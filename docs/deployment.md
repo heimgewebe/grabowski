@@ -41,7 +41,7 @@ python -m grabowski_mcp
 
 Außerdem enthält er die erwartete Werkzeugliste. Das Deployment liest Entry-
 Point und Tool-Gate ausschließlich aus diesem Contract. Der Modulmodus ist der
-produktive Modus in PR #8; ein scriptbasierter Modus ist strukturell vorgesehen.
+einzige Entry-Point-Modus in PR #8.
 
 Auf dem aktuellen Host startet das Live-Profil noch:
 

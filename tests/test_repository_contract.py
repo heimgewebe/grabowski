@@ -36,8 +36,12 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('"repo_head"', source)
         self.assertIn('"runtime_lock_sha256"', source)
         self.assertIn('"manifest_schema_valid"', source)
+        self.assertIn('"release_path_valid"', source)
         self.assertIn('"source_identity_valid"', source)
         self.assertIn('"runtime_pointer_valid"', source)
+        self.assertIn('"entrypoint_contract_identity_valid"', source)
+        self.assertIn('"release_python_identity_valid"', source)
+        self.assertIn('"python_runtime_identity_valid"', source)
         self.assertNotIn('"manifest_valid"', source)
 
     def test_runtime_entrypoint_contract_exists(self) -> None:
@@ -49,6 +53,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(contract["schema_version"], 1)
         self.assertEqual(contract["mode"], "module")
         self.assertEqual(contract["module"], "grabowski_mcp")
+        self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_mcp.py")
         self.assertEqual(
             set(contract["expected_tools"]),
@@ -74,6 +79,19 @@ class RepositoryContractTests(unittest.TestCase):
         )
         lock_text = runtime_lock.read_text(encoding="utf-8")
         self.assertIn("mcp==1.27.2", lock_text)
+        self.assertIn("--hash=sha256:", lock_text)
+
+    def test_deploy_tooling_lock_contract_exists(self) -> None:
+        tooling_input = ROOT / "requirements" / "deploy-tooling.in"
+        tooling_lock = ROOT / "requirements" / "deploy-tooling.lock.txt"
+        self.assertTrue(tooling_input.is_file())
+        self.assertTrue(tooling_lock.is_file())
+        self.assertEqual(
+            tooling_input.read_text(encoding="utf-8").strip(),
+            "PyYAML==6.0.3",
+        )
+        lock_text = tooling_lock.read_text(encoding="utf-8")
+        self.assertIn("pyyaml==6.0.3", lock_text)
         self.assertIn("--hash=sha256:", lock_text)
 
     def test_merges_is_explicitly_read_only(self) -> None:

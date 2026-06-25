@@ -85,6 +85,86 @@ class DeployRuntimeTests(unittest.TestCase):
             ["/release/.venv/bin/python", "-m", "grabowski_mcp"],
         )
 
+    def test_script_entrypoint_contract_is_rejected(self) -> None:
+        raw = json.dumps(
+            {
+                "schema_version": 1,
+                "mode": "script",
+                "script": "grabowski_mcp.py",
+                "source": "src/grabowski_mcp.py",
+                "expected_tools": ["grabowski_status"],
+            }
+        ).encode()
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "Nicht unterstützter"):
+            deploy_runtime.load_contract_bytes(raw)
+
+    def test_managed_path_rejects_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            allowed = Path(directory) / "home" / "alex"
+            allowed.mkdir(parents=True)
+            (Path(directory) / "tmp").mkdir()
+            path = allowed / "../../tmp/grabowski-mcp"
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "außerhalb"):
+                deploy_runtime.normalize_managed_path(path, allowed_root=allowed)
+
+    def test_managed_path_rejects_similar_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            allowed = root / "home" / "alex"
+            allowed.mkdir(parents=True)
+            other = root / "home" / "alex-other"
+            other.mkdir(parents=True)
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "außerhalb"):
+                deploy_runtime.normalize_managed_path(
+                    other / "grabowski-mcp",
+                    allowed_root=allowed,
+                )
+
+    def test_managed_path_rejects_symlinked_parent_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            allowed = root / "allowed"
+            allowed.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            link_parent = allowed / "link-to-outside"
+            link_parent.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "außerhalb"):
+                deploy_runtime.normalize_managed_path(
+                    link_parent / "grabowski-mcp",
+                    allowed_root=allowed,
+                )
+
+    def test_runtime_symlink_component_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            allowed = Path(directory) / "allowed"
+            allowed.mkdir()
+            release = allowed / "release"
+            release.mkdir()
+            runtime = allowed / "grabowski-mcp"
+            runtime.symlink_to(release, target_is_directory=True)
+            normalized = deploy_runtime.require_runtime_replaceable(
+                runtime,
+                allowed_root=allowed,
+            )
+            self.assertEqual(normalized, runtime)
+
+    def test_releases_root_symlink_is_rejected_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            allowed = Path(directory) / "allowed"
+            allowed.mkdir()
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            runtime = allowed / "grabowski-mcp"
+            releases = allowed / deploy_runtime.RELEASES_DIR_NAME
+            releases.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "Releases-Root"):
+                deploy_runtime.require_runtime_replaceable(
+                    runtime,
+                    allowed_root=allowed,
+                )
+            self.assertFalse(runtime.exists())
+
     def test_profile_operator_mismatch_stops_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -96,7 +176,7 @@ class DeployRuntimeTests(unittest.TestCase):
 
             with (
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
-                patch.object(deploy_runtime, "require_runtime_replaceable"),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "service_active", return_value=True),
                 patch.object(deploy_runtime, "profile_entrypoint", return_value=deploy_runtime.EntryPoint(mode="module", python=runtime / ".venv/bin/python", module="grabowski_operator")),
                 patch.object(deploy_runtime, "build_release") as build_release,
@@ -269,6 +349,180 @@ class DeployRuntimeTests(unittest.TestCase):
             },
         )
 
+    def _write_complete_release(
+        self,
+        release: Path,
+        snapshot: deploy_runtime.Snapshot,
+        runtime: Path,
+    ) -> Path:
+        (release / "inputs/src").mkdir(parents=True)
+        (release / "inputs/runtime-entrypoint.json").write_bytes(snapshot.contract_bytes)
+        (release / "inputs/runtime.in").write_bytes(snapshot.runtime_input_bytes)
+        (release / "inputs/runtime.lock.txt").write_bytes(snapshot.runtime_lock_bytes)
+        (release / "inputs/src/grabowski_mcp.py").write_bytes(snapshot.source_bytes)
+        python = release / ".venv/bin/python"
+        python.parent.mkdir(parents=True)
+        python.write_text("", encoding="utf-8")
+        module = release / ".venv/lib/python3.10/site-packages/grabowski_mcp.py"
+        module.parent.mkdir(parents=True)
+        module.write_bytes(snapshot.source_bytes)
+        self._write_manifest(release, snapshot, runtime)
+        return module
+
+    def _verify_complete_release(
+        self,
+        release: Path,
+        runtime: Path,
+        snapshot: deploy_runtime.Snapshot,
+        module: Path,
+    ) -> None:
+        manifest = deploy_runtime.read_manifest(release)
+        python = release / ".venv/bin/python"
+        with (
+            patch.object(deploy_runtime, "import_module_path", return_value=module),
+            patch.object(deploy_runtime, "site_packages_path", return_value=module.parent),
+        ):
+            deploy_runtime.verify_final_release_artifacts(
+                release,
+                runtime,
+                snapshot.contract,
+                snapshot=snapshot,
+                manifest=manifest,
+                process={"exe": str(python)},
+            )
+
+    def test_final_identity_accepts_complete_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self._snapshot()
+            module = self._write_complete_release(release, snapshot, runtime)
+            self._verify_complete_release(release, runtime, snapshot, module)
+
+    def test_final_identity_rejects_source_snapshot_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self._snapshot()
+            module = self._write_complete_release(release, snapshot, runtime)
+            (release / "inputs/src/grabowski_mcp.py").write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "driftete"):
+                self._verify_complete_release(release, runtime, snapshot, module)
+
+    def test_final_identity_rejects_lock_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self._snapshot()
+            module = self._write_complete_release(release, snapshot, runtime)
+            (release / "inputs/runtime.lock.txt").write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "driftete"):
+                self._verify_complete_release(release, runtime, snapshot, module)
+
+    def test_final_identity_rejects_contract_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self._snapshot()
+            module = self._write_complete_release(release, snapshot, runtime)
+            (release / "inputs/runtime-entrypoint.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "driftete"):
+                self._verify_complete_release(release, runtime, snapshot, module)
+
+    def test_final_identity_rejects_manifest_path_outside_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self._snapshot()
+            module = self._write_complete_release(release, snapshot, runtime)
+            manifest = deploy_runtime.read_manifest(release)
+            outside = root / "outside.lock"
+            outside.write_text("x\n", encoding="utf-8")
+            manifest["snapshot_paths"]["runtime_lock"] = str(outside)
+            with (
+                patch.object(deploy_runtime, "import_module_path", return_value=module),
+                patch.object(deploy_runtime, "site_packages_path", return_value=module.parent),
+            ):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Snapshotpfad"):
+                    deploy_runtime.verify_final_release_artifacts(
+                        release,
+                        runtime,
+                        snapshot.contract,
+                        snapshot=snapshot,
+                        manifest=manifest,
+                        process={"exe": str(release / ".venv/bin/python")},
+                    )
+
+    def test_final_identity_rejects_unexpected_module_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self._snapshot()
+            module = self._write_complete_release(release, snapshot, runtime)
+            other = release / ".venv/lib/python3.10/site-packages/other.py"
+            other.write_bytes(snapshot.source_bytes)
+            manifest = deploy_runtime.read_manifest(release)
+            with (
+                patch.object(deploy_runtime, "import_module_path", return_value=other),
+                patch.object(deploy_runtime, "site_packages_path", return_value=module.parent),
+            ):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Modulpfad"):
+                    deploy_runtime.verify_final_release_artifacts(
+                        release,
+                        runtime,
+                        snapshot.contract,
+                        snapshot=snapshot,
+                        manifest=manifest,
+                        process={"exe": str(release / ".venv/bin/python")},
+                    )
+
+    def test_final_identity_rejects_module_bytes_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self._snapshot()
+            module = self._write_complete_release(release, snapshot, runtime)
+            module.write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "Moduldatei"):
+                self._verify_complete_release(release, runtime, snapshot, module)
+
+    def test_final_identity_rejects_changed_symlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            other = root / "other"
+            release.mkdir()
+            other.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self._snapshot()
+            module = self._write_complete_release(release, snapshot, runtime)
+            runtime.unlink()
+            runtime.symlink_to(other)
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "Symlink"):
+                self._verify_complete_release(release, runtime, snapshot, module)
+
     def test_successful_fake_deploy_switches_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -292,7 +546,7 @@ class DeployRuntimeTests(unittest.TestCase):
 
             with (
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
-                patch.object(deploy_runtime, "require_runtime_replaceable"),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
                 patch.object(deploy_runtime, "service_active", side_effect=lambda: next(service_values, False)),
                 patch.object(deploy_runtime, "build_release", return_value=build),
@@ -340,7 +594,7 @@ class DeployRuntimeTests(unittest.TestCase):
 
             with (
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
-                patch.object(deploy_runtime, "require_runtime_replaceable"),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
                 patch.object(deploy_runtime, "service_active", side_effect=lambda: next(service_values, False)),
                 patch.object(deploy_runtime, "build_release", return_value=build),
@@ -367,7 +621,7 @@ class DeployRuntimeTests(unittest.TestCase):
 
             with (
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
-                patch.object(deploy_runtime, "require_runtime_replaceable"),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
                 patch.object(deploy_runtime, "service_active", return_value=True),
                 patch.object(deploy_runtime, "build_release", return_value=build),
@@ -375,9 +629,47 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "run", side_effect=lambda argv, **kwargs: self._completed(argv, 1)),
                 patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "active"}),
             ):
-                with self.assertRaisesRegex(deploy_runtime.DeployError, "vor Pointermutation"):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackabbruch"):
                     deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
             self.assertEqual(runtime.resolve(), old_release.resolve())
+
+    def test_pre_pointer_activation_failure_recovers_old_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old_release = root / "old"
+            old_release.mkdir()
+            runtime.symlink_to(old_release)
+            new_release = root / "new"
+            (new_release / "inputs/src").mkdir(parents=True)
+            snapshot = self._snapshot()
+            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            self._write_manifest(new_release, snapshot, runtime)
+            live_entrypoint = deploy_runtime.EntryPoint(
+                mode="module",
+                python=runtime / ".venv/bin/python",
+                module="grabowski_mcp",
+            )
+            service_values = iter([True, False, False])
+
+            with (
+                patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
+                patch.object(deploy_runtime, "require_profile_matches_contract", return_value=live_entrypoint),
+                patch.object(deploy_runtime, "service_active", side_effect=lambda: next(service_values, False)),
+                patch.object(deploy_runtime, "build_release", return_value=build),
+                patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
+                patch.object(deploy_runtime, "run", side_effect=lambda argv, **kwargs: self._completed(argv)),
+                patch.object(deploy_runtime, "activate_pointer", side_effect=deploy_runtime.DeployError("activate failed")),
+                patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)) as wait_ready,
+                patch.object(deploy_runtime, "verify_running_profile_entrypoint", return_value={"pid": 200}) as verify_previous,
+                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "active"}),
+            ):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
+                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+            self.assertEqual(runtime.resolve(), old_release.resolve())
+            wait_ready.assert_called()
+            verify_previous.assert_called_once_with(live_entrypoint)
 
     def test_new_start_failure_restores_old_pointer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -400,7 +692,7 @@ class DeployRuntimeTests(unittest.TestCase):
 
             with (
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
-                patch.object(deploy_runtime, "require_runtime_replaceable"),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
                 patch.object(deploy_runtime, "service_active", side_effect=lambda: next(service_values, False)),
                 patch.object(deploy_runtime, "build_release", return_value=build),
@@ -429,7 +721,7 @@ class DeployRuntimeTests(unittest.TestCase):
 
             with (
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
-                patch.object(deploy_runtime, "require_runtime_replaceable"),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
                 patch.object(deploy_runtime, "service_active", side_effect=lambda: next(service_values, False)),
                 patch.object(deploy_runtime, "build_release", return_value=build),
@@ -442,6 +734,221 @@ class DeployRuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
                     deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
             self.assertEqual(runtime.resolve(), old_release.resolve())
+
+    def test_rollback_stop_timeout_preserves_original_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old = root / "old"
+            old.mkdir()
+            runtime.symlink_to(old)
+            previous = deploy_runtime.capture_pointer(runtime)
+
+            def fake_run(argv, **kwargs):
+                if "stop" in argv:
+                    raise deploy_runtime.DeployError(
+                        "token=FAKE-SECRET timeout",
+                        phase="command-timeout",
+                        details={"argv": argv, "timeout_seconds": 1},
+                    )
+                return self._completed(argv)
+
+            with (
+                patch.object(deploy_runtime, "run", side_effect=fake_run),
+                patch.object(deploy_runtime, "service_active", return_value=False),
+                patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)),
+                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "active"}),
+            ):
+                with self.assertRaises(deploy_runtime.DeployError) as ctx:
+                    deploy_runtime.rollback_after_failure(
+                        deploy_runtime.DeployError("original root cause"),
+                        runtime=runtime,
+                        previous=previous,
+                        legacy_backup=None,
+                        timeout_seconds=1,
+                        phase="start",
+                    )
+            message = str(ctx.exception)
+            self.assertIn("original root cause", message)
+            self.assertIn("rollback-stop-command", message)
+            self.assertNotIn("FAKE-SECRET", message)
+
+    def test_rollback_unknown_service_state_does_not_restore_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old = root / "old"
+            old.mkdir()
+            runtime.symlink_to(old)
+            previous = deploy_runtime.capture_pointer(runtime)
+            with (
+                patch.object(deploy_runtime, "run", return_value=self._completed(["stop"])),
+                patch.object(deploy_runtime, "service_active", side_effect=deploy_runtime.DeployError("state failed")),
+                patch.object(deploy_runtime, "restore_pointer") as restore_pointer,
+                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "unknown"}),
+            ):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackabbruch"):
+                    deploy_runtime.rollback_after_failure(
+                        deploy_runtime.DeployError("original"),
+                        runtime=runtime,
+                        previous=previous,
+                        legacy_backup=None,
+                        timeout_seconds=1,
+                        phase="stop",
+                    )
+            restore_pointer.assert_not_called()
+
+    def test_rollback_active_service_does_not_restore_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old = root / "old"
+            old.mkdir()
+            runtime.symlink_to(old)
+            previous = deploy_runtime.capture_pointer(runtime)
+            with (
+                patch.object(deploy_runtime, "run", return_value=self._completed(["stop"])),
+                patch.object(deploy_runtime, "service_active", return_value=True),
+                patch.object(deploy_runtime, "restore_pointer") as restore_pointer,
+                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "active"}),
+            ):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackabbruch"):
+                    deploy_runtime.rollback_after_failure(
+                        deploy_runtime.DeployError("original"),
+                        runtime=runtime,
+                        previous=previous,
+                        legacy_backup=None,
+                        timeout_seconds=1,
+                        phase="stop",
+                    )
+            restore_pointer.assert_not_called()
+
+    def test_rollback_pointer_restore_exception_skips_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old = root / "old"
+            old.mkdir()
+            runtime.symlink_to(old)
+            previous = deploy_runtime.capture_pointer(runtime)
+            calls: list[list[str]] = []
+
+            def fake_run(argv, **kwargs):
+                calls.append(argv)
+                return self._completed(argv)
+
+            with (
+                patch.object(deploy_runtime, "run", side_effect=fake_run),
+                patch.object(deploy_runtime, "service_active", return_value=False),
+                patch.object(deploy_runtime, "restore_pointer", side_effect=OSError("restore failed")),
+                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "inactive"}),
+            ):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Restorefehler"):
+                    deploy_runtime.rollback_after_failure(
+                        deploy_runtime.DeployError("original"),
+                        runtime=runtime,
+                        previous=previous,
+                        legacy_backup=None,
+                        timeout_seconds=1,
+                        phase="start",
+                    )
+            self.assertFalse(any("start" in argv for argv in calls))
+
+    def test_rollback_pointer_restore_mismatch_skips_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old = root / "old"
+            new = root / "new"
+            old.mkdir()
+            new.mkdir()
+            runtime.symlink_to(old)
+            previous = deploy_runtime.capture_pointer(runtime)
+            runtime.unlink()
+            runtime.symlink_to(new)
+            calls: list[list[str]] = []
+
+            def fake_run(argv, **kwargs):
+                calls.append(argv)
+                return self._completed(argv)
+
+            with (
+                patch.object(deploy_runtime, "run", side_effect=fake_run),
+                patch.object(deploy_runtime, "service_active", return_value=False),
+                patch.object(deploy_runtime, "restore_pointer", return_value=None),
+                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "inactive"}),
+            ):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Pointerverifikationsfehler"):
+                    deploy_runtime.rollback_after_failure(
+                        deploy_runtime.DeployError("original"),
+                        runtime=runtime,
+                        previous=previous,
+                        legacy_backup=None,
+                        timeout_seconds=1,
+                        phase="start",
+                    )
+            self.assertFalse(any("start" in argv for argv in calls))
+
+    def test_rollback_start_timeout_is_aggregated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old = root / "old"
+            old.mkdir()
+            runtime.symlink_to(old)
+            previous = deploy_runtime.capture_pointer(runtime)
+
+            def fake_run(argv, **kwargs):
+                if "start" in argv:
+                    raise deploy_runtime.DeployError(
+                        "start timeout",
+                        phase="command-timeout",
+                        details={"argv": argv, "timeout_seconds": 1},
+                    )
+                return self._completed(argv)
+
+            with (
+                patch.object(deploy_runtime, "run", side_effect=fake_run),
+                patch.object(deploy_runtime, "service_active", return_value=False),
+                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "inactive"}),
+            ):
+                with self.assertRaises(deploy_runtime.DeployError) as ctx:
+                    deploy_runtime.rollback_after_failure(
+                        deploy_runtime.DeployError("original"),
+                        runtime=runtime,
+                        previous=previous,
+                        legacy_backup=None,
+                        timeout_seconds=1,
+                        phase="readiness",
+                    )
+            self.assertIn("rollback-start-command", str(ctx.exception))
+
+    def test_rollback_readiness_and_final_state_errors_are_aggregated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old = root / "old"
+            old.mkdir()
+            runtime.symlink_to(old)
+            previous = deploy_runtime.capture_pointer(runtime)
+            with (
+                patch.object(deploy_runtime, "run", return_value=self._completed(["cmd"])),
+                patch.object(deploy_runtime, "service_active", return_value=False),
+                patch.object(deploy_runtime, "wait_until_ready", side_effect=deploy_runtime.DeployError("ready failed")),
+                patch.object(deploy_runtime, "service_state", side_effect=deploy_runtime.DeployError("final failed")),
+            ):
+                with self.assertRaises(deploy_runtime.DeployError) as ctx:
+                    deploy_runtime.rollback_after_failure(
+                        deploy_runtime.DeployError("original"),
+                        runtime=runtime,
+                        previous=previous,
+                        legacy_backup=None,
+                        timeout_seconds=1,
+                        phase="identity",
+                    )
+            message = str(ctx.exception)
+            self.assertIn("rollback-readiness", message)
+            self.assertIn("rollback-final-service-state", message)
 
     def test_incomplete_manifest_is_not_schema_valid(self) -> None:
         errors = deploy_runtime.validate_manifest_schema(
@@ -496,6 +1003,45 @@ class DeployRuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Unerwartete"):
                     deploy_runtime.verify_installed_distributions(Path("/python"), path)
 
+    def test_direct_pin_version_mismatch_is_rejected(self) -> None:
+        snapshot = self._snapshot()
+        snapshot = deploy_runtime.Snapshot(
+            repo_head=snapshot.repo_head,
+            dirty=snapshot.dirty,
+            contract=snapshot.contract,
+            contract_bytes=snapshot.contract_bytes,
+            runtime_input_bytes=b"mcp==1.27.2\nexample==1.0\n",
+            runtime_lock_bytes=(
+                b"mcp==1.27.2 \\\n"
+                b"    --hash=sha256:" + b"1" * 64 + b"\n"
+                b"example==2.0 \\\n"
+                b"    --hash=sha256:" + b"2" * 64 + b"\n"
+            ),
+            source_bytes=snapshot.source_bytes,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "Direkte Pins"):
+                deploy_runtime.build_release(
+                    snapshot,
+                    root / deploy_runtime.RELEASES_DIR_NAME,
+                    root / "grabowski-mcp",
+                )
+
+    def test_mark_incomplete_redacts_fake_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory)
+            deploy_runtime.mark_incomplete(
+                release,
+                "test",
+                RuntimeError("token=FAKE-SECRET-VALUE should not persist"),
+            )
+            marker = (release / deploy_runtime.INCOMPLETE_MARKER).read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("FAKE-SECRET-VALUE", marker)
+            self.assertIn("<redacted>", marker)
+
     def test_command_timeout_becomes_structured_deploy_error(self) -> None:
         def timeout(*args, **kwargs):
             raise subprocess.TimeoutExpired(args[0], 1)
@@ -508,6 +1054,7 @@ class DeployRuntimeTests(unittest.TestCase):
 
     def test_yaml_parser_ignores_commented_command(self) -> None:
         fake_yaml = types.SimpleNamespace(
+            __version__=deploy_runtime.TOOLING_PYYAML_VERSION,
             safe_load=lambda text: {"mcp": {"command": "/runtime/.venv/bin/python -m grabowski_mcp"}}
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -521,6 +1068,66 @@ class DeployRuntimeTests(unittest.TestCase):
             with patch.dict(sys.modules, {"yaml": fake_yaml}):
                 argv = deploy_runtime.yaml_profile_command(path)
         self.assertEqual(argv, ["/runtime/.venv/bin/python", "-m", "grabowski_mcp"])
+
+    def test_yaml_parser_requires_pinned_dependency(self) -> None:
+        fake_yaml = types.SimpleNamespace(
+            __version__="0.0",
+            safe_load=lambda text: {"mcp": {"command": "x"}},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.yaml"
+            path.write_text("mcp:\n  command: x\n", encoding="utf-8")
+            with patch.dict(sys.modules, {"yaml": fake_yaml}):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "PyYAML-Version"):
+                    deploy_runtime.yaml_profile_command(path)
+
+    def test_yaml_parser_rejects_multiple_commands(self) -> None:
+        fake_yaml = types.SimpleNamespace(
+            __version__=deploy_runtime.TOOLING_PYYAML_VERSION,
+            safe_load=lambda text: {
+                "mcp": {"command": "one"},
+                "nested": {"command": "two"},
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.yaml"
+            path.write_text("ignored\n", encoding="utf-8")
+            with patch.dict(sys.modules, {"yaml": fake_yaml}):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "genau einen"):
+                    deploy_runtime.yaml_profile_command(path)
+
+    def test_yaml_parser_accepts_command_list(self) -> None:
+        fake_yaml = types.SimpleNamespace(
+            __version__=deploy_runtime.TOOLING_PYYAML_VERSION,
+            safe_load=lambda text: {
+                "mcp": {"command": ["/runtime/.venv/bin/python", "-m", "grabowski_mcp"]}
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.yaml"
+            path.write_text("ignored\n", encoding="utf-8")
+            with patch.dict(sys.modules, {"yaml": fake_yaml}):
+                argv = deploy_runtime.yaml_profile_command(path)
+        self.assertEqual(argv, ["/runtime/.venv/bin/python", "-m", "grabowski_mcp"])
+
+    def test_yaml_parser_error_does_not_include_profile_secret(self) -> None:
+        class FakeYamlError(Exception):
+            problem_mark = types.SimpleNamespace(line=4, column=2)
+
+        fake_yaml = types.SimpleNamespace(
+            __version__=deploy_runtime.TOOLING_PYYAML_VERSION,
+            safe_load=lambda text: (_ for _ in ()).throw(
+                FakeYamlError("token=FAKE-SECRET in profile")
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.yaml"
+            path.write_text("token: FAKE-SECRET\n", encoding="utf-8")
+            with patch.dict(sys.modules, {"yaml": fake_yaml}):
+                with self.assertRaises(deploy_runtime.DeployError) as ctx:
+                    deploy_runtime.yaml_profile_command(path)
+        self.assertNotIn("FAKE-SECRET", str(ctx.exception))
+        self.assertEqual(ctx.exception.details["line"], 5)
 
 
 if __name__ == "__main__":

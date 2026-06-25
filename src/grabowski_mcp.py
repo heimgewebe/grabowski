@@ -8,6 +8,7 @@ from typing import Any
 import hashlib
 import json
 import os
+import platform
 import shutil
 import stat as statmod
 import sys
@@ -206,6 +207,27 @@ def _append_audit(record: dict[str, Any]) -> None:
         os.close(fd)
 
 
+def _false_deployment_metadata(base: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    return {
+        **base,
+        "manifest_parse_valid": False,
+        "manifest_schema_valid": False,
+        "release_path_valid": False,
+        "runtime_pointer_valid": False,
+        "source_identity_valid": False,
+        "lock_identity_valid": False,
+        "entrypoint_contract_identity_valid": False,
+        "release_python_identity_valid": False,
+        "python_runtime_identity_valid": False,
+        "provenance_valid": False,
+        **extra,
+    }
+
+
+def _path_inside(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
 def _deployment_metadata() -> dict[str, Any]:
     manifest_path = DEPLOYMENT_MANIFEST
     base: dict[str, Any] = {
@@ -213,40 +235,15 @@ def _deployment_metadata() -> dict[str, Any]:
         "manifest_exists": manifest_path.is_file(),
     }
     if not manifest_path.is_file():
-        return {
-            **base,
-            "manifest_parse_valid": False,
-            "manifest_schema_valid": False,
-            "source_identity_valid": False,
-            "lock_identity_valid": False,
-            "runtime_pointer_valid": False,
-            "provenance_valid": False,
-        }
+        return _false_deployment_metadata(base)
 
     try:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return {
-            **base,
-            "manifest_parse_valid": False,
-            "manifest_schema_valid": False,
-            "source_identity_valid": False,
-            "lock_identity_valid": False,
-            "runtime_pointer_valid": False,
-            "provenance_valid": False,
-            "error": str(exc),
-        }
+        return _false_deployment_metadata(base, error_type=type(exc).__name__)
 
     if not isinstance(raw, dict):
-        return {
-            **base,
-            "manifest_parse_valid": True,
-            "manifest_schema_valid": False,
-            "source_identity_valid": False,
-            "lock_identity_valid": False,
-            "runtime_pointer_valid": False,
-            "provenance_valid": False,
-        }
+        return _false_deployment_metadata(base, manifest_parse_valid=True)
 
     required = {
         "schema_version",
@@ -255,11 +252,13 @@ def _deployment_metadata() -> dict[str, Any]:
         "entrypoint_contract",
         "entrypoint_contract_sha256",
         "source_sha256",
+        "runtime_input_sha256",
         "runtime_lock_sha256",
         "snapshot_paths",
         "immutable_release_path",
         "expected_stable_runtime_path",
         "release_python_path",
+        "entrypoint_path",
         "platform",
         "python_version",
         "python_implementation",
@@ -274,6 +273,28 @@ def _deployment_metadata() -> dict[str, Any]:
         and required.issubset(raw)
     )
 
+    release_root = manifest_path.parent.resolve()
+    snapshot_paths = raw.get("snapshot_paths")
+    stable_runtime = None
+    if isinstance(raw.get("expected_stable_runtime_path"), str):
+        stable_runtime = Path(raw["expected_stable_runtime_path"])
+
+    release_path_valid = False
+    try:
+        releases_root = (
+            stable_runtime.parent / "grabowski-mcp-releases"
+            if stable_runtime is not None
+            else None
+        )
+        release_path_valid = (
+            isinstance(raw.get("immutable_release_path"), str)
+            and Path(raw["immutable_release_path"]) == manifest_path.parent
+            and releases_root is not None
+            and release_root.parent.resolve() == releases_root.resolve()
+        )
+    except (OSError, RuntimeError):
+        release_path_valid = False
+
     source_identity_valid = False
     if isinstance(raw, dict) and isinstance(raw.get("source_sha256"), str):
         try:
@@ -284,39 +305,78 @@ def _deployment_metadata() -> dict[str, Any]:
             source_identity_valid = False
 
     lock_identity_valid = False
-    snapshot_paths = raw.get("snapshot_paths") if isinstance(raw, dict) else None
-    lock_path = None
     if isinstance(snapshot_paths, dict):
-        lock_value = snapshot_paths.get("runtime_lock")
-        if isinstance(lock_value, str):
-            lock_path = Path(lock_value)
-    if lock_path is not None and isinstance(raw.get("runtime_lock_sha256"), str):
         try:
+            lock_path = Path(str(snapshot_paths.get("runtime_lock")))
+            expected_lock = release_root / "inputs/runtime.lock.txt"
             lock_identity_valid = (
-                lock_path.is_file()
+                lock_path == expected_lock
+                and lock_path.is_file()
+                and _path_inside(lock_path.resolve(), release_root)
                 and _sha256(lock_path) == raw["runtime_lock_sha256"]
             )
         except OSError:
             lock_identity_valid = False
 
+    entrypoint_contract_identity_valid = False
+    if isinstance(snapshot_paths, dict):
+        try:
+            contract_path = Path(str(snapshot_paths.get("runtime_entrypoint")))
+            expected_contract = release_root / "inputs/runtime-entrypoint.json"
+            contract_raw = json.loads(contract_path.read_text(encoding="utf-8"))
+            contract_valid = (
+                isinstance(contract_raw, dict)
+                and contract_raw.get("schema_version") == 1
+                and contract_raw.get("mode") == "module"
+                and isinstance(contract_raw.get("module"), str)
+                and isinstance(contract_raw.get("expected_tools"), list)
+            )
+            entrypoint_contract_identity_valid = (
+                contract_path == expected_contract
+                and contract_path.is_file()
+                and _path_inside(contract_path.resolve(), release_root)
+                and _sha256(contract_path) == raw["entrypoint_contract_sha256"]
+                and contract_valid
+            )
+        except (OSError, json.JSONDecodeError):
+            entrypoint_contract_identity_valid = False
+
     runtime_pointer_valid = False
     try:
-        stable = Path(str(raw.get("expected_stable_runtime_path")))
-        release = Path(str(raw.get("immutable_release_path")))
         runtime_pointer_valid = (
-            stable.is_symlink()
-            and stable.resolve() == release.resolve()
+            stable_runtime is not None
+            and stable_runtime.is_symlink()
+            and stable_runtime.resolve() == release_root
         )
     except (OSError, RuntimeError):
         runtime_pointer_valid = False
 
-    repo_head = raw.get("repo_head") if isinstance(raw, dict) else None
+    release_python_identity_valid = False
+    try:
+        release_python = Path(str(raw.get("release_python_path")))
+        expected_python = release_root / ".venv/bin/python"
+        release_python_identity_valid = (
+            release_python == expected_python
+            and release_python.exists()
+            and release_python.resolve() == Path(sys.executable).resolve()
+        )
+    except (OSError, RuntimeError):
+        release_python_identity_valid = False
+
+    python_runtime_identity_valid = (
+        raw.get("python_version") == platform.python_version()
+        and raw.get("python_implementation") == platform.python_implementation()
+    )
+
     provenance_valid = (
-        isinstance(repo_head, str)
-        and len(repo_head) == 40
-        and all(char in "0123456789abcdef" for char in repo_head)
-        and isinstance(raw.get("release_python_path"), str)
-        and ".stage" not in raw.get("release_python_path", "")
+        schema_valid
+        and release_path_valid
+        and runtime_pointer_valid
+        and source_identity_valid
+        and lock_identity_valid
+        and entrypoint_contract_identity_valid
+        and release_python_identity_valid
+        and python_runtime_identity_valid
     )
 
     allowed = {
@@ -327,6 +387,7 @@ def _deployment_metadata() -> dict[str, Any]:
             "repo_head",
             "entrypoint_contract_sha256",
             "source_sha256",
+            "runtime_input_sha256",
             "runtime_lock_sha256",
             "mcp_protocol_version",
             "python_version",
@@ -340,8 +401,12 @@ def _deployment_metadata() -> dict[str, Any]:
         **base,
         "manifest_parse_valid": True,
         "manifest_schema_valid": schema_valid,
+        "release_path_valid": release_path_valid,
         "source_identity_valid": source_identity_valid,
         "lock_identity_valid": lock_identity_valid,
+        "entrypoint_contract_identity_valid": entrypoint_contract_identity_valid,
+        "release_python_identity_valid": release_python_identity_valid,
+        "python_runtime_identity_valid": python_runtime_identity_valid,
         "runtime_pointer_valid": runtime_pointer_valid,
         "provenance_valid": provenance_valid,
         **allowed,

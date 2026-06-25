@@ -26,6 +26,7 @@ PROFILE_NAME = "grabowski"
 HEALTH_URL = "http://127.0.0.1:18080/healthz"
 READY_URL = "http://127.0.0.1:18080/readyz"
 HOME = Path.home()
+TOOLING_PYYAML_VERSION = "6.0.3"
 DEFAULT_PROFILE_PATH = HOME / ".config/tunnel-client/grabowski.yaml"
 DEFAULT_LOCK_FILE = HOME / ".local/state/grabowski/deploy.lock"
 RUNTIME_INPUT_RELATIVE = Path("requirements/runtime.in")
@@ -106,6 +107,74 @@ def redact_text(text: str, *, limit: int = 4000) -> str:
     return "\n".join(lines)[-limit:]
 
 
+def redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_text(value, limit=500)
+    if isinstance(value, list):
+        return [redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): redact_value(item)
+            for key, item in value.items()
+            if not SECRET_WORD_RE.search(str(key))
+        }
+    return value
+
+
+def safe_error_summary(exc: BaseException) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "type": type(exc).__name__,
+        "message": redact_text(str(exc), limit=500),
+    }
+    if isinstance(exc, DeployError):
+        if exc.phase is not None:
+            summary["phase"] = exc.phase
+        if exc.details:
+            safe_details: dict[str, Any] = {}
+            for key, value in exc.details.items():
+                if key == "argv" and isinstance(value, list):
+                    safe_details[key] = redact_argv([str(item) for item in value])
+                elif key == "timeout_seconds":
+                    safe_details[key] = value
+                elif isinstance(value, str):
+                    safe_details[key] = redact_text(value, limit=500)
+                else:
+                    safe_details[key] = redact_value(value)
+            summary["details"] = safe_details
+    if isinstance(exc, subprocess.CalledProcessError):
+        summary["returncode"] = exc.returncode
+        if isinstance(exc.cmd, list):
+            summary["argv"] = redact_argv([str(item) for item in exc.cmd])
+    if isinstance(exc, subprocess.TimeoutExpired):
+        summary["timeout_seconds"] = exc.timeout
+        if isinstance(exc.cmd, list):
+            summary["argv"] = redact_argv([str(item) for item in exc.cmd])
+    return summary
+
+
+def summarize_result(value: Any) -> Any:
+    if isinstance(value, subprocess.CompletedProcess):
+        return {"returncode": value.returncode}
+    if isinstance(value, PointerState):
+        return pointer_to_dict(value)
+    if isinstance(value, ReadinessResult):
+        return {
+            "ok": value.ok,
+            "service": value.service,
+            "health": value.health,
+            "readiness": value.readiness,
+            "main_pid": value.main_pid,
+            "journal": value.journal,
+        }
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return value
+    return repr(value)
+
+
 def run(
     argv: list[str],
     *,
@@ -181,6 +250,38 @@ def sha256_bytes(data: bytes) -> str:
 def require_file(path: Path, label: str) -> None:
     if not path.is_file():
         fail(f"{label} fehlt: {path}")
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def normalize_managed_path(
+    path: Path,
+    *,
+    allowed_root: Path,
+    cwd: Path | None = None,
+) -> Path:
+    expanded = path.expanduser()
+    base = cwd if cwd is not None else Path.cwd()
+    candidate = expanded if expanded.is_absolute() else base / expanded
+    normalized = Path(os.path.abspath(os.fspath(candidate)))
+    try:
+        allowed_real = allowed_root.expanduser().resolve(strict=True)
+    except OSError as exc:
+        fail(f"Erlaubter Root ist nicht validierbar: {allowed_root}")
+        raise AssertionError from exc
+    try:
+        parent_real = normalized.parent.resolve(strict=True)
+    except OSError as exc:
+        fail(f"Managed-Path-Parent fehlt: {normalized.parent}")
+        raise AssertionError from exc
+    if not path_is_within(parent_real, allowed_real):
+        fail(
+            "Managed-Path-Parent liegt außerhalb des erlaubten Roots: "
+            f"{parent_real}"
+        )
+    return parent_real / normalized.name
 
 
 def normalize_package_name(name: str) -> str:
@@ -275,36 +376,22 @@ class RuntimeContract:
     mode: str
     expected_tools: tuple[str, ...]
     source: Path
-    module: str | None = None
-    script: Path | None = None
+    module: str
 
     def to_manifest(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
+        return {
             "schema_version": self.schema_version,
             "mode": self.mode,
             "expected_tools": list(self.expected_tools),
             "source": self.source.as_posix(),
+            "module": self.module,
         }
-        if self.module is not None:
-            data["module"] = self.module
-        if self.script is not None:
-            data["script"] = self.script.as_posix()
-        return data
 
     def command_argv(self, release_path: Path, python_exe: Path) -> list[str]:
-        if self.mode == "module":
-            assert self.module is not None
-            return [str(python_exe), "-m", self.module]
-        if self.mode == "script":
-            assert self.script is not None
-            return [str(python_exe), str(release_path / self.script)]
-        fail(f"Nicht unterstützter Entry-Point-Modus: {self.mode}")
+        return [str(python_exe), "-m", self.module]
 
     def describe(self) -> str:
-        if self.mode == "module":
-            return f"python -m {self.module}"
-        assert self.script is not None
-        return f"python {self.script.as_posix()}"
+        return f"python -m {self.module}"
 
 
 def _relative_path(value: str, label: str) -> Path:
@@ -324,7 +411,7 @@ def load_contract_bytes(data: bytes) -> RuntimeContract:
     if raw.get("schema_version") != 1:
         fail("Runtime-Entry-Point-Contract benötigt schema_version 1")
     mode = raw.get("mode")
-    if mode not in {"module", "script"}:
+    if mode != "module":
         fail(f"Nicht unterstützter Entry-Point-Modus: {mode!r}")
     tools = raw.get("expected_tools")
     if not isinstance(tools, list) or not tools or not all(isinstance(item, str) and item for item in tools):
@@ -332,24 +419,13 @@ def load_contract_bytes(data: bytes) -> RuntimeContract:
     source = _relative_path(str(raw.get("source", "")), "source")
     if source.as_posix() == ".":
         fail("Runtime-Entry-Point-Contract benötigt source")
-    if mode == "module":
-        module = raw.get("module")
-        if not isinstance(module, str) or not MODULE_RE.match(module):
-            fail(f"Ungültiges Modul im Runtime-Entry-Point-Contract: {module!r}")
-        return RuntimeContract(
-            schema_version=1,
-            mode="module",
-            module=module,
-            source=source,
-            expected_tools=tuple(tools),
-        )
-    script_raw = raw.get("script")
-    if not isinstance(script_raw, str):
-        fail("Script-Entry-Point benötigt script")
+    module = raw.get("module")
+    if not isinstance(module, str) or not MODULE_RE.match(module):
+        fail(f"Ungültiges Modul im Runtime-Entry-Point-Contract: {module!r}")
     return RuntimeContract(
         schema_version=1,
-        mode="script",
-        script=_relative_path(script_raw, "script"),
+        mode="module",
+        module=module,
         source=source,
         expected_tools=tuple(tools),
     )
@@ -483,7 +559,14 @@ def deployment_lock(lock_path: Path) -> Iterator[None]:
 
 
 def releases_root_for(runtime: Path) -> Path:
-    return runtime.parent / RELEASES_DIR_NAME
+    releases_root = runtime.parent / RELEASES_DIR_NAME
+    if releases_root.parent != runtime.parent:
+        fail("Releases-Root besitzt nicht denselben Parent wie Runtime")
+    if releases_root.is_symlink():
+        fail(f"Releases-Root darf kein Symlink sein: {releases_root}")
+    if releases_root.exists() and not releases_root.is_dir():
+        fail(f"Releases-Root ist kein Verzeichnis: {releases_root}")
+    return releases_root
 
 
 def release_id_base(snapshot: Snapshot) -> str:
@@ -588,38 +671,31 @@ def verify_installed_distributions(python_exe: Path, lock_path: Path) -> None:
         fail("Installierte Versionen weichen vom Lock ab: " + ", ".join(mismatched))
 
 
-def module_destination(site_packages: Path, module: str) -> Path:
+def module_destination(
+    site_packages: Path,
+    module: str,
+    *,
+    create_packages: bool = True,
+) -> Path:
     parts = module.split(".")
     if len(parts) == 1:
         return site_packages / f"{parts[0]}.py"
     package_root = site_packages
     for part in parts[:-1]:
         package_root = package_root / part
-        package_root.mkdir(exist_ok=True)
+        if create_packages:
+            package_root.mkdir(exist_ok=True)
         init = package_root / "__init__.py"
-        if not init.exists():
+        if create_packages and not init.exists():
             init.write_text("", encoding="utf-8")
     return package_root / f"{parts[-1]}.py"
 
 
 def install_runtime_source(snapshot: Snapshot, release_path: Path, python_exe: Path) -> Path:
-    if snapshot.contract.mode == "module":
-        assert snapshot.contract.module is not None
-        destination = module_destination(
-            site_packages_path(python_exe),
-            snapshot.contract.module,
-        )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(snapshot.source_bytes)
-        run(
-            [str(python_exe), "-m", "py_compile", str(destination)],
-            timeout=TIMEOUTS["python"],
-            env=pip_env(),
-        )
-        return destination
-
-    assert snapshot.contract.script is not None
-    destination = release_path / snapshot.contract.script
+    destination = module_destination(
+        site_packages_path(python_exe),
+        snapshot.contract.module,
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(snapshot.source_bytes)
     run(
@@ -649,21 +725,15 @@ def import_module_path(python_exe: Path, module: str) -> Path:
 
 
 def verify_entrypoint_importable(release_path: Path, python_exe: Path, contract: RuntimeContract) -> Path:
-    if contract.mode == "module":
-        assert contract.module is not None
-        module_path = import_module_path(python_exe, contract.module)
-        if not (
-            is_within(module_path, release_path / ".venv")
-            or is_within(module_path, release_path)
-        ):
-            fail(
-                f"Modul {contract.module!r} liegt außerhalb des Releases: {module_path}"
-            )
-        return module_path
-    assert contract.script is not None
-    script = release_path / contract.script
-    require_file(script, "Runtime-Script")
-    return script
+    module_path = import_module_path(python_exe, contract.module)
+    if not (
+        is_within(module_path, release_path / ".venv")
+        or is_within(module_path, release_path)
+    ):
+        fail(
+            f"Modul {contract.module!r} liegt außerhalb des Releases: {module_path}"
+        )
+    return module_path
 
 
 def send_json(proc: subprocess.Popen[bytes], payload: dict[str, Any]) -> None:
@@ -872,7 +942,7 @@ def mark_incomplete(release_path: Path, phase: str, exc: BaseException) -> None:
         "schema_version": 1,
         "completion_status": "incomplete",
         "phase": phase,
-        "error": str(exc),
+        "error": safe_error_summary(exc),
         "created_at_unix": int(time.time()),
     }
     try:
@@ -900,6 +970,16 @@ def build_release(
         missing_direct = sorted(set(direct_pins) - set(locked_pins))
         if missing_direct:
             fail("Direkte Pins fehlen im Lock: " + ", ".join(missing_direct))
+        mismatched_direct = sorted(
+            f"{name}=={direct_pins[name]} != {locked_pins[name]}"
+            for name in direct_pins
+            if name in locked_pins and direct_pins[name] != locked_pins[name]
+        )
+        if mismatched_direct:
+            fail(
+                "Direkte Pins weichen vom Lock ab: "
+                + ", ".join(mismatched_direct)
+            )
 
         phase = "venv"
         venv = release_path / ".venv"
@@ -1036,11 +1116,13 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
         "entrypoint_contract": dict,
         "entrypoint_contract_sha256": str,
         "source_sha256": str,
+        "runtime_input_sha256": str,
         "runtime_lock_sha256": str,
         "snapshot_paths": dict,
         "immutable_release_path": str,
         "expected_stable_runtime_path": str,
         "release_python_path": str,
+        "entrypoint_path": str,
         "platform": str,
         "python_version": str,
         "python_implementation": str,
@@ -1072,6 +1154,7 @@ def verify_manifest(
     expected = {
         "repo_head": snapshot.repo_head,
         "source_sha256": snapshot.source_sha256,
+        "runtime_input_sha256": snapshot.runtime_input_sha256,
         "runtime_lock_sha256": snapshot.runtime_lock_sha256,
         "entrypoint_contract_sha256": snapshot.contract_sha256,
     }
@@ -1086,24 +1169,137 @@ def verify_manifest(
     return manifest
 
 
+def require_manifest_snapshot_path(
+    manifest: dict[str, Any],
+    key: str,
+    expected: Path,
+    release_path: Path,
+) -> Path:
+    raw_paths = manifest.get("snapshot_paths")
+    if not isinstance(raw_paths, dict):
+        fail("Deployment-Manifest enthält keine Snapshotpfade")
+    value = raw_paths.get(key)
+    if not isinstance(value, str):
+        fail(f"Deployment-Manifest enthält keinen Snapshotpfad {key}")
+    actual = Path(value)
+    if actual != expected:
+        fail(f"Snapshotpfad {key} weicht ab: {actual} != {expected}")
+    require_file(actual, f"Snapshot {key}")
+    try:
+        actual.resolve(strict=True).relative_to(release_path.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        fail(f"Snapshotpfad {key} liegt außerhalb des Releases: {actual}")
+        raise AssertionError from exc
+    return actual
+
+
+def verify_final_release_artifacts(
+    release_path: Path,
+    runtime: Path,
+    contract: RuntimeContract,
+    *,
+    snapshot: Snapshot,
+    manifest: dict[str, Any],
+    process: dict[str, Any],
+) -> None:
+    if not runtime.is_symlink():
+        fail("Finaler Runtimepfad ist kein Symlink")
+    real_release = runtime.resolve(strict=True)
+    if real_release != release_path.resolve(strict=True):
+        fail(
+            "Finaler Runtime-Symlink zeigt nicht mehr auf das ausgewählte Release: "
+            f"{runtime} -> {real_release}"
+        )
+    manifest_path = real_release / MANIFEST_NAME
+    require_file(manifest_path, "Deployment-Manifest")
+    if Path(str(manifest.get("immutable_release_path"))) != real_release:
+        fail("Manifest behauptet ein anderes immutable_release_path")
+
+    input_root = real_release / "inputs"
+    contract_path = require_manifest_snapshot_path(
+        manifest,
+        "runtime_entrypoint",
+        input_root / ENTRYPOINT_CONTRACT_RELATIVE.name,
+        real_release,
+    )
+    runtime_input_path = require_manifest_snapshot_path(
+        manifest,
+        "runtime_input",
+        input_root / RUNTIME_INPUT_RELATIVE.name,
+        real_release,
+    )
+    runtime_lock_path = require_manifest_snapshot_path(
+        manifest,
+        "runtime_lock",
+        input_root / RUNTIME_LOCK_RELATIVE.name,
+        real_release,
+    )
+    source_path = require_manifest_snapshot_path(
+        manifest,
+        "source",
+        input_root / snapshot.contract.source,
+        real_release,
+    )
+
+    checks = {
+        contract_path: snapshot.contract_sha256,
+        runtime_input_path: snapshot.runtime_input_sha256,
+        runtime_lock_path: snapshot.runtime_lock_sha256,
+        source_path: snapshot.source_sha256,
+    }
+    for path, expected_hash in checks.items():
+        if sha256(path) != expected_hash:
+            fail(f"Finales Releaseartefakt driftete nach Aktivierung: {path}")
+
+    release_python = real_release / ".venv/bin/python"
+    if Path(str(manifest.get("release_python_path"))) != release_python:
+        fail("Manifest-Release-Pythonpfad entspricht nicht dem realen Release")
+    require_file(release_python, "Release-Python")
+
+    imported_module = verify_entrypoint_importable(
+        real_release,
+        release_python,
+        contract,
+    )
+    require_file(imported_module, "Importiertes Modul")
+    expected_module = module_destination(
+        site_packages_path(release_python),
+        contract.module,
+        create_packages=False,
+    )
+    require_file(expected_module, "Erwartetes Release-Modul")
+    if imported_module.resolve(strict=True) != expected_module.resolve(strict=True):
+        fail(
+            "Importierter Modulpfad entspricht nicht dem erwarteten "
+            f"Release-Ziel: {imported_module} != {expected_module}"
+        )
+    entrypoint_value = manifest.get("entrypoint_path")
+    if not isinstance(entrypoint_value, str):
+        fail("Manifest enthält keinen Entry-Point-Pfad")
+    if Path(entrypoint_value).resolve(strict=True) != imported_module.resolve(strict=True):
+        fail("Manifest-Entry-Point entspricht nicht der aktuellen Modulauflösung")
+    if sha256(imported_module) != snapshot.source_sha256:
+        fail("Importierte Moduldatei entspricht nicht dem Source-Snapshot")
+
+    process_exe_value = process.get("exe") if isinstance(process, dict) else None
+    if (
+        process_exe_value is not None
+        and Path(str(process_exe_value)).resolve() != release_python.resolve()
+    ):
+        fail("Laufender Pythonprozess entspricht nicht dem Release-Python")
+
+
 @dataclass(frozen=True)
 class EntryPoint:
     mode: str
     python: Path
-    module: str | None = None
-    script: Path | None = None
+    module: str
 
     def compatible_with(self, contract: RuntimeContract) -> bool:
-        if self.mode != contract.mode:
-            return False
-        if self.mode == "module":
-            return self.module == contract.module
-        return self.script == contract.script
+        return self.mode == contract.mode and self.module == contract.module
 
     def describe(self) -> str:
-        if self.mode == "module":
-            return f"{self.python} -m {self.module}"
-        return f"{self.python} {self.script}"
+        return f"{self.python} -m {self.module}"
 
 
 def recursive_values_for_key(value: Any, key: str) -> list[Any]:
@@ -1126,7 +1322,20 @@ def yaml_profile_command(profile_path: Path) -> list[str]:
     except ImportError as exc:
         fail("PyYAML ist für strukturierte Profilprüfung erforderlich")
         raise AssertionError from exc
-    data = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    if getattr(yaml, "__version__", None) != TOOLING_PYYAML_VERSION:
+        fail(
+            "PyYAML-Version für strukturierte Profilprüfung ist nicht "
+            f"reproduzierbar: {getattr(yaml, '__version__', None)!r}"
+        )
+    try:
+        data = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        mark = getattr(exc, "problem_mark", None)
+        details: dict[str, Any] = {"error_type": type(exc).__name__}
+        if mark is not None:
+            details["line"] = getattr(mark, "line", 0) + 1
+            details["column"] = getattr(mark, "column", 0) + 1
+        fail("Tunnelprofil ist kein gültiges YAML", details=details)
     commands = recursive_values_for_key(data, "command")
     string_commands = [item for item in commands if isinstance(item, str)]
     list_commands = [item for item in commands if isinstance(item, list)]
@@ -1142,8 +1351,8 @@ def yaml_profile_command(profile_path: Path) -> list[str]:
 
 def profile_entrypoint(profile_path: Path, runtime: Path) -> EntryPoint:
     argv = yaml_profile_command(profile_path)
-    if len(argv) < 3:
-        fail("Tunnelprofil-command ist zu kurz")
+    if len(argv) != 3:
+        fail("Tunnelprofil-command entspricht nicht dem Modul-Entry-Point")
     expected_python = runtime / ".venv/bin/python"
     if argv[0] != str(expected_python):
         fail("Tunnelprofil verwendet nicht den stabilen Runtime-Pythonpfad")
@@ -1151,15 +1360,7 @@ def profile_entrypoint(profile_path: Path, runtime: Path) -> EntryPoint:
         if not MODULE_RE.match(argv[2]):
             fail(f"Tunnelprofil verwendet ein ungültiges Modul: {argv[2]}")
         return EntryPoint(mode="module", python=expected_python, module=argv[2])
-    if len(argv) == 2:
-        script = Path(argv[1])
-        if script.is_absolute():
-            try:
-                script = script.relative_to(runtime)
-            except ValueError:
-                fail("Tunnelprofil-Script liegt außerhalb des stabilen Runtimepfads")
-        return EntryPoint(mode="script", python=expected_python, script=script)
-    fail("Tunnelprofil-command entspricht keinem unterstützten Entry-Point")
+    fail("Tunnelprofil-command entspricht nicht dem Modul-Entry-Point")
 
 
 def require_profile_matches_contract(profile_path: Path, runtime: Path, contract: RuntimeContract) -> EntryPoint:
@@ -1371,16 +1572,40 @@ def verify_systemd_tunnel_process(
 
 def argv_matches_entrypoint(argv: list[str], runtime: Path, contract: RuntimeContract) -> bool:
     if len(argv) != 3 or argv[1] != "-m":
-        if contract.mode == "script" and len(argv) == 2:
-            assert contract.script is not None
-            return Path(argv[0]).resolve() == (runtime / ".venv/bin/python").resolve() and Path(argv[1]).resolve() == (runtime / contract.script).resolve()
-        return False
-    if contract.mode != "module":
         return False
     return (
         Path(argv[0]).resolve() == (runtime / ".venv/bin/python").resolve()
         and argv[2] == contract.module
     )
+
+
+def argv_matches_profile_entrypoint(argv: list[str], entrypoint: EntryPoint) -> bool:
+    return (
+        entrypoint.mode == "module"
+        and len(argv) == 3
+        and argv[0] == str(entrypoint.python)
+        and argv[1] == "-m"
+        and argv[2] == entrypoint.module
+    )
+
+
+def verify_running_profile_entrypoint(
+    entrypoint: EntryPoint,
+    *,
+    main_pid: int | None = None,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any]:
+    root_pid = verify_systemd_tunnel_process(main_pid=main_pid, proc_root=proc_root)
+    expected_python_resolved = entrypoint.python.resolve()
+    for pid in descendant_pids(root_pid, proc_root):
+        argv = process_argv(pid, proc_root)
+        if not argv_matches_profile_entrypoint(argv, entrypoint):
+            continue
+        exe = process_exe(pid, proc_root)
+        if exe is None or exe.resolve() != expected_python_resolved:
+            continue
+        return {"pid": pid, "argv": redact_argv(argv)}
+    fail("Kein laufender MCP-Prozess verwendet exakt den vorherigen Profil-Entry-Point")
 
 
 def verify_running_entrypoint(
@@ -1411,6 +1636,7 @@ def verify_running_entrypoint(
         return {
             "pid": pid,
             "entrypoint_path": str(entrypoint_path),
+            "exe": str(exe),
             "argv": redact_argv(argv),
         }
 
@@ -1454,6 +1680,14 @@ def verify_runtime_identity(
         snapshot=snapshot,
         stable_runtime=runtime,
     )
+    verify_final_release_artifacts(
+        release_path,
+        runtime,
+        contract,
+        snapshot=snapshot,
+        manifest=manifest,
+        process=process,
+    )
     return {"process": process, "manifest": manifest}
 
 
@@ -1474,12 +1708,22 @@ def capture_pointer(runtime: Path) -> PointerState:
     return PointerState("missing", runtime)
 
 
-def require_runtime_replaceable(runtime: Path) -> None:
-    if not str(runtime).startswith(str(HOME) + os.sep):
-        fail(f"Runtimepfad liegt außerhalb des Userbereichs: {runtime}")
+def require_runtime_replaceable(
+    runtime: Path,
+    *,
+    allowed_root: Path = HOME,
+    cwd: Path | None = None,
+) -> Path:
+    runtime = normalize_managed_path(
+        runtime,
+        allowed_root=allowed_root,
+        cwd=cwd,
+    )
     if not runtime.parent.is_dir() or not os.access(runtime.parent, os.W_OK):
         fail(f"Runtime-Parent ist nicht schreibbar: {runtime.parent}")
     capture_pointer(runtime)
+    releases_root_for(runtime)
+    return runtime
 
 
 def unique_sibling(path: Path, suffix: str) -> Path:
@@ -1552,7 +1796,7 @@ def restore_pointer(
 
 @dataclass
 class RollbackState:
-    original_error: str
+    original_error: dict[str, Any]
     phase: str
     previous_pointer: dict[str, str | None]
     stop_returncode: int | None = None
@@ -1563,7 +1807,8 @@ class RollbackState:
     restored_identity: str | None = None
     final_pointer: dict[str, str | None] | None = None
     final_service: dict[str, Any] | None = None
-    errors: list[str] = field(default_factory=list)
+    phases: dict[str, Any] = field(default_factory=dict)
+    errors: list[Any] = field(default_factory=list)
 
     def message(self) -> str:
         payload = {
@@ -1578,6 +1823,7 @@ class RollbackState:
             "restored_identity": self.restored_identity,
             "final_pointer": self.final_pointer,
             "final_service": self.final_service,
+            "rollback_phases": self.phases,
             "rollback_errors": self.errors,
         }
         return json.dumps(payload, sort_keys=True, ensure_ascii=False)
@@ -1591,6 +1837,62 @@ def pointer_to_dict(pointer: PointerState) -> dict[str, str | None]:
     }
 
 
+def pointer_states_equal(actual: PointerState, expected: PointerState) -> bool:
+    return (
+        actual.kind == expected.kind
+        and actual.path == expected.path
+        and actual.target == expected.target
+    )
+
+
+def verify_pointer_state(runtime: Path, expected: PointerState) -> PointerState:
+    actual = capture_pointer(runtime)
+    if not pointer_states_equal(actual, expected):
+        fail(
+            "Pointerzustand entspricht nach Wiederherstellung nicht dem "
+            "ursprünglichen Zustand",
+            phase="rollback-pointer-verification",
+            details={
+                "actual": pointer_to_dict(actual),
+                "expected": pointer_to_dict(expected),
+            },
+        )
+    return actual
+
+
+def rollback_step(
+    state: RollbackState,
+    name: str,
+    callback,
+) -> tuple[Any | None, BaseException | None]:
+    try:
+        value = callback()
+    except Exception as exc:
+        summary = safe_error_summary(exc)
+        state.phases[name] = {"ok": False, "error": summary}
+        state.errors.append({"phase": name, "error": summary})
+        return None, exc
+    state.phases[name] = {"ok": True, "result": summarize_result(value)}
+    return value, None
+
+
+def finalize_rollback_state(state: RollbackState, runtime: Path) -> None:
+    pointer, _ = rollback_step(
+        state,
+        "rollback-final-pointer",
+        lambda: capture_pointer(runtime),
+    )
+    if isinstance(pointer, PointerState):
+        state.final_pointer = pointer_to_dict(pointer)
+    service, _ = rollback_step(
+        state,
+        "rollback-final-service-state",
+        service_state,
+    )
+    if isinstance(service, dict):
+        state.final_service = service
+
+
 def rollback_after_failure(
     original: BaseException,
     *,
@@ -1600,57 +1902,130 @@ def rollback_after_failure(
     timeout_seconds: int,
     phase: str,
     contract: RuntimeContract | None = None,
+    recovery_entrypoint: EntryPoint | None = None,
 ) -> NoReturn:
     state = RollbackState(
-        original_error=str(original),
+        original_error=safe_error_summary(original),
         phase=phase,
         previous_pointer=pointer_to_dict(previous),
     )
-    stop_result = run(
-        ["systemctl", "--user", "stop", SERVICE],
-        check=False,
-        capture=True,
-        timeout=TIMEOUTS["service_stop"],
-    )
-    state.stop_returncode = stop_result.returncode
-    inactive = not service_active()
-    state.inactive_after_stop = inactive
-    if not inactive:
-        state.errors.append("Dienst blieb aktiv; keine Pointermutation im Rollback")
-        state.final_pointer = pointer_to_dict(capture_pointer(runtime))
-        state.final_service = service_state()
-        raise DeployError("Kritischer Rollbackabbruch: " + state.message()) from original
-    try:
-        restore_pointer(runtime, previous, legacy_backup)
-        state.pointer_restore = "restored"
-    except Exception as exc:
-        state.pointer_restore = "failed"
-        state.errors.append(f"Pointerwiederherstellung fehlgeschlagen: {exc}")
 
-    start_result = run(
-        ["systemctl", "--user", "start", SERVICE],
-        check=False,
-        capture=True,
-        timeout=TIMEOUTS["service_start"],
+    def abort(message: str) -> NoReturn:
+        finalize_rollback_state(state, runtime)
+        raise DeployError(message + state.message()) from original
+
+    stop_result, _ = rollback_step(
+        state,
+        "rollback-stop-command",
+        lambda: run(
+            ["systemctl", "--user", "stop", SERVICE],
+            check=False,
+            capture=True,
+            timeout=TIMEOUTS["service_stop"],
+        ),
     )
-    state.start_returncode = start_result.returncode
+    if isinstance(stop_result, subprocess.CompletedProcess):
+        state.stop_returncode = stop_result.returncode
+
+    inactive, inactive_error = rollback_step(
+        state,
+        "rollback-service-state-after-stop",
+        lambda: not service_active(),
+    )
+    state.inactive_after_stop = inactive if inactive_error is None else None
+    if inactive is not True:
+        state.errors.append(
+            {
+                "phase": "rollback-service-state-after-stop",
+                "message": (
+                    "Dienstzustand ist aktiv oder unbekannt; "
+                    "keine Pointermutation im Rollback"
+                ),
+            }
+        )
+        abort("Kritischer Rollbackabbruch: ")
+
+    _, restore_error = rollback_step(
+        state,
+        "rollback-pointer-restore",
+        lambda: restore_pointer(runtime, previous, legacy_backup),
+    )
+    if restore_error is not None:
+        state.pointer_restore = "failed"
+        abort("Kritischer Rollbackabbruch nach Restorefehler: ")
+    state.pointer_restore = "restored"
+
+    _, verify_error = rollback_step(
+        state,
+        "rollback-pointer-verification",
+        lambda: verify_pointer_state(runtime, previous),
+    )
+    if verify_error is not None:
+        state.pointer_restore = "verification-failed"
+        abort("Kritischer Rollbackabbruch nach Pointerverifikationsfehler: ")
+
+    start_result, start_error = rollback_step(
+        state,
+        "rollback-start-command",
+        lambda: run(
+            ["systemctl", "--user", "start", SERVICE],
+            check=False,
+            capture=True,
+            timeout=TIMEOUTS["service_start"],
+        ),
+    )
+    if isinstance(start_result, subprocess.CompletedProcess):
+        state.start_returncode = start_result.returncode
+    if start_error is not None or not isinstance(start_result, subprocess.CompletedProcess):
+        abort("Deployment fehlgeschlagen; Rollbackstart scheiterte; Rollbackzustand: ")
     if start_result.returncode != 0:
-        state.errors.append("Start der wiederhergestellten Runtime fehlgeschlagen")
-    readiness = wait_until_ready(timeout_seconds)
-    state.readiness_ok = readiness.ok
+        state.errors.append(
+            {
+                "phase": "rollback-start-command",
+                "message": "Start der wiederhergestellten Runtime fehlgeschlagen",
+            }
+        )
+        abort("Deployment fehlgeschlagen; Rollbackzustand: ")
+
+    readiness, readiness_error = rollback_step(
+        state,
+        "rollback-readiness",
+        lambda: wait_until_ready(timeout_seconds),
+    )
+    if isinstance(readiness, ReadinessResult):
+        state.readiness_ok = readiness.ok
+    if readiness_error is not None or not isinstance(readiness, ReadinessResult):
+        abort("Deployment fehlgeschlagen; Rollbackreadiness scheiterte; Rollbackzustand: ")
     if not readiness.ok:
-        state.errors.append("Wiederhergestellte Runtime wurde nicht ready")
-    if start_result.returncode == 0 and readiness.ok and contract is not None:
-        try:
-            verify_running_entrypoint(runtime, contract)
-            state.restored_identity = "verified"
-        except Exception as exc:
-            state.restored_identity = "failed"
-            state.errors.append(
-                f"Wiederhergestellte Runtime-Identität fehlgeschlagen: {exc}"
-            )
-    state.final_pointer = pointer_to_dict(capture_pointer(runtime))
-    state.final_service = service_state()
+        state.errors.append(
+            {
+                "phase": "rollback-readiness",
+                "message": "Wiederhergestellte Runtime wurde nicht ready",
+            }
+        )
+        abort("Deployment fehlgeschlagen; Rollbackzustand: ")
+
+    if recovery_entrypoint is not None:
+        _, identity_error = rollback_step(
+            state,
+            "rollback-identity",
+            lambda: verify_running_profile_entrypoint(recovery_entrypoint),
+        )
+    elif contract is not None:
+        _, identity_error = rollback_step(
+            state,
+            "rollback-identity",
+            lambda: verify_running_entrypoint(runtime, contract),
+        )
+    else:
+        identity_error = None
+        state.phases["rollback-identity"] = {"ok": True, "result": "skipped"}
+    if identity_error is not None:
+        state.restored_identity = "failed"
+        abort("Deployment fehlgeschlagen; Rollbackidentität scheiterte; Rollbackzustand: ")
+    state.restored_identity = "verified"
+
+    finalize_rollback_state(state, runtime)
     raise DeployError("Deployment fehlgeschlagen; Rollbackzustand: " + state.message()) from original
 
 
@@ -1679,8 +2054,8 @@ def deploy(
     timeout_seconds: int,
 ) -> None:
     snapshot = snapshot_from_git(repo)
-    require_runtime_replaceable(runtime)
-    require_profile_matches_contract(profile_path, runtime, snapshot.contract)
+    runtime = require_runtime_replaceable(runtime)
+    live_entrypoint = require_profile_matches_contract(profile_path, runtime, snapshot.contract)
     if not service_active():
         fail(f"{SERVICE} ist vor dem Deployment nicht aktiv.")
 
@@ -1757,23 +2132,6 @@ def deploy(
         print(f"Legacy-Backup:   {legacy_backup}")
 
     except Exception as original:
-        if not pointer_changed:
-            if not service_active():
-                start_result = run(
-                    ["systemctl", "--user", "start", SERVICE],
-                    check=False,
-                    capture=True,
-                    timeout=TIMEOUTS["service_start"],
-                )
-                if start_result.returncode != 0:
-                    raise DeployError(
-                        "Deployment vor Pointermutation fehlgeschlagen; "
-                        "vorherige Runtime konnte nicht neu gestartet werden: "
-                        f"{original}"
-                    ) from original
-            raise DeployError(
-                f"Kritischer Deploymentabbruch vor Pointermutation: {original}"
-            ) from original
         rollback_after_failure(
             original,
             runtime=runtime,
@@ -1782,12 +2140,13 @@ def deploy(
             timeout_seconds=timeout_seconds,
             phase=phase,
             contract=snapshot.contract,
+            recovery_entrypoint=live_entrypoint,
         )
 
 
 def preflight_apply(repo: Path, runtime: Path, profile_path: Path) -> None:
     snapshot = snapshot_from_git(repo)
-    require_runtime_replaceable(runtime)
+    runtime = require_runtime_replaceable(runtime)
     require_profile_matches_contract(profile_path, runtime, snapshot.contract)
 
 
@@ -1851,7 +2210,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     repo = args.repo.resolve()
-    runtime = absolute_no_resolve(args.runtime)
+    runtime = normalize_managed_path(args.runtime, allowed_root=HOME)
     profile_path = absolute_no_resolve(args.profile_path)
     lock_file = absolute_no_resolve(args.lock_file)
 
@@ -1883,7 +2242,11 @@ def main() -> int:
         )
         return exc.returncode or 1
     except Exception as exc:
-        print(f"STOP: Unerwarteter Fehler: {exc}", file=sys.stderr)
+        print(
+            "STOP: Unerwarteter Fehler: "
+            + json.dumps(safe_error_summary(exc), sort_keys=True, ensure_ascii=False),
+            file=sys.stderr,
+        )
         return 1
 
     return 0

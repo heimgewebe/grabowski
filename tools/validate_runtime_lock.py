@@ -26,6 +26,15 @@ def main() -> int:
         raise SystemExit(
             "Runtime lock is missing direct pins: " + ", ".join(missing)
         )
+    mismatched = sorted(
+        f"{name}=={direct[name]} != {locked[name]}"
+        for name in direct
+        if name in locked and direct[name] != locked[name]
+    )
+    if mismatched:
+        raise SystemExit(
+            "Runtime lock direct pins differ: " + ", ".join(mismatched)
+        )
 
     print(f"PASS: runtime lock contains {len(locked)} pinned, hashed packages")
     return 0
