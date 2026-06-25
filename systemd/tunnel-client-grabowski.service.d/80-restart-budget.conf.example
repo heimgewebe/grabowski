@@ -1,0 +1,3 @@
+[Unit]
+StartLimitIntervalSec=5min
+StartLimitBurst=5

@@ -1,0 +1,23 @@
+[Unit]
+Description=Grabowski semantic runtime watchdog
+After=tunnel-client-grabowski.service
+ConditionPathExists=%h/.local/libexec/grabowski/watchdog_runtime.py
+
+[Service]
+Type=oneshot
+Environment=GRABOWSKI_WATCHDOG_EXPECTED_MODULE=grabowski_operator
+EnvironmentFile=-%h/.config/grabowski/watchdog.env
+ExecStart=/usr/bin/python3 %h/.local/libexec/grabowski/watchdog_runtime.py --expected-module ${GRABOWSKI_WATCHDOG_EXPECTED_MODULE}
+SuccessExitStatus=1
+TimeoutStartSec=45
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/grabowski
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native

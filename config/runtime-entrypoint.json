@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "mode": "module",
+  "module": "grabowski_mcp",
+  "source": "src/grabowski_mcp.py",
+  "expected_tools": [
+    "grabowski_status",
+    "grabowski_list_directory",
+    "grabowski_stat",
+    "grabowski_read_text",
+    "grabowski_create_text",
+    "grabowski_replace_text",
+    "latest_complete_bundles"
+  ]
+}

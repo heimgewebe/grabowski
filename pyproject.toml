@@ -7,7 +7,7 @@ name = "grabowski-mcp"
 version = "0.1.0"
 description = "Local MCP operator for the Heim-PC"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
   "mcp==1.27.2"
 ]
