@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grabowski-mcp"
+version = "0.1.0"
+description = "Local MCP operator for the Heim-PC"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp==1.27.2"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["grabowski_mcp"]

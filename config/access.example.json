@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "mode": "bounded-read-write",
+  "read_roots": [
+    "${HOME}/repos",
+    "${HOME}/grabowski-workspace",
+    "${HOME}/.local/state/grabowski"
+  ],
+  "write_roots": [
+    "${HOME}/repos",
+    "${HOME}/grabowski-workspace"
+  ],
+  "write_excluded_roots": [
+    "${HOME}/repos/merges"
+  ],
+  "max_read_bytes": 2000000,
+  "max_write_bytes": 2000000,
+  "max_list_entries": 500,
+  "forbid_symlinks": true,
+  "forbidden_components": [
+    ".git",
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+    ".password-store",
+    ".local/share/keyrings"
+  ],
+  "forbidden_file_patterns": [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.kdbx",
+    "id_rsa",
+    "id_ed25519",
+    "credentials.json"
+  ],
+  "forbidden_capabilities": [
+    "shell_execute",
+    "file_delete",
+    "file_move",
+    "chmod",
+    "chown",
+    "git_mutate",
+    "service_control",
+    "secret_read",
+    "browser_profile_read"
+  ]
+}

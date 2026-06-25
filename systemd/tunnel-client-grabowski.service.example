@@ -1,0 +1,19 @@
+[Unit]
+Description=Grabowski MCP Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/tunnel-client/grabowski.runtime.env
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/tunnel-client run --profile grabowski
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=20
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=default.target

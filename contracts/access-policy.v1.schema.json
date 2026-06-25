@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heimgewebe.local/contracts/grabowski/access-policy.v1.schema.json",
+  "title": "Grabowski Access Policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "mode",
+    "read_roots",
+    "write_roots",
+    "write_excluded_roots",
+    "max_read_bytes",
+    "max_write_bytes",
+    "max_list_entries",
+    "forbid_symlinks",
+    "forbidden_components",
+    "forbidden_file_patterns",
+    "forbidden_capabilities"
+  ],
+  "properties": {
+    "version": {"const": 1},
+    "mode": {"type": "string", "minLength": 1},
+    "read_roots": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "write_roots": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "write_excluded_roots": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "max_read_bytes": {"type": "integer", "minimum": 1},
+    "max_write_bytes": {"type": "integer", "minimum": 1},
+    "max_list_entries": {"type": "integer", "minimum": 1},
+    "forbid_symlinks": {"type": "boolean"},
+    "forbidden_components": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "forbidden_file_patterns": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "forbidden_capabilities": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    }
+  }
+}
