@@ -13,6 +13,7 @@ validate: syntax test policy runtime-lock deploy-tooling-check secrets
 syntax:
 >$(PYTHON) -m py_compile src/grabowski_mcp.py
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
+>$(PYTHON) -m py_compile tools/watchdog_runtime.py
 >$(PYTHON) -m py_compile tools/validate_runtime_lock.py
 
 test:

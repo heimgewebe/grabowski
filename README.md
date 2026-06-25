@@ -71,3 +71,12 @@ Details: [`docs/deployment.md`](docs/deployment.md).
 Die Runtime-Abhängigkeiten sind in `requirements/runtime.lock.txt` vollständig
 versioniert und gehasht. Das Deployment prüft außerdem den exklusiven Lock,
 die gestartete Prozessidentität und das Provenienzmanifest.
+
+## Restart- und Watchdog-Härtung
+
+`Restart=on-failure` schützt nur den Tunnel-Hauptprozess. Da `/healthz` und
+`/readyz` auch nach dem Tod des MCP-Kindprozesses grün bleiben können, ergänzt
+ein systemd-Timer einen semantischen Prozessbaumcheck mit Fehlerschwelle und
+persistierendem Restart-Budget.
+
+Details: [`docs/restart-watchdog.md`](docs/restart-watchdog.md).
