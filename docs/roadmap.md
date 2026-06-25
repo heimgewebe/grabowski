@@ -11,11 +11,13 @@
 
 ## GRABOWSKI-SHELL-001
 
+Status: operator bootstrap implemented; durable execution hardening in progress.
+
 - allgemeiner Command Runner,
-- Hintergrundjobs,
-- Timeouts,
-- Logs,
-- Prozesssteuerung.
+- persistente Hintergrundjobs,
+- synchrone Hard-Timeouts,
+- strukturierte Logs und Ergebnisartefakte,
+- Prozesssteuerung ohne verwaiste Kindprozesse.
 
 ## GRABOWSKI-GIT-001
 
@@ -47,8 +49,20 @@ Status: implemented in repository; live cutover requires explicit deployment.
 - atomarer Runtime-Wechsel,
 - MCP-Handshake sowie Tool-List-Gate,
 - Health- und Readiness-Gates,
-- automatischer Rollback,
-- Deployment-Manifest mit Repo-HEAD und Source-Hash.
+- automatischer Rollback bei behandelbaren Deploymentfehlern,
+- Deployment-Manifest mit Repo-HEAD, Source-Hash, Lockfile-Hash und Plattform-Provenienz,
+- exklusiver Deployment-Lock,
+- gestartete Runtime- und Prozessidentität,
+- verhaltensbasierte Fehler- und Rollbacktests.
+
+
+## GRABOWSKI-DEPLOY-002
+
+- persistentes Deployment-Transaktionsjournal,
+- atomare Phasenfortschreibung mit Datei- und Directory-`fsync`,
+- Recovery von ursprünglichem Pointer und Legacy-Backup nach SIGKILL, Stromausfall oder Neustart,
+- deterministische Startprüfung vor einem neuen Deployment,
+- optionaler systemd-Recovery-Service nach eigenem Design-Gate.
 
 ## GRABOWSKI-FLEET-001
 

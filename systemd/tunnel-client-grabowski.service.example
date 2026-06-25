@@ -2,6 +2,8 @@
 Description=Grabowski MCP Tunnel
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=5
 
 [Service]
 Type=simple
