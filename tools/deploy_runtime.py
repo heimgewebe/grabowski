@@ -2210,7 +2210,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     repo = args.repo.resolve()
-    runtime = normalize_managed_path(args.runtime, allowed_root=HOME)
+    runtime = absolute_no_resolve(args.runtime)
     profile_path = absolute_no_resolve(args.profile_path)
     lock_file = absolute_no_resolve(args.lock_file)
 

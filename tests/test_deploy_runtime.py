@@ -1052,6 +1052,24 @@ class DeployRuntimeTests(unittest.TestCase):
         self.assertEqual(ctx.exception.phase, "command-timeout")
         self.assertIn("<redacted>", ctx.exception.details["argv"])
 
+    def test_check_mode_does_not_validate_default_runtime_parent(self) -> None:
+        args = types.SimpleNamespace(
+            repo=ROOT,
+            runtime=Path("/missing-home/.local/share/grabowski-mcp"),
+            profile_path=Path("/unused-profile.yaml"),
+            lock_file=Path("/unused-lock"),
+            timeout=1,
+            check=True,
+            apply=False,
+        )
+        with (
+            patch.object(deploy_runtime, "parse_args", return_value=args),
+            patch.object(deploy_runtime, "check", return_value=None) as check,
+            patch.object(deploy_runtime, "normalize_managed_path", side_effect=AssertionError("should not normalize")),
+        ):
+            self.assertEqual(deploy_runtime.main(), 0)
+        check.assert_called_once()
+
     def test_yaml_parser_ignores_commented_command(self) -> None:
         fake_yaml = types.SimpleNamespace(
             __version__=deploy_runtime.TOOLING_PYYAML_VERSION,
