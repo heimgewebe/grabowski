@@ -39,13 +39,10 @@
     "credentials.json"
   ],
   "forbidden_capabilities": [
-    "shell_execute",
     "file_delete",
     "file_move",
     "chmod",
     "chown",
-    "git_mutate",
-    "service_control",
     "secret_read",
     "browser_profile_read"
   ]

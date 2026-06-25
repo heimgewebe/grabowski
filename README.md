@@ -56,27 +56,25 @@ Reproduzierbarkeit ohne Runtime-Mutation prüfen:
 make deploy-check
 ```
 
-Produktive Runtime mit exception-sicherem Rollback aktualisieren:
+Produktive Runtime mit automatischem Rollback aktualisieren:
 
 ```bash
 make deploy
 ```
 
-Auf dem aktuellen Host stoppt dieser Branch erwartungsgemäß vor jeder
-Runtime-Mutation, solange das Live-Profil `python -m grabowski_operator`
-verlangt und der PR-#8-Vertrag `python -m grabowski_mcp` liefert.
-
 Details: [`docs/deployment.md`](docs/deployment.md).
 
-Die Runtime-Abhängigkeiten sind in `requirements/runtime.lock.txt` vollständig
-versioniert und gehasht. Das Deployment prüft außerdem den exklusiven Lock,
-die gestartete Prozessidentität und das Provenienzmanifest.
+## Operator-Fähigkeiten
 
-## Restart- und Watchdog-Härtung
+Der Operator-Einstiegspunkt `grabowski_operator` ergänzt die kuratierten
+Dateiwerkzeuge um:
 
-`Restart=on-failure` schützt nur den Tunnel-Hauptprozess. Da `/healthz` und
-`/readyz` auch nach dem Tod des MCP-Kindprozesses grün bleiben können, ergänzt
-ein systemd-Timer einen semantischen Prozessbaumcheck mit Fehlerschwelle und
-persistierendem Restart-Budget.
+- nicht-interaktive Kommandos,
+- systemd-basierte Hintergrundjobs,
+- Git und GitHub CLI,
+- User-Service-Steuerung,
+- tmux-Capture und tmux-Eingaben,
+- Prozess- und Portdiagnose.
 
-Details: [`docs/restart-watchdog.md`](docs/restart-watchdog.md).
+Direkter Zugriff auf beliebige grafische Terminalfenster ist nicht möglich.
+Bestehende tmux-Sitzungen können dagegen gezielt gelesen und bedient werden.
