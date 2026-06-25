@@ -58,6 +58,51 @@ class DeployRuntimeTests(unittest.TestCase):
     def _completed(argv, returncode: int = 0) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, returncode, "", "")
 
+    @staticmethod
+    def _obs_active() -> "deploy_runtime.ServiceObservation":
+        return deploy_runtime.ServiceObservation(
+            query_valid=True,
+            load_state="loaded",
+            active_state="active",
+            sub_state="running",
+            main_pid=4321,
+            returncode=0,
+        )
+
+    @staticmethod
+    def _obs_inactive() -> "deploy_runtime.ServiceObservation":
+        return deploy_runtime.ServiceObservation(
+            query_valid=True,
+            load_state="loaded",
+            active_state="inactive",
+            sub_state="dead",
+            main_pid=0,
+            returncode=0,
+        )
+
+    @staticmethod
+    def _obs_unknown() -> "deploy_runtime.ServiceObservation":
+        return deploy_runtime.ServiceObservation(
+            query_valid=False,
+            load_state="unknown",
+            active_state="unknown",
+            sub_state="unknown",
+            main_pid=None,
+            returncode=0,
+        )
+
+    def _activation(
+        self,
+        runtime: Path,
+        previous: "deploy_runtime.PointerState",
+        release_path: Path | None = None,
+    ) -> "deploy_runtime.ActivationState":
+        return deploy_runtime.ActivationState(
+            runtime=runtime,
+            release_path=release_path if release_path is not None else runtime.parent / "new",
+            previous=previous,
+        )
+
     def test_sha256_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sample.txt"
@@ -177,7 +222,7 @@ class DeployRuntimeTests(unittest.TestCase):
             with (
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
                 patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
-                patch.object(deploy_runtime, "service_active", return_value=True),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
                 patch.object(deploy_runtime, "profile_entrypoint", return_value=deploy_runtime.EntryPoint(mode="module", python=runtime / ".venv/bin/python", module="grabowski_operator")),
                 patch.object(deploy_runtime, "build_release") as build_release,
             ):
@@ -319,17 +364,60 @@ class DeployRuntimeTests(unittest.TestCase):
 
     def test_deployment_lock_is_released_after_exception(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            lock = Path(directory) / "deploy.lock"
+            state_root = Path(directory)
+            lock = state_root / "deploy.lock"
             with self.assertRaises(RuntimeError):
-                with deploy_runtime.deployment_lock(lock):
+                with deploy_runtime.deployment_lock(lock, state_root=state_root):
                     raise RuntimeError("boom")
-            with deploy_runtime.deployment_lock(lock):
+            with deploy_runtime.deployment_lock(lock, state_root=state_root):
                 pass
+
+    def test_deployment_lock_rejects_symlink_final_component(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            target = state_root / "real-target"
+            target.write_text("x\n", encoding="utf-8")
+            lock = state_root / "deploy.lock"
+            lock.symlink_to(target)
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "Symlink"):
+                with deploy_runtime.deployment_lock(lock, state_root=state_root):
+                    pass
+
+    def test_deployment_lock_rejects_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            lock = state_root / "deploy.lock"
+            os.mkfifo(lock)
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "reguläre Datei"):
+                with deploy_runtime.deployment_lock(lock, state_root=state_root):
+                    pass
+
+    def test_deployment_lock_rejects_path_outside_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory) / "state"
+            state_root.mkdir()
+            outside = Path(directory) / "elsewhere"
+            outside.mkdir()
+            lock = outside / "deploy.lock"
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "außerhalb|State-Root"):
+                with deploy_runtime.deployment_lock(lock, state_root=state_root):
+                    pass
+
+    def test_deployment_lock_rejects_symlinked_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            real_root = Path(directory) / "real"
+            real_root.mkdir()
+            linked_root = Path(directory) / "linked"
+            linked_root.symlink_to(real_root, target_is_directory=True)
+            lock = linked_root / "deploy.lock"
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "Symlink"):
+                with deploy_runtime.deployment_lock(lock, state_root=linked_root):
+                    pass
 
     def _write_manifest(self, release: Path, snapshot: deploy_runtime.Snapshot, runtime: Path) -> None:
         deploy_runtime.write_manifest(
             release,
-            release_id="release",
+            release_id=release.name,
             snapshot=snapshot,
             stable_runtime=runtime,
             input_paths={
@@ -542,13 +630,13 @@ class DeployRuntimeTests(unittest.TestCase):
                 provenance={},
             )
             self._write_manifest(new_release, snapshot, runtime)
-            service_values = iter([True, False])
 
             with (
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
                 patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
-                patch.object(deploy_runtime, "service_active", side_effect=lambda: next(service_values, False)),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
                 patch.object(deploy_runtime, "build_release", return_value=build),
                 patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
                 patch.object(deploy_runtime, "run", side_effect=lambda argv, **kwargs: self._completed(argv)),
@@ -567,11 +655,87 @@ class DeployRuntimeTests(unittest.TestCase):
             release = root / "release"
             release.mkdir()
             previous = deploy_runtime.capture_pointer(runtime)
-            backup = deploy_runtime.activate_pointer(runtime, release, previous)
+            self.assertEqual(previous.kind, "directory")
+            self.assertIsNotNone(previous.ino)
+            original_ino = previous.ino
+            state = self._activation(runtime, previous, release_path=release)
+            deploy_runtime.activate_pointer(state)
             self.assertTrue(runtime.is_symlink())
-            deploy_runtime.restore_pointer(runtime, previous, backup)
+            self.assertTrue(state.legacy_renamed)
+            self.assertTrue(state.symlink_replaced)
+            deploy_runtime.restore_pointer(state)
             self.assertTrue(runtime.is_dir())
+            self.assertFalse(runtime.is_symlink())
             self.assertTrue((runtime / ".venv").is_dir())
+            self.assertEqual(deploy_runtime.directory_identity(runtime)[1], original_ino)
+
+    def test_activate_pointer_does_not_self_rollback_between_rename_and_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            runtime.mkdir()
+            (runtime / "marker").write_text("payload\n", encoding="utf-8")
+            release = root / "release"
+            release.mkdir()
+            previous = deploy_runtime.capture_pointer(runtime)
+            state = self._activation(runtime, previous, release_path=release)
+
+            with patch.object(
+                deploy_runtime,
+                "atomic_symlink_replace",
+                side_effect=OSError("symlink replace failed"),
+            ):
+                with self.assertRaises(OSError):
+                    deploy_runtime.activate_pointer(state)
+
+            # No hidden rollback: runtime is gone, legacy backup holds the dir.
+            self.assertTrue(state.legacy_renamed)
+            self.assertFalse(state.symlink_replaced)
+            self.assertFalse(runtime.exists())
+            self.assertIsNotNone(state.legacy_backup)
+            self.assertTrue((state.legacy_backup / "marker").is_file())
+
+            # The explicit rollback owner repairs the directory exactly.
+            deploy_runtime.restore_pointer(state)
+            self.assertTrue(runtime.is_dir())
+            self.assertTrue((runtime / "marker").is_file())
+            self.assertEqual(
+                deploy_runtime.directory_identity(runtime)[1], previous.ino
+            )
+
+    def test_restore_pointer_is_idempotent_for_already_restored_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            runtime.mkdir()
+            previous = deploy_runtime.capture_pointer(runtime)
+            state = self._activation(runtime, previous, release_path=root / "release")
+            # Pointer never moved; legacy_backup is None. Idempotent accept.
+            deploy_runtime.restore_pointer(state)
+            self.assertTrue(runtime.is_dir())
+            self.assertEqual(
+                deploy_runtime.directory_identity(runtime)[1], previous.ino
+            )
+
+    def test_restore_pointer_rejects_wrong_inode_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            runtime.mkdir()
+            previous = deploy_runtime.capture_pointer(runtime)
+            release = root / "release"
+            release.mkdir()
+            state = self._activation(runtime, previous, release_path=release)
+            deploy_runtime.activate_pointer(state)
+            # Replace the legacy backup with a different directory (wrong inode).
+            impostor = root / "impostor"
+            impostor.mkdir()
+            assert state.legacy_backup is not None
+            import shutil as _shutil
+            _shutil.rmtree(state.legacy_backup)
+            impostor.rename(state.legacy_backup)
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "(?i)identität"):
+                deploy_runtime.restore_pointer(state)
 
     def test_stop_failure_but_inactive_allows_pointer_switch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -585,7 +749,6 @@ class DeployRuntimeTests(unittest.TestCase):
             snapshot = self._snapshot()
             build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
-            service_values = iter([True, False])
 
             def fake_run(argv, **kwargs):
                 if argv[-2:] == ["stop", deploy_runtime.SERVICE]:
@@ -596,7 +759,8 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
                 patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
-                patch.object(deploy_runtime, "service_active", side_effect=lambda: next(service_values, False)),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
                 patch.object(deploy_runtime, "build_release", return_value=build),
                 patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
                 patch.object(deploy_runtime, "run", side_effect=fake_run),
@@ -623,11 +787,12 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
                 patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
-                patch.object(deploy_runtime, "service_active", return_value=True),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
                 patch.object(deploy_runtime, "build_release", return_value=build),
                 patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
                 patch.object(deploy_runtime, "run", side_effect=lambda argv, **kwargs: self._completed(argv, 1)),
-                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "active"}),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackabbruch"):
                     deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
@@ -650,20 +815,19 @@ class DeployRuntimeTests(unittest.TestCase):
                 python=runtime / ".venv/bin/python",
                 module="grabowski_mcp",
             )
-            service_values = iter([True, False, False])
 
             with (
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
                 patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract", return_value=live_entrypoint),
-                patch.object(deploy_runtime, "service_active", side_effect=lambda: next(service_values, False)),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
                 patch.object(deploy_runtime, "build_release", return_value=build),
                 patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
                 patch.object(deploy_runtime, "run", side_effect=lambda argv, **kwargs: self._completed(argv)),
                 patch.object(deploy_runtime, "activate_pointer", side_effect=deploy_runtime.DeployError("activate failed")),
                 patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)) as wait_ready,
                 patch.object(deploy_runtime, "verify_running_profile_entrypoint", return_value={"pid": 200}) as verify_previous,
-                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "active"}),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
                     deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
@@ -683,7 +847,6 @@ class DeployRuntimeTests(unittest.TestCase):
             snapshot = self._snapshot()
             build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
-            service_values = iter([True, False, False])
 
             def fake_run(argv, **kwargs):
                 if "start" in argv:
@@ -694,12 +857,12 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
                 patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
-                patch.object(deploy_runtime, "service_active", side_effect=lambda: next(service_values, False)),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
                 patch.object(deploy_runtime, "build_release", return_value=build),
                 patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
                 patch.object(deploy_runtime, "run", side_effect=fake_run),
                 patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)),
-                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "inactive"}),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
                     deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
@@ -717,19 +880,18 @@ class DeployRuntimeTests(unittest.TestCase):
             snapshot = self._snapshot()
             build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
-            service_values = iter([True, False, False])
 
             with (
                 patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
                 patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
-                patch.object(deploy_runtime, "service_active", side_effect=lambda: next(service_values, False)),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
                 patch.object(deploy_runtime, "build_release", return_value=build),
                 patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
                 patch.object(deploy_runtime, "run", side_effect=lambda argv, **kwargs: self._completed(argv)),
                 patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)),
                 patch.object(deploy_runtime, "verify_runtime_identity", side_effect=deploy_runtime.DeployError("identity mismatch")),
-                patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "inactive"}),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
                     deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
@@ -755,16 +917,14 @@ class DeployRuntimeTests(unittest.TestCase):
 
             with (
                 patch.object(deploy_runtime, "run", side_effect=fake_run),
-                patch.object(deploy_runtime, "service_active", return_value=False),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
                 patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)),
                 patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "active"}),
             ):
                 with self.assertRaises(deploy_runtime.DeployError) as ctx:
                     deploy_runtime.rollback_after_failure(
                         deploy_runtime.DeployError("original root cause"),
-                        runtime=runtime,
-                        previous=previous,
-                        legacy_backup=None,
+                        activation=self._activation(runtime, previous),
                         timeout_seconds=1,
                         phase="start",
                     )
@@ -783,16 +943,14 @@ class DeployRuntimeTests(unittest.TestCase):
             previous = deploy_runtime.capture_pointer(runtime)
             with (
                 patch.object(deploy_runtime, "run", return_value=self._completed(["stop"])),
-                patch.object(deploy_runtime, "service_active", side_effect=deploy_runtime.DeployError("state failed")),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", side_effect=deploy_runtime.DeployError("state failed")),
                 patch.object(deploy_runtime, "restore_pointer") as restore_pointer,
                 patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "unknown"}),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackabbruch"):
                     deploy_runtime.rollback_after_failure(
                         deploy_runtime.DeployError("original"),
-                        runtime=runtime,
-                        previous=previous,
-                        legacy_backup=None,
+                        activation=self._activation(runtime, previous),
                         timeout_seconds=1,
                         phase="stop",
                     )
@@ -808,16 +966,14 @@ class DeployRuntimeTests(unittest.TestCase):
             previous = deploy_runtime.capture_pointer(runtime)
             with (
                 patch.object(deploy_runtime, "run", return_value=self._completed(["stop"])),
-                patch.object(deploy_runtime, "service_active", return_value=True),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
                 patch.object(deploy_runtime, "restore_pointer") as restore_pointer,
                 patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "active"}),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackabbruch"):
                     deploy_runtime.rollback_after_failure(
                         deploy_runtime.DeployError("original"),
-                        runtime=runtime,
-                        previous=previous,
-                        legacy_backup=None,
+                        activation=self._activation(runtime, previous),
                         timeout_seconds=1,
                         phase="stop",
                     )
@@ -839,16 +995,14 @@ class DeployRuntimeTests(unittest.TestCase):
 
             with (
                 patch.object(deploy_runtime, "run", side_effect=fake_run),
-                patch.object(deploy_runtime, "service_active", return_value=False),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
                 patch.object(deploy_runtime, "restore_pointer", side_effect=OSError("restore failed")),
                 patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "inactive"}),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Restorefehler"):
                     deploy_runtime.rollback_after_failure(
                         deploy_runtime.DeployError("original"),
-                        runtime=runtime,
-                        previous=previous,
-                        legacy_backup=None,
+                        activation=self._activation(runtime, previous),
                         timeout_seconds=1,
                         phase="start",
                     )
@@ -874,16 +1028,14 @@ class DeployRuntimeTests(unittest.TestCase):
 
             with (
                 patch.object(deploy_runtime, "run", side_effect=fake_run),
-                patch.object(deploy_runtime, "service_active", return_value=False),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
                 patch.object(deploy_runtime, "restore_pointer", return_value=None),
                 patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "inactive"}),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Pointerverifikationsfehler"):
                     deploy_runtime.rollback_after_failure(
                         deploy_runtime.DeployError("original"),
-                        runtime=runtime,
-                        previous=previous,
-                        legacy_backup=None,
+                        activation=self._activation(runtime, previous),
                         timeout_seconds=1,
                         phase="start",
                     )
@@ -909,15 +1061,13 @@ class DeployRuntimeTests(unittest.TestCase):
 
             with (
                 patch.object(deploy_runtime, "run", side_effect=fake_run),
-                patch.object(deploy_runtime, "service_active", return_value=False),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
                 patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "inactive"}),
             ):
                 with self.assertRaises(deploy_runtime.DeployError) as ctx:
                     deploy_runtime.rollback_after_failure(
                         deploy_runtime.DeployError("original"),
-                        runtime=runtime,
-                        previous=previous,
-                        legacy_backup=None,
+                        activation=self._activation(runtime, previous),
                         timeout_seconds=1,
                         phase="readiness",
                     )
@@ -933,16 +1083,14 @@ class DeployRuntimeTests(unittest.TestCase):
             previous = deploy_runtime.capture_pointer(runtime)
             with (
                 patch.object(deploy_runtime, "run", return_value=self._completed(["cmd"])),
-                patch.object(deploy_runtime, "service_active", return_value=False),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
                 patch.object(deploy_runtime, "wait_until_ready", side_effect=deploy_runtime.DeployError("ready failed")),
                 patch.object(deploy_runtime, "service_state", side_effect=deploy_runtime.DeployError("final failed")),
             ):
                 with self.assertRaises(deploy_runtime.DeployError) as ctx:
                     deploy_runtime.rollback_after_failure(
                         deploy_runtime.DeployError("original"),
-                        runtime=runtime,
-                        previous=previous,
-                        legacy_backup=None,
+                        activation=self._activation(runtime, previous),
                         timeout_seconds=1,
                         phase="identity",
                     )
@@ -1146,6 +1294,74 @@ class DeployRuntimeTests(unittest.TestCase):
                     deploy_runtime.yaml_profile_command(path)
         self.assertNotIn("FAKE-SECRET", str(ctx.exception))
         self.assertEqual(ctx.exception.details["line"], 5)
+
+
+    def test_observe_service_accepts_only_complete_active_state(self) -> None:
+        output = (
+            "LoadState=loaded\n"
+            "ActiveState=active\n"
+            "SubState=running\n"
+            "MainPID=4321\n"
+        )
+        completed = subprocess.CompletedProcess(["systemctl"], 0, output, "")
+        with patch.object(deploy_runtime, "run", return_value=completed):
+            observation = deploy_runtime.observe_service()
+        self.assertTrue(observation.query_valid)
+        self.assertTrue(observation.confirmed_active)
+        self.assertFalse(observation.confirmed_inactive)
+
+    def test_observe_service_accepts_only_complete_inactive_state(self) -> None:
+        output = (
+            "LoadState=loaded\n"
+            "ActiveState=inactive\n"
+            "SubState=dead\n"
+            "MainPID=0\n"
+        )
+        completed = subprocess.CompletedProcess(["systemctl"], 0, output, "")
+        with patch.object(deploy_runtime, "run", return_value=completed):
+            observation = deploy_runtime.observe_service()
+        self.assertTrue(observation.query_valid)
+        self.assertFalse(observation.confirmed_active)
+        self.assertTrue(observation.confirmed_inactive)
+
+    def test_observe_service_rejects_unknown_and_transitional_states(self) -> None:
+        cases = (
+            (4, "LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n"),
+            (0, "LoadState=loaded\nActiveState=deactivating\nSubState=stop-sigterm\nMainPID=4321\n"),
+            (0, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=4321\n"),
+            (0, "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"),
+            (0, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=bad\n"),
+        )
+        for returncode, output in cases:
+            with self.subTest(returncode=returncode, output=output):
+                completed = subprocess.CompletedProcess(
+                    ["systemctl"], returncode, output, ""
+                )
+                with patch.object(deploy_runtime, "run", return_value=completed):
+                    observation = deploy_runtime.observe_service()
+                self.assertFalse(observation.confirmed_active)
+                self.assertFalse(observation.confirmed_inactive)
+
+    def test_wait_until_confirmed_inactive_polls_transitional_state(self) -> None:
+        observations = iter(
+            [
+                deploy_runtime.ServiceObservation(
+                    query_valid=True,
+                    load_state="loaded",
+                    active_state="deactivating",
+                    sub_state="stop-sigterm",
+                    main_pid=4321,
+                    returncode=0,
+                ),
+                self._obs_inactive(),
+            ]
+        )
+        with (
+            patch.object(deploy_runtime, "observe_service", side_effect=observations),
+            patch.object(deploy_runtime.time, "sleep", return_value=None),
+        ):
+            observation = deploy_runtime.wait_until_confirmed_inactive(1)
+        self.assertTrue(observation.confirmed_inactive)
 
 
 if __name__ == "__main__":

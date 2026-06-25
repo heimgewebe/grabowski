@@ -14,6 +14,7 @@ import re
 import select
 import shlex
 import shutil
+import stat as statmod
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,8 @@ READY_URL = "http://127.0.0.1:18080/readyz"
 HOME = Path.home()
 TOOLING_PYYAML_VERSION = "6.0.3"
 DEFAULT_PROFILE_PATH = HOME / ".config/tunnel-client/grabowski.yaml"
-DEFAULT_LOCK_FILE = HOME / ".local/state/grabowski/deploy.lock"
+DEFAULT_STATE_ROOT = HOME / ".local/state/grabowski"
+DEFAULT_LOCK_FILE = DEFAULT_STATE_ROOT / "deploy.lock"
 RUNTIME_INPUT_RELATIVE = Path("requirements/runtime.in")
 RUNTIME_LOCK_RELATIVE = Path("requirements/runtime.lock.txt")
 ENTRYPOINT_CONTRACT_RELATIVE = Path("config/runtime-entrypoint.json")
@@ -297,26 +299,33 @@ def parse_pinned_requirement(line: str, *, allow_continuation: bool) -> tuple[st
     return normalize_package_name(match.group(1)), match.group(2)
 
 
-def parse_runtime_input(path: Path) -> dict[str, str]:
-    require_file(path, "Runtime-Input")
+def parse_pinned_input_file(path: Path, *, label: str = "Pinned-Input") -> dict[str, str]:
+    require_file(path, label)
     pins: dict[str, str] = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
         if stripped.startswith("-") or "://" in stripped or stripped.startswith("git+"):
-            fail(f"Nicht erlaubte runtime.in-Option: {stripped}")
+            fail(f"Nicht erlaubte Pin-Option in {label}: {stripped}")
         name, version = parse_pinned_requirement(stripped, allow_continuation=False)
         if name in pins:
-            fail(f"Doppeltes Paket in runtime.in: {name}")
+            fail(f"Doppeltes Paket in {label}: {name}")
         pins[name] = version
+    if not pins:
+        fail(f"{label} enthält keine gepinnten Pakete")
+    return pins
+
+
+def parse_runtime_input(path: Path) -> dict[str, str]:
+    pins = parse_pinned_input_file(path, label="Runtime-Input")
     if pins.get("mcp") != "1.27.2":
         fail("runtime.in muss mcp==1.27.2 enthalten")
     return pins
 
 
-def parse_runtime_lock(path: Path) -> dict[str, str]:
-    require_file(path, "Runtime-Lockfile")
+def parse_pinned_lock_file(path: Path, *, label: str = "Pinned-Lockfile") -> dict[str, str]:
+    require_file(path, label)
     locked: dict[str, str] = {}
     current_name: str | None = None
     current_requirement: str | None = None
@@ -364,7 +373,12 @@ def parse_runtime_lock(path: Path) -> dict[str, str]:
     close_block()
 
     if not locked:
-        fail("Runtime-Lock enthält keine Anforderungen")
+        fail(f"{label} enthält keine Anforderungen")
+    return locked
+
+
+def parse_runtime_lock(path: Path) -> dict[str, str]:
+    locked = parse_pinned_lock_file(path, label="Runtime-Lockfile")
     if locked.get("mcp") != "1.27.2":
         fail("Runtime-Lock muss mcp==1.27.2 enthalten")
     return locked
@@ -530,32 +544,78 @@ def snapshot_from_worktree(repo: Path) -> Snapshot:
 
 
 @contextmanager
-def deployment_lock(lock_path: Path) -> Iterator[None]:
-    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with lock_path.open("a+", encoding="utf-8") as handle:
+def deployment_lock(
+    lock_path: Path,
+    *,
+    state_root: Path = DEFAULT_STATE_ROOT,
+) -> Iterator[None]:
+    if state_root.is_symlink():
+        fail(f"Deployment-State-Root darf kein Symlink sein: {state_root}")
+    try:
+        state_root_real = state_root.expanduser().resolve(strict=True)
+    except OSError as exc:
+        fail(f"Deployment-State-Root ist nicht validierbar: {state_root}")
+        raise AssertionError from exc
+    root_stat = state_root_real.stat()
+    if not statmod.S_ISDIR(root_stat.st_mode):
+        fail(f"Deployment-State-Root ist kein Verzeichnis: {state_root_real}")
+    if root_stat.st_uid != os.getuid():
+        fail("Deployment-State-Root gehört nicht dem aktuellen Benutzer")
+
+    safe_lock = normalize_managed_path(lock_path, allowed_root=state_root_real)
+    if safe_lock.parent != state_root_real:
+        fail("Deployment-Lock muss direkt im Grabowski-State-Root liegen")
+    if safe_lock.is_symlink():
+        fail(f"Deployment-Lock darf kein Symlink sein: {safe_lock}")
+
+    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(safe_lock, flags, 0o600)
+    except OSError as exc:
+        fail(
+            "Deployment-Lock konnte nicht sicher geöffnet werden",
+            phase="deployment-lock-open",
+            details={"error_type": type(exc).__name__},
+        )
+        raise AssertionError from exc
+
+    try:
+        info = os.fstat(fd)
+        if not statmod.S_ISREG(info.st_mode):
+            fail("Deployment-Lock ist keine reguläre Datei")
+        if info.st_uid != os.getuid():
+            fail("Deployment-Lock gehört nicht dem aktuellen Benutzer")
+        os.fchmod(fd, 0o600)
+        verified = os.fstat(fd)
+        if statmod.S_IMODE(verified.st_mode) != 0o600:
+            fail("Deployment-Lock hat nicht den erwarteten Modus 0600")
+        if verified.st_uid != os.getuid():
+            fail("Deployment-Lock gehört nicht dem aktuellen Benutzer")
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            fail(f"Ein anderes Deployment hält bereits den Lock: {lock_path}")
+            fail(f"Ein anderes Deployment hält bereits den Lock: {safe_lock}")
             raise AssertionError from exc
 
-        handle.seek(0)
-        handle.truncate()
-        handle.write(
+        payload = (
             json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "acquired_at_unix": int(time.time()),
-                },
+                {"pid": os.getpid(), "acquired_at_unix": int(time.time())},
                 sort_keys=True,
             )
             + "\n"
-        )
-        handle.flush()
+        ).encode("utf-8")
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload)
+        os.fsync(fd)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def releases_root_for(runtime: Path) -> Path:
@@ -1108,6 +1168,14 @@ def read_manifest(runtime_or_release: Path) -> dict[str, Any]:
     return data
 
 
+def _is_lower_hex(value: Any, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
 def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
     required = {
         "schema_version": int,
@@ -1129,16 +1197,50 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
         "mcp_protocol_version": str,
         "created_at_unix": int,
         "completion_status": str,
+        "executable": str,
+        "pip_version": str,
     }
     errors: list[str] = []
     for key, kind in required.items():
-        if not isinstance(manifest.get(key), kind):
+        value = manifest.get(key)
+        if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
             errors.append(key)
     if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         errors.append("schema_version")
     if manifest.get("completion_status") != "complete":
         errors.append("completion_status")
-    return errors
+    if not _is_lower_hex(manifest.get("repo_head"), 40):
+        errors.append("repo_head")
+    for key in (
+        "entrypoint_contract_sha256",
+        "source_sha256",
+        "runtime_input_sha256",
+        "runtime_lock_sha256",
+    ):
+        if not _is_lower_hex(manifest.get(key), 64):
+            errors.append(key)
+    contract = manifest.get("entrypoint_contract")
+    if not isinstance(contract, dict):
+        errors.append("entrypoint_contract")
+    else:
+        if contract.get("schema_version") != 1 or contract.get("mode") != "module":
+            errors.append("entrypoint_contract")
+        if not isinstance(contract.get("module"), str) or not MODULE_RE.match(contract["module"]):
+            errors.append("entrypoint_contract")
+        if not isinstance(contract.get("source"), str):
+            errors.append("entrypoint_contract")
+        tools = contract.get("expected_tools")
+        if not isinstance(tools, list) or not tools or not all(isinstance(item, str) and item for item in tools):
+            errors.append("entrypoint_contract")
+    snapshot_paths = manifest.get("snapshot_paths")
+    if not isinstance(snapshot_paths, dict) or set(snapshot_paths) != {
+        "runtime_entrypoint", "runtime_input", "runtime_lock", "source"
+    } or not all(isinstance(value, str) for value in snapshot_paths.values()):
+        errors.append("snapshot_paths")
+    created = manifest.get("created_at_unix")
+    if not isinstance(created, int) or isinstance(created, bool) or created <= 0:
+        errors.append("created_at_unix")
+    return sorted(set(errors))
 
 
 def verify_manifest(
@@ -1157,6 +1259,7 @@ def verify_manifest(
         "runtime_input_sha256": snapshot.runtime_input_sha256,
         "runtime_lock_sha256": snapshot.runtime_lock_sha256,
         "entrypoint_contract_sha256": snapshot.contract_sha256,
+        "entrypoint_contract": snapshot.contract.to_manifest(),
     }
     if stable_runtime is not None:
         expected["expected_stable_runtime_path"] = str(stable_runtime)
@@ -1166,6 +1269,11 @@ def verify_manifest(
                 f"Manifest-Feld {key} weicht ab: "
                 f"{manifest.get(key)!r} != {value!r}"
             )
+    release_path = runtime_or_release.resolve(strict=True)
+    if manifest.get("release_id") != release_path.name:
+        fail("Manifest-Release-ID entspricht nicht dem Releaseverzeichnis")
+    if Path(str(manifest.get("immutable_release_path"))).resolve(strict=True) != release_path:
+        fail("Manifest-Releasepfad entspricht nicht dem realen Release")
     return manifest
 
 
@@ -1373,64 +1481,118 @@ def require_profile_matches_contract(profile_path: Path, runtime: Path, contract
     return live
 
 
-def service_active() -> bool:
-    result = run(
-        ["systemctl", "--user", "is-active", "--quiet", SERVICE],
-        check=False,
-        timeout=TIMEOUTS["systemd_query"],
-    )
-    return result.returncode == 0
+@dataclass(frozen=True)
+class ServiceObservation:
+    query_valid: bool
+    load_state: str | None
+    active_state: str | None
+    sub_state: str | None
+    main_pid: int | None
+    returncode: int
+
+    @property
+    def confirmed_active(self) -> bool:
+        return (
+            self.query_valid
+            and self.load_state == "loaded"
+            and self.active_state == "active"
+            and self.main_pid is not None
+            and self.main_pid > 0
+        )
+
+    @property
+    def confirmed_inactive(self) -> bool:
+        return (
+            self.query_valid
+            and self.load_state == "loaded"
+            and self.active_state in {"inactive", "failed"}
+            and self.main_pid == 0
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "returncode": self.returncode,
+            "query_valid": self.query_valid,
+            "LoadState": self.load_state,
+            "ActiveState": self.active_state,
+            "SubState": self.sub_state,
+            "MainPID": self.main_pid,
+            "confirmed_active": self.confirmed_active,
+            "confirmed_inactive": self.confirmed_inactive,
+        }
 
 
-def service_state() -> dict[str, Any]:
+def observe_service() -> ServiceObservation:
     result = run(
         [
-            "systemctl",
-            "--user",
-            "show",
-            SERVICE,
-            "-p",
-            "ActiveState",
-            "-p",
-            "SubState",
-            "-p",
-            "MainPID",
+            "systemctl", "--user", "show", SERVICE,
+            "-p", "LoadState",
+            "-p", "ActiveState",
+            "-p", "SubState",
+            "-p", "MainPID",
             "--no-pager",
         ],
         capture=True,
         check=False,
         timeout=TIMEOUTS["systemd_query"],
     )
-    data: dict[str, Any] = {"returncode": result.returncode}
+    fields: dict[str, str] = {}
+    duplicate = False
     for line in result.stdout.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            data[key] = value
-    return data
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in fields:
+            duplicate = True
+        fields[key] = value
+    required = {"LoadState", "ActiveState", "SubState", "MainPID"}
+    main_pid: int | None = None
+    try:
+        main_pid = int(fields["MainPID"])
+        if main_pid < 0:
+            main_pid = None
+    except (KeyError, ValueError):
+        main_pid = None
+    query_valid = (
+        result.returncode == 0
+        and not duplicate
+        and set(fields) == required
+        and main_pid is not None
+    )
+    return ServiceObservation(
+        query_valid=query_valid,
+        load_state=fields.get("LoadState"),
+        active_state=fields.get("ActiveState"),
+        sub_state=fields.get("SubState"),
+        main_pid=main_pid,
+        returncode=result.returncode,
+    )
+
+
+def service_active() -> bool:
+    return observe_service().confirmed_active
+
+
+def service_state() -> dict[str, Any]:
+    return observe_service().to_dict()
+
+
+def wait_until_confirmed_inactive(timeout_seconds: int) -> ServiceObservation:
+    deadline = time.monotonic() + timeout_seconds
+    last = observe_service()
+    while time.monotonic() < deadline:
+        if last.confirmed_inactive:
+            return last
+        time.sleep(0.2)
+        last = observe_service()
+    return last
 
 
 def service_main_pid() -> int:
-    result = run(
-        [
-            "systemctl",
-            "--user",
-            "show",
-            SERVICE,
-            "-p",
-            "MainPID",
-            "--value",
-        ],
-        capture=True,
-        timeout=TIMEOUTS["systemd_query"],
-    )
-    try:
-        pid = int(result.stdout.strip())
-    except ValueError as exc:
-        fail(f"Ungültige MainPID: {result.stdout!r}")
-        raise AssertionError from exc
-    if pid <= 0:
-        fail(f"{SERVICE} besitzt keine aktive MainPID.")
-    return pid
+    observation = observe_service()
+    if not observation.confirmed_active or observation.main_pid is None:
+        fail(f"{SERVICE} besitzt keine bestätigte aktive MainPID.")
+    return observation.main_pid
 
 
 def http_text(url: str) -> str | None:
@@ -1696,6 +1858,15 @@ class PointerState:
     kind: str
     path: Path
     target: Path | None = None
+    dev: int | None = None
+    ino: int | None = None
+
+
+def directory_identity(path: Path) -> tuple[int, int]:
+    st = os.lstat(path)
+    if not statmod.S_ISDIR(st.st_mode):
+        fail(f"Erwartetes Verzeichnis fehlt oder ist kein Verzeichnis: {path}")
+    return (st.st_dev, st.st_ino)
 
 
 def capture_pointer(runtime: Path) -> PointerState:
@@ -1704,7 +1875,8 @@ def capture_pointer(runtime: Path) -> PointerState:
     if runtime.exists():
         if not runtime.is_dir():
             fail(f"Runtimepfad ist weder Verzeichnis noch Symlink: {runtime}")
-        return PointerState("directory", runtime)
+        dev, ino = directory_identity(runtime)
+        return PointerState("directory", runtime, dev=dev, ino=ino)
     return PointerState("missing", runtime)
 
 
@@ -1752,36 +1924,88 @@ def atomic_symlink_replace(runtime: Path, target: Path) -> None:
             pass
 
 
-def activate_pointer(runtime: Path, release_path: Path, previous: PointerState) -> Path | None:
+@dataclass
+class ActivationState:
+    """Single owner of every reversible pointer mutation during activation."""
+
+    runtime: Path
+    release_path: Path
+    previous: PointerState
     legacy_backup: Path | None = None
+    legacy_renamed: bool = False
+    symlink_replaced: bool = False
+    steps: list[str] = field(default_factory=list)
+
+    def record(self, step: str) -> None:
+        self.steps.append(step)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "runtime": str(self.runtime),
+            "release_path": str(self.release_path),
+            "previous_pointer": pointer_to_dict(self.previous),
+            "legacy_backup": str(self.legacy_backup) if self.legacy_backup else None,
+            "legacy_renamed": self.legacy_renamed,
+            "symlink_replaced": self.symlink_replaced,
+            "steps": list(self.steps),
+        }
+
+
+def activate_pointer(state: ActivationState) -> None:
+    """Perform the pointer swap, recording each step; never roll back here.
+
+    Recovery is the responsibility of ``restore_pointer`` using the state this
+    function records. No hidden internal rollback is performed so that a failure
+    between the directory rename and the symlink replace is observable and
+    repairable by the explicit rollback owner.
+    """
+    runtime = state.runtime
+    previous = state.previous
     if previous.kind == "directory":
         legacy_backup = unique_sibling(runtime, "legacy")
         runtime.rename(legacy_backup)
-        try:
-            atomic_symlink_replace(runtime, release_path)
-        except Exception:
-            if not runtime.exists() and legacy_backup.exists():
-                legacy_backup.rename(runtime)
-            raise
-        return legacy_backup
+        state.legacy_backup = legacy_backup
+        state.legacy_renamed = True
+        state.record("legacy-directory-renamed")
+        atomic_symlink_replace(runtime, state.release_path)
+        state.symlink_replaced = True
+        state.record("symlink-replaced")
+        return
     if previous.kind in {"symlink", "missing"}:
-        atomic_symlink_replace(runtime, release_path)
-        return None
+        atomic_symlink_replace(runtime, state.release_path)
+        state.symlink_replaced = True
+        state.record("symlink-replaced")
+        return
     fail(f"Nicht unterstützter Pointerzustand: {previous.kind}")
 
 
-def restore_pointer(
-    runtime: Path,
-    previous: PointerState,
-    legacy_backup: Path | None,
-) -> None:
+def restore_pointer(state: ActivationState) -> None:
+    """Idempotently restore the original pointer recorded in ``state``.
+
+    If the runtime pointer already matches the captured original exactly it is
+    accepted as-is. Otherwise the original is rebuilt from the activation state,
+    and legacy directory restoration is confirmed by device/inode identity.
+    """
+    runtime = state.runtime
+    previous = state.previous
+    current = capture_pointer(runtime)
+    if pointer_states_equal(current, previous):
+        if previous.kind == "directory":
+            if directory_identity(runtime) != (previous.dev, previous.ino):
+                fail("Wiederhergestelltes Verzeichnis hat falsche Geräte-/Inode-Identität")
+        return
     if previous.kind == "directory":
-        if legacy_backup is None or not legacy_backup.exists():
+        backup = state.legacy_backup
+        if backup is None or not backup.exists():
             fail("Legacy-Backup fehlt für Rollback")
+        if directory_identity(backup) != (previous.dev, previous.ino):
+            fail("Legacy-Backup hat nicht die ursprüngliche Verzeichnisidentität")
         if runtime.exists() or runtime.is_symlink():
             failed_pointer = unique_sibling(runtime, "failed-pointer")
             runtime.rename(failed_pointer)
-        legacy_backup.rename(runtime)
+        backup.rename(runtime)
+        if directory_identity(runtime) != (previous.dev, previous.ino):
+            fail("Wiederhergestelltes Verzeichnis hat falsche Geräte-/Inode-Identität")
         return
     if previous.kind == "symlink":
         assert previous.target is not None
@@ -1842,6 +2066,8 @@ def pointer_states_equal(actual: PointerState, expected: PointerState) -> bool:
         actual.kind == expected.kind
         and actual.path == expected.path
         and actual.target == expected.target
+        and actual.dev == expected.dev
+        and actual.ino == expected.ino
     )
 
 
@@ -1896,14 +2122,14 @@ def finalize_rollback_state(state: RollbackState, runtime: Path) -> None:
 def rollback_after_failure(
     original: BaseException,
     *,
-    runtime: Path,
-    previous: PointerState,
-    legacy_backup: Path | None,
+    activation: ActivationState,
     timeout_seconds: int,
     phase: str,
     contract: RuntimeContract | None = None,
     recovery_entrypoint: EntryPoint | None = None,
 ) -> NoReturn:
+    runtime = activation.runtime
+    previous = activation.previous
     state = RollbackState(
         original_error=safe_error_summary(original),
         phase=phase,
@@ -1930,15 +2156,20 @@ def rollback_after_failure(
     inactive, inactive_error = rollback_step(
         state,
         "rollback-service-state-after-stop",
-        lambda: not service_active(),
+        lambda: wait_until_confirmed_inactive(TIMEOUTS["service_stop"]),
     )
-    state.inactive_after_stop = inactive if inactive_error is None else None
-    if inactive is not True:
+    state.inactive_after_stop = (
+        inactive.confirmed_inactive
+        if isinstance(inactive, ServiceObservation) and inactive_error is None
+        else None
+    )
+    if not isinstance(inactive, ServiceObservation) or not inactive.confirmed_inactive:
         state.errors.append(
             {
                 "phase": "rollback-service-state-after-stop",
                 "message": (
-                    "Dienstzustand ist aktiv oder unbekannt; "
+                    "Dienstzustand ist nicht bestätigt inaktiv "
+                    "(aktiv/aktivierend/unbekannt); "
                     "keine Pointermutation im Rollback"
                 ),
             }
@@ -1948,7 +2179,7 @@ def rollback_after_failure(
     _, restore_error = rollback_step(
         state,
         "rollback-pointer-restore",
-        lambda: restore_pointer(runtime, previous, legacy_backup),
+        lambda: restore_pointer(activation),
     )
     if restore_error is not None:
         state.pointer_restore = "failed"
@@ -2056,16 +2287,23 @@ def deploy(
     snapshot = snapshot_from_git(repo)
     runtime = require_runtime_replaceable(runtime)
     live_entrypoint = require_profile_matches_contract(profile_path, runtime, snapshot.contract)
-    if not service_active():
-        fail(f"{SERVICE} ist vor dem Deployment nicht aktiv.")
+    initial_service = observe_service()
+    if not initial_service.confirmed_active:
+        fail(
+            f"{SERVICE} ist vor dem Deployment nicht bestätigt aktiv.",
+            details={"service": initial_service.to_dict()},
+        )
 
     build = build_release(snapshot, releases_root_for(runtime), runtime)
     verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
     verify_manifest(build.release_path, snapshot=snapshot, stable_runtime=runtime)
 
     previous = capture_pointer(runtime)
-    legacy_backup: Path | None = None
-    pointer_changed = False
+    activation = ActivationState(
+        runtime=runtime,
+        release_path=build.release_path,
+        previous=previous,
+    )
     phase = "stop"
 
     try:
@@ -2075,16 +2313,20 @@ def deploy(
             capture=True,
             timeout=TIMEOUTS["service_stop"],
         )
-        if service_active():
+        observation = wait_until_confirmed_inactive(TIMEOUTS["service_stop"])
+        if not observation.confirmed_inactive:
             fail(
-                "Dienst blieb nach Stopversuch aktiv; keine Pointermutation",
+                "Dienst wurde nach Stopversuch nicht als inaktiv bestätigt; "
+                "keine Pointermutation",
                 phase="stop",
-                details={"stop_returncode": stop_result.returncode},
+                details={
+                    "stop_returncode": stop_result.returncode,
+                    "service": observation.to_dict(),
+                },
             )
 
         phase = "activate-pointer"
-        legacy_backup = activate_pointer(runtime, build.release_path, previous)
-        pointer_changed = True
+        activate_pointer(activation)
 
         phase = "start"
         start_result = run(
@@ -2129,14 +2371,12 @@ def deploy(
         print(f"Runtime-PID:     {identity['process']['pid']}")
         print(f"Runtime:         {runtime}")
         print(f"Release:         {build.release_path}")
-        print(f"Legacy-Backup:   {legacy_backup}")
+        print(f"Legacy-Backup:   {activation.legacy_backup}")
 
     except Exception as original:
         rollback_after_failure(
             original,
-            runtime=runtime,
-            previous=previous,
-            legacy_backup=legacy_backup,
+            activation=activation,
             timeout_seconds=timeout_seconds,
             phase=phase,
             contract=snapshot.contract,
@@ -2227,23 +2467,22 @@ def main() -> int:
                     timeout_seconds=args.timeout,
                 )
     except DeployError as exc:
-        if exc.details:
-            print(
-                f"STOP: {exc} | details={json.dumps(exc.details, sort_keys=True, ensure_ascii=False)}",
-                file=sys.stderr,
-            )
-        else:
-            print(f"STOP: {exc}", file=sys.stderr)
+        print(
+            "STOP: "
+            + json.dumps(safe_error_summary(exc), sort_keys=True, ensure_ascii=False),
+            file=sys.stderr,
+        )
         return 1
     except subprocess.CalledProcessError as exc:
         print(
-            f"STOP: Befehl fehlgeschlagen: {redact_argv([str(item) for item in exc.cmd])}",
+            "STOP: "
+            + json.dumps(safe_error_summary(exc), sort_keys=True, ensure_ascii=False),
             file=sys.stderr,
         )
         return exc.returncode or 1
     except Exception as exc:
         print(
-            "STOP: Unerwarteter Fehler: "
+            "STOP: "
             + json.dumps(safe_error_summary(exc), sort_keys=True, ensure_ascii=False),
             file=sys.stderr,
         )

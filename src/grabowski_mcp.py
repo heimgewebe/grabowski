@@ -207,28 +207,139 @@ def _append_audit(record: dict[str, Any]) -> None:
         os.close(fd)
 
 
+_DEPLOYMENT_IDENTITY_KEYS = (
+    "manifest_parse_valid",
+    "manifest_schema_valid",
+    "release_path_valid",
+    "release_id_valid",
+    "repo_head_valid",
+    "runtime_pointer_valid",
+    "runtime_input_identity_valid",
+    "lock_identity_valid",
+    "source_snapshot_identity_valid",
+    "source_identity_valid",
+    "embedded_contract_valid",
+    "entrypoint_contract_identity_valid",
+    "entrypoint_path_valid",
+    "release_python_identity_valid",
+    "python_runtime_identity_valid",
+    "platform_identity_valid",
+)
+
+
 def _false_deployment_metadata(base: dict[str, Any], **extra: Any) -> dict[str, Any]:
-    return {
-        **base,
-        "manifest_parse_valid": False,
-        "manifest_schema_valid": False,
-        "release_path_valid": False,
-        "runtime_pointer_valid": False,
-        "source_identity_valid": False,
-        "lock_identity_valid": False,
-        "entrypoint_contract_identity_valid": False,
-        "release_python_identity_valid": False,
-        "python_runtime_identity_valid": False,
-        "provenance_valid": False,
-        **extra,
-    }
+    result = {**base}
+    for key in _DEPLOYMENT_IDENTITY_KEYS:
+        result[key] = False
+    result["provenance_valid"] = False
+    result.update(extra)
+    return result
 
 
 def _path_inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _is_hex(value: Any, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
+    required = {
+        "schema_version": int,
+        "release_id": str,
+        "repo_head": str,
+        "entrypoint_contract": dict,
+        "entrypoint_contract_sha256": str,
+        "source_sha256": str,
+        "runtime_input_sha256": str,
+        "runtime_lock_sha256": str,
+        "snapshot_paths": dict,
+        "immutable_release_path": str,
+        "expected_stable_runtime_path": str,
+        "release_python_path": str,
+        "entrypoint_path": str,
+        "platform": str,
+        "python_version": str,
+        "python_implementation": str,
+        "mcp_protocol_version": str,
+        "created_at_unix": int,
+        "completion_status": str,
+        "executable": str,
+        "pip_version": str,
+    }
+    for key, kind in required.items():
+        value = raw.get(key)
+        if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
+            return False
+    if raw.get("schema_version") != 3:
+        return False
+    if raw.get("completion_status") != "complete":
+        return False
+    if not _is_hex(raw.get("repo_head"), 40):
+        return False
+    for key in (
+        "entrypoint_contract_sha256",
+        "source_sha256",
+        "runtime_input_sha256",
+        "runtime_lock_sha256",
+    ):
+        if not _is_hex(raw.get(key), 64):
+            return False
+    contract = raw.get("entrypoint_contract")
+    if not isinstance(contract, dict):
+        return False
+    if contract.get("schema_version") != 1 or contract.get("mode") != "module":
+        return False
+    if not isinstance(contract.get("module"), str) or not contract.get("module"):
+        return False
+    if not isinstance(contract.get("source"), str) or not contract.get("source"):
+        return False
+    tools = contract.get("expected_tools")
+    if not isinstance(tools, list) or not tools or not all(
+        isinstance(item, str) and item for item in tools
+    ):
+        return False
+    snapshot_paths = raw.get("snapshot_paths")
+    if not isinstance(snapshot_paths, dict) or set(snapshot_paths) != {
+        "runtime_entrypoint",
+        "runtime_input",
+        "runtime_lock",
+        "source",
+    }:
+        return False
+    if not all(isinstance(value, str) for value in snapshot_paths.values()):
+        return False
+    created = raw.get("created_at_unix")
+    if not isinstance(created, int) or isinstance(created, bool) or created <= 0:
+        return False
+    return True
+
+
 def _deployment_metadata() -> dict[str, Any]:
+    """Provenance summary for grabowski_status.
+
+    Every check is conjoined into provenance_valid. A malformed, tampered, or
+    partially-written manifest must never raise out of here so that
+    grabowski_status keeps returning policy state.
+    """
+    try:
+        return _deployment_metadata_impl()
+    except Exception as exc:  # pragma: no cover - defensive catch-all
+        return _false_deployment_metadata(
+            {
+                "manifest_path": str(DEPLOYMENT_MANIFEST),
+                "manifest_exists": False,
+            },
+            error_type=type(exc).__name__,
+        )
+
+
+def _deployment_metadata_impl() -> dict[str, Any]:
     manifest_path = DEPLOYMENT_MANIFEST
     base: dict[str, Any] = {
         "manifest_path": str(manifest_path),
@@ -245,39 +356,33 @@ def _deployment_metadata() -> dict[str, Any]:
     if not isinstance(raw, dict):
         return _false_deployment_metadata(base, manifest_parse_valid=True)
 
-    required = {
-        "schema_version",
-        "release_id",
-        "repo_head",
-        "entrypoint_contract",
-        "entrypoint_contract_sha256",
-        "source_sha256",
-        "runtime_input_sha256",
-        "runtime_lock_sha256",
-        "snapshot_paths",
-        "immutable_release_path",
-        "expected_stable_runtime_path",
-        "release_python_path",
-        "entrypoint_path",
-        "platform",
-        "python_version",
-        "python_implementation",
-        "mcp_protocol_version",
-        "created_at_unix",
-        "completion_status",
-    }
-    schema_valid = (
-        isinstance(raw, dict)
-        and raw.get("schema_version") == 3
-        and raw.get("completion_status") == "complete"
-        and required.issubset(raw)
-    )
+    schema_valid = _manifest_schema_valid(raw)
 
     release_root = manifest_path.parent.resolve()
     snapshot_paths = raw.get("snapshot_paths")
+    if not isinstance(snapshot_paths, dict):
+        snapshot_paths = {}
     stable_runtime = None
     if isinstance(raw.get("expected_stable_runtime_path"), str):
         stable_runtime = Path(raw["expected_stable_runtime_path"])
+
+    def _snapshot_sha_valid(key: str, expected_relative: str, sha_field: str) -> bool:
+        try:
+            recorded = snapshot_paths.get(key)
+            if not isinstance(recorded, str):
+                return False
+            recorded_path = Path(recorded)
+            expected_path = release_root / expected_relative
+            expected_sha = raw.get(sha_field)
+            return (
+                recorded_path == expected_path
+                and recorded_path.is_file()
+                and _path_inside(recorded_path.resolve(), release_root)
+                and isinstance(expected_sha, str)
+                and _sha256(recorded_path) == expected_sha
+            )
+        except (OSError, RuntimeError, ValueError):
+            return False
 
     release_path_valid = False
     try:
@@ -286,60 +391,26 @@ def _deployment_metadata() -> dict[str, Any]:
             if stable_runtime is not None
             else None
         )
+        immutable_release = raw.get("immutable_release_path")
         release_path_valid = (
-            isinstance(raw.get("immutable_release_path"), str)
-            and Path(raw["immutable_release_path"]) == manifest_path.parent
+            isinstance(immutable_release, str)
+            and Path(immutable_release).resolve(strict=True) == release_root
             and releases_root is not None
-            and release_root.parent.resolve() == releases_root.resolve()
+            and release_root.parent == releases_root.resolve(strict=True)
         )
     except (OSError, RuntimeError):
         release_path_valid = False
 
-    source_identity_valid = False
-    if isinstance(raw, dict) and isinstance(raw.get("source_sha256"), str):
-        try:
-            source_identity_valid = (
-                _sha256(Path(__file__).resolve()) == raw["source_sha256"]
-            )
-        except OSError:
-            source_identity_valid = False
+    release_id_valid = False
+    try:
+        release_id_valid = (
+            isinstance(raw.get("release_id"), str)
+            and raw["release_id"] == release_root.name
+        )
+    except (OSError, RuntimeError):
+        release_id_valid = False
 
-    lock_identity_valid = False
-    if isinstance(snapshot_paths, dict):
-        try:
-            lock_path = Path(str(snapshot_paths.get("runtime_lock")))
-            expected_lock = release_root / "inputs/runtime.lock.txt"
-            lock_identity_valid = (
-                lock_path == expected_lock
-                and lock_path.is_file()
-                and _path_inside(lock_path.resolve(), release_root)
-                and _sha256(lock_path) == raw["runtime_lock_sha256"]
-            )
-        except OSError:
-            lock_identity_valid = False
-
-    entrypoint_contract_identity_valid = False
-    if isinstance(snapshot_paths, dict):
-        try:
-            contract_path = Path(str(snapshot_paths.get("runtime_entrypoint")))
-            expected_contract = release_root / "inputs/runtime-entrypoint.json"
-            contract_raw = json.loads(contract_path.read_text(encoding="utf-8"))
-            contract_valid = (
-                isinstance(contract_raw, dict)
-                and contract_raw.get("schema_version") == 1
-                and contract_raw.get("mode") == "module"
-                and isinstance(contract_raw.get("module"), str)
-                and isinstance(contract_raw.get("expected_tools"), list)
-            )
-            entrypoint_contract_identity_valid = (
-                contract_path == expected_contract
-                and contract_path.is_file()
-                and _path_inside(contract_path.resolve(), release_root)
-                and _sha256(contract_path) == raw["entrypoint_contract_sha256"]
-                and contract_valid
-            )
-        except (OSError, json.JSONDecodeError):
-            entrypoint_contract_identity_valid = False
+    repo_head_valid = _is_hex(raw.get("repo_head"), 40)
 
     runtime_pointer_valid = False
     try:
@@ -350,6 +421,83 @@ def _deployment_metadata() -> dict[str, Any]:
         )
     except (OSError, RuntimeError):
         runtime_pointer_valid = False
+
+    runtime_input_identity_valid = _snapshot_sha_valid(
+        "runtime_input", "inputs/runtime.in", "runtime_input_sha256"
+    )
+    lock_identity_valid = _snapshot_sha_valid(
+        "runtime_lock", "inputs/runtime.lock.txt", "runtime_lock_sha256"
+    )
+
+    # Source snapshot path is derived from the embedded contract's repo-relative
+    # source, e.g. inputs/src/grabowski_mcp.py.
+    source_snapshot_identity_valid = False
+    try:
+        contract = raw.get("entrypoint_contract")
+        source_relative = contract.get("source") if isinstance(contract, dict) else None
+        if isinstance(source_relative, str) and source_relative:
+            source_snapshot_identity_valid = _snapshot_sha_valid(
+                "source", f"inputs/{source_relative}", "source_sha256"
+            )
+    except (OSError, RuntimeError, ValueError):
+        source_snapshot_identity_valid = False
+
+    # Imported module bytes: the running module file must equal the recorded
+    # source hash.
+    source_identity_valid = False
+    if isinstance(raw.get("source_sha256"), str):
+        try:
+            source_identity_valid = (
+                _sha256(Path(__file__).resolve()) == raw["source_sha256"]
+            )
+        except OSError:
+            source_identity_valid = False
+
+    entrypoint_contract_identity_valid = False
+    embedded_contract_valid = False
+    try:
+        contract_path = Path(str(snapshot_paths.get("runtime_entrypoint")))
+        expected_contract = release_root / "inputs/runtime-entrypoint.json"
+        contract_raw = json.loads(contract_path.read_text(encoding="utf-8"))
+        contract_valid = (
+            isinstance(contract_raw, dict)
+            and contract_raw.get("schema_version") == 1
+            and contract_raw.get("mode") == "module"
+            and isinstance(contract_raw.get("module"), str)
+            and isinstance(contract_raw.get("expected_tools"), list)
+        )
+        entrypoint_contract_identity_valid = (
+            contract_path == expected_contract
+            and contract_path.is_file()
+            and _path_inside(contract_path.resolve(), release_root)
+            and _sha256(contract_path) == raw.get("entrypoint_contract_sha256")
+            and contract_valid
+        )
+        embedded = raw.get("entrypoint_contract")
+        if isinstance(embedded, dict) and isinstance(contract_raw, dict):
+            embedded_contract_valid = embedded == contract_raw
+    except (OSError, json.JSONDecodeError, ValueError):
+        entrypoint_contract_identity_valid = False
+        embedded_contract_valid = False
+
+    # Entrypoint path: the installed module inside the release whose bytes equal
+    # the source snapshot hash.
+    entrypoint_path_valid = False
+    try:
+        entrypoint_value = raw.get("entrypoint_path")
+        if isinstance(entrypoint_value, str):
+            entrypoint_path = Path(entrypoint_value)
+            resolved_entrypoint = entrypoint_path.resolve(strict=True)
+            running_module = Path(__file__).resolve(strict=True)
+            entrypoint_path_valid = (
+                entrypoint_path.is_file()
+                and _path_inside(resolved_entrypoint, release_root)
+                and resolved_entrypoint == running_module
+                and isinstance(raw.get("source_sha256"), str)
+                and _sha256(entrypoint_path) == raw["source_sha256"]
+            )
+    except (OSError, RuntimeError, ValueError):
+        entrypoint_path_valid = False
 
     release_python_identity_valid = False
     try:
@@ -367,16 +515,24 @@ def _deployment_metadata() -> dict[str, Any]:
         raw.get("python_version") == platform.python_version()
         and raw.get("python_implementation") == platform.python_implementation()
     )
+    platform_identity_valid = raw.get("platform") == platform.platform()
 
     provenance_valid = (
         schema_valid
         and release_path_valid
+        and release_id_valid
+        and repo_head_valid
         and runtime_pointer_valid
-        and source_identity_valid
+        and runtime_input_identity_valid
         and lock_identity_valid
+        and source_snapshot_identity_valid
+        and source_identity_valid
+        and embedded_contract_valid
         and entrypoint_contract_identity_valid
+        and entrypoint_path_valid
         and release_python_identity_valid
         and python_runtime_identity_valid
+        and platform_identity_valid
     )
 
     allowed = {
@@ -402,12 +558,19 @@ def _deployment_metadata() -> dict[str, Any]:
         "manifest_parse_valid": True,
         "manifest_schema_valid": schema_valid,
         "release_path_valid": release_path_valid,
-        "source_identity_valid": source_identity_valid,
+        "release_id_valid": release_id_valid,
+        "repo_head_valid": repo_head_valid,
+        "runtime_pointer_valid": runtime_pointer_valid,
+        "runtime_input_identity_valid": runtime_input_identity_valid,
         "lock_identity_valid": lock_identity_valid,
+        "source_snapshot_identity_valid": source_snapshot_identity_valid,
+        "source_identity_valid": source_identity_valid,
+        "embedded_contract_valid": embedded_contract_valid,
         "entrypoint_contract_identity_valid": entrypoint_contract_identity_valid,
+        "entrypoint_path_valid": entrypoint_path_valid,
         "release_python_identity_valid": release_python_identity_valid,
         "python_runtime_identity_valid": python_runtime_identity_valid,
-        "runtime_pointer_valid": runtime_pointer_valid,
+        "platform_identity_valid": platform_identity_valid,
         "provenance_valid": provenance_valid,
         **allowed,
     }

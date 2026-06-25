@@ -29,11 +29,12 @@ runtime-lock-refresh:
 >$(UV) pip compile requirements/runtime.in --python-version 3.10 --python-platform x86_64-unknown-linux-gnu --generate-hashes --output-file requirements/runtime.lock.txt
 
 deploy-tooling:
->$(PYTHON) -m venv $(DEPLOY_TOOLING_VENV)
+>$(PYTHON) -m venv --clear $(DEPLOY_TOOLING_VENV)
 >PIP_CONFIG_FILE=/dev/null PIP_NO_INPUT=1 PYTHONNOUSERSITE=1 $(DEPLOY_TOOL_PYTHON) -m pip install --isolated --disable-pip-version-check --no-input --require-hashes --no-deps --only-binary=:all: --index-url https://pypi.org/simple -r requirements/deploy-tooling.lock.txt
 
 deploy-tooling-check: deploy-tooling
 >$(DEPLOY_TOOL_PYTHON) -c 'import yaml; raise SystemExit(0 if yaml.__version__ == "6.0.3" else 1)'
+>PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1 $(DEPLOY_TOOL_PYTHON) tools/verify_tooling_venv.py
 
 deploy-tooling-lock-refresh:
 >test "$$($(UV) --version)" = "uv $(UV_RUNTIME_LOCK_VERSION)"

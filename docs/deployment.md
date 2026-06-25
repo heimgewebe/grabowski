@@ -211,3 +211,7 @@ Das Werkzeug:
 
 Retention alter Releases und ein separates Deployment-Eventlog bleiben eigene
 Folgetasks.
+
+## Härtungsnachtrag
+
+Dienstzustände werden strukturiert geprüft; unbekannte oder transitive Zustände blockieren Pointermutationen. Rollback wartet begrenzt auf bestätigte Inaktivität. Legacy-Verzeichnisse werden zusätzlich über Geräte- und Inode-Identität verifiziert. Statusprovenienz bindet Manifest, Release, Runtime-Input, Lock, Source-Snapshot, Modul, Contract, Entry-Point, Python und Plattform. Der Deployment-Lock ist auf den Grabowski-State-Root begrenzt, symlinksicher geöffnet und auf eine reguläre Datei des aktuellen Benutzers mit Modus 0600 beschränkt. Runtime- und Tooling-Locks verwenden dieselbe strikte Pin- und Hashsemantik; die Tooling-Venv wird vor der Closure-Prüfung geleert.
