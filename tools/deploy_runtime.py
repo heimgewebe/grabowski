@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
-import platform
+import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,48 +25,145 @@ SERVICE = "tunnel-client-grabowski.service"
 PROFILE_NAME = "grabowski"
 HEALTH_URL = "http://127.0.0.1:18080/healthz"
 READY_URL = "http://127.0.0.1:18080/readyz"
-HOME = Path.home().resolve()
+HOME = Path.home()
 DEFAULT_PROFILE_PATH = HOME / ".config/tunnel-client/grabowski.yaml"
 DEFAULT_LOCK_FILE = HOME / ".local/state/grabowski/deploy.lock"
+RUNTIME_INPUT_RELATIVE = Path("requirements/runtime.in")
 RUNTIME_LOCK_RELATIVE = Path("requirements/runtime.lock.txt")
-EXPECTED_TOOLS = {
-    "grabowski_status",
-    "grabowski_list_directory",
-    "grabowski_stat",
-    "grabowski_read_text",
-    "grabowski_create_text",
-    "grabowski_replace_text",
-    "latest_complete_bundles",
-}
-PROTOCOL_VERSIONS = (
+ENTRYPOINT_CONTRACT_RELATIVE = Path("config/runtime-entrypoint.json")
+RELEASES_DIR_NAME = "grabowski-mcp-releases"
+MANIFEST_NAME = "deployment-manifest.json"
+INCOMPLETE_MARKER = "deployment-incomplete.json"
+MANIFEST_SCHEMA_VERSION = 3
+MCP_PROTOCOL_VERSIONS = (
     "2025-06-18",
     "2025-03-26",
     "2024-11-05",
 )
+ALLOWED_VENV_BASE_DISTS = {"pip", "setuptools", "wheel"}
+TIMEOUTS = {
+    "git": 10,
+    "systemd_query": 10,
+    "service_stop": 30,
+    "service_start": 30,
+    "mcp_probe": 20,
+    "package_install": 180,
+    "python": 20,
+    "journal": 10,
+}
+PIN_RE = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9_.-]*)==([A-Za-z0-9][A-Za-z0-9!+_.-]*)(?:\s*\\)?$"
+)
+HASH_RE = re.compile(r"^--hash=sha256:[0-9a-f]{64}(?:\s*\\)?$")
+MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+SECRET_WORD_RE = re.compile(
+    r"(token|secret|password|passwd|apikey|api-key|authorization|bearer)",
+    re.IGNORECASE,
+)
 
 
 class DeployError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        phase: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.phase = phase
+        self.details = details or {}
 
 
-def fail(message: str) -> NoReturn:
-    raise DeployError(message)
+def fail(message: str, *, phase: str | None = None, details: dict[str, Any] | None = None) -> NoReturn:
+    raise DeployError(message, phase=phase, details=details)
+
+
+def redact_argv(argv: list[str]) -> list[str]:
+    redacted: list[str] = []
+    hide_next = False
+    for item in argv:
+        if hide_next:
+            redacted.append("<redacted>")
+            hide_next = False
+            continue
+        if SECRET_WORD_RE.search(item):
+            redacted.append("<redacted>")
+            if "=" not in item:
+                hide_next = True
+            continue
+        redacted.append(item)
+    return redacted
+
+
+def redact_text(text: str, *, limit: int = 4000) -> str:
+    lines = []
+    for line in text.splitlines()[-80:]:
+        if SECRET_WORD_RE.search(line):
+            lines.append("<redacted>")
+        else:
+            lines.append(line)
+    return "\n".join(lines)[-limit:]
 
 
 def run(
     argv: list[str],
     *,
+    timeout: int,
     cwd: Path | None = None,
     check: bool = True,
     capture: bool = False,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        argv,
-        cwd=cwd,
-        check=check,
-        text=True,
-        capture_output=capture,
-    )
+    try:
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            check=check,
+            text=True,
+            capture_output=capture,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        fail(
+            "Externer Befehl hat sein Timeout überschritten.",
+            phase="command-timeout",
+            details={
+                "argv": redact_argv(argv),
+                "timeout_seconds": timeout,
+                "cwd": str(cwd) if cwd else None,
+            },
+        )
+        raise AssertionError from exc
+
+
+def run_bytes(
+    argv: list[str],
+    *,
+    timeout: int,
+    cwd: Path | None = None,
+) -> bytes:
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        fail(
+            "Externer Befehl hat sein Timeout überschritten.",
+            phase="command-timeout",
+            details={
+                "argv": redact_argv(argv),
+                "timeout_seconds": timeout,
+                "cwd": str(cwd) if cwd else None,
+            },
+        )
+        raise AssertionError from exc
+    return result.stdout
 
 
 def sha256(path: Path) -> str:
@@ -74,9 +174,217 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def require_file(path: Path, label: str) -> None:
     if not path.is_file():
         fail(f"{label} fehlt: {path}")
+
+
+def normalize_package_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def parse_pinned_requirement(line: str, *, allow_continuation: bool) -> tuple[str, str]:
+    match = PIN_RE.match(line)
+    if not match:
+        fail(f"Requirement ist nicht exakt gepinnt: {line}")
+    if line.rstrip().endswith("\\") and not allow_continuation:
+        fail(f"Requirement darf keine Fortsetzung haben: {line}")
+    return normalize_package_name(match.group(1)), match.group(2)
+
+
+def parse_runtime_input(path: Path) -> dict[str, str]:
+    require_file(path, "Runtime-Input")
+    pins: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("-") or "://" in stripped or stripped.startswith("git+"):
+            fail(f"Nicht erlaubte runtime.in-Option: {stripped}")
+        name, version = parse_pinned_requirement(stripped, allow_continuation=False)
+        if name in pins:
+            fail(f"Doppeltes Paket in runtime.in: {name}")
+        pins[name] = version
+    if pins.get("mcp") != "1.27.2":
+        fail("runtime.in muss mcp==1.27.2 enthalten")
+    return pins
+
+
+def parse_runtime_lock(path: Path) -> dict[str, str]:
+    require_file(path, "Runtime-Lockfile")
+    locked: dict[str, str] = {}
+    current_name: str | None = None
+    current_requirement: str | None = None
+    current_version: str | None = None
+    hashes = 0
+
+    def close_block() -> None:
+        nonlocal current_name, current_requirement, current_version, hashes
+        if current_name is None:
+            return
+        if hashes == 0:
+            fail(f"Runtime-Lockblock ohne SHA-256-Hashes: {current_requirement}")
+        if current_name in locked:
+            fail(f"Doppeltes Paket im Runtime-Lock: {current_name}")
+        assert current_version is not None
+        locked[current_name] = current_version
+        current_name = None
+        current_requirement = None
+        current_version = None
+        hashes = 0
+
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            continue
+        if raw[:1].isspace():
+            if current_name is None:
+                fail(f"Fortsetzungszeile ohne Requirement: {raw!r}")
+            if stripped.startswith("#"):
+                continue
+            if not HASH_RE.match(stripped):
+                fail(f"Nicht erlaubte Fortsetzungsoption im Lock: {stripped}")
+            hashes += 1
+            continue
+        close_block()
+        if stripped.startswith(("-e", "--", "-c", "-r")) or "://" in stripped or stripped.startswith("git+"):
+            fail(f"Nicht erlaubte Runtime-Lock-Anforderung: {stripped}")
+        current_name, current_version = parse_pinned_requirement(
+            stripped,
+            allow_continuation=True,
+        )
+        current_requirement = stripped
+    close_block()
+
+    if not locked:
+        fail("Runtime-Lock enthält keine Anforderungen")
+    if locked.get("mcp") != "1.27.2":
+        fail("Runtime-Lock muss mcp==1.27.2 enthalten")
+    return locked
+
+
+@dataclass(frozen=True)
+class RuntimeContract:
+    schema_version: int
+    mode: str
+    expected_tools: tuple[str, ...]
+    source: Path
+    module: str | None = None
+    script: Path | None = None
+
+    def to_manifest(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "mode": self.mode,
+            "expected_tools": list(self.expected_tools),
+            "source": self.source.as_posix(),
+        }
+        if self.module is not None:
+            data["module"] = self.module
+        if self.script is not None:
+            data["script"] = self.script.as_posix()
+        return data
+
+    def command_argv(self, release_path: Path, python_exe: Path) -> list[str]:
+        if self.mode == "module":
+            assert self.module is not None
+            return [str(python_exe), "-m", self.module]
+        if self.mode == "script":
+            assert self.script is not None
+            return [str(python_exe), str(release_path / self.script)]
+        fail(f"Nicht unterstützter Entry-Point-Modus: {self.mode}")
+
+    def describe(self) -> str:
+        if self.mode == "module":
+            return f"python -m {self.module}"
+        assert self.script is not None
+        return f"python {self.script.as_posix()}"
+
+
+def _relative_path(value: str, label: str) -> Path:
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        fail(f"{label} muss ein repository-relativer Pfad sein: {value}")
+    return path
+
+
+def load_contract_bytes(data: bytes) -> RuntimeContract:
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"Runtime-Entry-Point-Contract ist ungültig: {exc}")
+    if not isinstance(raw, dict):
+        fail("Runtime-Entry-Point-Contract ist kein Objekt")
+    if raw.get("schema_version") != 1:
+        fail("Runtime-Entry-Point-Contract benötigt schema_version 1")
+    mode = raw.get("mode")
+    if mode not in {"module", "script"}:
+        fail(f"Nicht unterstützter Entry-Point-Modus: {mode!r}")
+    tools = raw.get("expected_tools")
+    if not isinstance(tools, list) or not tools or not all(isinstance(item, str) and item for item in tools):
+        fail("Runtime-Entry-Point-Contract benötigt expected_tools als nichtleere Stringliste")
+    source = _relative_path(str(raw.get("source", "")), "source")
+    if source.as_posix() == ".":
+        fail("Runtime-Entry-Point-Contract benötigt source")
+    if mode == "module":
+        module = raw.get("module")
+        if not isinstance(module, str) or not MODULE_RE.match(module):
+            fail(f"Ungültiges Modul im Runtime-Entry-Point-Contract: {module!r}")
+        return RuntimeContract(
+            schema_version=1,
+            mode="module",
+            module=module,
+            source=source,
+            expected_tools=tuple(tools),
+        )
+    script_raw = raw.get("script")
+    if not isinstance(script_raw, str):
+        fail("Script-Entry-Point benötigt script")
+    return RuntimeContract(
+        schema_version=1,
+        mode="script",
+        script=_relative_path(script_raw, "script"),
+        source=source,
+        expected_tools=tuple(tools),
+    )
+
+
+def load_contract(path: Path) -> RuntimeContract:
+    require_file(path, "Runtime-Entry-Point-Contract")
+    return load_contract_bytes(path.read_bytes())
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    repo_head: str
+    dirty: bool
+    contract: RuntimeContract
+    contract_bytes: bytes
+    runtime_input_bytes: bytes
+    runtime_lock_bytes: bytes
+    source_bytes: bytes
+
+    @property
+    def contract_sha256(self) -> str:
+        return sha256_bytes(self.contract_bytes)
+
+    @property
+    def runtime_input_sha256(self) -> str:
+        return sha256_bytes(self.runtime_input_bytes)
+
+    @property
+    def runtime_lock_sha256(self) -> str:
+        return sha256_bytes(self.runtime_lock_bytes)
+
+    @property
+    def source_sha256(self) -> str:
+        return sha256_bytes(self.source_bytes)
 
 
 def git_head(repo: Path) -> str:
@@ -84,6 +392,7 @@ def git_head(repo: Path) -> str:
         ["git", "rev-parse", "HEAD"],
         cwd=repo,
         capture=True,
+        timeout=TIMEOUTS["git"],
     )
     return result.stdout.strip()
 
@@ -93,6 +402,7 @@ def repo_dirty(repo: Path) -> bool:
         ["git", "status", "--porcelain"],
         cwd=repo,
         capture=True,
+        timeout=TIMEOUTS["git"],
     )
     return bool(result.stdout.strip())
 
@@ -101,6 +411,46 @@ def require_clean_repo(repo: Path) -> str:
     if repo_dirty(repo):
         fail("Repository enthält uncommittete Änderungen.")
     return git_head(repo)
+
+
+def git_show(repo: Path, head: str, path: Path) -> bytes:
+    return run_bytes(
+        ["git", "show", f"{head}:{path.as_posix()}"],
+        cwd=repo,
+        timeout=TIMEOUTS["git"],
+    )
+
+
+def snapshot_from_git(repo: Path) -> Snapshot:
+    repo_head = require_clean_repo(repo)
+    contract_bytes = git_show(repo, repo_head, ENTRYPOINT_CONTRACT_RELATIVE)
+    contract = load_contract_bytes(contract_bytes)
+    return Snapshot(
+        repo_head=repo_head,
+        dirty=False,
+        contract=contract,
+        contract_bytes=contract_bytes,
+        runtime_input_bytes=git_show(repo, repo_head, RUNTIME_INPUT_RELATIVE),
+        runtime_lock_bytes=git_show(repo, repo_head, RUNTIME_LOCK_RELATIVE),
+        source_bytes=git_show(repo, repo_head, contract.source),
+    )
+
+
+def snapshot_from_worktree(repo: Path) -> Snapshot:
+    repo_head = git_head(repo)
+    dirty = repo_dirty(repo)
+    contract_path = repo / ENTRYPOINT_CONTRACT_RELATIVE
+    contract_bytes = contract_path.read_bytes()
+    contract = load_contract_bytes(contract_bytes)
+    return Snapshot(
+        repo_head=repo_head,
+        dirty=dirty,
+        contract=contract,
+        contract_bytes=contract_bytes,
+        runtime_input_bytes=(repo / RUNTIME_INPUT_RELATIVE).read_bytes(),
+        runtime_lock_bytes=(repo / RUNTIME_LOCK_RELATIVE).read_bytes(),
+        source_bytes=(repo / contract.source).read_bytes(),
+    )
 
 
 @contextmanager
@@ -118,7 +468,7 @@ def deployment_lock(lock_path: Path) -> Iterator[None]:
         handle.write(
             json.dumps(
                 {
-                    "pid": str(Path("/proc/self").resolve().name),
+                    "pid": os.getpid(),
                     "acquired_at_unix": int(time.time()),
                 },
                 sort_keys=True,
@@ -132,36 +482,188 @@ def deployment_lock(lock_path: Path) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def service_active() -> bool:
-    result = run(
-        ["systemctl", "--user", "is-active", "--quiet", SERVICE],
-        check=False,
+def releases_root_for(runtime: Path) -> Path:
+    return runtime.parent / RELEASES_DIR_NAME
+
+
+def release_id_base(snapshot: Snapshot) -> str:
+    return (
+        f"{snapshot.repo_head[:12]}"
+        f"-src{snapshot.source_sha256[:12]}"
+        f"-lock{snapshot.runtime_lock_sha256[:12]}"
+        f"-contract{snapshot.contract_sha256[:12]}"
     )
-    return result.returncode == 0
 
 
-def http_text(url: str) -> str | None:
+def allocate_release_path(releases_root: Path, snapshot: Snapshot) -> tuple[str, Path]:
+    releases_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    base = release_id_base(snapshot)
+    for attempt in range(1000):
+        release_id = base if attempt == 0 else f"{base}-attempt{attempt}"
+        release_path = releases_root / release_id
+        try:
+            release_path.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        return release_id, release_path
+    fail(f"Keine freie Release-ID für {base}")
+
+
+def write_snapshot_inputs(snapshot: Snapshot, release_path: Path) -> dict[str, str]:
+    inputs = release_path / "inputs"
+    source_path = inputs / snapshot.contract.source
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    inputs.mkdir(parents=True, exist_ok=True)
+    files = {
+        "runtime_entrypoint": inputs / ENTRYPOINT_CONTRACT_RELATIVE.name,
+        "runtime_input": inputs / RUNTIME_INPUT_RELATIVE.name,
+        "runtime_lock": inputs / RUNTIME_LOCK_RELATIVE.name,
+        "source": source_path,
+    }
+    files["runtime_entrypoint"].write_bytes(snapshot.contract_bytes)
+    files["runtime_input"].write_bytes(snapshot.runtime_input_bytes)
+    files["runtime_lock"].write_bytes(snapshot.runtime_lock_bytes)
+    files["source"].write_bytes(snapshot.source_bytes)
+    return {key: str(path) for key, path in files.items()}
+
+
+def pip_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PIP_CONFIG_FILE"] = os.devnull
+    env["PIP_NO_INPUT"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
+def python_json(python_exe: Path, code: str) -> Any:
     result = run(
-        ["curl", "-fsS", "--max-time", "2", url],
-        check=False,
+        [str(python_exe), "-c", code],
         capture=True,
+        timeout=TIMEOUTS["python"],
+        env=pip_env(),
     )
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip()
+    return json.loads(result.stdout)
 
 
-def wait_until_ready(timeout_seconds: int) -> bool:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if (
-            service_active()
-            and http_text(HEALTH_URL) == "live"
-            and http_text(READY_URL) == "ready"
+def site_packages_path(python_exe: Path) -> Path:
+    value = python_json(
+        python_exe,
+        "import json,sysconfig; print(json.dumps(sysconfig.get_paths()['purelib']))",
+    )
+    return Path(value)
+
+
+def installed_distributions(python_exe: Path) -> dict[str, str]:
+    return python_json(
+        python_exe,
+        (
+            "import importlib.metadata,json; "
+            "print(json.dumps({d.metadata['Name']: d.version "
+            "for d in importlib.metadata.distributions() if d.metadata.get('Name')}, "
+            "sort_keys=True))"
+        ),
+    )
+
+
+def verify_installed_distributions(python_exe: Path, lock_path: Path) -> None:
+    locked = parse_runtime_lock(lock_path)
+    installed_raw = installed_distributions(python_exe)
+    installed = {
+        normalize_package_name(name): version
+        for name, version in installed_raw.items()
+    }
+    allowed = set(locked) | ALLOWED_VENV_BASE_DISTS
+    unexpected = sorted(set(installed) - allowed)
+    if unexpected:
+        fail("Unerwartete installierte Distributionen: " + ", ".join(unexpected))
+    missing = sorted(set(locked) - set(installed))
+    if missing:
+        fail("Runtime-Lockpakete fehlen in der Venv: " + ", ".join(missing))
+    mismatched = sorted(
+        f"{name}=={installed[name]} != {locked[name]}"
+        for name in locked
+        if installed.get(name) != locked[name]
+    )
+    if mismatched:
+        fail("Installierte Versionen weichen vom Lock ab: " + ", ".join(mismatched))
+
+
+def module_destination(site_packages: Path, module: str) -> Path:
+    parts = module.split(".")
+    if len(parts) == 1:
+        return site_packages / f"{parts[0]}.py"
+    package_root = site_packages
+    for part in parts[:-1]:
+        package_root = package_root / part
+        package_root.mkdir(exist_ok=True)
+        init = package_root / "__init__.py"
+        if not init.exists():
+            init.write_text("", encoding="utf-8")
+    return package_root / f"{parts[-1]}.py"
+
+
+def install_runtime_source(snapshot: Snapshot, release_path: Path, python_exe: Path) -> Path:
+    if snapshot.contract.mode == "module":
+        assert snapshot.contract.module is not None
+        destination = module_destination(
+            site_packages_path(python_exe),
+            snapshot.contract.module,
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(snapshot.source_bytes)
+        run(
+            [str(python_exe), "-m", "py_compile", str(destination)],
+            timeout=TIMEOUTS["python"],
+            env=pip_env(),
+        )
+        return destination
+
+    assert snapshot.contract.script is not None
+    destination = release_path / snapshot.contract.script
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(snapshot.source_bytes)
+    run(
+        [str(python_exe), "-m", "py_compile", str(destination)],
+        timeout=TIMEOUTS["python"],
+        env=pip_env(),
+    )
+    return destination
+
+
+def is_within(path: Path, root: Path) -> bool:
+    resolved_path = path.resolve()
+    resolved_root = root.resolve()
+    return resolved_path == resolved_root or resolved_root in resolved_path.parents
+
+
+def import_module_path(python_exe: Path, module: str) -> Path:
+    code = (
+        "import importlib.util,json; "
+        f"spec=importlib.util.find_spec({module!r}); "
+        "print(json.dumps(None if spec is None else spec.origin))"
+    )
+    origin = python_json(python_exe, code)
+    if not isinstance(origin, str):
+        fail(f"Modul {module!r} ist in der Release-Venv nicht importierbar")
+    return Path(origin)
+
+
+def verify_entrypoint_importable(release_path: Path, python_exe: Path, contract: RuntimeContract) -> Path:
+    if contract.mode == "module":
+        assert contract.module is not None
+        module_path = import_module_path(python_exe, contract.module)
+        if not (
+            is_within(module_path, release_path / ".venv")
+            or is_within(module_path, release_path)
         ):
-            return True
-        time.sleep(1)
-    return False
+            fail(
+                f"Modul {contract.module!r} liegt außerhalb des Releases: {module_path}"
+            )
+        return module_path
+    assert contract.script is not None
+    script = release_path / contract.script
+    require_file(script, "Runtime-Script")
+    return script
 
 
 def send_json(proc: subprocess.Popen[bytes], payload: dict[str, Any]) -> None:
@@ -225,17 +727,19 @@ def stop_process(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=3)
 
 
-def probe_mcp(python_exe: Path, server_script: Path) -> str:
+def probe_mcp(release_path: Path, python_exe: Path, contract: RuntimeContract) -> str:
     last_error: Exception | None = None
 
-    for version in PROTOCOL_VERSIONS:
+    for version in MCP_PROTOCOL_VERSIONS:
         with tempfile.TemporaryFile() as stderr_file:
             proc = subprocess.Popen(
-                [str(python_exe), str(server_script)],
+                contract.command_argv(release_path, python_exe),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,
+                cwd=str(release_path),
                 bufsize=0,
+                env=pip_env(),
             )
 
             try:
@@ -255,11 +759,10 @@ def probe_mcp(python_exe: Path, server_script: Path) -> str:
                         },
                     },
                 )
-                initialized = wait_for_id(proc, 1, 15)
+                initialized = wait_for_id(proc, 1, TIMEOUTS["mcp_probe"])
                 if "error" in initialized:
                     raise DeployError(
-                        f"initialize({version}) meldete "
-                        f"{initialized['error']}"
+                        f"initialize({version}) meldete {initialized['error']}"
                     )
 
                 negotiated = initialized.get("result", {}).get(
@@ -287,7 +790,7 @@ def probe_mcp(python_exe: Path, server_script: Path) -> str:
                         "params": {},
                     },
                 )
-                listed = wait_for_id(proc, 2, 15)
+                listed = wait_for_id(proc, 2, TIMEOUTS["mcp_probe"])
                 if "error" in listed:
                     raise DeployError(
                         f"tools/list meldete {listed['error']}"
@@ -304,7 +807,7 @@ def probe_mcp(python_exe: Path, server_script: Path) -> str:
                     for item in tools
                     if isinstance(item, dict)
                 }
-                missing = sorted(EXPECTED_TOOLS - names)
+                missing = sorted(set(contract.expected_tools) - names)
                 if missing:
                     raise DeployError(
                         "MCP-Probe vermisst Werkzeuge: "
@@ -321,10 +824,10 @@ def probe_mcp(python_exe: Path, server_script: Path) -> str:
                 stderr_tail = stderr_file.read().decode(
                     "utf-8",
                     errors="replace",
-                )[-4000:]
+                )
                 if stderr_tail:
                     print(
-                        f"MCP-Probe stderr ({version}):\n{stderr_tail}",
+                        f"MCP-Probe stderr ({version}):\n{redact_text(stderr_tail)}",
                         file=sys.stderr,
                     )
 
@@ -332,118 +835,189 @@ def probe_mcp(python_exe: Path, server_script: Path) -> str:
 
 
 def python_provenance(python_exe: Path) -> dict[str, str]:
-    result = run(
-        [
-            str(python_exe),
-            "-c",
-            (
-                "import json,platform,sys; "
-                "print(json.dumps({"
-                "'python_version': platform.python_version(),"
-                "'python_implementation': platform.python_implementation(),"
-                "'platform': platform.platform(),"
-                "'executable': sys.executable"
-                "}, sort_keys=True))"
-            ),
-        ],
-        capture=True,
+    data = python_json(
+        python_exe,
+        (
+            "import json,platform,sys; "
+            "print(json.dumps({"
+            "'python_version': platform.python_version(),"
+            "'python_implementation': platform.python_implementation(),"
+            "'platform': platform.platform(),"
+            "'executable': sys.executable"
+            "}, sort_keys=True))"
+        ),
     )
-    data = json.loads(result.stdout)
     pip = run(
         [str(python_exe), "-m", "pip", "--version"],
         capture=True,
+        timeout=TIMEOUTS["python"],
+        env=pip_env(),
     ).stdout.strip()
-    data["pip_version"] = pip
+    data["pip_version"] = pip.split(" from ", 1)[0]
     return data
 
 
-def create_stage(
-    repo: Path,
-    runtime: Path,
-) -> tuple[Path, str, dict[str, str]]:
-    runtime_parent = runtime.parent
-    runtime_parent.mkdir(parents=True, exist_ok=True)
+@dataclass
+class BuildResult:
+    release_id: str
+    release_path: Path
+    python_exe: Path
+    entrypoint_path: Path
+    protocol_version: str
+    provenance: dict[str, str]
 
-    stage = Path(
-        tempfile.mkdtemp(
-            prefix=".grabowski-mcp.stage.",
-            dir=runtime_parent,
-        )
-    )
 
+def mark_incomplete(release_path: Path, phase: str, exc: BaseException) -> None:
+    marker = {
+        "schema_version": 1,
+        "completion_status": "incomplete",
+        "phase": phase,
+        "error": str(exc),
+        "created_at_unix": int(time.time()),
+    }
     try:
-        source = repo / "src" / "grabowski_mcp.py"
-        lockfile = repo / RUNTIME_LOCK_RELATIVE
-        require_file(source, "MCP-Server")
-        require_file(lockfile, "Runtime-Lockfile")
+        (release_path / INCOMPLETE_MARKER).write_text(
+            json.dumps(marker, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
-        venv = stage / ".venv"
-        run([sys.executable, "-m", "venv", str(venv)])
+
+def build_release(
+    snapshot: Snapshot,
+    releases_root: Path,
+    stable_runtime: Path,
+) -> BuildResult:
+    release_id, release_path = allocate_release_path(releases_root, snapshot)
+    phase = "inputs"
+    try:
+        input_paths = write_snapshot_inputs(snapshot, release_path)
+        runtime_input = release_path / "inputs" / RUNTIME_INPUT_RELATIVE.name
+        runtime_lock = release_path / "inputs" / RUNTIME_LOCK_RELATIVE.name
+        direct_pins = parse_runtime_input(runtime_input)
+        locked_pins = parse_runtime_lock(runtime_lock)
+        missing_direct = sorted(set(direct_pins) - set(locked_pins))
+        if missing_direct:
+            fail("Direkte Pins fehlen im Lock: " + ", ".join(missing_direct))
+
+        phase = "venv"
+        venv = release_path / ".venv"
+        run(
+            [sys.executable, "-m", "venv", str(venv)],
+            timeout=TIMEOUTS["python"],
+            env=pip_env(),
+        )
         venv_python = venv / "bin" / "python"
+
+        phase = "package-install"
         run(
             [
                 str(venv_python),
                 "-m",
                 "pip",
                 "install",
+                "--isolated",
                 "--disable-pip-version-check",
                 "--no-input",
                 "--require-hashes",
                 "--no-deps",
+                "--only-binary=:all:",
+                "--index-url",
+                "https://pypi.org/simple",
                 "-r",
-                str(lockfile),
-            ]
+                str(runtime_lock),
+            ],
+            timeout=TIMEOUTS["package_install"],
+            env=pip_env(),
         )
-        run([str(venv_python), "-m", "pip", "check"])
-
-        shutil.copy2(source, stage / "grabowski_mcp.py")
         run(
-            [
-                str(venv_python),
-                "-m",
-                "py_compile",
-                str(stage / "grabowski_mcp.py"),
-            ]
+            [str(venv_python), "-m", "pip", "check"],
+            timeout=TIMEOUTS["python"],
+            env=pip_env(),
         )
-        negotiated = probe_mcp(
-            venv_python,
-            stage / "grabowski_mcp.py",
-        )
-        return stage, negotiated, python_provenance(venv_python)
+        verify_installed_distributions(venv_python, runtime_lock)
 
-    except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
+        phase = "runtime-source"
+        installed_entrypoint = install_runtime_source(snapshot, release_path, venv_python)
+        entrypoint_path = verify_entrypoint_importable(
+            release_path,
+            venv_python,
+            snapshot.contract,
+        )
+        if entrypoint_path.resolve() != installed_entrypoint.resolve():
+            fail(
+                "Installierter Entry-Point weicht von der Importauflösung ab: "
+                f"{installed_entrypoint} != {entrypoint_path}"
+            )
+
+        phase = "mcp-probe"
+        protocol_version = probe_mcp(release_path, venv_python, snapshot.contract)
+        provenance = python_provenance(venv_python)
+
+        phase = "manifest"
+        write_manifest(
+            release_path,
+            release_id=release_id,
+            snapshot=snapshot,
+            stable_runtime=stable_runtime,
+            input_paths=input_paths,
+            entrypoint_path=entrypoint_path,
+            protocol_version=protocol_version,
+            provenance=provenance,
+        )
+        return BuildResult(
+            release_id=release_id,
+            release_path=release_path,
+            python_exe=venv_python,
+            entrypoint_path=entrypoint_path,
+            protocol_version=protocol_version,
+            provenance=provenance,
+        )
+    except Exception as exc:
+        mark_incomplete(release_path, phase, exc)
         raise
 
 
 def write_manifest(
-    stage: Path,
+    release_path: Path,
     *,
-    repo_head: str,
-    source_hash: str,
-    lockfile_hash: str,
+    release_id: str,
+    snapshot: Snapshot,
+    stable_runtime: Path,
+    input_paths: dict[str, str],
+    entrypoint_path: Path,
     protocol_version: str,
     provenance: dict[str, str],
 ) -> None:
     manifest: dict[str, Any] = {
-        "schema_version": 2,
-        "repo_head": repo_head,
-        "source_sha256": source_hash,
-        "runtime_lock_path": str(RUNTIME_LOCK_RELATIVE),
-        "runtime_lock_sha256": lockfile_hash,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "release_id": release_id,
+        "repo_head": snapshot.repo_head,
+        "entrypoint_contract": snapshot.contract.to_manifest(),
+        "entrypoint_contract_sha256": snapshot.contract_sha256,
+        "source_sha256": snapshot.source_sha256,
+        "runtime_input_sha256": snapshot.runtime_input_sha256,
+        "runtime_lock_sha256": snapshot.runtime_lock_sha256,
+        "snapshot_paths": input_paths,
+        "immutable_release_path": str(release_path),
+        "expected_stable_runtime_path": str(stable_runtime),
+        "release_python_path": str(release_path / ".venv/bin/python"),
+        "entrypoint_path": str(entrypoint_path),
         "mcp_protocol_version": protocol_version,
         "created_at_unix": int(time.time()),
+        "completion_status": "complete",
         **provenance,
     }
-    path = stage / "deployment-manifest.json"
+    path = release_path / MANIFEST_NAME
     path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
 
-def read_manifest(runtime: Path) -> dict[str, Any]:
-    path = runtime / "deployment-manifest.json"
+def read_manifest(runtime_or_release: Path) -> dict[str, Any]:
+    path = runtime_or_release / MANIFEST_NAME
     require_file(path, "Deployment-Manifest")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -454,20 +1028,55 @@ def read_manifest(runtime: Path) -> dict[str, Any]:
     return data
 
 
-def verify_manifest(
-    runtime: Path,
-    *,
-    repo_head: str,
-    source_hash: str,
-    lockfile_hash: str,
-) -> dict[str, Any]:
-    manifest = read_manifest(runtime)
-    expected = {
-        "schema_version": 2,
-        "repo_head": repo_head,
-        "source_sha256": source_hash,
-        "runtime_lock_sha256": lockfile_hash,
+def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
+    required = {
+        "schema_version": int,
+        "release_id": str,
+        "repo_head": str,
+        "entrypoint_contract": dict,
+        "entrypoint_contract_sha256": str,
+        "source_sha256": str,
+        "runtime_lock_sha256": str,
+        "snapshot_paths": dict,
+        "immutable_release_path": str,
+        "expected_stable_runtime_path": str,
+        "release_python_path": str,
+        "platform": str,
+        "python_version": str,
+        "python_implementation": str,
+        "mcp_protocol_version": str,
+        "created_at_unix": int,
+        "completion_status": str,
     }
+    errors: list[str] = []
+    for key, kind in required.items():
+        if not isinstance(manifest.get(key), kind):
+            errors.append(key)
+    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        errors.append("schema_version")
+    if manifest.get("completion_status") != "complete":
+        errors.append("completion_status")
+    return errors
+
+
+def verify_manifest(
+    runtime_or_release: Path,
+    *,
+    snapshot: Snapshot,
+    stable_runtime: Path | None = None,
+) -> dict[str, Any]:
+    manifest = read_manifest(runtime_or_release)
+    schema_errors = validate_manifest_schema(manifest)
+    if schema_errors:
+        fail("Deployment-Manifest ist nicht schema-valid: " + ", ".join(schema_errors))
+    expected = {
+        "repo_head": snapshot.repo_head,
+        "source_sha256": snapshot.source_sha256,
+        "runtime_lock_sha256": snapshot.runtime_lock_sha256,
+        "entrypoint_contract_sha256": snapshot.contract_sha256,
+    }
+    if stable_runtime is not None:
+        expected["expected_stable_runtime_path"] = str(stable_runtime)
     for key, value in expected.items():
         if manifest.get(key) != value:
             fail(
@@ -477,23 +1086,102 @@ def verify_manifest(
     return manifest
 
 
-def verify_profile_command(profile_path: Path, runtime: Path) -> None:
+@dataclass(frozen=True)
+class EntryPoint:
+    mode: str
+    python: Path
+    module: str | None = None
+    script: Path | None = None
+
+    def compatible_with(self, contract: RuntimeContract) -> bool:
+        if self.mode != contract.mode:
+            return False
+        if self.mode == "module":
+            return self.module == contract.module
+        return self.script == contract.script
+
+    def describe(self) -> str:
+        if self.mode == "module":
+            return f"{self.python} -m {self.module}"
+        return f"{self.python} {self.script}"
+
+
+def recursive_values_for_key(value: Any, key: str) -> list[Any]:
+    found: list[Any] = []
+    if isinstance(value, dict):
+        for item_key, item_value in value.items():
+            if item_key == key:
+                found.append(item_value)
+            found.extend(recursive_values_for_key(item_value, key))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(recursive_values_for_key(item, key))
+    return found
+
+
+def yaml_profile_command(profile_path: Path) -> list[str]:
     require_file(profile_path, "Tunnelprofil")
-    text = profile_path.read_text(encoding="utf-8")
-    expected_python = str(runtime / ".venv/bin/python")
-    expected_server = str(runtime / "grabowski_mcp.py")
-    command_lines = [line for line in text.splitlines() if "command:" in line]
-    if not any(
-        expected_python in line and expected_server in line
-        for line in command_lines
-    ):
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ImportError as exc:
+        fail("PyYAML ist für strukturierte Profilprüfung erforderlich")
+        raise AssertionError from exc
+    data = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    commands = recursive_values_for_key(data, "command")
+    string_commands = [item for item in commands if isinstance(item, str)]
+    list_commands = [item for item in commands if isinstance(item, list)]
+    if len(string_commands) + len(list_commands) != 1:
+        fail("Tunnelprofil enthält nicht genau einen strukturierten command")
+    if string_commands:
+        return shlex.split(string_commands[0])
+    values = list_commands[0]
+    if not all(isinstance(item, str) for item in values):
+        fail("Tunnelprofil-command-Liste enthält Nicht-String-Werte")
+    return list(values)
+
+
+def profile_entrypoint(profile_path: Path, runtime: Path) -> EntryPoint:
+    argv = yaml_profile_command(profile_path)
+    if len(argv) < 3:
+        fail("Tunnelprofil-command ist zu kurz")
+    expected_python = runtime / ".venv/bin/python"
+    if argv[0] != str(expected_python):
+        fail("Tunnelprofil verwendet nicht den stabilen Runtime-Pythonpfad")
+    if argv[1] == "-m" and len(argv) == 3:
+        if not MODULE_RE.match(argv[2]):
+            fail(f"Tunnelprofil verwendet ein ungültiges Modul: {argv[2]}")
+        return EntryPoint(mode="module", python=expected_python, module=argv[2])
+    if len(argv) == 2:
+        script = Path(argv[1])
+        if script.is_absolute():
+            try:
+                script = script.relative_to(runtime)
+            except ValueError:
+                fail("Tunnelprofil-Script liegt außerhalb des stabilen Runtimepfads")
+        return EntryPoint(mode="script", python=expected_python, script=script)
+    fail("Tunnelprofil-command entspricht keinem unterstützten Entry-Point")
+
+
+def require_profile_matches_contract(profile_path: Path, runtime: Path, contract: RuntimeContract) -> EntryPoint:
+    live = profile_entrypoint(profile_path, runtime)
+    if not live.compatible_with(contract):
         fail(
-            "Tunnelprofil zeigt nicht auf die deployte Runtime: "
-            f"{profile_path}"
+            "Live-Profil und Branch-Runtimevertrag passen nicht zusammen: "
+            f"Profil={live.describe()} Branch={contract.describe()}"
         )
+    return live
 
 
-def verify_service_execstart() -> None:
+def service_active() -> bool:
+    result = run(
+        ["systemctl", "--user", "is-active", "--quiet", SERVICE],
+        check=False,
+        timeout=TIMEOUTS["systemd_query"],
+    )
+    return result.returncode == 0
+
+
+def service_state() -> dict[str, Any]:
     result = run(
         [
             "systemctl",
@@ -501,14 +1189,23 @@ def verify_service_execstart() -> None:
             "show",
             SERVICE,
             "-p",
-            "ExecStart",
-            "--value",
+            "ActiveState",
+            "-p",
+            "SubState",
+            "-p",
+            "MainPID",
+            "--no-pager",
         ],
         capture=True,
+        check=False,
+        timeout=TIMEOUTS["systemd_query"],
     )
-    value = result.stdout.strip()
-    if "tunnel-client" not in value or PROFILE_NAME not in value:
-        fail(f"Unerwartetes systemd ExecStart: {value}")
+    data: dict[str, Any] = {"returncode": result.returncode}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            data[key] = value
+    return data
 
 
 def service_main_pid() -> int:
@@ -523,6 +1220,7 @@ def service_main_pid() -> int:
             "--value",
         ],
         capture=True,
+        timeout=TIMEOUTS["systemd_query"],
     )
     try:
         pid = int(result.stdout.strip())
@@ -532,6 +1230,81 @@ def service_main_pid() -> int:
     if pid <= 0:
         fail(f"{SERVICE} besitzt keine aktive MainPID.")
     return pid
+
+
+def http_text(url: str) -> str | None:
+    result = run(
+        ["curl", "-fsS", "--max-time", "2", url],
+        check=False,
+        capture=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def journal_tail() -> str:
+    result = run(
+        [
+            "journalctl",
+            "--user",
+            "-u",
+            SERVICE,
+            "-n",
+            "40",
+            "--no-pager",
+        ],
+        check=False,
+        capture=True,
+        timeout=TIMEOUTS["journal"],
+    )
+    return redact_text(result.stdout + result.stderr)
+
+
+@dataclass
+class ReadinessResult:
+    ok: bool
+    service: dict[str, Any]
+    health: str | None
+    readiness: str | None
+    main_pid: int | None
+    journal: str = ""
+
+
+def readiness_probe(*, include_journal: bool = False) -> ReadinessResult:
+    state = service_state()
+    main_pid: int | None = None
+    try:
+        main_pid = int(str(state.get("MainPID", "0")))
+    except ValueError:
+        main_pid = None
+    health = http_text(HEALTH_URL)
+    readiness = http_text(READY_URL)
+    ok = (
+        state.get("ActiveState") == "active"
+        and health == "live"
+        and readiness == "ready"
+    )
+    return ReadinessResult(
+        ok=ok,
+        service=state,
+        health=health,
+        readiness=readiness,
+        main_pid=main_pid,
+        journal=journal_tail() if include_journal and not ok else "",
+    )
+
+
+def wait_until_ready(timeout_seconds: int) -> ReadinessResult:
+    deadline = time.monotonic() + timeout_seconds
+    last = readiness_probe()
+    while time.monotonic() < deadline:
+        last = readiness_probe()
+        if last.ok:
+            return last
+        time.sleep(1)
+    return readiness_probe(include_journal=True)
 
 
 def child_pids(pid: int, proc_root: Path = Path("/proc")) -> list[int]:
@@ -574,93 +1347,328 @@ def process_argv(pid: int, proc_root: Path = Path("/proc")) -> list[str]:
     ]
 
 
-def verify_running_runtime(
+def process_exe(pid: int, proc_root: Path = Path("/proc")) -> Path | None:
+    path = proc_root / str(pid) / "exe"
+    try:
+        return Path(os.readlink(path))
+    except OSError:
+        return None
+
+
+def verify_systemd_tunnel_process(
+    *,
+    main_pid: int | None = None,
+    proc_root: Path = Path("/proc"),
+) -> int:
+    pid = service_main_pid() if main_pid is None else main_pid
+    argv = process_argv(pid, proc_root)
+    expected_a = [str(HOME / ".local/bin/tunnel-client"), "run", "--profile", PROFILE_NAME]
+    expected_b = [str(HOME / ".local/bin/tunnel-client"), "run", f"--profile={PROFILE_NAME}"]
+    if tuple(argv) not in {tuple(expected_a), tuple(expected_b)}:
+        fail("systemd-MainPID verwendet nicht exakt den erwarteten Tunnel-Client")
+    return pid
+
+
+def argv_matches_entrypoint(argv: list[str], runtime: Path, contract: RuntimeContract) -> bool:
+    if len(argv) != 3 or argv[1] != "-m":
+        if contract.mode == "script" and len(argv) == 2:
+            assert contract.script is not None
+            return Path(argv[0]).resolve() == (runtime / ".venv/bin/python").resolve() and Path(argv[1]).resolve() == (runtime / contract.script).resolve()
+        return False
+    if contract.mode != "module":
+        return False
+    return (
+        Path(argv[0]).resolve() == (runtime / ".venv/bin/python").resolve()
+        and argv[2] == contract.module
+    )
+
+
+def verify_running_entrypoint(
     runtime: Path,
+    contract: RuntimeContract,
+    *,
+    main_pid: int | None = None,
+    proc_root: Path = Path("/proc"),
+    release_hint: Path | None = None,
+) -> dict[str, Any]:
+    root_pid = verify_systemd_tunnel_process(main_pid=main_pid, proc_root=proc_root)
+    expected_python = runtime / ".venv/bin/python"
+    expected_python_resolved = expected_python.resolve()
+    expected_root = release_hint or runtime.resolve()
+
+    for pid in descendant_pids(root_pid, proc_root):
+        argv = process_argv(pid, proc_root)
+        if not argv_matches_entrypoint(argv, runtime, contract):
+            continue
+        exe = process_exe(pid, proc_root)
+        if exe is None or exe.resolve() != expected_python_resolved:
+            continue
+        entrypoint_path = verify_entrypoint_importable(
+            expected_root,
+            expected_python,
+            contract,
+        )
+        return {
+            "pid": pid,
+            "entrypoint_path": str(entrypoint_path),
+            "argv": redact_argv(argv),
+        }
+
+    fail("Kein laufender MCP-Prozess verwendet exakt den erwarteten Entry-Point")
+
+
+def verify_running_runtime(
+    release_path: Path,
+    runtime: Path,
+    contract: RuntimeContract,
     *,
     main_pid: int | None = None,
     proc_root: Path = Path("/proc"),
 ) -> dict[str, Any]:
-    root_pid = service_main_pid() if main_pid is None else main_pid
-    expected_python = str(runtime / ".venv/bin/python")
-    expected_server = str(runtime / "grabowski_mcp.py")
-
-    for pid in [root_pid, *descendant_pids(root_pid, proc_root)]:
-        argv = process_argv(pid, proc_root)
-        if expected_python in argv and expected_server in argv:
-            return {"pid": pid, "argv": argv}
-
-    fail(
-        "Kein laufender MCP-Prozess verwendet die erwartete Runtime: "
-        f"{runtime}"
+    if not runtime.is_symlink():
+        fail("Stabiler Runtimepfad ist kein Symlink")
+    if runtime.resolve() != release_path.resolve():
+        fail(
+            "Stabiler Runtime-Symlink zeigt nicht auf das ausgewählte Release: "
+            f"{runtime} -> {runtime.resolve()}"
+        )
+    return verify_running_entrypoint(
+        runtime,
+        contract,
+        main_pid=main_pid,
+        proc_root=proc_root,
+        release_hint=release_path,
     )
 
 
 def verify_runtime_identity(
+    release_path: Path,
     runtime: Path,
-    profile_path: Path,
+    contract: RuntimeContract,
     *,
-    repo_head: str,
-    source_hash: str,
-    lockfile_hash: str,
+    snapshot: Snapshot,
 ) -> dict[str, Any]:
-    verify_profile_command(profile_path, runtime)
-    verify_service_execstart()
-    process = verify_running_runtime(runtime)
+    process = verify_running_runtime(release_path, runtime, contract)
     manifest = verify_manifest(
-        runtime,
-        repo_head=repo_head,
-        source_hash=source_hash,
-        lockfile_hash=lockfile_hash,
+        release_path,
+        snapshot=snapshot,
+        stable_runtime=runtime,
     )
     return {"process": process, "manifest": manifest}
 
 
-def install_stage(
-    runtime: Path,
-    stage: Path,
-    *,
-    stamp: str,
-) -> Path | None:
-    backup: Path | None = None
+@dataclass
+class PointerState:
+    kind: str
+    path: Path
+    target: Path | None = None
 
+
+def capture_pointer(runtime: Path) -> PointerState:
+    if runtime.is_symlink():
+        return PointerState("symlink", runtime, runtime.readlink())
     if runtime.exists():
-        backup = runtime.with_name(
-            f"{runtime.name}.rollback.{stamp}"
-        )
-        if backup.exists():
-            fail(f"Rollback-Pfad existiert bereits: {backup}")
-        runtime.rename(backup)
+        if not runtime.is_dir():
+            fail(f"Runtimepfad ist weder Verzeichnis noch Symlink: {runtime}")
+        return PointerState("directory", runtime)
+    return PointerState("missing", runtime)
 
+
+def require_runtime_replaceable(runtime: Path) -> None:
+    if not str(runtime).startswith(str(HOME) + os.sep):
+        fail(f"Runtimepfad liegt außerhalb des Userbereichs: {runtime}")
+    if not runtime.parent.is_dir() or not os.access(runtime.parent, os.W_OK):
+        fail(f"Runtime-Parent ist nicht schreibbar: {runtime.parent}")
+    capture_pointer(runtime)
+
+
+def unique_sibling(path: Path, suffix: str) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for attempt in range(1000):
+        candidate = path.with_name(
+            f"{path.name}.{suffix}.{stamp}"
+            if attempt == 0
+            else f"{path.name}.{suffix}.{stamp}.{attempt}"
+        )
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+    fail(f"Kein freier Pfad neben {path} für {suffix}")
+
+
+def atomic_symlink_replace(runtime: Path, target: Path) -> None:
+    temporary = runtime.with_name(f".{runtime.name}.next.{os.getpid()}")
     try:
-        stage.rename(runtime)
-    except Exception:
-        if backup is not None and backup.exists() and not runtime.exists():
-            backup.rename(runtime)
-        raise
+        os.symlink(str(target), temporary)
+        os.replace(temporary, runtime)
+    finally:
+        try:
+            if temporary.is_symlink() or temporary.exists():
+                temporary.unlink()
+        except FileNotFoundError:
+            pass
 
-    return backup
+
+def activate_pointer(runtime: Path, release_path: Path, previous: PointerState) -> Path | None:
+    legacy_backup: Path | None = None
+    if previous.kind == "directory":
+        legacy_backup = unique_sibling(runtime, "legacy")
+        runtime.rename(legacy_backup)
+        try:
+            atomic_symlink_replace(runtime, release_path)
+        except Exception:
+            if not runtime.exists() and legacy_backup.exists():
+                legacy_backup.rename(runtime)
+            raise
+        return legacy_backup
+    if previous.kind in {"symlink", "missing"}:
+        atomic_symlink_replace(runtime, release_path)
+        return None
+    fail(f"Nicht unterstützter Pointerzustand: {previous.kind}")
 
 
-def restore_previous_runtime(
+def restore_pointer(
     runtime: Path,
-    backup: Path | None,
+    previous: PointerState,
+    legacy_backup: Path | None,
+) -> None:
+    if previous.kind == "directory":
+        if legacy_backup is None or not legacy_backup.exists():
+            fail("Legacy-Backup fehlt für Rollback")
+        if runtime.exists() or runtime.is_symlink():
+            failed_pointer = unique_sibling(runtime, "failed-pointer")
+            runtime.rename(failed_pointer)
+        legacy_backup.rename(runtime)
+        return
+    if previous.kind == "symlink":
+        assert previous.target is not None
+        atomic_symlink_replace(runtime, previous.target)
+        return
+    if previous.kind == "missing":
+        if runtime.exists() or runtime.is_symlink():
+            runtime.unlink()
+        return
+    fail(f"Nicht unterstützter Rollback-Pointerzustand: {previous.kind}")
+
+
+@dataclass
+class RollbackState:
+    original_error: str
+    phase: str
+    previous_pointer: dict[str, str | None]
+    stop_returncode: int | None = None
+    inactive_after_stop: bool | None = None
+    pointer_restore: str | None = None
+    start_returncode: int | None = None
+    readiness_ok: bool | None = None
+    restored_identity: str | None = None
+    final_pointer: dict[str, str | None] | None = None
+    final_service: dict[str, Any] | None = None
+    errors: list[str] = field(default_factory=list)
+
+    def message(self) -> str:
+        payload = {
+            "original_error": self.original_error,
+            "phase": self.phase,
+            "previous_pointer": self.previous_pointer,
+            "stop_returncode": self.stop_returncode,
+            "inactive_after_stop": self.inactive_after_stop,
+            "pointer_restore": self.pointer_restore,
+            "start_returncode": self.start_returncode,
+            "readiness_ok": self.readiness_ok,
+            "restored_identity": self.restored_identity,
+            "final_pointer": self.final_pointer,
+            "final_service": self.final_service,
+            "rollback_errors": self.errors,
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+def pointer_to_dict(pointer: PointerState) -> dict[str, str | None]:
+    return {
+        "kind": pointer.kind,
+        "path": str(pointer.path),
+        "target": str(pointer.target) if pointer.target is not None else None,
+    }
+
+
+def rollback_after_failure(
+    original: BaseException,
     *,
-    stamp: str,
-) -> Path | None:
-    failed_runtime: Path | None = None
+    runtime: Path,
+    previous: PointerState,
+    legacy_backup: Path | None,
+    timeout_seconds: int,
+    phase: str,
+    contract: RuntimeContract | None = None,
+) -> NoReturn:
+    state = RollbackState(
+        original_error=str(original),
+        phase=phase,
+        previous_pointer=pointer_to_dict(previous),
+    )
+    stop_result = run(
+        ["systemctl", "--user", "stop", SERVICE],
+        check=False,
+        capture=True,
+        timeout=TIMEOUTS["service_stop"],
+    )
+    state.stop_returncode = stop_result.returncode
+    inactive = not service_active()
+    state.inactive_after_stop = inactive
+    if not inactive:
+        state.errors.append("Dienst blieb aktiv; keine Pointermutation im Rollback")
+        state.final_pointer = pointer_to_dict(capture_pointer(runtime))
+        state.final_service = service_state()
+        raise DeployError("Kritischer Rollbackabbruch: " + state.message()) from original
+    try:
+        restore_pointer(runtime, previous, legacy_backup)
+        state.pointer_restore = "restored"
+    except Exception as exc:
+        state.pointer_restore = "failed"
+        state.errors.append(f"Pointerwiederherstellung fehlgeschlagen: {exc}")
 
-    if runtime.exists():
-        failed_runtime = runtime.with_name(
-            f"{runtime.name}.failed.{stamp}"
-        )
-        if failed_runtime.exists():
-            fail(f"Failed-Runtime-Pfad existiert bereits: {failed_runtime}")
-        runtime.rename(failed_runtime)
+    start_result = run(
+        ["systemctl", "--user", "start", SERVICE],
+        check=False,
+        capture=True,
+        timeout=TIMEOUTS["service_start"],
+    )
+    state.start_returncode = start_result.returncode
+    if start_result.returncode != 0:
+        state.errors.append("Start der wiederhergestellten Runtime fehlgeschlagen")
+    readiness = wait_until_ready(timeout_seconds)
+    state.readiness_ok = readiness.ok
+    if not readiness.ok:
+        state.errors.append("Wiederhergestellte Runtime wurde nicht ready")
+    if start_result.returncode == 0 and readiness.ok and contract is not None:
+        try:
+            verify_running_entrypoint(runtime, contract)
+            state.restored_identity = "verified"
+        except Exception as exc:
+            state.restored_identity = "failed"
+            state.errors.append(
+                f"Wiederhergestellte Runtime-Identität fehlgeschlagen: {exc}"
+            )
+    state.final_pointer = pointer_to_dict(capture_pointer(runtime))
+    state.final_service = service_state()
+    raise DeployError("Deployment fehlgeschlagen; Rollbackzustand: " + state.message()) from original
 
-    if backup is not None and backup.exists():
-        backup.rename(runtime)
 
-    return failed_runtime
+def verify_apply_snapshot_unchanged(repo: Path, snapshot: Snapshot, release_path: Path) -> None:
+    if repo_dirty(repo):
+        fail("Repository driftete vor Aktivierung: Arbeitsbaum ist dirty")
+    if git_head(repo) != snapshot.repo_head:
+        fail("Repository driftete vor Aktivierung: HEAD weicht ab")
+    input_root = release_path / "inputs"
+    checks = {
+        input_root / ENTRYPOINT_CONTRACT_RELATIVE.name: snapshot.contract_sha256,
+        input_root / RUNTIME_INPUT_RELATIVE.name: snapshot.runtime_input_sha256,
+        input_root / RUNTIME_LOCK_RELATIVE.name: snapshot.runtime_lock_sha256,
+        input_root / snapshot.contract.source: snapshot.source_sha256,
+    }
+    for path, expected in checks.items():
+        if sha256(path) != expected:
+            fail(f"Release-Snapshot driftete vor Aktivierung: {path}")
 
 
 def deploy(
@@ -670,139 +1678,147 @@ def deploy(
     *,
     timeout_seconds: int,
 ) -> None:
-    repo_head = require_clean_repo(repo)
+    snapshot = snapshot_from_git(repo)
+    require_runtime_replaceable(runtime)
+    require_profile_matches_contract(profile_path, runtime, snapshot.contract)
     if not service_active():
         fail(f"{SERVICE} ist vor dem Deployment nicht aktiv.")
 
-    source = repo / "src" / "grabowski_mcp.py"
-    lockfile = repo / RUNTIME_LOCK_RELATIVE
-    require_file(source, "MCP-Server")
-    require_file(lockfile, "Runtime-Lockfile")
-    source_hash = sha256(source)
-    lockfile_hash = sha256(lockfile)
-    stage, protocol_version, provenance = create_stage(repo, runtime)
-    write_manifest(
-        stage,
-        repo_head=repo_head,
-        source_hash=source_hash,
-        lockfile_hash=lockfile_hash,
-        protocol_version=protocol_version,
-        provenance=provenance,
-    )
+    build = build_release(snapshot, releases_root_for(runtime), runtime)
+    verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
+    verify_manifest(build.release_path, snapshot=snapshot, stable_runtime=runtime)
 
-    backup: Path | None = None
-    swapped = False
-    stamp = time.strftime("%Y%m%d-%H%M%S")
+    previous = capture_pointer(runtime)
+    legacy_backup: Path | None = None
+    pointer_changed = False
+    phase = "stop"
 
     try:
-        run(["systemctl", "--user", "stop", SERVICE])
-        backup = install_stage(runtime, stage, stamp=stamp)
-        swapped = True
+        stop_result = run(
+            ["systemctl", "--user", "stop", SERVICE],
+            check=False,
+            capture=True,
+            timeout=TIMEOUTS["service_stop"],
+        )
+        if service_active():
+            fail(
+                "Dienst blieb nach Stopversuch aktiv; keine Pointermutation",
+                phase="stop",
+                details={"stop_returncode": stop_result.returncode},
+            )
 
-        run(["systemctl", "--user", "start", SERVICE])
-        if not wait_until_ready(timeout_seconds):
-            fail("Neue Runtime wurde nicht rechtzeitig live und ready.")
+        phase = "activate-pointer"
+        legacy_backup = activate_pointer(runtime, build.release_path, previous)
+        pointer_changed = True
 
-        deployed_source = runtime / "grabowski_mcp.py"
-        if sha256(deployed_source) != source_hash:
-            fail("Deployter Source-Hash weicht vom Repo ab.")
+        phase = "start"
+        start_result = run(
+            ["systemctl", "--user", "start", SERVICE],
+            check=False,
+            capture=True,
+            timeout=TIMEOUTS["service_start"],
+        )
+        if start_result.returncode != 0:
+            fail("Neue Runtime konnte nicht gestartet werden", phase="start")
 
+        phase = "readiness"
+        readiness = wait_until_ready(timeout_seconds)
+        if not readiness.ok:
+            fail(
+                "Neue Runtime wurde nicht rechtzeitig live und ready.",
+                phase="readiness",
+                details={
+                    "service": readiness.service,
+                    "health": readiness.health,
+                    "readiness": readiness.readiness,
+                    "main_pid": readiness.main_pid,
+                    "journal": readiness.journal,
+                },
+            )
+
+        phase = "identity"
         identity = verify_runtime_identity(
+            build.release_path,
             runtime,
-            profile_path,
-            repo_head=repo_head,
-            source_hash=source_hash,
-            lockfile_hash=lockfile_hash,
+            snapshot.contract,
+            snapshot=snapshot,
         )
 
         print("PASS: Deployment erfolgreich")
-        print(f"Repo-HEAD:       {repo_head}")
-        print(f"Source-SHA256:   {source_hash}")
-        print(f"Lock-SHA256:     {lockfile_hash}")
-        print(f"MCP-Protokoll:   {protocol_version}")
+        print(f"Repo-HEAD:       {snapshot.repo_head}")
+        print(f"Release-ID:      {build.release_id}")
+        print(f"Source-SHA256:   {snapshot.source_sha256}")
+        print(f"Lock-SHA256:     {snapshot.runtime_lock_sha256}")
+        print(f"Entry-Point:     {snapshot.contract.describe()}")
+        print(f"MCP-Protokoll:   {build.protocol_version}")
         print(f"Runtime-PID:     {identity['process']['pid']}")
         print(f"Runtime:         {runtime}")
-        print(f"Rollback:        {backup}")
+        print(f"Release:         {build.release_path}")
+        print(f"Legacy-Backup:   {legacy_backup}")
 
     except Exception as original:
-        if swapped:
-            run(
-                ["systemctl", "--user", "stop", SERVICE],
-            )
-            try:
-                restore_previous_runtime(
-                    runtime,
-                    backup,
-                    stamp=stamp,
-                )
-            except Exception as rollback_exc:
-                raise DeployError(
-                    f"Deployment fehlgeschlagen ({original}); "
-                    f"Rollback konnte nicht installiert werden: {rollback_exc}"
-                ) from rollback_exc
-
-            run(
-                ["systemctl", "--user", "start", SERVICE],
-            )
-            if backup is not None and not wait_until_ready(timeout_seconds):
-                raise DeployError(
-                    f"Deployment fehlgeschlagen ({original}); "
-                    "wiederhergestellte Runtime wurde nicht ready."
-                ) from original
-        else:
-            if not runtime.exists() and backup is not None and backup.exists():
-                backup.rename(runtime)
+        if not pointer_changed:
             if not service_active():
-                run(
+                start_result = run(
                     ["systemctl", "--user", "start", SERVICE],
+                    check=False,
+                    capture=True,
+                    timeout=TIMEOUTS["service_start"],
                 )
-        raise
+                if start_result.returncode != 0:
+                    raise DeployError(
+                        "Deployment vor Pointermutation fehlgeschlagen; "
+                        "vorherige Runtime konnte nicht neu gestartet werden: "
+                        f"{original}"
+                    ) from original
+            raise DeployError(
+                f"Kritischer Deploymentabbruch vor Pointermutation: {original}"
+            ) from original
+        rollback_after_failure(
+            original,
+            runtime=runtime,
+            previous=previous,
+            legacy_backup=legacy_backup,
+            timeout_seconds=timeout_seconds,
+            phase=phase,
+            contract=snapshot.contract,
+        )
 
-    finally:
-        if stage.exists():
-            shutil.rmtree(stage, ignore_errors=True)
+
+def preflight_apply(repo: Path, runtime: Path, profile_path: Path) -> None:
+    snapshot = snapshot_from_git(repo)
+    require_runtime_replaceable(runtime)
+    require_profile_matches_contract(profile_path, runtime, snapshot.contract)
 
 
 def check(repo: Path, runtime: Path) -> None:
-    repo_head = git_head(repo)
-    dirty = repo_dirty(repo)
-    source = repo / "src" / "grabowski_mcp.py"
-    lockfile = repo / RUNTIME_LOCK_RELATIVE
-    require_file(source, "MCP-Server")
-    require_file(lockfile, "Runtime-Lockfile")
+    snapshot = snapshot_from_worktree(repo)
+    with tempfile.TemporaryDirectory(prefix="grabowski-mcp-check.") as directory:
+        check_runtime = Path(directory) / runtime.name
+        releases_root = Path(directory) / RELEASES_DIR_NAME
+        build = build_release(snapshot, releases_root, check_runtime)
+        verify_manifest(build.release_path, snapshot=snapshot, stable_runtime=check_runtime)
+        print("PASS: Deployment-Check ist dependency-locked")
+        print(f"Repo-HEAD:       {snapshot.repo_head}")
+        print(f"Arbeitsbaum:     {'dirty' if snapshot.dirty else 'clean'}")
+        print(f"Release-ID:      {build.release_id}")
+        print(f"Source-SHA256:   {snapshot.source_sha256}")
+        print(f"Lock-SHA256:     {snapshot.runtime_lock_sha256}")
+        print(f"Entry-Point:     {snapshot.contract.describe()}")
+        print(f"Python:          {build.provenance['python_version']}")
+        print(f"MCP-Protokoll:   {build.protocol_version}")
 
-    stage, protocol_version, provenance = create_stage(repo, runtime)
-    try:
-        source_hash = sha256(source)
-        lockfile_hash = sha256(lockfile)
-        write_manifest(
-            stage,
-            repo_head=repo_head,
-            source_hash=source_hash,
-            lockfile_hash=lockfile_hash,
-            protocol_version=protocol_version,
-            provenance=provenance,
-        )
-        verify_manifest(
-            stage,
-            repo_head=repo_head,
-            source_hash=source_hash,
-            lockfile_hash=lockfile_hash,
-        )
-        print("PASS: Deployment-Staging ist dependency-locked")
-        print(f"Repo-HEAD:       {repo_head}")
-        print(f"Arbeitsbaum:     {'dirty' if dirty else 'clean'}")
-        print(f"Source-SHA256:   {source_hash}")
-        print(f"Lock-SHA256:     {lockfile_hash}")
-        print(f"Python:          {provenance['python_version']}")
-        print(f"MCP-Protokoll:   {protocol_version}")
-    finally:
-        shutil.rmtree(stage, ignore_errors=True)
+
+def absolute_no_resolve(path: Path) -> Path:
+    expanded = path.expanduser()
+    if expanded.is_absolute():
+        return expanded
+    return Path.cwd() / expanded
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Deploy Grabowski atomically from its repository."
+        description="Deploy Grabowski atomically from immutable releases."
     )
     parser.add_argument(
         "--repo",
@@ -835,14 +1851,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     repo = args.repo.resolve()
-    runtime = args.runtime.expanduser().resolve()
-    profile_path = args.profile_path.expanduser().resolve()
-    lock_file = args.lock_file.expanduser().resolve()
+    runtime = absolute_no_resolve(args.runtime)
+    profile_path = absolute_no_resolve(args.profile_path)
+    lock_file = absolute_no_resolve(args.lock_file)
 
     try:
         if args.check:
             check(repo, runtime)
         else:
+            preflight_apply(repo, runtime, profile_path)
             with deployment_lock(lock_file):
                 deploy(
                     repo,
@@ -851,11 +1868,17 @@ def main() -> int:
                     timeout_seconds=args.timeout,
                 )
     except DeployError as exc:
-        print(f"STOP: {exc}", file=sys.stderr)
+        if exc.details:
+            print(
+                f"STOP: {exc} | details={json.dumps(exc.details, sort_keys=True, ensure_ascii=False)}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"STOP: {exc}", file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as exc:
         print(
-            f"STOP: Befehl fehlgeschlagen: {exc.cmd}",
+            f"STOP: Befehl fehlgeschlagen: {redact_argv([str(item) for item in exc.cmd])}",
             file=sys.stderr,
         )
         return exc.returncode or 1

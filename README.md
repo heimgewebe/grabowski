@@ -62,6 +62,10 @@ Produktive Runtime mit automatischem Rollback aktualisieren:
 make deploy
 ```
 
+Auf dem aktuellen Host stoppt dieser Branch erwartungsgemäß vor jeder
+Runtime-Mutation, solange das Live-Profil `python -m grabowski_operator`
+verlangt und der PR-#8-Vertrag `python -m grabowski_mcp` liefert.
+
 Details: [`docs/deployment.md`](docs/deployment.md).
 
 Die Runtime-Abhängigkeiten sind in `requirements/runtime.lock.txt` vollständig

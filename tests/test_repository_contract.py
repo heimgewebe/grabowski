@@ -35,6 +35,33 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('"deployment": _deployment_metadata()', source)
         self.assertIn('"repo_head"', source)
         self.assertIn('"runtime_lock_sha256"', source)
+        self.assertIn('"manifest_schema_valid"', source)
+        self.assertIn('"source_identity_valid"', source)
+        self.assertIn('"runtime_pointer_valid"', source)
+        self.assertNotIn('"manifest_valid"', source)
+
+    def test_runtime_entrypoint_contract_exists(self) -> None:
+        contract = json.loads(
+            (
+                ROOT / "config" / "runtime-entrypoint.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(contract["schema_version"], 1)
+        self.assertEqual(contract["mode"], "module")
+        self.assertEqual(contract["module"], "grabowski_mcp")
+        self.assertEqual(contract["source"], "src/grabowski_mcp.py")
+        self.assertEqual(
+            set(contract["expected_tools"]),
+            {
+                "grabowski_status",
+                "grabowski_list_directory",
+                "grabowski_stat",
+                "grabowski_read_text",
+                "grabowski_create_text",
+                "grabowski_replace_text",
+                "latest_complete_bundles",
+            },
+        )
 
     def test_runtime_lock_contract_exists(self) -> None:
         runtime_input = ROOT / "requirements" / "runtime.in"

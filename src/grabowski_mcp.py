@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import stat as statmod
+import sys
 import tempfile
 
 from mcp.server.fastmcp import FastMCP
@@ -21,7 +22,15 @@ STATE_DIR = HOME / ".local" / "state" / "grabowski"
 POLICY_PATH = HOME / ".config" / "grabowski" / "access.json"
 AUDIT_LOG = STATE_DIR / "write-audit.jsonl"
 BUNDLE_REGISTRY = STATE_DIR / "rlens-latest-complete-bundles.tsv"
-DEPLOYMENT_MANIFEST = Path(__file__).resolve().parent / "deployment-manifest.json"
+
+def _deployment_manifest_path() -> Path:
+    executable = Path(sys.executable)
+    if executable.parent.name == "bin" and executable.parent.parent.name == ".venv":
+        return executable.parent.parent.parent / "deployment-manifest.json"
+    return Path(__file__).resolve().parent / "deployment-manifest.json"
+
+
+DEPLOYMENT_MANIFEST = _deployment_manifest_path()
 
 mcp = FastMCP(APP_NAME)
 
@@ -198,14 +207,145 @@ def _append_audit(record: dict[str, Any]) -> None:
 
 
 def _deployment_metadata() -> dict[str, Any]:
-    if not DEPLOYMENT_MANIFEST.is_file():
-        return {"manifest_path": str(DEPLOYMENT_MANIFEST), "manifest_exists": False}
+    manifest_path = DEPLOYMENT_MANIFEST
+    base: dict[str, Any] = {
+        "manifest_path": str(manifest_path),
+        "manifest_exists": manifest_path.is_file(),
+    }
+    if not manifest_path.is_file():
+        return {
+            **base,
+            "manifest_parse_valid": False,
+            "manifest_schema_valid": False,
+            "source_identity_valid": False,
+            "lock_identity_valid": False,
+            "runtime_pointer_valid": False,
+            "provenance_valid": False,
+        }
+
     try:
-        raw = json.loads(DEPLOYMENT_MANIFEST.read_text(encoding="utf-8"))
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return {"manifest_path": str(DEPLOYMENT_MANIFEST), "manifest_exists": True, "manifest_valid": False, "error": str(exc)}
-    allowed = {key: raw.get(key) for key in ("schema_version", "repo_head", "source_sha256", "runtime_lock_path", "runtime_lock_sha256", "mcp_protocol_version", "python_version", "python_implementation", "platform", "created_at_unix")}
-    return {"manifest_path": str(DEPLOYMENT_MANIFEST), "manifest_exists": True, "manifest_valid": True, **allowed}
+        return {
+            **base,
+            "manifest_parse_valid": False,
+            "manifest_schema_valid": False,
+            "source_identity_valid": False,
+            "lock_identity_valid": False,
+            "runtime_pointer_valid": False,
+            "provenance_valid": False,
+            "error": str(exc),
+        }
+
+    if not isinstance(raw, dict):
+        return {
+            **base,
+            "manifest_parse_valid": True,
+            "manifest_schema_valid": False,
+            "source_identity_valid": False,
+            "lock_identity_valid": False,
+            "runtime_pointer_valid": False,
+            "provenance_valid": False,
+        }
+
+    required = {
+        "schema_version",
+        "release_id",
+        "repo_head",
+        "entrypoint_contract",
+        "entrypoint_contract_sha256",
+        "source_sha256",
+        "runtime_lock_sha256",
+        "snapshot_paths",
+        "immutable_release_path",
+        "expected_stable_runtime_path",
+        "release_python_path",
+        "platform",
+        "python_version",
+        "python_implementation",
+        "mcp_protocol_version",
+        "created_at_unix",
+        "completion_status",
+    }
+    schema_valid = (
+        isinstance(raw, dict)
+        and raw.get("schema_version") == 3
+        and raw.get("completion_status") == "complete"
+        and required.issubset(raw)
+    )
+
+    source_identity_valid = False
+    if isinstance(raw, dict) and isinstance(raw.get("source_sha256"), str):
+        try:
+            source_identity_valid = (
+                _sha256(Path(__file__).resolve()) == raw["source_sha256"]
+            )
+        except OSError:
+            source_identity_valid = False
+
+    lock_identity_valid = False
+    snapshot_paths = raw.get("snapshot_paths") if isinstance(raw, dict) else None
+    lock_path = None
+    if isinstance(snapshot_paths, dict):
+        lock_value = snapshot_paths.get("runtime_lock")
+        if isinstance(lock_value, str):
+            lock_path = Path(lock_value)
+    if lock_path is not None and isinstance(raw.get("runtime_lock_sha256"), str):
+        try:
+            lock_identity_valid = (
+                lock_path.is_file()
+                and _sha256(lock_path) == raw["runtime_lock_sha256"]
+            )
+        except OSError:
+            lock_identity_valid = False
+
+    runtime_pointer_valid = False
+    try:
+        stable = Path(str(raw.get("expected_stable_runtime_path")))
+        release = Path(str(raw.get("immutable_release_path")))
+        runtime_pointer_valid = (
+            stable.is_symlink()
+            and stable.resolve() == release.resolve()
+        )
+    except (OSError, RuntimeError):
+        runtime_pointer_valid = False
+
+    repo_head = raw.get("repo_head") if isinstance(raw, dict) else None
+    provenance_valid = (
+        isinstance(repo_head, str)
+        and len(repo_head) == 40
+        and all(char in "0123456789abcdef" for char in repo_head)
+        and isinstance(raw.get("release_python_path"), str)
+        and ".stage" not in raw.get("release_python_path", "")
+    )
+
+    allowed = {
+        key: raw.get(key)
+        for key in (
+            "schema_version",
+            "release_id",
+            "repo_head",
+            "entrypoint_contract_sha256",
+            "source_sha256",
+            "runtime_lock_sha256",
+            "mcp_protocol_version",
+            "python_version",
+            "python_implementation",
+            "platform",
+            "created_at_unix",
+            "completion_status",
+        )
+    }
+    return {
+        **base,
+        "manifest_parse_valid": True,
+        "manifest_schema_valid": schema_valid,
+        "source_identity_valid": source_identity_valid,
+        "lock_identity_valid": lock_identity_valid,
+        "runtime_pointer_valid": runtime_pointer_valid,
+        "provenance_valid": provenance_valid,
+        **allowed,
+    }
 
 
 @mcp.tool(name="grabowski_status", annotations=READ_ANNOTATIONS)
