@@ -41,10 +41,14 @@
 
 ## GRABOWSKI-DEPLOY-001
 
+Status: implemented in repository; live cutover requires explicit deployment.
+
 - reproduzierbares Deployment aus diesem Repo,
 - atomarer Runtime-Wechsel,
+- MCP-Handshake sowie Tool-List-Gate,
 - Health- und Readiness-Gates,
-- automatischer Rollback.
+- automatischer Rollback,
+- Deployment-Manifest mit Repo-HEAD und Source-Hash.
 
 ## GRABOWSKI-FLEET-001
 

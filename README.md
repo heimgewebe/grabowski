@@ -47,3 +47,19 @@ make validate
 ## Roadmap
 
 Siehe [`docs/roadmap.md`](docs/roadmap.md).
+
+## Deployment aus dem Repository
+
+Reproduzierbarkeit ohne Runtime-Mutation prüfen:
+
+```bash
+make deploy-check
+```
+
+Produktive Runtime mit automatischem Rollback aktualisieren:
+
+```bash
+make deploy
+```
+
+Details: [`docs/deployment.md`](docs/deployment.md).
