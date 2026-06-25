@@ -6,9 +6,11 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
+import re
 import shutil
 import stat as statmod
 import sys
@@ -32,6 +34,12 @@ def _deployment_manifest_path() -> Path:
 
 
 DEPLOYMENT_MANIFEST = _deployment_manifest_path()
+EXPECTED_STABLE_RUNTIME = HOME / ".local" / "share" / "grabowski-mcp"
+DEPLOYMENT_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_CONTRACT_BYTES = 64 * 1024
+MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
+MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
 mcp = FastMCP(APP_NAME)
 
@@ -213,6 +221,7 @@ _DEPLOYMENT_IDENTITY_KEYS = (
     "release_path_valid",
     "release_id_valid",
     "repo_head_valid",
+    "stable_runtime_manifest_valid",
     "runtime_pointer_valid",
     "runtime_input_identity_valid",
     "lock_identity_valid",
@@ -222,8 +231,14 @@ _DEPLOYMENT_IDENTITY_KEYS = (
     "entrypoint_contract_identity_valid",
     "entrypoint_path_valid",
     "release_python_identity_valid",
+    "executable_identity_valid",
+    "pip_identity_valid",
+    "protocol_identity_valid",
     "python_runtime_identity_valid",
     "platform_identity_valid",
+    "artifact_integrity_valid",
+    "runtime_binding_valid",
+    "environment_compatibility_valid",
 )
 
 
@@ -246,6 +261,13 @@ def _is_hex(value: Any, length: int) -> bool:
         and len(value) == length
         and all(char in "0123456789abcdef" for char in value)
     )
+
+
+def _safe_relative_path(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    path = Path(value)
+    return not path.is_absolute() and ".." not in path.parts and path.as_posix() != "."
 
 
 def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
@@ -276,9 +298,7 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         value = raw.get(key)
         if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
             return False
-    if raw.get("schema_version") != 3:
-        return False
-    if raw.get("completion_status") != "complete":
+    if raw.get("schema_version") != 3 or raw.get("completion_status") != "complete":
         return False
     if not _is_hex(raw.get("repo_head"), 40):
         return False
@@ -291,49 +311,100 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         if not _is_hex(raw.get(key), 64):
             return False
     contract = raw.get("entrypoint_contract")
-    if not isinstance(contract, dict):
+    if not isinstance(contract, dict) or set(contract) != {
+        "schema_version", "mode", "module", "source", "expected_tools"
+    }:
         return False
     if contract.get("schema_version") != 1 or contract.get("mode") != "module":
         return False
-    if not isinstance(contract.get("module"), str) or not contract.get("module"):
+    module = contract.get("module")
+    if not isinstance(module, str) or MODULE_RE.fullmatch(module) is None:
         return False
-    if not isinstance(contract.get("source"), str) or not contract.get("source"):
+    if not _safe_relative_path(contract.get("source")):
         return False
     tools = contract.get("expected_tools")
-    if not isinstance(tools, list) or not tools or not all(
-        isinstance(item, str) and item for item in tools
+    if (
+        not isinstance(tools, list)
+        or not tools
+        or not all(isinstance(item, str) and item for item in tools)
+        or len(set(tools)) != len(tools)
     ):
         return False
     snapshot_paths = raw.get("snapshot_paths")
     if not isinstance(snapshot_paths, dict) or set(snapshot_paths) != {
-        "runtime_entrypoint",
-        "runtime_input",
-        "runtime_lock",
-        "source",
+        "runtime_entrypoint", "runtime_input", "runtime_lock", "source"
     }:
         return False
-    if not all(isinstance(value, str) for value in snapshot_paths.values()):
+    if not all(isinstance(value, str) and value for value in snapshot_paths.values()):
         return False
     created = raw.get("created_at_unix")
-    if not isinstance(created, int) or isinstance(created, bool) or created <= 0:
-        return False
-    return True
+    return isinstance(created, int) and not isinstance(created, bool) and created > 0
+
+
+def _read_bound_regular_file(
+    recorded: Any,
+    expected: Path,
+    release_root: Path,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    """Read only the exact expected regular file after binding path and inode."""
+    if not isinstance(recorded, str) or Path(recorded) != expected:
+        return None
+    fd: int | None = None
+    try:
+        release_real = release_root.resolve(strict=True)
+        parent_real = expected.parent.resolve(strict=True)
+        if not _path_inside(parent_real, release_real):
+            return None
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(expected, flags)
+        opened = os.fstat(fd)
+        linked = os.stat(expected, follow_symlinks=False)
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or not statmod.S_ISREG(linked.st_mode)
+            or opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_nlink != 1
+            or opened.st_size > max_bytes
+        ):
+            return None
+        resolved = expected.resolve(strict=True)
+        if not _path_inside(resolved, release_real):
+            return None
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        return data if len(data) <= max_bytes else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _deployment_metadata() -> dict[str, Any]:
-    """Provenance summary for grabowski_status.
-
-    Every check is conjoined into provenance_valid. A malformed, tampered, or
-    partially-written manifest must never raise out of here so that
-    grabowski_status keeps returning policy state.
-    """
+    """Return fail-closed deployment evidence without leaking manifest errors."""
     try:
         return _deployment_metadata_impl()
-    except Exception as exc:  # pragma: no cover - defensive catch-all
+    except Exception as exc:  # pragma: no cover - final status containment
+        try:
+            manifest_exists = DEPLOYMENT_MANIFEST.is_file()
+        except OSError:
+            manifest_exists = False
         return _false_deployment_metadata(
             {
                 "manifest_path": str(DEPLOYMENT_MANIFEST),
-                "manifest_exists": False,
+                "manifest_exists": manifest_exists,
             },
             error_type=type(exc).__name__,
         )
@@ -347,210 +418,173 @@ def _deployment_metadata_impl() -> dict[str, Any]:
     }
     if not manifest_path.is_file():
         return _false_deployment_metadata(base)
-
     try:
+        info = manifest_path.stat()
+        if not statmod.S_ISREG(info.st_mode) or info.st_size > MAX_MANIFEST_BYTES:
+            return _false_deployment_metadata(base, error_type="UnsafeManifest")
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         return _false_deployment_metadata(base, error_type=type(exc).__name__)
-
     if not isinstance(raw, dict):
         return _false_deployment_metadata(base, manifest_parse_valid=True)
 
     schema_valid = _manifest_schema_valid(raw)
-
     release_root = manifest_path.parent.resolve()
-    snapshot_paths = raw.get("snapshot_paths")
-    if not isinstance(snapshot_paths, dict):
-        snapshot_paths = {}
-    stable_runtime = None
-    if isinstance(raw.get("expected_stable_runtime_path"), str):
-        stable_runtime = Path(raw["expected_stable_runtime_path"])
+    snapshot_paths = raw.get("snapshot_paths") if isinstance(raw.get("snapshot_paths"), dict) else {}
+    canonical_runtime = EXPECTED_STABLE_RUNTIME
+    canonical_releases = canonical_runtime.parent / "grabowski-mcp-releases"
 
-    def _snapshot_sha_valid(key: str, expected_relative: str, sha_field: str) -> bool:
-        try:
-            recorded = snapshot_paths.get(key)
-            if not isinstance(recorded, str):
-                return False
-            recorded_path = Path(recorded)
-            expected_path = release_root / expected_relative
-            expected_sha = raw.get(sha_field)
-            return (
-                recorded_path == expected_path
-                and recorded_path.is_file()
-                and _path_inside(recorded_path.resolve(), release_root)
-                and isinstance(expected_sha, str)
-                and _sha256(recorded_path) == expected_sha
-            )
-        except (OSError, RuntimeError, ValueError):
-            return False
-
+    stable_runtime_manifest_valid = (
+        isinstance(raw.get("expected_stable_runtime_path"), str)
+        and Path(raw["expected_stable_runtime_path"]) == canonical_runtime
+    )
     release_path_valid = False
     try:
-        releases_root = (
-            stable_runtime.parent / "grabowski-mcp-releases"
-            if stable_runtime is not None
-            else None
-        )
-        immutable_release = raw.get("immutable_release_path")
         release_path_valid = (
-            isinstance(immutable_release, str)
-            and Path(immutable_release).resolve(strict=True) == release_root
-            and releases_root is not None
-            and release_root.parent == releases_root.resolve(strict=True)
+            isinstance(raw.get("immutable_release_path"), str)
+            and Path(raw["immutable_release_path"]).resolve(strict=True) == release_root
+            and release_root.parent == canonical_releases.resolve(strict=True)
         )
     except (OSError, RuntimeError):
         release_path_valid = False
-
-    release_id_valid = False
-    try:
-        release_id_valid = (
-            isinstance(raw.get("release_id"), str)
-            and raw["release_id"] == release_root.name
-        )
-    except (OSError, RuntimeError):
-        release_id_valid = False
-
+    release_id_valid = isinstance(raw.get("release_id"), str) and raw.get("release_id") == release_root.name
     repo_head_valid = _is_hex(raw.get("repo_head"), 40)
-
     runtime_pointer_valid = False
     try:
         runtime_pointer_valid = (
-            stable_runtime is not None
-            and stable_runtime.is_symlink()
-            and stable_runtime.resolve() == release_root
+            canonical_runtime.is_symlink()
+            and canonical_runtime.resolve(strict=True) == release_root
         )
     except (OSError, RuntimeError):
         runtime_pointer_valid = False
 
-    runtime_input_identity_valid = _snapshot_sha_valid(
-        "runtime_input", "inputs/runtime.in", "runtime_input_sha256"
+    def snapshot_bytes(key: str, relative: str, limit: int = MAX_SNAPSHOT_BYTES) -> bytes | None:
+        return _read_bound_regular_file(
+            snapshot_paths.get(key), release_root / relative, release_root, max_bytes=limit
+        )
+
+    runtime_input_data = snapshot_bytes("runtime_input", "inputs/runtime.in")
+    runtime_lock_data = snapshot_bytes("runtime_lock", "inputs/runtime.lock.txt")
+    runtime_input_identity_valid = (
+        runtime_input_data is not None
+        and hashlib.sha256(runtime_input_data).hexdigest() == raw.get("runtime_input_sha256")
     )
-    lock_identity_valid = _snapshot_sha_valid(
-        "runtime_lock", "inputs/runtime.lock.txt", "runtime_lock_sha256"
+    lock_identity_valid = (
+        runtime_lock_data is not None
+        and hashlib.sha256(runtime_lock_data).hexdigest() == raw.get("runtime_lock_sha256")
     )
 
-    # Source snapshot path is derived from the embedded contract's repo-relative
-    # source, e.g. inputs/src/grabowski_mcp.py.
-    source_snapshot_identity_valid = False
-    try:
-        contract = raw.get("entrypoint_contract")
-        source_relative = contract.get("source") if isinstance(contract, dict) else None
-        if isinstance(source_relative, str) and source_relative:
-            source_snapshot_identity_valid = _snapshot_sha_valid(
-                "source", f"inputs/{source_relative}", "source_sha256"
-            )
-    except (OSError, RuntimeError, ValueError):
-        source_snapshot_identity_valid = False
-
-    # Imported module bytes: the running module file must equal the recorded
-    # source hash.
-    source_identity_valid = False
-    if isinstance(raw.get("source_sha256"), str):
+    expected_contract = release_root / "inputs/runtime-entrypoint.json"
+    contract_data = _read_bound_regular_file(
+        snapshot_paths.get("runtime_entrypoint"),
+        expected_contract,
+        release_root,
+        max_bytes=MAX_CONTRACT_BYTES,
+    )
+    contract_raw: dict[str, Any] | None = None
+    if contract_data is not None:
         try:
-            source_identity_valid = (
-                _sha256(Path(__file__).resolve()) == raw["source_sha256"]
-            )
-        except OSError:
-            source_identity_valid = False
+            parsed = json.loads(contract_data.decode("utf-8"))
+            if isinstance(parsed, dict):
+                contract_raw = parsed
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+    entrypoint_contract_identity_valid = (
+        contract_data is not None
+        and contract_raw is not None
+        and hashlib.sha256(contract_data).hexdigest() == raw.get("entrypoint_contract_sha256")
+        and _manifest_schema_valid({**raw, "entrypoint_contract": contract_raw})
+    )
+    embedded_contract_valid = isinstance(raw.get("entrypoint_contract"), dict) and raw.get("entrypoint_contract") == contract_raw
 
-    entrypoint_contract_identity_valid = False
-    embedded_contract_valid = False
-    try:
-        contract_path = Path(str(snapshot_paths.get("runtime_entrypoint")))
-        expected_contract = release_root / "inputs/runtime-entrypoint.json"
-        contract_raw = json.loads(contract_path.read_text(encoding="utf-8"))
-        contract_valid = (
-            isinstance(contract_raw, dict)
-            and contract_raw.get("schema_version") == 1
-            and contract_raw.get("mode") == "module"
-            and isinstance(contract_raw.get("module"), str)
-            and isinstance(contract_raw.get("expected_tools"), list)
-        )
-        entrypoint_contract_identity_valid = (
-            contract_path == expected_contract
-            and contract_path.is_file()
-            and _path_inside(contract_path.resolve(), release_root)
-            and _sha256(contract_path) == raw.get("entrypoint_contract_sha256")
-            and contract_valid
-        )
-        embedded = raw.get("entrypoint_contract")
-        if isinstance(embedded, dict) and isinstance(contract_raw, dict):
-            embedded_contract_valid = embedded == contract_raw
-    except (OSError, json.JSONDecodeError, ValueError):
-        entrypoint_contract_identity_valid = False
-        embedded_contract_valid = False
+    source_snapshot_data: bytes | None = None
+    if contract_raw is not None and _safe_relative_path(contract_raw.get("source")):
+        source_snapshot_data = snapshot_bytes("source", f"inputs/{contract_raw['source']}")
+    source_snapshot_identity_valid = (
+        source_snapshot_data is not None
+        and hashlib.sha256(source_snapshot_data).hexdigest() == raw.get("source_sha256")
+    )
 
-    # Entrypoint path: the installed module inside the release whose bytes equal
-    # the source snapshot hash.
-    entrypoint_path_valid = False
-    try:
-        entrypoint_value = raw.get("entrypoint_path")
-        if isinstance(entrypoint_value, str):
-            entrypoint_path = Path(entrypoint_value)
-            resolved_entrypoint = entrypoint_path.resolve(strict=True)
-            running_module = Path(__file__).resolve(strict=True)
-            entrypoint_path_valid = (
-                entrypoint_path.is_file()
-                and _path_inside(resolved_entrypoint, release_root)
-                and resolved_entrypoint == running_module
-                and isinstance(raw.get("source_sha256"), str)
-                and _sha256(entrypoint_path) == raw["source_sha256"]
-            )
-    except (OSError, RuntimeError, ValueError):
-        entrypoint_path_valid = False
+    running_module = Path(__file__).resolve(strict=True)
+    module_data = _read_bound_regular_file(
+        raw.get("entrypoint_path"), running_module, release_root, max_bytes=MAX_SNAPSHOT_BYTES
+    )
+    entrypoint_path_valid = module_data is not None
+    source_identity_valid = (
+        module_data is not None
+        and hashlib.sha256(module_data).hexdigest() == raw.get("source_sha256")
+    )
 
     release_python_identity_valid = False
+    executable_identity_valid = False
     try:
         release_python = Path(str(raw.get("release_python_path")))
         expected_python = release_root / ".venv/bin/python"
+        current_python = Path(sys.executable)
         release_python_identity_valid = (
             release_python == expected_python
             and release_python.exists()
-            and release_python.resolve() == Path(sys.executable).resolve()
+            and release_python.resolve(strict=True) == current_python.resolve(strict=True)
         )
-    except (OSError, RuntimeError):
-        release_python_identity_valid = False
+        executable_identity_valid = (
+            isinstance(raw.get("executable"), str)
+            and Path(raw["executable"]) == release_python
+            and Path(raw["executable"]).resolve(strict=True) == current_python.resolve(strict=True)
+        )
+    except (OSError, RuntimeError, ValueError):
+        pass
 
+    try:
+        pip_identity_valid = raw.get("pip_version") == f"pip {importlib.metadata.version('pip')}"
+    except importlib.metadata.PackageNotFoundError:
+        pip_identity_valid = False
+    protocol_identity_valid = raw.get("mcp_protocol_version") in DEPLOYMENT_PROTOCOL_VERSIONS
     python_runtime_identity_valid = (
         raw.get("python_version") == platform.python_version()
         and raw.get("python_implementation") == platform.python_implementation()
     )
     platform_identity_valid = raw.get("platform") == platform.platform()
 
-    provenance_valid = (
-        schema_valid
-        and release_path_valid
-        and release_id_valid
-        and repo_head_valid
-        and runtime_pointer_valid
-        and runtime_input_identity_valid
-        and lock_identity_valid
-        and source_snapshot_identity_valid
-        and source_identity_valid
-        and embedded_contract_valid
-        and entrypoint_contract_identity_valid
-        and entrypoint_path_valid
-        and release_python_identity_valid
-        and python_runtime_identity_valid
-        and platform_identity_valid
-    )
+    artifact_integrity_valid = all((
+        schema_valid,
+        repo_head_valid,
+        runtime_input_identity_valid,
+        lock_identity_valid,
+        source_snapshot_identity_valid,
+        embedded_contract_valid,
+        entrypoint_contract_identity_valid,
+        protocol_identity_valid,
+    ))
+    runtime_binding_valid = all((
+        release_path_valid,
+        release_id_valid,
+        stable_runtime_manifest_valid,
+        runtime_pointer_valid,
+        source_identity_valid,
+        entrypoint_path_valid,
+        release_python_identity_valid,
+        executable_identity_valid,
+        pip_identity_valid,
+    ))
+    environment_compatibility_valid = all((
+        python_runtime_identity_valid,
+        platform_identity_valid,
+    ))
+    provenance_valid = all((
+        artifact_integrity_valid,
+        runtime_binding_valid,
+        environment_compatibility_valid,
+    ))
 
     allowed = {
         key: raw.get(key)
         for key in (
-            "schema_version",
-            "release_id",
-            "repo_head",
-            "entrypoint_contract_sha256",
-            "source_sha256",
-            "runtime_input_sha256",
-            "runtime_lock_sha256",
-            "mcp_protocol_version",
-            "python_version",
-            "python_implementation",
-            "platform",
-            "created_at_unix",
-            "completion_status",
+            "schema_version", "release_id", "repo_head",
+            "entrypoint_contract_sha256", "source_sha256",
+            "runtime_input_sha256", "runtime_lock_sha256",
+            "mcp_protocol_version", "python_version",
+            "python_implementation", "platform", "executable",
+            "pip_version", "created_at_unix", "completion_status",
         )
     }
     return {
@@ -560,6 +594,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         "release_path_valid": release_path_valid,
         "release_id_valid": release_id_valid,
         "repo_head_valid": repo_head_valid,
+        "stable_runtime_manifest_valid": stable_runtime_manifest_valid,
         "runtime_pointer_valid": runtime_pointer_valid,
         "runtime_input_identity_valid": runtime_input_identity_valid,
         "lock_identity_valid": lock_identity_valid,
@@ -569,8 +604,14 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         "entrypoint_contract_identity_valid": entrypoint_contract_identity_valid,
         "entrypoint_path_valid": entrypoint_path_valid,
         "release_python_identity_valid": release_python_identity_valid,
+        "executable_identity_valid": executable_identity_valid,
+        "pip_identity_valid": pip_identity_valid,
+        "protocol_identity_valid": protocol_identity_valid,
         "python_runtime_identity_valid": python_runtime_identity_valid,
         "platform_identity_valid": platform_identity_valid,
+        "artifact_integrity_valid": artifact_integrity_valid,
+        "runtime_binding_valid": runtime_binding_valid,
+        "environment_compatibility_valid": environment_compatibility_valid,
         "provenance_valid": provenance_valid,
         **allowed,
     }

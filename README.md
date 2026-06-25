@@ -56,7 +56,7 @@ Reproduzierbarkeit ohne Runtime-Mutation prüfen:
 make deploy-check
 ```
 
-Produktive Runtime mit automatischem Rollback aktualisieren:
+Produktive Runtime mit exception-sicherem Rollback aktualisieren:
 
 ```bash
 make deploy

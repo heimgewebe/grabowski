@@ -789,7 +789,6 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "require_profile_matches_contract"),
                 patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
                 patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_active()),
-                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
                 patch.object(deploy_runtime, "build_release", return_value=build),
                 patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
                 patch.object(deploy_runtime, "run", side_effect=lambda argv, **kwargs: self._completed(argv, 1)),
@@ -966,7 +965,7 @@ class DeployRuntimeTests(unittest.TestCase):
             previous = deploy_runtime.capture_pointer(runtime)
             with (
                 patch.object(deploy_runtime, "run", return_value=self._completed(["stop"])),
-                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_active()),
                 patch.object(deploy_runtime, "restore_pointer") as restore_pointer,
                 patch.object(deploy_runtime, "service_state", return_value={"ActiveState": "active"}),
             ):
@@ -1362,6 +1361,154 @@ class DeployRuntimeTests(unittest.TestCase):
         ):
             observation = deploy_runtime.wait_until_confirmed_inactive(1)
         self.assertTrue(observation.confirmed_inactive)
+
+
+    def test_readiness_requires_confirmed_active_service(self) -> None:
+        observation = deploy_runtime.ServiceObservation(
+            query_valid=False,
+            load_state="loaded",
+            active_state="active",
+            sub_state="running",
+            main_pid=0,
+            returncode=0,
+        )
+        with (
+            patch.object(deploy_runtime, "observe_service", return_value=observation),
+            patch.object(deploy_runtime, "http_text", side_effect=["live", "ready"]),
+        ):
+            result = deploy_runtime.readiness_probe()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.main_pid, 0)
+        self.assertFalse(result.service["confirmed_active"])
+
+    def test_readiness_accepts_only_confirmed_active_with_green_http(self) -> None:
+        with (
+            patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+            patch.object(deploy_runtime, "http_text", side_effect=["live", "ready"]),
+        ):
+            result = deploy_runtime.readiness_probe()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.main_pid, 4321)
+
+    def test_deployment_lock_rejects_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            original = state_root / "original"
+            original.write_text("x\n", encoding="utf-8")
+            lock = state_root / "deploy.lock"
+            os.link(original, lock)
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "Hardlinks"):
+                with deploy_runtime.deployment_lock(lock, state_root=state_root):
+                    pass
+
+    def test_lock_rejects_requirement_without_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.lock.txt"
+            path.write_text(
+                "mcp==1.27.2\n"
+                "    --hash=sha256:" + "1" * 64 + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "Fortsetzung"):
+                deploy_runtime.parse_runtime_lock(path)
+
+    def test_lock_rejects_open_final_hash_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.lock.txt"
+            path.write_text(
+                "mcp==1.27.2 \\\n"
+                "    --hash=sha256:" + "1" * 64 + " \\\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "offener Fortsetzung"):
+                deploy_runtime.parse_runtime_lock(path)
+
+
+    def test_repo_drift_after_stop_blocks_pointer_and_restores_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old_release = root / "old"
+            old_release.mkdir()
+            runtime.symlink_to(old_release)
+            new_release = root / "new"
+            (new_release / "inputs/src").mkdir(parents=True)
+            snapshot = self._snapshot()
+            build = deploy_runtime.BuildResult(
+                "new", new_release, new_release / ".venv/bin/python",
+                new_release / "module.py", "2025-06-18", {}
+            )
+            self._write_manifest(new_release, snapshot, runtime)
+            live = deploy_runtime.EntryPoint(
+                mode="module",
+                python=runtime / ".venv/bin/python",
+                module="grabowski_mcp",
+            )
+            with (
+                patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
+                patch.object(deploy_runtime, "require_profile_matches_contract", return_value=live),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
+                patch.object(deploy_runtime, "build_release", return_value=build),
+                patch.object(
+                    deploy_runtime,
+                    "verify_apply_snapshot_unchanged",
+                    side_effect=[None, deploy_runtime.DeployError("late repo drift")],
+                ) as verify_snapshot,
+                patch.object(deploy_runtime, "run", side_effect=lambda argv, **kwargs: self._completed(argv)),
+                patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)),
+                patch.object(deploy_runtime, "verify_running_profile_entrypoint", return_value={"pid": 200}),
+                patch.object(deploy_runtime, "activate_pointer") as activate_pointer,
+            ):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
+                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+            self.assertEqual(verify_snapshot.call_count, 2)
+            activate_pointer.assert_not_called()
+            self.assertEqual(runtime.resolve(), old_release.resolve())
+
+    def test_profile_drift_after_stop_blocks_pointer_and_restores_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old_release = root / "old"
+            old_release.mkdir()
+            runtime.symlink_to(old_release)
+            new_release = root / "new"
+            (new_release / "inputs/src").mkdir(parents=True)
+            snapshot = self._snapshot()
+            build = deploy_runtime.BuildResult(
+                "new", new_release, new_release / ".venv/bin/python",
+                new_release / "module.py", "2025-06-18", {}
+            )
+            self._write_manifest(new_release, snapshot, runtime)
+            live = deploy_runtime.EntryPoint(
+                mode="module",
+                python=runtime / ".venv/bin/python",
+                module="grabowski_mcp",
+            )
+            with (
+                patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
+                patch.object(
+                    deploy_runtime,
+                    "require_profile_matches_contract",
+                    side_effect=[live, deploy_runtime.DeployError("late profile drift")],
+                ) as verify_profile,
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "wait_until_confirmed_inactive", return_value=self._obs_inactive()),
+                patch.object(deploy_runtime, "build_release", return_value=build),
+                patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
+                patch.object(deploy_runtime, "run", side_effect=lambda argv, **kwargs: self._completed(argv)),
+                patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)),
+                patch.object(deploy_runtime, "verify_running_profile_entrypoint", return_value={"pid": 200}),
+                patch.object(deploy_runtime, "activate_pointer") as activate_pointer,
+            ):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
+                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+            self.assertEqual(verify_profile.call_count, 2)
+            activate_pointer.assert_not_called()
+            self.assertEqual(runtime.resolve(), old_release.resolve())
 
 
 if __name__ == "__main__":

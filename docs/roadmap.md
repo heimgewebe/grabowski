@@ -47,11 +47,20 @@ Status: implemented in repository; live cutover requires explicit deployment.
 - atomarer Runtime-Wechsel,
 - MCP-Handshake sowie Tool-List-Gate,
 - Health- und Readiness-Gates,
-- automatischer Rollback,
+- automatischer Rollback bei behandelbaren Deploymentfehlern,
 - Deployment-Manifest mit Repo-HEAD, Source-Hash, Lockfile-Hash und Plattform-Provenienz,
 - exklusiver Deployment-Lock,
 - gestartete Runtime- und Prozessidentität,
 - verhaltensbasierte Fehler- und Rollbacktests.
+
+
+## GRABOWSKI-DEPLOY-002
+
+- persistentes Deployment-Transaktionsjournal,
+- atomare Phasenfortschreibung mit Datei- und Directory-`fsync`,
+- Recovery von ursprünglichem Pointer und Legacy-Backup nach SIGKILL, Stromausfall oder Neustart,
+- deterministische Startprüfung vor einem neuen Deployment,
+- optionaler systemd-Recovery-Service nach eigenem Design-Gate.
 
 ## GRABOWSKI-FLEET-001
 

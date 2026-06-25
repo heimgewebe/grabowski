@@ -2,8 +2,9 @@
 
 ## Ziel
 
-Die laufende Grabowski-Runtime wird aus einem Git-Commit als unveränderliches
-Release erzeugt. Der stabile Hostpfad bleibt:
+Die laufende Grabowski-Runtime wird aus einem Git-Commit als integritätsgeprüftes
+Release erzeugt. Nach der Aktivierung wird es durch Betriebsregel nicht mehr
+verändert; technischer Schreibschutz ist nicht Teil dieser Garantie. Der stabile Hostpfad bleibt:
 
 ```text
 ~/.local/share/grabowski-mcp
@@ -86,14 +87,15 @@ Das produktive Deployment verlangt:
 - sauberen Git-Arbeitsbaum,
 - fixierten Git-HEAD,
 - Entry-Point-Kompatibilität zwischen Live-Profil und Branchvertrag,
-- exklusiven Deployment-Lock,
-- unveränderten HEAD und sauberen Arbeitsbaum unmittelbar vor Aktivierung.
+- einen strukturiert bestätigten aktiven systemd-Zustand,
+- einen exklusiven, inodegebundenen Deployment-Lock,
+- erneute Prüfung von HEAD, Arbeitsbaum, Release-Snapshots und Profil nach dem Stop und unmittelbar vor der Pointermutation.
 
 Apply materialisiert Source, `runtime.in`, Lock und Runtimevertrag aus dem
 erfassten Git-Commit. Danach werden Hashes, Installation, Manifest und Probe
 nur aus den Release-Snapshots abgeleitet.
 
-## Immutable Releases
+## Integritätsgeprüfte Releases
 
 Ein Release wird direkt an seinem endgültigen Pfad gebaut:
 
@@ -154,9 +156,12 @@ Rohe Prozessargumente werden nicht als Statusdaten ausgegeben.
 
 ## Rollback
 
-Rollback ist eine explizite Zustandsmaschine. Sie erfasst ursprünglichen Fehler,
-Phase, Pointerzustand, Stop-/Start-Ergebnisse, Dienstinaktivität,
-Pointerwiederherstellung, Readiness und finalen Zustand.
+Rollback ist für behandelbare Fehler innerhalb des laufenden Deploymentprozesses
+eine explizite Zustandsmaschine. Sie erfasst ursprünglichen Fehler, Phase,
+Pointerzustand, Stop-/Start-Ergebnisse, Dienstinaktivität,
+Pointerwiederherstellung, Readiness und finalen Zustand. Diese Garantie ist
+exception-sicher, aber nicht crash-sicher gegen SIGKILL, Stromausfall oder
+Rechnerneustart zwischen zwei Mutationen.
 
 Regeln:
 
@@ -168,6 +173,19 @@ Regeln:
 6. Dienst starten.
 7. Health, Readiness und Identität prüfen.
 8. Original- und Rollbackfehler gemeinsam melden.
+
+## Statusprovenienz
+
+`grabowski_status` trennt drei Aussagen:
+
+- `artifact_integrity_valid`: Manifeststruktur und gebundene Releaseartefakte,
+- `runtime_binding_valid`: kanonischer Stable-Pfad, Pointer, Modul und Pythonbinary,
+- `environment_compatibility_valid`: aktuelle Python- und Plattformgleichheit.
+
+`provenance_valid` ist nur wahr, wenn alle drei Aggregate wahr sind. Das Manifest
+darf den kanonischen Stable-Pfad nicht selbst bestimmen. Snapshotpfade werden
+vor dem Lesen exakt an reguläre Dateien im realen Release gebunden; Symlinks,
+Hardlinks, fremde Dateitypen und übergroße Contractdateien werden abgelehnt.
 
 ## Dependency-Lock
 
@@ -212,6 +230,9 @@ Das Werkzeug:
 Retention alter Releases und ein separates Deployment-Eventlog bleiben eigene
 Folgetasks.
 
-## Härtungsnachtrag
+## Verbleibende Grenze
 
-Dienstzustände werden strukturiert geprüft; unbekannte oder transitive Zustände blockieren Pointermutationen. Rollback wartet begrenzt auf bestätigte Inaktivität. Legacy-Verzeichnisse werden zusätzlich über Geräte- und Inode-Identität verifiziert. Statusprovenienz bindet Manifest, Release, Runtime-Input, Lock, Source-Snapshot, Modul, Contract, Entry-Point, Python und Plattform. Der Deployment-Lock ist auf den Grabowski-State-Root begrenzt, symlinksicher geöffnet und auf eine reguläre Datei des aktuellen Benutzers mit Modus 0600 beschränkt. Runtime- und Tooling-Locks verwenden dieselbe strikte Pin- und Hashsemantik; die Tooling-Venv wird vor der Closure-Prüfung geleert.
+Ein persistentes Deployment-Transaktionsjournal mit Recovery nach SIGKILL,
+Stromausfall oder Neustart ist nicht Bestandteil von GRABOWSKI-DEPLOY-001.
+Dieser PR implementiert daher keinen halben Crash-Recovery-Mechanismus; der
+Folgetask GRABOWSKI-DEPLOY-002 trägt diese eigene Zustandsmaschine.

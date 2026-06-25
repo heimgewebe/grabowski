@@ -331,13 +331,16 @@ def parse_pinned_lock_file(path: Path, *, label: str = "Pinned-Lockfile") -> dic
     current_requirement: str | None = None
     current_version: str | None = None
     hashes = 0
+    continuation_open = False
 
     def close_block() -> None:
-        nonlocal current_name, current_requirement, current_version, hashes
+        nonlocal current_name, current_requirement, current_version, hashes, continuation_open
         if current_name is None:
             return
         if hashes == 0:
             fail(f"Runtime-Lockblock ohne SHA-256-Hashes: {current_requirement}")
+        if continuation_open:
+            fail(f"Runtime-Lockblock endet mit offener Fortsetzung: {current_requirement}")
         if current_name in locked:
             fail(f"Doppeltes Paket im Runtime-Lock: {current_name}")
         assert current_version is not None
@@ -346,6 +349,7 @@ def parse_pinned_lock_file(path: Path, *, label: str = "Pinned-Lockfile") -> dic
         current_requirement = None
         current_version = None
         hashes = 0
+        continuation_open = False
 
     for raw in path.read_text(encoding="utf-8").splitlines():
         stripped = raw.strip()
@@ -358,18 +362,24 @@ def parse_pinned_lock_file(path: Path, *, label: str = "Pinned-Lockfile") -> dic
                 fail(f"Fortsetzungszeile ohne Requirement: {raw!r}")
             if stripped.startswith("#"):
                 continue
+            if not continuation_open:
+                fail(f"Hashzeile ohne offene Requirement-Fortsetzung: {stripped}")
             if not HASH_RE.match(stripped):
                 fail(f"Nicht erlaubte Fortsetzungsoption im Lock: {stripped}")
             hashes += 1
+            continuation_open = stripped.endswith("\\")
             continue
         close_block()
         if stripped.startswith(("-e", "--", "-c", "-r")) or "://" in stripped or stripped.startswith("git+"):
             fail(f"Nicht erlaubte Runtime-Lock-Anforderung: {stripped}")
+        if not stripped.endswith("\\"):
+            fail(f"Lock-Requirement benötigt eine Hash-Fortsetzung: {stripped}")
         current_name, current_version = parse_pinned_requirement(
             stripped,
             allow_continuation=True,
         )
         current_requirement = stripped
+        continuation_open = True
     close_block()
 
     if not locked:
@@ -568,36 +578,51 @@ def deployment_lock(
     if safe_lock.is_symlink():
         fail(f"Deployment-Lock darf kein Symlink sein: {safe_lock}")
 
-    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    dir_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        dir_flags |= os.O_DIRECTORY
+    dir_fd = os.open(state_root_real, dir_flags)
+    fd: int | None = None
     try:
-        fd = os.open(safe_lock, flags, 0o600)
-    except OSError as exc:
-        fail(
-            "Deployment-Lock konnte nicht sicher geöffnet werden",
-            phase="deployment-lock-open",
-            details={"error_type": type(exc).__name__},
-        )
-        raise AssertionError from exc
+        flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(safe_lock.name, flags, 0o600, dir_fd=dir_fd)
+        except OSError as exc:
+            fail(
+                "Deployment-Lock konnte nicht sicher geöffnet werden",
+                phase="deployment-lock-open",
+                details={"error_type": type(exc).__name__},
+            )
+            raise AssertionError from exc
 
-    try:
         info = os.fstat(fd)
         if not statmod.S_ISREG(info.st_mode):
             fail("Deployment-Lock ist keine reguläre Datei")
         if info.st_uid != os.getuid():
             fail("Deployment-Lock gehört nicht dem aktuellen Benutzer")
+        if info.st_nlink != 1:
+            fail("Deployment-Lock darf keine Hardlinks besitzen")
         os.fchmod(fd, 0o600)
         verified = os.fstat(fd)
         if statmod.S_IMODE(verified.st_mode) != 0o600:
             fail("Deployment-Lock hat nicht den erwarteten Modus 0600")
-        if verified.st_uid != os.getuid():
-            fail("Deployment-Lock gehört nicht dem aktuellen Benutzer")
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             fail(f"Ein anderes Deployment hält bereits den Lock: {safe_lock}")
             raise AssertionError from exc
+
+        linked = os.stat(safe_lock.name, dir_fd=dir_fd, follow_symlinks=False)
+        locked = os.fstat(fd)
+        if (
+            not statmod.S_ISREG(linked.st_mode)
+            or linked.st_dev != locked.st_dev
+            or linked.st_ino != locked.st_ino
+            or linked.st_nlink != 1
+        ):
+            fail("Deployment-Lock-Verzeichniseintrag wurde ausgetauscht")
 
         payload = (
             json.dumps(
@@ -615,7 +640,9 @@ def deployment_lock(
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+        os.close(dir_fd)
 
 
 def releases_root_for(runtime: Path) -> Path:
@@ -672,9 +699,20 @@ def write_snapshot_inputs(snapshot: Snapshot, release_path: Path) -> dict[str, s
 
 def pip_env() -> dict[str, str]:
     env = os.environ.copy()
+    for key in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "VIRTUAL_ENV",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_FIND_LINKS",
+        "PIP_INDEX_URL",
+        "PIP_TRUSTED_HOST",
+    ):
+        env.pop(key, None)
     env["PIP_CONFIG_FILE"] = os.devnull
     env["PIP_NO_INPUT"] = "1"
     env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 
@@ -1209,6 +1247,8 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
         errors.append("schema_version")
     if manifest.get("completion_status") != "complete":
         errors.append("completion_status")
+    if manifest.get("mcp_protocol_version") not in MCP_PROTOCOL_VERSIONS:
+        errors.append("mcp_protocol_version")
     if not _is_lower_hex(manifest.get("repo_head"), 40):
         errors.append("repo_head")
     for key in (
@@ -1274,6 +1314,11 @@ def verify_manifest(
         fail("Manifest-Release-ID entspricht nicht dem Releaseverzeichnis")
     if Path(str(manifest.get("immutable_release_path"))).resolve(strict=True) != release_path:
         fail("Manifest-Releasepfad entspricht nicht dem realen Release")
+    release_python = release_path / ".venv/bin/python"
+    if Path(str(manifest.get("release_python_path"))) != release_python:
+        fail("Manifest-Release-Pythonpfad entspricht nicht dem Release")
+    if Path(str(manifest.get("executable"))) != release_python:
+        fail("Manifest-Executable entspricht nicht dem Release-Python")
     return manifest
 
 
@@ -1636,25 +1681,20 @@ class ReadinessResult:
 
 
 def readiness_probe(*, include_journal: bool = False) -> ReadinessResult:
-    state = service_state()
-    main_pid: int | None = None
-    try:
-        main_pid = int(str(state.get("MainPID", "0")))
-    except ValueError:
-        main_pid = None
+    observation = observe_service()
     health = http_text(HEALTH_URL)
     readiness = http_text(READY_URL)
     ok = (
-        state.get("ActiveState") == "active"
+        observation.confirmed_active
         and health == "live"
         and readiness == "ready"
     )
     return ReadinessResult(
         ok=ok,
-        service=state,
+        service=observation.to_dict(),
         health=health,
         readiness=readiness,
-        main_pid=main_pid,
+        main_pid=observation.main_pid,
         journal=journal_tail() if include_journal and not ok else "",
     )
 
@@ -2022,14 +2062,14 @@ def restore_pointer(state: ActivationState) -> None:
 class RollbackState:
     original_error: dict[str, Any]
     phase: str
-    previous_pointer: dict[str, str | None]
+    previous_pointer: dict[str, Any]
     stop_returncode: int | None = None
     inactive_after_stop: bool | None = None
     pointer_restore: str | None = None
     start_returncode: int | None = None
     readiness_ok: bool | None = None
     restored_identity: str | None = None
-    final_pointer: dict[str, str | None] | None = None
+    final_pointer: dict[str, Any] | None = None
     final_service: dict[str, Any] | None = None
     phases: dict[str, Any] = field(default_factory=dict)
     errors: list[Any] = field(default_factory=list)
@@ -2053,11 +2093,13 @@ class RollbackState:
         return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
 
-def pointer_to_dict(pointer: PointerState) -> dict[str, str | None]:
+def pointer_to_dict(pointer: PointerState) -> dict[str, Any]:
     return {
         "kind": pointer.kind,
         "path": str(pointer.path),
         "target": str(pointer.target) if pointer.target is not None else None,
+        "dev": pointer.dev,
+        "ino": pointer.ino,
     }
 
 
@@ -2324,6 +2366,10 @@ def deploy(
                     "service": observation.to_dict(),
                 },
             )
+
+        phase = "pre-activation-revalidation"
+        verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
+        require_profile_matches_contract(profile_path, runtime, snapshot.contract)
 
         phase = "activate-pointer"
         activate_pointer(activation)
