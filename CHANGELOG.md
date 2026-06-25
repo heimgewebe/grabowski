@@ -7,3 +7,6 @@
 - Minimaler CI- und Repository-Contract eingerichtet.
 
 - Added reproducible repository-to-runtime deployment with isolated staging, MCP handshake, tool-list verification, health/readiness gates, source-hash verification, and automatic rollback.
+- Hardened deployment with a hashed dependency lock, exclusive deployment
+  lock, runtime-process identity proof, provenance reporting, and behavioral
+  rollback failure tests.

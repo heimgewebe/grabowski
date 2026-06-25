@@ -21,6 +21,7 @@ STATE_DIR = HOME / ".local" / "state" / "grabowski"
 POLICY_PATH = HOME / ".config" / "grabowski" / "access.json"
 AUDIT_LOG = STATE_DIR / "write-audit.jsonl"
 BUNDLE_REGISTRY = STATE_DIR / "rlens-latest-complete-bundles.tsv"
+DEPLOYMENT_MANIFEST = Path(__file__).resolve().parent / "deployment-manifest.json"
 
 mcp = FastMCP(APP_NAME)
 
@@ -196,6 +197,17 @@ def _append_audit(record: dict[str, Any]) -> None:
         os.close(fd)
 
 
+def _deployment_metadata() -> dict[str, Any]:
+    if not DEPLOYMENT_MANIFEST.is_file():
+        return {"manifest_path": str(DEPLOYMENT_MANIFEST), "manifest_exists": False}
+    try:
+        raw = json.loads(DEPLOYMENT_MANIFEST.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"manifest_path": str(DEPLOYMENT_MANIFEST), "manifest_exists": True, "manifest_valid": False, "error": str(exc)}
+    allowed = {key: raw.get(key) for key in ("schema_version", "repo_head", "source_sha256", "runtime_lock_path", "runtime_lock_sha256", "mcp_protocol_version", "python_version", "python_implementation", "platform", "created_at_unix")}
+    return {"manifest_path": str(DEPLOYMENT_MANIFEST), "manifest_exists": True, "manifest_valid": True, **allowed}
+
+
 @mcp.tool(name="grabowski_status", annotations=READ_ANNOTATIONS)
 def grabowski_status() -> dict[str, Any]:
     """Return Grabowski's bounded read/write policy and current local state."""
@@ -210,6 +222,7 @@ def grabowski_status() -> dict[str, Any]:
         "write_excluded_roots": policy.get("write_excluded_roots", []),
         "latest_complete_bundles_path": str(BUNDLE_REGISTRY),
         "latest_complete_bundles_exists": BUNDLE_REGISTRY.is_file(),
+        "deployment": _deployment_metadata(),
         "forbidden_capabilities": policy.get("forbidden_capabilities", []),
     }
 

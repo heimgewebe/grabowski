@@ -48,7 +48,10 @@ Status: implemented in repository; live cutover requires explicit deployment.
 - MCP-Handshake sowie Tool-List-Gate,
 - Health- und Readiness-Gates,
 - automatischer Rollback,
-- Deployment-Manifest mit Repo-HEAD und Source-Hash.
+- Deployment-Manifest mit Repo-HEAD, Source-Hash, Lockfile-Hash und Plattform-Provenienz,
+- exklusiver Deployment-Lock,
+- gestartete Runtime- und Prozessidentität,
+- verhaltensbasierte Fehler- und Rollbacktests.
 
 ## GRABOWSKI-FLEET-001
 

@@ -3,21 +3,29 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 from pathlib import Path
+import platform
 import select
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from typing import NoReturn
+from typing import Any, Iterator, NoReturn
 
 
 SERVICE = "tunnel-client-grabowski.service"
+PROFILE_NAME = "grabowski"
 HEALTH_URL = "http://127.0.0.1:18080/healthz"
 READY_URL = "http://127.0.0.1:18080/readyz"
+HOME = Path.home().resolve()
+DEFAULT_PROFILE_PATH = HOME / ".config/tunnel-client/grabowski.yaml"
+DEFAULT_LOCK_FILE = HOME / ".local/state/grabowski/deploy.lock"
+RUNTIME_LOCK_RELATIVE = Path("requirements/runtime.lock.txt")
 EXPECTED_TOOLS = {
     "grabowski_status",
     "grabowski_list_directory",
@@ -95,6 +103,35 @@ def require_clean_repo(repo: Path) -> str:
     return git_head(repo)
 
 
+@contextmanager
+def deployment_lock(lock_path: Path) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            fail(f"Ein anderes Deployment hält bereits den Lock: {lock_path}")
+            raise AssertionError from exc
+
+        handle.seek(0)
+        handle.truncate()
+        handle.write(
+            json.dumps(
+                {
+                    "pid": str(Path("/proc/self").resolve().name),
+                    "acquired_at_unix": int(time.time()),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        handle.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def service_active() -> bool:
     result = run(
         ["systemctl", "--user", "is-active", "--quiet", SERVICE],
@@ -127,7 +164,7 @@ def wait_until_ready(timeout_seconds: int) -> bool:
     return False
 
 
-def send_json(proc: subprocess.Popen[bytes], payload: dict) -> None:
+def send_json(proc: subprocess.Popen[bytes], payload: dict[str, Any]) -> None:
     if proc.stdin is None:
         fail("MCP-Probe besitzt kein stdin.")
     raw = (
@@ -142,7 +179,7 @@ def wait_for_id(
     proc: subprocess.Popen[bytes],
     wanted_id: int,
     timeout_seconds: int,
-) -> dict:
+) -> dict[str, Any]:
     if proc.stdout is None:
         fail("MCP-Probe besitzt kein stdout.")
 
@@ -294,7 +331,36 @@ def probe_mcp(python_exe: Path, server_script: Path) -> str:
     fail(f"MCP-Probe fehlgeschlagen: {last_error}")
 
 
-def create_stage(repo: Path, runtime: Path) -> tuple[Path, str]:
+def python_provenance(python_exe: Path) -> dict[str, str]:
+    result = run(
+        [
+            str(python_exe),
+            "-c",
+            (
+                "import json,platform,sys; "
+                "print(json.dumps({"
+                "'python_version': platform.python_version(),"
+                "'python_implementation': platform.python_implementation(),"
+                "'platform': platform.platform(),"
+                "'executable': sys.executable"
+                "}, sort_keys=True))"
+            ),
+        ],
+        capture=True,
+    )
+    data = json.loads(result.stdout)
+    pip = run(
+        [str(python_exe), "-m", "pip", "--version"],
+        capture=True,
+    ).stdout.strip()
+    data["pip_version"] = pip
+    return data
+
+
+def create_stage(
+    repo: Path,
+    runtime: Path,
+) -> tuple[Path, str, dict[str, str]]:
     runtime_parent = runtime.parent
     runtime_parent.mkdir(parents=True, exist_ok=True)
 
@@ -307,14 +373,12 @@ def create_stage(repo: Path, runtime: Path) -> tuple[Path, str]:
 
     try:
         source = repo / "src" / "grabowski_mcp.py"
-        pyproject = repo / "pyproject.toml"
-
+        lockfile = repo / RUNTIME_LOCK_RELATIVE
         require_file(source, "MCP-Server")
-        require_file(pyproject, "pyproject.toml")
+        require_file(lockfile, "Runtime-Lockfile")
 
         venv = stage / ".venv"
         run([sys.executable, "-m", "venv", str(venv)])
-
         venv_python = venv / "bin" / "python"
         run(
             [
@@ -324,9 +388,13 @@ def create_stage(repo: Path, runtime: Path) -> tuple[Path, str]:
                 "install",
                 "--disable-pip-version-check",
                 "--no-input",
-                str(repo),
+                "--require-hashes",
+                "--no-deps",
+                "-r",
+                str(lockfile),
             ]
         )
+        run([str(venv_python), "-m", "pip", "check"])
 
         shutil.copy2(source, stage / "grabowski_mcp.py")
         run(
@@ -341,7 +409,7 @@ def create_stage(repo: Path, runtime: Path) -> tuple[Path, str]:
             venv_python,
             stage / "grabowski_mcp.py",
         )
-        return stage, negotiated
+        return stage, negotiated, python_provenance(venv_python)
 
     except Exception:
         shutil.rmtree(stage, ignore_errors=True)
@@ -353,20 +421,198 @@ def write_manifest(
     *,
     repo_head: str,
     source_hash: str,
+    lockfile_hash: str,
     protocol_version: str,
+    provenance: dict[str, str],
 ) -> None:
-    manifest = {
-        "schema_version": 1,
+    manifest: dict[str, Any] = {
+        "schema_version": 2,
         "repo_head": repo_head,
         "source_sha256": source_hash,
+        "runtime_lock_path": str(RUNTIME_LOCK_RELATIVE),
+        "runtime_lock_sha256": lockfile_hash,
         "mcp_protocol_version": protocol_version,
         "created_at_unix": int(time.time()),
+        **provenance,
     }
     path = stage / "deployment-manifest.json"
     path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def read_manifest(runtime: Path) -> dict[str, Any]:
+    path = runtime / "deployment-manifest.json"
+    require_file(path, "Deployment-Manifest")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        fail(f"Deployment-Manifest ist ungültig: {exc}")
+    if not isinstance(data, dict):
+        fail("Deployment-Manifest ist kein Objekt.")
+    return data
+
+
+def verify_manifest(
+    runtime: Path,
+    *,
+    repo_head: str,
+    source_hash: str,
+    lockfile_hash: str,
+) -> dict[str, Any]:
+    manifest = read_manifest(runtime)
+    expected = {
+        "schema_version": 2,
+        "repo_head": repo_head,
+        "source_sha256": source_hash,
+        "runtime_lock_sha256": lockfile_hash,
+    }
+    for key, value in expected.items():
+        if manifest.get(key) != value:
+            fail(
+                f"Manifest-Feld {key} weicht ab: "
+                f"{manifest.get(key)!r} != {value!r}"
+            )
+    return manifest
+
+
+def verify_profile_command(profile_path: Path, runtime: Path) -> None:
+    require_file(profile_path, "Tunnelprofil")
+    text = profile_path.read_text(encoding="utf-8")
+    expected_python = str(runtime / ".venv/bin/python")
+    expected_server = str(runtime / "grabowski_mcp.py")
+    command_lines = [line for line in text.splitlines() if "command:" in line]
+    if not any(
+        expected_python in line and expected_server in line
+        for line in command_lines
+    ):
+        fail(
+            "Tunnelprofil zeigt nicht auf die deployte Runtime: "
+            f"{profile_path}"
+        )
+
+
+def verify_service_execstart() -> None:
+    result = run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            SERVICE,
+            "-p",
+            "ExecStart",
+            "--value",
+        ],
+        capture=True,
+    )
+    value = result.stdout.strip()
+    if "tunnel-client" not in value or PROFILE_NAME not in value:
+        fail(f"Unerwartetes systemd ExecStart: {value}")
+
+
+def service_main_pid() -> int:
+    result = run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            SERVICE,
+            "-p",
+            "MainPID",
+            "--value",
+        ],
+        capture=True,
+    )
+    try:
+        pid = int(result.stdout.strip())
+    except ValueError as exc:
+        fail(f"Ungültige MainPID: {result.stdout!r}")
+        raise AssertionError from exc
+    if pid <= 0:
+        fail(f"{SERVICE} besitzt keine aktive MainPID.")
+    return pid
+
+
+def child_pids(pid: int, proc_root: Path = Path("/proc")) -> list[int]:
+    path = proc_root / str(pid) / "task" / str(pid) / "children"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return []
+    return [int(value) for value in text.split()] if text else []
+
+
+def descendant_pids(
+    root_pid: int,
+    proc_root: Path = Path("/proc"),
+) -> list[int]:
+    result: list[int] = []
+    pending = [root_pid]
+    seen = {root_pid}
+    while pending:
+        current = pending.pop()
+        for child in child_pids(current, proc_root):
+            if child in seen:
+                continue
+            seen.add(child)
+            result.append(child)
+            pending.append(child)
+    return result
+
+
+def process_argv(pid: int, proc_root: Path = Path("/proc")) -> list[str]:
+    path = proc_root / str(pid) / "cmdline"
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    return [
+        item.decode("utf-8", errors="replace")
+        for item in raw.split(b"\0")
+        if item
+    ]
+
+
+def verify_running_runtime(
+    runtime: Path,
+    *,
+    main_pid: int | None = None,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any]:
+    root_pid = service_main_pid() if main_pid is None else main_pid
+    expected_python = str(runtime / ".venv/bin/python")
+    expected_server = str(runtime / "grabowski_mcp.py")
+
+    for pid in [root_pid, *descendant_pids(root_pid, proc_root)]:
+        argv = process_argv(pid, proc_root)
+        if expected_python in argv and expected_server in argv:
+            return {"pid": pid, "argv": argv}
+
+    fail(
+        "Kein laufender MCP-Prozess verwendet die erwartete Runtime: "
+        f"{runtime}"
+    )
+
+
+def verify_runtime_identity(
+    runtime: Path,
+    profile_path: Path,
+    *,
+    repo_head: str,
+    source_hash: str,
+    lockfile_hash: str,
+) -> dict[str, Any]:
+    verify_profile_command(profile_path, runtime)
+    verify_service_execstart()
+    process = verify_running_runtime(runtime)
+    manifest = verify_manifest(
+        runtime,
+        repo_head=repo_head,
+        source_hash=source_hash,
+        lockfile_hash=lockfile_hash,
+    )
+    return {"process": process, "manifest": manifest}
 
 
 def install_stage(
@@ -420,6 +666,7 @@ def restore_previous_runtime(
 def deploy(
     repo: Path,
     runtime: Path,
+    profile_path: Path,
     *,
     timeout_seconds: int,
 ) -> None:
@@ -428,13 +675,19 @@ def deploy(
         fail(f"{SERVICE} ist vor dem Deployment nicht aktiv.")
 
     source = repo / "src" / "grabowski_mcp.py"
+    lockfile = repo / RUNTIME_LOCK_RELATIVE
+    require_file(source, "MCP-Server")
+    require_file(lockfile, "Runtime-Lockfile")
     source_hash = sha256(source)
-    stage, protocol_version = create_stage(repo, runtime)
+    lockfile_hash = sha256(lockfile)
+    stage, protocol_version, provenance = create_stage(repo, runtime)
     write_manifest(
         stage,
         repo_head=repo_head,
         source_hash=source_hash,
+        lockfile_hash=lockfile_hash,
         protocol_version=protocol_version,
+        provenance=provenance,
     )
 
     backup: Path | None = None
@@ -447,7 +700,6 @@ def deploy(
         swapped = True
 
         run(["systemctl", "--user", "start", SERVICE])
-
         if not wait_until_ready(timeout_seconds):
             fail("Neue Runtime wurde nicht rechtzeitig live und ready.")
 
@@ -455,40 +707,54 @@ def deploy(
         if sha256(deployed_source) != source_hash:
             fail("Deployter Source-Hash weicht vom Repo ab.")
 
+        identity = verify_runtime_identity(
+            runtime,
+            profile_path,
+            repo_head=repo_head,
+            source_hash=source_hash,
+            lockfile_hash=lockfile_hash,
+        )
+
         print("PASS: Deployment erfolgreich")
         print(f"Repo-HEAD:       {repo_head}")
         print(f"Source-SHA256:   {source_hash}")
+        print(f"Lock-SHA256:     {lockfile_hash}")
         print(f"MCP-Protokoll:   {protocol_version}")
+        print(f"Runtime-PID:     {identity['process']['pid']}")
         print(f"Runtime:         {runtime}")
         print(f"Rollback:        {backup}")
 
-    except Exception:
+    except Exception as original:
         if swapped:
             run(
                 ["systemctl", "--user", "stop", SERVICE],
-                check=False,
             )
-            restore_previous_runtime(
-                runtime,
-                backup,
-                stamp=stamp,
-            )
+            try:
+                restore_previous_runtime(
+                    runtime,
+                    backup,
+                    stamp=stamp,
+                )
+            except Exception as rollback_exc:
+                raise DeployError(
+                    f"Deployment fehlgeschlagen ({original}); "
+                    f"Rollback konnte nicht installiert werden: {rollback_exc}"
+                ) from rollback_exc
+
             run(
                 ["systemctl", "--user", "start", SERVICE],
-                check=False,
             )
             if backup is not None and not wait_until_ready(timeout_seconds):
-                print(
-                    "WARN: Wiederhergestellte Runtime wurde nicht ready.",
-                    file=sys.stderr,
-                )
+                raise DeployError(
+                    f"Deployment fehlgeschlagen ({original}); "
+                    "wiederhergestellte Runtime wurde nicht ready."
+                ) from original
         else:
             if not runtime.exists() and backup is not None and backup.exists():
                 backup.rename(runtime)
             if not service_active():
                 run(
                     ["systemctl", "--user", "start", SERVICE],
-                    check=False,
                 )
         raise
 
@@ -501,14 +767,34 @@ def check(repo: Path, runtime: Path) -> None:
     repo_head = git_head(repo)
     dirty = repo_dirty(repo)
     source = repo / "src" / "grabowski_mcp.py"
+    lockfile = repo / RUNTIME_LOCK_RELATIVE
     require_file(source, "MCP-Server")
+    require_file(lockfile, "Runtime-Lockfile")
 
-    stage, protocol_version = create_stage(repo, runtime)
+    stage, protocol_version, provenance = create_stage(repo, runtime)
     try:
-        print("PASS: Deployment-Staging ist reproduzierbar")
+        source_hash = sha256(source)
+        lockfile_hash = sha256(lockfile)
+        write_manifest(
+            stage,
+            repo_head=repo_head,
+            source_hash=source_hash,
+            lockfile_hash=lockfile_hash,
+            protocol_version=protocol_version,
+            provenance=provenance,
+        )
+        verify_manifest(
+            stage,
+            repo_head=repo_head,
+            source_hash=source_hash,
+            lockfile_hash=lockfile_hash,
+        )
+        print("PASS: Deployment-Staging ist dependency-locked")
         print(f"Repo-HEAD:       {repo_head}")
         print(f"Arbeitsbaum:     {'dirty' if dirty else 'clean'}")
-        print(f"Source-SHA256:   {sha256(source)}")
+        print(f"Source-SHA256:   {source_hash}")
+        print(f"Lock-SHA256:     {lockfile_hash}")
+        print(f"Python:          {provenance['python_version']}")
         print(f"MCP-Protokoll:   {protocol_version}")
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -526,7 +812,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--runtime",
         type=Path,
-        default=Path.home() / ".local/share/grabowski-mcp",
+        default=HOME / ".local/share/grabowski-mcp",
+    )
+    parser.add_argument(
+        "--profile-path",
+        type=Path,
+        default=DEFAULT_PROFILE_PATH,
+    )
+    parser.add_argument(
+        "--lock-file",
+        type=Path,
+        default=DEFAULT_LOCK_FILE,
     )
     parser.add_argument("--timeout", type=int, default=40)
 
@@ -540,16 +836,20 @@ def main() -> int:
     args = parse_args()
     repo = args.repo.resolve()
     runtime = args.runtime.expanduser().resolve()
+    profile_path = args.profile_path.expanduser().resolve()
+    lock_file = args.lock_file.expanduser().resolve()
 
     try:
         if args.check:
             check(repo, runtime)
         else:
-            deploy(
-                repo,
-                runtime,
-                timeout_seconds=args.timeout,
-            )
+            with deployment_lock(lock_file):
+                deploy(
+                    repo,
+                    runtime,
+                    profile_path,
+                    timeout_seconds=args.timeout,
+                )
     except DeployError as exc:
         print(f"STOP: {exc}", file=sys.stderr)
         return 1

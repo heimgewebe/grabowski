@@ -63,3 +63,7 @@ make deploy
 ```
 
 Details: [`docs/deployment.md`](docs/deployment.md).
+
+Die Runtime-Abhängigkeiten sind in `requirements/runtime.lock.txt` vollständig
+versioniert und gehasht. Das Deployment prüft außerdem den exklusiven Lock,
+die gestartete Prozessidentität und das Provenienzmanifest.
