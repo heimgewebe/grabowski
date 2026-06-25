@@ -8,6 +8,7 @@ validate: syntax test policy secrets
 
 syntax:
 >$(PYTHON) -m py_compile src/grabowski_mcp.py
+>$(PYTHON) -m py_compile src/grabowski_operator.py
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
 
 test:
