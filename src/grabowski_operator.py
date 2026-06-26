@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import json
 import os
 from pathlib import Path
@@ -23,8 +25,8 @@ HOME = Path.home().resolve()
 EVIDENCE_ROOT = (HOME / "repos" / "merges").resolve()
 STATE_DIR = (HOME / ".local" / "state" / "grabowski").resolve()
 JOB_PREFIX = "grabowski-job-"
-DEFAULT_TIMEOUT = 900
-MAX_TIMEOUT = 7200
+DEFAULT_TIMEOUT = 60
+MAX_TIMEOUT = 120
 DEFAULT_OUTPUT_BYTES = 250_000
 MAX_OUTPUT_BYTES = 2_000_000
 
@@ -178,6 +180,21 @@ def _output_limit(value: int) -> int:
     return value
 
 
+def _terminate_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    grace_seconds: float = 3.0,
+) -> tuple[bytes, bytes]:
+    if process.poll() is not None:
+        return process.communicate()
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        return process.communicate(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        return process.communicate()
+
+
 def _run(
     argv: list[str],
     *,
@@ -186,26 +203,23 @@ def _run(
     max_output_bytes: int,
 ) -> dict[str, Any]:
     started = time.monotonic()
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=_safe_environment(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
     try:
-        completed = subprocess.run(
-            argv,
-            cwd=cwd,
-            env=_safe_environment(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout_seconds,
-            check=False,
-        )
+        stdout_raw, stderr_raw = process.communicate(timeout=timeout_seconds)
         timed_out = False
-        returncode: int | None = completed.returncode
-        stdout_raw = completed.stdout
-        stderr_raw = completed.stderr
-    except subprocess.TimeoutExpired as exc:
+        returncode: int | None = process.returncode
+    except subprocess.TimeoutExpired:
         timed_out = True
-        returncode = None
-        stdout_raw = exc.stdout or b""
-        stderr_raw = exc.stderr or b""
+        stdout_raw, stderr_raw = _terminate_process_group(process)
+        returncode = process.returncode
 
     stdout = _redact(
         stdout_raw.decode("utf-8", errors="replace")
@@ -646,8 +660,32 @@ def grabowski_ports() -> dict[str, Any]:
     )
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the Grabowski MCP operator."
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "streamable-http"),
+        default="stdio",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=18181)
+    return parser.parse_args()
+
+
 def main() -> None:
-    mcp.run()
+    args = _parse_args()
+    if args.transport == "streamable-http":
+        if args.host != "127.0.0.1":
+            raise SystemExit(
+                "Grabowski HTTP transport must bind to 127.0.0.1"
+            )
+        if not 1024 <= args.port <= 65535:
+            raise SystemExit("port must be between 1024 and 65535")
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+    mcp.run(transport=args.transport)
 
 
 if __name__ == "__main__":
