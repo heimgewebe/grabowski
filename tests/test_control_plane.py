@@ -44,6 +44,7 @@ if "mcp" not in sys.modules:
 import grabowski_fleet as fleet
 import grabowski_operations as operations
 import grabowski_privileged as privileged
+import grabowski_privileged_broker as privileged_broker
 
 
 def _write(path: Path, value: object) -> None:
@@ -162,7 +163,95 @@ class OperationTests(unittest.TestCase):
             self.assertTrue(result["rollback"]["success"])
 
 
+class PrivilegedBrokerTests(unittest.TestCase):
+    def _reference(self, now: int = 1000) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema_version": 1,
+            "execution": "unprivileged-reference-only",
+            "may_execute": False,
+            "requires_external_privileged_agent": True,
+            "replay_policy": "single-use-external-broker",
+            "action": "edit_system_service",
+            "target": "grabowski-mcp.service",
+            "justification": "Restart the explicitly named managed service",
+            "request_id": "a" * 32,
+            "created_at_unix": now,
+            "expires_at_unix": now + 900,
+        }
+        value["reference_sha256"] = privileged_broker.canonical_sha256(value)
+        return value
+
+    def test_reference_and_fixed_template_are_validated(self) -> None:
+        reference = self._reference()
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 1,
+            "actions": {
+                "edit_system_service": {
+                    "enabled": True,
+                    "target_pattern": "[A-Za-z0-9_.@:-]{1,200}",
+                    "argv": ["/usr/bin/systemctl", "restart", "{target}"],
+                    "timeout_seconds": 120,
+                }
+            },
+        }
+        argv, timeout = privileged_broker.resolve_action(config, parsed)
+        self.assertEqual(
+            argv,
+            ["/usr/bin/systemctl", "restart", "grabowski-mcp.service"],
+        )
+        self.assertEqual(timeout, 120)
+
+    def test_tamper_expiry_disable_and_replay_fail_closed(self) -> None:
+        reference = self._reference()
+        reference["target"] = "other.service"
+        with self.assertRaisesRegex(ValueError, "hash"):
+            privileged_broker.parse_reference(
+                json.dumps(reference).encode("utf-8"), now=1000
+            )
+        expired = self._reference()
+        with self.assertRaisesRegex(PermissionError, "currently valid"):
+            privileged_broker.parse_reference(
+                json.dumps(expired).encode("utf-8"), now=2000
+            )
+        valid = self._reference()
+        parsed = privileged_broker.parse_reference(
+            json.dumps(valid).encode("utf-8"), now=1000
+        )
+        disabled = {
+            "schema_version": 1,
+            "actions": {
+                "edit_system_service": {
+                    "enabled": False,
+                    "target_pattern": ".*",
+                    "argv": ["/usr/bin/false", "{target}"],
+                    "timeout_seconds": 1,
+                }
+            },
+        }
+        with self.assertRaisesRegex(PermissionError, "disabled"):
+            privileged_broker.resolve_action(disabled, parsed)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            privileged_broker.claim_once(state, "b" * 32)
+            with self.assertRaises(FileExistsError):
+                privileged_broker.claim_once(state, "b" * 32)
+
+
 class PrivilegedAndConnectorTests(unittest.TestCase):
+    def test_systemd_socket_contract_is_rooted_and_group_bounded(self) -> None:
+        socket_unit = (ROOT / "systemd" / "grabowski-privileged-broker.socket").read_text(encoding="utf-8")
+        service_unit = (ROOT / "systemd" / "grabowski-privileged-broker@.service").read_text(encoding="utf-8")
+        self.assertIn("Accept=yes", socket_unit)
+        self.assertIn("SocketGroup=grabowski", socket_unit)
+        self.assertIn("SocketMode=0660", socket_unit)
+        self.assertIn("User=root", service_unit)
+        self.assertIn("StandardInput=socket", service_unit)
+        self.assertIn("NoNewPrivileges=yes", service_unit)
+        self.assertIn("ExecStart=/usr/local/libexec/grabowski-privileged-broker", service_unit)
+
     def test_privileged_status_is_fail_closed_without_root_assets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

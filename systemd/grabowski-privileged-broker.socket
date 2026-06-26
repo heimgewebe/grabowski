@@ -1,0 +1,14 @@
+[Unit]
+Description=Grabowski privileged action broker socket
+Documentation=file:/usr/local/share/doc/grabowski/control-plane.md
+
+[Socket]
+ListenStream=/run/grabowski/privileged-broker.sock
+SocketMode=0660
+SocketGroup=grabowski
+DirectoryMode=0750
+Accept=yes
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

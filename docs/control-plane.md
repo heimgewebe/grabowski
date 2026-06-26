@@ -30,9 +30,16 @@ Parameter dürfen nur als vollständige Tokens `${name}` eingesetzt werden. Teil
 
 ## Privilegierter Broker
 
-`config/privileged-actions.example.json` definiert root-eigene argv-Vorlagen. Alle Beispielaktionen sind deaktiviert. `grabowski_privileged_broker_status` prüft nur Readiness; ohne root-eigenen Broker, root-eigene Konfiguration und Request-Client bleibt der Pfad fail-closed.
+`config/privileged-actions.example.json` definiert root-eigene argv-Vorlagen. Alle Beispielaktionen sind deaktiviert. Der Broker besteht aus:
 
-Die Installation des Root-Brokers ist bewusst kein unprivilegierter Selbstumbau. Ein solcher Broker muss außerhalb des normalen MCP-Prozesses installiert und durch minimale `sudoers`-Regeln an exakt einen Request-Client gebunden werden.
+- `src/grabowski_privileged_broker.py`: Referenz-, TTL-, Template- und Replay-Prüfung,
+- `tools/grabowski_privileged_broker.py`: root-seitiger Handler ohne Shell,
+- `tools/grabowski_privileged_request.py`: begrenzter Unix-Socket-Client,
+- `systemd/grabowski-privileged-broker.socket` und `@.service`: gruppenbegrenzte Socket-Aktivierung.
+
+Der Handler akzeptiert nur kurzlebige, hashgebundene Referenzen aus `grabowski_privileged_action_reference`, ersetzt ausschließlich das vollständige Token `{target}`, verlangt absolute Executables und markiert jede Request-ID vor der Ausführung als verbraucht. Auditdaten enthalten Ziel- und argv-Hashes, nicht Begründung oder Secretwerte.
+
+`grabowski_privileged_broker_status` prüft Binary, root-eigene Konfiguration, Socket und Client. Die Hostinstallation ist bewusst kein unprivilegierter Selbstumbau: Dateien müssen root-eigen unter `/usr/local` und `/etc` installiert, der Socket aktiviert und der Operator der Gruppe `grabowski` hinzugefügt werden. Bis dahin bleibt der Pfad fail-closed.
 
 ## Secrets
 

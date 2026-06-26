@@ -19,6 +19,7 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_fleet.py
 >$(PYTHON) -m py_compile src/grabowski_operations.py
 >$(PYTHON) -m py_compile src/grabowski_privileged.py
+>$(PYTHON) -m py_compile src/grabowski_privileged_broker.py
 >$(PYTHON) -m py_compile tools/build_operator_context.py
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
 >$(PYTHON) -m py_compile tools/deploy_runtime_dual.py
@@ -29,6 +30,8 @@ syntax:
 >$(PYTHON) -m py_compile tools/grabowski_fleet_cli.py
 >$(PYTHON) -m py_compile tools/grabowski_recipe_cli.py
 >$(PYTHON) -m py_compile tools/grabowski_privileged_status.py
+>$(PYTHON) -m py_compile tools/grabowski_privileged_broker.py
+>$(PYTHON) -m py_compile tools/grabowski_privileged_request.py
 
 test:
 >$(PYTHON) -m unittest discover -s tests -v

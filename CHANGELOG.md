@@ -5,8 +5,8 @@
 - Added a typed home fleet registry and argv-only local/SSH execution path for
   `heim-pc`, `heimserver` and `heimberry`, plus contracted operation recipes
   with preflight, action, postflight and reverse-order rollback.
-- Added fail-closed privileged-broker readiness and disabled root-owned action
-  templates without granting generic privilege escalation.
+- Added a fail-closed systemd-socket privileged broker with hash/TTL/replay
+  validation, fixed root-owned action templates, and all examples disabled.
 - Made `secret_reveal` a break-glass path requiring justification and explicit
   context-exposure acknowledgement; `secret_use` remains the default.
 - Added a deterministic connector tool-snapshot probe and control-plane tests.
