@@ -1,0 +1,297 @@
+{
+  "capability_source": "src/grabowski_capabilities.py",
+  "capability_source_sha256": "42ba4b36e5bbc197b55640b7cb3d3c524b8150c8e620e5091da180315dbcd302",
+  "contract": "config/runtime-entrypoint.json",
+  "contract_sha256": "b6d2df7310dfd8c29952388a377e5a7bb9801527c83ad8008d4b19fb587e6d47",
+  "integrity": {
+    "duplicate_tools": [],
+    "missing_declarations": [],
+    "missing_profiles": [],
+    "orphan_profiles": [],
+    "undeclared_tools": []
+  },
+  "schema_version": 1,
+  "tools": [
+    {
+      "category": "context",
+      "description": "Return Grabowski's bounded read/write policy and current local state.",
+      "effects": [],
+      "id": "grabowski_status",
+      "purpose": "Read policy, deployment provenance and the current bounded operating mode.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_status"
+    },
+    {
+      "category": "context",
+      "description": "Return a task-oriented live operator context and explicit drift findings.",
+      "effects": [],
+      "id": "grabowski_context",
+      "purpose": "Return a task-oriented live operator context and explicit drift findings.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_context"
+    },
+    {
+      "category": "filesystem",
+      "description": "List one allowed directory without recursion or symlink traversal.",
+      "effects": [],
+      "id": "grabowski_list_directory",
+      "purpose": "List one allowed directory without recursive traversal.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_list_directory"
+    },
+    {
+      "category": "filesystem",
+      "description": "Return metadata and SHA-256 for one allowed regular file.",
+      "effects": [],
+      "id": "grabowski_stat",
+      "purpose": "Read metadata and a content hash for one allowed path.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_stat"
+    },
+    {
+      "category": "filesystem",
+      "description": "Read UTF-8 text from an allowed file and return a concurrency hash.",
+      "effects": [],
+      "id": "grabowski_read_text",
+      "purpose": "Read bounded UTF-8 text and obtain a concurrency hash.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_read_text"
+    },
+    {
+      "category": "filesystem",
+      "description": "Use this when a new UTF-8 text file must be created inside an allowed write root. It fails if the path already exists.",
+      "effects": [
+        "file-create"
+      ],
+      "id": "grabowski_create_text",
+      "purpose": "Create one new UTF-8 file atomically inside an allowed write root.",
+      "read_only": false,
+      "reversibility": "manual-or-git",
+      "risk_class": "medium",
+      "tool": "grabowski_create_text"
+    },
+    {
+      "category": "filesystem",
+      "description": "Use this when an existing allowed UTF-8 text file must be replaced atomically. The exact SHA-256 returned by grabowski_read_text or grabowski_stat is required.",
+      "effects": [
+        "file-replace",
+        "backup-create"
+      ],
+      "id": "grabowski_replace_text",
+      "purpose": "Replace one UTF-8 file atomically after a hash precondition and retain a backup.",
+      "read_only": false,
+      "reversibility": "backup-and-git",
+      "risk_class": "medium",
+      "tool": "grabowski_replace_text"
+    },
+    {
+      "category": "knowledge",
+      "description": "Return the curated latest-complete Lens/repoLens bundle registry.",
+      "effects": [],
+      "id": "latest_complete_bundles",
+      "purpose": "Read the curated latest-complete Lens and repoLens bundle registry.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "latest_complete_bundles"
+    },
+    {
+      "category": "command",
+      "description": "Run one non-interactive command and return redacted output.",
+      "effects": [
+        "command-dependent"
+      ],
+      "id": "grabowski_terminal_run",
+      "purpose": "Run one bounded non-interactive command as the current user.",
+      "read_only": false,
+      "reversibility": "command-dependent",
+      "risk_class": "variable",
+      "tool": "grabowski_terminal_run"
+    },
+    {
+      "category": "command",
+      "description": "Start a durable background command as a transient user systemd unit.",
+      "effects": [
+        "process-start",
+        "state-create",
+        "command-dependent"
+      ],
+      "id": "grabowski_job_start",
+      "purpose": "Start a durable bounded background command as a transient user service.",
+      "read_only": false,
+      "reversibility": "job-cancel-and-command-dependent",
+      "risk_class": "variable",
+      "tool": "grabowski_job_start"
+    },
+    {
+      "category": "command",
+      "description": "Return durable metadata and current systemd status for one job.",
+      "effects": [],
+      "id": "grabowski_job_status",
+      "purpose": "Read durable metadata and current service state for one Grabowski job.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_job_status"
+    },
+    {
+      "category": "command",
+      "description": "Read persistent stdout and stderr for one Grabowski job.",
+      "effects": [],
+      "id": "grabowski_job_logs",
+      "purpose": "Read redacted persistent output for one Grabowski job.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_job_logs"
+    },
+    {
+      "category": "command",
+      "description": "Stop one Grabowski background job.",
+      "effects": [
+        "process-stop"
+      ],
+      "id": "grabowski_job_cancel",
+      "purpose": "Stop one Grabowski-owned background job.",
+      "read_only": false,
+      "reversibility": "restart-job",
+      "risk_class": "medium",
+      "tool": "grabowski_job_cancel"
+    },
+    {
+      "category": "version-control",
+      "description": "Run Git in one repository with protected-main force-push guard.",
+      "effects": [
+        "git-dependent"
+      ],
+      "id": "grabowski_git",
+      "purpose": "Run Git in one repository with protected-main force-push protection.",
+      "read_only": false,
+      "reversibility": "git-dependent",
+      "risk_class": "variable",
+      "tool": "grabowski_git"
+    },
+    {
+      "category": "version-control",
+      "description": "Create or switch one local Git branch through a typed operation.",
+      "effects": [
+        "git-reference-change",
+        "working-tree-switch"
+      ],
+      "id": "grabowski_git_branch",
+      "purpose": "Create or switch local branches through a typed, audited branch operation.",
+      "read_only": false,
+      "reversibility": "git-branch-switch",
+      "risk_class": "medium",
+      "tool": "grabowski_git_branch"
+    },
+    {
+      "category": "remote-version-control",
+      "description": "Run GitHub CLI with redacted output.",
+      "effects": [
+        "remote-dependent"
+      ],
+      "id": "grabowski_github",
+      "purpose": "Run GitHub CLI operations with output redaction.",
+      "read_only": false,
+      "reversibility": "operation-dependent",
+      "risk_class": "variable",
+      "tool": "grabowski_github"
+    },
+    {
+      "category": "service",
+      "description": "Inspect or control one user-level systemd service.",
+      "effects": [
+        "service-state-change"
+      ],
+      "id": "grabowski_user_service",
+      "purpose": "Inspect or control one user-level systemd service.",
+      "read_only": false,
+      "reversibility": "inverse-service-action",
+      "risk_class": "high",
+      "tool": "grabowski_user_service"
+    },
+    {
+      "category": "session",
+      "description": "List tmux sessions visible to the current user.",
+      "effects": [],
+      "id": "grabowski_tmux_list",
+      "purpose": "List tmux sessions visible to the current user.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_tmux_list"
+    },
+    {
+      "category": "session",
+      "description": "Capture text from one tmux pane.",
+      "effects": [],
+      "id": "grabowski_tmux_capture",
+      "purpose": "Read text from one tmux pane.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_tmux_capture"
+    },
+    {
+      "category": "session",
+      "description": "Send literal text to one tmux pane, optionally followed by Enter.",
+      "effects": [
+        "interactive-input",
+        "command-dependent"
+      ],
+      "id": "grabowski_tmux_send",
+      "purpose": "Send literal input to one tmux pane, optionally followed by Enter.",
+      "read_only": false,
+      "reversibility": "command-dependent",
+      "risk_class": "high",
+      "tool": "grabowski_tmux_send"
+    },
+    {
+      "category": "process",
+      "description": "List current-user processes, optionally filtered by a regex.",
+      "effects": [],
+      "id": "grabowski_process_list",
+      "purpose": "List current-user processes with optional regular-expression filtering.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_process_list"
+    },
+    {
+      "category": "process",
+      "description": "Send TERM, INT, HUP or KILL to one process owned by the current user.",
+      "effects": [
+        "process-signal",
+        "possible-process-stop"
+      ],
+      "id": "grabowski_process_signal",
+      "purpose": "Signal one process owned by the current user.",
+      "read_only": false,
+      "reversibility": "usually-not-reversible",
+      "risk_class": "high",
+      "tool": "grabowski_process_signal"
+    },
+    {
+      "category": "diagnostics",
+      "description": "List listening TCP and UDP sockets.",
+      "effects": [],
+      "id": "grabowski_ports",
+      "purpose": "List listening TCP and UDP sockets.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_ports"
+    }
+  ]
+}
