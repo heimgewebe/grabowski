@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -18,13 +19,16 @@ import deploy_runtime as core
 
 TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 OPERATOR_SERVICE = "grabowski-operator.service"
+OPERATOR_LISTENER_HOST = "127.0.0.1"
+OPERATOR_LISTENER_PORT = 18181
+OPERATOR_LISTENER_REQUIRED_SAMPLES = 2
 OPERATOR_HTTP_ARGUMENTS = (
     "--transport",
     "streamable-http",
     "--host",
-    "127.0.0.1",
+    OPERATOR_LISTENER_HOST,
     "--port",
-    "18181",
+    str(OPERATOR_LISTENER_PORT),
 )
 
 
@@ -360,6 +364,50 @@ def verify_operator_process(
     }
 
 
+def require_operator_listener(
+    *,
+    timeout_seconds: int = core.TIMEOUTS["service_start"],
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    consecutive = 0
+    attempts = 0
+    last_error: str | None = None
+    while time.monotonic() < deadline:
+        attempts += 1
+        remaining = max(0.1, deadline - time.monotonic())
+        try:
+            with socket.create_connection(
+                (OPERATOR_LISTENER_HOST, OPERATOR_LISTENER_PORT),
+                timeout=min(0.5, remaining),
+            ):
+                consecutive += 1
+                last_error = None
+        except OSError as exc:
+            consecutive = 0
+            last_error = f"{type(exc).__name__}: {exc}"
+        else:
+            if consecutive >= OPERATOR_LISTENER_REQUIRED_SAMPLES:
+                return {
+                    "host": OPERATOR_LISTENER_HOST,
+                    "port": OPERATOR_LISTENER_PORT,
+                    "successful_samples": consecutive,
+                    "attempts": attempts,
+                }
+        time.sleep(0.1)
+    core.fail(
+        "Operator-Listener ist nicht bestätigt erreichbar",
+        phase="operator-listener",
+        details={
+            "host": OPERATOR_LISTENER_HOST,
+            "port": OPERATOR_LISTENER_PORT,
+            "required_consecutive_samples": OPERATOR_LISTENER_REQUIRED_SAMPLES,
+            "successful_consecutive_samples": consecutive,
+            "attempts": attempts,
+            "last_error": last_error,
+        },
+    )
+
+
 def journal_tail(unit: str) -> str:
     result = core.run(
         ["journalctl", "--user", "-u", unit, "-n", "40", "--no-pager"],
@@ -518,9 +566,13 @@ def rollback_url(
     identity = None
     if operator_start_ok and started_operator is not None:
         identity_ok, identity = step("verify-operator", lambda: verify_operator_process(activation.runtime, contract))
+    listener_ok = False
+    listener = None
+    if identity_ok and identity is not None:
+        listener_ok, listener = step("operator-listener", lambda: require_operator_listener(timeout_seconds=timeout_seconds))
     tunnel_start_ok = False
     started_tunnel = None
-    if identity_ok and identity is not None:
+    if listener_ok and listener is not None:
         tunnel_start_ok, started_tunnel = step("start-tunnel", lambda: start_service(TUNNEL_SERVICE))
     ready_ok = False
     ready = None
@@ -555,6 +607,7 @@ def preflight_url(
     require_service_active(OPERATOR_SERVICE)
     require_service_active(TUNNEL_SERVICE)
     verify_operator_process(runtime, snapshot.contract)
+    require_operator_listener()
     verify_tunnel_process()
     return snapshot, runtime, topology
 
@@ -619,6 +672,8 @@ def deploy_url(
             snapshot.contract,
             release_hint=build.release_path,
         )
+        phase = "operator-listener"
+        require_operator_listener(timeout_seconds=timeout_seconds)
 
         phase = "start-tunnel"
         start_service(TUNNEL_SERVICE)

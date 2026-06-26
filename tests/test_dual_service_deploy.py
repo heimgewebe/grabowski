@@ -153,6 +153,53 @@ class OperatorIdentityTests(unittest.TestCase):
                         dual.verify_operator_process(RUNTIME, CONTRACT)
 
 
+class FakeSocket:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class OperatorListenerGateTests(unittest.TestCase):
+    def test_listener_gate_waits_for_two_consecutive_successful_samples(self) -> None:
+        with (
+            mock.patch.object(
+                dual.socket,
+                "create_connection",
+                side_effect=[
+                    ConnectionRefusedError("refused"),
+                    FakeSocket(),
+                    ConnectionRefusedError("flapped"),
+                    FakeSocket(),
+                    FakeSocket(),
+                ],
+            ) as connect,
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            result = dual.require_operator_listener(timeout_seconds=1)
+        self.assertEqual(result["successful_samples"], 2)
+        self.assertEqual(result["attempts"], 5)
+        self.assertEqual(connect.call_count, 5)
+
+    def test_listener_gate_fails_closed_on_timeout(self) -> None:
+        with (
+            mock.patch.object(
+                dual.socket,
+                "create_connection",
+                side_effect=ConnectionRefusedError("refused"),
+            ),
+            mock.patch.object(
+                dual.time,
+                "monotonic",
+                side_effect=[0.0, 0.0, 0.0, 0.1, 0.1, 0.31],
+            ),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(core.DeployError, "Operator-Listener"):
+                dual.require_operator_listener(timeout_seconds=0.3)
+
+
 class DeploymentSequenceTests(unittest.TestCase):
     def snapshot(self):
         return SimpleNamespace(
@@ -167,6 +214,49 @@ class DeploymentSequenceTests(unittest.TestCase):
             release_path=Path("/release/new"),
             release_id="new",
             protocol_version="2025-06-18",
+        )
+
+    def test_url_preflight_requires_operator_listener(self) -> None:
+        events: list[str] = []
+        snapshot = self.snapshot()
+        topology = dual.ProfileTopology("url", server_url_count=1)
+        with (
+            mock.patch.object(core, "snapshot_from_git", return_value=snapshot),
+            mock.patch.object(core, "require_runtime_replaceable", return_value=RUNTIME),
+            mock.patch.object(dual, "profile_topology", return_value=topology),
+            mock.patch.object(dual, "require_topology_matches_contract"),
+            mock.patch.object(
+                dual,
+                "require_service_active",
+                side_effect=lambda unit: events.append(f"active:{unit}") or observation(True),
+            ),
+            mock.patch.object(
+                dual,
+                "verify_operator_process",
+                side_effect=lambda *args, **kwargs: events.append("verify:operator") or {"pid": 1},
+            ),
+            mock.patch.object(
+                dual,
+                "require_operator_listener",
+                side_effect=lambda **kwargs: events.append("listener") or {"successful_samples": 2},
+            ),
+            mock.patch.object(
+                dual,
+                "verify_tunnel_process",
+                side_effect=lambda: events.append("verify:tunnel") or {"pid": 2},
+            ),
+        ):
+            result = dual.preflight_url(ROOT, RUNTIME, Path("profile.yaml"))
+        self.assertEqual(result, (snapshot, RUNTIME, topology))
+        self.assertEqual(
+            events,
+            [
+                f"active:{dual.OPERATOR_SERVICE}",
+                f"active:{dual.TUNNEL_SERVICE}",
+                "verify:operator",
+                "listener",
+                "verify:tunnel",
+            ],
         )
 
     def test_cutover_order_is_tunnel_then_operator_and_reverse_on_start(self) -> None:
@@ -211,6 +301,11 @@ class DeploymentSequenceTests(unittest.TestCase):
             ),
             mock.patch.object(
                 dual,
+                "require_operator_listener",
+                side_effect=lambda **kwargs: events.append("listener") or {"successful_samples": 2},
+            ),
+            mock.patch.object(
+                dual,
                 "verify_tunnel_process",
                 side_effect=lambda: events.append("verify:tunnel") or {"pid": 2},
             ),
@@ -230,6 +325,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "activate",
                 f"start:{dual.OPERATOR_SERVICE}",
                 "verify:operator",
+                "listener",
                 f"start:{dual.TUNNEL_SERVICE}",
                 "verify:tunnel",
             ],
@@ -309,6 +405,11 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "verify_operator_process",
                 side_effect=lambda *args, **kwargs: events.append("verify:operator") or {"pid": 1},
             ),
+            mock.patch.object(
+                dual,
+                "require_operator_listener",
+                side_effect=lambda **kwargs: events.append("listener") or {"successful_samples": 2},
+            ),
             mock.patch.object(dual, "wait_until_ready", return_value=ready),
         ):
             with self.assertRaises(core.DeployError):
@@ -327,6 +428,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "verify:pointer",
                 f"start:{dual.OPERATOR_SERVICE}",
                 "verify:operator",
+                "listener",
                 f"start:{dual.TUNNEL_SERVICE}",
             ],
         )
