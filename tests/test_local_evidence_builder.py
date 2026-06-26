@@ -432,6 +432,38 @@ class LocalEvidenceBuilderTests(unittest.TestCase):
             (bundle / record["artifact"]).read_text(encoding="utf-8"),
         )
 
+    def test_patch_selection_boundary_marks_bundle_partial(self) -> None:
+        self._write("src/app.py", "def answer():\n    return 43\n")
+        self._write("docs/app.md", "Changed documentation.\n")
+        attribute = "_".join(("MAX", "PATCH", "PATHS"))
+
+        with mock.patch.object(BUILDER, attribute, 1):
+            bundle, result = self._build_direct(
+                self._job("patch-boundary"),
+                "patch-boundary",
+            )
+
+        provenance = self._json(bundle / "provenance.json")
+        self.assertEqual("partial", result["status"])
+        self.assertEqual(1, len(provenance["patch_paths"]))
+        self.assertTrue(any("budget" in item for item in result["limitations"]))
+
+    def test_new_file_record_boundary_marks_bundle_partial(self) -> None:
+        self._write("src/new_a.py", "A = 1\n")
+        self._write("src/new_b.py", "B = 2\n")
+        attribute = "_".join(("MAX", "UNTRACKED", "RECORDS"))
+
+        with mock.patch.object(BUILDER, attribute, 1):
+            bundle, result = self._build_direct(
+                self._job("record-boundary"),
+                "record-boundary",
+            )
+
+        records = self._json(bundle / "untracked-files.json")["records"]
+        self.assertEqual("partial", result["status"])
+        self.assertEqual(1, len(records))
+        self.assertTrue(any("budget" in item for item in result["limitations"]))
+
     def test_core_artifacts_are_deterministic_for_identical_repo_state(self) -> None:
         job = self._job("repeatable")
         first, first_bundle = self._invoke(job, "repeatable-a")
