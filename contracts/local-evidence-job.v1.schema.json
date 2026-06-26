@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heimgewebe.local/contracts/grabowski/local-evidence-job.v1.schema.json",
+  "title": "Grabowski Local Evidence Job v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "mode",
+    "repo",
+    "task",
+    "expected_branch",
+    "expected_head",
+    "allowed_paths",
+    "max_patch_bytes"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "job_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+    },
+    "mode": {"const": "repo-evidence"},
+    "repo": {"type": "string", "minLength": 1},
+    "task": {"type": "string", "minLength": 1, "maxLength": 10000},
+    "expected_branch": {"type": "string", "minLength": 1, "maxLength": 255},
+    "expected_head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+    "allowed_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+      },
+      "uniqueItems": true,
+      "maxItems": 200
+    },
+    "max_patch_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2000000
+    }
+  }
+}
