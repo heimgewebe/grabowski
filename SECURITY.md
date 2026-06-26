@@ -11,7 +11,9 @@
 
 ## Unerlässliche Grenzen
 
-- keine Ausgabe von Secrets,
+- keine Secret-Ausgabe über generische Werkzeuge; dedizierte Secret-Reveals
+  sind capability- und SHA-256-gebunden,
+- keine Secret-Werte in Audit, Evidence, Prozess-argv oder Environment,
 - keine Mutation von Evidence,
 - kein automatisches `sudo`,
 - keine irreversible Löschung ohne Backup oder Papierkorb,

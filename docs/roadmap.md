@@ -2,6 +2,8 @@
 
 ## GRABOWSKI-POWER-001
 
+Status: v2 foundation implemented in repository; broader patch/search remains follow-up.
+
 - vollständige Dateioperationen,
 - Suche,
 - Patch Engine,
@@ -11,7 +13,7 @@
 
 ## GRABOWSKI-SHELL-001
 
-Status: operator bootstrap implemented; durable execution hardening in progress.
+Status: v2 foundation implemented in repository; durable execution hardening in progress.
 
 - allgemeiner Command Runner,
 - persistente Hintergrundjobs,
@@ -33,6 +35,18 @@ Status: Slice A implemented on `feat/grabowski-local-evidence`; pilot measuremen
 
 Der Ausbau beginnt erst nach einem realen Pilot mit messbarer Reduktion von
 manuellen Evidenzschritten oder übertragenem Kontext.
+
+## GRABOWSKI-OPERATOR-V2
+
+Status: foundation implemented in repository; live cutover remains explicit.
+
+- Access-Profile und Capabilities,
+- Home-weites Operator-Beispiel ohne Live-Mutation,
+- secret-safe argv-/Output-Redaction,
+- Quarantäne und Rollback-Belege für Text-Ersetzungen,
+- Kill-Switch für Mutationen,
+- tamper-evidente Audit-Verifikation,
+- unprivilegierter Referenzvertrag für spätere privilegierte Aktionen.
 
 ## GRABOWSKI-GIT-001
 

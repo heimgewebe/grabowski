@@ -140,6 +140,7 @@ def grabowski_context(profile: str = "concise") -> dict[str, Any]:
         known_gaps.append("runtime entrypoint contract is unavailable")
     known_gaps.append("the connector's frozen client-side tool snapshot is not observable from the local runtime")
     policy = base._load_policy()
+    active_profile = base._active_profile(policy)
     return {
         "schema_version": capabilities.CONTEXT_SCHEMA_VERSION,
         "profile": profile,
@@ -152,10 +153,20 @@ def grabowski_context(profile: str = "concise") -> dict[str, Any]:
         },
         "policy": {
             "mode": policy.get("mode"),
-            "read_roots": policy.get("read_roots", []),
-            "write_roots": policy.get("write_roots", []),
-            "write_excluded_roots": policy.get("write_excluded_roots", []),
+            "active_profile": active_profile["name"],
+            "access_profiles": sorted(policy.get("profiles", {})),
+            "capabilities": sorted(base._effective_capabilities(policy)),
+            "read_roots": base._profile_values(policy, "read_roots"),
+            "write_roots": base._profile_values(policy, "write_roots"),
+            "write_excluded_roots": (
+                base._profile_values(policy, "write_excluded_roots") or []
+            ),
+            "secret_roots": base._secret_root_values(policy),
+            "browser_profile_roots": base._browser_profile_root_values(policy),
+            "secret_export_roots": base._secret_export_root_values(policy),
             "forbidden_capabilities": policy.get("forbidden_capabilities", []),
+            "kill_switch": base._kill_switch_state(),
+            "audit": base._verify_audit_log(base.AUDIT_LOG),
         },
         "capabilities": capabilities.filter_capabilities(records, profile),
         "classification": classification,
@@ -173,6 +184,7 @@ def grabowski_context(profile: str = "concise") -> dict[str, Any]:
 @mcp.tool(name="grabowski_git_branch", annotations=MUTATING)
 def grabowski_git_branch(repo: str, action: str, branch: str, start_point: str = "HEAD") -> dict[str, Any]:
     """Create or switch one local Git branch through a typed operation."""
+    operator._require_operator_mutation("git_cli")
     path = Path(repo).expanduser().resolve(strict=True)
     if not path.is_dir():
         raise ValueError(f"Repository path is not a directory: {path}")

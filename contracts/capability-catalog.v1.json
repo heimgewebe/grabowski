@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "42ba4b36e5bbc197b55640b7cb3d3c524b8150c8e620e5091da180315dbcd302",
+  "capability_source_sha256": "b170fefdde1cbc6aa14f44bd1ad75c4b4bb7a2dbb15c0c37945f64ef8299dc46",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "b6d2df7310dfd8c29952388a377e5a7bb9801527c83ad8008d4b19fb587e6d47",
+  "contract_sha256": "556129d0a330d90b0bd46e10f0367b85e65fef8719a7f6b2408fe3fb6b7eb3f9",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -68,6 +68,71 @@
       "tool": "grabowski_read_text"
     },
     {
+      "category": "secret",
+      "description": "Inspect one configured secret path without returning file content.",
+      "effects": [],
+      "id": "grabowski_secret_inspect",
+      "purpose": "Inspect metadata and bounded listings under explicit secret roots without returning content.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "medium",
+      "tool": "grabowski_secret_inspect"
+    },
+    {
+      "category": "secret",
+      "description": "Reveal one bounded secret text file after an exact SHA-256 precondition.",
+      "effects": [
+        "secret-content-return"
+      ],
+      "id": "grabowski_secret_reveal",
+      "purpose": "Reveal bounded secret text only with an exact SHA-256 precondition.",
+      "read_only": false,
+      "reversibility": "not-applicable",
+      "risk_class": "high",
+      "tool": "grabowski_secret_reveal"
+    },
+    {
+      "category": "secret",
+      "description": "Run one argv-only command with a secret exposed only through an fd/path.",
+      "effects": [
+        "process-start",
+        "secret-use",
+        "command-dependent"
+      ],
+      "id": "grabowski_secret_use",
+      "purpose": "Run one argv-only command with a secret supplied through a file descriptor or restricted temporary path.",
+      "read_only": false,
+      "reversibility": "command-dependent",
+      "risk_class": "high",
+      "tool": "grabowski_secret_use"
+    },
+    {
+      "category": "secret",
+      "description": "Atomically export one secret to a configured local destination root.",
+      "effects": [
+        "secret-copy-create"
+      ],
+      "id": "grabowski_secret_export",
+      "purpose": "Create one local 0600 copy of a secret under configured export roots with a source hash precondition.",
+      "read_only": false,
+      "reversibility": "manual-delete",
+      "risk_class": "high",
+      "tool": "grabowski_secret_export"
+    },
+    {
+      "category": "secret",
+      "description": "Read bounded metadata/text under configured browser profile roots.",
+      "effects": [
+        "profile-content-return"
+      ],
+      "id": "grabowski_browser_profile_read",
+      "purpose": "Read bounded browser profile metadata and text, with binary databases kept metadata-only.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "high",
+      "tool": "grabowski_browser_profile_read"
+    },
+    {
       "category": "filesystem",
       "description": "Use this when a new UTF-8 text file must be created inside an allowed write root. It fails if the path already exists.",
       "effects": [
@@ -93,6 +158,74 @@
       "reversibility": "backup-and-git",
       "risk_class": "medium",
       "tool": "grabowski_replace_text"
+    },
+    {
+      "category": "filesystem",
+      "description": "Remove one allowed regular file or empty directory into quarantine for audit-backed restoration.",
+      "effects": [
+        "file-remove",
+        "directory-remove",
+        "quarantine-create"
+      ],
+      "id": "grabowski_remove_path",
+      "purpose": "Remove one regular file or empty directory into quarantine after a typed precondition.",
+      "read_only": false,
+      "reversibility": "quarantine-restore",
+      "risk_class": "medium",
+      "tool": "grabowski_remove_path"
+    },
+    {
+      "category": "audit",
+      "description": "Restore one path from a reversible audited filesystem removal transaction.",
+      "effects": [
+        "file-create",
+        "directory-create"
+      ],
+      "id": "grabowski_restore_removed_path",
+      "purpose": "Restore one path from an audited reversible filesystem removal.",
+      "read_only": false,
+      "reversibility": "new-remove-operation",
+      "risk_class": "medium",
+      "tool": "grabowski_restore_removed_path"
+    },
+    {
+      "category": "filesystem",
+      "description": "Irreversibly remove one allowed regular file or empty directory with a separate explicit capability.",
+      "effects": [
+        "file-delete",
+        "directory-delete"
+      ],
+      "id": "grabowski_destroy_path",
+      "purpose": "Irreversibly remove one regular file or empty directory with a separate explicit capability.",
+      "read_only": false,
+      "reversibility": "irreversible",
+      "risk_class": "high",
+      "tool": "grabowski_destroy_path"
+    },
+    {
+      "category": "audit",
+      "description": "Restore the quarantined preimage for one audited replace transaction.",
+      "effects": [
+        "file-replace",
+        "backup-create"
+      ],
+      "id": "grabowski_rollback_text",
+      "purpose": "Restore a quarantined preimage from an audited replace transaction.",
+      "read_only": false,
+      "reversibility": "audit-rollback",
+      "risk_class": "medium",
+      "tool": "grabowski_rollback_text"
+    },
+    {
+      "category": "audit",
+      "description": "Verify the tamper-evident write audit hash chain.",
+      "effects": [],
+      "id": "grabowski_verify_audit",
+      "purpose": "Verify the tamper-evident write audit hash chain.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_verify_audit"
     },
     {
       "category": "knowledge",
@@ -292,6 +425,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_ports"
+    },
+    {
+      "category": "privileged-reference",
+      "description": "Create a strict reference for a future privileged action without executing it.",
+      "effects": [],
+      "id": "grabowski_privileged_action_reference",
+      "purpose": "Create a non-executable reference contract for a future external privileged action.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "medium",
+      "tool": "grabowski_privileged_action_reference"
     }
   ]
 }

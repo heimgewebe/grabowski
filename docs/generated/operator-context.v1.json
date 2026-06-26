@@ -56,6 +56,71 @@
       "tool": "grabowski_read_text"
     },
     {
+      "category": "secret",
+      "description": "Inspect one configured secret path without returning file content.",
+      "effects": [],
+      "id": "grabowski_secret_inspect",
+      "purpose": "Inspect metadata and bounded listings under explicit secret roots without returning content.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "medium",
+      "tool": "grabowski_secret_inspect"
+    },
+    {
+      "category": "secret",
+      "description": "Reveal one bounded secret text file after an exact SHA-256 precondition.",
+      "effects": [
+        "secret-content-return"
+      ],
+      "id": "grabowski_secret_reveal",
+      "purpose": "Reveal bounded secret text only with an exact SHA-256 precondition.",
+      "read_only": false,
+      "reversibility": "not-applicable",
+      "risk_class": "high",
+      "tool": "grabowski_secret_reveal"
+    },
+    {
+      "category": "secret",
+      "description": "Run one argv-only command with a secret exposed only through an fd/path.",
+      "effects": [
+        "process-start",
+        "secret-use",
+        "command-dependent"
+      ],
+      "id": "grabowski_secret_use",
+      "purpose": "Run one argv-only command with a secret supplied through a file descriptor or restricted temporary path.",
+      "read_only": false,
+      "reversibility": "command-dependent",
+      "risk_class": "high",
+      "tool": "grabowski_secret_use"
+    },
+    {
+      "category": "secret",
+      "description": "Atomically export one secret to a configured local destination root.",
+      "effects": [
+        "secret-copy-create"
+      ],
+      "id": "grabowski_secret_export",
+      "purpose": "Create one local 0600 copy of a secret under configured export roots with a source hash precondition.",
+      "read_only": false,
+      "reversibility": "manual-delete",
+      "risk_class": "high",
+      "tool": "grabowski_secret_export"
+    },
+    {
+      "category": "secret",
+      "description": "Read bounded metadata/text under configured browser profile roots.",
+      "effects": [
+        "profile-content-return"
+      ],
+      "id": "grabowski_browser_profile_read",
+      "purpose": "Read bounded browser profile metadata and text, with binary databases kept metadata-only.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "high",
+      "tool": "grabowski_browser_profile_read"
+    },
+    {
       "category": "filesystem",
       "description": "Use this when a new UTF-8 text file must be created inside an allowed write root. It fails if the path already exists.",
       "effects": [
@@ -81,6 +146,74 @@
       "reversibility": "backup-and-git",
       "risk_class": "medium",
       "tool": "grabowski_replace_text"
+    },
+    {
+      "category": "filesystem",
+      "description": "Remove one allowed regular file or empty directory into quarantine for audit-backed restoration.",
+      "effects": [
+        "file-remove",
+        "directory-remove",
+        "quarantine-create"
+      ],
+      "id": "grabowski_remove_path",
+      "purpose": "Remove one regular file or empty directory into quarantine after a typed precondition.",
+      "read_only": false,
+      "reversibility": "quarantine-restore",
+      "risk_class": "medium",
+      "tool": "grabowski_remove_path"
+    },
+    {
+      "category": "audit",
+      "description": "Restore one path from a reversible audited filesystem removal transaction.",
+      "effects": [
+        "file-create",
+        "directory-create"
+      ],
+      "id": "grabowski_restore_removed_path",
+      "purpose": "Restore one path from an audited reversible filesystem removal.",
+      "read_only": false,
+      "reversibility": "new-remove-operation",
+      "risk_class": "medium",
+      "tool": "grabowski_restore_removed_path"
+    },
+    {
+      "category": "filesystem",
+      "description": "Irreversibly remove one allowed regular file or empty directory with a separate explicit capability.",
+      "effects": [
+        "file-delete",
+        "directory-delete"
+      ],
+      "id": "grabowski_destroy_path",
+      "purpose": "Irreversibly remove one regular file or empty directory with a separate explicit capability.",
+      "read_only": false,
+      "reversibility": "irreversible",
+      "risk_class": "high",
+      "tool": "grabowski_destroy_path"
+    },
+    {
+      "category": "audit",
+      "description": "Restore the quarantined preimage for one audited replace transaction.",
+      "effects": [
+        "file-replace",
+        "backup-create"
+      ],
+      "id": "grabowski_rollback_text",
+      "purpose": "Restore a quarantined preimage from an audited replace transaction.",
+      "read_only": false,
+      "reversibility": "audit-rollback",
+      "risk_class": "medium",
+      "tool": "grabowski_rollback_text"
+    },
+    {
+      "category": "audit",
+      "description": "Verify the tamper-evident write audit hash chain.",
+      "effects": [],
+      "id": "grabowski_verify_audit",
+      "purpose": "Verify the tamper-evident write audit hash chain.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_verify_audit"
     },
     {
       "category": "knowledge",
@@ -280,6 +413,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_ports"
+    },
+    {
+      "category": "privileged-reference",
+      "description": "Create a strict reference for a future privileged action without executing it.",
+      "effects": [],
+      "id": "grabowski_privileged_action_reference",
+      "purpose": "Create a non-executable reference contract for a future external privileged action.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "medium",
+      "tool": "grabowski_privileged_action_reference"
     }
   ],
   "integrity": {
@@ -291,13 +435,25 @@
   },
   "kind": "repository-operator-context",
   "policy_contract": {
+    "access_profiles": [
+      "bounded-read-write",
+      "home-wide-operator"
+    ],
+    "active_profile": "bounded-read-write",
+    "browser_profile_roots": [],
+    "capabilities": [
+      "file_read",
+      "file_write",
+      "audit_verify",
+      "rollback_text",
+      "bundle_registry"
+    ],
     "forbidden_capabilities": [
       "file_delete",
+      "file_destroy",
       "file_move",
       "chmod",
-      "chown",
-      "secret_read",
-      "browser_profile_read"
+      "chown"
     ],
     "mode": "bounded-read-write",
     "read_roots": [
@@ -305,6 +461,8 @@
       "${HOME}/grabowski-workspace",
       "${HOME}/.local/state/grabowski"
     ],
+    "secret_export_roots": [],
+    "secret_roots": [],
     "write_excluded_roots": [
       "${HOME}/repos/merges"
     ],
@@ -321,8 +479,18 @@
       "grabowski_list_directory",
       "grabowski_stat",
       "grabowski_read_text",
+      "grabowski_secret_inspect",
+      "grabowski_secret_reveal",
+      "grabowski_secret_use",
+      "grabowski_secret_export",
+      "grabowski_browser_profile_read",
       "grabowski_create_text",
       "grabowski_replace_text",
+      "grabowski_remove_path",
+      "grabowski_restore_removed_path",
+      "grabowski_destroy_path",
+      "grabowski_rollback_text",
+      "grabowski_verify_audit",
       "latest_complete_bundles",
       "grabowski_terminal_run",
       "grabowski_job_start",
@@ -338,7 +506,8 @@
       "grabowski_tmux_send",
       "grabowski_process_list",
       "grabowski_process_signal",
-      "grabowski_ports"
+      "grabowski_ports",
+      "grabowski_privileged_action_reference"
     ],
     "module": "grabowski_operator",
     "source": "src/grabowski_runtime.py",
@@ -365,22 +534,22 @@
   "sources": {
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "42ba4b36e5bbc197b55640b7cb3d3c524b8150c8e620e5091da180315dbcd302"
+      "sha256": "b170fefdde1cbc6aa14f44bd1ad75c4b4bb7a2dbb15c0c37945f64ef8299dc46"
     },
     "policy_example": {
       "path": "config/access.example.json",
-      "sha256": "93ca57a93aef0dcc4bbe1d86f62967a27e44e1d4d893e9df892f9cf6aec9797e"
+      "sha256": "ae19b6ab81b88826e75cd86daea5874c130162bd9b8d6dbfd755221e8fc42d2e"
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "b6d2df7310dfd8c29952388a377e5a7bb9801527c83ad8008d4b19fb587e6d47"
+      "sha256": "556129d0a330d90b0bd46e10f0367b85e65fef8719a7f6b2408fe3fb6b7eb3f9"
     },
     "runtime_sources": {
-      "src/grabowski_capabilities.py": "42ba4b36e5bbc197b55640b7cb3d3c524b8150c8e620e5091da180315dbcd302",
-      "src/grabowski_mcp.py": "cdd184d114e3893165d787d587736e16088652dc772c99b5ca63201fa6ca9975",
-      "src/grabowski_operator.py": "581fb1e7ec520a45faddb6ccbd4554f7418d34d485ee6447af491b06f50fbbb9",
+      "src/grabowski_capabilities.py": "b170fefdde1cbc6aa14f44bd1ad75c4b4bb7a2dbb15c0c37945f64ef8299dc46",
+      "src/grabowski_mcp.py": "d67a9319a5b695bf3e76829672ef7015b1df92b17ebdfdd53da37b2ced8e62e1",
+      "src/grabowski_operator.py": "9e77e41d36367d464f6c743815dbffa3491b383705a81cfef7337199669f7ab8",
       "src/grabowski_runtime.py": "23bae20314189b95dcf4d6aed6f7b5c1c2cd6e91cec18e0bef0b440585b9f1bf",
-      "src/grabowski_runtime_extensions.py": "38299e663d4566dc2e9a66bf4ee7d53e225f77c7616bc3e9701537b05cbf3e8b"
+      "src/grabowski_runtime_extensions.py": "1c7e7d5f6a8149efbfb823cd8a8ce6ecc1424da5b10bdf7801abcc99f03cf0b7"
     }
   }
 }

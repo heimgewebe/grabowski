@@ -27,8 +27,18 @@
     "grabowski_list_directory",
     "grabowski_stat",
     "grabowski_read_text",
+    "grabowski_secret_inspect",
+    "grabowski_secret_reveal",
+    "grabowski_secret_use",
+    "grabowski_secret_export",
+    "grabowski_browser_profile_read",
     "grabowski_create_text",
     "grabowski_replace_text",
+    "grabowski_remove_path",
+    "grabowski_restore_removed_path",
+    "grabowski_destroy_path",
+    "grabowski_rollback_text",
+    "grabowski_verify_audit",
     "latest_complete_bundles",
     "grabowski_terminal_run",
     "grabowski_job_start",
@@ -44,6 +54,7 @@
     "grabowski_tmux_send",
     "grabowski_process_list",
     "grabowski_process_signal",
-    "grabowski_ports"
+    "grabowski_ports",
+    "grabowski_privileged_action_reference"
   ]
 }

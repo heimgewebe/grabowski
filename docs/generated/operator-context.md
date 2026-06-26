@@ -17,8 +17,18 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_list_directory` | filesystem | yes | low | List one allowed directory without recursive traversal. |
 | `grabowski_stat` | filesystem | yes | low | Read metadata and a content hash for one allowed path. |
 | `grabowski_read_text` | filesystem | yes | low | Read bounded UTF-8 text and obtain a concurrency hash. |
+| `grabowski_secret_inspect` | secret | yes | medium | Inspect metadata and bounded listings under explicit secret roots without returning content. |
+| `grabowski_secret_reveal` | secret | no | high | Reveal bounded secret text only with an exact SHA-256 precondition. |
+| `grabowski_secret_use` | secret | no | high | Run one argv-only command with a secret supplied through a file descriptor or restricted temporary path. |
+| `grabowski_secret_export` | secret | no | high | Create one local 0600 copy of a secret under configured export roots with a source hash precondition. |
+| `grabowski_browser_profile_read` | secret | yes | high | Read bounded browser profile metadata and text, with binary databases kept metadata-only. |
 | `grabowski_create_text` | filesystem | no | medium | Create one new UTF-8 file atomically inside an allowed write root. |
 | `grabowski_replace_text` | filesystem | no | medium | Replace one UTF-8 file atomically after a hash precondition and retain a backup. |
+| `grabowski_remove_path` | filesystem | no | medium | Remove one regular file or empty directory into quarantine after a typed precondition. |
+| `grabowski_restore_removed_path` | audit | no | medium | Restore one path from an audited reversible filesystem removal. |
+| `grabowski_destroy_path` | filesystem | no | high | Irreversibly remove one regular file or empty directory with a separate explicit capability. |
+| `grabowski_rollback_text` | audit | no | medium | Restore a quarantined preimage from an audited replace transaction. |
+| `grabowski_verify_audit` | audit | yes | low | Verify the tamper-evident write audit hash chain. |
 | `latest_complete_bundles` | knowledge | yes | low | Read the curated latest-complete Lens and repoLens bundle registry. |
 | `grabowski_terminal_run` | command | no | variable | Run one bounded non-interactive command as the current user. |
 | `grabowski_job_start` | command | no | variable | Start a durable bounded background command as a transient user service. |
@@ -35,14 +45,20 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_process_list` | process | yes | low | List current-user processes with optional regular-expression filtering. |
 | `grabowski_process_signal` | process | no | high | Signal one process owned by the current user. |
 | `grabowski_ports` | diagnostics | yes | low | List listening TCP and UDP sockets. |
+| `grabowski_privileged_action_reference` | privileged-reference | yes | medium | Create a non-executable reference contract for a future external privileged action. |
 
 ## Policy contract
 
 - Mode: `bounded-read-write`
+- Active profile: `bounded-read-write`
+- Capabilities: `file_read`, `file_write`, `audit_verify`, `rollback_text`, `bundle_registry`
 - Read roots: `${HOME}/repos`, `${HOME}/grabowski-workspace`, `${HOME}/.local/state/grabowski`
 - Write roots: `${HOME}/repos`, `${HOME}/grabowski-workspace`
 - Read-only exclusions: `${HOME}/repos/merges`
-- Forbidden capabilities: `file_delete`, `file_move`, `chmod`, `chown`, `secret_read`, `browser_profile_read`
+- Secret roots: `none`
+- Browser profile roots: `none`
+- Secret export roots: `none`
+- Forbidden capabilities: `file_delete`, `file_destroy`, `file_move`, `chmod`, `chown`
 
 ## Update contract
 
