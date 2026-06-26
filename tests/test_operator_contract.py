@@ -102,6 +102,20 @@ class OperatorContractTests(unittest.TestCase):
         self.assertIn('args.host != "127.0.0.1"', source)
         self.assertIn('mcp.run(transport=args.transport)', source)
 
+    def test_background_jobs_have_a_separate_runtime_budget(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("DEFAULT_JOB_RUNTIME = 7_200", source)
+        self.assertIn("MAX_JOB_RUNTIME = 86_400", source)
+        self.assertIn("--property=RuntimeMaxSec=", source)
+
+    def test_background_job_evidence_is_persistent(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn('JOBS_DIR = STATE_DIR / "jobs"', source)
+        self.assertIn('directory / "metadata.json"', source)
+        self.assertIn("--property=KillMode=control-group", source)
+        self.assertIn("--property=StandardOutput=append:", source)
+        self.assertIn("--property=StandardError=append:", source)
+
 
 if __name__ == "__main__":
     unittest.main()
