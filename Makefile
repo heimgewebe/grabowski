@@ -6,7 +6,7 @@ UV_RUNTIME_LOCK_VERSION := 0.9.18
 DEPLOY_TOOLING_VENV ?= build/deploy-tooling/.venv
 DEPLOY_TOOL_PYTHON := $(DEPLOY_TOOLING_VENV)/bin/python
 
-.PHONY: validate syntax test policy context-refresh context-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy
+.PHONY: validate syntax test policy context-refresh context-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy
 
 validate: syntax test policy context-check runtime-lock deploy-tooling-check secrets
 
@@ -18,6 +18,7 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_runtime.py
 >$(PYTHON) -m py_compile tools/build_operator_context.py
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
+>$(PYTHON) -m py_compile tools/deploy_runtime_dual.py
 >$(PYTHON) -m py_compile tools/watchdog_runtime.py
 >$(PYTHON) -m py_compile tools/validate_runtime_lock.py
 
@@ -56,7 +57,10 @@ secrets:
 >$(PYTHON) tools/check_no_secrets.py
 
 deploy-check: context-check deploy-tooling
->$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime.py --check
+>$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --check
+
+deploy-preflight: context-check deploy-tooling
+>$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --preflight
 
 deploy: context-check deploy-tooling
->$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime.py --apply
+>$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --apply
