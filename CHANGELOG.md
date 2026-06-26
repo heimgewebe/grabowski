@@ -9,7 +9,8 @@
   validation, fixed root-owned action templates, and all examples disabled.
 - Made `secret_reveal` a break-glass path requiring justification and explicit
   context-exposure acknowledgement; `secret_use` remains the default.
-- Added a deterministic connector tool-snapshot probe and control-plane tests.
+- Added a deterministic connector contract probe that compares live MCP tool
+  names and security-critical input-schema fingerprints with the client snapshot.
 
 - Initialer Repository-Bootstrap aus der laufenden Grabowski-MCP-Runtime.
 - Zugriffspolicy-Contract und Beispielkonfiguration ergänzt.

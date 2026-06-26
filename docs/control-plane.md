@@ -52,4 +52,14 @@ Nur der Hash der Begründung wird auditiert.
 
 ## Connector-Probe
 
-`tools/connector_probe.py` vergleicht die im Client sichtbaren Toolnamen mit `config/runtime-entrypoint.json`. Damit wird ein eingefrorener oder veralteter Connector-Snapshot nachweisbar, ohne neue MCP-Werkzeuge vorauszusetzen.
+`tools/connector_probe.py` startet die installierte Runtime über MCP-stdio, liest deren vollständiges `tools/list` und vergleicht drei Ebenen:
+
+1. Werkzeugnamen des versionierten Runtime-Vertrags gegen die laufende Runtime,
+2. Werkzeugnamen des Clients gegen die laufende Runtime,
+3. normalisierte `inputSchema`-Fingerprints sicherheitskritischer Sentinel-Werkzeuge.
+
+Das beobachtete Client-Artefakt verwendet `schema_version: 1` und eine `tools`-Liste. Ein Element ist entweder nur ein Werkzeugname oder ein Objekt mit `name` und `inputSchema`. Für alle Sentinel-Werkzeuge muss das Schema enthalten sein; eine reine Namensliste gilt daher bewusst nicht als vollständiger Beleg.
+
+Aktueller Sentinel ist `grabowski_secret_reveal`, weil ein veralteter Connector dessen neue Break-Glass-Parameter unsichtbar machen kann, obwohl weiterhin 34 von 34 Werkzeugnamen übereinstimmen. Beschreibungen und JSON-Schema-Titel werden aus dem Fingerprint entfernt; operative Felder, Required-Listen, Typen und Defaults bleiben bindend.
+
+Die Runtime kann den eingefrorenen Client-Snapshot nicht selbst auslesen. Die Probe benötigt deshalb ein aus dem Clientvertrag erzeugtes Beobachtungsartefakt. Sie diagnostiziert Drift deterministisch, aktualisiert den Connector aber nicht selbst.
