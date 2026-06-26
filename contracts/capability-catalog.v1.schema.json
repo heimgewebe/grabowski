@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heimgewebe.example/contracts/capability-catalog.v1.schema.json",
+  "title": "Grabowski Capability Catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract",
+    "contract_sha256",
+    "capability_source",
+    "capability_source_sha256",
+    "tools",
+    "integrity"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "contract": {"const": "config/runtime-entrypoint.json"},
+    "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "capability_source": {"const": "src/grabowski_capabilities.py"},
+    "capability_source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "tools": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "tool",
+          "purpose",
+          "description",
+          "read_only",
+          "category",
+          "risk_class",
+          "effects",
+          "reversibility"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "tool": {"type": "string", "minLength": 1},
+          "purpose": {"type": "string", "minLength": 1},
+          "description": {"type": "string"},
+          "read_only": {"type": ["boolean", "null"]},
+          "category": {"type": "string", "minLength": 1},
+          "risk_class": {"enum": ["low", "medium", "high", "variable", "unclassified"]},
+          "effects": {"type": "array", "items": {"type": "string"}},
+          "reversibility": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "missing_profiles",
+        "orphan_profiles",
+        "duplicate_tools",
+        "missing_declarations",
+        "undeclared_tools"
+      ],
+      "properties": {
+        "missing_profiles": {"type": "array", "maxItems": 0},
+        "orphan_profiles": {"type": "array", "maxItems": 0},
+        "duplicate_tools": {"type": "array", "maxItems": 0},
+        "missing_declarations": {"type": "array", "maxItems": 0},
+        "undeclared_tools": {"type": "array", "maxItems": 0}
+      }
+    }
+  }
+}

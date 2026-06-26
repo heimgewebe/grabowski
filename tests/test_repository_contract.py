@@ -9,6 +9,11 @@ ROOT = Path(__file__).resolve().parents[1]
 class RepositoryContractTests(unittest.TestCase):
     def test_live_server_snapshot_exists(self) -> None:
         self.assertTrue((ROOT / "src" / "grabowski_mcp.py").is_file())
+        self.assertTrue((ROOT / "src" / "grabowski_operator.py").is_file())
+        self.assertTrue(
+            (ROOT / "src" / "grabowski_runtime_extensions.py").is_file()
+        )
+        self.assertTrue((ROOT / "src" / "grabowski_runtime.py").is_file())
 
     def test_grabowski_tool_names_are_present(self) -> None:
         source = (
@@ -26,6 +31,15 @@ class RepositoryContractTests(unittest.TestCase):
         for tool_name in expected:
             self.assertIn(tool_name, source)
         self.assertNotIn("heim_assi_status", source)
+
+    def test_extension_tool_names_are_present(self) -> None:
+        source = (
+            ROOT / "src" / "grabowski_runtime_extensions.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('name="grabowski_context"', source)
+        self.assertIn('name="grabowski_git_branch"', source)
+        self.assertIn("connector_snapshot_observable", source)
+        self.assertIn("canonical_checkout_matches_runtime", source)
 
     def test_status_exposes_deployment_provenance(self) -> None:
         source = (
@@ -54,15 +68,34 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(contract["mode"], "module")
         self.assertEqual(contract["module"], "grabowski_operator")
         self.assertNotIn("script", contract)
-        self.assertEqual(contract["source"], "src/grabowski_operator.py")
+        self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 21)
+        self.assertEqual(len(tools), 23)
         self.assertIn("grabowski_status", tools)
+        self.assertIn("grabowski_context", tools)
         self.assertIn("grabowski_terminal_run", tools)
         self.assertIn("grabowski_job_start", tools)
+        self.assertIn("grabowski_git_branch", tools)
         self.assertEqual(
             contract["supporting_sources"],
-            [{"module": "grabowski_mcp", "source": "src/grabowski_mcp.py"}],
+            [
+                {
+                    "module": "grabowski_operator_core",
+                    "source": "src/grabowski_operator.py",
+                },
+                {
+                    "module": "grabowski_mcp",
+                    "source": "src/grabowski_mcp.py",
+                },
+                {
+                    "module": "grabowski_capabilities",
+                    "source": "src/grabowski_capabilities.py",
+                },
+                {
+                    "module": "grabowski_runtime_extensions",
+                    "source": "src/grabowski_runtime_extensions.py",
+                },
+            ],
         )
 
     def test_runtime_lock_contract_exists(self) -> None:
