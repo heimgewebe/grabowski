@@ -277,7 +277,9 @@ class DeployRuntimeTests(unittest.TestCase):
 
             for pid in (100, 200):
                 (proc / str(pid) / "task" / str(pid)).mkdir(parents=True)
-            (proc / "100" / "task" / "100" / "children").write_text("200\n", encoding="utf-8")
+            (proc / "100" / "task" / "101").mkdir(parents=True)
+            (proc / "100" / "task" / "100" / "children").write_text("", encoding="utf-8")
+            (proc / "100" / "task" / "101" / "children").write_text("200\n", encoding="utf-8")
             (proc / "200" / "task" / "200" / "children").write_text("", encoding="utf-8")
             (proc / "100" / "cmdline").write_bytes(
                 str(deploy_runtime.HOME / ".local/bin/tunnel-client").encode()
@@ -298,6 +300,26 @@ class DeployRuntimeTests(unittest.TestCase):
                     proc_root=proc,
                 )
             self.assertEqual(result["pid"], 200)
+
+    def test_child_pids_aggregates_all_thread_children_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory) / "proc"
+            for tid in (100, 101, 102):
+                (proc / "100" / "task" / str(tid)).mkdir(parents=True)
+            (proc / "100" / "task" / "100" / "children").write_text(
+                "300 200\n", encoding="utf-8"
+            )
+            (proc / "100" / "task" / "101" / "children").write_text(
+                "200 400\n", encoding="utf-8"
+            )
+            (proc / "100" / "task" / "102" / "children").write_text(
+                "", encoding="utf-8"
+            )
+
+            self.assertEqual(
+                deploy_runtime.child_pids(100, proc),
+                [200, 300, 400],
+            )
 
     def test_systemd_profile_name_substring_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

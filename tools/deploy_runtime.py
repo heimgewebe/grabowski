@@ -1918,12 +1918,24 @@ def wait_until_ready(timeout_seconds: int) -> ReadinessResult:
 
 
 def child_pids(pid: int, proc_root: Path = Path("/proc")) -> list[int]:
-    path = proc_root / str(pid) / "task" / str(pid) / "children"
+    task_root = proc_root / str(pid) / "task"
     try:
-        text = path.read_text(encoding="utf-8").strip()
+        task_dirs = sorted(
+            (item for item in task_root.iterdir() if item.name.isdigit()),
+            key=lambda item: int(item.name),
+        )
     except FileNotFoundError:
         return []
-    return [int(value) for value in text.split()] if text else []
+
+    children: set[int] = set()
+    for task_dir in task_dirs:
+        try:
+            text = (task_dir / "children").read_text(encoding="utf-8").strip()
+        except (FileNotFoundError, ProcessLookupError):
+            # Threads can disappear between listing task/ and reading children.
+            continue
+        children.update(int(value) for value in text.split())
+    return sorted(children)
 
 
 def descendant_pids(
