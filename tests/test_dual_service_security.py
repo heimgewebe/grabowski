@@ -58,6 +58,7 @@ class RollbackReturnContractTests(unittest.TestCase):
             mock.patch.object(core, "verify_pointer_state", side_effect=lambda *args: events.append("verify-pointer") or object()),
             mock.patch.object(dual, "start_service", side_effect=lambda unit: events.append("start:" + unit) or active),
             mock.patch.object(dual, "verify_operator_process", return_value={"pid": 1}),
+            mock.patch.object(dual, "require_operator_listener", return_value={"successful_samples": 2}),
             mock.patch.object(dual, "wait_until_ready", return_value=ready),
         ):
             with self.assertRaises(core.DeployError) as caught:
