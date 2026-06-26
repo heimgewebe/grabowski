@@ -138,7 +138,9 @@ Exitcode 2, ohne ein autoritatives Ergebnisbundle zu publizieren.
 
 ## Sicherheitsgrenzen
 
-- Git-Leseoperationen laufen mit `GIT_OPTIONAL_LOCKS=0`.
+- Git-Leseoperationen laufen mit `GIT_OPTIONAL_LOCKS=0`. Patch-Diffs setzen
+  zusätzlich `--no-ext-diff` und `--no-textconv`, damit Repository-Konfiguration
+  keine externen Hilfsprogramme startet.
 - Der Builder prüft den Index in Tests auf Unverändertheit.
 - Sensible Komponenten und Dateimuster stammen aus der Zugriffspolicy und
   werden durch konservative Defaults ergänzt. Mehrteilige Komponenten wie

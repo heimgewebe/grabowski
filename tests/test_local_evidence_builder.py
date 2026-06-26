@@ -530,6 +530,47 @@ class LocalEvidenceBuilderTests(unittest.TestCase):
         self.assertFalse(output.exists())
         self.assertEqual([], list(self.workspace_root.iterdir()))
 
+    def test_null_branch_gate_is_rejected(self) -> None:
+        job = self._job("null-branch", expected_branch=None)
+
+        completed, bundle = self._invoke(job, "null-branch")
+
+        self.assertEqual(2, completed.returncode)
+        self.assertIn("expected_branch is invalid", completed.stderr)
+        self.assertFalse(bundle.exists())
+
+    def test_null_head_gate_is_rejected(self) -> None:
+        job = self._job("null-head", expected_head=None)
+
+        completed, bundle = self._invoke(job, "null-head")
+
+        self.assertEqual(2, completed.returncode)
+        self.assertIn("expected_head must be", completed.stderr)
+        self.assertFalse(bundle.exists())
+
+    def test_patch_capture_does_not_execute_text_conversion_helper(self) -> None:
+        marker = self.root / "conversion-helper-ran"
+        helper = self.root / "conversion-helper.sh"
+        helper.write_text(
+            f'#!/bin/sh\nprintf ran > {marker}\ncat "$1"\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+        self._write(".gitattributes", "docs/*.txt diff=probe\n")
+        self._write("docs/sample.txt", "before\n")
+        self._git("add", ".gitattributes", "docs/sample.txt")
+        self._git("commit", "-m", "add conversion fixture")
+        self.head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._git("config", "diff.probe.textconv", str(helper))
+        self._write("docs/sample.txt", "after\n")
+
+        completed, bundle = self._invoke(self._job("no-conversion"), "no-conversion")
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertFalse(marker.exists())
+        patch = (bundle / "diff.patch").read_text(encoding="utf-8")
+        self.assertIn("+after", patch)
+
     def test_core_artifacts_are_deterministic_for_identical_repo_state(self) -> None:
         job = self._job("repeatable")
         first, first_bundle = self._invoke(job, "repeatable-a")

@@ -212,12 +212,10 @@ def _load_job(path: Path) -> dict[str, Any]:
     if len(payload["task"]) > 10_000:
         raise JobValidationError("task exceeds 10000 characters")
     branch = payload["expected_branch"]
-    if branch is not None and (
-        not isinstance(branch, str) or not branch or len(branch) > 255
-    ):
+    if not isinstance(branch, str) or not branch or len(branch) > 255:
         raise JobValidationError("expected_branch is invalid")
     head = payload["expected_head"]
-    if head is not None and (not isinstance(head, str) or not HEAD_RE.fullmatch(head)):
+    if not isinstance(head, str) or not HEAD_RE.fullmatch(head):
         raise JobValidationError("expected_head must be a full 40-character SHA")
     max_patch = payload["max_patch_bytes"]
     if (
@@ -229,8 +227,7 @@ def _load_job(path: Path) -> dict[str, Any]:
             f"max_patch_bytes must be between 1 and {MAX_PATCH_BYTES}"
         )
     payload["allowed_paths"] = _normalize_allowed_paths(payload["allowed_paths"])
-    if head is not None:
-        payload["expected_head"] = head.lower()
+    payload["expected_head"] = head.lower()
     return payload
 
 
@@ -571,6 +568,7 @@ def _read_patch_source(reader: GitReader, tracked_paths: list[str]) -> bytes:
             "--binary",
             "--full-index",
             "--no-ext-diff",
+            "--no-textconv",
             "HEAD",
             "--",
             *tracked_paths,
@@ -912,16 +910,12 @@ def build(job_path: Path, output_raw: str) -> tuple[Path, dict[str, Any]]:
             patterns,
         )
         status = "complete"
-        if job.get("expected_branch") is not None and (
-            state_before["branch"] != job["expected_branch"]
-        ):
+        if state_before["branch"] != job["expected_branch"]:
             status = "rejected"
             limitations.append(
                 "Expected branch does not match the observed branch; no patch or references were built."
             )
-        if job.get("expected_head") is not None and (
-            state_before["head"] != job["expected_head"]
-        ):
+        if state_before["head"] != job["expected_head"]:
             status = "rejected"
             limitations.append(
                 "Expected head does not match the observed head; no patch or references were built."
