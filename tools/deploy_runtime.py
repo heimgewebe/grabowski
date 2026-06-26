@@ -2629,6 +2629,11 @@ def deploy(
         print(f"Legacy-Backup:   {activation.legacy_backup}")
 
     except Exception as original:
+        print(
+            "PRIMARY-DEPLOY-ERROR: "
+            + json.dumps(safe_error_summary(original), sort_keys=True),
+            file=sys.stderr,
+        )
         rollback_after_failure(
             original,
             activation=activation,
