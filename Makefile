@@ -16,6 +16,7 @@ syntax:
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
 >$(PYTHON) -m py_compile tools/watchdog_runtime.py
 >$(PYTHON) -m py_compile tools/validate_runtime_lock.py
+>$(PYTHON) -m py_compile tools/build_local_evidence.py
 
 test:
 >$(PYTHON) -m unittest discover -s tests -v

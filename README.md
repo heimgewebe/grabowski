@@ -26,6 +26,7 @@ auf reproduzierbares Deployment erfolgt in einem eigenen, getesteten Slice.
 - Verzeichnisauflistung
 - Textdateien erstellen und ersetzen
 - Lenskit-/repoLens-Bundle-Registry lesen
+- read-only Repo-Proof-Bundles mit Branch-/Head-Gate, Hashes und Provenance
 - `~/repos/merges` als unveränderbare Evidence-Zone
 
 ## Harte Invarianten
@@ -37,6 +38,19 @@ auf reproduzierbares Deployment erfolgt in einem eigenen, getesteten Slice.
 5. Symlink-Fluchten und konkurrierende Dateiänderungen müssen scheitern.
 6. Runtime-Konfiguration und Zugangsdaten gehören nicht ins Repository.
 7. Evidence, Handlung und Entscheidung bleiben getrennt.
+
+## Lokale Evidence-Bundles
+
+Ein begrenzter CLI-Builder erzeugt aus einem lokalen Git-Arbeitsbaum ein
+gehashtes Zustands-, Diff- und Referenzbundle, ohne das Repo zu verändern:
+
+```bash
+python3 tools/build_local_evidence.py --job JOB.json --output BUNDLE_DIR
+```
+
+Die Referenzlisten sind bewusst nur Kandidaten und tragen keine
+Vollständigkeitsbehauptung. Details und Statussemantik stehen in
+[`docs/local-evidence.md`](docs/local-evidence.md).
 
 ## Validierung
 

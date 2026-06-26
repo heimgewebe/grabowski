@@ -19,6 +19,21 @@ Status: operator bootstrap implemented; durable execution hardening in progress.
 - strukturierte Logs und Ergebnisartefakte,
 - Prozesssteuerung ohne verwaiste Kindprozesse.
 
+## GRABOWSKI-EVIDENCE-001
+
+Status: Slice A implemented on `feat/grabowski-local-evidence`; pilot measurement pending.
+
+- versionierte Job- und Result-Contracts,
+- read-only Repo-State-, Diff- und Referenzbundles,
+- Branch-/Head-Gates,
+- sensible Pfadauslassung und Patch-Redaktion,
+- Hashmanifest und Command-Provenance,
+- deterministische Kernartefakte,
+- noch keine MCP-Tool-Integration, Prüfprofile, Queue oder LLM-Schicht.
+
+Der Ausbau beginnt erst nach einem realen Pilot mit messbarer Reduktion von
+manuellen Evidenzschritten oder übertragenem Kontext.
+
 ## GRABOWSKI-GIT-001
 
 - Git-Lese- und Schreiboperationen,

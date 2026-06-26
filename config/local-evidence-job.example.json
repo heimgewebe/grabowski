@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "job_id": "example-repo-evidence",
+  "mode": "repo-evidence",
+  "repo": "/home/alex/repos/grabowski",
+  "task": "Build a read-only evidence bundle for the current Grabowski repository state.",
+  "expected_branch": "main",
+  "expected_head": "0000000000000000000000000000000000000000",
+  "allowed_paths": [],
+  "max_patch_bytes": 2000000
+}
