@@ -1,0 +1,21 @@
+[Unit]
+Description=Grabowski tunnel semantic watchdog
+After=tunnel-client-grabowski.service
+ConditionPathExists=%h/.local/libexec/grabowski/component_watchdog.py
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/libexec/grabowski/component_watchdog.py --component tunnel --service tunnel-client-grabowski.service --profile grabowski --health-url http://127.0.0.1:18080/healthz --ready-url http://127.0.0.1:18080/readyz
+SuccessExitStatus=1
+TimeoutStartSec=45
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/grabowski
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native

@@ -13,3 +13,4 @@
 - Switched DEPLOY-001 to immutable release directories activated through the
   stable runtime symlink, with a versioned `python -m` entry-point contract and
   fail-closed preflight for the current operator-profile mismatch.
+- Added the bounded local operator with command execution, systemd jobs, Git/GitHub, user-service, tmux, process, and port tools.

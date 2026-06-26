@@ -1,8 +1,14 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "mode": "module",
-  "module": "grabowski_mcp",
-  "source": "src/grabowski_mcp.py",
+  "module": "grabowski_operator",
+  "source": "src/grabowski_operator.py",
+  "supporting_sources": [
+    {
+      "module": "grabowski_mcp",
+      "source": "src/grabowski_mcp.py"
+    }
+  ],
   "expected_tools": [
     "grabowski_status",
     "grabowski_list_directory",
@@ -10,6 +16,20 @@
     "grabowski_read_text",
     "grabowski_create_text",
     "grabowski_replace_text",
-    "latest_complete_bundles"
+    "latest_complete_bundles",
+    "grabowski_terminal_run",
+    "grabowski_job_start",
+    "grabowski_job_status",
+    "grabowski_job_logs",
+    "grabowski_job_cancel",
+    "grabowski_git",
+    "grabowski_github",
+    "grabowski_user_service",
+    "grabowski_tmux_list",
+    "grabowski_tmux_capture",
+    "grabowski_tmux_send",
+    "grabowski_process_list",
+    "grabowski_process_signal",
+    "grabowski_ports"
   ]
 }

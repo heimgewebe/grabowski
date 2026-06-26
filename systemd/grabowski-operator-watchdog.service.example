@@ -1,0 +1,21 @@
+[Unit]
+Description=Grabowski operator semantic watchdog
+After=grabowski-operator.service
+ConditionPathExists=%h/.local/libexec/grabowski/component_watchdog.py
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/libexec/grabowski/component_watchdog.py --component operator --service grabowski-operator.service --runtime-root %h/.local/share/grabowski-mcp --module grabowski_operator --host 127.0.0.1 --port 18181 --mcp-url http://127.0.0.1:18181/mcp
+SuccessExitStatus=1
+TimeoutStartSec=45
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/grabowski
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native

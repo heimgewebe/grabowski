@@ -69,26 +69,38 @@ class DeploymentMetadataTests(unittest.TestCase):
         releases_root = root / "grabowski-mcp-releases"
         release = releases_root / "release-001"
         inputs = release / "inputs"
-        source_snapshot = inputs / "src/grabowski_mcp.py"
-        source_snapshot.parent.mkdir(parents=True)
-        module = release / ".venv/lib/python/site-packages/grabowski_mcp.py"
-        module.parent.mkdir(parents=True)
+        operator_snapshot = inputs / "src/grabowski_operator.py"
+        base_snapshot = inputs / "src/grabowski_mcp.py"
+        operator_snapshot.parent.mkdir(parents=True)
+        site_packages = release / ".venv/lib/python/site-packages"
+        operator_module = site_packages / "grabowski_operator.py"
+        base_module = site_packages / "grabowski_mcp.py"
+        site_packages.mkdir(parents=True)
         release_python = release / ".venv/bin/python"
         release_python.parent.mkdir(parents=True)
         release_python.write_text("python\n", encoding="utf-8")
 
-        source_bytes = b"grabowski-runtime\n"
-        source_snapshot.write_bytes(source_bytes)
-        module.write_bytes(source_bytes)
+        operator_bytes = b"grabowski-operator-runtime\n"
+        base_bytes = b"grabowski-base-runtime\n"
+        operator_snapshot.write_bytes(operator_bytes)
+        base_snapshot.write_bytes(base_bytes)
+        operator_module.write_bytes(operator_bytes)
+        base_module.write_bytes(base_bytes)
         runtime_input = inputs / "runtime.in"
         runtime_input.write_text("mcp==1.27.2\n", encoding="utf-8")
         runtime_lock = inputs / "runtime.lock.txt"
         runtime_lock.write_text("mcp==1.27.2\n", encoding="utf-8")
         contract = {
-            "schema_version": 1,
+            "schema_version": 2,
             "mode": "module",
-            "module": "grabowski_mcp",
-            "source": "src/grabowski_mcp.py",
+            "module": "grabowski_operator",
+            "source": "src/grabowski_operator.py",
+            "supporting_sources": [
+                {
+                    "module": "grabowski_mcp",
+                    "source": "src/grabowski_mcp.py",
+                }
+            ],
             "expected_tools": ["grabowski_status"],
         }
         contract_path = inputs / "runtime-entrypoint.json"
@@ -97,25 +109,37 @@ class DeploymentMetadataTests(unittest.TestCase):
         )
         stable = root / "grabowski-mcp"
         stable.symlink_to(release, target_is_directory=True)
+        source_sha256s = {
+            "grabowski_operator": _sha256(operator_snapshot),
+            "grabowski_mcp": _sha256(base_snapshot),
+        }
         manifest = {
-            "schema_version": 3,
+            "schema_version": 4,
             "release_id": release.name,
             "repo_head": "a" * 40,
             "entrypoint_contract": contract,
             "entrypoint_contract_sha256": _sha256(contract_path),
-            "source_sha256": _sha256(source_snapshot),
+            "source_sha256": source_sha256s["grabowski_operator"],
+            "source_sha256s": source_sha256s,
             "runtime_input_sha256": _sha256(runtime_input),
             "runtime_lock_sha256": _sha256(runtime_lock),
             "snapshot_paths": {
                 "runtime_entrypoint": str(contract_path),
                 "runtime_input": str(runtime_input),
                 "runtime_lock": str(runtime_lock),
-                "source": str(source_snapshot),
+                "source": str(operator_snapshot),
+                "supporting_sources": {
+                    "grabowski_mcp": str(base_snapshot),
+                },
             },
             "immutable_release_path": str(release),
             "expected_stable_runtime_path": str(stable),
             "release_python_path": str(release_python),
-            "entrypoint_path": str(module),
+            "entrypoint_path": str(operator_module),
+            "module_paths": {
+                "grabowski_operator": str(operator_module),
+                "grabowski_mcp": str(base_module),
+            },
             "platform": platform.platform(),
             "python_version": platform.python_version(),
             "python_implementation": platform.python_implementation(),
@@ -135,19 +159,28 @@ class DeploymentMetadataTests(unittest.TestCase):
             "manifest": manifest_path,
             "runtime_input": runtime_input,
             "runtime_lock": runtime_lock,
-            "source_snapshot": source_snapshot,
-            "module": module,
+            "source_snapshot": operator_snapshot,
+            "base_source_snapshot": base_snapshot,
+            "module": operator_module,
+            "base_module": base_module,
             "contract": contract_path,
             "release_python": release_python,
         }
 
     def _metadata(self, paths: dict[str, Path]) -> dict[str, object]:
         stable_manifest = paths["stable"] / "deployment-manifest.json"
+
+        def find_spec(module: str):
+            if module == "grabowski_operator":
+                return types.SimpleNamespace(origin=str(paths["module"]))
+            return None
+
         with (
             patch.object(grabowski_mcp, "DEPLOYMENT_MANIFEST", stable_manifest),
             patch.object(grabowski_mcp, "EXPECTED_STABLE_RUNTIME", paths["stable"]),
-            patch.object(grabowski_mcp, "__file__", str(paths["module"])),
+            patch.object(grabowski_mcp, "__file__", str(paths["base_module"])),
             patch.object(grabowski_mcp.sys, "executable", str(paths["release_python"])),
+            patch.object(grabowski_mcp.importlib.util, "find_spec", side_effect=find_spec),
         ):
             return grabowski_mcp._deployment_metadata()
 

@@ -80,3 +80,18 @@ ein systemd-Timer einen semantischen Prozessbaumcheck mit Fehlerschwelle und
 persistierendem Restart-Budget.
 
 Details: [`docs/restart-watchdog.md`](docs/restart-watchdog.md).
+
+## Operator-Fähigkeiten
+
+Der Operator-Einstiegspunkt `grabowski_operator` ergänzt die kuratierten
+Dateiwerkzeuge um:
+
+- nicht-interaktive Kommandos,
+- systemd-basierte Hintergrundjobs,
+- Git und GitHub CLI,
+- User-Service-Steuerung,
+- tmux-Capture und tmux-Eingaben,
+- Prozess- und Portdiagnose.
+
+Direkter Zugriff auf beliebige grafische Terminalfenster ist nicht möglich.
+Bestehende tmux-Sitzungen können dagegen gezielt gelesen und bedient werden.

@@ -50,22 +50,19 @@ class RepositoryContractTests(unittest.TestCase):
                 ROOT / "config" / "runtime-entrypoint.json"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(contract["schema_version"], 1)
+        self.assertEqual(contract["schema_version"], 2)
         self.assertEqual(contract["mode"], "module")
-        self.assertEqual(contract["module"], "grabowski_mcp")
+        self.assertEqual(contract["module"], "grabowski_operator")
         self.assertNotIn("script", contract)
-        self.assertEqual(contract["source"], "src/grabowski_mcp.py")
+        self.assertEqual(contract["source"], "src/grabowski_operator.py")
+        tools = set(contract["expected_tools"])
+        self.assertEqual(len(tools), 21)
+        self.assertIn("grabowski_status", tools)
+        self.assertIn("grabowski_terminal_run", tools)
+        self.assertIn("grabowski_job_start", tools)
         self.assertEqual(
-            set(contract["expected_tools"]),
-            {
-                "grabowski_status",
-                "grabowski_list_directory",
-                "grabowski_stat",
-                "grabowski_read_text",
-                "grabowski_create_text",
-                "grabowski_replace_text",
-                "latest_complete_bundles",
-            },
+            contract["supporting_sources"],
+            [{"module": "grabowski_mcp", "source": "src/grabowski_mcp.py"}],
         )
 
     def test_runtime_lock_contract_exists(self) -> None:

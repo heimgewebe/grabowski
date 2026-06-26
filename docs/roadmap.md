@@ -11,11 +11,13 @@
 
 ## GRABOWSKI-SHELL-001
 
+Status: operator bootstrap implemented; durable execution hardening in progress.
+
 - allgemeiner Command Runner,
-- Hintergrundjobs,
-- Timeouts,
-- Logs,
-- Prozesssteuerung.
+- persistente Hintergrundjobs,
+- synchrone Hard-Timeouts,
+- strukturierte Logs und Ergebnisartefakte,
+- Prozesssteuerung ohne verwaiste Kindprozesse.
 
 ## GRABOWSKI-GIT-001
 
