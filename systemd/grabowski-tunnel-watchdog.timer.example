@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Grabowski tunnel watchdog
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=30s
+AccuracySec=5s
+RandomizedDelaySec=3s
+Persistent=true
+Unit=grabowski-tunnel-watchdog.service
+
+[Install]
+WantedBy=timers.target

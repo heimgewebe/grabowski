@@ -1,0 +1,30 @@
+[Unit]
+Description=Grabowski MCP operator
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python -m grabowski_operator --transport streamable-http --host 127.0.0.1 --port 18181
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=20
+TimeoutStopSec=20
+KillMode=mixed
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/grabowski %h/repos %h/grabowski-workspace
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target
