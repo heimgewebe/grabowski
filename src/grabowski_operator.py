@@ -24,9 +24,12 @@ import grabowski_mcp as base
 HOME = Path.home().resolve()
 EVIDENCE_ROOT = (HOME / "repos" / "merges").resolve()
 STATE_DIR = (HOME / ".local" / "state" / "grabowski").resolve()
+JOBS_DIR = STATE_DIR / "jobs"
 JOB_PREFIX = "grabowski-job-"
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 120
+DEFAULT_JOB_RUNTIME = 7_200
+MAX_JOB_RUNTIME = 86_400
 DEFAULT_OUTPUT_BYTES = 250_000
 MAX_OUTPUT_BYTES = 2_000_000
 
@@ -172,6 +175,12 @@ def _timeout(value: int) -> int:
     return value
 
 
+def _job_runtime(value: int) -> int:
+    if value < 1 or value > MAX_JOB_RUNTIME:
+        raise ValueError(f"runtime_seconds must be between 1 and {MAX_JOB_RUNTIME}")
+    return value
+
+
 def _output_limit(value: int) -> int:
     if value < 1 or value > MAX_OUTPUT_BYTES:
         raise ValueError(
@@ -263,6 +272,80 @@ def _validate_unit(unit: str, *, job_only: bool = False) -> str:
     return unit
 
 
+def _jobs_root() -> Path:
+    if JOBS_DIR.is_symlink():
+        raise PermissionError(f"Jobs directory may not be a symlink: {JOBS_DIR}")
+    JOBS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root = JOBS_DIR.resolve(strict=True)
+    if root.parent != STATE_DIR:
+        raise PermissionError(f"Jobs directory escaped state root: {root}")
+    return root
+
+
+def _job_directory(unit: str, *, create: bool = False) -> Path:
+    name = _validate_unit(unit, job_only=True)
+    root = _jobs_root()
+    path = root / name
+    if path.is_symlink():
+        raise PermissionError(f"Job directory may not be a symlink: {path}")
+    if create:
+        path.mkdir(mode=0o700)
+    elif not path.is_dir():
+        raise ValueError(f"Job metadata does not exist: {name}")
+    resolved = path.resolve(strict=True)
+    if resolved.parent != root:
+        raise PermissionError(f"Job directory escaped jobs root: {resolved}")
+    return resolved
+
+
+def _write_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
+    path = directory / "metadata.json"
+    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        os.write(descriptor, data)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def _read_job_metadata(unit: str) -> dict[str, Any]:
+    directory = _job_directory(unit)
+    path = directory / "metadata.json"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"Job metadata is missing: {unit}")
+    if path.stat().st_size > 64 * 1024:
+        raise ValueError(f"Job metadata is too large: {unit}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("unit") != unit:
+        raise ValueError(f"Job metadata is invalid: {unit}")
+    return payload
+
+
+def _read_job_log(path: Path, max_lines: int) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        return {"text": "", "truncated": False, "bytes": 0}
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size > MAX_OUTPUT_BYTES:
+            handle.seek(-MAX_OUTPUT_BYTES, os.SEEK_END)
+        data = handle.read(MAX_OUTPUT_BYTES)
+    decoded = _redact(data.decode("utf-8", errors="replace"))
+    lines = decoded.splitlines()
+    line_truncated = len(lines) > max_lines
+    text = "\n".join(lines[-max_lines:])
+    return {
+        "text": text,
+        "truncated": size > MAX_OUTPUT_BYTES or line_truncated,
+        "bytes": size,
+    }
+
+
 def _git_branch(repo: Path) -> str:
     completed = subprocess.run(
         ["git", "-C", str(repo), "branch", "--show-current"],
@@ -315,11 +398,36 @@ def grabowski_terminal_run(
 def grabowski_job_start(
     argv: list[str],
     cwd: str | None = None,
+    runtime_seconds: int = DEFAULT_JOB_RUNTIME,
 ) -> dict[str, Any]:
-    """Start a background command as a transient user systemd unit."""
+    """Start a durable background command as a transient user systemd unit."""
     command = _validate_argv(argv)
     working_directory = _resolve_cwd(cwd)
+    runtime = _job_runtime(runtime_seconds)
     unit = JOB_PREFIX + uuid.uuid4().hex[:12]
+    directory = _job_directory(unit, create=True)
+    stdout_path = directory / "stdout.log"
+    stderr_path = directory / "stderr.log"
+    for path in (stdout_path, stderr_path):
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        os.close(descriptor)
+
+    metadata = {
+        "schema_version": 1,
+        "unit": unit,
+        "argv": command,
+        "command": shlex.join(command),
+        "cwd": str(working_directory),
+        "runtime_seconds": runtime,
+        "created_at_unix": int(time.time()),
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+    }
+    metadata_path = _write_job_metadata(directory, metadata)
 
     result = _run(
         [
@@ -327,9 +435,13 @@ def grabowski_job_start(
             "--user",
             "--unit",
             unit,
-            "--collect",
             "--property=Type=exec",
+            "--property=KillMode=control-group",
+            "--property=TimeoutStopSec=10s",
+            f"--property=RuntimeMaxSec={runtime}s",
             f"--property=WorkingDirectory={working_directory}",
+            f"--property=StandardOutput=append:{stdout_path}",
+            f"--property=StandardError=append:{stderr_path}",
             "--",
             *command,
         ],
@@ -341,17 +453,17 @@ def grabowski_job_start(
         raise RuntimeError(result["stderr"] or result["stdout"])
 
     return {
-        "unit": unit,
-        "argv": command,
-        "cwd": str(working_directory),
+        **metadata,
+        "metadata_path": str(metadata_path),
         "launcher": result,
     }
 
 
 @mcp.tool(name="grabowski_job_status", annotations=READ_ONLY)
 def grabowski_job_status(unit: str) -> dict[str, Any]:
-    """Return status fields for one Grabowski background job."""
+    """Return durable metadata and current systemd status for one job."""
     name = _validate_unit(unit, job_only=True)
+    metadata = _read_job_metadata(name)
     result = _run(
         [
             "systemctl",
@@ -365,15 +477,22 @@ def grabowski_job_status(unit: str) -> dict[str, Any]:
             "--property=Result",
             "--property=ExecMainCode",
             "--property=ExecMainStatus",
+            "--property=RuntimeMaxUSec",
         ],
         cwd=HOME,
         timeout_seconds=30,
         max_output_bytes=DEFAULT_OUTPUT_BYTES,
     )
+    properties = _parse_show(result["stdout"])
     return {
         "unit": name,
+        "metadata": metadata,
+        "systemd_visible": (
+            result["returncode"] == 0
+            and properties.get("LoadState") != "not-found"
+        ),
         "returncode": result["returncode"],
-        "properties": _parse_show(result["stdout"]),
+        "properties": properties,
         "stderr": result["stderr"],
     }
 
@@ -383,25 +502,25 @@ def grabowski_job_logs(
     unit: str,
     max_lines: int = 200,
 ) -> dict[str, Any]:
-    """Read recent journal output for one Grabowski background job."""
+    """Read persistent stdout and stderr for one Grabowski job."""
     name = _validate_unit(unit, job_only=True)
     if max_lines < 1 or max_lines > 2000:
         raise ValueError("max_lines must be between 1 and 2000")
-    result = _run(
-        [
-            "journalctl",
-            "--user",
-            "--unit",
-            name,
-            "--no-pager",
-            "--lines",
-            str(max_lines),
-        ],
-        cwd=HOME,
-        timeout_seconds=60,
-        max_output_bytes=MAX_OUTPUT_BYTES,
-    )
-    return {"unit": name, **result}
+    metadata = _read_job_metadata(name)
+    directory = _job_directory(name)
+    expected = {
+        "stdout_path": directory / "stdout.log",
+        "stderr_path": directory / "stderr.log",
+    }
+    for key, path in expected.items():
+        if metadata.get(key) != str(path):
+            raise ValueError(f"Job metadata path mismatch: {key}")
+    return {
+        "unit": name,
+        "metadata": metadata,
+        "stdout": _read_job_log(expected["stdout_path"], max_lines),
+        "stderr": _read_job_log(expected["stderr_path"], max_lines),
+    }
 
 
 @mcp.tool(name="grabowski_job_cancel", annotations=MUTATING)
