@@ -19,7 +19,13 @@ CATALOG_PATH = ROOT / "contracts" / "capability-catalog.v1.json"
 CONTEXT_JSON_PATH = ROOT / "docs" / "generated" / "operator-context.v1.json"
 CONTEXT_MD_PATH = ROOT / "docs" / "generated" / "operator-context.md"
 READ_ANNOTATION_NAMES = {"READ_ANNOTATIONS", "READ_ONLY"}
-WRITE_ANNOTATION_NAMES = {"CREATE_ANNOTATIONS", "REPLACE_ANNOTATIONS", "MUTATING"}
+WRITE_ANNOTATION_NAMES = {
+    "CREATE_ANNOTATIONS",
+    "REPLACE_ANNOTATIONS",
+    "REMOVE_ANNOTATIONS",
+    "SECRET_REVEAL_ANNOTATIONS",
+    "MUTATING",
+}
 
 
 def _sha256(path: Path) -> str:
@@ -112,6 +118,27 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
     policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
     capabilities = _load_capabilities_module()
+    profiles = policy.get("profiles", {})
+    active_profile_name = policy.get("active_profile", policy.get("mode"))
+    active_profile = (
+        profiles.get(active_profile_name, {})
+        if isinstance(profiles, dict) and isinstance(active_profile_name, str)
+        else {}
+    )
+    if not isinstance(active_profile, dict):
+        active_profile = {}
+
+    def policy_values(key: str, default: Any = None) -> Any:
+        if key in active_profile:
+            return active_profile[key]
+        return policy.get(key, default)
+
+    def format_policy_values(key: str) -> str:
+        values = policy_values(key, [])
+        if not values:
+            return "`none`"
+        return ", ".join(f"`{item}`" for item in values)
+
     discovered, source_hashes = _discover_tools(contract)
     expected_tools = list(contract["expected_tools"])
     descriptions = {
@@ -175,9 +202,15 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
         },
         "policy_contract": {
             "mode": policy.get("mode"),
-            "read_roots": policy.get("read_roots", []),
-            "write_roots": policy.get("write_roots", []),
-            "write_excluded_roots": policy.get("write_excluded_roots", []),
+            "active_profile": active_profile_name,
+            "access_profiles": sorted(profiles) if isinstance(profiles, dict) else [],
+            "capabilities": policy_values("capabilities", []),
+            "read_roots": policy_values("read_roots", []),
+            "write_roots": policy_values("write_roots", []),
+            "write_excluded_roots": policy_values("write_excluded_roots", []),
+            "secret_roots": policy_values("secret_roots", []),
+            "browser_profile_roots": policy_values("browser_profile_roots", []),
+            "secret_export_roots": policy_values("secret_export_roots", []),
             "forbidden_capabilities": policy.get("forbidden_capabilities", []),
         },
         "capabilities": records,
@@ -221,9 +254,14 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
             "## Policy contract",
             "",
             f"- Mode: `{policy.get('mode', 'unknown')}`",
-            f"- Read roots: {', '.join(f'`{item}`' for item in policy.get('read_roots', []))}",
-            f"- Write roots: {', '.join(f'`{item}`' for item in policy.get('write_roots', []))}",
-            f"- Read-only exclusions: {', '.join(f'`{item}`' for item in policy.get('write_excluded_roots', []))}",
+            f"- Active profile: `{active_profile_name or 'unknown'}`",
+            f"- Capabilities: {format_policy_values('capabilities')}",
+            f"- Read roots: {format_policy_values('read_roots')}",
+            f"- Write roots: {format_policy_values('write_roots')}",
+            f"- Read-only exclusions: {format_policy_values('write_excluded_roots')}",
+            f"- Secret roots: {format_policy_values('secret_roots')}",
+            f"- Browser profile roots: {format_policy_values('browser_profile_roots')}",
+            f"- Secret export roots: {format_policy_values('secret_export_roots')}",
             f"- Forbidden capabilities: {', '.join(f'`{item}`' for item in policy.get('forbidden_capabilities', []))}",
             "",
             "## Update contract",

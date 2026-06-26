@@ -25,6 +25,12 @@ meldet.
 - Dateistatistik und Hashes
 - Verzeichnisauflistung
 - Textdateien erstellen und atomar ersetzen
+- dedizierte Secret-Root-Inspektion, hash-gebundene Reveals,
+  strukturierte Secret-Nutzung per FD und lokale Secret-Exports
+- dedizierter Browser-Profil-Lesezugriff mit Metadaten/Text und
+  metadata-only Behandlung binärer Browser-Datenbanken
+- transaktionale Text-Rollbacks mit Quarantänebelegen
+- tamper-evidente Audit-Verifikation
 - nicht-interaktive Kommandos und dauerhafte Hintergrundjobs
 - Git, typisierte Branch-Operationen und GitHub CLI
 - User-Service-, tmux-, Prozess- und Portoperationen
@@ -35,7 +41,9 @@ meldet.
 
 ## Harte Invarianten
 
-1. Secrets werden weder gelesen noch an ChatGPT ausgegeben.
+1. Secrets werden nicht über generische Dateiwerkzeuge gelesen; dedizierte
+   Secret-Werkzeuge sind capability-gebunden, hash-gebunden und schreiben
+   keine Secret-Werte in Audit, Evidence, argv oder Environment.
 2. `~/repos/merges` wird niemals verändert.
 3. Keine stillen Git-, Service- oder Systemmutationen.
 4. Änderungen müssen belegbar und möglichst reversibel sein.
@@ -113,6 +121,37 @@ ein systemd-Timer einen semantischen Prozessbaumcheck mit Fehlerschwelle und
 persistierendem Restart-Budget.
 
 Details: [`docs/restart-watchdog.md`](docs/restart-watchdog.md).
+
+## Operator v2 Foundation
+
+Die Runtime lädt bestehende v1-Policies ohne neue Secret-Felder weiter. Neue
+typed Secret-/Browser-Felder liegen in `version: 2` Policies:
+`secret_roots`, `browser_profile_roots` und `secret_export_roots`.
+`config/access.example.json` hält den bisherigen bounded-read-write-Default;
+`config/access.home-wide-operator.example.json` zeigt ein nicht-live
+Home-weites Operatorprofil für eine spätere bewusste Umstellung.
+
+Die dedizierten sensitiven Tools sind:
+
+- `grabowski_secret_inspect`: nur Metadaten, Hashes und bounded Listings.
+- `grabowski_secret_reveal`: roher bounded Text nur mit aktuellem SHA-256.
+- `grabowski_secret_use`: argv-only Prozess mit Secret über FD oder
+  restriktiven Tempfile-Fallback; Secret-Werte werden aus Ausgaben redigiert.
+- `grabowski_secret_export`: lokaler create-only Export nach
+  `secret_export_roots`, Modus `0600`, mit Quellhash-Vorbedingung.
+- `grabowski_browser_profile_read`: Browser-Profil-Metadaten und bounded Text;
+  binäre Browser-Datenbanken bleiben metadata-only.
+
+Mutierende Werkzeuge prüfen einen Kill-Switch unter
+`~/.local/state/grabowski/operator-kill-switch` oder
+`GRABOWSKI_OPERATOR_KILL_SWITCH=1`. Schreiboperationen erzeugen
+Quarantänebelege unter dem Grabowski-State, hängen hash-verkettete Auditrecords
+an und können ersetzte Textdateien über `grabowski_rollback_text`
+wiederherstellen. `grabowski_remove_path` entfernt reguläre Dateien oder leere
+Verzeichnisse typisiert in eine Quarantäne und
+`grabowski_restore_removed_path` stellt diese Audit-Transaktionen wieder her.
+Irreversibles Entfernen bleibt getrennt hinter `grabowski_destroy_path` und der
+separaten `file_destroy`-Capability.
 
 ## Operator-Fähigkeiten
 

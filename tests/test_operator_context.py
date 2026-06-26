@@ -47,6 +47,20 @@ class OperatorContextTests(unittest.TestCase):
             )
         )
 
+    def test_secret_reveal_is_not_read_only_in_generated_contracts(self) -> None:
+        catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+        context = json.loads(CONTEXT.read_text(encoding="utf-8"))
+        catalog_tool = next(
+            item for item in catalog["tools"]
+            if item["tool"] == "grabowski_secret_reveal"
+        )
+        context_tool = next(
+            item for item in context["capabilities"]
+            if item["tool"] == "grabowski_secret_reveal"
+        )
+        self.assertIs(catalog_tool["read_only"], False)
+        self.assertIs(context_tool["read_only"], False)
+
     def test_repository_context_points_to_live_context(self) -> None:
         context = json.loads(CONTEXT.read_text(encoding="utf-8"))
         self.assertEqual(context["kind"], "repository-operator-context")
@@ -66,6 +80,7 @@ class OperatorContextTests(unittest.TestCase):
         self.assertIn('name="grabowski_git_branch"', source)
         self.assertIn('"check-ref-format"', source)
         self.assertIn("PROTECTED_BRANCHES", source)
+        self.assertIn('operator._require_operator_mutation("git_cli")', source)
         self.assertIn("_append_audit", source)
         self.assertNotIn("shell=True", source)
 

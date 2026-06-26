@@ -1,25 +1,36 @@
 {
   "version": 2,
-  "mode": "bounded-read-write",
-  "active_profile": "bounded-read-write",
+  "mode": "home-wide-operator",
+  "active_profile": "home-wide-operator",
   "read_roots": [
-    "${HOME}/repos",
-    "${HOME}/grabowski-workspace",
-    "${HOME}/.local/state/grabowski"
+    "${HOME}"
   ],
   "write_roots": [
-    "${HOME}/repos",
-    "${HOME}/grabowski-workspace"
+    "${HOME}"
   ],
   "write_excluded_roots": [
     "${HOME}/repos/merges"
   ],
-  "secret_roots": [],
-  "browser_profile_roots": [],
-  "secret_export_roots": [],
+  "secret_roots": [
+    "${HOME}/.ssh",
+    "${HOME}/.gnupg",
+    "${HOME}/.aws",
+    "${HOME}/.kube",
+    "${HOME}/.password-store",
+    "${HOME}/.local/share/keyrings"
+  ],
+  "browser_profile_roots": [
+    "${HOME}/.mozilla/firefox",
+    "${HOME}/.config/BraveSoftware/Brave-Browser",
+    "${HOME}/.config/google-chrome",
+    "${HOME}/.config/chromium"
+  ],
+  "secret_export_roots": [
+    "${HOME}/grabowski-secret-exports"
+  ],
   "max_read_bytes": 2000000,
   "max_write_bytes": 2000000,
-  "max_list_entries": 500,
+  "max_list_entries": 1000,
   "max_secret_use_output_bytes": 250000,
   "max_secret_use_seconds": 30,
   "forbid_symlinks": true,
@@ -68,36 +79,6 @@
     "privileged_reference": "Create non-executable references for future privileged actions."
   },
   "profiles": {
-    "bounded-read-write": {
-      "description": "Default local file profile; keeps existing bounded read/write behavior.",
-      "read_roots": [
-        "${HOME}/repos",
-        "${HOME}/grabowski-workspace",
-        "${HOME}/.local/state/grabowski"
-      ],
-      "write_roots": [
-        "${HOME}/repos",
-        "${HOME}/grabowski-workspace"
-      ],
-      "write_excluded_roots": [
-        "${HOME}/repos/merges"
-      ],
-      "secret_roots": [],
-      "browser_profile_roots": [],
-      "secret_export_roots": [],
-      "max_read_bytes": 2000000,
-      "max_write_bytes": 2000000,
-      "max_list_entries": 500,
-      "max_secret_use_output_bytes": 250000,
-      "max_secret_use_seconds": 30,
-      "capabilities": [
-        "file_read",
-        "file_write",
-        "audit_verify",
-        "rollback_text",
-        "bundle_registry"
-      ]
-    },
     "home-wide-operator": {
       "description": "Example only: home-wide operator profile for a deliberate local cutover.",
       "read_roots": [

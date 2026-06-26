@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heimgewebe.local/contracts/grabowski/privileged-action-reference.v1.schema.json",
+  "title": "Grabowski Privileged Action Reference v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "execution",
+    "may_execute",
+    "requires_external_privileged_agent",
+    "replay_policy",
+    "action",
+    "target",
+    "justification",
+    "request_id",
+    "created_at_unix",
+    "expires_at_unix",
+    "reference_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "execution": {"const": "unprivileged-reference-only"},
+    "may_execute": {"const": false},
+    "requires_external_privileged_agent": {"const": true},
+    "replay_policy": {"const": "single-use-external-broker"},
+    "action": {
+      "type": "string",
+      "enum": [
+        "install_system_package",
+        "edit_system_service",
+        "bind_privileged_port",
+        "change_file_owner",
+        "mount_filesystem"
+      ]
+    },
+    "target": {"type": "string", "minLength": 1, "maxLength": 1000},
+    "justification": {"type": "string", "minLength": 1, "maxLength": 1000},
+    "request_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "created_at_unix": {"type": "integer", "minimum": 1},
+    "expires_at_unix": {"type": "integer", "minimum": 1},
+    "reference_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

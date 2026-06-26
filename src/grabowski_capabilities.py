@@ -44,6 +44,41 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_secret_inspect": {
+        "category": "secret",
+        "purpose": "Inspect metadata and bounded listings under explicit secret roots without returning content.",
+        "risk_class": "medium",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_secret_reveal": {
+        "category": "secret",
+        "purpose": "Reveal bounded secret text only with an exact SHA-256 precondition.",
+        "risk_class": "high",
+        "effects": ["secret-content-return"],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_secret_use": {
+        "category": "secret",
+        "purpose": "Run one argv-only command with a secret supplied through a file descriptor or restricted temporary path.",
+        "risk_class": "high",
+        "effects": ["process-start", "secret-use", "command-dependent"],
+        "reversibility": "command-dependent",
+    },
+    "grabowski_secret_export": {
+        "category": "secret",
+        "purpose": "Create one local 0600 copy of a secret under configured export roots with a source hash precondition.",
+        "risk_class": "high",
+        "effects": ["secret-copy-create"],
+        "reversibility": "manual-delete",
+    },
+    "grabowski_browser_profile_read": {
+        "category": "secret",
+        "purpose": "Read bounded browser profile metadata and text, with binary databases kept metadata-only.",
+        "risk_class": "high",
+        "effects": ["profile-content-return"],
+        "reversibility": "not-applicable",
+    },
     "grabowski_create_text": {
         "category": "filesystem",
         "purpose": "Create one new UTF-8 file atomically inside an allowed write root.",
@@ -57,6 +92,41 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "risk_class": "medium",
         "effects": ["file-replace", "backup-create"],
         "reversibility": "backup-and-git",
+    },
+    "grabowski_remove_path": {
+        "category": "filesystem",
+        "purpose": "Remove one regular file or empty directory into quarantine after a typed precondition.",
+        "risk_class": "medium",
+        "effects": ["file-remove", "directory-remove", "quarantine-create"],
+        "reversibility": "quarantine-restore",
+    },
+    "grabowski_restore_removed_path": {
+        "category": "audit",
+        "purpose": "Restore one path from an audited reversible filesystem removal.",
+        "risk_class": "medium",
+        "effects": ["file-create", "directory-create"],
+        "reversibility": "new-remove-operation",
+    },
+    "grabowski_destroy_path": {
+        "category": "filesystem",
+        "purpose": "Irreversibly remove one regular file or empty directory with a separate explicit capability.",
+        "risk_class": "high",
+        "effects": ["file-delete", "directory-delete"],
+        "reversibility": "irreversible",
+    },
+    "grabowski_rollback_text": {
+        "category": "audit",
+        "purpose": "Restore a quarantined preimage from an audited replace transaction.",
+        "risk_class": "medium",
+        "effects": ["file-replace", "backup-create"],
+        "reversibility": "audit-rollback",
+    },
+    "grabowski_verify_audit": {
+        "category": "audit",
+        "purpose": "Verify the tamper-evident write audit hash chain.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
     },
     "latest_complete_bundles": {
         "category": "knowledge",
@@ -170,6 +240,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_privileged_action_reference": {
+        "category": "privileged-reference",
+        "purpose": "Create a non-executable reference contract for a future external privileged action.",
+        "risk_class": "medium",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
 }
 
 
@@ -178,6 +255,7 @@ PROFILE_CATEGORIES: dict[str, set[str] | None] = {
     "repository-work": {
         "context",
         "filesystem",
+        "audit",
         "knowledge",
         "command",
         "version-control",
@@ -190,6 +268,7 @@ PROFILE_CATEGORIES: dict[str, set[str] | None] = {
         "session",
         "process",
         "diagnostics",
+        "privileged-reference",
     },
     "full": None,
 }
