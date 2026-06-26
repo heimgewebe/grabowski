@@ -47,8 +47,9 @@ Fläche. Stattdessen stehen dedizierte Capabilities bereit:
 `browser_profile_read`.
 
 `secret_inspect` gibt nur Metadaten, Hashes und bounded Directory-Listings
-zurück. `secret_reveal` ist der einzige rohe Secret-Textpfad und benötigt immer
-einen aktuellen SHA-256-Precondition-Hash. `secret_use` startet argv-only
+zurück. `secret_reveal` ist der einzige rohe Secret-Textpfad und verlangt einen
+aktuellen SHA-256-Precondition-Hash, eine Begründung und die explizite
+Bestätigung der Exposition im Chatkontext. Standardpfad ist `secret_use`; er startet argv-only
 Kommandos und reicht das Secret über einen geerbten FD oder einen restriktiven,
 aufgeräumten Tempfile-Fallback durch; das Secret erscheint nicht in argv oder
 Environment und wird aus stdout/stderr in exakter, base64-, URL-safe-base64-

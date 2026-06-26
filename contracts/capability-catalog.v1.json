@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "b170fefdde1cbc6aa14f44bd1ad75c4b4bb7a2dbb15c0c37945f64ef8299dc46",
+  "capability_source_sha256": "51c62c07c6dac4ac53e350fa2d0646369d7e0076aebd40a71bd91592b85e9a01",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "556129d0a330d90b0bd46e10f0367b85e65fef8719a7f6b2408fe3fb6b7eb3f9",
   "integrity": {
@@ -80,12 +80,12 @@
     },
     {
       "category": "secret",
-      "description": "Reveal one bounded secret text file after an exact SHA-256 precondition.",
+      "description": "Break-glass reveal after hash, justification and exposure acknowledgement.",
       "effects": [
         "secret-content-return"
       ],
       "id": "grabowski_secret_reveal",
-      "purpose": "Reveal bounded secret text only with an exact SHA-256 precondition.",
+      "purpose": "Break-glass reveal of bounded secret text with hash, justification and explicit context-exposure acknowledgement.",
       "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "high",

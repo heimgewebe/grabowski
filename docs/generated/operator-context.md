@@ -18,7 +18,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_stat` | filesystem | yes | low | Read metadata and a content hash for one allowed path. |
 | `grabowski_read_text` | filesystem | yes | low | Read bounded UTF-8 text and obtain a concurrency hash. |
 | `grabowski_secret_inspect` | secret | yes | medium | Inspect metadata and bounded listings under explicit secret roots without returning content. |
-| `grabowski_secret_reveal` | secret | no | high | Reveal bounded secret text only with an exact SHA-256 precondition. |
+| `grabowski_secret_reveal` | secret | no | high | Break-glass reveal of bounded secret text with hash, justification and explicit context-exposure acknowledgement. |
 | `grabowski_secret_use` | secret | no | high | Run one argv-only command with a secret supplied through a file descriptor or restricted temporary path. |
 | `grabowski_secret_export` | secret | no | high | Create one local 0600 copy of a secret under configured export roots with a source hash precondition. |
 | `grabowski_browser_profile_read` | secret | yes | high | Read bounded browser profile metadata and text, with binary databases kept metadata-only. |

@@ -53,7 +53,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_secret_reveal": {
         "category": "secret",
-        "purpose": "Reveal bounded secret text only with an exact SHA-256 precondition.",
+        "purpose": "Break-glass reveal of bounded secret text with hash, justification and explicit context-exposure acknowledgement.",
         "risk_class": "high",
         "effects": ["secret-content-return"],
         "reversibility": "not-applicable",

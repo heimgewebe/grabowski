@@ -645,9 +645,12 @@ class OperatorV2RuntimeTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(RuntimeError, "precondition failed"):
                     grabowski_mcp.grabowski_secret_reveal(str(target), "0" * 64)
+                with self.assertRaisesRegex(PermissionError, "acknowledgement"):
+                    grabowski_mcp.grabowski_secret_reveal(str(target), source_sha)
                 reveal = grabowski_mcp.grabowski_secret_reveal(
-                    str(target),
-                    source_sha,
+                    str(target), source_sha,
+                    justification="Need raw value for explicit diagnostic comparison",
+                    acknowledge_context_exposure=True,
                 )
                 self.assertEqual(reveal["text"], secret_value + "\n")
                 self.assertNotIn(secret_value, _state_text(state))
@@ -943,7 +946,11 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 value = "audited-reveal-secret-12345"
                 source = secret / "token.txt"
                 source.write_text(value, encoding="utf-8")
-                result = grabowski_mcp.grabowski_secret_reveal(str(source), _sha256(source))
+                result = grabowski_mcp.grabowski_secret_reveal(
+                    str(source), _sha256(source),
+                    justification="Verify value-free reveal audit evidence",
+                    acknowledge_context_exposure=True,
+                )
                 self.assertIn("audit_record_sha256", result)
                 records = grabowski_mcp._audit_records()
                 self.assertEqual(records[-1]["operation"], "secret-reveal")
@@ -1015,7 +1022,11 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     source_sha,
                 )
                 self.assertEqual(
-                    grabowski_mcp.grabowski_secret_reveal(str(source), source_sha)["text"],
+                    grabowski_mcp.grabowski_secret_reveal(
+                        str(source), source_sha,
+                        justification="Confirm read path remains available during kill switch",
+                        acknowledge_context_exposure=True,
+                    )["text"],
                     "kill-switch-secret",
                 )
                 with self.assertRaisesRegex(PermissionError, "kill switch"):

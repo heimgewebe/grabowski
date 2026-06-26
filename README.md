@@ -134,7 +134,7 @@ Home-weites Operatorprofil für eine spätere bewusste Umstellung.
 Die dedizierten sensitiven Tools sind:
 
 - `grabowski_secret_inspect`: nur Metadaten, Hashes und bounded Listings.
-- `grabowski_secret_reveal`: roher bounded Text nur mit aktuellem SHA-256.
+- `grabowski_secret_reveal`: Break-Glass-Text nur mit aktuellem SHA-256, Begründung und bestätigter Kontext-Exposition.
 - `grabowski_secret_use`: argv-only Prozess mit Secret über FD oder
   restriktiven Tempfile-Fallback; Secret-Werte werden aus Ausgaben redigiert.
 - `grabowski_secret_export`: lokaler create-only Export nach

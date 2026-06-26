@@ -98,3 +98,14 @@ Status: implemented in repository; live cutover requires explicit deployment.
 - Heimgewebe-Rolle bestimmen,
 - Fleet-Registrierung im Metarepo,
 - Produzenten und Konsumenten contractuell festlegen.
+
+## GRABOWSKI-CONTROL-PLANE-001
+
+Status: typed user-space control plane implemented; privileged execution remains fail-closed until an externally installed root-owned broker is approved.
+
+- registrierte lokale und SSH-Ziele für `heim-pc`, `heimserver` und `heimberry`,
+- argv-only Fleet-Ausführung mit Batch-SSH, deaktivierten Forwardings und Zeitgrenzen,
+- Operationsrezepte mit Preflight, Action, Postflight und umgekehrtem Rollback,
+- `secret_use` als Standard und begründungspflichtiges Break-Glass-`secret_reveal`,
+- deterministische Connector-Snapshot-Probe,
+- root-eigene Privileged-Action-Templates standardmäßig deaktiviert.

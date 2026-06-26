@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Added a typed home fleet registry and argv-only local/SSH execution path for
+  `heim-pc`, `heimserver` and `heimberry`, plus contracted operation recipes
+  with preflight, action, postflight and reverse-order rollback.
+- Added fail-closed privileged-broker readiness and disabled root-owned action
+  templates without granting generic privilege escalation.
+- Made `secret_reveal` a break-glass path requiring justification and explicit
+  context-exposure acknowledgement; `secret_use` remains the default.
+- Added a deterministic connector tool-snapshot probe and control-plane tests.
+
 - Initialer Repository-Bootstrap aus der laufenden Grabowski-MCP-Runtime.
 - Zugriffspolicy-Contract und Beispielkonfiguration ergänzt.
 - Minimaler CI- und Repository-Contract eingerichtet.
