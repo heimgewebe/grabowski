@@ -159,7 +159,9 @@ class LocalEvidenceBuilderTests(unittest.TestCase):
         result_schema = self._json(RESULT_SCHEMA)
         self.assertFalse(job_schema["additionalProperties"])
         self.assertEqual(set(job_schema["properties"]), BUILDER.JOB_FIELDS)
-        self.assertTrue({"expected_branch", "expected_head"} <= set(job_schema["required"]))
+        self.assertTrue(
+            {"expected_branch", "expected_head"} <= set(job_schema["required"])
+        )
         self.assertEqual(1, job_schema["properties"]["schema_version"]["const"])
         self.assertFalse(result_schema["additionalProperties"])
         self.assertEqual(
@@ -167,7 +169,9 @@ class LocalEvidenceBuilderTests(unittest.TestCase):
             set(result_schema["properties"]["status"]["enum"]),
         )
 
-    def test_clean_repo_builds_complete_hashed_bundle_without_index_mutation(self) -> None:
+    def test_clean_repo_builds_complete_hashed_bundle_without_index_mutation(
+        self,
+    ) -> None:
         before_status = self._git(
             "status", "--porcelain=v1", "-z", "--untracked-files=all"
         ).stdout
@@ -196,7 +200,9 @@ class LocalEvidenceBuilderTests(unittest.TestCase):
         self.assertEqual(before_status, after_status)
         self.assertEqual(before_index, after_index)
 
-    def test_dirty_repo_records_changes_references_and_safe_untracked_content(self) -> None:
+    def test_dirty_repo_records_changes_references_and_safe_untracked_content(
+        self,
+    ) -> None:
         self._write("src/app.py", "def answer():\n    return 43\n")
         self._write("src/new.py", "VALUE = 1\n")
 
@@ -209,9 +215,13 @@ class LocalEvidenceBuilderTests(unittest.TestCase):
         self.assertEqual("complete", result["status"])
         self.assertEqual({"src/app.py", "src/new.py"}, paths)
         self.assertIn("return 43", (bundle / "diff.patch").read_text(encoding="utf-8"))
-        self.assertNotIn("VALUE = 1", (bundle / "diff.patch").read_text(encoding="utf-8"))
+        self.assertNotIn(
+            "VALUE = 1", (bundle / "diff.patch").read_text(encoding="utf-8")
+        )
         untracked = self._json(bundle / "untracked-files.json")["records"]
-        new_record = next(record for record in untracked if record["path"] == "src/new.py")
+        new_record = next(
+            record for record in untracked if record["path"] == "src/new.py"
+        )
         self.assertTrue(new_record["captured"])
         self.assertEqual(
             "VALUE = 1\n",
@@ -267,7 +277,9 @@ class LocalEvidenceBuilderTests(unittest.TestCase):
         self.assertEqual(1, changed["sensitive_change_count_omitted"])
         for path in bundle.rglob("*"):
             if path.is_file():
-                self.assertNotIn(secret, path.read_text(encoding="utf-8", errors="replace"))
+                self.assertNotIn(
+                    secret, path.read_text(encoding="utf-8", errors="replace")
+                )
 
     def test_patch_redaction_marks_bundle_partial(self) -> None:
         secret = "sk-" + "abcdefghijklmnopqrstuvwx"
@@ -463,6 +475,60 @@ class LocalEvidenceBuilderTests(unittest.TestCase):
         self.assertEqual("partial", result["status"])
         self.assertEqual(1, len(records))
         self.assertTrue(any("budget" in item for item in result["limitations"]))
+
+    def test_multisegment_forbidden_path_is_omitted(self) -> None:
+        self._write(".local/share/keyrings/session.txt", "credential material\n")
+
+        completed, bundle = self._invoke(
+            self._job("multisegment-forbidden"),
+            "multisegment-forbidden",
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        result = self._json(bundle / "result.json")
+        changed = self._json(bundle / "changed-paths.json")
+        self.assertEqual("partial", result["status"])
+        self.assertEqual([], changed["entries"])
+        self.assertEqual(1, changed["sensitive_change_count_omitted"])
+
+    def test_invalid_policy_cleans_temporary_bundle(self) -> None:
+        policy = self.root / "invalid-policy.json"
+        policy.write_bytes(b"\xff\xfe")
+        job = self._job("invalid-policy")
+        output = self.workspace_root / "invalid-policy"
+        environment = {
+            "GRABOWSKI_REPO_ROOT": str(self.repos_root),
+            "GRABOWSKI_WORKSPACE_ROOT": str(self.workspace_root),
+            "GRABOWSKI_POLICY_PATH": str(policy),
+        }
+
+        with mock.patch.dict(os.environ, environment, clear=False):
+            with self.assertRaisesRegex(BUILDER.EvidenceError, "valid UTF-8 JSON"):
+                BUILDER.build(job, str(output))
+
+        self.assertFalse(output.exists())
+        self.assertEqual([], list(self.workspace_root.iterdir()))
+
+    def test_invalid_policy_entry_fails_closed_and_cleans_up(self) -> None:
+        policy = self.root / "invalid-entry-policy.json"
+        policy.write_text(
+            json.dumps({"forbidden_components": [1]}),
+            encoding="utf-8",
+        )
+        job = self._job("invalid-policy-entry")
+        output = self.workspace_root / "invalid-policy-entry"
+        environment = {
+            "GRABOWSKI_REPO_ROOT": str(self.repos_root),
+            "GRABOWSKI_WORKSPACE_ROOT": str(self.workspace_root),
+            "GRABOWSKI_POLICY_PATH": str(policy),
+        }
+
+        with mock.patch.dict(os.environ, environment, clear=False):
+            with self.assertRaisesRegex(BUILDER.EvidenceError, "non-empty strings"):
+                BUILDER.build(job, str(output))
+
+        self.assertFalse(output.exists())
+        self.assertEqual([], list(self.workspace_root.iterdir()))
 
     def test_core_artifacts_are_deterministic_for_identical_repo_state(self) -> None:
         job = self._job("repeatable")

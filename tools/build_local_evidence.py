@@ -11,6 +11,7 @@ import os
 from pathlib import Path, PurePosixPath
 import platform
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -158,7 +159,9 @@ def _ensure_directory_tree(path: Path) -> Path:
             raise EvidenceError(f"Symlink path component is forbidden: {current}")
         if current.exists():
             if not current.is_dir():
-                raise EvidenceError(f"Directory component is not a directory: {current}")
+                raise EvidenceError(
+                    f"Directory component is not a directory: {current}"
+                )
             continue
         current.mkdir(mode=0o700)
     return candidate
@@ -214,9 +217,7 @@ def _load_job(path: Path) -> dict[str, Any]:
     ):
         raise JobValidationError("expected_branch is invalid")
     head = payload["expected_head"]
-    if head is not None and (
-        not isinstance(head, str) or not HEAD_RE.fullmatch(head)
-    ):
+    if head is not None and (not isinstance(head, str) or not HEAD_RE.fullmatch(head)):
         raise JobValidationError("expected_head must be a full 40-character SHA")
     max_patch = payload["max_patch_bytes"]
     if (
@@ -243,10 +244,14 @@ def _normalize_allowed_paths(value: Any) -> list[str]:
         if not isinstance(raw, str) or not raw or len(raw) > 4096:
             raise JobValidationError("allowed_paths entries must be non-empty strings")
         if "\x00" in raw or "\\" in raw:
-            raise JobValidationError("allowed_paths entries contain forbidden characters")
+            raise JobValidationError(
+                "allowed_paths entries contain forbidden characters"
+            )
         path = PurePosixPath(raw)
         if path.is_absolute() or ".." in path.parts:
-            raise JobValidationError("allowed_paths entries must be relative and confined")
+            raise JobValidationError(
+                "allowed_paths entries must be relative and confined"
+            )
         canonical = path.as_posix().rstrip("/") or "."
         if canonical in normalized:
             raise JobValidationError(f"Duplicate allowed path: {canonical}")
@@ -322,16 +327,44 @@ def _load_sensitive_rules() -> tuple[set[str], set[str]]:
     _reject_symlink_components(policy)
     if not policy.is_file() or policy.stat().st_size > MAX_JOB_BYTES:
         raise EvidenceError(f"Policy path is not a bounded regular file: {policy}")
-    payload = json.loads(policy.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(policy.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvidenceError(f"Policy is not valid UTF-8 JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise EvidenceError("Policy must be a JSON object")
     raw_components = payload.get("forbidden_components", [])
     raw_patterns = payload.get("forbidden_file_patterns", [])
     if not isinstance(raw_components, list) or not isinstance(raw_patterns, list):
-        raise EvidenceError("Policy sensitive path rules must be arrays")
-    components.update(item for item in raw_components if isinstance(item, str))
-    patterns.update(item for item in raw_patterns if isinstance(item, str))
+        raise EvidenceError("Policy path rules must be arrays")
+    if any(not isinstance(item, str) or not item for item in raw_components):
+        raise EvidenceError(
+            "Policy forbidden_components entries must be non-empty strings"
+        )
+    if any(not isinstance(item, str) or not item for item in raw_patterns):
+        raise EvidenceError(
+            "Policy forbidden_file_patterns entries must be non-empty strings"
+        )
+    for item in raw_components:
+        component = PurePosixPath(item)
+        if component.is_absolute() or ".." in component.parts:
+            raise EvidenceError(
+                "Policy forbidden_components entries must be confined relative paths"
+            )
+    components.update(raw_components)
+    patterns.update(raw_patterns)
     return components, patterns
+
+
+def _contains_component_sequence(path: PurePosixPath, raw: str) -> bool:
+    sequence = PurePosixPath(raw).parts
+    if not sequence:
+        return False
+    width = len(sequence)
+    return any(
+        path.parts[index : index + width] == sequence
+        for index in range(len(path.parts) - width + 1)
+    )
 
 
 def _is_sensitive(
@@ -340,7 +373,7 @@ def _is_sensitive(
     patterns: set[str],
 ) -> bool:
     path = PurePosixPath(relative_path)
-    if any(part in components for part in path.parts):
+    if any(_contains_component_sequence(path, item) for item in components):
         return True
     return any(fnmatch(path.name, pattern) for pattern in patterns)
 
@@ -416,9 +449,7 @@ def _parse_status(data: bytes) -> list[dict[str, Any]]:
         if code[0] in {"R", "C"} or code[1] in {"R", "C"}:
             if index >= len(records) or not records[index]:
                 raise EvidenceError("Rename status record is incomplete")
-            entry["original_path"] = records[index].decode(
-                "utf-8", errors="replace"
-            )
+            entry["original_path"] = records[index].decode("utf-8", errors="replace")
             index += 1
         entries.append(entry)
     return entries
@@ -504,13 +535,7 @@ def _redact(text: str) -> tuple[str, int]:
 
 
 def _tracked_paths(entries: list[dict[str, Any]]) -> list[str]:
-    return sorted(
-        {
-            entry["path"]
-            for entry in entries
-            if not entry["untracked"]
-        }
-    )
+    return sorted({entry["path"] for entry in entries if not entry["untracked"]})
 
 
 def _select_patch_paths(
@@ -614,7 +639,11 @@ def _build_patch(
 
 def _safe_relative_artifact_path(raw: str) -> PurePosixPath:
     path = PurePosixPath(raw)
-    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
         raise EvidenceError(f"Unsafe repository-relative path: {raw!r}")
     return path
 
@@ -648,7 +677,9 @@ def _capture_untracked(
             continue
         if not source.is_file():
             record["reason"] = "not-regular-file"
-            limitations.append(f"Untracked non-regular file content was omitted: {raw_path}")
+            limitations.append(
+                f"Untracked non-regular file content was omitted: {raw_path}"
+            )
             records.append(record)
             continue
         size = source.stat().st_size
@@ -710,8 +741,10 @@ def _capture_untracked(
 
 def _category(path: str) -> str | None:
     name = PurePosixPath(path).name
-    if path.startswith("tests/") or name.startswith("test_") or any(
-        marker in name for marker in (".test.", ".spec.")
+    if (
+        path.startswith("tests/")
+        or name.startswith("test_")
+        or any(marker in name for marker in (".test.", ".spec."))
     ):
         return "tests"
     if path.startswith(".github/workflows/") and path.endswith((".yml", ".yaml")):
@@ -830,8 +863,7 @@ def _build_references(
         records.append({"path": path, "reasons": sorted(reasons[path])})
     for category in sorted(capped):
         limitations.append(
-            f"{category} references exceeded the cap of "
-            f"{MAX_REFERENCES_PER_CATEGORY}."
+            f"{category} references exceeded the cap of {MAX_REFERENCES_PER_CATEGORY}."
         )
     return result, source_hashes
 
@@ -860,241 +892,246 @@ def build(job_path: Path, output_raw: str) -> tuple[Path, dict[str, Any]]:
     job = _load_job(job_path)
     repo = _resolve_repo(job["repo"])
     temporary, output = _prepare_output(output_raw, job["job_id"])
-    reader = GitReader(repo)
-    limitations: list[str] = []
-    components, patterns = _load_sensitive_rules()
+    published = False
+    try:
+        reader = GitReader(repo)
+        limitations: list[str] = []
+        components, patterns = _load_sensitive_rules()
 
-    redacted_task, task_redactions = _redact(job["task"])
-    if task_redactions:
-        job["task"] = redacted_task
-        limitations.append(
-            f"Job task contained {task_redactions} secret-like value(s) and was redacted."
-        )
+        redacted_task, task_redactions = _redact(job["task"])
+        if task_redactions:
+            job["task"] = redacted_task
+            limitations.append(
+                f"Job task contained {task_redactions} secret-like value(s) and was redacted."
+            )
 
-    state_before, visible_entries, counters = _snapshot(
-        reader,
-        job["allowed_paths"],
-        components,
-        patterns,
-    )
-    status = "complete"
-    if job.get("expected_branch") is not None and (
-        state_before["branch"] != job["expected_branch"]
-    ):
-        status = "rejected"
-        limitations.append(
-            "Expected branch does not match the observed branch; no patch or references were built."
-        )
-    if job.get("expected_head") is not None and (
-        state_before["head"] != job["expected_head"]
-    ):
-        status = "rejected"
-        limitations.append(
-            "Expected head does not match the observed head; no patch or references were built."
-        )
-    if counters["sensitive_omitted"]:
-        status = "partial" if status == "complete" else status
-        limitations.append(
-            f"{counters['sensitive_omitted']} sensitive-path change(s) were omitted."
-        )
-    if counters["outside_allowed_omitted"]:
-        status = "partial" if status == "complete" else status
-        limitations.append(
-            f"{counters['outside_allowed_omitted']} change(s) outside allowed_paths were omitted."
-        )
-
-    if counters["change_limit_omitted"]:
-        status = "partial" if status == "complete" else status
-        limitations.append(
-            f"{counters['change_limit_omitted']} change(s) exceeded the visible change budget and were omitted."
-        )
-    _write_json(temporary / "job.json", job)
-    patch = b""
-    patch_source_sha256 = _sha256(b"")
-    patch_paths: list[str] = []
-    references = {"tests": [], "workflows": [], "contracts": [], "docs": []}
-    reference_source_hashes: dict[str, str] = {}
-    untracked = {
-        "schema_version": SCHEMA_VERSION,
-        "captured_bytes_before_redaction": 0,
-        "records": [],
-    }
-    if status != "rejected":
-        patch, patch_source_sha256, patch_paths = _build_patch(
+        state_before, visible_entries, counters = _snapshot(
             reader,
-            visible_entries,
-            job["max_patch_bytes"],
-            limitations,
-        )
-        references, reference_source_hashes = _build_references(
-            reader,
-            visible_entries,
             job["allowed_paths"],
             components,
             patterns,
-            limitations,
         )
-        untracked = _capture_untracked(repo, visible_entries, temporary, limitations)
-        if limitations and status == "complete":
-            status = "partial"
+        status = "complete"
+        if job.get("expected_branch") is not None and (
+            state_before["branch"] != job["expected_branch"]
+        ):
+            status = "rejected"
+            limitations.append(
+                "Expected branch does not match the observed branch; no patch or references were built."
+            )
+        if job.get("expected_head") is not None and (
+            state_before["head"] != job["expected_head"]
+        ):
+            status = "rejected"
+            limitations.append(
+                "Expected head does not match the observed head; no patch or references were built."
+            )
+        if counters["sensitive_omitted"]:
+            status = "partial" if status == "complete" else status
+            limitations.append(
+                f"{counters['sensitive_omitted']} sensitive-path change(s) were omitted."
+            )
+        if counters["outside_allowed_omitted"]:
+            status = "partial" if status == "complete" else status
+            limitations.append(
+                f"{counters['outside_allowed_omitted']} change(s) outside allowed_paths were omitted."
+            )
 
-    state_after, after_entries, after_counters = _snapshot(
-        reader,
-        job["allowed_paths"],
-        components,
-        patterns,
-    )
-    status_stable = (
-        state_before == state_after
-        and visible_entries == after_entries
-        and counters == after_counters
-    )
-    patch_source_stable = True
-    untracked_sources_stable = True
-    reference_sources_stable = True
-    if status != "rejected":
-        patch_source_stable = (
-            _sha256(_read_patch_source(reader, patch_paths))
-            == patch_source_sha256
-        )
-        untracked_sources_stable = _verify_untracked_sources(repo, untracked)
-        reference_sources_stable = _verify_reference_sources(
-            repo,
-            reference_source_hashes,
-        )
-
-    stable = (
-        status_stable
-        and patch_source_stable
-        and untracked_sources_stable
-        and reference_sources_stable
-    )
-    if not status_stable:
-        limitations.append(
-            "Git identity or status changed during collection."
-        )
-    if not patch_source_stable:
-        limitations.append(
-            "Tracked patch source changed during collection."
-        )
-    if not untracked_sources_stable:
-        limitations.append(
-            "At least one untracked source changed during collection."
-        )
-    if not reference_sources_stable:
-        limitations.append(
-            "At least one scanned reference source changed during collection."
-        )
-    if not stable and status != "rejected":
-        status = "partial"
-        limitations.append(
-            "Artifacts do not represent one fully stable repository snapshot."
-        )
-
-    repo_state = {
-        **state_before,
-        "status_stable": status_stable,
-        "patch_source_stable": patch_source_stable,
-        "untracked_sources_stable": untracked_sources_stable,
-        "reference_sources_stable": reference_sources_stable,
-        "stable_during_collection": stable,
-        "state_after": state_after,
-    }
-    _write_json(temporary / "repo-state.json", repo_state)
-    _write_json(
-        temporary / "changed-paths.json",
-        {
+        if counters["change_limit_omitted"]:
+            status = "partial" if status == "complete" else status
+            limitations.append(
+                f"{counters['change_limit_omitted']} change(s) exceeded the visible change budget and were omitted."
+            )
+        _write_json(temporary / "job.json", job)
+        patch = b""
+        patch_source_sha256 = _sha256(b"")
+        patch_paths: list[str] = []
+        references = {"tests": [], "workflows": [], "contracts": [], "docs": []}
+        reference_source_hashes: dict[str, str] = {}
+        untracked = {
             "schema_version": SCHEMA_VERSION,
-            "entries": visible_entries,
-            "sensitive_change_count_omitted": counters["sensitive_omitted"],
-            "outside_allowed_change_count_omitted": counters[
-                "outside_allowed_omitted"
-            ],
-            "change_limit_count_omitted": counters["change_limit_omitted"],
-        },
-    )
-    _write_bytes(temporary / "diff.patch", patch)
-    _write_json(temporary / "untracked-files.json", untracked)
-    references_dir = temporary / "references"
-    references_dir.mkdir(mode=0o700)
-    for category in ("tests", "workflows", "contracts", "docs"):
+            "captured_bytes_before_redaction": 0,
+            "records": [],
+        }
+        if status != "rejected":
+            patch, patch_source_sha256, patch_paths = _build_patch(
+                reader,
+                visible_entries,
+                job["max_patch_bytes"],
+                limitations,
+            )
+            references, reference_source_hashes = _build_references(
+                reader,
+                visible_entries,
+                job["allowed_paths"],
+                components,
+                patterns,
+                limitations,
+            )
+            untracked = _capture_untracked(
+                repo, visible_entries, temporary, limitations
+            )
+            if limitations and status == "complete":
+                status = "partial"
+
+        state_after, after_entries, after_counters = _snapshot(
+            reader,
+            job["allowed_paths"],
+            components,
+            patterns,
+        )
+        status_stable = (
+            state_before == state_after
+            and visible_entries == after_entries
+            and counters == after_counters
+        )
+        patch_source_stable = True
+        untracked_sources_stable = True
+        reference_sources_stable = True
+        if status != "rejected":
+            patch_source_stable = (
+                _sha256(_read_patch_source(reader, patch_paths)) == patch_source_sha256
+            )
+            untracked_sources_stable = _verify_untracked_sources(repo, untracked)
+            reference_sources_stable = _verify_reference_sources(
+                repo,
+                reference_source_hashes,
+            )
+
+        stable = (
+            status_stable
+            and patch_source_stable
+            and untracked_sources_stable
+            and reference_sources_stable
+        )
+        if not status_stable:
+            limitations.append("Git identity or status changed during collection.")
+        if not patch_source_stable:
+            limitations.append("Tracked patch source changed during collection.")
+        if not untracked_sources_stable:
+            limitations.append(
+                "At least one untracked source changed during collection."
+            )
+        if not reference_sources_stable:
+            limitations.append(
+                "At least one scanned reference source changed during collection."
+            )
+        if not stable and status != "rejected":
+            status = "partial"
+            limitations.append(
+                "Artifacts do not represent one fully stable repository snapshot."
+            )
+
+        repo_state = {
+            **state_before,
+            "status_stable": status_stable,
+            "patch_source_stable": patch_source_stable,
+            "untracked_sources_stable": untracked_sources_stable,
+            "reference_sources_stable": reference_sources_stable,
+            "stable_during_collection": stable,
+            "state_after": state_after,
+        }
+        _write_json(temporary / "repo-state.json", repo_state)
         _write_json(
-            references_dir / f"{category}.json",
+            temporary / "changed-paths.json",
             {
                 "schema_version": SCHEMA_VERSION,
-                "category": category,
-                "complete": False,
-                "records": references[category],
+                "entries": visible_entries,
+                "sensitive_change_count_omitted": counters["sensitive_omitted"],
+                "outside_allowed_change_count_omitted": counters[
+                    "outside_allowed_omitted"
+                ],
+                "change_limit_count_omitted": counters["change_limit_omitted"],
+            },
+        )
+        _write_bytes(temporary / "diff.patch", patch)
+        _write_json(temporary / "untracked-files.json", untracked)
+        references_dir = temporary / "references"
+        references_dir.mkdir(mode=0o700)
+        for category in ("tests", "workflows", "contracts", "docs"):
+            _write_json(
+                references_dir / f"{category}.json",
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "category": category,
+                    "complete": False,
+                    "records": references[category],
+                },
+            )
+
+        limitations = sorted(set(limitations))
+        limitation_lines = (
+            ["# Local Evidence Limitations", ""]
+            + (
+                [f"- {item}" for item in limitations]
+                if limitations
+                else ["- None detected by the builder."]
+            )
+            + [
+                "",
+                "Reference lists are deterministic candidates, not a proof of complete impact coverage.",
+            ]
+        )
+        _write_bytes(
+            temporary / "limitations.md",
+            ("\n".join(limitation_lines) + "\n").encode("utf-8"),
+        )
+        _write_json(
+            temporary / "provenance.json",
+            {
+                "schema_version": SCHEMA_VERSION,
+                "builder_version": BUILDER_VERSION,
+                "generated_at": _utc_now(),
+                "python_version": platform.python_version(),
+                "platform": platform.platform(),
+                "repo_root_policy": os.environ.get(
+                    "GRABOWSKI_REPO_ROOT", str(Path.home() / "repos")
+                ),
+                "workspace_root_policy": os.environ.get(
+                    "GRABOWSKI_WORKSPACE_ROOT",
+                    str(Path.home() / "grabowski-workspace" / "jobs"),
+                ),
+                "patch_source_sha256": patch_source_sha256,
+                "patch_paths": patch_paths,
+                "reference_source_sha256s": reference_source_hashes,
+                "commands": reader.commands,
             },
         )
 
-    limitations = sorted(set(limitations))
-    limitation_lines = (
-        ["# Local Evidence Limitations", ""]
-        + (
-            [f"- {item}" for item in limitations]
-            if limitations
-            else ["- None detected by the builder."]
+        artifact_paths = sorted(
+            path
+            for path in temporary.rglob("*")
+            if path.is_file() and path.name not in {"result.json", "hashes.sha256"}
         )
-        + [
-            "",
-            "Reference lists are deterministic candidates, not a proof of complete impact coverage.",
-        ]
-    )
-    _write_bytes(
-        temporary / "limitations.md",
-        ("\n".join(limitation_lines) + "\n").encode("utf-8"),
-    )
-    _write_json(
-        temporary / "provenance.json",
-        {
+        result = {
             "schema_version": SCHEMA_VERSION,
-            "builder_version": BUILDER_VERSION,
-            "generated_at": _utc_now(),
-            "python_version": platform.python_version(),
-            "platform": platform.platform(),
-            "repo_root_policy": os.environ.get(
-                "GRABOWSKI_REPO_ROOT", str(Path.home() / "repos")
-            ),
-            "workspace_root_policy": os.environ.get(
-                "GRABOWSKI_WORKSPACE_ROOT",
-                str(Path.home() / "grabowski-workspace" / "jobs"),
-            ),
-            "patch_source_sha256": patch_source_sha256,
-            "patch_paths": patch_paths,
-            "reference_source_sha256s": reference_source_hashes,
-            "commands": reader.commands,
-        },
-    )
-
-    artifact_paths = sorted(
-        path
-        for path in temporary.rglob("*")
-        if path.is_file() and path.name not in {"result.json", "hashes.sha256"}
-    )
-    result = {
-        "schema_version": SCHEMA_VERSION,
-        "job_id": job["job_id"],
-        "status": status,
-        "repo": str(repo),
-        "head": state_before["head"],
-        "branch": state_before["branch"],
-        "artifacts": [_artifact_record(path, temporary) for path in artifact_paths],
-        "limitations": limitations,
-        "started_at": started_at,
-        "finished_at": _utc_now(),
-    }
-    _write_json(temporary / "result.json", result)
-    _write_bytes(temporary / "hashes.sha256", _hash_manifest(temporary))
-    os.replace(temporary, output)
-    return output, result
+            "job_id": job["job_id"],
+            "status": status,
+            "repo": str(repo),
+            "head": state_before["head"],
+            "branch": state_before["branch"],
+            "artifacts": [_artifact_record(path, temporary) for path in artifact_paths],
+            "limitations": limitations,
+            "started_at": started_at,
+            "finished_at": _utc_now(),
+        }
+        _write_json(temporary / "result.json", result)
+        _write_bytes(temporary / "hashes.sha256", _hash_manifest(temporary))
+        os.replace(temporary, output)
+        published = True
+        return output, result
+    finally:
+        if not published and temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build a bounded, read-only local evidence bundle for one Git repo."
     )
-    parser.add_argument("--job", required=True, help="Path to local-evidence-job.v1 JSON")
+    parser.add_argument(
+        "--job", required=True, help="Path to local-evidence-job.v1 JSON"
+    )
     parser.add_argument("--output", required=True, help="New bundle directory")
     return parser.parse_args()
 

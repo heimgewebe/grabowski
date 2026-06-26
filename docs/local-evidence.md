@@ -141,7 +141,9 @@ Exitcode 2, ohne ein autoritatives Ergebnisbundle zu publizieren.
 - Git-Leseoperationen laufen mit `GIT_OPTIONAL_LOCKS=0`.
 - Der Builder prüft den Index in Tests auf Unverändertheit.
 - Sensible Komponenten und Dateimuster stammen aus der Zugriffspolicy und
-  werden durch konservative Defaults ergänzt.
+  werden durch konservative Defaults ergänzt. Mehrteilige Komponenten wie
+  `.local/share/keyrings` werden als zusammenhängende Pfadsequenz behandelt.
+- Nicht lesbare oder strukturell fehlerhafte Policy-Regeln scheitern fail-closed.
 - Patchinhalte und aufgenommene ungetrackte Texte werden zusätzlich auf
   typische Schlüssel- und Secretmuster redigiert.
 - Sichtbare Änderungen sind auf 5.000 Einträge begrenzt.
@@ -153,7 +155,8 @@ Exitcode 2, ohne ein autoritatives Ergebnisbundle zu publizieren.
 - Symlink-Referenzkandidaten und ungetrackte Symlinks werden nicht gelesen;
   Symlink-Komponenten in Steuerpfaden werden abgelehnt.
 - Ausgabe wird zunächst in einem temporären Verzeichnis aufgebaut und erst
-  nach vollständiger Erzeugung atomar publiziert.
+  nach vollständiger Erzeugung atomar publiziert. Bei Fehlern wird das
+  temporäre Verzeichnis entfernt.
 
 Diese Grenzen verhindern nicht jede denkbare Geheimnisform. Ein
 sprachmodellfreies Werkzeug wird nicht dadurch allwissend, dass sein JSON sehr
