@@ -425,8 +425,12 @@ class DeployRuntimeTests(unittest.TestCase):
                 "runtime_input": str(release / "inputs/runtime.in"),
                 "runtime_lock": str(release / "inputs/runtime.lock.txt"),
                 "source": str(release / "inputs/src/grabowski_mcp.py"),
+                "supporting_sources": {},
             },
             entrypoint_path=release / ".venv/lib/python3.10/site-packages/grabowski_mcp.py",
+            module_paths={
+                snapshot.contract.module: release / ".venv/lib/python3.10/site-packages/grabowski_mcp.py"
+            },
             protocol_version="2025-06-18",
             provenance={
                 "python_version": "3.10.12",

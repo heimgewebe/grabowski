@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import platform
@@ -278,6 +279,7 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         "entrypoint_contract": dict,
         "entrypoint_contract_sha256": str,
         "source_sha256": str,
+        "source_sha256s": dict,
         "runtime_input_sha256": str,
         "runtime_lock_sha256": str,
         "snapshot_paths": dict,
@@ -285,6 +287,7 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         "expected_stable_runtime_path": str,
         "release_python_path": str,
         "entrypoint_path": str,
+        "module_paths": dict,
         "platform": str,
         "python_version": str,
         "python_implementation": str,
@@ -298,7 +301,7 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         value = raw.get(key)
         if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
             return False
-    if raw.get("schema_version") != 3 or raw.get("completion_status") != "complete":
+    if raw.get("schema_version") != 4 or raw.get("completion_status") != "complete":
         return False
     if not _is_hex(raw.get("repo_head"), 40):
         return False
@@ -311,16 +314,22 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         if not _is_hex(raw.get(key), 64):
             return False
     contract = raw.get("entrypoint_contract")
-    if not isinstance(contract, dict) or set(contract) != {
-        "schema_version", "mode", "module", "source", "expected_tools"
-    }:
+    if not isinstance(contract, dict):
         return False
-    if contract.get("schema_version") != 1 or contract.get("mode") != "module":
+    schema_version = contract.get("schema_version")
+    expected_keys = {"schema_version", "mode", "module", "source", "expected_tools"}
+    if schema_version == 2:
+        expected_keys.add("supporting_sources")
+    if schema_version not in {1, 2} or set(contract) != expected_keys:
         return False
     module = contract.get("module")
-    if not isinstance(module, str) or MODULE_RE.fullmatch(module) is None:
-        return False
-    if not _safe_relative_path(contract.get("source")):
+    source = contract.get("source")
+    if (
+        contract.get("mode") != "module"
+        or not isinstance(module, str)
+        or MODULE_RE.fullmatch(module) is None
+        or not _safe_relative_path(source)
+    ):
         return False
     tools = contract.get("expected_tools")
     if (
@@ -330,12 +339,61 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         or len(set(tools)) != len(tools)
     ):
         return False
+    modules = {module}
+    sources = {source}
+    supporting_modules: set[str] = set()
+    supporting = contract.get("supporting_sources", [])
+    if not isinstance(supporting, list):
+        return False
+    for item in supporting:
+        if not isinstance(item, dict) or set(item) != {"module", "source"}:
+            return False
+        item_module = item.get("module")
+        item_source = item.get("source")
+        if (
+            not isinstance(item_module, str)
+            or MODULE_RE.fullmatch(item_module) is None
+            or item_module in modules
+            or not _safe_relative_path(item_source)
+            or item_source in sources
+        ):
+            return False
+        modules.add(item_module)
+        supporting_modules.add(item_module)
+        sources.add(item_source)
+    hashes = raw.get("source_sha256s")
+    if (
+        not isinstance(hashes, dict)
+        or set(hashes) != modules
+        or not all(_is_hex(value, 64) for value in hashes.values())
+        or hashes.get(module) != raw.get("source_sha256")
+    ):
+        return False
+    module_paths = raw.get("module_paths")
+    if (
+        not isinstance(module_paths, dict)
+        or set(module_paths) != modules
+        or not all(isinstance(value, str) and value for value in module_paths.values())
+        or module_paths.get(module) != raw.get("entrypoint_path")
+    ):
+        return False
     snapshot_paths = raw.get("snapshot_paths")
     if not isinstance(snapshot_paths, dict) or set(snapshot_paths) != {
-        "runtime_entrypoint", "runtime_input", "runtime_lock", "source"
+        "runtime_entrypoint", "runtime_input", "runtime_lock", "source",
+        "supporting_sources",
     }:
         return False
-    if not all(isinstance(value, str) and value for value in snapshot_paths.values()):
+    if not all(
+        isinstance(snapshot_paths.get(key), str) and snapshot_paths.get(key)
+        for key in ("runtime_entrypoint", "runtime_input", "runtime_lock", "source")
+    ):
+        return False
+    support_paths = snapshot_paths.get("supporting_sources")
+    if (
+        not isinstance(support_paths, dict)
+        or set(support_paths) != supporting_modules
+        or not all(isinstance(value, str) and value for value in support_paths.values())
+    ):
         return False
     created = raw.get("created_at_unix")
     return isinstance(created, int) and not isinstance(created, bool) and created > 0
@@ -497,22 +555,117 @@ def _deployment_metadata_impl() -> dict[str, Any]:
     )
     embedded_contract_valid = isinstance(raw.get("entrypoint_contract"), dict) and raw.get("entrypoint_contract") == contract_raw
 
-    source_snapshot_data: bytes | None = None
-    if contract_raw is not None and _safe_relative_path(contract_raw.get("source")):
-        source_snapshot_data = snapshot_bytes("source", f"inputs/{contract_raw['source']}")
-    source_snapshot_identity_valid = (
-        source_snapshot_data is not None
-        and hashlib.sha256(source_snapshot_data).hexdigest() == raw.get("source_sha256")
-    )
+    contract_sources: list[tuple[str, str]] = []
+    if contract_raw is not None:
+        main_module = contract_raw.get("module")
+        main_source = contract_raw.get("source")
+        if (
+            isinstance(main_module, str)
+            and MODULE_RE.fullmatch(main_module) is not None
+            and _safe_relative_path(main_source)
+        ):
+            contract_sources.append((main_module, main_source))
+        supporting = contract_raw.get("supporting_sources", [])
+        if isinstance(supporting, list):
+            for item in supporting:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("module"), str)
+                    and MODULE_RE.fullmatch(item["module"]) is not None
+                    and _safe_relative_path(item.get("source"))
+                ):
+                    contract_sources.append((item["module"], item["source"]))
 
-    running_module = Path(__file__).resolve(strict=True)
-    module_data = _read_bound_regular_file(
-        raw.get("entrypoint_path"), running_module, release_root, max_bytes=MAX_SNAPSHOT_BYTES
+    source_hashes = raw.get("source_sha256s")
+    module_paths = raw.get("module_paths")
+    supporting_snapshot_paths = snapshot_paths.get("supporting_sources")
+    snapshot_identity_by_module: dict[str, bool] = {}
+    module_identity_by_module: dict[str, bool] = {}
+    module_origins: dict[str, Path] = {}
+
+    for index, (module_name, source_name) in enumerate(contract_sources):
+        recorded_snapshot = (
+            snapshot_paths.get("source")
+            if index == 0
+            else (
+                supporting_snapshot_paths.get(module_name)
+                if isinstance(supporting_snapshot_paths, dict)
+                else None
+            )
+        )
+        snapshot_data = _read_bound_regular_file(
+            recorded_snapshot,
+            release_root / "inputs" / source_name,
+            release_root,
+            max_bytes=MAX_SNAPSHOT_BYTES,
+        )
+        expected_hash = (
+            source_hashes.get(module_name)
+            if isinstance(source_hashes, dict)
+            else None
+        )
+        snapshot_identity_by_module[module_name] = (
+            snapshot_data is not None
+            and hashlib.sha256(snapshot_data).hexdigest() == expected_hash
+        )
+
+        origin: Path | None = None
+        if module_name == "grabowski_mcp":
+            try:
+                origin = Path(__file__).resolve(strict=True)
+            except (OSError, RuntimeError):
+                origin = None
+        else:
+            try:
+                spec = importlib.util.find_spec(module_name)
+                if spec is not None and isinstance(spec.origin, str):
+                    origin = Path(spec.origin).resolve(strict=True)
+            except (ImportError, OSError, RuntimeError, ValueError):
+                origin = None
+        if origin is not None:
+            module_origins[module_name] = origin
+        recorded_module = (
+            module_paths.get(module_name)
+            if isinstance(module_paths, dict)
+            else None
+        )
+        module_data = (
+            _read_bound_regular_file(
+                recorded_module,
+                origin,
+                release_root,
+                max_bytes=MAX_SNAPSHOT_BYTES,
+            )
+            if origin is not None
+            else None
+        )
+        module_identity_by_module[module_name] = (
+            module_data is not None
+            and hashlib.sha256(module_data).hexdigest() == expected_hash
+        )
+
+    source_snapshot_identity_valid = (
+        bool(contract_sources)
+        and len(snapshot_identity_by_module) == len(contract_sources)
+        and all(snapshot_identity_by_module.values())
     )
-    entrypoint_path_valid = module_data is not None
     source_identity_valid = (
-        module_data is not None
-        and hashlib.sha256(module_data).hexdigest() == raw.get("source_sha256")
+        bool(contract_sources)
+        and len(module_identity_by_module) == len(contract_sources)
+        and all(module_identity_by_module.values())
+    )
+    entrypoint_module = contract_sources[0][0] if contract_sources else None
+    entrypoint_origin = (
+        module_origins.get(entrypoint_module)
+        if entrypoint_module is not None
+        else None
+    )
+    entrypoint_path_valid = (
+        entrypoint_origin is not None
+        and raw.get("entrypoint_path") == str(entrypoint_origin)
+        and isinstance(module_paths, dict)
+        and module_paths.get(entrypoint_module) == str(entrypoint_origin)
+        and module_identity_by_module.get(entrypoint_module, False)
     )
 
     release_python_identity_valid = False
@@ -581,7 +734,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         for key in (
             "schema_version", "release_id", "repo_head",
             "entrypoint_contract_sha256", "source_sha256",
-            "runtime_input_sha256", "runtime_lock_sha256",
+            "source_sha256s", "runtime_input_sha256", "runtime_lock_sha256",
             "mcp_protocol_version", "python_version",
             "python_implementation", "platform", "executable",
             "pip_version", "created_at_unix", "completion_status",
@@ -599,7 +752,9 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         "runtime_input_identity_valid": runtime_input_identity_valid,
         "lock_identity_valid": lock_identity_valid,
         "source_snapshot_identity_valid": source_snapshot_identity_valid,
+        "source_snapshot_identity_by_module": snapshot_identity_by_module,
         "source_identity_valid": source_identity_valid,
+        "source_identity_by_module": module_identity_by_module,
         "embedded_contract_valid": embedded_contract_valid,
         "entrypoint_contract_identity_valid": entrypoint_contract_identity_valid,
         "entrypoint_path_valid": entrypoint_path_valid,
