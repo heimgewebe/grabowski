@@ -281,6 +281,64 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertEqual(module.fingerprint(expected), module.fingerprint(list(reversed(expected))))
         self.assertNotEqual(module.fingerprint(expected), module.fingerprint(expected[:-1]))
 
+        runtime_schema = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "title": "Path"},
+                "expected_sha256": {"type": "string"},
+                "max_bytes": {
+                    "anyOf": [{"type": "integer"}, {"type": "null"}],
+                    "default": None,
+                },
+                "justification": {"type": "string", "default": ""},
+                "acknowledge_context_exposure": {
+                    "type": "boolean",
+                    "default": False,
+                },
+            },
+            "required": ["path", "expected_sha256"],
+        }
+        runtime_tools = [
+            {
+                "name": name,
+                **(
+                    {"inputSchema": runtime_schema}
+                    if name == "grabowski_secret_reveal"
+                    else {}
+                ),
+            }
+            for name in expected
+        ]
+        current = module.probe(
+            expected,
+            {"grabowski_secret_reveal": runtime_schema},
+            runtime_tools,
+        )
+        self.assertTrue(current["matches"])
+        self.assertTrue(current["schema_contract_matches"])
+
+        stale_schema = json.loads(json.dumps(runtime_schema))
+        del stale_schema["properties"]["justification"]
+        del stale_schema["properties"]["acknowledge_context_exposure"]
+        stale = module.probe(
+            expected,
+            {"grabowski_secret_reveal": stale_schema},
+            runtime_tools,
+        )
+        self.assertFalse(stale["matches"])
+        self.assertFalse(stale["schema_contract_matches"])
+        self.assertEqual(
+            stale["schema_mismatches"][0]["tool"],
+            "grabowski_secret_reveal",
+        )
+
+        names_only = module.probe(expected, {}, runtime_tools)
+        self.assertFalse(names_only["matches"])
+        self.assertEqual(
+            names_only["missing_schema_sentinels"],
+            ["grabowski_secret_reveal"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
