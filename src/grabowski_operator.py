@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -59,6 +60,27 @@ SENSITIVE_ENV_PARTS = (
 )
 PRIVILEGE_ESCALATORS = {"sudo", "su", "pkexec", "doas"}
 PROTECTED_BRANCHES = {"main", "master"}
+PRIVILEGED_REFERENCE_TTL_SECONDS = 900
+PRIVILEGED_REFERENCE_REPLAY_POLICY = "single-use-external-broker"
+OPERATOR_CAPABILITIES = (
+    "terminal_execute",
+    "durable_job",
+    "git_cli",
+    "github_cli",
+    "user_service_control",
+    "tmux_interaction",
+    "process_inspect",
+    "process_signal",
+    "port_inspect",
+    "privileged_reference",
+)
+PRIVILEGED_REFERENCE_ACTIONS = {
+    "install_system_package",
+    "edit_system_service",
+    "bind_privileged_port",
+    "change_file_owner",
+    "mount_filesystem",
+}
 
 REDACTIONS = (
     (
@@ -108,11 +130,98 @@ def _find_server() -> FastMCP:
 mcp = _find_server()
 
 
-def _redact(text: str) -> str:
+def _redact(text: str, extra_secrets: list[str] | None = None) -> str:
     result = text
     for pattern, replacement in REDACTIONS:
         result = pattern.sub(replacement, result)
+    for secret in sorted(set(extra_secrets or []), key=len, reverse=True):
+        if secret:
+            result = result.replace(secret, "<REDACTED>")
     return result
+
+
+def _argv_hash(argv: list[str]) -> str:
+    encoded = json.dumps(
+        argv,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _redact_argv(argv: list[str]) -> list[str]:
+    redacted: list[str] = []
+    hide_next = False
+    for item in argv:
+        if hide_next:
+            redacted.append("<REDACTED>")
+            hide_next = False
+            continue
+
+        key = item.split("=", 1)[0].lstrip("-").replace("-", "_").upper()
+        if any(part in key for part in SENSITIVE_ENV_PARTS):
+            if "=" in item:
+                redacted.append(f"{item.split('=', 1)[0]}=<REDACTED>")
+            else:
+                redacted.append(item)
+                hide_next = True
+            continue
+        redacted.append(_redact(item))
+    return redacted
+
+
+def _argv_secret_values(argv: list[str]) -> list[str]:
+    values: list[str] = []
+    hide_next = False
+    for item in argv:
+        if hide_next:
+            values.append(item)
+            hide_next = False
+            continue
+
+        key = item.split("=", 1)[0].lstrip("-").replace("-", "_").upper()
+        if not any(part in key for part in SENSITIVE_ENV_PARTS):
+            continue
+        if "=" in item:
+            values.append(item.split("=", 1)[1])
+        else:
+            hide_next = True
+    return values
+
+
+def _redacted_command(argv: list[str]) -> str:
+    return shlex.join(_redact_argv(argv))
+
+
+def _operator_capabilities() -> set[str]:
+    policy = base._load_policy()
+    forbidden = set(policy.get("forbidden_capabilities", []))
+    profiles = policy.get("profiles")
+    if isinstance(profiles, dict):
+        profile = base._active_profile(policy)
+        raw = profile.get("capabilities", [])
+        capabilities = {item for item in raw if isinstance(item, str)}
+    else:
+        capabilities = set(OPERATOR_CAPABILITIES)
+    return {
+        capability
+        for capability in capabilities
+        if capability in OPERATOR_CAPABILITIES and capability not in forbidden
+    }
+
+
+def _require_operator_capability(capability: str) -> None:
+    if capability not in _operator_capabilities():
+        raise PermissionError(f"Operator capability is not enabled: {capability}")
+
+
+def _require_operator_mutation(capability: str) -> None:
+    _require_operator_capability(capability)
+    state = base._kill_switch_state()
+    if state["engaged"]:
+        raise PermissionError(
+            "Grabowski operator kill switch is engaged; mutating tools are disabled."
+        )
 
 
 def _limit(text: str, limit: int) -> tuple[str, bool]:
@@ -146,7 +255,42 @@ def _resolve_cwd(cwd: str | None) -> Path:
     return resolved
 
 
-def _validate_argv(argv: list[str]) -> list[str]:
+def _path_inside(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _path_like_argument(value: str) -> bool:
+    if "://" in value:
+        return False
+    return value.startswith(("/", ".", "~")) or "/" in value
+
+
+def _argument_path_candidates(value: str) -> list[str]:
+    candidates = [value]
+    if "=" in value:
+        candidates.append(value.split("=", 1)[1])
+    return candidates
+
+
+def _argument_targets_evidence(value: str, cwd: Path) -> bool:
+    if str(EVIDENCE_ROOT) in value:
+        return True
+    for candidate in _argument_path_candidates(value):
+        if not _path_like_argument(candidate):
+            continue
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = cwd / path
+        try:
+            resolved = path.resolve(strict=False)
+        except OSError:
+            resolved = path.absolute()
+        if _path_inside(resolved, EVIDENCE_ROOT):
+            return True
+    return False
+
+
+def _validate_argv(argv: list[str], *, cwd: Path | None = None) -> list[str]:
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise ValueError("argv must be a non-empty list of non-empty strings")
 
@@ -157,9 +301,9 @@ def _validate_argv(argv: list[str]) -> list[str]:
             f"{executable}"
         )
 
-    evidence = str(EVIDENCE_ROOT)
+    working_directory = HOME if cwd is None else cwd
     for item in argv:
-        if evidence in item:
+        if _argument_targets_evidence(item, working_directory):
             raise PermissionError(
                 "Direct command arguments may not target immutable evidence."
             )
@@ -230,18 +374,22 @@ def _run(
         stdout_raw, stderr_raw = _terminate_process_group(process)
         returncode = process.returncode
 
+    argv_secrets = _argv_secret_values(argv)
     stdout = _redact(
-        stdout_raw.decode("utf-8", errors="replace")
+        stdout_raw.decode("utf-8", errors="replace"),
+        argv_secrets,
     )
     stderr = _redact(
-        stderr_raw.decode("utf-8", errors="replace")
+        stderr_raw.decode("utf-8", errors="replace"),
+        argv_secrets,
     )
     stdout, stdout_truncated = _limit(stdout, max_output_bytes)
     stderr, stderr_truncated = _limit(stderr, max_output_bytes)
 
     return {
-        "argv": argv,
-        "command": shlex.join(argv),
+        "argv": _redact_argv(argv),
+        "argv_sha256": _argv_hash(argv),
+        "command": _redacted_command(argv),
         "cwd": str(cwd),
         "returncode": returncode,
         "timed_out": timed_out,
@@ -359,6 +507,33 @@ def _git_branch(repo: Path) -> str:
     return completed.stdout.strip()
 
 
+def _force_push_requested(arguments: list[str]) -> bool:
+    return any(
+        item in {"-f", "--force", "--force-with-lease"}
+        or item.startswith("--force=")
+        or item.startswith("--force-with-lease=")
+        or item.startswith("+")
+        for item in arguments[1:]
+    )
+
+
+def _normal_branch_name(ref: str) -> str:
+    value = ref.removeprefix("+")
+    if ":" in value:
+        value = value.rsplit(":", 1)[1]
+    value = value.removeprefix("refs/heads/")
+    return value
+
+
+def _push_mentions_protected_branch(arguments: list[str]) -> bool:
+    for item in arguments[1:]:
+        if not item or item.startswith("-"):
+            continue
+        if _normal_branch_name(item) in PROTECTED_BRANCHES:
+            return True
+    return False
+
+
 def _guard_git(arguments: list[str], repo: Path) -> None:
     if not arguments:
         raise ValueError("Git arguments must not be empty")
@@ -366,13 +541,11 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
     if arguments[0] != "push":
         return
 
-    force = any(
-        item in {"-f", "--force", "--force-with-lease"}
-        or item.startswith("--force=")
-        or item.startswith("--force-with-lease=")
-        for item in arguments[1:]
-    )
-    if force and _git_branch(repo) in PROTECTED_BRANCHES:
+    force = _force_push_requested(arguments)
+    if force and (
+        _git_branch(repo) in PROTECTED_BRANCHES
+        or _push_mentions_protected_branch(arguments)
+    ):
         raise PermissionError(
             "Force-push to a protected main branch is blocked."
         )
@@ -386,9 +559,11 @@ def grabowski_terminal_run(
     max_output_bytes: int = DEFAULT_OUTPUT_BYTES,
 ) -> dict[str, Any]:
     """Run one non-interactive command and return redacted output."""
+    _require_operator_mutation("terminal_execute")
+    working_directory = _resolve_cwd(cwd)
     return _run(
-        _validate_argv(argv),
-        cwd=_resolve_cwd(cwd),
+        _validate_argv(argv, cwd=working_directory),
+        cwd=working_directory,
         timeout_seconds=_timeout(timeout_seconds),
         max_output_bytes=_output_limit(max_output_bytes),
     )
@@ -401,8 +576,9 @@ def grabowski_job_start(
     runtime_seconds: int = DEFAULT_JOB_RUNTIME,
 ) -> dict[str, Any]:
     """Start a durable background command as a transient user systemd unit."""
-    command = _validate_argv(argv)
+    _require_operator_mutation("durable_job")
     working_directory = _resolve_cwd(cwd)
+    command = _validate_argv(argv, cwd=working_directory)
     runtime = _job_runtime(runtime_seconds)
     unit = JOB_PREFIX + uuid.uuid4().hex[:12]
     directory = _job_directory(unit, create=True)
@@ -419,8 +595,9 @@ def grabowski_job_start(
     metadata = {
         "schema_version": 1,
         "unit": unit,
-        "argv": command,
-        "command": shlex.join(command),
+        "argv": _redact_argv(command),
+        "argv_sha256": _argv_hash(command),
+        "command": _redacted_command(command),
         "cwd": str(working_directory),
         "runtime_seconds": runtime,
         "created_at_unix": int(time.time()),
@@ -462,6 +639,7 @@ def grabowski_job_start(
 @mcp.tool(name="grabowski_job_status", annotations=READ_ONLY)
 def grabowski_job_status(unit: str) -> dict[str, Any]:
     """Return durable metadata and current systemd status for one job."""
+    _require_operator_capability("durable_job")
     name = _validate_unit(unit, job_only=True)
     metadata = _read_job_metadata(name)
     result = _run(
@@ -503,6 +681,7 @@ def grabowski_job_logs(
     max_lines: int = 200,
 ) -> dict[str, Any]:
     """Read persistent stdout and stderr for one Grabowski job."""
+    _require_operator_capability("durable_job")
     name = _validate_unit(unit, job_only=True)
     if max_lines < 1 or max_lines > 2000:
         raise ValueError("max_lines must be between 1 and 2000")
@@ -526,6 +705,7 @@ def grabowski_job_logs(
 @mcp.tool(name="grabowski_job_cancel", annotations=MUTATING)
 def grabowski_job_cancel(unit: str) -> dict[str, Any]:
     """Stop one Grabowski background job."""
+    _require_operator_mutation("durable_job")
     name = _validate_unit(unit, job_only=True)
     return _run(
         ["systemctl", "--user", "stop", name],
@@ -542,14 +722,16 @@ def grabowski_git(
     timeout_seconds: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     """Run Git in one repository with protected-main force-push guard."""
+    _require_operator_mutation("git_cli")
     path = Path(repo).expanduser().resolve(strict=True)
     if not path.is_dir():
         raise ValueError(f"Repository path is not a directory: {path}")
     if path == EVIDENCE_ROOT or EVIDENCE_ROOT in path.parents:
         raise PermissionError("Git mutation of immutable evidence is blocked.")
     _guard_git(arguments, path)
+    command = _validate_argv(["git", "-C", str(path), *arguments], cwd=path)
     return _run(
-        ["git", "-C", str(path), *arguments],
+        command,
         cwd=path,
         timeout_seconds=_timeout(timeout_seconds),
         max_output_bytes=MAX_OUTPUT_BYTES,
@@ -563,11 +745,14 @@ def grabowski_github(
     timeout_seconds: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     """Run GitHub CLI with redacted output."""
+    _require_operator_mutation("github_cli")
     if not arguments:
         raise ValueError("GitHub CLI arguments must not be empty")
+    working_directory = _resolve_cwd(cwd)
+    command = _validate_argv(["gh", *arguments], cwd=working_directory)
     return _run(
-        ["gh", *arguments],
-        cwd=_resolve_cwd(cwd),
+        command,
+        cwd=working_directory,
         timeout_seconds=_timeout(timeout_seconds),
         max_output_bytes=MAX_OUTPUT_BYTES,
     )
@@ -580,6 +765,7 @@ def grabowski_user_service(
     max_lines: int = 200,
 ) -> dict[str, Any]:
     """Inspect or control one user-level systemd service."""
+    _require_operator_capability("user_service_control")
     name = _validate_unit(unit)
     allowed = {
         "status",
@@ -592,6 +778,8 @@ def grabowski_user_service(
     }
     if action not in allowed:
         raise ValueError(f"action must be one of {sorted(allowed)}")
+    if action not in {"status", "logs"}:
+        _require_operator_mutation("user_service_control")
 
     if action == "logs":
         if max_lines < 1 or max_lines > 2000:
@@ -628,6 +816,7 @@ def grabowski_user_service(
 @mcp.tool(name="grabowski_tmux_list", annotations=READ_ONLY)
 def grabowski_tmux_list() -> dict[str, Any]:
     """List tmux sessions visible to the current user."""
+    _require_operator_capability("tmux_interaction")
     return _run(
         [
             "tmux",
@@ -648,6 +837,7 @@ def grabowski_tmux_capture(
     start_line: int = -300,
 ) -> dict[str, Any]:
     """Capture text from one tmux pane."""
+    _require_operator_capability("tmux_interaction")
     if not target or len(target) > 200:
         raise ValueError("Invalid tmux target")
     if start_line > 0 or start_line < -10000:
@@ -675,6 +865,7 @@ def grabowski_tmux_send(
     press_enter: bool = True,
 ) -> dict[str, Any]:
     """Send literal text to one tmux pane, optionally followed by Enter."""
+    _require_operator_mutation("tmux_interaction")
     if not target or len(target) > 200:
         raise ValueError("Invalid tmux target")
     if len(text.encode("utf-8")) > 100_000:
@@ -707,6 +898,7 @@ def grabowski_tmux_send(
 @mcp.tool(name="grabowski_process_list", annotations=READ_ONLY)
 def grabowski_process_list(pattern: str | None = None) -> dict[str, Any]:
     """List current-user processes, optionally filtered by a regex."""
+    _require_operator_capability("process_inspect")
     result = _run(
         [
             "ps",
@@ -732,6 +924,7 @@ def grabowski_process_signal(
     signal_name: str = "TERM",
 ) -> dict[str, Any]:
     """Send TERM, INT, HUP or KILL to one process owned by the current user."""
+    _require_operator_mutation("process_signal")
     allowed = {
         "TERM": signal.SIGTERM,
         "INT": signal.SIGINT,
@@ -771,12 +964,61 @@ def grabowski_process_signal(
 @mcp.tool(name="grabowski_ports", annotations=READ_ONLY)
 def grabowski_ports() -> dict[str, Any]:
     """List listening TCP and UDP sockets."""
+    _require_operator_capability("port_inspect")
     return _run(
         ["ss", "-lntup"],
         cwd=HOME,
         timeout_seconds=30,
         max_output_bytes=MAX_OUTPUT_BYTES,
     )
+
+
+@mcp.tool(name="grabowski_privileged_action_reference", annotations=READ_ONLY)
+def grabowski_privileged_action_reference(
+    action: str,
+    target: str,
+    justification: str,
+) -> dict[str, Any]:
+    """Create a strict reference for a future privileged action without executing it."""
+    _require_operator_capability("privileged_reference")
+    if action not in PRIVILEGED_REFERENCE_ACTIONS:
+        raise ValueError(
+            f"action must be one of {sorted(PRIVILEGED_REFERENCE_ACTIONS)}"
+        )
+    for label, value in {
+        "target": target,
+        "justification": justification,
+    }.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} must be a non-empty string")
+        if len(value.encode("utf-8")) > 1000 or "\x00" in value:
+            raise ValueError(f"{label} is too large or contains NUL")
+        if _redact(value) != value:
+            raise ValueError(f"{label} appears to contain secret material")
+
+    created_at = int(time.time())
+    payload = {
+        "schema_version": 1,
+        "execution": "unprivileged-reference-only",
+        "may_execute": False,
+        "requires_external_privileged_agent": True,
+        "replay_policy": PRIVILEGED_REFERENCE_REPLAY_POLICY,
+        "action": action,
+        "target": target,
+        "justification": justification,
+        "request_id": uuid.uuid4().hex,
+        "created_at_unix": created_at,
+        "expires_at_unix": created_at + PRIVILEGED_REFERENCE_TTL_SECONDS,
+    }
+    payload["reference_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return payload
 
 
 def _parse_args() -> argparse.Namespace:

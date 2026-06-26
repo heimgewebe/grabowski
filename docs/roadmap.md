@@ -2,6 +2,8 @@
 
 ## GRABOWSKI-POWER-001
 
+Status: v2 foundation implemented in repository; broader patch/search remains follow-up.
+
 - vollständige Dateioperationen,
 - Suche,
 - Patch Engine,
@@ -11,11 +13,25 @@
 
 ## GRABOWSKI-SHELL-001
 
+Status: v2 foundation implemented in repository.
+
 - allgemeiner Command Runner,
 - Hintergrundjobs,
 - Timeouts,
 - Logs,
 - Prozesssteuerung.
+
+## GRABOWSKI-OPERATOR-V2
+
+Status: foundation implemented in repository; live cutover remains explicit.
+
+- Access-Profile und Capabilities,
+- Home-weites Operator-Beispiel ohne Live-Mutation,
+- secret-safe argv-/Output-Redaction,
+- Quarantäne und Rollback-Belege für Text-Ersetzungen,
+- Kill-Switch für Mutationen,
+- tamper-evidente Audit-Verifikation,
+- unprivilegierter Referenzvertrag für spätere privilegierte Aktionen.
 
 ## GRABOWSKI-GIT-001
 

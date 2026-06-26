@@ -40,9 +40,10 @@ Für diesen Branch beschreibt er den Basisserver:
 python -m grabowski_mcp
 ```
 
-Außerdem enthält er die erwartete Werkzeugliste. Das Deployment liest Entry-
-Point und Tool-Gate ausschließlich aus diesem Contract. Der Modulmodus ist der
-einzige Entry-Point-Modus in PR #8.
+Außerdem enthält er die erwartete Werkzeugliste, inklusive
+`grabowski_rollback_text` und `grabowski_verify_audit`. Das Deployment liest
+Entry-Point und Tool-Gate ausschließlich aus diesem Contract. Der Modulmodus
+bleibt der einzige Entry-Point-Modus.
 
 Auf dem aktuellen Host startet das Live-Profil noch:
 
@@ -50,10 +51,9 @@ Auf dem aktuellen Host startet das Live-Profil noch:
 python -m grabowski_operator
 ```
 
-Ein produktives `--apply` aus PR #8 muss deshalb vor jeder Dienst- oder
-Runtime-Mutation fail-closed abbrechen. Die Operator-Runtime wird erst nach dem
-Merge von PR #8 und einem Rebase/Härtung des gestapelten Operator-Slices
-migriert.
+Ein produktives `--apply` muss deshalb vor jeder Dienst- oder Runtime-Mutation
+fail-closed abbrechen, solange Live-Profil und Runtimevertrag nicht exakt
+zusammenpassen. Dieses Repository ändert keine Live-Profile oder Services.
 
 ## Prüfung ohne Runtime-Mutation
 
@@ -229,6 +229,27 @@ Das Werkzeug:
 
 Retention alter Releases und ein separates Deployment-Eventlog bleiben eigene
 Folgetasks.
+
+## Operator-v2-Metadaten
+
+Der Access-Policy-Contract unterstützt optionale Profile und Capabilities, ohne
+das v1-Top-Level-Format zu entfernen. Typed Secret-/Browser-Roots sind ein
+v2-Policy-Feldsatz (`secret_roots`, `browser_profile_roots`,
+`secret_export_roots`) und werden nicht in die Live-Policy geschrieben. Das
+Standardbeispiel bleibt `bounded-read-write`; das Home-weite Operatorprofil
+liegt separat als Repository-Beispiel vor und ist keine Live-Konfiguration.
+
+Der Runtime-Entrypoint deklariert die dedizierten sensitiven Tools
+`grabowski_secret_inspect`, `grabowski_secret_reveal`,
+`grabowski_secret_use`, `grabowski_secret_export` und
+`grabowski_browser_profile_read`, damit Deployment-Metadaten nicht auf einer
+schwächeren Toolliste attestieren.
+
+Der Kill-Switch ist eine Runtime-Bremse für mutierende Tools und benötigt keine
+Deployment-Mutation. Ein vorhandener
+`~/.local/state/grabowski/operator-kill-switch` oder
+`GRABOWSKI_OPERATOR_KILL_SWITCH=1` reicht, damit Mutationen fail-closed
+abbrechen.
 
 ## Verbleibende Grenze
 

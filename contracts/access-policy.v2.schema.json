@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://heimgewebe.local/contracts/grabowski/access-policy.v1.schema.json",
-  "title": "Grabowski Access Policy v1",
+  "$id": "https://heimgewebe.local/contracts/grabowski/access-policy.v2.schema.json",
+  "title": "Grabowski Access Policy v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -10,16 +10,21 @@
     "read_roots",
     "write_roots",
     "write_excluded_roots",
+    "secret_roots",
+    "browser_profile_roots",
+    "secret_export_roots",
     "max_read_bytes",
     "max_write_bytes",
     "max_list_entries",
+    "max_secret_use_output_bytes",
+    "max_secret_use_seconds",
     "forbid_symlinks",
     "forbidden_components",
     "forbidden_file_patterns",
     "forbidden_capabilities"
   ],
   "properties": {
-    "version": {"const": 1},
+    "version": {"const": 2},
     "mode": {"type": "string", "minLength": 1},
     "active_profile": {"type": "string", "minLength": 1},
     "read_roots": {
@@ -37,9 +42,26 @@
       "items": {"type": "string", "minLength": 1},
       "uniqueItems": true
     },
+    "secret_roots": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "browser_profile_roots": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "secret_export_roots": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
     "max_read_bytes": {"type": "integer", "minimum": 1},
     "max_write_bytes": {"type": "integer", "minimum": 1},
     "max_list_entries": {"type": "integer", "minimum": 1},
+    "max_secret_use_output_bytes": {"type": "integer", "minimum": 1},
+    "max_secret_use_seconds": {"type": "integer", "minimum": 1},
     "forbid_symlinks": {"type": "boolean"},
     "forbidden_components": {
       "type": "array",
@@ -53,7 +75,7 @@
     },
     "forbidden_capabilities": {
       "type": "array",
-      "items": {"type": "string"},
+      "items": {"type": "string", "enum": ["file_read", "file_write", "audit_verify", "rollback_text", "bundle_registry", "secret_inspect", "secret_reveal", "secret_use", "secret_export", "browser_profile_read", "terminal_execute", "durable_job", "git_cli", "github_cli", "user_service_control", "tmux_interaction", "process_inspect", "process_signal", "port_inspect", "privileged_reference", "file_delete", "file_move", "chmod", "chown", "secret_read"]},
       "uniqueItems": true
     },
     "capability_definitions": {
@@ -71,6 +93,9 @@
           "read_roots",
           "write_roots",
           "write_excluded_roots",
+          "secret_roots",
+          "browser_profile_roots",
+          "secret_export_roots",
           "capabilities"
         ],
         "properties": {
@@ -90,12 +115,29 @@
             "items": {"type": "string", "minLength": 1},
             "uniqueItems": true
           },
+          "secret_roots": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "uniqueItems": true
+          },
+          "browser_profile_roots": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "uniqueItems": true
+          },
+          "secret_export_roots": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "uniqueItems": true
+          },
           "max_read_bytes": {"type": "integer", "minimum": 1},
           "max_write_bytes": {"type": "integer", "minimum": 1},
           "max_list_entries": {"type": "integer", "minimum": 1},
+          "max_secret_use_output_bytes": {"type": "integer", "minimum": 1},
+          "max_secret_use_seconds": {"type": "integer", "minimum": 1},
           "capabilities": {
             "type": "array",
-            "items": {"type": "string", "minLength": 1},
+            "items": {"type": "string", "enum": ["file_read", "file_write", "audit_verify", "rollback_text", "bundle_registry", "secret_inspect", "secret_reveal", "secret_use", "secret_export", "browser_profile_read", "terminal_execute", "durable_job", "git_cli", "github_cli", "user_service_control", "tmux_interaction", "process_inspect", "process_signal", "port_inspect", "privileged_reference", "file_delete", "file_move", "chmod", "chown", "secret_read"]},
             "uniqueItems": true
           }
         }

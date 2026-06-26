@@ -8,3 +8,4 @@
 
 - Added reproducible repository-to-runtime deployment with isolated staging, MCP handshake, tool-list verification, health/readiness gates, source-hash verification, and automatic rollback.
 - Added the Grabowski operator entry point with command execution, background jobs, Git/GitHub, user-service, tmux, process, and port tools.
+- Added Operator v2 foundation contracts: explicit access profiles and capabilities, v2 typed secret/browser roots, dedicated `secret_inspect`/`secret_reveal`/`secret_use`/`secret_export`/`browser_profile_read` tools, home-wide operator example, kill switch, argv/output redaction, quarantined text rollback, tamper-evident audit verification, and unprivileged privileged-action references.

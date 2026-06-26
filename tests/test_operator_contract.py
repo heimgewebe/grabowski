@@ -1,11 +1,96 @@
 from pathlib import Path
 import ast
+import hashlib
+import importlib.util
 import json
+import sys
+import tempfile
+import types
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src" / "grabowski_operator.py"
+
+
+class _FakeFastMCP:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def tool(self, *args, **kwargs):
+        return lambda function: function
+
+
+class _FakeToolAnnotations:
+    def __init__(self, **kwargs):
+        self.values = kwargs
+
+
+def _load_operator_module():
+    fake_mcp = types.ModuleType("mcp")
+    fake_server = types.ModuleType("mcp.server")
+    fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+    fake_types = types.ModuleType("mcp.types")
+    fake_base = types.ModuleType("grabowski_mcp")
+    fake_fastmcp.FastMCP = _FakeFastMCP
+    fake_types.ToolAnnotations = _FakeToolAnnotations
+    fake_base.mcp = _FakeFastMCP()
+
+    def load_policy():
+        return {
+            "active_profile": "operator",
+            "forbidden_capabilities": [],
+            "profiles": {
+                "operator": {
+                    "capabilities": [
+                        "terminal_execute",
+                        "durable_job",
+                        "git_cli",
+                        "github_cli",
+                        "user_service_control",
+                        "tmux_interaction",
+                        "process_inspect",
+                        "process_signal",
+                        "port_inspect",
+                        "privileged_reference",
+                    ],
+                },
+            },
+        }
+
+    def active_profile(policy):
+        return {
+            "name": "operator",
+            **policy["profiles"]["operator"],
+        }
+
+    fake_base._load_policy = load_policy
+    fake_base._active_profile = active_profile
+    fake_base._kill_switch_state = lambda: {"engaged": False}
+
+    module_name = "grabowski_operator_contract_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        SOURCE,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load grabowski_operator")
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(
+        sys.modules,
+        {
+            "mcp": fake_mcp,
+            "mcp.server": fake_server,
+            "mcp.server.fastmcp": fake_fastmcp,
+            "mcp.types": fake_types,
+            "grabowski_mcp": fake_base,
+            module_name: module,
+        },
+        clear=False,
+    ):
+        spec.loader.exec_module(module)
+    return module
 
 
 class OperatorContractTests(unittest.TestCase):
@@ -54,6 +139,7 @@ class OperatorContractTests(unittest.TestCase):
             "grabowski_process_list",
             "grabowski_process_signal",
             "grabowski_ports",
+            "grabowski_privileged_action_reference",
         }
         self.assertEqual(expected, declared)
 
@@ -115,6 +201,112 @@ class OperatorContractTests(unittest.TestCase):
         self.assertIn("--property=KillMode=control-group", source)
         self.assertIn("--property=StandardOutput=append:", source)
         self.assertIn("--property=StandardError=append:", source)
+
+    def test_secret_bearing_argv_is_redacted_in_results(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("def _redact_argv", source)
+        self.assertIn('"argv_sha256"', source)
+        self.assertIn("_redacted_command", source)
+
+    def test_operator_mutations_have_capability_and_kill_switch_gate(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("OPERATOR_CAPABILITIES", source)
+        self.assertIn("def _require_operator_mutation", source)
+        self.assertIn("base._kill_switch_state()", source)
+
+    def test_privileged_action_tool_is_reference_only(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("PRIVILEGED_REFERENCE_ACTIONS", source)
+        self.assertIn('"unprivileged-reference-only"', source)
+        self.assertIn('"may_execute": False', source)
+        self.assertIn('"requires_external_privileged_agent": True', source)
+        self.assertIn('"expires_at_unix"', source)
+        self.assertIn('"replay_policy"', source)
+
+    def test_secret_argv_values_are_redacted_from_command_output(self) -> None:
+        operator = _load_operator_module()
+        secret = "plain-secret-value-12345"
+        script = (
+            "import sys; "
+            "print(sys.argv[2]); "
+            "print(sys.argv[2], file=sys.stderr)"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = operator._run(
+                [sys.executable, "-c", script, "--token", secret],
+                cwd=Path(directory),
+                timeout_seconds=30,
+                max_output_bytes=10000,
+            )
+        self.assertEqual(result["returncode"], 0)
+        self.assertNotIn(secret, result["argv"])
+        self.assertNotIn(secret, result["command"])
+        self.assertNotIn(secret, result["stdout"])
+        self.assertNotIn(secret, result["stderr"])
+        self.assertIn("<REDACTED>", result["stdout"])
+        self.assertIn("<REDACTED>", result["stderr"])
+
+    def test_relative_command_arguments_may_not_target_merges(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / "repos" / "merges"
+            evidence.mkdir(parents=True)
+            with patch.object(operator, "EVIDENCE_ROOT", evidence):
+                with self.assertRaisesRegex(PermissionError, "immutable evidence"):
+                    operator._validate_argv(
+                        ["touch", "repos/merges/proof.txt"],
+                        cwd=root,
+                    )
+                with self.assertRaisesRegex(PermissionError, "immutable evidence"):
+                    operator._validate_argv(
+                        ["tool", "--output=repos/merges/proof.txt"],
+                        cwd=root,
+                    )
+
+    def test_force_push_to_explicit_protected_destination_is_blocked(self) -> None:
+        operator = _load_operator_module()
+        with patch.object(operator, "_git_branch", return_value="feature"):
+            with self.assertRaisesRegex(PermissionError, "protected main branch"):
+                operator._guard_git(
+                    ["push", "--force", "origin", "HEAD:main"],
+                    Path("/repo"),
+                )
+            with self.assertRaisesRegex(PermissionError, "protected main branch"):
+                operator._guard_git(
+                    ["push", "origin", "+refs/heads/master:refs/heads/master"],
+                    Path("/repo"),
+                )
+
+    def test_privileged_reference_has_expiry_replay_policy_and_bound_hash(self) -> None:
+        operator = _load_operator_module()
+        with (
+            patch.object(operator, "_require_operator_capability", return_value=None),
+            patch.object(operator.time, "time", return_value=1_700_000_000),
+        ):
+            payload = operator.grabowski_privileged_action_reference(
+                "edit_system_service",
+                "grabowski-watchdog.service",
+                "document external approval request",
+            )
+
+        self.assertEqual(payload["created_at_unix"], 1_700_000_000)
+        self.assertEqual(payload["expires_at_unix"], 1_700_000_900)
+        self.assertEqual(payload["replay_policy"], "single-use-external-broker")
+        material = {
+            key: value
+            for key, value in payload.items()
+            if key != "reference_sha256"
+        }
+        expected = hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(payload["reference_sha256"], expected)
 
 
 if __name__ == "__main__":

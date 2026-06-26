@@ -38,7 +38,11 @@ Force-Pushes auf `main` und `master` bleiben gesperrt.
 
 - keine Privilegieneskalation über `sudo`, `su`, `pkexec` oder `doas`,
 - redigierte bekannte Secrets in Tool-Ausgaben,
-- keine direkte Ausführung innerhalb von `~/repos/merges`,
+- redigierte argv-, Command- und sensible argv-Werte in Ergebnis-,
+  Job-Metadaten und Prozessausgaben,
+- Mutationsstopp bei aktivem Operator-Kill-Switch,
+- keine direkte Ausführung innerhalb von `~/repos/merges` und keine
+  direkten absoluten oder relativen Command-Argumente in diese Evidence-Zone,
 - kein Force-Push auf geschützte Hauptbranches,
 - Zeit- und Ausgabelimits,
 - keine interaktive Passwortabfrage.
@@ -46,3 +50,17 @@ Force-Pushes auf `main` und `master` bleiben gesperrt.
 Ein allgemeiner Command Runner hat naturgemäß eine große Reichweite. Die
 Schutzmaßnahmen reduzieren Fehlbedienung, ersetzen aber keine vollständige
 Betriebssystem-Sandbox.
+
+`grabowski_secret_use` ist kein allgemeiner Shell-Runner. Das Tool akzeptiert
+nur argv-Listen, blockt Shell-Strings und `sh -c`/`bash -c`, ersetzt den
+Literal-Platzhalter `{SECRET_FD_PATH}` durch einen FD-Pfad oder restriktiven
+Tempfile-Fallback und gibt nur redigierte, bounded stdout/stderr zurück.
+
+## Privileged References
+
+`grabowski_privileged_action_reference` ist absichtlich kein
+Privilegienmechanismus. Das Tool erzeugt nur ein schema-valides
+`unprivileged-reference-only` Objekt für eine spätere externe Komponente und
+lehnt secret-artige Ziel- oder Begründungstexte ab. Referenzen enthalten eine
+kurze Ablaufzeit und deklarieren eine Single-Use-Replay-Policy für den späteren
+externen Broker.

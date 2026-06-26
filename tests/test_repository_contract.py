@@ -19,8 +19,15 @@ class RepositoryContractTests(unittest.TestCase):
             "grabowski_list_directory",
             "grabowski_stat",
             "grabowski_read_text",
+            "grabowski_secret_inspect",
+            "grabowski_secret_reveal",
+            "grabowski_secret_use",
+            "grabowski_secret_export",
+            "grabowski_browser_profile_read",
             "grabowski_create_text",
             "grabowski_replace_text",
+            "grabowski_rollback_text",
+            "grabowski_verify_audit",
             "latest_complete_bundles",
         }
         for tool_name in expected:
@@ -33,6 +40,13 @@ class RepositoryContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("DEPLOYMENT_MANIFEST", source)
         self.assertIn('"deployment": _deployment_metadata()', source)
+        self.assertIn('"active_profile"', source)
+        self.assertIn('"capabilities"', source)
+        self.assertIn('"kill_switch"', source)
+        self.assertIn('"audit"', source)
+        self.assertIn('"secret_roots"', source)
+        self.assertIn('"browser_profile_roots"', source)
+        self.assertIn('"secret_export_roots"', source)
         self.assertIn('"repo_head"', source)
         self.assertIn('"runtime_lock_sha256"', source)
         self.assertIn('"manifest_schema_valid"', source)
@@ -62,8 +76,15 @@ class RepositoryContractTests(unittest.TestCase):
                 "grabowski_list_directory",
                 "grabowski_stat",
                 "grabowski_read_text",
+                "grabowski_secret_inspect",
+                "grabowski_secret_reveal",
+                "grabowski_secret_use",
+                "grabowski_secret_export",
+                "grabowski_browser_profile_read",
                 "grabowski_create_text",
                 "grabowski_replace_text",
+                "grabowski_rollback_text",
+                "grabowski_verify_audit",
                 "latest_complete_bundles",
             },
         )
@@ -103,6 +124,122 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn(
             "${HOME}/repos/merges",
             policy["write_excluded_roots"],
+        )
+        for profile in policy["profiles"].values():
+            self.assertIn(
+                "${HOME}/repos/merges",
+                profile["write_excluded_roots"],
+            )
+
+    def test_access_profiles_and_capabilities_are_explicit(self) -> None:
+        policy = json.loads(
+            (
+                ROOT / "config" / "access.example.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(policy["active_profile"], "bounded-read-write")
+        self.assertEqual(policy["version"], 2)
+        self.assertIn("bounded-read-write", policy["profiles"])
+        self.assertIn("home-wide-operator", policy["profiles"])
+        self.assertIn(
+            "terminal_execute",
+            policy["profiles"]["home-wide-operator"]["capabilities"],
+        )
+        for capability in (
+            "secret_inspect",
+            "secret_reveal",
+            "secret_use",
+            "secret_export",
+            "browser_profile_read",
+        ):
+            self.assertIn(
+                capability,
+                policy["profiles"]["home-wide-operator"]["capabilities"],
+            )
+            self.assertNotIn(
+                capability,
+                policy["profiles"]["bounded-read-write"]["capabilities"],
+            )
+        self.assertNotIn(
+            "terminal_execute",
+            policy["profiles"]["bounded-read-write"]["capabilities"],
+        )
+        target_secret_roots = {
+            "${HOME}/.ssh",
+            "${HOME}/.gnupg",
+            "${HOME}/.aws",
+            "${HOME}/.kube",
+            "${HOME}/.password-store",
+            "${HOME}/.local/share/keyrings",
+        }
+        target_browser_roots = {
+            "${HOME}/.mozilla/firefox",
+            "${HOME}/.config/BraveSoftware/Brave-Browser",
+            "${HOME}/.config/google-chrome",
+            "${HOME}/.config/chromium",
+        }
+        self.assertTrue(
+            target_secret_roots.issubset(
+                set(policy["profiles"]["home-wide-operator"]["secret_roots"])
+            )
+        )
+        self.assertTrue(
+            target_browser_roots.issubset(
+                set(policy["profiles"]["home-wide-operator"]["browser_profile_roots"])
+            )
+        )
+        self.assertTrue(
+            target_secret_roots.isdisjoint(
+                set(policy["profiles"]["home-wide-operator"]["write_excluded_roots"])
+            )
+        )
+        self.assertEqual(policy["forbidden_components"], [".git"])
+        self.assertNotIn("id_ed25519", policy["forbidden_file_patterns"])
+        self.assertNotIn("id_rsa", policy["forbidden_file_patterns"])
+
+    def test_home_wide_operator_example_is_not_live_metadata(self) -> None:
+        policy = json.loads(
+            (
+                ROOT / "config" / "access.home-wide-operator.example.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(policy["active_profile"], "home-wide-operator")
+        self.assertEqual(policy["version"], 2)
+        self.assertEqual(policy["read_roots"], ["${HOME}"])
+        self.assertIn("privileged_reference", policy["capability_definitions"])
+        self.assertIn("secret_use", policy["capability_definitions"])
+        self.assertIn("browser_profile_read", policy["capability_definitions"])
+        self.assertEqual(policy["forbidden_components"], [".git"])
+
+    def test_access_policy_schema_versions_are_separate(self) -> None:
+        v1 = json.loads(
+            (
+                ROOT / "contracts" / "access-policy.v1.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        v2 = json.loads(
+            (
+                ROOT / "contracts" / "access-policy.v2.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(v1["properties"]["version"]["const"], 1)
+        self.assertEqual(v2["properties"]["version"]["const"], 2)
+        self.assertNotIn("secret_roots", v1["properties"])
+        self.assertIn("secret_roots", v2["properties"])
+
+    def test_privileged_reference_contract_exists(self) -> None:
+        contract = json.loads(
+            (
+                ROOT / "contracts" / "privileged-action-reference.v1.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(contract["properties"]["execution"]["const"], "unprivileged-reference-only")
+        self.assertFalse(contract["properties"]["may_execute"]["const"])
+        self.assertTrue(contract["properties"]["requires_external_privileged_agent"]["const"])
+        self.assertIn("expires_at_unix", contract["required"])
+        self.assertEqual(
+            contract["properties"]["replay_policy"]["const"],
+            "single-use-external-broker",
         )
 
     def test_runtime_credentials_are_ignored(self) -> None:

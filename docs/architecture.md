@@ -26,12 +26,15 @@ MCP-Tools und deren Schemas.
 
 ### Policy Layer
 Explizite Lese-, Schreib- und Ausschlussregeln.
+Optionale Operator-v2-Profile bündeln Roots, Limits und Capabilities.
 
 ### Execution Layer
 Datei-, Prozess-, Git- und Serviceoperationen.
 
 ### Evidence Layer
 Hashes, Diffs, Logs, Operation-IDs und Rollbackdaten.
+Write-Audits sind hash-verkettet; Text-Ersetzungen bewahren eine quarantänierte
+Vorversion für streng geprüfte Rollbacks.
 
 ## Grundsatz
 
