@@ -51,6 +51,8 @@ Ein allgemeiner Command Runner hat naturgemäß eine große Reichweite. Die
 Schutzmaßnahmen reduzieren Fehlbedienung, ersetzen aber keine vollständige
 Betriebssystem-Sandbox.
 
+Rohe Offenlegung ist ein Break-Glass-Pfad. Standardmäßig wird ein Secret mit
+`grabowski_secret_use` verwendet, ohne es in den Chatkontext zu übertragen.
 `grabowski_secret_use` ist kein allgemeiner Shell-Runner. Das Tool akzeptiert
 nur argv-Listen, blockt Shell-Strings und `sh -c`/`bash -c`, ersetzt den
 Literal-Platzhalter `{SECRET_FD_PATH}` durch einen FD-Pfad oder restriktiven

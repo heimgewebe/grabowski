@@ -68,12 +68,12 @@
     },
     {
       "category": "secret",
-      "description": "Reveal one bounded secret text file after an exact SHA-256 precondition.",
+      "description": "Break-glass reveal after hash, justification and exposure acknowledgement.",
       "effects": [
         "secret-content-return"
       ],
       "id": "grabowski_secret_reveal",
-      "purpose": "Reveal bounded secret text only with an exact SHA-256 precondition.",
+      "purpose": "Break-glass reveal of bounded secret text with hash, justification and explicit context-exposure acknowledgement.",
       "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "high",
@@ -534,19 +534,19 @@
   "sources": {
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "b170fefdde1cbc6aa14f44bd1ad75c4b4bb7a2dbb15c0c37945f64ef8299dc46"
+      "sha256": "51c62c07c6dac4ac53e350fa2d0646369d7e0076aebd40a71bd91592b85e9a01"
     },
     "policy_example": {
       "path": "config/access.example.json",
-      "sha256": "ae19b6ab81b88826e75cd86daea5874c130162bd9b8d6dbfd755221e8fc42d2e"
+      "sha256": "0967f6f418a7b644372095b4ad3d074d6b388ef65326e76895ca09f62aab8369"
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
       "sha256": "556129d0a330d90b0bd46e10f0367b85e65fef8719a7f6b2408fe3fb6b7eb3f9"
     },
     "runtime_sources": {
-      "src/grabowski_capabilities.py": "b170fefdde1cbc6aa14f44bd1ad75c4b4bb7a2dbb15c0c37945f64ef8299dc46",
-      "src/grabowski_mcp.py": "d67a9319a5b695bf3e76829672ef7015b1df92b17ebdfdd53da37b2ced8e62e1",
+      "src/grabowski_capabilities.py": "51c62c07c6dac4ac53e350fa2d0646369d7e0076aebd40a71bd91592b85e9a01",
+      "src/grabowski_mcp.py": "365823a89c342ddc2e893e07ff1462fc4f076e33caacc852d38d3e11b1f9d7e4",
       "src/grabowski_operator.py": "9e77e41d36367d464f6c743815dbffa3491b383705a81cfef7337199669f7ab8",
       "src/grabowski_runtime.py": "23bae20314189b95dcf4d6aed6f7b5c1c2cd6e91cec18e0bef0b440585b9f1bf",
       "src/grabowski_runtime_extensions.py": "1c7e7d5f6a8149efbfb823cd8a8ce6ecc1424da5b10bdf7801abcc99f03cf0b7"

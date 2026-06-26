@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "actions": {
+    "edit_system_service": {
+      "enabled": false,
+      "target_pattern": "[A-Za-z0-9_.@:-]{1,200}",
+      "argv": ["/usr/bin/systemctl", "restart", "{target}"],
+      "timeout_seconds": 120
+    }
+  }
+}

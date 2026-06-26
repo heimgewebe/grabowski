@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "operations": {
+    "restart-user-service": {
+      "description": "Restart one user service and verify that it becomes active.",
+      "parameters": {
+        "unit": "[A-Za-z0-9_.@:-]{1,200}"
+      },
+      "steps": [
+        {"phase": "preflight", "target": "local", "argv": ["systemctl", "--user", "show", "${unit}", "--property=LoadState"]},
+        {"phase": "action", "target": "local", "argv": ["systemctl", "--user", "restart", "${unit}"]},
+        {"phase": "postflight", "target": "local", "argv": ["systemctl", "--user", "is-active", "${unit}"]},
+        {"phase": "rollback", "target": "local", "argv": ["systemctl", "--user", "restart", "${unit}"], "allow_failure": true}
+      ]
+    },
+    "probe-host": {
+      "description": "Run a bounded hostname probe on one registered host.",
+      "parameters": {
+        "host": "[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
+      },
+      "steps": [
+        {"phase": "action", "target": "${host}", "argv": ["hostname"]}
+      ]
+    }
+  }
+}

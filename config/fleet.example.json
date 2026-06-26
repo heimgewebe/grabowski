@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "hosts": {
+    "heim-pc": {
+      "transport": "local",
+      "target": "local",
+      "enabled": true,
+      "roles": ["workstation", "operator"],
+      "command_allowlist": ["*"]
+    },
+    "heimserver": {
+      "transport": "ssh",
+      "target": "heimserver",
+      "enabled": true,
+      "roles": ["server"],
+      "command_allowlist": ["*"],
+      "connect_timeout_seconds": 10
+    },
+    "heimberry": {
+      "transport": "ssh",
+      "target": "heimberry",
+      "enabled": true,
+      "roles": ["dns", "infrastructure"],
+      "command_allowlist": ["*"],
+      "connect_timeout_seconds": 10
+    }
+  }
+}

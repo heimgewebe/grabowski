@@ -2567,8 +2567,10 @@ def grabowski_secret_reveal(
     path: str,
     expected_sha256: str,
     max_bytes: int | None = None,
+    justification: str = "",
+    acknowledge_context_exposure: bool = False,
 ) -> dict[str, Any]:
-    """Reveal one bounded secret text file after an exact SHA-256 precondition."""
+    """Break-glass reveal after hash, justification and exposure acknowledgement."""
     _require_capability("secret_reveal")
     _require_valid_audit_chain()
     _validate_sha256(expected_sha256, "expected_sha256")
@@ -2578,6 +2580,15 @@ def grabowski_secret_reveal(
         expected_sha256=expected_sha256,
         max_bytes=max_bytes,
     )
+    if not acknowledge_context_exposure:
+        raise PermissionError("Secret reveal requires explicit context-exposure acknowledgement")
+    if not isinstance(justification, str) or not justification.strip():
+        raise ValueError("Secret reveal requires a non-empty justification")
+    if len(justification.encode("utf-8")) > 1000 or "\x00" in justification:
+        raise ValueError("Secret reveal justification is too large or contains NUL")
+    if _redact_sensitive_text(justification)[0] != justification:
+        raise ValueError("Secret reveal justification appears to contain secret material")
+    justification_sha256 = hashlib.sha256(justification.encode("utf-8")).hexdigest()
     transaction_id, transaction_dir = _new_transaction_dir("secret-reveal", target)
     active_profile = _active_profile(_load_policy())
     evidence = {
@@ -2589,6 +2600,8 @@ def grabowski_secret_reveal(
         "size": snapshot["size"],
         "profile": active_profile["name"],
         "capability": "secret_reveal",
+        "justification_sha256": justification_sha256,
+        "context_exposure_acknowledged": True,
         "postflight": {
             "sha256_precondition_valid": True,
             "race_checked": True,
@@ -2607,6 +2620,8 @@ def grabowski_secret_reveal(
         "backup": None,
         "profile": active_profile["name"],
         "capability": "secret_reveal",
+        "justification_sha256": justification_sha256,
+        "context_exposure_acknowledged": True,
         "postflight": evidence["postflight"],
         "quarantine": {"directory": str(transaction_dir), "preimage_path": None},
         "rollback": {

@@ -63,7 +63,7 @@
     "rollback_text": "Restore a quarantined preimage from an audited replace transaction.",
     "bundle_registry": "Read the curated Lens/repoLens latest-complete bundle registry.",
     "secret_inspect": "Inspect metadata and bounded directory listings under explicit secret roots without returning file content.",
-    "secret_reveal": "Reveal bounded raw secret text only through the dedicated reveal tool and only with a current SHA-256 precondition.",
+    "secret_reveal": "Break-glass reveal only with a current SHA-256, justification and explicit context-exposure acknowledgement; prefer secret_use.",
     "secret_use": "Run bounded argv-only commands with a secret supplied through an inherited file descriptor or restrictive temporary fallback.",
     "secret_export": "Atomically create a local 0600 copy inside configured secret export roots with a source hash precondition.",
     "browser_profile_read": "Read bounded browser profile metadata and text under explicit browser profile roots; binary databases are metadata-only.",
