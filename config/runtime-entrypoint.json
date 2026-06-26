@@ -2,15 +2,28 @@
   "schema_version": 2,
   "mode": "module",
   "module": "grabowski_operator",
-  "source": "src/grabowski_operator.py",
+  "source": "src/grabowski_runtime.py",
   "supporting_sources": [
+    {
+      "module": "grabowski_operator_core",
+      "source": "src/grabowski_operator.py"
+    },
     {
       "module": "grabowski_mcp",
       "source": "src/grabowski_mcp.py"
+    },
+    {
+      "module": "grabowski_capabilities",
+      "source": "src/grabowski_capabilities.py"
+    },
+    {
+      "module": "grabowski_runtime_extensions",
+      "source": "src/grabowski_runtime_extensions.py"
     }
   ],
   "expected_tools": [
     "grabowski_status",
+    "grabowski_context",
     "grabowski_list_directory",
     "grabowski_stat",
     "grabowski_read_text",
@@ -23,6 +36,7 @@
     "grabowski_job_logs",
     "grabowski_job_cancel",
     "grabowski_git",
+    "grabowski_git_branch",
     "grabowski_github",
     "grabowski_user_service",
     "grabowski_tmux_list",

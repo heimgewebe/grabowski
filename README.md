@@ -3,30 +3,34 @@
 Grabowski ist der lokale MCP-Operator für den Heim-PC.
 
 Er verbindet ChatGPT über einen OpenAI Secure MCP Tunnel mit lokalen Datei-,
-Repo-, Diagnose- und späteren Operationsfunktionen.
+Repo-, Diagnose- und Operationsfunktionen.
 
 ## Status
 
-Dieses Repository enthält den belegten Ausgangsstand der aktuell laufenden
-Grabowski-MCP-Runtime.
-
-Die produktive Runtime wird zunächst weiterhin aus folgendem Pfad gestartet:
+Dieses Repository enthält den reproduzierbaren Quell- und Deploymentvertrag
+der Grabowski-MCP-Runtime. Die produktive Runtime wird über einen atomaren
+Symlink aus folgendem Pfad gestartet:
 
 ```text
 ~/.local/share/grabowski-mcp/
 ```
 
-Das Repository ist noch nicht automatisch der Deployment-Pfad. Die Umstellung
-auf reproduzierbares Deployment erfolgt in einem eigenen, getesteten Slice.
+Ein Repository-Stand ist erst dann als live zu behandeln, wenn
+`grabowski_status` eine gültige Deployment-Provenienz für genau diesen Commit
+meldet.
 
 ## Aktuelle Fähigkeiten
 
 - begrenztes Lesen und Schreiben
 - Dateistatistik und Hashes
 - Verzeichnisauflistung
-- Textdateien erstellen und ersetzen
+- Textdateien erstellen und atomar ersetzen
+- nicht-interaktive Kommandos und dauerhafte Hintergrundjobs
+- Git, typisierte Branch-Operationen und GitHub CLI
+- User-Service-, tmux-, Prozess- und Portoperationen
 - Lenskit-/repoLens-Bundle-Registry lesen
 - read-only Repo-Proof-Bundles mit Branch-/Head-Gate, Hashes und Provenance
+- live erzeugter Operator-Kontext mit Runtime-/Checkout-Drift
 - `~/repos/merges` als unveränderbare Evidence-Zone
 
 ## Harte Invarianten
@@ -52,6 +56,22 @@ Die Referenzlisten sind bewusst nur Kandidaten und tragen keine
 Vollständigkeitsbehauptung. Details und Statussemantik stehen in
 [`docs/local-evidence.md`](docs/local-evidence.md).
 
+## Operator-Kontext
+
+[`GRABOWSKI.md`](GRABOWSKI.md) ist der stabile Einstieg. Der
+maschinenlesbare Fähigkeitskatalog und die generierte Repository-Sicht werden
+aus Runtime-Vertrag und tatsächlichen MCP-Deklarationen erzeugt:
+
+```bash
+make context-refresh
+make context-check
+```
+
+Die laufende Instanz liefert mit `grabowski_context` bei jedem Aufruf den
+aktuellen Runtime-, Policy- und Checkout-Zustand. `make validate` schlägt fehl,
+wenn der generierte Kontext veraltet ist oder Toolvertrag, Deklarationen und
+Risikoprofile auseinanderlaufen.
+
 ## Validierung
 
 ```bash
@@ -76,15 +96,14 @@ Produktive Runtime mit exception-sicherem Rollback aktualisieren:
 make deploy
 ```
 
-Auf dem aktuellen Host stoppt dieser Branch erwartungsgemäß vor jeder
-Runtime-Mutation, solange das Live-Profil `python -m grabowski_operator`
-verlangt und der PR-#8-Vertrag `python -m grabowski_mcp` liefert.
+Das Live-Modul bleibt `grabowski_operator`. Dessen neue kleine Wrapper-Quelle
+lädt den bisherigen Operator als `grabowski_operator_core` und anschließend die
+separat prüfbaren Kontext- und Branch-Erweiterungen. Tunnelprofil, Watchdog und
+Rollbackvertrag behalten dadurch denselben Entry-Point. Das Deployment prüft
+MCP-Handshake, erwartete Toolliste, Runtime-Identität, Source-Hashes,
+Lockfile, Plattform-Provenienz und Rollbackbedingungen.
 
 Details: [`docs/deployment.md`](docs/deployment.md).
-
-Die Runtime-Abhängigkeiten sind in `requirements/runtime.lock.txt` vollständig
-versioniert und gehasht. Das Deployment prüft außerdem den exklusiven Lock,
-die gestartete Prozessidentität und das Provenienzmanifest.
 
 ## Restart- und Watchdog-Härtung
 
@@ -97,15 +116,17 @@ Details: [`docs/restart-watchdog.md`](docs/restart-watchdog.md).
 
 ## Operator-Fähigkeiten
 
-Der Operator-Einstiegspunkt `grabowski_operator` ergänzt die kuratierten
-Dateiwerkzeuge um:
+Der Runtime-Einstiegspunkt `grabowski_operator` umfasst die kuratierten
+Dateiwerkzeuge und Erweiterungen für:
 
 - nicht-interaktive Kommandos,
 - systemd-basierte Hintergrundjobs,
 - Git und GitHub CLI,
+- typisierte lokale Branch-Erstellung und Branchwechsel,
 - User-Service-Steuerung,
 - tmux-Capture und tmux-Eingaben,
-- Prozess- und Portdiagnose.
+- Prozess- und Portdiagnose,
+- einen taskorientierten Live-Kontext.
 
 Direkter Zugriff auf beliebige grafische Terminalfenster ist nicht möglich.
 Bestehende tmux-Sitzungen können dagegen gezielt gelesen und bedient werden.

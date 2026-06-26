@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CONTRACT_PATH = ROOT / "config" / "runtime-entrypoint.json"
+POLICY_PATH = ROOT / "config" / "access.example.json"
+CAPABILITIES_PATH = ROOT / "src" / "grabowski_capabilities.py"
+CATALOG_PATH = ROOT / "contracts" / "capability-catalog.v1.json"
+CONTEXT_JSON_PATH = ROOT / "docs" / "generated" / "operator-context.v1.json"
+CONTEXT_MD_PATH = ROOT / "docs" / "generated" / "operator-context.md"
+READ_ANNOTATION_NAMES = {"READ_ANNOTATIONS", "READ_ONLY"}
+WRITE_ANNOTATION_NAMES = {"CREATE_ANNOTATIONS", "REPLACE_ANNOTATIONS", "MUTATING"}
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _load_capabilities_module() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "grabowski_capabilities_build",
+        CAPABILITIES_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Could not load capability definitions")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _tool_declaration(node: ast.AST) -> tuple[str, bool | None] | None:
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    for decorator in node.decorator_list:
+        if not isinstance(decorator, ast.Call):
+            continue
+        function = decorator.func
+        if not (
+            isinstance(function, ast.Attribute)
+            and function.attr == "tool"
+        ):
+            continue
+        tool_name: str | None = None
+        read_only: bool | None = None
+        for keyword in decorator.keywords:
+            if (
+                keyword.arg == "name"
+                and isinstance(keyword.value, ast.Constant)
+                and isinstance(keyword.value.value, str)
+            ):
+                tool_name = keyword.value.value
+            if keyword.arg == "annotations" and isinstance(keyword.value, ast.Name):
+                if keyword.value.id in READ_ANNOTATION_NAMES:
+                    read_only = True
+                elif keyword.value.id in WRITE_ANNOTATION_NAMES:
+                    read_only = False
+        if tool_name is not None:
+            return tool_name, read_only
+    return None
+
+
+def _source_records(contract: dict[str, Any]) -> list[dict[str, str]]:
+    records = [
+        {
+            "module": str(contract["module"]),
+            "source": str(contract["source"]),
+        }
+    ]
+    records.extend(contract.get("supporting_sources", []))
+    return records
+
+
+def _discover_tools(
+    contract: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    tools: dict[str, dict[str, Any]] = {}
+    source_hashes: dict[str, str] = {}
+    for record in _source_records(contract):
+        relative = str(record["source"])
+        source_path = ROOT / relative
+        source_hashes[relative] = _sha256(source_path)
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=relative)
+        for node in tree.body:
+            declaration = _tool_declaration(node)
+            if declaration is None:
+                continue
+            name, read_only = declaration
+            if name in tools:
+                raise ValueError(f"Duplicate MCP tool declaration: {name}")
+            assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            tools[name] = {
+                "tool": name,
+                "function": node.name,
+                "source": relative,
+                "description": ast.get_docstring(node) or "",
+                "read_only": read_only,
+            }
+    return tools, dict(sorted(source_hashes.items()))
+
+
+def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+    capabilities = _load_capabilities_module()
+    discovered, source_hashes = _discover_tools(contract)
+    expected_tools = list(contract["expected_tools"])
+    descriptions = {
+        name: record["description"]
+        for name, record in discovered.items()
+    }
+    read_only = {
+        name: record["read_only"]
+        for name, record in discovered.items()
+    }
+    records = capabilities.capability_records(
+        expected_tools,
+        descriptions=descriptions,
+        read_only=read_only,
+    )
+    classification = capabilities.classify_contract(expected_tools)
+    expected_set = set(expected_tools)
+    discovered_set = set(discovered)
+    integrity = {
+        **classification,
+        "missing_declarations": sorted(expected_set - discovered_set),
+        "undeclared_tools": sorted(discovered_set - expected_set),
+    }
+
+    catalog = {
+        "schema_version": capabilities.CATALOG_SCHEMA_VERSION,
+        "contract": "config/runtime-entrypoint.json",
+        "contract_sha256": _sha256(CONTRACT_PATH),
+        "capability_source": "src/grabowski_capabilities.py",
+        "capability_source_sha256": _sha256(CAPABILITIES_PATH),
+        "tools": records,
+        "integrity": integrity,
+    }
+    context = {
+        "schema_version": capabilities.CONTEXT_SCHEMA_VERSION,
+        "kind": "repository-operator-context",
+        "purpose": (
+            "Deterministic repository contract for the Grabowski operator. "
+            "Live state is returned by the grabowski_context MCP tool."
+        ),
+        "sources": {
+            "runtime_contract": {
+                "path": "config/runtime-entrypoint.json",
+                "sha256": _sha256(CONTRACT_PATH),
+            },
+            "policy_example": {
+                "path": "config/access.example.json",
+                "sha256": _sha256(POLICY_PATH),
+            },
+            "capability_definitions": {
+                "path": "src/grabowski_capabilities.py",
+                "sha256": _sha256(CAPABILITIES_PATH),
+            },
+            "runtime_sources": source_hashes,
+        },
+        "runtime_contract": {
+            "module": contract["module"],
+            "source": contract["source"],
+            "supporting_sources": contract.get("supporting_sources", []),
+            "expected_tools": expected_tools,
+        },
+        "policy_contract": {
+            "mode": policy.get("mode"),
+            "read_roots": policy.get("read_roots", []),
+            "write_roots": policy.get("write_roots", []),
+            "write_excluded_roots": policy.get("write_excluded_roots", []),
+            "forbidden_capabilities": policy.get("forbidden_capabilities", []),
+        },
+        "capabilities": records,
+        "integrity": integrity,
+    }
+
+    lines = [
+        "# Generated Grabowski Operator Context",
+        "",
+        "> Generated by `tools/build_operator_context.py`. Do not edit manually.",
+        "",
+        "This document describes the repository contract. Current runtime state must be read through `grabowski_context`.",
+        "",
+        "## Contract integrity",
+        "",
+    ]
+    finding_count = sum(len(value) for value in integrity.values())
+    if finding_count == 0:
+        lines.append("All expected tools are declared and classified; no orphan declarations or profiles exist.")
+    else:
+        for key, values in integrity.items():
+            lines.append(f"- `{key}`: {', '.join(values) if values else 'none'}")
+    lines.extend(
+        [
+            "",
+            "## Capabilities",
+            "",
+            "| Tool | Category | Read only | Risk | Purpose |",
+            "|---|---|---:|---|---|",
+        ]
+    )
+    for item in records:
+        read_label = "yes" if item["read_only"] is True else "no" if item["read_only"] is False else "unknown"
+        purpose = str(item["purpose"]).replace("|", "\\|")
+        lines.append(
+            f"| `{item['tool']}` | {item['category']} | {read_label} | {item['risk_class']} | {purpose} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Policy contract",
+            "",
+            f"- Mode: `{policy.get('mode', 'unknown')}`",
+            f"- Read roots: {', '.join(f'`{item}`' for item in policy.get('read_roots', []))}",
+            f"- Write roots: {', '.join(f'`{item}`' for item in policy.get('write_roots', []))}",
+            f"- Read-only exclusions: {', '.join(f'`{item}`' for item in policy.get('write_excluded_roots', []))}",
+            f"- Forbidden capabilities: {', '.join(f'`{item}`' for item in policy.get('forbidden_capabilities', []))}",
+            "",
+            "## Update contract",
+            "",
+            "`make context-refresh` regenerates this document and the JSON catalog. `make validate` fails when generated artifacts are stale or a tool is missing a declaration or capability profile.",
+            "",
+        ]
+    )
+    return catalog, context, "\n".join(lines)
+
+
+def _json_text(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def _expected_outputs() -> dict[Path, str]:
+    catalog, context, markdown = build_documents()
+    return {
+        CATALOG_PATH: _json_text(catalog),
+        CONTEXT_JSON_PATH: _json_text(context),
+        CONTEXT_MD_PATH: markdown,
+    }
+
+
+def _integrity_errors(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for key, values in payload["integrity"].items():
+        if values:
+            errors.append(f"{key}: {', '.join(values)}")
+    return errors
+
+
+def write_outputs() -> int:
+    outputs = _expected_outputs()
+    catalog = json.loads(outputs[CATALOG_PATH])
+    errors = _integrity_errors(catalog)
+    if errors:
+        print("Capability contract is incomplete:", file=sys.stderr)
+        for error in errors:
+            print(f"- {error}", file=sys.stderr)
+        return 1
+    for path, content in outputs.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        print(path.relative_to(ROOT))
+    return 0
+
+
+def check_outputs() -> int:
+    outputs = _expected_outputs()
+    catalog = json.loads(outputs[CATALOG_PATH])
+    errors = _integrity_errors(catalog)
+    stale: list[str] = []
+    for path, expected in outputs.items():
+        if not path.is_file() or path.read_text(encoding="utf-8") != expected:
+            stale.append(str(path.relative_to(ROOT)))
+    if errors or stale:
+        if errors:
+            print("Capability contract is incomplete:", file=sys.stderr)
+            for error in errors:
+                print(f"- {error}", file=sys.stderr)
+        if stale:
+            print(
+                "Generated operator context is stale; run make context-refresh:",
+                file=sys.stderr,
+            )
+            for path in stale:
+                print(f"- {path}", file=sys.stderr)
+        return 1
+    print("operator context: current")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--write", action="store_true")
+    mode.add_argument("--check", action="store_true")
+    arguments = parser.parse_args()
+    return write_outputs() if arguments.write else check_outputs()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
