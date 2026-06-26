@@ -78,6 +78,30 @@ class OperatorContractTests(unittest.TestCase):
         self.assertIn('HOME / "repos" / "merges"', source)
         self.assertIn("immutable evidence", source)
 
+    def test_synchronous_commands_have_bounded_runtime(self) -> None:
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+        assignments = {}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant):
+                assignments[target.id] = node.value.value
+        self.assertEqual(60, assignments.get("DEFAULT_TIMEOUT"))
+        self.assertEqual(120, assignments.get("MAX_TIMEOUT"))
+
+    def test_timeout_kills_the_full_process_group(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("start_new_session=True", source)
+        self.assertIn("os.killpg(process.pid, signal.SIGTERM)", source)
+        self.assertIn("os.killpg(process.pid, signal.SIGKILL)", source)
+
+    def test_http_transport_is_loopback_only(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn('choices=("stdio", "streamable-http")', source)
+        self.assertIn('args.host != "127.0.0.1"', source)
+        self.assertIn('mcp.run(transport=args.transport)', source)
+
 
 if __name__ == "__main__":
     unittest.main()
