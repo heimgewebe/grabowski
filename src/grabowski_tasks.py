@@ -12,6 +12,7 @@ from typing import Any
 
 import grabowski_fleet as fleet
 import grabowski_mcp as base
+import grabowski_recovery as recovery
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -112,6 +113,15 @@ def _database() -> sqlite3.Connection:
         connection.close()
         raise
     return connection
+
+
+def _require_recovery_gate() -> dict[str, Any]:
+    status = recovery.recovery_status()
+    if not status["ready_for_user_power_worker"]:
+        actions = status.get("required_actions", [])
+        detail = "; ".join(actions) if actions else "recovery evidence is incomplete"
+        raise PermissionError(f"Power-worker recovery gate is not ready: {detail}")
+    return status
 
 
 def _validate_task_id(task_id: str) -> str:
@@ -348,6 +358,7 @@ def grabowski_task_start(
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit."""
     operator._require_operator_mutation("durable_job")
+    recovery_gate = _require_recovery_gate()
     target = fleet.fleet_host(host)
     command = _validate_command(argv)
     working_directory = _validate_cwd(host, cwd)
@@ -410,6 +421,7 @@ def grabowski_task_start(
         "argv_sha256": record["argv_sha256"],
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
+        "recovery_checked_at_unix": recovery_gate["checked_at_unix"],
     }
     base._append_audit(audit)
     return {"task": _public(stored), "audit": audit}
@@ -489,6 +501,7 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     record = _row(task_id)
     if record["resume_policy"] in {"never", "manual"}:
         raise PermissionError("Task resume policy does not permit automatic retry")
+    recovery_gate = _require_recovery_gate()
     observation = _observe(record)
     if observation["state"] == "running":
         raise RuntimeError("Task is still running")
@@ -513,6 +526,7 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
         "attempt": attempt,
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
+        "recovery_checked_at_unix": recovery_gate["checked_at_unix"],
     }
     base._append_audit(audit)
     return {"task": _public(stored), "audit": audit}

@@ -89,7 +89,9 @@ class TaskTests(unittest.TestCase):
         selected = LOCAL_HOST if host == "local" else REMOTE_HOST
         with patch.object(tasks.fleet, "fleet_host", return_value=selected), patch.object(
             tasks, "_dispatch", return_value=_launcher()
-        ) as dispatch, patch.object(tasks.base, "_append_audit"):
+        ) as dispatch, patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+        ):
             result = tasks.grabowski_task_start(
                 host,
                 ["/bin/echo", "ok"],
@@ -149,6 +151,8 @@ class TaskTests(unittest.TestCase):
         missing["stderr"] = "unit not found"
         with patch.object(tasks, "_dispatch", side_effect=[missing, _launcher()]), patch.object(
             tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
         ):
             resumed = tasks.grabowski_task_resume(task_id)
         task = resumed["task"]
@@ -160,7 +164,9 @@ class TaskTests(unittest.TestCase):
     def test_manual_resume_policy_fails_closed(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_dispatch", return_value=_launcher()
-        ), patch.object(tasks.base, "_append_audit"):
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
+        ):
             started = tasks.grabowski_task_start(
                 "local",
                 ["/bin/true"],
@@ -170,6 +176,20 @@ class TaskTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(PermissionError, "does not permit"):
             tasks.grabowski_task_resume(started["task"]["task_id"])
+
+    def test_power_worker_fails_closed_when_recovery_is_not_ready(self) -> None:
+        with patch.object(
+            tasks.recovery,
+            "recovery_status",
+            return_value={
+                "ready_for_user_power_worker": False,
+                "required_actions": ["produce recovery evidence"],
+            },
+        ):
+            with self.assertRaisesRegex(PermissionError, "recovery gate"):
+                tasks.grabowski_task_start(
+                    "local", ["/bin/true"], cwd=str(self.root)
+                )
 
     def test_database_rejects_symlink(self) -> None:
         target = self.root / "real.sqlite3"
