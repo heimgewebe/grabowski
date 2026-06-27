@@ -121,6 +121,60 @@ class WorkerTests(unittest.TestCase):
         self.assertIsNone(workers.resources.inspect_resource("port:9223"))
         self.assertFalse(profile.exists())
 
+    def test_collected_successful_unit_is_completed(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9225, runtime_seconds=60)
+        probe = result(
+            stdout=(
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+                "Result=success\nExecMainStatus=0\n"
+            )
+        )
+        with patch.object(workers.operator, "_run", return_value=probe):
+            status = workers.worker_status(
+                started["worker"]["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(status["state"], "completed")
+        self.assertIsNone(workers.resources.inspect_resource("port:9225"))
+
+    def test_collected_failed_unit_is_failed(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9226, runtime_seconds=60)
+        probe = result(
+            stdout=(
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+                "Result=exit-code\nExecMainStatus=1\n"
+            )
+        )
+        with patch.object(workers.operator, "_run", return_value=probe):
+            status = workers.worker_status(
+                started["worker"]["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(status["state"], "failed")
+        self.assertIsNone(workers.resources.inspect_resource("port:9226"))
+
+    def test_collected_unit_without_result_is_interrupted(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9227, runtime_seconds=60)
+        probe = result(
+            stdout=(
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+                "Result=\nExecMainStatus=\n"
+            )
+        )
+        with patch.object(workers.operator, "_run", return_value=probe):
+            status = workers.worker_status(
+                started["worker"]["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(status["state"], "interrupted")
+        self.assertIsNone(workers.resources.inspect_resource("port:9227"))
+
     def test_gui_fails_clearly_without_xvfb(self) -> None:
         with patch.object(workers.shutil, "which", return_value=None):
             with self.assertRaisesRegex(RuntimeError, "Xvfb is not installed"):
