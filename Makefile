@@ -20,6 +20,8 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_operations.py
 >$(PYTHON) -m py_compile src/grabowski_privileged.py
 >$(PYTHON) -m py_compile src/grabowski_privileged_broker.py
+>$(PYTHON) -m py_compile src/grabowski_recovery.py
+>$(PYTHON) -m py_compile src/grabowski_tasks.py
 >$(PYTHON) -m py_compile tools/build_operator_context.py
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
 >$(PYTHON) -m py_compile tools/deploy_runtime_dual.py
