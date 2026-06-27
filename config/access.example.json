@@ -65,7 +65,11 @@
     "process_inspect": "Inspect current-user processes.",
     "process_signal": "Signal current-user processes with protected PID checks.",
     "port_inspect": "Inspect listening sockets.",
-    "privileged_reference": "Create non-executable references for future privileged actions."
+    "privileged_reference": "Create non-executable references for future privileged actions.",
+    "resource_lease": "Acquire, renew, inspect and release typed collision-control resource leases.",
+    "artifact_transfer": "Transfer regular files with hash-bound source and destination preconditions.",
+    "browser_worker": "Start and control isolated agent-owned browser workers with loopback-only debugging.",
+    "gui_worker": "Start and control isolated Xvfb GUI workers without a remote display listener."
   },
   "profiles": {
     "bounded-read-write": {
@@ -144,6 +148,10 @@
         "browser_profile_read",
         "terminal_execute",
         "durable_job",
+        "resource_lease",
+        "artifact_transfer",
+        "browser_worker",
+        "gui_worker",
         "git_cli",
         "github_cli",
         "user_service_control",

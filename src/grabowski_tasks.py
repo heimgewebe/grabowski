@@ -13,6 +13,7 @@ from typing import Any
 import grabowski_fleet as fleet
 import grabowski_mcp as base
 import grabowski_recovery as recovery
+import grabowski_resources as resources
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -92,7 +93,9 @@ def _database() -> sqlite3.Connection:
             created_at_unix INTEGER NOT NULL,
             updated_at_unix INTEGER NOT NULL,
             launcher_json TEXT NOT NULL,
-            last_observation_json TEXT
+            last_observation_json TEXT,
+            resource_keys_json TEXT NOT NULL DEFAULT '[]',
+            lease_owner_id TEXT
         )
         """
     )
@@ -101,9 +104,25 @@ def _database() -> sqlite3.Connection:
     ).fetchone()
     if current is None:
         connection.execute(
-            "INSERT INTO metadata(key, value) VALUES('schema_version', '1')"
+            "INSERT INTO metadata(key, value) VALUES('schema_version', '2')"
         )
-    elif current["value"] != "1":
+    elif current["value"] == "1":
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(tasks)")
+        }
+        if "resource_keys_json" not in columns:
+            connection.execute(
+                "ALTER TABLE tasks ADD COLUMN resource_keys_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "lease_owner_id" not in columns:
+            connection.execute(
+                "ALTER TABLE tasks ADD COLUMN lease_owner_id TEXT"
+            )
+        connection.execute(
+            "UPDATE metadata SET value='2' WHERE key='schema_version'"
+        )
+    elif current["value"] != "2":
         connection.close()
         raise RuntimeError("Unsupported task database schema")
     connection.commit()
@@ -115,13 +134,34 @@ def _database() -> sqlite3.Connection:
     return connection
 
 
-def _require_recovery_gate() -> dict[str, Any]:
+def _command_requires_recovery(argv: list[str]) -> bool:
+    names = [Path(item).name.lower() for item in argv if isinstance(item, str)]
+    if not names:
+        return False
+    direct = {
+        "shutdown", "reboot", "poweroff", "halt", "hibernate",
+        "sleep-heimserver", "sleep-heim-pc", "sleep-heimberry",
+    }
+    if any(name in direct for name in names[:2]):
+        return True
+    joined = " ".join(item.lower() for item in argv)
+    power_actions = (
+        "systemctl poweroff", "systemctl reboot", "systemctl suspend",
+        "systemctl hibernate", "loginctl poweroff", "loginctl reboot",
+        "loginctl suspend", "loginctl hibernate",
+    )
+    return any(action in joined for action in power_actions)
+
+
+def _require_recovery_gate(argv: list[str]) -> dict[str, Any]:
+    if not _command_requires_recovery(argv):
+        return {"required": False, "checked_at_unix": None}
     status = recovery.recovery_status()
     if not status["ready_for_user_power_worker"]:
         actions = status.get("required_actions", [])
         detail = "; ".join(actions) if actions else "recovery evidence is incomplete"
         raise PermissionError(f"Power-worker recovery gate is not ready: {detail}")
-    return status
+    return {**status, "required": True}
 
 
 def _validate_task_id(task_id: str) -> str:
@@ -174,6 +214,32 @@ def _validate_resume_policy(value: str) -> str:
     if value not in RESUME_POLICIES:
         raise ValueError(f"resume_policy must be one of {sorted(RESUME_POLICIES)}")
     return value
+
+
+def _resource_keys(values: list[str] | None) -> list[str]:
+    if values is None or values == []:
+        return []
+    return resources.normalize_resource_keys(values)
+
+
+def _lease_owner(task_id: str) -> str:
+    return f"task:{_validate_task_id(task_id)}"
+
+
+def _record_resource_keys(record: dict[str, Any]) -> list[str]:
+    raw = record.get("resource_keys_json") or "[]"
+    values = json.loads(raw)
+    if not isinstance(values, list):
+        raise RuntimeError("Stored task resource keys are invalid")
+    return [resources.normalize_resource_key(value) for value in values]
+
+
+def _release_record_resources(record: dict[str, Any]) -> dict[str, Any] | None:
+    keys = _record_resource_keys(record)
+    if not keys:
+        return None
+    owner = record.get("lease_owner_id") or _lease_owner(record["task_id"])
+    return resources.release_resources(owner, keys)
 
 
 def _validate_command(argv: list[str]) -> list[str]:
@@ -263,6 +329,8 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
             if record["last_observation_json"]
             else None
         ),
+        "resource_keys": _record_resource_keys(record),
+        "lease_owner_id": record.get("lease_owner_id"),
     }
 
 
@@ -355,18 +423,21 @@ def grabowski_task_start(
     cpu_weight: int = 100,
     io_weight: int = 100,
     memory_max_bytes: int | None = None,
+    resource_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit."""
     operator._require_operator_mutation("durable_job")
-    recovery_gate = _require_recovery_gate()
     target = fleet.fleet_host(host)
     command = _validate_command(argv)
+    recovery_gate = _require_recovery_gate(command)
     working_directory = _validate_cwd(host, cwd)
     runtime = operator._job_runtime(runtime_seconds)
     policy = _validate_resume_policy(resume_policy)
     cpu, io = _validate_weights(cpu_weight, io_weight)
     memory = _validate_memory(memory_max_bytes)
+    task_resources = _resource_keys(resource_keys)
     task_id = uuid.uuid4().hex[:24]
+    lease_owner = _lease_owner(task_id)
     attempt = 1
     unit = _task_unit(task_id, attempt)
     now = _now()
@@ -388,30 +459,51 @@ def grabowski_task_start(
         "updated_at_unix": now,
         "launcher_json": _canonical_json({"pending": True}),
         "last_observation_json": None,
+        "resource_keys_json": _canonical_json(task_resources),
+        "lease_owner_id": lease_owner,
     }
-    with _database() as connection:
-        connection.execute(
+    lease_result = None
+    if task_resources:
+        lease_result = resources.acquire_resources(
+            lease_owner,
+            task_resources,
+            purpose=f"persistent task {task_id}",
+            ttl_seconds=min(
+                resources.MAX_TTL_SECONDS,
+                max(resources.MIN_TTL_SECONDS, runtime + 300),
+            ),
+            metadata={"task_id": task_id, "host": host, "attempt": attempt},
+        )
+    try:
+        with _database() as connection:
+            connection.execute(
             """
             INSERT INTO tasks(
                 task_id, host, unit, attempt, state, resume_policy,
                 argv_json, argv_sha256, cwd, runtime_seconds,
                 cpu_weight, io_weight, memory_max_bytes,
                 created_at_unix, updated_at_unix, launcher_json,
-                last_observation_json
+                last_observation_json, resource_keys_json, lease_owner_id
             ) VALUES(
                 :task_id, :host, :unit, :attempt, :state, :resume_policy,
                 :argv_json, :argv_sha256, :cwd, :runtime_seconds,
                 :cpu_weight, :io_weight, :memory_max_bytes,
                 :created_at_unix, :updated_at_unix, :launcher_json,
-                :last_observation_json
+                :last_observation_json, :resource_keys_json, :lease_owner_id
             )
             """,
-            record,
-        )
-        connection.commit()
+                record,
+            )
+            connection.commit()
+    except Exception:
+        if task_resources:
+            resources.release_resources(lease_owner, task_resources)
+        raise
     launcher = _dispatch(host, _launch_argv(record), timeout_seconds=60)
     state = "running" if launcher["returncode"] == 0 else "failed"
     stored = _set_state(task_id, state, launcher=launcher)
+    if launcher["returncode"] != 0:
+        _release_record_resources(stored)
     audit = {
         "timestamp_unix": _now(),
         "operation": "task-start",
@@ -421,7 +513,12 @@ def grabowski_task_start(
         "argv_sha256": record["argv_sha256"],
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
-        "recovery_checked_at_unix": recovery_gate["checked_at_unix"],
+        "recovery_required": recovery_gate.get("required", False),
+        "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),
+        "resource_keys": task_resources,
+        "resource_lease_expires_at_unix": (
+            lease_result["expires_at_unix"] if lease_result else None
+        ),
     }
     base._append_audit(audit)
     return {"task": _public(stored), "audit": audit}
@@ -438,6 +535,8 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
         observation["state"],
         observation=observation,
     )
+    if observation["state"] not in {"launching", "running"}:
+        _release_record_resources(stored)
     return _public(stored)
 
 
@@ -482,6 +581,8 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     )
     state = "cancelled" if result["returncode"] == 0 else record["state"]
     stored = _set_state(task_id, state, observation={"cancel": result})
+    if result["returncode"] == 0:
+        _release_record_resources(stored)
     audit = {
         "timestamp_unix": _now(),
         "operation": "task-cancel",
@@ -501,13 +602,32 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     record = _row(task_id)
     if record["resume_policy"] in {"never", "manual"}:
         raise PermissionError("Task resume policy does not permit automatic retry")
-    recovery_gate = _require_recovery_gate()
+    command = json.loads(record["argv_json"])
+    recovery_gate = _require_recovery_gate(command)
     observation = _observe(record)
     if observation["state"] == "running":
         raise RuntimeError("Task is still running")
     attempt = int(record["attempt"]) + 1
     unit = _task_unit(task_id, attempt)
     candidate = {**record, "attempt": attempt, "unit": unit}
+    task_resources = _record_resource_keys(record)
+    lease_owner = record.get("lease_owner_id") or _lease_owner(task_id)
+    lease_result = None
+    if task_resources:
+        lease_result = resources.acquire_resources(
+            lease_owner,
+            task_resources,
+            purpose=f"persistent task {task_id}",
+            ttl_seconds=min(
+                resources.MAX_TTL_SECONDS,
+                max(resources.MIN_TTL_SECONDS, int(record["runtime_seconds"]) + 300),
+            ),
+            metadata={
+                "task_id": task_id,
+                "host": record["host"],
+                "attempt": attempt,
+            },
+        )
     launcher = _dispatch(record["host"], _launch_argv(candidate), timeout_seconds=60)
     state = "running" if launcher["returncode"] == 0 else "failed"
     stored = _set_state(
@@ -518,6 +638,8 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
         unit=unit,
         attempt=attempt,
     )
+    if launcher["returncode"] != 0:
+        _release_record_resources(stored)
     audit = {
         "timestamp_unix": _now(),
         "operation": "task-resume",
@@ -526,10 +648,86 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
         "attempt": attempt,
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
-        "recovery_checked_at_unix": recovery_gate["checked_at_unix"],
+        "recovery_required": recovery_gate.get("required", False),
+        "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),
+        "resource_keys": task_resources,
+        "resource_lease_expires_at_unix": (
+            lease_result["expires_at_unix"] if lease_result else None
+        ),
     }
     base._append_audit(audit)
     return {"task": _public(stored), "audit": audit}
+
+
+def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
+    if not isinstance(auto_resume, bool):
+        raise ValueError("auto_resume must be boolean")
+    with _database() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE state IN ('launching', 'running') "
+            "ORDER BY created_at_unix, task_id"
+        ).fetchall()
+    refreshed: list[dict[str, Any]] = []
+    resumed: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for raw in rows:
+        record = dict(raw)
+        observation = _observe(record)
+        stored = _set_state(
+            record["task_id"],
+            observation["state"],
+            observation=observation,
+        )
+        if observation["state"] not in {"launching", "running"}:
+            _release_record_resources(stored)
+        refreshed.append(_public(stored))
+        if not auto_resume or observation["state"] == "running":
+            continue
+        if stored["resume_policy"] != "retry-safe":
+            blocked.append(
+                {
+                    "task_id": stored["task_id"],
+                    "resume_policy": stored["resume_policy"],
+                    "reason": "automatic resume requires retry-safe policy",
+                }
+            )
+            continue
+        try:
+            resumed.append(grabowski_task_resume(stored["task_id"])["task"])
+        except Exception as exc:
+            blocked.append(
+                {
+                    "task_id": stored["task_id"],
+                    "resume_policy": stored["resume_policy"],
+                    "reason": operator._redact_text(str(exc)),
+                }
+            )
+    return {
+        "auto_resume": auto_resume,
+        "scanned": len(rows),
+        "refreshed": refreshed,
+        "resumed": resumed,
+        "blocked": blocked,
+        "checked_at_unix": _now(),
+    }
+
+
+@mcp.tool(name="grabowski_task_reconcile", annotations=MUTATING)
+def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:
+    """Reconcile persistent tasks after process loss or host restart."""
+    operator._require_operator_mutation("durable_job")
+    result = reconcile_tasks(auto_resume=auto_resume)
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "task-reconcile",
+            "auto_resume": auto_resume,
+            "scanned": result["scanned"],
+            "resumed_count": len(result["resumed"]),
+            "blocked_count": len(result["blocked"]),
+        }
+    )
+    return result
 
 
 @mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)

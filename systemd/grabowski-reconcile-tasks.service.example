@@ -1,0 +1,14 @@
+[Unit]
+Description=Reconcile persistent Grabowski tasks
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python -m grabowski_task_reconcile --auto-resume
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/grabowski
+UMask=0077
+TimeoutStartSec=120s
