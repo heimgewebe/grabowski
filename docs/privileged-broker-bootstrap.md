@@ -12,8 +12,9 @@ Dieser Bootstrap ist die einzige absichtlich externe Root-Stufe. Vorher bleibt d
 | `config/privileged-actions.example.json` | `/etc/grabowski/privileged-actions.json` | `0600` |
 | `systemd/grabowski-privileged-broker.socket` | `/etc/systemd/system/` | `0644` |
 | `systemd/grabowski-privileged-broker@.service` | `/etc/systemd/system/` | `0644` |
+| `tmpfiles/grabowski.conf` | `/etc/tmpfiles.d/grabowski.conf` | `0644` |
 
-Danach wird eine Systemgruppe `grabowski` angelegt, der Operator dieser Gruppe hinzugefügt, `systemctl daemon-reload` ausgeführt und ausschließlich `grabowski-privileged-broker.socket` aktiviert.
+Danach wird eine Systemgruppe `grabowski` angelegt, der Operator dieser Gruppe hinzugefügt und `systemd-tmpfiles --create /etc/tmpfiles.d/grabowski.conf` ausgeführt. Das versionierte tmpfiles-Fragment stellt sicher, dass `/run/grabowski` dauerhaft `root:grabowski` mit Modus `0750` gehört; `SocketGroup=grabowski` allein setzt nur die Gruppe des Sockets, nicht die des Elternverzeichnisses. Erst anschließend werden `systemctl daemon-reload` und ausschließlich `grabowski-privileged-broker.socket` aktiviert. Neue Gruppenmitgliedschaften gelten erst in einer frischen Login-Sitzung.
 
 ## Aktivierung einer Aktion
 

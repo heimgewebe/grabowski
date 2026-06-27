@@ -244,9 +244,11 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
     def test_systemd_socket_contract_is_rooted_and_group_bounded(self) -> None:
         socket_unit = (ROOT / "systemd" / "grabowski-privileged-broker.socket").read_text(encoding="utf-8")
         service_unit = (ROOT / "systemd" / "grabowski-privileged-broker@.service").read_text(encoding="utf-8")
+        tmpfiles = (ROOT / "tmpfiles" / "grabowski.conf").read_text(encoding="utf-8")
         self.assertIn("Accept=yes", socket_unit)
         self.assertIn("SocketGroup=grabowski", socket_unit)
         self.assertIn("SocketMode=0660", socket_unit)
+        self.assertEqual(tmpfiles, "d /run/grabowski 0750 root grabowski -\n")
         self.assertIn("User=root", service_unit)
         self.assertIn("StandardInput=socket", service_unit)
         self.assertIn("NoNewPrivileges=yes", service_unit)
