@@ -86,6 +86,7 @@ class WorkerTests(unittest.TestCase):
         launch = run.call_args.args[0]
         self.assertIn("--slice=grabowski-workers.slice", launch)
         self.assertIn("--property=NoNewPrivileges=yes", launch)
+        self.assertIn("--property=RemainAfterExit=yes", launch)
         self.assertEqual(
             workers.resources.inspect_resource("port:9222")["owner_id"],
             f"worker:{worker['worker_id']}",
@@ -120,6 +121,23 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(status["state"], "completed")
         self.assertIsNone(workers.resources.inspect_resource("port:9223"))
         self.assertFalse(profile.exists())
+
+    def test_exited_remain_after_exit_worker_is_completed(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9225, runtime_seconds=60)
+        worker = started["worker"]
+        probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=active\nSubState=exited\n"
+                "Result=success\nExecMainStatus=0\n"
+            )
+        )
+        with patch.object(workers.operator, "_run", return_value=probe):
+            status = workers.worker_status(worker["worker_id"], expected_kind="browser")
+        self.assertEqual(status["state"], "completed")
+        self.assertIsNone(workers.resources.inspect_resource("port:9225"))
 
     def test_gui_fails_clearly_without_xvfb(self) -> None:
         with patch.object(workers.shutil, "which", return_value=None):

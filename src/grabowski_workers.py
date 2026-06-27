@@ -226,6 +226,7 @@ def _launch_argv(record: dict[str, Any], writable_paths: list[Path]) -> list[str
         record["unit"],
         "--slice=grabowski-workers.slice",
         "--property=Type=exec",
+        "--property=RemainAfterExit=yes",
         "--property=KillMode=control-group",
         "--property=TimeoutStopSec=10s",
         "--property=NoNewPrivileges=yes",
@@ -385,6 +386,13 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
     unit_result = properties.get("Result")
     if result["returncode"] != 0 or load in {None, "not-found"}:
         state = "interrupted"
+    elif active == "active" and properties.get("SubState") == "exited":
+        state = (
+            "completed"
+            if unit_result in {None, "", "success"}
+            and properties.get("ExecMainStatus") in {None, "", "0"}
+            else "failed"
+        )
     elif active in {"active", "activating", "reloading"}:
         state = "running"
     elif active == "failed" or unit_result not in {None, "", "success"}:
