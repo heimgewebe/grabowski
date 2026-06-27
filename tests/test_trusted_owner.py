@@ -113,18 +113,6 @@ class TrustedOwnerTests(unittest.TestCase):
         with patch.object(base, "_load_policy", return_value=TRUSTED_POLICY):
             base._reject_sensitive(target)
 
-    def test_operator_unit_removes_execution_sandbox(self) -> None:
-        unit = (ROOT / "systemd" / "grabowski-operator.service.example").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("NoNewPrivileges=no", unit)
-        self.assertIn("ProtectSystem=off", unit)
-        self.assertIn("ProtectHome=no", unit)
-        self.assertIn("PrivateTmp=no", unit)
-        self.assertIn("TasksMax=infinity", unit)
-        self.assertNotIn("ReadWritePaths=", unit)
-        self.assertNotIn("MemoryDenyWriteExecute=yes", unit)
-
 
 if __name__ == "__main__":
     unittest.main()

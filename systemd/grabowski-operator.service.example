@@ -1,5 +1,5 @@
 [Unit]
-Description=Grabowski MCP trusted-owner operator
+Description=Grabowski MCP operator
 After=network.target
 StartLimitIntervalSec=300
 StartLimitBurst=10
@@ -11,17 +11,20 @@ ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python -m grabowski_operator -
 Restart=on-failure
 RestartSec=2
 TimeoutStartSec=20
-TimeoutStopSec=30
+TimeoutStopSec=20
 KillMode=mixed
-UMask=0022
+UMask=0077
 Environment=PYTHONUNBUFFERED=1
-Environment=GRABOWSKI_TRUSTED_OWNER=1
-NoNewPrivileges=no
-PrivateTmp=no
-ProtectSystem=off
-ProtectHome=no
-TasksMax=infinity
-LimitNOFILE=1048576
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/grabowski %h/repos %h/grabowski-workspace
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target
