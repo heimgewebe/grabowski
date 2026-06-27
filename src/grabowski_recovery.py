@@ -169,5 +169,5 @@ def recovery_status() -> dict[str, Any]:
 @mcp.tool(name="grabowski_recovery_status", annotations=READ_ONLY)
 def grabowski_recovery_status() -> dict[str, Any]:
     """Evaluate the fail-closed recovery gate for power-worker activation."""
-    operator._require_operator_capability("audit_verify")
+    base._require_capability("audit_verify")
     return recovery_status()
