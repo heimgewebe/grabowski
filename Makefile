@@ -36,7 +36,7 @@ syntax:
 >$(PYTHON) -m py_compile tools/grabowski_privileged_request.py
 
 test:
->GRABOWSKI_POLICY_PATH="$(CURDIR)/config/access.home-wide-operator.example.json" $(PYTHON) -m unittest discover -s tests -v
+>set -eu; test_home="$(CURDIR)/build/test-home"; rm -rf "$$test_home"; trap 'rm -rf "$$test_home"' EXIT; install -d -m 700 "$$test_home/.config/grabowski"; install -m 600 config/access.home-wide-operator.example.json "$$test_home/.config/grabowski/access.json"; HOME="$$test_home" $(PYTHON) -m unittest discover -s tests -v
 
 policy:
 >$(PYTHON) tools/validate_access_policy.py

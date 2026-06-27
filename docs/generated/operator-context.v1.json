@@ -507,7 +507,7 @@
       "id": "grabowski_task_start",
       "purpose": "Start a persistent local or fleet task in its own systemd unit.",
       "read_only": false,
-      "reversibility": "task-cancel-and-command-dependent",
+      "reversibility": "cancel-or-command-dependent",
       "risk_class": "variable",
       "tool": "grabowski_task_start"
     },
@@ -545,7 +545,7 @@
       "id": "grabowski_task_cancel",
       "purpose": "Stop one task process group while retaining its persistent record.",
       "read_only": false,
-      "reversibility": "task-resume-when-policy-allows",
+      "reversibility": "resume-policy-dependent",
       "risk_class": "medium",
       "tool": "grabowski_task_cancel"
     },
@@ -560,7 +560,7 @@
       "id": "grabowski_task_resume",
       "purpose": "Recreate a missing or stopped task unit from its persistent record.",
       "read_only": false,
-      "reversibility": "task-cancel-and-command-dependent",
+      "reversibility": "cancel-or-command-dependent",
       "risk_class": "variable",
       "tool": "grabowski_task_resume"
     },
@@ -728,7 +728,7 @@
   "sources": {
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "05b58dc9e61a7325dc5b849ad724b6c5f7b4e3f1cb63a53d7cf739d4b112257b"
+      "sha256": "c9ea091ab6be1e3a74b839151f3bcc67ad2d742c3c42dde7e870a9157fd9548e"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -739,7 +739,7 @@
       "sha256": "4cb785ab58c42128129acb56c781f77163ace62ed1e51733534d8499bbaa2811"
     },
     "runtime_sources": {
-      "src/grabowski_capabilities.py": "05b58dc9e61a7325dc5b849ad724b6c5f7b4e3f1cb63a53d7cf739d4b112257b",
+      "src/grabowski_capabilities.py": "c9ea091ab6be1e3a74b839151f3bcc67ad2d742c3c42dde7e870a9157fd9548e",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
       "src/grabowski_mcp.py": "e878103776fedc09b44ef876631ead8a514b3e01eb2da85f99fe0ee17f5a0452",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",

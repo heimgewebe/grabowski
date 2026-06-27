@@ -301,7 +301,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "purpose": "Start a persistent local or fleet task in its own systemd unit.",
         "risk_class": "variable",
         "effects": ["process-start", "state-create", "command-dependent"],
-        "reversibility": "task-cancel-and-command-dependent",
+        "reversibility": "cancel-or-command-dependent",
     },
     "grabowski_task_status": {
         "category": "task",
@@ -322,14 +322,14 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "purpose": "Stop one task process group while retaining its persistent record.",
         "risk_class": "medium",
         "effects": ["process-stop", "state-change"],
-        "reversibility": "task-resume-when-policy-allows",
+        "reversibility": "resume-policy-dependent",
     },
     "grabowski_task_resume": {
         "category": "task",
         "purpose": "Recreate a missing or stopped task unit from its persistent record.",
         "risk_class": "variable",
         "effects": ["process-start", "state-change", "command-dependent"],
-        "reversibility": "task-cancel-and-command-dependent",
+        "reversibility": "cancel-or-command-dependent",
     },
     "grabowski_task_list": {
         "category": "task",
