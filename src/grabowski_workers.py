@@ -383,8 +383,19 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
     active = properties.get("ActiveState")
     load = properties.get("LoadState")
     unit_result = properties.get("Result")
-    if result["returncode"] != 0 or load in {None, "not-found"}:
+    exec_main_status = properties.get("ExecMainStatus")
+    if result["returncode"] != 0:
         state = "interrupted"
+    elif load in {None, "not-found"}:
+        if unit_result == "success" and exec_main_status == "0":
+            state = "completed"
+        elif (
+            unit_result not in {None, "", "success"}
+            or exec_main_status not in {None, "", "0"}
+        ):
+            state = "failed"
+        else:
+            state = "interrupted"
     elif active in {"active", "activating", "reloading"}:
         state = "running"
     elif active == "failed" or unit_result not in {None, "", "success"}:
