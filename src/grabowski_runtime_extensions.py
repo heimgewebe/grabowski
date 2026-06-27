@@ -154,6 +154,7 @@ def grabowski_context(profile: str = "concise") -> dict[str, Any]:
         "policy": {
             "mode": policy.get("mode"),
             "active_profile": active_profile["name"],
+            "trusted_owner": base._trusted_owner_enabled(policy),
             "access_profiles": sorted(policy.get("profiles", {})),
             "capabilities": sorted(base._effective_capabilities(policy)),
             "read_roots": base._profile_values(policy, "read_roots"),
@@ -188,13 +189,13 @@ def grabowski_git_branch(repo: str, action: str, branch: str, start_point: str =
     path = Path(repo).expanduser().resolve(strict=True)
     if not path.is_dir():
         raise ValueError(f"Repository path is not a directory: {path}")
-    if path == EVIDENCE_ROOT or EVIDENCE_ROOT in path.parents:
+    if (path == EVIDENCE_ROOT or EVIDENCE_ROOT in path.parents) and not operator._trusted_owner_mode():
         raise PermissionError("Git mutation of immutable evidence is blocked.")
     name = _validate_branch_name(path, branch)
     allowed = {"create", "switch", "create-and-switch"}
     if action not in allowed:
         raise ValueError(f"action must be one of {sorted(allowed)}")
-    if action != "switch" and name in PROTECTED_BRANCHES:
+    if action != "switch" and name in PROTECTED_BRANCHES and not operator._trusted_owner_mode():
         raise PermissionError("Creation of a protected main branch is blocked.")
     if not start_point or len(start_point) > 200 or start_point.startswith("-"):
         raise ValueError("Invalid start point")

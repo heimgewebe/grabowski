@@ -19,6 +19,26 @@
     {
       "module": "grabowski_runtime_extensions",
       "source": "src/grabowski_runtime_extensions.py"
+    },
+    {
+      "module": "grabowski_fleet",
+      "source": "src/grabowski_fleet.py"
+    },
+    {
+      "module": "grabowski_operations",
+      "source": "src/grabowski_operations.py"
+    },
+    {
+      "module": "grabowski_privileged",
+      "source": "src/grabowski_privileged.py"
+    },
+    {
+      "module": "grabowski_tasks",
+      "source": "src/grabowski_tasks.py"
+    },
+    {
+      "module": "grabowski_recovery",
+      "source": "src/grabowski_recovery.py"
     }
   ],
   "expected_tools": [
@@ -55,6 +75,19 @@
     "grabowski_process_list",
     "grabowski_process_signal",
     "grabowski_ports",
-    "grabowski_privileged_action_reference"
+    "grabowski_privileged_action_reference",
+    "grabowski_fleet_list",
+    "grabowski_fleet_run",
+    "grabowski_operation_list",
+    "grabowski_operation_plan",
+    "grabowski_operation_run",
+    "grabowski_privileged_broker_status",
+    "grabowski_task_start",
+    "grabowski_task_status",
+    "grabowski_task_logs",
+    "grabowski_task_cancel",
+    "grabowski_task_resume",
+    "grabowski_task_list",
+    "grabowski_recovery_status"
   ]
 }

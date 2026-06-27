@@ -46,6 +46,19 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_process_signal` | process | no | high | Signal one process owned by the current user. |
 | `grabowski_ports` | diagnostics | yes | low | List listening TCP and UDP sockets. |
 | `grabowski_privileged_action_reference` | privileged-reference | yes | medium | Create a non-executable reference contract for a future external privileged action. |
+| `grabowski_fleet_list` | fleet | yes | low | Return the validated local and SSH host registry. |
+| `grabowski_fleet_run` | fleet | no | variable | Run one bounded argv command on one registered local or SSH host. |
+| `grabowski_operation_list` | operation | yes | low | List validated named multi-step operations. |
+| `grabowski_operation_plan` | operation | yes | low | Render a named operation and rollback path without executing it. |
+| `grabowski_operation_run` | operation | no | high | Run a named preflight/action/postflight operation with rollback after failure. |
+| `grabowski_privileged_broker_status` | privileged-reference | yes | low | Inspect the root-owned privileged broker installation without executing it. |
+| `grabowski_task_start` | task | no | variable | Start a persistent local or fleet task in its own systemd unit. |
+| `grabowski_task_status` | task | yes | low | Observe one persistent task and refresh its recorded state. |
+| `grabowski_task_logs` | task | yes | low | Read redacted journal output for one local or fleet task. |
+| `grabowski_task_cancel` | task | no | medium | Stop one task process group while retaining its persistent record. |
+| `grabowski_task_resume` | task | no | variable | Recreate a missing or stopped task unit from its persistent record. |
+| `grabowski_task_list` | task | yes | low | List recent persistent task records with optional state filtering. |
+| `grabowski_recovery_status` | recovery | yes | low | Evaluate the fail-closed recovery gate for power-worker activation. |
 
 ## Policy contract
 

@@ -29,10 +29,13 @@ JOBS_DIR = STATE_DIR / "jobs"
 JOB_PREFIX = "grabowski-job-"
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 120
+TRUSTED_MAX_TIMEOUT = 86_400
 DEFAULT_JOB_RUNTIME = 7_200
 MAX_JOB_RUNTIME = 86_400
+TRUSTED_MAX_JOB_RUNTIME = 2_592_000
 DEFAULT_OUTPUT_BYTES = 250_000
 MAX_OUTPUT_BYTES = 2_000_000
+TRUSTED_MAX_OUTPUT_BYTES = 33_554_432
 
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
@@ -210,6 +213,13 @@ def _operator_capabilities() -> set[str]:
     }
 
 
+def _trusted_owner_mode() -> bool:
+    predicate = getattr(base, "_trusted_owner_enabled", None)
+    if predicate is None:
+        return False
+    return bool(predicate(base._load_policy()))
+
+
 def _require_operator_capability(capability: str) -> None:
     if capability not in _operator_capabilities():
         raise PermissionError(f"Operator capability is not enabled: {capability}")
@@ -234,13 +244,17 @@ def _limit(text: str, limit: int) -> tuple[str, bool]:
 
 
 def _safe_environment() -> dict[str, str]:
-    environment: dict[str, str] = {}
-    for key, value in os.environ.items():
-        upper = key.upper()
-        if any(part in upper for part in SENSITIVE_ENV_PARTS):
-            continue
-        environment[key] = value
+    if _trusted_owner_mode():
+        environment = dict(os.environ)
+    else:
+        environment = {}
+        for key, value in os.environ.items():
+            upper = key.upper()
+            if any(part in upper for part in SENSITIVE_ENV_PARTS):
+                continue
+            environment[key] = value
     environment["GRABOWSKI_EVIDENCE_ROOT"] = str(EVIDENCE_ROOT)
+    environment["GRABOWSKI_TRUSTED_OWNER"] = "1" if _trusted_owner_mode() else "0"
     return environment
 
 
@@ -249,7 +263,9 @@ def _resolve_cwd(cwd: str | None) -> Path:
     resolved = path.resolve(strict=True)
     if not resolved.is_dir():
         raise ValueError(f"Working directory is not a directory: {resolved}")
-    if resolved == EVIDENCE_ROOT or EVIDENCE_ROOT in resolved.parents:
+    if (
+        resolved == EVIDENCE_ROOT or EVIDENCE_ROOT in resolved.parents
+    ) and not _trusted_owner_mode():
         raise PermissionError(
             f"Commands may not run inside immutable evidence: {resolved}"
         )
@@ -310,41 +326,46 @@ def _validate_argv(argv: list[str], *, cwd: Path | None = None) -> list[str]:
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise ValueError("argv must be a non-empty list of non-empty strings")
 
+    trusted_owner = _trusted_owner_mode()
     executable = Path(argv[0]).name
-    if executable in PRIVILEGE_ESCALATORS:
+    if executable in PRIVILEGE_ESCALATORS and not trusted_owner:
         raise PermissionError(
             f"Privilege escalation is not available through Grabowski: "
             f"{executable}"
         )
 
     working_directory = HOME if cwd is None else cwd
-    for item in argv:
-        if _argument_targets_evidence(item, working_directory):
-            raise PermissionError(
-                "Direct command arguments may not target immutable evidence."
-            )
+    if not trusted_owner:
+        for item in argv:
+            if _argument_targets_evidence(item, working_directory):
+                raise PermissionError(
+                    "Direct command arguments may not target immutable evidence."
+                )
 
     return argv
 
 
 def _timeout(value: int) -> int:
-    if value < 1 or value > MAX_TIMEOUT:
+    maximum = TRUSTED_MAX_TIMEOUT if _trusted_owner_mode() else MAX_TIMEOUT
+    if value < 1 or value > maximum:
         raise ValueError(
-            f"timeout_seconds must be between 1 and {MAX_TIMEOUT}"
+            f"timeout_seconds must be between 1 and {maximum}"
         )
     return value
 
 
 def _job_runtime(value: int) -> int:
-    if value < 1 or value > MAX_JOB_RUNTIME:
-        raise ValueError(f"runtime_seconds must be between 1 and {MAX_JOB_RUNTIME}")
+    maximum = TRUSTED_MAX_JOB_RUNTIME if _trusted_owner_mode() else MAX_JOB_RUNTIME
+    if value < 1 or value > maximum:
+        raise ValueError(f"runtime_seconds must be between 1 and {maximum}")
     return value
 
 
 def _output_limit(value: int) -> int:
-    if value < 1 or value > MAX_OUTPUT_BYTES:
+    maximum = TRUSTED_MAX_OUTPUT_BYTES if _trusted_owner_mode() else MAX_OUTPUT_BYTES
+    if value < 1 or value > maximum:
         raise ValueError(
-            f"max_output_bytes must be between 1 and {MAX_OUTPUT_BYTES}"
+            f"max_output_bytes must be between 1 and {maximum}"
         )
     return value
 
@@ -565,6 +586,8 @@ def _push_mentions_protected_branch(arguments: list[str]) -> bool:
 def _guard_git(arguments: list[str], repo: Path) -> None:
     if not arguments:
         raise ValueError("Git arguments must not be empty")
+    if _trusted_owner_mode():
+        return
 
     if arguments[0] != "push":
         return
@@ -758,7 +781,7 @@ def grabowski_git(
     path = Path(repo).expanduser().resolve(strict=True)
     if not path.is_dir():
         raise ValueError(f"Repository path is not a directory: {path}")
-    if path == EVIDENCE_ROOT or EVIDENCE_ROOT in path.parents:
+    if (path == EVIDENCE_ROOT or EVIDENCE_ROOT in path.parents) and not _trusted_owner_mode():
         raise PermissionError("Git mutation of immutable evidence is blocked.")
     _guard_git(arguments, path)
     command = _validate_argv(["git", "-C", str(path), *arguments], cwd=path)

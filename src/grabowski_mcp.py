@@ -123,6 +123,7 @@ TOP_LEVEL_POLICY_FIELDS = {
     "forbidden_capabilities",
     "capability_definitions",
     "profiles",
+    "trusted_owner",
 }
 PROFILE_POLICY_FIELDS = {
     "description",
@@ -138,6 +139,7 @@ PROFILE_POLICY_FIELDS = {
     "max_secret_use_output_bytes",
     "max_secret_use_seconds",
     "capabilities",
+    "trusted_owner",
 }
 ROOT_LIST_FIELDS = {
     "read_roots",
@@ -341,6 +343,8 @@ def _validate_policy(policy: Any) -> None:
         raise RuntimeError("Access policy mode must be a string")
     if "active_profile" in policy and not isinstance(policy["active_profile"], str):
         raise RuntimeError("Access policy active_profile must be a string")
+    if "trusted_owner" in policy and not isinstance(policy["trusted_owner"], bool):
+        raise RuntimeError("Access policy trusted_owner must be a boolean")
 
     for key in ROOT_LIST_FIELDS:
         if key in policy:
@@ -416,6 +420,8 @@ def _validate_policy(policy: Any) -> None:
                 )
         if "description" in profile and not isinstance(profile["description"], str):
             raise RuntimeError(f"Access profile {name} description must be a string")
+        if "trusted_owner" in profile and not isinstance(profile["trusted_owner"], bool):
+            raise RuntimeError(f"Access profile {name} trusted_owner must be a boolean")
         for key in ROOT_LIST_FIELDS:
             if key in profile:
                 _validate_root_values(profile[key], label=f"profile {name} {key}")
@@ -491,6 +497,7 @@ def _legacy_profile(policy: dict[str, Any]) -> dict[str, Any]:
             for capability in BASE_CAPABILITIES
             if capability not in forbidden
         ],
+        "trusted_owner": bool(policy.get("trusted_owner", False)),
     }
 
 
@@ -506,6 +513,12 @@ def _active_profile(policy: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(profile, dict):
         raise RuntimeError(f"Access profile is not an object: {active}")
     return {"name": active, **profile}
+
+
+def _trusted_owner_enabled(policy: dict[str, Any] | None = None) -> bool:
+    source = _load_policy() if policy is None else policy
+    profile = _active_profile(source)
+    return bool(profile.get("trusted_owner", source.get("trusted_owner", False)))
 
 
 def _profile_values(policy: dict[str, Any], key: str) -> Any:
@@ -660,6 +673,8 @@ def _excluded_roots(kind: str) -> list[Path]:
 
 def _reject_sensitive(path: Path) -> None:
     policy = _load_policy()
+    if _trusted_owner_enabled(policy):
+        return
     forbidden_components = set(policy.get("forbidden_components", []))
     forbidden_patterns = list(policy.get("forbidden_file_patterns", []))
 
@@ -705,7 +720,7 @@ def _resolve_existing(raw_path: str, kind: str) -> Path:
     resolved = candidate.resolve(strict=True)
     if not _is_within(resolved, _roots(kind)):
         raise PermissionError(f"Path is outside configured {kind} roots: {resolved}")
-    if _path_is_sensitive(resolved):
+    if _path_is_sensitive(resolved) and not _trusted_owner_enabled():
         raise PermissionError(
             "Path is inside configured secret/browser roots; use dedicated tools."
         )
@@ -727,15 +742,16 @@ def _resolve_write_target(raw_path: str) -> tuple[Path, bool]:
     if not _is_within(resolved, _roots("write")):
         raise PermissionError(f"Path is outside configured write roots: {resolved}")
 
-    if _is_within(resolved, _excluded_roots("write")):
+    trusted_owner = _trusted_owner_enabled()
+    if _is_within(resolved, _excluded_roots("write")) and not trusted_owner:
         raise PermissionError(f"Path is explicitly read-only: {resolved}")
 
-    if _path_is_sensitive(resolved):
+    if _path_is_sensitive(resolved) and not trusted_owner:
         raise PermissionError(
             "Path is inside configured secret/browser roots; use dedicated tools."
         )
 
-    if _protected_generic_write_target(resolved):
+    if _protected_generic_write_target(resolved) and not trusted_owner:
         raise PermissionError(f"Path is protected from generic mutation: {resolved}")
 
     return resolved, exists
@@ -2395,6 +2411,7 @@ def grabowski_status() -> dict[str, Any]:
         "service": "grabowski-mcp",
         "mode": policy.get("mode", "bounded-read-write"),
         "active_profile": active_profile["name"],
+        "trusted_owner": _trusted_owner_enabled(policy),
         "access_profiles": sorted(policy.get("profiles", {})),
         "capabilities": sorted(_effective_capabilities(policy)),
         "state_dir": str(STATE_DIR),
@@ -2580,8 +2597,11 @@ def grabowski_secret_reveal(
         expected_sha256=expected_sha256,
         max_bytes=max_bytes,
     )
-    if not acknowledge_context_exposure:
+    trusted_owner = _trusted_owner_enabled()
+    if not trusted_owner and not acknowledge_context_exposure:
         raise PermissionError("Secret reveal requires explicit context-exposure acknowledgement")
+    if trusted_owner and not justification.strip():
+        justification = "trusted-owner implicit reveal"
     if not isinstance(justification, str) or not justification.strip():
         raise ValueError("Secret reveal requires a non-empty justification")
     if len(justification.encode("utf-8")) > 1000 or "\x00" in justification:
@@ -2589,6 +2609,7 @@ def grabowski_secret_reveal(
     if _redact_sensitive_text(justification)[0] != justification:
         raise ValueError("Secret reveal justification appears to contain secret material")
     justification_sha256 = hashlib.sha256(justification.encode("utf-8")).hexdigest()
+    exposure_mode = "trusted-owner-policy" if trusted_owner else "explicit-acknowledgement"
     transaction_id, transaction_dir = _new_transaction_dir("secret-reveal", target)
     active_profile = _active_profile(_load_policy())
     evidence = {
@@ -2601,7 +2622,8 @@ def grabowski_secret_reveal(
         "profile": active_profile["name"],
         "capability": "secret_reveal",
         "justification_sha256": justification_sha256,
-        "context_exposure_acknowledged": True,
+        "context_exposure_acknowledged": bool(acknowledge_context_exposure),
+        "exposure_mode": exposure_mode,
         "postflight": {
             "sha256_precondition_valid": True,
             "race_checked": True,
@@ -2621,7 +2643,8 @@ def grabowski_secret_reveal(
         "profile": active_profile["name"],
         "capability": "secret_reveal",
         "justification_sha256": justification_sha256,
-        "context_exposure_acknowledged": True,
+        "context_exposure_acknowledged": bool(acknowledge_context_exposure),
+        "exposure_mode": exposure_mode,
         "postflight": evidence["postflight"],
         "quarantine": {"directory": str(transaction_dir), "preimage_path": None},
         "rollback": {

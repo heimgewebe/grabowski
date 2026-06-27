@@ -87,7 +87,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 34)
+        self.assertEqual(len(tools), 47)
         legacy_tools = {
             "grabowski_status",
             "grabowski_context",
@@ -125,27 +125,11 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("grabowski_restore_removed_path", tools)
         self.assertIn("grabowski_destroy_path", tools)
         self.assertIn("grabowski_privileged_action_reference", tools)
-        self.assertEqual(
-            contract["supporting_sources"],
-            [
-                {
-                    "module": "grabowski_operator_core",
-                    "source": "src/grabowski_operator.py",
-                },
-                {
-                    "module": "grabowski_mcp",
-                    "source": "src/grabowski_mcp.py",
-                },
-                {
-                    "module": "grabowski_capabilities",
-                    "source": "src/grabowski_capabilities.py",
-                },
-                {
-                    "module": "grabowski_runtime_extensions",
-                    "source": "src/grabowski_runtime_extensions.py",
-                },
-            ],
-        )
+        supporting = {item["module"]: item["source"] for item in contract["supporting_sources"]}
+        self.assertEqual(supporting["grabowski_operator_core"], "src/grabowski_operator.py")
+        for module in ("grabowski_mcp", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_tasks", "grabowski_recovery"):
+            self.assertIn(module, supporting)
+            self.assertTrue((ROOT / supporting[module]).is_file())
 
     def test_runtime_lock_contract_exists(self) -> None:
         runtime_input = ROOT / "requirements" / "runtime.in"

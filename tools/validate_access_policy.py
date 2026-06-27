@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICIES = (
     ROOT / "config" / "access.example.json",
     ROOT / "config" / "access.home-wide-operator.example.json",
+    ROOT / "config" / "access.trusted-owner.example.json",
 )
 SCHEMAS = (
     ROOT / "contracts" / "access-policy.v1.schema.json",
@@ -135,7 +136,10 @@ def validate_policy(path: Path) -> None:
             )
     if data["version"] != 2:
         raise SystemExit(f"{path}: example policies must use policy version 2.")
-    if "${HOME}/repos/merges" not in data["write_excluded_roots"]:
+    trusted_owner = bool(data.get("trusted_owner", False))
+    if "trusted_owner" in data and not isinstance(data["trusted_owner"], bool):
+        raise SystemExit(f"{path}: trusted_owner must be a boolean.")
+    if not trusted_owner and "${HOME}/repos/merges" not in data["write_excluded_roots"]:
         raise SystemExit(
             f"{path}: ${{HOME}}/repos/merges must remain an explicit write exclusion."
         )
@@ -173,7 +177,7 @@ def validate_policy(path: Path) -> None:
             f"{path}: private key names belong behind secret tools, not generic "
             f"forbidden_file_patterns: {blocked_private_files}"
         )
-    if not any(root in data["read_roots"] for root in ("${HOME}/repos", "${HOME}")):
+    if not any(root in data["read_roots"] for root in ("/", "${HOME}/repos", "${HOME}")):
         raise SystemExit(f"{path}: policy must keep a documented read root.")
     require_capabilities(path, "forbidden_capabilities", data["forbidden_capabilities"])
 
@@ -214,7 +218,10 @@ def validate_policy(path: Path) -> None:
                 raise SystemExit(f"{path}: profile {name} missing list {key}.")
             if key != "capabilities":
                 require_string_list(path, profile, key)
-        if "${HOME}/repos/merges" not in profile["write_excluded_roots"]:
+        profile_trusted_owner = bool(profile.get("trusted_owner", trusted_owner))
+        if "trusted_owner" in profile and not isinstance(profile["trusted_owner"], bool):
+            raise SystemExit(f"{path}: profile {name} trusted_owner must be boolean.")
+        if not profile_trusted_owner and "${HOME}/repos/merges" not in profile["write_excluded_roots"]:
             raise SystemExit(
                 f"{path}: profile {name} must exclude ${{HOME}}/repos/merges."
             )

@@ -20,6 +20,8 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_operations.py
 >$(PYTHON) -m py_compile src/grabowski_privileged.py
 >$(PYTHON) -m py_compile src/grabowski_privileged_broker.py
+>$(PYTHON) -m py_compile src/grabowski_recovery.py
+>$(PYTHON) -m py_compile src/grabowski_tasks.py
 >$(PYTHON) -m py_compile tools/build_operator_context.py
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
 >$(PYTHON) -m py_compile tools/deploy_runtime_dual.py
@@ -34,7 +36,7 @@ syntax:
 >$(PYTHON) -m py_compile tools/grabowski_privileged_request.py
 
 test:
->$(PYTHON) -m unittest discover -s tests -v
+>set -eu; test_home="$(CURDIR)/build/test-home"; rm -rf "$$test_home"; trap 'rm -rf "$$test_home"' EXIT; install -d -m 700 "$$test_home/.config/grabowski"; install -m 600 config/access.home-wide-operator.example.json "$$test_home/.config/grabowski/access.json"; HOME="$$test_home" $(PYTHON) -m unittest discover -s tests -v
 
 policy:
 >$(PYTHON) tools/validate_access_policy.py

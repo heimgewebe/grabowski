@@ -1,0 +1,124 @@
+{
+  "version": 2,
+  "mode": "trusted-owner",
+  "active_profile": "trusted-owner",
+  "read_roots": [
+    "/"
+  ],
+  "write_roots": [
+    "/"
+  ],
+  "write_excluded_roots": [],
+  "secret_roots": [
+    "${HOME}/.ssh",
+    "${HOME}/.gnupg",
+    "${HOME}/.aws",
+    "${HOME}/.kube",
+    "${HOME}/.password-store",
+    "${HOME}/.local/share/keyrings"
+  ],
+  "browser_profile_roots": [
+    "${HOME}/.mozilla/firefox",
+    "${HOME}/.config/BraveSoftware/Brave-Browser",
+    "${HOME}/.config/google-chrome",
+    "${HOME}/.config/chromium"
+  ],
+  "secret_export_roots": [
+    "${HOME}"
+  ],
+  "max_read_bytes": 33554432,
+  "max_write_bytes": 33554432,
+  "max_list_entries": 100000,
+  "max_secret_use_output_bytes": 33554432,
+  "max_secret_use_seconds": 3600,
+  "forbid_symlinks": false,
+  "forbidden_components": [],
+  "forbidden_file_patterns": [],
+  "forbidden_capabilities": [],
+  "capability_definitions": {
+    "file_read": "Read bounded, non-secret text and metadata inside configured roots.",
+    "file_write": "Create and replace bounded text files with hash preconditions, audit and quarantine.",
+    "file_delete": "Remove regular files or empty directories into quarantine for audit-backed restoration.",
+    "file_destroy": "Irreversibly remove regular files or empty directories only through a separate explicit capability.",
+    "audit_verify": "Verify the tamper-evident write audit chain.",
+    "rollback_text": "Restore a quarantined preimage from an audited replace transaction.",
+    "bundle_registry": "Read the curated Lens/repoLens latest-complete bundle registry.",
+    "secret_inspect": "Inspect metadata and bounded directory listings under explicit secret roots without returning file content.",
+    "secret_reveal": "Break-glass reveal only with a current SHA-256, justification and explicit context-exposure acknowledgement; prefer secret_use.",
+    "secret_use": "Run bounded argv-only commands with a secret supplied through an inherited file descriptor or restrictive temporary fallback.",
+    "secret_export": "Atomically create a local 0600 copy inside configured secret export roots with a source hash precondition.",
+    "browser_profile_read": "Read bounded browser profile metadata and text under explicit browser profile roots; binary databases are metadata-only.",
+    "terminal_execute": "Run arbitrary host-visible commands, including shells and privilege frontends, with audit and redacted output.",
+    "durable_job": "Start long-running transient user-systemd jobs with extended Trusted Owner budgets.",
+    "git_cli": "Run guarded Git commands inside a repository.",
+    "github_cli": "Run GitHub CLI with redacted output.",
+    "user_service_control": "Inspect and control user-level systemd units.",
+    "tmux_interaction": "Read or send literal input to existing tmux panes.",
+    "process_inspect": "Inspect current-user processes.",
+    "process_signal": "Signal current-user processes with protected PID checks.",
+    "port_inspect": "Inspect listening sockets.",
+    "privileged_reference": "Create privileged references and use the installed trusted-owner root broker escape hatch."
+  },
+  "profiles": {
+    "trusted-owner": {
+      "description": "Trusted owner profile: unrestricted host-visible user execution, broad filesystem access, full capabilities, and compatibility with the root broker escape hatch.",
+      "read_roots": [
+        "/"
+      ],
+      "write_roots": [
+        "/"
+      ],
+      "write_excluded_roots": [],
+      "secret_roots": [
+        "${HOME}/.ssh",
+        "${HOME}/.gnupg",
+        "${HOME}/.aws",
+        "${HOME}/.kube",
+        "${HOME}/.password-store",
+        "${HOME}/.local/share/keyrings"
+      ],
+      "browser_profile_roots": [
+        "${HOME}/.mozilla/firefox",
+        "${HOME}/.config/BraveSoftware/Brave-Browser",
+        "${HOME}/.config/google-chrome",
+        "${HOME}/.config/chromium"
+      ],
+      "secret_export_roots": [
+        "${HOME}"
+      ],
+      "max_read_bytes": 33554432,
+      "max_write_bytes": 33554432,
+      "max_list_entries": 100000,
+      "max_secret_use_output_bytes": 33554432,
+      "max_secret_use_seconds": 3600,
+      "capabilities": [
+        "file_read",
+        "file_write",
+        "audit_verify",
+        "rollback_text",
+        "bundle_registry",
+        "secret_inspect",
+        "secret_reveal",
+        "secret_use",
+        "secret_export",
+        "browser_profile_read",
+        "terminal_execute",
+        "durable_job",
+        "git_cli",
+        "github_cli",
+        "user_service_control",
+        "tmux_interaction",
+        "process_inspect",
+        "process_signal",
+        "port_inspect",
+        "privileged_reference",
+        "file_destroy",
+        "file_move",
+        "chmod",
+        "chown"
+      ],
+      "trusted_owner": true
+    }
+  },
+  "trusted_owner": true
+}

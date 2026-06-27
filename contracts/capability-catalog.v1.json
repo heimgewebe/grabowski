@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "51c62c07c6dac4ac53e350fa2d0646369d7e0076aebd40a71bd91592b85e9a01",
+  "capability_source_sha256": "c9ea091ab6be1e3a74b839151f3bcc67ad2d742c3c42dde7e870a9157fd9548e",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "556129d0a330d90b0bd46e10f0367b85e65fef8719a7f6b2408fe3fb6b7eb3f9",
+  "contract_sha256": "4cb785ab58c42128129acb56c781f77163ace62ed1e51733534d8499bbaa2811",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -436,6 +436,167 @@
       "reversibility": "not-applicable",
       "risk_class": "medium",
       "tool": "grabowski_privileged_action_reference"
+    },
+    {
+      "category": "fleet",
+      "description": "Return the validated local and SSH host registry.",
+      "effects": [],
+      "id": "grabowski_fleet_list",
+      "purpose": "Return the validated local and SSH host registry.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_fleet_list"
+    },
+    {
+      "category": "fleet",
+      "description": "Run one argv command on one registered local or SSH host.",
+      "effects": [
+        "remote-command-dependent"
+      ],
+      "id": "grabowski_fleet_run",
+      "purpose": "Run one bounded argv command on one registered local or SSH host.",
+      "read_only": false,
+      "reversibility": "command-dependent",
+      "risk_class": "variable",
+      "tool": "grabowski_fleet_run"
+    },
+    {
+      "category": "operation",
+      "description": "List validated named operations.",
+      "effects": [],
+      "id": "grabowski_operation_list",
+      "purpose": "List validated named multi-step operations.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_operation_list"
+    },
+    {
+      "category": "operation",
+      "description": "Render one operation and its rollback path without executing it.",
+      "effects": [],
+      "id": "grabowski_operation_plan",
+      "purpose": "Render a named operation and rollback path without executing it.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_operation_plan"
+    },
+    {
+      "category": "operation",
+      "description": "Run preflight, action and postflight, then rollback after a failure.",
+      "effects": [
+        "multi-host-command-dependent",
+        "rollback-possible"
+      ],
+      "id": "grabowski_operation_run",
+      "purpose": "Run a named preflight/action/postflight operation with rollback after failure.",
+      "read_only": false,
+      "reversibility": "recipe-dependent",
+      "risk_class": "high",
+      "tool": "grabowski_operation_run"
+    },
+    {
+      "category": "privileged-reference",
+      "description": "Inspect the fail-closed root-owned privileged broker installation.",
+      "effects": [],
+      "id": "grabowski_privileged_broker_status",
+      "purpose": "Inspect the root-owned privileged broker installation without executing it.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_privileged_broker_status"
+    },
+    {
+      "category": "task",
+      "description": "Start one persistent local or fleet task in its own systemd unit.",
+      "effects": [
+        "process-start",
+        "state-create",
+        "command-dependent"
+      ],
+      "id": "grabowski_task_start",
+      "purpose": "Start a persistent local or fleet task in its own systemd unit.",
+      "read_only": false,
+      "reversibility": "cancel-or-command-dependent",
+      "risk_class": "variable",
+      "tool": "grabowski_task_start"
+    },
+    {
+      "category": "task",
+      "description": "Observe one persistent task and refresh its recorded state.",
+      "effects": [
+        "state-refresh"
+      ],
+      "id": "grabowski_task_status",
+      "purpose": "Observe one persistent task and refresh its recorded state.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_status"
+    },
+    {
+      "category": "task",
+      "description": "Read redacted journal output for one local or fleet task.",
+      "effects": [],
+      "id": "grabowski_task_logs",
+      "purpose": "Read redacted journal output for one local or fleet task.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_logs"
+    },
+    {
+      "category": "task",
+      "description": "Stop one task process group and retain its persistent task record.",
+      "effects": [
+        "process-stop",
+        "state-change"
+      ],
+      "id": "grabowski_task_cancel",
+      "purpose": "Stop one task process group while retaining its persistent record.",
+      "read_only": false,
+      "reversibility": "resume-policy-dependent",
+      "risk_class": "medium",
+      "tool": "grabowski_task_cancel"
+    },
+    {
+      "category": "task",
+      "description": "Recreate a missing or stopped task unit from its persistent record.",
+      "effects": [
+        "process-start",
+        "state-change",
+        "command-dependent"
+      ],
+      "id": "grabowski_task_resume",
+      "purpose": "Recreate a missing or stopped task unit from its persistent record.",
+      "read_only": false,
+      "reversibility": "cancel-or-command-dependent",
+      "risk_class": "variable",
+      "tool": "grabowski_task_resume"
+    },
+    {
+      "category": "task",
+      "description": "List recent persistent task records, optionally filtered by state.",
+      "effects": [],
+      "id": "grabowski_task_list",
+      "purpose": "List recent persistent task records with optional state filtering.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_list"
+    },
+    {
+      "category": "recovery",
+      "description": "Evaluate the fail-closed recovery gate for power-worker activation.",
+      "effects": [],
+      "id": "grabowski_recovery_status",
+      "purpose": "Evaluate the fail-closed recovery gate for power-worker activation.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_recovery_status"
     }
   ]
 }

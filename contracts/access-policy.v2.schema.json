@@ -24,63 +24,143 @@
     "forbidden_capabilities"
   ],
   "properties": {
-    "version": {"const": 2},
-    "mode": {"type": "string", "minLength": 1},
-    "active_profile": {"type": "string", "minLength": 1},
+    "version": {
+      "const": 2
+    },
+    "mode": {
+      "type": "string",
+      "minLength": 1
+    },
+    "active_profile": {
+      "type": "string",
+      "minLength": 1
+    },
     "read_roots": {
       "type": "array",
-      "items": {"type": "string", "minLength": 1},
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "uniqueItems": true
     },
     "write_roots": {
       "type": "array",
-      "items": {"type": "string", "minLength": 1},
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "uniqueItems": true
     },
     "write_excluded_roots": {
       "type": "array",
-      "items": {"type": "string", "minLength": 1},
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "uniqueItems": true
     },
     "secret_roots": {
       "type": "array",
-      "items": {"type": "string", "minLength": 1},
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "uniqueItems": true
     },
     "browser_profile_roots": {
       "type": "array",
-      "items": {"type": "string", "minLength": 1},
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "uniqueItems": true
     },
     "secret_export_roots": {
       "type": "array",
-      "items": {"type": "string", "minLength": 1},
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "uniqueItems": true
     },
-    "max_read_bytes": {"type": "integer", "minimum": 1},
-    "max_write_bytes": {"type": "integer", "minimum": 1},
-    "max_list_entries": {"type": "integer", "minimum": 1},
-    "max_secret_use_output_bytes": {"type": "integer", "minimum": 1},
-    "max_secret_use_seconds": {"type": "integer", "minimum": 1},
-    "forbid_symlinks": {"type": "boolean"},
+    "max_read_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "max_write_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "max_list_entries": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "max_secret_use_output_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "max_secret_use_seconds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "forbid_symlinks": {
+      "type": "boolean"
+    },
     "forbidden_components": {
       "type": "array",
-      "items": {"type": "string"},
+      "items": {
+        "type": "string"
+      },
       "uniqueItems": true
     },
     "forbidden_file_patterns": {
       "type": "array",
-      "items": {"type": "string"},
+      "items": {
+        "type": "string"
+      },
       "uniqueItems": true
     },
     "forbidden_capabilities": {
       "type": "array",
-      "items": {"type": "string", "enum": ["file_read", "file_write", "audit_verify", "rollback_text", "bundle_registry", "secret_inspect", "secret_reveal", "secret_use", "secret_export", "browser_profile_read", "terminal_execute", "durable_job", "git_cli", "github_cli", "user_service_control", "tmux_interaction", "process_inspect", "process_signal", "port_inspect", "privileged_reference", "file_delete", "file_destroy", "file_move", "chmod", "chown", "secret_read"]},
+      "items": {
+        "type": "string",
+        "enum": [
+          "file_read",
+          "file_write",
+          "audit_verify",
+          "rollback_text",
+          "bundle_registry",
+          "secret_inspect",
+          "secret_reveal",
+          "secret_use",
+          "secret_export",
+          "browser_profile_read",
+          "terminal_execute",
+          "durable_job",
+          "git_cli",
+          "github_cli",
+          "user_service_control",
+          "tmux_interaction",
+          "process_inspect",
+          "process_signal",
+          "port_inspect",
+          "privileged_reference",
+          "file_delete",
+          "file_destroy",
+          "file_move",
+          "chmod",
+          "chown",
+          "secret_read"
+        ]
+      },
       "uniqueItems": true
     },
     "capability_definitions": {
       "type": "object",
-      "additionalProperties": {"type": "string", "minLength": 1}
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
     },
     "profiles": {
       "type": "object",
@@ -99,49 +179,121 @@
           "capabilities"
         ],
         "properties": {
-          "description": {"type": "string", "minLength": 1},
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
           "read_roots": {
             "type": "array",
-            "items": {"type": "string", "minLength": 1},
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
             "uniqueItems": true
           },
           "write_roots": {
             "type": "array",
-            "items": {"type": "string", "minLength": 1},
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
             "uniqueItems": true
           },
           "write_excluded_roots": {
             "type": "array",
-            "items": {"type": "string", "minLength": 1},
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
             "uniqueItems": true
           },
           "secret_roots": {
             "type": "array",
-            "items": {"type": "string", "minLength": 1},
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
             "uniqueItems": true
           },
           "browser_profile_roots": {
             "type": "array",
-            "items": {"type": "string", "minLength": 1},
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
             "uniqueItems": true
           },
           "secret_export_roots": {
             "type": "array",
-            "items": {"type": "string", "minLength": 1},
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
             "uniqueItems": true
           },
-          "max_read_bytes": {"type": "integer", "minimum": 1},
-          "max_write_bytes": {"type": "integer", "minimum": 1},
-          "max_list_entries": {"type": "integer", "minimum": 1},
-          "max_secret_use_output_bytes": {"type": "integer", "minimum": 1},
-          "max_secret_use_seconds": {"type": "integer", "minimum": 1},
+          "max_read_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_write_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_list_entries": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_secret_use_output_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_secret_use_seconds": {
+            "type": "integer",
+            "minimum": 1
+          },
           "capabilities": {
             "type": "array",
-            "items": {"type": "string", "enum": ["file_read", "file_write", "audit_verify", "rollback_text", "bundle_registry", "secret_inspect", "secret_reveal", "secret_use", "secret_export", "browser_profile_read", "terminal_execute", "durable_job", "git_cli", "github_cli", "user_service_control", "tmux_interaction", "process_inspect", "process_signal", "port_inspect", "privileged_reference", "file_delete", "file_destroy", "file_move", "chmod", "chown", "secret_read"]},
+            "items": {
+              "type": "string",
+              "enum": [
+                "file_read",
+                "file_write",
+                "audit_verify",
+                "rollback_text",
+                "bundle_registry",
+                "secret_inspect",
+                "secret_reveal",
+                "secret_use",
+                "secret_export",
+                "browser_profile_read",
+                "terminal_execute",
+                "durable_job",
+                "git_cli",
+                "github_cli",
+                "user_service_control",
+                "tmux_interaction",
+                "process_inspect",
+                "process_signal",
+                "port_inspect",
+                "privileged_reference",
+                "file_delete",
+                "file_destroy",
+                "file_move",
+                "chmod",
+                "chown",
+                "secret_read"
+              ]
+            },
             "uniqueItems": true
+          },
+          "trusted_owner": {
+            "type": "boolean"
           }
         }
       }
+    },
+    "trusted_owner": {
+      "type": "boolean"
     }
   }
 }
