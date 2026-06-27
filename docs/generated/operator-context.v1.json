@@ -585,6 +585,233 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_recovery_status"
+    },
+    {
+      "category": "resource",
+      "description": "Atomically acquire typed resource leases for one owner.",
+      "effects": [
+        "lease-create",
+        "possible-expired-lease-reclaim"
+      ],
+      "id": "grabowski_resource_acquire",
+      "purpose": "Atomically acquire typed resource leases for one owner.",
+      "read_only": false,
+      "reversibility": "resource-release",
+      "risk_class": "medium",
+      "tool": "grabowski_resource_acquire"
+    },
+    {
+      "category": "resource",
+      "description": "Renew live resource leases owned by one owner.",
+      "effects": [
+        "lease-update"
+      ],
+      "id": "grabowski_resource_renew",
+      "purpose": "Renew live resource leases owned by one owner.",
+      "read_only": false,
+      "reversibility": "lease-expiry-or-release",
+      "risk_class": "medium",
+      "tool": "grabowski_resource_renew"
+    },
+    {
+      "category": "resource",
+      "description": "Release owner-bound resource leases; force is an explicit high-risk override.",
+      "effects": [
+        "lease-remove",
+        "possible-force-release"
+      ],
+      "id": "grabowski_resource_release",
+      "purpose": "Release owner-bound resource leases with an explicit force override.",
+      "read_only": false,
+      "reversibility": "resource-reacquire",
+      "risk_class": "high",
+      "tool": "grabowski_resource_release"
+    },
+    {
+      "category": "resource",
+      "description": "Inspect one typed resource lease without returning private metadata.",
+      "effects": [],
+      "id": "grabowski_resource_inspect",
+      "purpose": "Inspect one typed resource lease without returning private metadata.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_resource_inspect"
+    },
+    {
+      "category": "resource",
+      "description": "List bounded resource leases, optionally filtered by owner.",
+      "effects": [],
+      "id": "grabowski_resource_list",
+      "purpose": "List bounded typed resource leases with optional owner filtering.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_resource_list"
+    },
+    {
+      "category": "task",
+      "description": "Reconcile persistent tasks after process loss or host restart.",
+      "effects": [
+        "state-refresh",
+        "lease-release",
+        "possible-process-start"
+      ],
+      "id": "grabowski_task_reconcile",
+      "purpose": "Reconcile persistent task records with systemd units and safely resume retry-safe tasks.",
+      "read_only": false,
+      "reversibility": "conditional",
+      "risk_class": "high",
+      "tool": "grabowski_task_reconcile"
+    },
+    {
+      "category": "artifact",
+      "description": "Return regular-file metadata and SHA-256 for one local or fleet artifact.",
+      "effects": [],
+      "id": "grabowski_artifact_stat",
+      "purpose": "Read regular-file size and SHA-256 on one registered fleet host.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_artifact_stat"
+    },
+    {
+      "category": "artifact",
+      "description": "Push one hash-bound local regular file to a registered SSH fleet host.",
+      "effects": [
+        "remote-file-create-or-replace",
+        "temporary-file-create"
+      ],
+      "id": "grabowski_artifact_push",
+      "purpose": "Push one hash-bound regular file to a registered SSH fleet host.",
+      "read_only": false,
+      "reversibility": "destination-preimage-dependent",
+      "risk_class": "high",
+      "tool": "grabowski_artifact_push"
+    },
+    {
+      "category": "artifact",
+      "description": "Pull one hash-bound regular file from a registered SSH fleet host.",
+      "effects": [
+        "local-file-create-or-replace",
+        "temporary-file-create"
+      ],
+      "id": "grabowski_artifact_pull",
+      "purpose": "Pull one hash-bound regular file from a registered SSH fleet host.",
+      "read_only": false,
+      "reversibility": "destination-preimage-dependent",
+      "risk_class": "high",
+      "tool": "grabowski_artifact_pull"
+    },
+    {
+      "category": "browser-worker",
+      "description": "Start one agent-owned browser with loopback-only CDP in a separate unit.",
+      "effects": [
+        "process-start",
+        "profile-create-or-use",
+        "loopback-listener"
+      ],
+      "id": "grabowski_browser_worker_start",
+      "purpose": "Start an agent-owned browser with a loopback-only debugging endpoint.",
+      "read_only": false,
+      "reversibility": "worker-stop",
+      "risk_class": "high",
+      "tool": "grabowski_browser_worker_start"
+    },
+    {
+      "category": "browser-worker",
+      "description": "Observe one isolated browser worker and release terminal leases.",
+      "effects": [
+        "state-refresh",
+        "possible-lease-release"
+      ],
+      "id": "grabowski_browser_worker_status",
+      "purpose": "Observe one isolated browser worker and reconcile terminal leases.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_browser_worker_status"
+    },
+    {
+      "category": "browser-worker",
+      "description": "Stop one isolated browser worker and clean ephemeral state.",
+      "effects": [
+        "process-stop",
+        "lease-release",
+        "ephemeral-state-remove"
+      ],
+      "id": "grabowski_browser_worker_stop",
+      "purpose": "Stop one isolated browser worker and clean ephemeral state.",
+      "read_only": false,
+      "reversibility": "worker-restart",
+      "risk_class": "medium",
+      "tool": "grabowski_browser_worker_stop"
+    },
+    {
+      "category": "browser-worker",
+      "description": "List isolated agent-owned browser workers.",
+      "effects": [],
+      "id": "grabowski_browser_worker_list",
+      "purpose": "List isolated agent-owned browser workers.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_browser_worker_list"
+    },
+    {
+      "category": "gui-worker",
+      "description": "Start one argv-only GUI child on an isolated Xvfb display without a listener.",
+      "effects": [
+        "process-start",
+        "display-create",
+        "ephemeral-state-create"
+      ],
+      "id": "grabowski_gui_worker_start",
+      "purpose": "Start an argv-only GUI worker on an isolated Xvfb display.",
+      "read_only": false,
+      "reversibility": "worker-stop",
+      "risk_class": "high",
+      "tool": "grabowski_gui_worker_start"
+    },
+    {
+      "category": "gui-worker",
+      "description": "Observe one isolated GUI worker and release terminal leases.",
+      "effects": [
+        "state-refresh",
+        "possible-lease-release"
+      ],
+      "id": "grabowski_gui_worker_status",
+      "purpose": "Observe one isolated GUI worker and reconcile terminal leases.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_gui_worker_status"
+    },
+    {
+      "category": "gui-worker",
+      "description": "Stop one isolated GUI worker and clean its ephemeral XDG state.",
+      "effects": [
+        "process-stop",
+        "lease-release",
+        "ephemeral-state-remove"
+      ],
+      "id": "grabowski_gui_worker_stop",
+      "purpose": "Stop one isolated GUI worker and clean ephemeral XDG state.",
+      "read_only": false,
+      "reversibility": "worker-restart",
+      "risk_class": "medium",
+      "tool": "grabowski_gui_worker_stop"
+    },
+    {
+      "category": "gui-worker",
+      "description": "List isolated GUI workers.",
+      "effects": [],
+      "id": "grabowski_gui_worker_list",
+      "purpose": "List isolated GUI workers.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_gui_worker_list"
     }
   ],
   "integrity": {
@@ -681,7 +908,24 @@
       "grabowski_task_cancel",
       "grabowski_task_resume",
       "grabowski_task_list",
-      "grabowski_recovery_status"
+      "grabowski_recovery_status",
+      "grabowski_resource_acquire",
+      "grabowski_resource_renew",
+      "grabowski_resource_release",
+      "grabowski_resource_inspect",
+      "grabowski_resource_list",
+      "grabowski_task_reconcile",
+      "grabowski_artifact_stat",
+      "grabowski_artifact_push",
+      "grabowski_artifact_pull",
+      "grabowski_browser_worker_start",
+      "grabowski_browser_worker_status",
+      "grabowski_browser_worker_stop",
+      "grabowski_browser_worker_list",
+      "grabowski_gui_worker_start",
+      "grabowski_gui_worker_status",
+      "grabowski_gui_worker_stop",
+      "grabowski_gui_worker_list"
     ],
     "module": "grabowski_operator",
     "source": "src/grabowski_runtime.py",
@@ -721,6 +965,26 @@
       {
         "module": "grabowski_recovery",
         "source": "src/grabowski_recovery.py"
+      },
+      {
+        "module": "grabowski_resources",
+        "source": "src/grabowski_resources.py"
+      },
+      {
+        "module": "grabowski_task_reconcile",
+        "source": "src/grabowski_task_reconcile.py"
+      },
+      {
+        "module": "grabowski_artifacts",
+        "source": "src/grabowski_artifacts.py"
+      },
+      {
+        "module": "grabowski_workers",
+        "source": "src/grabowski_workers.py"
+      },
+      {
+        "module": "grabowski_worker_process",
+        "source": "src/grabowski_worker_process.py"
       }
     ]
   },
@@ -728,27 +992,32 @@
   "sources": {
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "c9ea091ab6be1e3a74b839151f3bcc67ad2d742c3c42dde7e870a9157fd9548e"
+      "sha256": "ea5bcd2b4f2d343f5353ed46327f08dd1954cde5dc0b5f3ff23c4e8dcdca6749"
     },
     "policy_example": {
       "path": "config/access.example.json",
-      "sha256": "0967f6f418a7b644372095b4ad3d074d6b388ef65326e76895ca09f62aab8369"
+      "sha256": "6e2b0ecf2a4a4d0b3740a14f63a760e947335487034cbc039523dae0e9f0edaa"
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "4cb785ab58c42128129acb56c781f77163ace62ed1e51733534d8499bbaa2811"
+      "sha256": "b71d156258ccc1d5e64bd88db3572f77d834970abf838c157343ee3c5dc318f9"
     },
     "runtime_sources": {
-      "src/grabowski_capabilities.py": "c9ea091ab6be1e3a74b839151f3bcc67ad2d742c3c42dde7e870a9157fd9548e",
+      "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
+      "src/grabowski_capabilities.py": "ea5bcd2b4f2d343f5353ed46327f08dd1954cde5dc0b5f3ff23c4e8dcdca6749",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
-      "src/grabowski_mcp.py": "e878103776fedc09b44ef876631ead8a514b3e01eb2da85f99fe0ee17f5a0452",
+      "src/grabowski_mcp.py": "7ee81dcc812f7f93fbdaabf74b59cb4088a09e17fbfeca469afbfe96454685a8",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
-      "src/grabowski_operator.py": "1682b94c186386be2868e4e700a431bd50c26576a8923cb33bdf7416bed1f8cb",
+      "src/grabowski_operator.py": "e982a1753dcb20b8c579960e8ed3e932d23c26587f8245f3e2ebae44b5ba76ac",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
       "src/grabowski_recovery.py": "7d02ecdc5bc391314e2df994c67a93cf3c53f73eab90fef9bc9f6e885be16b35",
-      "src/grabowski_runtime.py": "85ffdfcce077d3c1b4daeca08e84f5bda87ff538477e242de48504ed517b4f5f",
+      "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
+      "src/grabowski_runtime.py": "1f16db6db861a022c594e927f642e4bed75082d8fe1164a71620c7b3e8cbbe7c",
       "src/grabowski_runtime_extensions.py": "3092fc1e9031cc2d3beb9e6e1e2a43ea31d68fe07cc6186055d06dacb56e87ed",
-      "src/grabowski_tasks.py": "557a1719825b333e01419f3b5b9f197c3689615d087be5dac628bec46d9b4ebe"
+      "src/grabowski_task_reconcile.py": "884c80f2f4049b3f328198a60c55106034a1bf7cf64b036b52f25df767a5ecb1",
+      "src/grabowski_tasks.py": "56999dfed7ad96f18aa4cb267d2b991a65fafe3167f6d189bf9cce862eec6782",
+      "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
+      "src/grabowski_workers.py": "6d27eaf6129ff45eb2ca6affb625765647e913fbbf3d04ebe71aa3c8b0a79422"
     }
   }
 }

@@ -17,11 +17,17 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_runtime_extensions.py
 >$(PYTHON) -m py_compile src/grabowski_runtime.py
 >$(PYTHON) -m py_compile src/grabowski_fleet.py
+>$(PYTHON) -m py_compile src/grabowski_artifacts.py
 >$(PYTHON) -m py_compile src/grabowski_operations.py
 >$(PYTHON) -m py_compile src/grabowski_privileged.py
+>$(PYTHON) -m py_compile src/grabowski_privileged_status_core.py
 >$(PYTHON) -m py_compile src/grabowski_privileged_broker.py
 >$(PYTHON) -m py_compile src/grabowski_recovery.py
 >$(PYTHON) -m py_compile src/grabowski_tasks.py
+>$(PYTHON) -m py_compile src/grabowski_resources.py
+>$(PYTHON) -m py_compile src/grabowski_task_reconcile.py
+>$(PYTHON) -m py_compile src/grabowski_workers.py
+>$(PYTHON) -m py_compile src/grabowski_worker_process.py
 >$(PYTHON) -m py_compile tools/build_operator_context.py
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
 >$(PYTHON) -m py_compile tools/deploy_runtime_dual.py

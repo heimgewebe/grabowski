@@ -76,6 +76,10 @@ OPERATOR_CAPABILITIES = (
     "process_signal",
     "port_inspect",
     "privileged_reference",
+    "resource_lease",
+    "artifact_transfer",
+    "browser_worker",
+    "gui_worker",
 )
 PRIVILEGED_REFERENCE_ACTIONS = {
     "install_system_package",

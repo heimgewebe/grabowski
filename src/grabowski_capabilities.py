@@ -338,8 +338,129 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_task_reconcile": {
+        "category": "task",
+        "purpose": "Reconcile persistent task records with systemd units and safely resume retry-safe tasks.",
+        "risk_class": "high",
+        "effects": ["state-refresh", "lease-release", "possible-process-start"],
+        "reversibility": "conditional",
+    },
+    "grabowski_resource_acquire": {
+        "category": "resource",
+        "purpose": "Atomically acquire typed resource leases for one owner.",
+        "risk_class": "medium",
+        "effects": ["lease-create", "possible-expired-lease-reclaim"],
+        "reversibility": "resource-release",
+    },
+    "grabowski_resource_renew": {
+        "category": "resource",
+        "purpose": "Renew live resource leases owned by one owner.",
+        "risk_class": "medium",
+        "effects": ["lease-update"],
+        "reversibility": "lease-expiry-or-release",
+    },
+    "grabowski_resource_release": {
+        "category": "resource",
+        "purpose": "Release owner-bound resource leases with an explicit force override.",
+        "risk_class": "high",
+        "effects": ["lease-remove", "possible-force-release"],
+        "reversibility": "resource-reacquire",
+    },
+    "grabowski_resource_inspect": {
+        "category": "resource",
+        "purpose": "Inspect one typed resource lease without returning private metadata.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_resource_list": {
+        "category": "resource",
+        "purpose": "List bounded typed resource leases with optional owner filtering.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_artifact_stat": {
+        "category": "artifact",
+        "purpose": "Read regular-file size and SHA-256 on one registered fleet host.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_artifact_push": {
+        "category": "artifact",
+        "purpose": "Push one hash-bound regular file to a registered SSH fleet host.",
+        "risk_class": "high",
+        "effects": ["remote-file-create-or-replace", "temporary-file-create"],
+        "reversibility": "destination-preimage-dependent",
+    },
+    "grabowski_artifact_pull": {
+        "category": "artifact",
+        "purpose": "Pull one hash-bound regular file from a registered SSH fleet host.",
+        "risk_class": "high",
+        "effects": ["local-file-create-or-replace", "temporary-file-create"],
+        "reversibility": "destination-preimage-dependent",
+    },
 
 }
+
+
+TOOL_PROFILES.update(
+{'grabowski_browser_worker_start': {'category': 'browser-worker',
+                                    'purpose': 'Start an agent-owned browser with a loopback-only '
+                                               'debugging endpoint.',
+                                    'risk_class': 'high',
+                                    'effects': ['process-start',
+                                                'profile-create-or-use',
+                                                'loopback-listener'],
+                                    'reversibility': 'worker-stop'},
+ 'grabowski_browser_worker_status': {'category': 'browser-worker',
+                                     'purpose': 'Observe one isolated browser worker and reconcile '
+                                                'terminal leases.',
+                                     'risk_class': 'low',
+                                     'effects': ['state-refresh', 'possible-lease-release'],
+                                     'reversibility': 'not-applicable'},
+ 'grabowski_browser_worker_stop': {'category': 'browser-worker',
+                                   'purpose': 'Stop one isolated browser worker and clean '
+                                              'ephemeral state.',
+                                   'risk_class': 'medium',
+                                   'effects': ['process-stop',
+                                               'lease-release',
+                                               'ephemeral-state-remove'],
+                                   'reversibility': 'worker-restart'},
+ 'grabowski_browser_worker_list': {'category': 'browser-worker',
+                                   'purpose': 'List isolated agent-owned browser workers.',
+                                   'risk_class': 'low',
+                                   'effects': [],
+                                   'reversibility': 'not-applicable'},
+ 'grabowski_gui_worker_start': {'category': 'gui-worker',
+                                'purpose': 'Start an argv-only GUI worker on an isolated Xvfb '
+                                           'display.',
+                                'risk_class': 'high',
+                                'effects': ['process-start',
+                                            'display-create',
+                                            'ephemeral-state-create'],
+                                'reversibility': 'worker-stop'},
+ 'grabowski_gui_worker_status': {'category': 'gui-worker',
+                                 'purpose': 'Observe one isolated GUI worker and reconcile '
+                                            'terminal leases.',
+                                 'risk_class': 'low',
+                                 'effects': ['state-refresh', 'possible-lease-release'],
+                                 'reversibility': 'not-applicable'},
+ 'grabowski_gui_worker_stop': {'category': 'gui-worker',
+                               'purpose': 'Stop one isolated GUI worker and clean ephemeral XDG '
+                                          'state.',
+                               'risk_class': 'medium',
+                               'effects': ['process-stop',
+                                           'lease-release',
+                                           'ephemeral-state-remove'],
+                               'reversibility': 'worker-restart'},
+ 'grabowski_gui_worker_list': {'category': 'gui-worker',
+                               'purpose': 'List isolated GUI workers.',
+                               'risk_class': 'low',
+                               'effects': [],
+                               'reversibility': 'not-applicable'}}
+)
 
 
 PROFILE_CATEGORIES: dict[str, set[str] | None] = {
@@ -356,6 +477,10 @@ PROFILE_CATEGORIES: dict[str, set[str] | None] = {
         "operation",
         "task",
         "recovery",
+        "resource",
+        "artifact",
+        "browser-worker",
+        "gui-worker",
     },
     "host-operations": {
         "context",
@@ -369,6 +494,10 @@ PROFILE_CATEGORIES: dict[str, set[str] | None] = {
         "operation",
         "task",
         "recovery",
+        "resource",
+        "artifact",
+        "browser-worker",
+        "gui-worker",
     },
     "full": None,
 }

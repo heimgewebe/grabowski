@@ -39,6 +39,26 @@
     {
       "module": "grabowski_recovery",
       "source": "src/grabowski_recovery.py"
+    },
+    {
+      "module": "grabowski_resources",
+      "source": "src/grabowski_resources.py"
+    },
+    {
+      "module": "grabowski_task_reconcile",
+      "source": "src/grabowski_task_reconcile.py"
+    },
+    {
+      "module": "grabowski_artifacts",
+      "source": "src/grabowski_artifacts.py"
+    },
+    {
+      "module": "grabowski_workers",
+      "source": "src/grabowski_workers.py"
+    },
+    {
+      "module": "grabowski_worker_process",
+      "source": "src/grabowski_worker_process.py"
     }
   ],
   "expected_tools": [
@@ -88,6 +108,23 @@
     "grabowski_task_cancel",
     "grabowski_task_resume",
     "grabowski_task_list",
-    "grabowski_recovery_status"
+    "grabowski_recovery_status",
+    "grabowski_resource_acquire",
+    "grabowski_resource_renew",
+    "grabowski_resource_release",
+    "grabowski_resource_inspect",
+    "grabowski_resource_list",
+    "grabowski_task_reconcile",
+    "grabowski_artifact_stat",
+    "grabowski_artifact_push",
+    "grabowski_artifact_pull",
+    "grabowski_browser_worker_start",
+    "grabowski_browser_worker_status",
+    "grabowski_browser_worker_stop",
+    "grabowski_browser_worker_list",
+    "grabowski_gui_worker_start",
+    "grabowski_gui_worker_status",
+    "grabowski_gui_worker_stop",
+    "grabowski_gui_worker_list"
   ]
 }

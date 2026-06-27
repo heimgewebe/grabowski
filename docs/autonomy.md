@@ -66,3 +66,12 @@ Privilegienmechanismus. Das Tool erzeugt nur ein schema-valides
 lehnt secret-artige Ziel- oder Begründungstexte ab. Referenzen enthalten eine
 kurze Ablaufzeit und deklarieren eine Single-Use-Replay-Policy für den späteren
 externen Broker.
+
+
+## Kollisionskontrolle und spezialisierte Worker
+
+Breite User-Space-Ausführung wird durch typisierte Ressourcenleases koordiniert. Persistente Tasks, Artefakttransfers sowie Browser- und GUI-Worker belegen ihre Pfade, Ports, Profile oder Displays atomar und geben sie bei terminalen Zuständen wieder frei.
+
+Browser- und GUI-Arbeit läuft nicht im öffentlichen MCP-Prozess. Agenteneigene Browser erhalten eine ausschließlich an Loopback gebundene Debug-Schnittstelle. GUI-Worker verwenden Xvfb ohne TCP-, VNC- oder Xpra-Listener. Bestehende Nutzertabs werden nicht übernommen.
+
+Der Rootpfad bleibt ein separater, root-eigener Template-Broker. Das Status-CLI ist checkout-fähig und MCP-unabhängig; Installation und Aktivierung bleiben explizite Hostoperationen.

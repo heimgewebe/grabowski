@@ -63,6 +63,10 @@ OPERATOR_CAPABILITIES = (
     "process_signal",
     "port_inspect",
     "privileged_reference",
+    "resource_lease",
+    "artifact_transfer",
+    "browser_worker",
+    "gui_worker",
 )
 RESERVED_DISABLED_CAPABILITIES = (
     "file_delete",

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "c9ea091ab6be1e3a74b839151f3bcc67ad2d742c3c42dde7e870a9157fd9548e",
+  "capability_source_sha256": "ea5bcd2b4f2d343f5353ed46327f08dd1954cde5dc0b5f3ff23c4e8dcdca6749",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "4cb785ab58c42128129acb56c781f77163ace62ed1e51733534d8499bbaa2811",
+  "contract_sha256": "b71d156258ccc1d5e64bd88db3572f77d834970abf838c157343ee3c5dc318f9",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -597,6 +597,233 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_recovery_status"
+    },
+    {
+      "category": "resource",
+      "description": "Atomically acquire typed resource leases for one owner.",
+      "effects": [
+        "lease-create",
+        "possible-expired-lease-reclaim"
+      ],
+      "id": "grabowski_resource_acquire",
+      "purpose": "Atomically acquire typed resource leases for one owner.",
+      "read_only": false,
+      "reversibility": "resource-release",
+      "risk_class": "medium",
+      "tool": "grabowski_resource_acquire"
+    },
+    {
+      "category": "resource",
+      "description": "Renew live resource leases owned by one owner.",
+      "effects": [
+        "lease-update"
+      ],
+      "id": "grabowski_resource_renew",
+      "purpose": "Renew live resource leases owned by one owner.",
+      "read_only": false,
+      "reversibility": "lease-expiry-or-release",
+      "risk_class": "medium",
+      "tool": "grabowski_resource_renew"
+    },
+    {
+      "category": "resource",
+      "description": "Release owner-bound resource leases; force is an explicit high-risk override.",
+      "effects": [
+        "lease-remove",
+        "possible-force-release"
+      ],
+      "id": "grabowski_resource_release",
+      "purpose": "Release owner-bound resource leases with an explicit force override.",
+      "read_only": false,
+      "reversibility": "resource-reacquire",
+      "risk_class": "high",
+      "tool": "grabowski_resource_release"
+    },
+    {
+      "category": "resource",
+      "description": "Inspect one typed resource lease without returning private metadata.",
+      "effects": [],
+      "id": "grabowski_resource_inspect",
+      "purpose": "Inspect one typed resource lease without returning private metadata.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_resource_inspect"
+    },
+    {
+      "category": "resource",
+      "description": "List bounded resource leases, optionally filtered by owner.",
+      "effects": [],
+      "id": "grabowski_resource_list",
+      "purpose": "List bounded typed resource leases with optional owner filtering.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_resource_list"
+    },
+    {
+      "category": "task",
+      "description": "Reconcile persistent tasks after process loss or host restart.",
+      "effects": [
+        "state-refresh",
+        "lease-release",
+        "possible-process-start"
+      ],
+      "id": "grabowski_task_reconcile",
+      "purpose": "Reconcile persistent task records with systemd units and safely resume retry-safe tasks.",
+      "read_only": false,
+      "reversibility": "conditional",
+      "risk_class": "high",
+      "tool": "grabowski_task_reconcile"
+    },
+    {
+      "category": "artifact",
+      "description": "Return regular-file metadata and SHA-256 for one local or fleet artifact.",
+      "effects": [],
+      "id": "grabowski_artifact_stat",
+      "purpose": "Read regular-file size and SHA-256 on one registered fleet host.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_artifact_stat"
+    },
+    {
+      "category": "artifact",
+      "description": "Push one hash-bound local regular file to a registered SSH fleet host.",
+      "effects": [
+        "remote-file-create-or-replace",
+        "temporary-file-create"
+      ],
+      "id": "grabowski_artifact_push",
+      "purpose": "Push one hash-bound regular file to a registered SSH fleet host.",
+      "read_only": false,
+      "reversibility": "destination-preimage-dependent",
+      "risk_class": "high",
+      "tool": "grabowski_artifact_push"
+    },
+    {
+      "category": "artifact",
+      "description": "Pull one hash-bound regular file from a registered SSH fleet host.",
+      "effects": [
+        "local-file-create-or-replace",
+        "temporary-file-create"
+      ],
+      "id": "grabowski_artifact_pull",
+      "purpose": "Pull one hash-bound regular file from a registered SSH fleet host.",
+      "read_only": false,
+      "reversibility": "destination-preimage-dependent",
+      "risk_class": "high",
+      "tool": "grabowski_artifact_pull"
+    },
+    {
+      "category": "browser-worker",
+      "description": "Start one agent-owned browser with loopback-only CDP in a separate unit.",
+      "effects": [
+        "process-start",
+        "profile-create-or-use",
+        "loopback-listener"
+      ],
+      "id": "grabowski_browser_worker_start",
+      "purpose": "Start an agent-owned browser with a loopback-only debugging endpoint.",
+      "read_only": false,
+      "reversibility": "worker-stop",
+      "risk_class": "high",
+      "tool": "grabowski_browser_worker_start"
+    },
+    {
+      "category": "browser-worker",
+      "description": "Observe one isolated browser worker and release terminal leases.",
+      "effects": [
+        "state-refresh",
+        "possible-lease-release"
+      ],
+      "id": "grabowski_browser_worker_status",
+      "purpose": "Observe one isolated browser worker and reconcile terminal leases.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_browser_worker_status"
+    },
+    {
+      "category": "browser-worker",
+      "description": "Stop one isolated browser worker and clean ephemeral state.",
+      "effects": [
+        "process-stop",
+        "lease-release",
+        "ephemeral-state-remove"
+      ],
+      "id": "grabowski_browser_worker_stop",
+      "purpose": "Stop one isolated browser worker and clean ephemeral state.",
+      "read_only": false,
+      "reversibility": "worker-restart",
+      "risk_class": "medium",
+      "tool": "grabowski_browser_worker_stop"
+    },
+    {
+      "category": "browser-worker",
+      "description": "List isolated agent-owned browser workers.",
+      "effects": [],
+      "id": "grabowski_browser_worker_list",
+      "purpose": "List isolated agent-owned browser workers.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_browser_worker_list"
+    },
+    {
+      "category": "gui-worker",
+      "description": "Start one argv-only GUI child on an isolated Xvfb display without a listener.",
+      "effects": [
+        "process-start",
+        "display-create",
+        "ephemeral-state-create"
+      ],
+      "id": "grabowski_gui_worker_start",
+      "purpose": "Start an argv-only GUI worker on an isolated Xvfb display.",
+      "read_only": false,
+      "reversibility": "worker-stop",
+      "risk_class": "high",
+      "tool": "grabowski_gui_worker_start"
+    },
+    {
+      "category": "gui-worker",
+      "description": "Observe one isolated GUI worker and release terminal leases.",
+      "effects": [
+        "state-refresh",
+        "possible-lease-release"
+      ],
+      "id": "grabowski_gui_worker_status",
+      "purpose": "Observe one isolated GUI worker and reconcile terminal leases.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_gui_worker_status"
+    },
+    {
+      "category": "gui-worker",
+      "description": "Stop one isolated GUI worker and clean its ephemeral XDG state.",
+      "effects": [
+        "process-stop",
+        "lease-release",
+        "ephemeral-state-remove"
+      ],
+      "id": "grabowski_gui_worker_stop",
+      "purpose": "Stop one isolated GUI worker and clean ephemeral XDG state.",
+      "read_only": false,
+      "reversibility": "worker-restart",
+      "risk_class": "medium",
+      "tool": "grabowski_gui_worker_stop"
+    },
+    {
+      "category": "gui-worker",
+      "description": "List isolated GUI workers.",
+      "effects": [],
+      "id": "grabowski_gui_worker_list",
+      "purpose": "List isolated GUI workers.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_gui_worker_list"
     }
   ]
 }

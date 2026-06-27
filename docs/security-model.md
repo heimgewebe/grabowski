@@ -64,9 +64,23 @@ und erzwingen Byte-Limits vor und während des Lesens. Audit und Evidence für
 sensitive Mutationen enthalten nur Pfade, Hashes, Request-/Transaction-IDs,
 Capability-/Profil- und Postflight-Metadaten, keine Secret-Werte.
 
-Privilegierte Aktionen werden nicht lokal ausgeführt. Der v1-Contract unter
-`contracts/privileged-action-reference.v1.schema.json` beschreibt nur
-unprivilegierte Referenzen für eine spätere, getrennt autorisierte Komponente.
-Jede Referenz trägt eine Ablaufzeit und eine deklarierte
-`single-use-external-broker`-Replay-Policy; ein späterer privilegierter Broker
-muss abgelaufene oder bereits verwendete Referenzen ablehnen.
+Privilegierte Aktionen bleiben von der gehärteten MCP-Runtime getrennt. Der
+Contract unter `contracts/privileged-action-reference.v1.schema.json` erzeugt
+kurzlebige Single-Use-Referenzen für den root-eigenen Socket-Broker. Der Broker
+führt ausschließlich konfigurierte argv-Templates aus; sein Host-Bootstrap ist
+eine explizite Systemoperation.
+
+## Trusted Owner
+
+Für den allein kontrollierten Heim-PC ist `trusted-owner` das vorgesehene
+Vollprofil. Es stellt den gesamten sichtbaren Host-Dateibaum, die vollständige
+Prozessumgebung, lange Laufzeitbudgets, Fleet-Ausführung und alle implementierten
+Capabilities bereit. Befehl-, Pfad- oder Programmnamen werden in diesem Profil
+nicht pauschal blockiert. Auch Privilegierungs-Frontends dürfen aufgerufen
+werden; ob sie erfolgreich sind, entscheidet die Hostkonfiguration.
+
+Erhalten bleiben nur wirkungsbezogene Invarianten: Konkurrenzleases, atomare
+Publikation, Audit-Provenienz, Secret-Redaktion in Ausgaben, Schutz vor stillen
+Zielüberschreibungen und die kanonische Evidence-Zone. Diese Mechanismen
+verhindern keine legitime Aufgabe, sondern machen parallele und folgenreiche
+Operationen deterministisch überprüfbar.

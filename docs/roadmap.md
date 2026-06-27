@@ -109,3 +109,18 @@ Status: typed user-space control plane implemented; privileged execution remains
 - `secret_use` als Standard und begründungspflichtiges Break-Glass-`secret_reveal`,
 - deterministische Connector-Snapshot-Probe,
 - root-eigene Privileged-Action-Templates standardmäßig deaktiviert.
+
+
+## GRABOWSKI-OPERATOR-COMPLETION-001
+
+Status: implemented in repository; live policy migration and connector refresh remain explicit.
+
+- atomare Ressourcenleases für Repo, Pfad, Port, Dienst, Browserprofil und Display,
+- verlustfreie Task-DB-Migration und lease-gebundene persistente Tasks,
+- Boot-/Perioden-Reconciliation mit Auto-Resume nur für `retry-safe`; Recovery-Gates nur für Power-Effekte,
+- hashgebundener Artefakttransport mit Ziel-CAS und atomarer Publikation,
+- agenteneigene Browserworker mit Loopback-CDP,
+- isolierte Xvfb-GUI-Worker ohne Remote-Display-Listener,
+- MCP-unabhängiger, inhaltsfreier Rootbroker-Status.
+
+Hostseitig offen bleiben die bewusste Rootbroker-Installation, Xvfb-Bereitstellung, Reconcile-Unit-Aktivierung und der Connector-Snapshot-Refresh.

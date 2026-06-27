@@ -59,6 +59,23 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_task_resume` | task | no | variable | Recreate a missing or stopped task unit from its persistent record. |
 | `grabowski_task_list` | task | yes | low | List recent persistent task records with optional state filtering. |
 | `grabowski_recovery_status` | recovery | yes | low | Evaluate the fail-closed recovery gate for power-worker activation. |
+| `grabowski_resource_acquire` | resource | no | medium | Atomically acquire typed resource leases for one owner. |
+| `grabowski_resource_renew` | resource | no | medium | Renew live resource leases owned by one owner. |
+| `grabowski_resource_release` | resource | no | high | Release owner-bound resource leases with an explicit force override. |
+| `grabowski_resource_inspect` | resource | yes | low | Inspect one typed resource lease without returning private metadata. |
+| `grabowski_resource_list` | resource | yes | low | List bounded typed resource leases with optional owner filtering. |
+| `grabowski_task_reconcile` | task | no | high | Reconcile persistent task records with systemd units and safely resume retry-safe tasks. |
+| `grabowski_artifact_stat` | artifact | yes | low | Read regular-file size and SHA-256 on one registered fleet host. |
+| `grabowski_artifact_push` | artifact | no | high | Push one hash-bound regular file to a registered SSH fleet host. |
+| `grabowski_artifact_pull` | artifact | no | high | Pull one hash-bound regular file from a registered SSH fleet host. |
+| `grabowski_browser_worker_start` | browser-worker | no | high | Start an agent-owned browser with a loopback-only debugging endpoint. |
+| `grabowski_browser_worker_status` | browser-worker | yes | low | Observe one isolated browser worker and reconcile terminal leases. |
+| `grabowski_browser_worker_stop` | browser-worker | no | medium | Stop one isolated browser worker and clean ephemeral state. |
+| `grabowski_browser_worker_list` | browser-worker | yes | low | List isolated agent-owned browser workers. |
+| `grabowski_gui_worker_start` | gui-worker | no | high | Start an argv-only GUI worker on an isolated Xvfb display. |
+| `grabowski_gui_worker_status` | gui-worker | yes | low | Observe one isolated GUI worker and reconcile terminal leases. |
+| `grabowski_gui_worker_stop` | gui-worker | no | medium | Stop one isolated GUI worker and clean ephemeral XDG state. |
+| `grabowski_gui_worker_list` | gui-worker | yes | low | List isolated GUI workers. |
 
 ## Policy contract
 
