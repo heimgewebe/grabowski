@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added a typed read surface with narrow context, Git, GitHub and user-service
+  diagnostics; generic operator tools remain available, while publication
+  profiles are defined as projections of the single canonical contract.
 - Added a typed home fleet registry and argv-only local/SSH execution path for
   `heim-pc`, `heimserver` and `heimberry`, plus contracted operation recipes
   with preflight, action, postflight and reverse-order rollback.

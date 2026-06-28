@@ -30,6 +30,18 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_rollback_text` | audit | no | medium | Restore a quarantined preimage from an audited replace transaction. |
 | `grabowski_verify_audit` | audit | yes | low | Verify the tamper-evident write audit hash chain. |
 | `latest_complete_bundles` | knowledge | yes | low | Read the curated latest-complete Lens and repoLens bundle registry. |
+| `grabowski_runtime_health` | context | yes | low | Read minimal deployment, audit and kill-switch health without path inventories. |
+| `grabowski_deployment_identity` | context | yes | low | Read bounded runtime identity and integrity flags without local paths. |
+| `grabowski_contract_drift` | context | yes | low | Read bounded runtime-contract and capability-catalog drift. |
+| `grabowski_checkout_summary` | version-control | yes | low | Read a bounded summary of Grabowski repository worktrees. |
+| `grabowski_git_status` | version-control | yes | low | Read fixed short Git status for one allowed repository. |
+| `grabowski_git_diff` | version-control | yes | low | Read a bounded staged or unstaged Git diff without external helpers. |
+| `grabowski_git_log` | version-control | yes | low | Read a bounded fixed-format Git commit log. |
+| `grabowski_git_show` | version-control | yes | low | Read one bounded Git revision without external diff or textconv helpers. |
+| `grabowski_github_pr_view` | remote-version-control | yes | low | Read bounded GitHub pull-request metadata without body or comments. |
+| `grabowski_github_checks` | remote-version-control | yes | low | Read bounded GitHub pull-request check results. |
+| `grabowski_service_status` | service | yes | low | Read a fixed property set for one user-level systemd unit. |
+| `grabowski_service_logs` | service | yes | low | Read bounded redacted journal lines for one user-level systemd unit. |
 | `grabowski_terminal_run` | command | no | variable | Run one bounded non-interactive command as the current user. |
 | `grabowski_job_start` | command | no | variable | Start a durable bounded background command as a transient user service. |
 | `grabowski_job_status` | command | yes | low | Read durable metadata and current service state for one Grabowski job. |

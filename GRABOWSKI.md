@@ -4,27 +4,37 @@ Grabowski is the local MCP operator for the user's home PC. Its purpose is to le
 
 ## Start here
 
-For a complex task, first call:
+For ordinary orientation, prefer the narrow read tools:
+
+```text
+grabowski_runtime_health()
+grabowski_contract_drift()
+```
+
+Add only the context required by the task:
+
+```text
+grabowski_deployment_identity()
+grabowski_checkout_summary()
+```
+
+Use the broad live context only when the task actually needs the combined policy, capability and checkout inventory:
 
 ```text
 grabowski_context(profile="concise")
-```
-
-Then select a task profile when useful:
-
-```text
 grabowski_context(profile="repository-work")
 grabowski_context(profile="host-operations")
 grabowski_context(profile="full")
 ```
 
-The live context is authoritative for the running deployment, active policy, available capabilities and checkout drift. The generated repository documents describe the intended contract:
+The live tools are authoritative for the running deployment, active policy, available capabilities and checkout drift. The generated repository documents describe the intended contract:
 
 - `docs/generated/operator-context.md`
 - `docs/generated/operator-context.v1.json`
 - `contracts/capability-catalog.v1.json`
 - `docs/control-plane.md`
 - `docs/checkout-lifecycle.md`
+- `docs/typed-read-surface.md`
 - `docs/privileged-broker-bootstrap.md`
 
 ## Truth hierarchy
@@ -39,9 +49,15 @@ A mismatch must remain visible. Do not silently treat an older checkout or conne
 
 ## Operating rule
 
-Before a mutation establish the target, current state, intended result, validation, stop condition and rollback path. Prefer typed operations over generic shell or Git commands when a typed operation exists.
+Use the narrowest typed read operation that can establish current state. Before a mutation establish the target, intended result, validation, stop condition and rollback path. Prefer typed operations over generic shell, Git, GitHub or service commands when a typed operation exists.
+
+Generic operator tools remain available as fallback mechanisms; they are not the default diagnostic route. A failed read is classified and reviewed rather than automatically repeated through a broader tool.
 
 `~/repos/merges` is immutable evidence. Secret values and browser profiles are not exposed. Privileged or secret-backed effects should eventually be delegated through typed brokers rather than by revealing credentials to ChatGPT.
+
+## Publication profiles
+
+`core`, `operator` and `full` are projections of the single runtime contract and capability catalog, not duplicated implementations. No second connector is registered merely because the projections exist. A separate core connector requires a measured canary advantage first.
 
 ## Self-update contract
 
@@ -55,4 +71,4 @@ Before a mutation establish the target, current state, intended result, validati
 - capability profiles are missing or orphaned;
 - duplicate tools are present.
 
-The `grabowski_context` tool computes live runtime and checkout state on every call. Static prose is therefore not trusted as a substitute for current evidence.
+The live context tools compute runtime and checkout state on every call. Static prose is therefore not trusted as a substitute for current evidence.

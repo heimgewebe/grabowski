@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "d2d2c13221e5e2b54c562a03458041a3dc3fd8d6d32d242591f6965bac1f4ffc",
+  "capability_source_sha256": "44c6c03fa63d78c8e47c50a42075b47e8c3bad5905227e40512c705d6ea5d22e",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "ccef480118e427f11891120cd06dd399344c14e2801014b51f9467dae0dfd498",
+  "contract_sha256": "3280aa145264aa9cafa371901de1538d83fd445f3b78ee77a70d65a51369f153",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -237,6 +237,142 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "latest_complete_bundles"
+    },
+    {
+      "category": "context",
+      "description": "Return minimal Grabowski deployment, audit and kill-switch health.",
+      "effects": [],
+      "id": "grabowski_runtime_health",
+      "purpose": "Read minimal deployment, audit and kill-switch health without path inventories.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_runtime_health"
+    },
+    {
+      "category": "context",
+      "description": "Return bounded runtime identity and integrity flags without local paths.",
+      "effects": [],
+      "id": "grabowski_deployment_identity",
+      "purpose": "Read bounded runtime identity and integrity flags without local paths.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_deployment_identity"
+    },
+    {
+      "category": "context",
+      "description": "Return bounded runtime-contract and capability-catalog drift.",
+      "effects": [],
+      "id": "grabowski_contract_drift",
+      "purpose": "Read bounded runtime-contract and capability-catalog drift.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_contract_drift"
+    },
+    {
+      "category": "version-control",
+      "description": "Return a bounded summary of Grabowski repository worktrees.",
+      "effects": [],
+      "id": "grabowski_checkout_summary",
+      "purpose": "Read a bounded summary of Grabowski repository worktrees.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_checkout_summary"
+    },
+    {
+      "category": "version-control",
+      "description": "Read fixed short Git status for one allowed repository.",
+      "effects": [],
+      "id": "grabowski_git_status",
+      "purpose": "Read fixed short Git status for one allowed repository.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_git_status"
+    },
+    {
+      "category": "version-control",
+      "description": "Read a bounded unstaged or staged Git diff without external helpers.",
+      "effects": [],
+      "id": "grabowski_git_diff",
+      "purpose": "Read a bounded staged or unstaged Git diff without external helpers.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_git_diff"
+    },
+    {
+      "category": "version-control",
+      "description": "Read a bounded fixed-format Git commit log.",
+      "effects": [],
+      "id": "grabowski_git_log",
+      "purpose": "Read a bounded fixed-format Git commit log.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_git_log"
+    },
+    {
+      "category": "version-control",
+      "description": "Read one bounded Git revision without external diff or textconv helpers.",
+      "effects": [],
+      "id": "grabowski_git_show",
+      "purpose": "Read one bounded Git revision without external diff or textconv helpers.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_git_show"
+    },
+    {
+      "category": "remote-version-control",
+      "description": "Read bounded GitHub pull-request metadata without body or comments.",
+      "effects": [
+        "remote-read"
+      ],
+      "id": "grabowski_github_pr_view",
+      "purpose": "Read bounded GitHub pull-request metadata without body or comments.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_github_pr_view"
+    },
+    {
+      "category": "remote-version-control",
+      "description": "Read bounded GitHub pull-request check results.",
+      "effects": [
+        "remote-read"
+      ],
+      "id": "grabowski_github_checks",
+      "purpose": "Read bounded GitHub pull-request check results.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_github_checks"
+    },
+    {
+      "category": "service",
+      "description": "Read a fixed property set for one user-level systemd unit.",
+      "effects": [],
+      "id": "grabowski_service_status",
+      "purpose": "Read a fixed property set for one user-level systemd unit.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_service_status"
+    },
+    {
+      "category": "service",
+      "description": "Read bounded recent journal lines for one user-level systemd unit.",
+      "effects": [],
+      "id": "grabowski_service_logs",
+      "purpose": "Read bounded redacted journal lines for one user-level systemd unit.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_service_logs"
     },
     {
       "category": "command",

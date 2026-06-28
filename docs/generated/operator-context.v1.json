@@ -227,6 +227,142 @@
       "tool": "latest_complete_bundles"
     },
     {
+      "category": "context",
+      "description": "Return minimal Grabowski deployment, audit and kill-switch health.",
+      "effects": [],
+      "id": "grabowski_runtime_health",
+      "purpose": "Read minimal deployment, audit and kill-switch health without path inventories.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_runtime_health"
+    },
+    {
+      "category": "context",
+      "description": "Return bounded runtime identity and integrity flags without local paths.",
+      "effects": [],
+      "id": "grabowski_deployment_identity",
+      "purpose": "Read bounded runtime identity and integrity flags without local paths.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_deployment_identity"
+    },
+    {
+      "category": "context",
+      "description": "Return bounded runtime-contract and capability-catalog drift.",
+      "effects": [],
+      "id": "grabowski_contract_drift",
+      "purpose": "Read bounded runtime-contract and capability-catalog drift.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_contract_drift"
+    },
+    {
+      "category": "version-control",
+      "description": "Return a bounded summary of Grabowski repository worktrees.",
+      "effects": [],
+      "id": "grabowski_checkout_summary",
+      "purpose": "Read a bounded summary of Grabowski repository worktrees.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_checkout_summary"
+    },
+    {
+      "category": "version-control",
+      "description": "Read fixed short Git status for one allowed repository.",
+      "effects": [],
+      "id": "grabowski_git_status",
+      "purpose": "Read fixed short Git status for one allowed repository.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_git_status"
+    },
+    {
+      "category": "version-control",
+      "description": "Read a bounded unstaged or staged Git diff without external helpers.",
+      "effects": [],
+      "id": "grabowski_git_diff",
+      "purpose": "Read a bounded staged or unstaged Git diff without external helpers.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_git_diff"
+    },
+    {
+      "category": "version-control",
+      "description": "Read a bounded fixed-format Git commit log.",
+      "effects": [],
+      "id": "grabowski_git_log",
+      "purpose": "Read a bounded fixed-format Git commit log.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_git_log"
+    },
+    {
+      "category": "version-control",
+      "description": "Read one bounded Git revision without external diff or textconv helpers.",
+      "effects": [],
+      "id": "grabowski_git_show",
+      "purpose": "Read one bounded Git revision without external diff or textconv helpers.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_git_show"
+    },
+    {
+      "category": "remote-version-control",
+      "description": "Read bounded GitHub pull-request metadata without body or comments.",
+      "effects": [
+        "remote-read"
+      ],
+      "id": "grabowski_github_pr_view",
+      "purpose": "Read bounded GitHub pull-request metadata without body or comments.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_github_pr_view"
+    },
+    {
+      "category": "remote-version-control",
+      "description": "Read bounded GitHub pull-request check results.",
+      "effects": [
+        "remote-read"
+      ],
+      "id": "grabowski_github_checks",
+      "purpose": "Read bounded GitHub pull-request check results.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_github_checks"
+    },
+    {
+      "category": "service",
+      "description": "Read a fixed property set for one user-level systemd unit.",
+      "effects": [],
+      "id": "grabowski_service_status",
+      "purpose": "Read a fixed property set for one user-level systemd unit.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_service_status"
+    },
+    {
+      "category": "service",
+      "description": "Read bounded recent journal lines for one user-level systemd unit.",
+      "effects": [],
+      "id": "grabowski_service_logs",
+      "purpose": "Read bounded redacted journal lines for one user-level systemd unit.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_service_logs"
+    },
+    {
       "category": "command",
       "description": "Run one non-interactive command and return redacted output.",
       "effects": [
@@ -935,6 +1071,18 @@
       "grabowski_rollback_text",
       "grabowski_verify_audit",
       "latest_complete_bundles",
+      "grabowski_runtime_health",
+      "grabowski_deployment_identity",
+      "grabowski_contract_drift",
+      "grabowski_checkout_summary",
+      "grabowski_git_status",
+      "grabowski_git_diff",
+      "grabowski_git_log",
+      "grabowski_git_show",
+      "grabowski_github_pr_view",
+      "grabowski_github_checks",
+      "grabowski_service_status",
+      "grabowski_service_logs",
       "grabowski_terminal_run",
       "grabowski_job_start",
       "grabowski_job_status",
@@ -1002,6 +1150,10 @@
         "source": "src/grabowski_capabilities.py"
       },
       {
+        "module": "grabowski_read_surface",
+        "source": "src/grabowski_read_surface.py"
+      },
+      {
         "module": "grabowski_runtime_extensions",
         "source": "src/grabowski_runtime_extensions.py"
       },
@@ -1055,7 +1207,7 @@
   "sources": {
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "d2d2c13221e5e2b54c562a03458041a3dc3fd8d6d32d242591f6965bac1f4ffc"
+      "sha256": "44c6c03fa63d78c8e47c50a42075b47e8c3bad5905227e40512c705d6ea5d22e"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1063,20 +1215,21 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "ccef480118e427f11891120cd06dd399344c14e2801014b51f9467dae0dfd498"
+      "sha256": "3280aa145264aa9cafa371901de1538d83fd445f3b78ee77a70d65a51369f153"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "d2d2c13221e5e2b54c562a03458041a3dc3fd8d6d32d242591f6965bac1f4ffc",
+      "src/grabowski_capabilities.py": "44c6c03fa63d78c8e47c50a42075b47e8c3bad5905227e40512c705d6ea5d22e",
       "src/grabowski_checkouts.py": "1e5d099d72f3d790387e53ff73f514ce4dd54768a9a0f1231b59f164101a0a4b",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
       "src/grabowski_mcp.py": "66f571fcfef64d139301273b29f34a79eb172a6859e2218bcc97f470a167a7e5",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "e982a1753dcb20b8c579960e8ed3e932d23c26587f8245f3e2ebae44b5ba76ac",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
+      "src/grabowski_read_surface.py": "e422ed78031793623513fbb215348809e3ac3bc874e68140d7f4b4278aebd260",
       "src/grabowski_recovery.py": "5da3dddbf900a9be0e302337a7bdba7926e3da085cc27eabc10cd4b645d66c24",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
-      "src/grabowski_runtime.py": "07117c35e3aefa6b59b35157ddbf5b8384db4c10b21d69bbc7bce172c21b3886",
+      "src/grabowski_runtime.py": "2c2e56f3a10c4d55ea529e1e46c58d94777a533f76458af177afbbd8c27848a8",
       "src/grabowski_runtime_extensions.py": "3092fc1e9031cc2d3beb9e6e1e2a43ea31d68fe07cc6186055d06dacb56e87ed",
       "src/grabowski_task_reconcile.py": "884c80f2f4049b3f328198a60c55106034a1bf7cf64b036b52f25df767a5ecb1",
       "src/grabowski_tasks.py": "ae48bff12dcc48decc5a083aa3c4f4bf6fed6033f707926b793a6d4c09e1139d",
