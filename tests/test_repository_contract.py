@@ -15,6 +15,7 @@ class RepositoryContractTests(unittest.TestCase):
         )
         self.assertTrue((ROOT / "src" / "grabowski_checkouts.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_runtime.py").is_file())
+        self.assertTrue((ROOT / "src" / "grabowski_read_surface.py").is_file())
 
     def test_grabowski_tool_names_are_present(self) -> None:
         source = (
@@ -88,7 +89,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 68)
+        self.assertEqual(len(tools), 80)
         legacy_tools = {
             "grabowski_status",
             "grabowski_context",
@@ -132,7 +133,8 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("grabowski_privileged_action_reference", tools)
         supporting = {item["module"]: item["source"] for item in contract["supporting_sources"]}
         self.assertEqual(supporting["grabowski_operator_core"], "src/grabowski_operator.py")
-        for module in ("grabowski_mcp", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_tasks", "grabowski_recovery"):
+        self.assertEqual(supporting["grabowski_read_surface"], "src/grabowski_read_surface.py")
+        for module in ("grabowski_mcp", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_tasks", "grabowski_recovery"):
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
 

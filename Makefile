@@ -6,15 +6,16 @@ UV_RUNTIME_LOCK_VERSION := 0.9.18
 DEPLOY_TOOLING_VENV ?= build/deploy-tooling/.venv
 DEPLOY_TOOL_PYTHON := $(DEPLOY_TOOLING_VENV)/bin/python
 
-.PHONY: validate syntax test policy context-refresh context-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy
+.PHONY: validate syntax test policy context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy
 
-validate: syntax test policy context-check runtime-lock deploy-tooling-check secrets
+validate: syntax test policy context-check profiles-check runtime-lock deploy-tooling-check secrets
 
 syntax:
 >$(PYTHON) -m py_compile src/grabowski_mcp.py
 >$(PYTHON) -m py_compile src/grabowski_operator.py
 >$(PYTHON) -m py_compile src/grabowski_capabilities.py
 >$(PYTHON) -m py_compile src/grabowski_runtime_extensions.py
+>$(PYTHON) -m py_compile src/grabowski_read_surface.py
 >$(PYTHON) -m py_compile src/grabowski_runtime.py
 >$(PYTHON) -m py_compile src/grabowski_fleet.py
 >$(PYTHON) -m py_compile src/grabowski_artifacts.py
@@ -30,6 +31,7 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_workers.py
 >$(PYTHON) -m py_compile src/grabowski_worker_process.py
 >$(PYTHON) -m py_compile tools/build_operator_context.py
+>$(PYTHON) -m py_compile tools/build_publication_profiles.py
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
 >$(PYTHON) -m py_compile tools/deploy_runtime_dual.py
 >$(PYTHON) -m py_compile tools/watchdog_runtime.py
@@ -50,9 +52,16 @@ policy:
 
 context-refresh:
 >$(PYTHON) tools/build_operator_context.py --write
+>$(PYTHON) tools/build_publication_profiles.py --write
 
 context-check:
 >$(PYTHON) tools/build_operator_context.py --check
+
+profiles-refresh:
+>$(PYTHON) tools/build_publication_profiles.py --write
+
+profiles-check:
+>$(PYTHON) tools/build_publication_profiles.py --check
 
 runtime-lock:
 >$(PYTHON) tools/validate_runtime_lock.py

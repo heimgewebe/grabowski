@@ -18,7 +18,7 @@ CAPABILITIES_PATH = ROOT / "src" / "grabowski_capabilities.py"
 CATALOG_PATH = ROOT / "contracts" / "capability-catalog.v1.json"
 CONTEXT_JSON_PATH = ROOT / "docs" / "generated" / "operator-context.v1.json"
 CONTEXT_MD_PATH = ROOT / "docs" / "generated" / "operator-context.md"
-READ_ANNOTATION_NAMES = {"READ_ANNOTATIONS", "READ_ONLY"}
+READ_ANNOTATION_NAMES = {"READ_ANNOTATIONS", "READ_ONLY", "LOCAL_READ", "REMOTE_READ"}
 WRITE_ANNOTATION_NAMES = {
     "CREATE_ANNOTATIONS",
     "REPLACE_ANNOTATIONS",
