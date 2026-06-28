@@ -16,6 +16,7 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_capabilities.py
 >$(PYTHON) -m py_compile src/grabowski_runtime_extensions.py
 >$(PYTHON) -m py_compile src/grabowski_read_surface.py
+>$(PYTHON) -m py_compile src/grabowski_self_deploy.py
 >$(PYTHON) -m py_compile src/grabowski_runtime.py
 >$(PYTHON) -m py_compile src/grabowski_fleet.py
 >$(PYTHON) -m py_compile src/grabowski_artifacts.py
@@ -32,6 +33,7 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_worker_process.py
 >$(PYTHON) -m py_compile tools/build_operator_context.py
 >$(PYTHON) -m py_compile tools/build_publication_profiles.py
+>$(PYTHON) -m py_compile tools/run_scheduled_deploy.py
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
 >$(PYTHON) -m py_compile tools/deploy_runtime_dual.py
 >$(PYTHON) -m py_compile tools/watchdog_runtime.py

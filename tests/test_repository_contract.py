@@ -53,6 +53,12 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("connector_snapshot_observable", source)
         self.assertIn("canonical_checkout_matches_runtime", source)
 
+    def test_status_exposes_live_tool_contract_fingerprint(self) -> None:
+        source = (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
+        self.assertIn('"tool_contract": _runtime_tool_contract_summary()', source)
+        self.assertIn('"registered_names_sha256"', source)
+        self.assertIn('"client_snapshot_observable": False', source)
+
     def test_status_exposes_deployment_provenance(self) -> None:
         source = (
             ROOT / "src" / "grabowski_mcp.py"
@@ -89,7 +95,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 80)
+        self.assertEqual(len(tools), 81)
         legacy_tools = {
             "grabowski_status",
             "grabowski_context",
@@ -134,7 +140,8 @@ class RepositoryContractTests(unittest.TestCase):
         supporting = {item["module"]: item["source"] for item in contract["supporting_sources"]}
         self.assertEqual(supporting["grabowski_operator_core"], "src/grabowski_operator.py")
         self.assertEqual(supporting["grabowski_read_surface"], "src/grabowski_read_surface.py")
-        for module in ("grabowski_mcp", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_tasks", "grabowski_recovery"):
+        self.assertEqual(supporting["grabowski_self_deploy"], "src/grabowski_self_deploy.py")
+        for module in ("grabowski_mcp", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_tasks", "grabowski_recovery"):
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
 

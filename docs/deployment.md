@@ -98,6 +98,14 @@ Apply materialisiert Source, `runtime.in`, Lock und Runtimevertrag aus dem
 erfassten Git-Commit. Danach werden Hashes, Installation, Manifest und Probe
 nur aus den Release-Snapshots abgeleitet.
 
+## Verzögerter Self-Deploy
+
+Ein Deployment, das Operator und Tunnel neu startet, darf nicht an den Lebenszyklus des aufrufenden MCP-Requests gebunden sein. Dafür existiert das typisierte Werkzeug `grabowski_runtime_deploy_schedule(expected_head, delay_seconds=8)`.
+
+Es akzeptiert weder einen Repositorypfad noch beliebige Befehle. Vor dem Start werden der kanonische Checkout, `main`, `HEAD`, `origin/main`, ein sauberer Arbeitsbaum und der versionierte Runner geprüft. Anschließend startet das Werkzeug einen eigenständigen dauerhaften systemd-Job und gibt dessen Unit und Logpfade zurück. Der Runner wartet zunächst, prüft den Checkout erneut, führt `make validate` und danach `make deploy` aus und verifiziert abschließend das Live-Manifest.
+
+Die Verzögerung ist Teil des Antwortvertrags: Der MCP-Request kann abgeschlossen werden, bevor Operator und Tunnel neu starten. Nach der Wiederverbindung liefern `grabowski_job_status` und `grabowski_job_logs` den dauerhaften Nachweis.
+
 ## Integritätsgeprüfte Releases
 
 Ein Release wird direkt an seinem endgültigen Pfad gebaut:

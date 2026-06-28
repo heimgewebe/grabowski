@@ -1,24 +1,20 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "3280aa145264aa9cafa371901de1538d83fd445f3b78ee77a70d65a51369f153"
+    "sha256": "5855b475409cf26ac0b80fae00d28dc98f20b1f44a3f106520d143b1364625ed"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "732ab4d0603269e3d806b90dcc15a383027dffe9f72111c1eccd4e5b4483e998"
+    "sha256": "bd957fcbeebf89f1fa5e84e29300648e068391e09813cd25d8d5076e40faac49"
   },
   "counts": {
-    "core": 36,
-    "full": 80,
-    "operator": 46
+    "core": 17,
+    "full": 81,
+    "operator": 66
   },
   "profiles": {
     "core": [
-      "grabowski_list_directory",
-      "grabowski_stat",
-      "grabowski_read_text",
       "grabowski_verify_audit",
-      "latest_complete_bundles",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -31,25 +27,10 @@
       "grabowski_github_checks",
       "grabowski_service_status",
       "grabowski_service_logs",
-      "grabowski_job_status",
-      "grabowski_job_logs",
-      "grabowski_checkout_inventory",
-      "grabowski_tmux_list",
-      "grabowski_tmux_capture",
-      "grabowski_process_list",
       "grabowski_ports",
       "grabowski_fleet_list",
-      "grabowski_operation_list",
-      "grabowski_operation_plan",
       "grabowski_privileged_broker_status",
-      "grabowski_task_logs",
-      "grabowski_task_list",
-      "grabowski_recovery_status",
-      "grabowski_resource_inspect",
-      "grabowski_resource_list",
-      "grabowski_artifact_stat",
-      "grabowski_browser_worker_list",
-      "grabowski_gui_worker_list"
+      "grabowski_recovery_status"
     ],
     "full": [
       "grabowski_status",
@@ -82,6 +63,7 @@
       "grabowski_github_checks",
       "grabowski_service_status",
       "grabowski_service_logs",
+      "grabowski_runtime_deploy_schedule",
       "grabowski_terminal_run",
       "grabowski_job_start",
       "grabowski_job_status",
@@ -136,6 +118,9 @@
     "operator": [
       "grabowski_status",
       "grabowski_context",
+      "grabowski_list_directory",
+      "grabowski_stat",
+      "grabowski_read_text",
       "grabowski_secret_inspect",
       "grabowski_secret_reveal",
       "grabowski_secret_use",
@@ -147,39 +132,56 @@
       "grabowski_restore_removed_path",
       "grabowski_destroy_path",
       "grabowski_rollback_text",
+      "latest_complete_bundles",
       "grabowski_runtime_health",
       "grabowski_contract_drift",
+      "grabowski_runtime_deploy_schedule",
       "grabowski_terminal_run",
       "grabowski_job_start",
+      "grabowski_job_status",
+      "grabowski_job_logs",
       "grabowski_job_cancel",
       "grabowski_git",
       "grabowski_git_branch",
+      "grabowski_checkout_inventory",
       "grabowski_checkout_retain",
       "grabowski_checkout_archive",
       "grabowski_checkout_cleanup",
       "grabowski_github",
       "grabowski_user_service",
+      "grabowski_tmux_list",
+      "grabowski_tmux_capture",
       "grabowski_tmux_send",
+      "grabowski_process_list",
       "grabowski_process_signal",
       "grabowski_privileged_action_reference",
       "grabowski_fleet_run",
+      "grabowski_operation_list",
+      "grabowski_operation_plan",
       "grabowski_operation_run",
       "grabowski_task_start",
       "grabowski_task_status",
+      "grabowski_task_logs",
       "grabowski_task_cancel",
       "grabowski_task_resume",
+      "grabowski_task_list",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",
       "grabowski_resource_release",
+      "grabowski_resource_inspect",
+      "grabowski_resource_list",
       "grabowski_task_reconcile",
+      "grabowski_artifact_stat",
       "grabowski_artifact_push",
       "grabowski_artifact_pull",
       "grabowski_browser_worker_start",
       "grabowski_browser_worker_status",
       "grabowski_browser_worker_stop",
+      "grabowski_browser_worker_list",
       "grabowski_gui_worker_start",
       "grabowski_gui_worker_status",
-      "grabowski_gui_worker_stop"
+      "grabowski_gui_worker_stop",
+      "grabowski_gui_worker_list"
     ]
   },
   "registration": {
@@ -191,14 +193,24 @@
       "allowed_effects": [
         "remote-read"
       ],
-      "excluded_categories": [
-        "secret"
-      ],
-      "excluded_tools": [
-        "grabowski_browser_profile_read",
-        "grabowski_context",
-        "grabowski_privileged_action_reference",
-        "grabowski_status"
+      "explicit_tools": [
+        "grabowski_checkout_summary",
+        "grabowski_contract_drift",
+        "grabowski_deployment_identity",
+        "grabowski_fleet_list",
+        "grabowski_git_diff",
+        "grabowski_git_log",
+        "grabowski_git_show",
+        "grabowski_git_status",
+        "grabowski_github_checks",
+        "grabowski_github_pr_view",
+        "grabowski_ports",
+        "grabowski_privileged_broker_status",
+        "grabowski_recovery_status",
+        "grabowski_runtime_health",
+        "grabowski_service_logs",
+        "grabowski_service_status",
+        "grabowski_verify_audit"
       ],
       "read_only": true,
       "risk_classes": [

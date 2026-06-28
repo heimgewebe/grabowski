@@ -6,9 +6,10 @@ from pathlib import Path
 import re
 import subprocess
 import time
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 import grabowski_capabilities as capabilities
 import grabowski_mcp as base
@@ -40,6 +41,7 @@ MAX_GIT_COMMITS = 100
 MAX_WORKTREES = 100
 MAX_REVISION_LENGTH = 200
 REVISION_RE = re.compile(r"[A-Za-z0-9_./@{}^~:+-]+")
+OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
 DEPLOYMENT_IDENTITY_FIELDS = (
     "schema_version",
     "release_id",
@@ -146,8 +148,20 @@ def _read_environment() -> dict[str, str]:
     return environment
 
 
-def _terminate(process: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
-    return operator._terminate_process_group(process)
+RepositoryPath = Annotated[str, Field(min_length=1, max_length=4096)]
+RevisionInput = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=MAX_REVISION_LENGTH,
+        pattern=REVISION_RE.pattern,
+    ),
+]
+OutputBytes = Annotated[int, Field(ge=1_024, le=MAX_OUTPUT_BYTES)]
+GitCommitCount = Annotated[int, Field(ge=1, le=MAX_GIT_COMMITS)]
+PullRequestNumber = Annotated[int, Field(ge=1, le=2_147_483_647)]
+SystemdUnit = Annotated[str, Field(min_length=1, max_length=255)]
+LogLineCount = Annotated[int, Field(ge=1, le=MAX_LOG_LINES)]
 
 
 def _run_read(
@@ -171,19 +185,25 @@ def _run_read(
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
-    try:
-        stdout_raw, stderr_raw = process.communicate(timeout=timeout_seconds)
-        timed_out = False
-        returncode: int | None = process.returncode
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        stdout_raw, stderr_raw = _terminate(process)
-        returncode = process.returncode
+    (
+        stdout_raw,
+        stderr_raw,
+        timed_out,
+        stdout_pipe_truncated,
+        stderr_pipe_truncated,
+    ) = base._read_limited_process_pipes(
+        process,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=max_output_bytes,
+    )
+    returncode: int | None = process.returncode
 
     stdout = operator._redact(stdout_raw.decode("utf-8", errors="replace"))
     stderr = operator._redact(stderr_raw.decode("utf-8", errors="replace"))
-    stdout, stdout_truncated = operator._limit(stdout, max_output_bytes)
-    stderr, stderr_truncated = operator._limit(stderr, max_output_bytes)
+    stdout, stdout_late_truncated = operator._limit(stdout, max_output_bytes)
+    stderr, stderr_late_truncated = operator._limit(stderr, max_output_bytes)
+    stdout_truncated = stdout_pipe_truncated or stdout_late_truncated
+    stderr_truncated = stderr_pipe_truncated or stderr_late_truncated
     return {
         "argv": operator._redact_argv(argv),
         "argv_sha256": operator._argv_hash(argv),
@@ -252,6 +272,33 @@ def _validate_revision(revision: str) -> str:
     ):
         raise ValueError("Invalid Git revision")
     return revision
+
+
+def _resolve_revision(repository: Path, revision: str) -> str:
+    selected = _validate_revision(revision)
+    result = _run_read(
+        _git_command(
+            repository,
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{selected}^{{object}}",
+        ),
+        cwd=repository,
+        timeout_seconds=20,
+        max_output_bytes=16_384,
+    )
+    object_ids = [line.strip() for line in result["stdout"].splitlines() if line.strip()]
+    if (
+        result["returncode"] != 0
+        or result["timed_out"]
+        or result["stdout_truncated"]
+        or len(object_ids) != 1
+        or not OBJECT_ID_RE.fullmatch(object_ids[0])
+    ):
+        message = result["stderr"].strip() or "Revision does not resolve to exactly one Git object"
+        raise ValueError(message)
+    return object_ids[0]
 
 
 def _validate_pr(pr: int) -> int:
@@ -386,7 +433,7 @@ def grabowski_checkout_summary() -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_git_status", annotations=LOCAL_READ)
-def grabowski_git_status(repo: str) -> dict[str, Any]:
+def grabowski_git_status(repo: RepositoryPath) -> dict[str, Any]:
     """Read fixed short Git status for one allowed repository."""
     repository = _resolve_repository(repo)
     return _run_read(
@@ -397,9 +444,9 @@ def grabowski_git_status(repo: str) -> dict[str, Any]:
 
 @mcp.tool(name="grabowski_git_diff", annotations=LOCAL_READ)
 def grabowski_git_diff(
-    repo: str,
+    repo: RepositoryPath,
     staged: bool = False,
-    max_output_bytes: int = DEFAULT_OUTPUT_BYTES,
+    max_output_bytes: OutputBytes = DEFAULT_OUTPUT_BYTES,
 ) -> dict[str, Any]:
     """Read a bounded unstaged or staged Git diff without external helpers."""
     repository = _resolve_repository(repo)
@@ -422,7 +469,10 @@ def grabowski_git_diff(
 
 
 @mcp.tool(name="grabowski_git_log", annotations=LOCAL_READ)
-def grabowski_git_log(repo: str, max_count: int = 20) -> dict[str, Any]:
+def grabowski_git_log(
+    repo: RepositoryPath,
+    max_count: GitCommitCount = 20,
+) -> dict[str, Any]:
     """Read a bounded fixed-format Git commit log."""
     if isinstance(max_count, bool) or max_count < 1 or max_count > MAX_GIT_COMMITS:
         raise ValueError(f"max_count must be between 1 and {MAX_GIT_COMMITS}")
@@ -443,13 +493,13 @@ def grabowski_git_log(repo: str, max_count: int = 20) -> dict[str, Any]:
 
 @mcp.tool(name="grabowski_git_show", annotations=LOCAL_READ)
 def grabowski_git_show(
-    repo: str,
-    revision: str = "HEAD",
-    max_output_bytes: int = DEFAULT_OUTPUT_BYTES,
+    repo: RepositoryPath,
+    revision: RevisionInput = "HEAD",
+    max_output_bytes: OutputBytes = DEFAULT_OUTPUT_BYTES,
 ) -> dict[str, Any]:
     """Read one bounded Git revision without external diff or textconv helpers."""
     repository = _resolve_repository(repo)
-    selected = _validate_revision(revision)
+    selected = _resolve_revision(repository, revision)
     return _run_read(
         _git_command(
             repository,
@@ -469,7 +519,10 @@ def grabowski_git_show(
 
 
 @mcp.tool(name="grabowski_github_pr_view", annotations=REMOTE_READ)
-def grabowski_github_pr_view(repo: str, pr: int) -> dict[str, Any]:
+def grabowski_github_pr_view(
+    repo: RepositoryPath,
+    pr: PullRequestNumber,
+) -> dict[str, Any]:
     """Read bounded GitHub pull-request metadata without body or comments."""
     operator._require_operator_capability("github_cli")
     repository = _resolve_repository(repo)
@@ -490,7 +543,10 @@ def grabowski_github_pr_view(repo: str, pr: int) -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_github_checks", annotations=REMOTE_READ)
-def grabowski_github_checks(repo: str, pr: int) -> dict[str, Any]:
+def grabowski_github_checks(
+    repo: RepositoryPath,
+    pr: PullRequestNumber,
+) -> dict[str, Any]:
     """Read bounded GitHub pull-request check results."""
     operator._require_operator_capability("github_cli")
     repository = _resolve_repository(repo)
@@ -511,7 +567,7 @@ def grabowski_github_checks(repo: str, pr: int) -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_service_status", annotations=LOCAL_READ)
-def grabowski_service_status(unit: str) -> dict[str, Any]:
+def grabowski_service_status(unit: SystemdUnit) -> dict[str, Any]:
     """Read a fixed property set for one user-level systemd unit."""
     operator._require_operator_capability("user_service_control")
     name = operator._validate_unit(unit)
@@ -535,7 +591,10 @@ def grabowski_service_status(unit: str) -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_service_logs", annotations=LOCAL_READ)
-def grabowski_service_logs(unit: str, max_lines: int = 200) -> dict[str, Any]:
+def grabowski_service_logs(
+    unit: SystemdUnit,
+    max_lines: LogLineCount = 200,
+) -> dict[str, Any]:
     """Read bounded recent journal lines for one user-level systemd unit."""
     operator._require_operator_capability("user_service_control")
     name = operator._validate_unit(unit)

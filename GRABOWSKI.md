@@ -47,11 +47,15 @@ The live tools are authoritative for the running deployment, active policy, avai
 
 A mismatch must remain visible. Do not silently treat an older checkout or connector snapshot as current.
 
+`grabowski_status` exposes the live registered/expected tool counts and name hashes. A client-side count or hash mismatch requires a connector refresh; the runtime cannot refresh ChatGPT's frozen snapshot itself.
+
 ## Operating rule
 
 Use the narrowest typed read operation that can establish current state. Before a mutation establish the target, intended result, validation, stop condition and rollback path. Prefer typed operations over generic shell, Git, GitHub or service commands when a typed operation exists.
 
 Generic operator tools remain available as fallback mechanisms; they are not the default diagnostic route. A failed read is classified and reviewed rather than automatically repeated through a broader tool.
+
+For a self-update that restarts operator and tunnel, prefer `grabowski_runtime_deploy_schedule` over a foreground `make deploy`. It binds the expected commit and returns a durable job before the delayed cutover begins.
 
 `~/repos/merges` is immutable evidence. Secret values and browser profiles are not exposed. Privileged or secret-backed effects should eventually be delegated through typed brokers rather than by revealing credentials to ChatGPT.
 

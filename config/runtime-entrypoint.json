@@ -21,6 +21,10 @@
       "source": "src/grabowski_read_surface.py"
     },
     {
+      "module": "grabowski_self_deploy",
+      "source": "src/grabowski_self_deploy.py"
+    },
+    {
       "module": "grabowski_runtime_extensions",
       "source": "src/grabowski_runtime_extensions.py"
     },
@@ -100,6 +104,7 @@
     "grabowski_github_checks",
     "grabowski_service_status",
     "grabowski_service_logs",
+    "grabowski_runtime_deploy_schedule",
     "grabowski_terminal_run",
     "grabowski_job_start",
     "grabowski_job_status",

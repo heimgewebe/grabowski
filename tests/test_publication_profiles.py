@@ -32,7 +32,7 @@ class PublicationProfileTests(unittest.TestCase):
         profiles = BUILDER.build()["profiles"]
         self.assertEqual(profiles["full"], contract["expected_tools"])
 
-    def test_core_contains_only_bounded_observational_tools(self) -> None:
+    def test_core_contains_exact_bounded_observational_tools(self) -> None:
         payload = BUILDER.build()
         catalog = json.loads(
             (ROOT / "contracts" / "capability-catalog.v1.json").read_text(
@@ -40,11 +40,11 @@ class PublicationProfileTests(unittest.TestCase):
             )
         )
         by_tool = {record["tool"]: record for record in catalog["tools"]}
+        self.assertEqual(set(payload["profiles"]["core"]), BUILDER.CORE_TOOLS)
         for tool in payload["profiles"]["core"]:
             record = by_tool[tool]
             self.assertIs(record["read_only"], True)
             self.assertIn(record["risk_class"], {"low", "medium"})
-            self.assertNotEqual(record["category"], "secret")
             self.assertTrue(
                 set(record["effects"]).issubset({"remote-read"}),
                 msg=f"non-observational core effect for {tool}: {record['effects']}",
@@ -54,21 +54,25 @@ class PublicationProfileTests(unittest.TestCase):
             "grabowski_git",
             "grabowski_user_service",
             "grabowski_browser_profile_read",
+            "grabowski_list_directory",
+            "grabowski_stat",
+            "grabowski_read_text",
+            "grabowski_tmux_list",
+            "grabowski_tmux_capture",
+            "grabowski_process_list",
+            "grabowski_browser_worker_list",
+            "grabowski_gui_worker_list",
+            "grabowski_job_logs",
+            "grabowski_task_logs",
+            "grabowski_operation_plan",
+            "grabowski_resource_list",
+            "grabowski_artifact_stat",
             "grabowski_context",
             "grabowski_status",
             "grabowski_privileged_action_reference",
-            "grabowski_task_status",
-            "grabowski_browser_worker_status",
-            "grabowski_gui_worker_status",
+            "grabowski_runtime_deploy_schedule",
         ):
             self.assertNotIn(excluded, payload["profiles"]["core"])
-        for required in (
-            "grabowski_runtime_health",
-            "grabowski_contract_drift",
-            "grabowski_git_status",
-            "grabowski_service_status",
-        ):
-            self.assertIn(required, payload["profiles"]["core"])
 
     def test_operator_retains_escape_hatches_and_orientation(self) -> None:
         operator = set(BUILDER.build()["profiles"]["operator"])
@@ -77,6 +81,7 @@ class PublicationProfileTests(unittest.TestCase):
             "grabowski_git",
             "grabowski_github",
             "grabowski_user_service",
+            "grabowski_runtime_deploy_schedule",
             "grabowski_runtime_health",
             "grabowski_contract_drift",
         ):

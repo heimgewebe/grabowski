@@ -84,7 +84,7 @@ Risikoprofile auseinanderlaufen.
 
 ## Typisierte Lesespur
 
-Fuer Status-, Git-, GitHub- und Service-Diagnostik stehen eng begrenzte Read-Werkzeuge bereit. Generische Operatorwerkzeuge bleiben als Fallback erhalten, sollen aber nicht fuer gewoehnliche Leseaufgaben verwendet werden. Die Profile `core`, `operator` und `full` werden aus einem kanonischen Vertrag abgeleitet; ein zweiter Connector wird erst nach einem Canary-Vergleich erwogen. Details: [`docs/typed-read-surface.md`](docs/typed-read-surface.md).
+Fuer Status-, Git-, GitHub- und Service-Diagnostik stehen eng begrenzte Read-Werkzeuge bereit. Generische Operatorwerkzeuge bleiben als Fallback erhalten, sollen aber nicht fuer gewoehnliche Leseaufgaben verwendet werden. Die Profile `core`, `operator` und `full` werden aus einem kanonischen Vertrag abgeleitet; `core` schliesst breite Dateisystem-, tmux-, Prozess- und Worker-Oberflaechen aus. Ein zweiter Connector wird erst nach einem Canary-Vergleich erwogen. Fuer Dienstneustarts steht ein verzoegerter, commitgebundener Self-Deploy-Job bereit. Details: [`docs/typed-read-surface.md`](docs/typed-read-surface.md).
 
 ## Validierung
 

@@ -42,6 +42,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_github_checks` | remote-version-control | yes | low | Read bounded GitHub pull-request check results. |
 | `grabowski_service_status` | service | yes | low | Read a fixed property set for one user-level systemd unit. |
 | `grabowski_service_logs` | service | yes | low | Read bounded redacted journal lines for one user-level systemd unit. |
+| `grabowski_runtime_deploy_schedule` | deployment | unknown | high | Schedule a validated delayed deployment from the canonical main checkout. |
 | `grabowski_terminal_run` | command | no | variable | Run one bounded non-interactive command as the current user. |
 | `grabowski_job_start` | command | no | variable | Start a durable bounded background command as a transient user service. |
 | `grabowski_job_status` | command | yes | low | Read durable metadata and current service state for one Grabowski job. |
