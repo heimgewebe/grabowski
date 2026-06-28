@@ -33,6 +33,8 @@ meldet.
 - tamper-evidente Audit-Verifikation
 - nicht-interaktive Kommandos und dauerhafte Hintergrundjobs
 - Git, typisierte Branch-Operationen und GitHub CLI
+- typisiertes Inventar, Retention, Archivierung und Dry-Run-First-Cleanup für
+  temporäre verlinkte Git-Checkouts
 - User-Service-, tmux-, Prozess- und Portoperationen
 - Lenskit-/repoLens-Bundle-Registry lesen
 - read-only Repo-Proof-Bundles mit Branch-/Head-Gate, Hashes und Provenance
@@ -162,6 +164,8 @@ Dateiwerkzeuge und Erweiterungen für:
 - systemd-basierte Hintergrundjobs,
 - Git und GitHub CLI,
 - typisierte lokale Branch-Erstellung und Branchwechsel,
+- den auditierten Lifecycle temporärer verlinkter Git-Checkouts mit
+  Recovery-Refs und branch-erhaltendem Cleanup,
 - User-Service-Steuerung,
 - tmux-Capture und tmux-Eingaben,
 - Prozess- und Portdiagnose,

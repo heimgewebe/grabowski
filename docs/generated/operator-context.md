@@ -37,6 +37,10 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_job_cancel` | command | no | medium | Stop one Grabowski-owned background job. |
 | `grabowski_git` | version-control | no | variable | Run Git in one repository with protected-main force-push protection. |
 | `grabowski_git_branch` | version-control | no | medium | Create or switch local branches through a typed, audited branch operation. |
+| `grabowski_checkout_inventory` | checkout-lifecycle | yes | low | Return deterministic linked-checkout inventory with retention, task, process and resource coordination state. |
+| `grabowski_checkout_retain` | checkout-lifecycle | no | medium | Assign explicit retention ownership to one temporary linked Git checkout. |
+| `grabowski_checkout_archive` | checkout-lifecycle | no | medium | Archive one clean temporary linked Git checkout by creating durable recovery refs without deleting branches. |
+| `grabowski_checkout_cleanup` | checkout-lifecycle | no | high | Plan or apply cleanup for an archived linked checkout; apply requires a persisted dry run. |
 | `grabowski_github` | remote-version-control | no | variable | Run GitHub CLI operations with output redaction. |
 | `grabowski_user_service` | service | no | high | Inspect or control one user-level systemd service. |
 | `grabowski_tmux_list` | session | yes | low | List tmux sessions visible to the current user. |

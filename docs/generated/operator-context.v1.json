@@ -317,6 +317,61 @@
       "tool": "grabowski_git_branch"
     },
     {
+      "category": "checkout-lifecycle",
+      "description": "Return a deterministic inventory of linked Git checkouts and lifecycle state.",
+      "effects": [],
+      "id": "grabowski_checkout_inventory",
+      "purpose": "Return deterministic linked-checkout inventory with retention, task, process and resource coordination state.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_checkout_inventory"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Assign explicit retention ownership to one temporary linked Git checkout.",
+      "effects": [
+        "state-create",
+        "resource-lease"
+      ],
+      "id": "grabowski_checkout_retain",
+      "purpose": "Assign explicit retention ownership to one temporary linked Git checkout.",
+      "read_only": false,
+      "reversibility": "retention-update",
+      "risk_class": "medium",
+      "tool": "grabowski_checkout_retain"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Archive one clean temporary linked checkout by creating durable recovery refs.",
+      "effects": [
+        "git-reference-create",
+        "state-create",
+        "resource-lease"
+      ],
+      "id": "grabowski_checkout_archive",
+      "purpose": "Archive one clean temporary linked Git checkout by creating durable recovery refs without deleting branches.",
+      "read_only": false,
+      "reversibility": "git-worktree-add-from-recovery-ref",
+      "risk_class": "medium",
+      "tool": "grabowski_checkout_archive"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Plan or apply cleanup for one archived linked checkout; apply requires a prior dry run.",
+      "effects": [
+        "working-tree-remove",
+        "state-change",
+        "resource-lease"
+      ],
+      "id": "grabowski_checkout_cleanup",
+      "purpose": "Plan or apply cleanup for an archived linked checkout; apply requires a persisted dry run.",
+      "read_only": false,
+      "reversibility": "git-worktree-add-from-recovery-ref",
+      "risk_class": "high",
+      "tool": "grabowski_checkout_cleanup"
+    },
+    {
       "category": "remote-version-control",
       "description": "Run GitHub CLI with redacted output.",
       "effects": [
@@ -887,6 +942,10 @@
       "grabowski_job_cancel",
       "grabowski_git",
       "grabowski_git_branch",
+      "grabowski_checkout_inventory",
+      "grabowski_checkout_retain",
+      "grabowski_checkout_archive",
+      "grabowski_checkout_cleanup",
       "grabowski_github",
       "grabowski_user_service",
       "grabowski_tmux_list",
@@ -947,6 +1006,10 @@
         "source": "src/grabowski_runtime_extensions.py"
       },
       {
+        "module": "grabowski_checkouts",
+        "source": "src/grabowski_checkouts.py"
+      },
+      {
         "module": "grabowski_fleet",
         "source": "src/grabowski_fleet.py"
       },
@@ -992,7 +1055,7 @@
   "sources": {
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "ea5bcd2b4f2d343f5353ed46327f08dd1954cde5dc0b5f3ff23c4e8dcdca6749"
+      "sha256": "d2d2c13221e5e2b54c562a03458041a3dc3fd8d6d32d242591f6965bac1f4ffc"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1000,11 +1063,12 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "b71d156258ccc1d5e64bd88db3572f77d834970abf838c157343ee3c5dc318f9"
+      "sha256": "ccef480118e427f11891120cd06dd399344c14e2801014b51f9467dae0dfd498"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "ea5bcd2b4f2d343f5353ed46327f08dd1954cde5dc0b5f3ff23c4e8dcdca6749",
+      "src/grabowski_capabilities.py": "d2d2c13221e5e2b54c562a03458041a3dc3fd8d6d32d242591f6965bac1f4ffc",
+      "src/grabowski_checkouts.py": "1e5d099d72f3d790387e53ff73f514ce4dd54768a9a0f1231b59f164101a0a4b",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
       "src/grabowski_mcp.py": "66f571fcfef64d139301273b29f34a79eb172a6859e2218bcc97f470a167a7e5",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
@@ -1012,10 +1076,10 @@
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
       "src/grabowski_recovery.py": "5da3dddbf900a9be0e302337a7bdba7926e3da085cc27eabc10cd4b645d66c24",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
-      "src/grabowski_runtime.py": "1f16db6db861a022c594e927f642e4bed75082d8fe1164a71620c7b3e8cbbe7c",
+      "src/grabowski_runtime.py": "07117c35e3aefa6b59b35157ddbf5b8384db4c10b21d69bbc7bce172c21b3886",
       "src/grabowski_runtime_extensions.py": "3092fc1e9031cc2d3beb9e6e1e2a43ea31d68fe07cc6186055d06dacb56e87ed",
       "src/grabowski_task_reconcile.py": "884c80f2f4049b3f328198a60c55106034a1bf7cf64b036b52f25df767a5ecb1",
-      "src/grabowski_tasks.py": "56999dfed7ad96f18aa4cb267d2b991a65fafe3167f6d189bf9cce862eec6782",
+      "src/grabowski_tasks.py": "ae48bff12dcc48decc5a083aa3c4f4bf6fed6033f707926b793a6d4c09e1139d",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "50f069b6a14fd4a1686de3cfec8dad1d5d835ef41ccc3669744f24699a8fd0dc"
     }

@@ -30,6 +30,8 @@ TASK_DB = Path(
     )
 ).expanduser()
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
+EXTERNAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
 RESUME_POLICIES = {"never", "retry-safe", "verify-then-retry", "manual"}
 TASK_STATES = {
@@ -95,7 +97,13 @@ def _database() -> sqlite3.Connection:
             launcher_json TEXT NOT NULL,
             last_observation_json TEXT,
             resource_keys_json TEXT NOT NULL DEFAULT '[]',
-            lease_owner_id TEXT
+            lease_owner_id TEXT,
+            request_id TEXT,
+            origin_ref TEXT,
+            external_run_id TEXT,
+            execution_envelope_sha256 TEXT,
+            acceptance_json TEXT NOT NULL DEFAULT '[]',
+            request_sha256 TEXT
         )
         """
     )

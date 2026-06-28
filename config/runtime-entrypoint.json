@@ -21,6 +21,10 @@
       "source": "src/grabowski_runtime_extensions.py"
     },
     {
+      "module": "grabowski_checkouts",
+      "source": "src/grabowski_checkouts.py"
+    },
+    {
       "module": "grabowski_fleet",
       "source": "src/grabowski_fleet.py"
     },
@@ -87,6 +91,10 @@
     "grabowski_job_cancel",
     "grabowski_git",
     "grabowski_git_branch",
+    "grabowski_checkout_inventory",
+    "grabowski_checkout_retain",
+    "grabowski_checkout_archive",
+    "grabowski_checkout_cleanup",
     "grabowski_github",
     "grabowski_user_service",
     "grabowski_tmux_list",
