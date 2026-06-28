@@ -91,6 +91,24 @@ class WorkerTests(unittest.TestCase):
             f"worker:{worker['worker_id']}",
         )
 
+    def test_persistent_profile_ignores_missing_alternative_roots(self) -> None:
+        existing_root = self.root / "brave"
+        existing_root.mkdir()
+        missing_root = self.root / "chromium"
+        profile = existing_root / "schauwerk"
+        configured_roots = [str(existing_root), str(missing_root)]
+
+        with patch.object(
+            workers.base, "_load_policy", return_value={}
+        ), patch.object(
+            workers.base, "_profile_values", return_value=configured_roots
+        ):
+            resolved, ephemeral = workers._browser_profile("0" * 20, str(profile))
+
+        self.assertEqual(resolved, profile)
+        self.assertTrue(resolved.is_dir())
+        self.assertFalse(ephemeral)
+
     def test_browser_args_cannot_override_binding_or_profile(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()):
             for argument in (

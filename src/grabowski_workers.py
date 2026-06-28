@@ -185,7 +185,7 @@ def _browser_profile(worker_id: str, persistent_profile: str | None) -> tuple[Pa
     else:
         parent = candidate.parent.resolve(strict=True)
         resolved = parent / candidate.name
-    roots = base._roots("browser_profile")
+    roots = base._roots("browser_profile", ignore_missing=True)
     if not base._is_within(resolved, roots):
         raise PermissionError("persistent browser profile is outside configured roots")
     if not resolved.exists():

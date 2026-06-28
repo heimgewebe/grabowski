@@ -643,12 +643,18 @@ def _policy_path(value: str) -> Path:
     return Path(value.replace("${HOME}", str(HOME))).expanduser()
 
 
-def _roots(kind: str) -> list[Path]:
+def _roots(kind: str, *, ignore_missing: bool = False) -> list[Path]:
     policy = _load_policy()
     values = _profile_values(policy, f"{kind}_roots")
     roots: list[Path] = []
     for value in values:
-        root = _policy_path(value).resolve(strict=True)
+        configured = _policy_path(value)
+        try:
+            root = configured.resolve(strict=True)
+        except FileNotFoundError:
+            if ignore_missing:
+                continue
+            raise
         if not root.is_dir():
             raise RuntimeError(f"Configured {kind} root is not a directory: {root}")
         roots.append(root)
