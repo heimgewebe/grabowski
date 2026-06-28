@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import tempfile
 import time
 import uuid
 from typing import Any
@@ -29,6 +30,8 @@ TASK_DB = Path(
         str(operator.STATE_DIR / "tasks.sqlite3"),
     )
 ).expanduser()
+TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
+
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
 EXTERNAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -40,6 +43,9 @@ TASK_STATES = {
     "completed",
     "failed",
     "cancelled",
+    "timed_out",
+    "signalled",
+    "outcome_unknown",
     "interrupted",
 }
 
@@ -54,6 +60,72 @@ def _canonical_json(value: Any) -> str:
 
 def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _is_terminal_state(state: str) -> bool:
+    return state in {"completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}
+
+
+def _write_outcome_receipt(record: dict[str, Any], state: str, observation: dict[str, Any] | None) -> None:
+    if not _is_terminal_state(state):
+        return
+    TASK_OUTCOMES_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = TASK_OUTCOMES_DIR / f"{record['task_id']}.json"
+    if path.exists():
+        return
+    payload = {
+        "schema_version": 1,
+        "task_id": record["task_id"],
+        "unit": record["unit"],
+        "attempt": record["attempt"],
+        "state": state,
+        "argv_sha256": record["argv_sha256"],
+        "execution_envelope_sha256": record.get("execution_envelope_sha256"),
+        "resource_keys": _record_resource_keys(record),
+        "observed_at_unix": _now(),
+        "observation_sha256": _sha256_json(observation or {}),
+        "observation": observation or {},
+    }
+    payload["receipt_sha256"] = _sha256_json({k: v for k, v in payload.items() if k != "receipt_sha256"})
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{record['task_id']}.", suffix=".tmp", dir=TASK_OUTCOMES_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.link(tmp_name, path)
+    except FileExistsError:
+        pass
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _classify_observation(result: dict[str, Any], properties: dict[str, str]) -> str:
+    active = properties.get("ActiveState")
+    load = properties.get("LoadState")
+    unit_result = properties.get("Result")
+    exec_code = properties.get("ExecMainCode")
+    exec_status = properties.get("ExecMainStatus")
+    if unit_result == "success" and exec_status in {None, "", "0"}:
+        return "completed" if active not in {"active", "activating", "reloading"} else "running"
+    if active in {"active", "activating", "reloading"}:
+        return "running"
+    if unit_result == "timeout":
+        return "timed_out"
+    if unit_result in {"signal", "core-dump"} or exec_code in {"2", "3"}:
+        return "signalled"
+    if unit_result in {"exit-code", "resources", "protocol", "watchdog"} or active == "failed":
+        return "failed"
+    if result["returncode"] != 0 or load in {None, "not-found"}:
+        return "outcome_unknown"
+    if active in {"inactive", "deactivating"}:
+        return "completed" if unit_result in {None, "", "success"} else "failed"
+    return "outcome_unknown"
 
 
 def _database() -> sqlite3.Connection:
@@ -369,12 +441,19 @@ def _set_state(
         values.append(attempt)
     values.append(_validate_task_id(task_id))
     with _database() as connection:
+        current = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (values[-1],)
+        ).fetchone()
+        if current is not None and _is_terminal_state(current["state"]):
+            return dict(current)
         connection.execute(
             f"UPDATE tasks SET {', '.join(updates)} WHERE task_id=?",
             values,
         )
         connection.commit()
-    return _row(task_id)
+    updated = _row(task_id)
+    _write_outcome_receipt(updated, state, observation)
+    return updated
 
 
 def _observe(record: dict[str, Any]) -> dict[str, Any]:
@@ -400,19 +479,7 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
         if "=" in line:
             key, value = line.split("=", 1)
             properties[key] = value
-    active = properties.get("ActiveState")
-    load = properties.get("LoadState")
-    unit_result = properties.get("Result")
-    if result["returncode"] != 0 or load in {None, "not-found"}:
-        state = "interrupted"
-    elif active in {"active", "activating", "reloading"}:
-        state = "running"
-    elif active == "failed" or unit_result not in {None, "", "success"}:
-        state = "failed"
-    elif active in {"inactive", "deactivating"}:
-        state = "completed" if unit_result in {None, "", "success"} else "failed"
-    else:
-        state = "interrupted"
+    state = _classify_observation(result, properties)
     return {
         "state": state,
         "properties": properties,
@@ -690,6 +757,15 @@ def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
             _release_record_resources(stored)
         refreshed.append(_public(stored))
         if not auto_resume or observation["state"] == "running":
+            continue
+        if observation["state"] == "outcome_unknown":
+            blocked.append(
+                {
+                    "task_id": stored["task_id"],
+                    "resume_policy": stored["resume_policy"],
+                    "reason": "outcome_unknown requires verification before retry",
+                }
+            )
             continue
         if stored["resume_policy"] != "retry-safe":
             blocked.append(

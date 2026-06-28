@@ -134,6 +134,27 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(listed["count"], 1)
         self.assertEqual(listed["tasks"][0]["task_id"], task["task_id"])
 
+    def test_collected_success_unit_maps_to_completed_not_unknown(self) -> None:
+        started = self._start()
+        task_id = started["task"]["task_id"]
+        probe = _launcher()
+        probe["stdout"] = (
+            "LoadState=not-found\n"
+            "ActiveState=inactive\n"
+            "SubState=dead\n"
+            "Result=success\n"
+            "ExecMainCode=0\n"
+            "ExecMainStatus=0\n"
+        )
+        with patch.object(tasks, "_dispatch", return_value=probe):
+            status = tasks.grabowski_task_status(task_id)
+        self.assertEqual(status["state"], "completed")
+        receipt = tasks.TASK_OUTCOMES_DIR / f"{task_id}.json"
+        self.assertTrue(receipt.is_file())
+        payload = json.loads(receipt.read_text())
+        self.assertEqual(payload["state"], "completed")
+        self.assertIn("receipt_sha256", payload)
+
     def test_status_maps_successful_inactive_unit_to_completed(self) -> None:
         started = self._start()
         task_id = started["task"]["task_id"]
@@ -151,7 +172,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(status["state"], "completed")
         self.assertEqual(status["last_observation"]["properties"]["Result"], "success")
 
-    def test_missing_unit_is_interrupted_and_can_resume(self) -> None:
+    def test_missing_unit_is_outcome_unknown_and_can_resume_manually(self) -> None:
         started = self._start(host="remote")
         task_id = started["task"]["task_id"]
         missing = _launcher(returncode=1)
@@ -166,7 +187,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(task["attempt"], 2)
         self.assertEqual(task["state"], "running")
         self.assertTrue(task["unit"].endswith("-a2.service"))
-        self.assertEqual(task["last_observation"]["state"], "interrupted")
+        self.assertEqual(task["last_observation"]["state"], "outcome_unknown")
 
     def test_manual_resume_policy_fails_closed(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
@@ -279,13 +300,10 @@ class TaskTests(unittest.TestCase):
         ):
             result = tasks.reconcile_tasks(auto_resume=True)
         self.assertEqual(result["scanned"], 1)
-        self.assertEqual(len(result["resumed"]), 1)
-        self.assertEqual(result["resumed"][0]["attempt"], 2)
-        self.assertEqual(result["resumed"][0]["state"], "running")
-        self.assertEqual(
-            tasks.resources.inspect_resource("display:12")["owner_id"],
-            started["task"]["lease_owner_id"],
-        )
+        self.assertEqual(result["resumed"], [])
+        self.assertEqual(result["blocked"][0]["task_id"], started["task"]["task_id"])
+        self.assertIn("outcome_unknown", result["blocked"][0]["reason"])
+        self.assertIsNone(tasks.resources.inspect_resource("display:12"))
 
     def test_reconcile_blocks_unverified_policy(self) -> None:
         started = self._start()
