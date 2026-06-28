@@ -65,6 +65,12 @@ Nur der Hash der Begründung wird auditiert.
 
 Die Runtime registriert eine eigene Read-Surface fuer schmale Kontext-, Git-, GitHub- und User-Service-Abfragen. Die Werkzeuge besitzen feste Argumentformen, begrenzte Ausgaben und wahrheitsgemaesse MCP-Annotationen. GitHub-Lesen bleibt wegen des externen Zugriffs `openWorldHint=true`; lokal geschlossene Diagnostik bleibt `false`. Generische Terminal-, Git-, GitHub- und Service-Werkzeuge werden nicht entfernt, sind aber nur Fallback. Die Projektionen `core`, `operator` und `full` stammen aus demselben Runtime-Vertrag und Katalog. Details stehen in `docs/typed-read-surface.md`.
 
+## Live-Werkzeugvertrag und Self-Deploy
+
+`grabowski_status` veröffentlicht zusätzlich erwartete und registrierte Werkzeuganzahl, Hashes beider Namensmengen sowie begrenzte Driftlisten. Der Client-Snapshot bleibt von der Runtime aus unbeobachtbar; weichen Anzahl oder Hash des Clients ab, ist ein Connector-Refresh erforderlich.
+
+`grabowski_runtime_deploy_schedule` ist der enge Selbstaktualisierungspfad. Er bindet die Zielrevision an den sauberen kanonischen `main`-Checkout und startet einen verzögerten dauerhaften Job. Dadurch überlebt der Deploymentprozess den Neustart der Dienste, die den ursprünglichen MCP-Request transportieren.
+
 ## Connector-Probe
 
 `tools/connector_probe.py` startet die installierte Runtime über MCP-stdio, liest deren vollständiges `tools/list` und vergleicht drei Ebenen:

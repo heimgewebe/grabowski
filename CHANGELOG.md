@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Hardened the typed read surface with streaming output bounds, single-object
+  Git revision resolution, schema-visible argument limits, compact Core profile
+  categories, live tool-contract fingerprints, and delayed self-deployment.
 - Added a typed read surface with narrow context, Git, GitHub and user-service
   diagnostics; generic operator tools remain available, while publication
   profiles are defined as projections of the single canonical contract.

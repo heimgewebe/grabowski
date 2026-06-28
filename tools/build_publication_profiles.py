@@ -13,13 +13,25 @@ RUNTIME_CONTRACT = ROOT / "config" / "runtime-entrypoint.json"
 CAPABILITY_CATALOG = ROOT / "contracts" / "capability-catalog.v1.json"
 OUTPUT = ROOT / "contracts" / "publication-profiles.v1.json"
 CORE_RISK_CLASSES = {"low", "medium"}
-CORE_EXCLUDED_CATEGORIES = {"secret"}
 CORE_ALLOWED_EFFECTS = {"remote-read"}
-CORE_EXCLUDED_TOOLS = {
-    "grabowski_browser_profile_read",
-    "grabowski_context",
-    "grabowski_status",
-    "grabowski_privileged_action_reference",
+CORE_TOOLS = {
+    "grabowski_verify_audit",
+    "grabowski_runtime_health",
+    "grabowski_deployment_identity",
+    "grabowski_contract_drift",
+    "grabowski_checkout_summary",
+    "grabowski_git_status",
+    "grabowski_git_diff",
+    "grabowski_git_log",
+    "grabowski_git_show",
+    "grabowski_github_pr_view",
+    "grabowski_github_checks",
+    "grabowski_service_status",
+    "grabowski_service_logs",
+    "grabowski_ports",
+    "grabowski_fleet_list",
+    "grabowski_privileged_broker_status",
+    "grabowski_recovery_status",
 }
 OPERATOR_ORIENTATION_TOOLS = {
     "grabowski_runtime_health",
@@ -54,6 +66,7 @@ def build() -> dict[str, Any]:
         raise ValueError("runtime expected_tools must be a string list")
     if not isinstance(records, list):
         raise ValueError("capability catalog tools must be a list")
+
     by_tool: dict[str, dict[str, Any]] = {}
     for record in records:
         if not isinstance(record, dict) or not isinstance(record.get("tool"), str):
@@ -62,20 +75,28 @@ def build() -> dict[str, Any]:
         if tool in by_tool:
             raise ValueError(f"duplicate capability record: {tool}")
         by_tool[tool] = record
+
     if set(expected) != set(by_tool):
         missing = sorted(set(expected) - set(by_tool))
         extra = sorted(set(by_tool) - set(expected))
         raise ValueError(f"contract/catalog mismatch: missing={missing}, extra={extra}")
 
+    missing_core = sorted(CORE_TOOLS - set(expected))
+    if missing_core:
+        raise ValueError(f"core tools missing from runtime contract: {missing_core}")
+
     core = [
         tool
         for tool in expected
-        if by_tool[tool].get("read_only") is True
+        if tool in CORE_TOOLS
+        and by_tool[tool].get("read_only") is True
         and by_tool[tool].get("risk_class") in CORE_RISK_CLASSES
-        and by_tool[tool].get("category") not in CORE_EXCLUDED_CATEGORIES
         and _effects_are_observational(by_tool[tool])
-        and tool not in CORE_EXCLUDED_TOOLS
     ]
+    if set(core) != CORE_TOOLS:
+        rejected = sorted(CORE_TOOLS - set(core))
+        raise ValueError(f"core tools violate publication constraints: {rejected}")
+
     core_set = set(core)
     operator = [
         tool
@@ -99,8 +120,7 @@ def build() -> dict[str, Any]:
                 "read_only": True,
                 "risk_classes": sorted(CORE_RISK_CLASSES),
                 "allowed_effects": sorted(CORE_ALLOWED_EFFECTS),
-                "excluded_categories": sorted(CORE_EXCLUDED_CATEGORIES),
-                "excluded_tools": sorted(CORE_EXCLUDED_TOOLS),
+                "explicit_tools": sorted(CORE_TOOLS),
             },
             "operator": {
                 "selection": "all tools not in core plus orientation tools",

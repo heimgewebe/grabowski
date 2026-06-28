@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "44c6c03fa63d78c8e47c50a42075b47e8c3bad5905227e40512c705d6ea5d22e",
+  "capability_source_sha256": "ca26900e53e495664e798c6b38632d1345a47569f527a6569934ffac56b2b712",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "3280aa145264aa9cafa371901de1538d83fd445f3b78ee77a70d65a51369f153",
+  "contract_sha256": "5855b475409cf26ac0b80fae00d28dc98f20b1f44a3f106520d143b1364625ed",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -373,6 +373,22 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_service_logs"
+    },
+    {
+      "category": "deployment",
+      "description": "Schedule a validated self-deployment in an independent delayed systemd job.",
+      "effects": [
+        "background-job-start",
+        "runtime-deploy",
+        "service-restart",
+        "remote-package-read"
+      ],
+      "id": "grabowski_runtime_deploy_schedule",
+      "purpose": "Schedule a validated delayed deployment from the canonical main checkout.",
+      "read_only": null,
+      "reversibility": "deployment-rollback",
+      "risk_class": "high",
+      "tool": "grabowski_runtime_deploy_schedule"
     },
     {
       "category": "command",

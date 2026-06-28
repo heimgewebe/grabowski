@@ -582,6 +582,24 @@ TOOL_PROFILES.update(
 )
 
 
+TOOL_PROFILES.update(
+    {
+        "grabowski_runtime_deploy_schedule": {
+            "category": "deployment",
+            "purpose": "Schedule a validated delayed deployment from the canonical main checkout.",
+            "risk_class": "high",
+            "effects": [
+                "background-job-start",
+                "runtime-deploy",
+                "service-restart",
+                "remote-package-read",
+            ],
+            "reversibility": "deployment-rollback",
+        },
+    }
+)
+
+
 PROFILE_CATEGORIES: dict[str, set[str] | None] = {
     "concise": None,
     "repository-work": {

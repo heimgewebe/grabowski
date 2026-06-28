@@ -363,6 +363,22 @@
       "tool": "grabowski_service_logs"
     },
     {
+      "category": "deployment",
+      "description": "Schedule a validated self-deployment in an independent delayed systemd job.",
+      "effects": [
+        "background-job-start",
+        "runtime-deploy",
+        "service-restart",
+        "remote-package-read"
+      ],
+      "id": "grabowski_runtime_deploy_schedule",
+      "purpose": "Schedule a validated delayed deployment from the canonical main checkout.",
+      "read_only": null,
+      "reversibility": "deployment-rollback",
+      "risk_class": "high",
+      "tool": "grabowski_runtime_deploy_schedule"
+    },
+    {
       "category": "command",
       "description": "Run one non-interactive command and return redacted output.",
       "effects": [
@@ -1083,6 +1099,7 @@
       "grabowski_github_checks",
       "grabowski_service_status",
       "grabowski_service_logs",
+      "grabowski_runtime_deploy_schedule",
       "grabowski_terminal_run",
       "grabowski_job_start",
       "grabowski_job_status",
@@ -1154,6 +1171,10 @@
         "source": "src/grabowski_read_surface.py"
       },
       {
+        "module": "grabowski_self_deploy",
+        "source": "src/grabowski_self_deploy.py"
+      },
+      {
         "module": "grabowski_runtime_extensions",
         "source": "src/grabowski_runtime_extensions.py"
       },
@@ -1207,7 +1228,7 @@
   "sources": {
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "44c6c03fa63d78c8e47c50a42075b47e8c3bad5905227e40512c705d6ea5d22e"
+      "sha256": "ca26900e53e495664e798c6b38632d1345a47569f527a6569934ffac56b2b712"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1215,22 +1236,23 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "3280aa145264aa9cafa371901de1538d83fd445f3b78ee77a70d65a51369f153"
+      "sha256": "5855b475409cf26ac0b80fae00d28dc98f20b1f44a3f106520d143b1364625ed"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "44c6c03fa63d78c8e47c50a42075b47e8c3bad5905227e40512c705d6ea5d22e",
+      "src/grabowski_capabilities.py": "ca26900e53e495664e798c6b38632d1345a47569f527a6569934ffac56b2b712",
       "src/grabowski_checkouts.py": "1e5d099d72f3d790387e53ff73f514ce4dd54768a9a0f1231b59f164101a0a4b",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
-      "src/grabowski_mcp.py": "66f571fcfef64d139301273b29f34a79eb172a6859e2218bcc97f470a167a7e5",
+      "src/grabowski_mcp.py": "7ca59e133096f120f0a5cb1c89c3500a1f7da9fe06a94f7a16cd5693f76ac30f",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "e982a1753dcb20b8c579960e8ed3e932d23c26587f8245f3e2ebae44b5ba76ac",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
-      "src/grabowski_read_surface.py": "72e06deea2e156afe94a956fee5f3497c983b2f7abab825aba22d118ed504c71",
+      "src/grabowski_read_surface.py": "1e8147ea845e8a9cc5ab723140dc996965f7aebb2183af74164de30d24f97928",
       "src/grabowski_recovery.py": "5da3dddbf900a9be0e302337a7bdba7926e3da085cc27eabc10cd4b645d66c24",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
-      "src/grabowski_runtime.py": "2c2e56f3a10c4d55ea529e1e46c58d94777a533f76458af177afbbd8c27848a8",
+      "src/grabowski_runtime.py": "51a9ffd23100d0ff19d996894405ff382614626d208c356758d8347873b4d970",
       "src/grabowski_runtime_extensions.py": "3092fc1e9031cc2d3beb9e6e1e2a43ea31d68fe07cc6186055d06dacb56e87ed",
+      "src/grabowski_self_deploy.py": "1c3e33310eecf259c636c6250f1f01618a0e0589ca85c2a9f8ed84cf025a9674",
       "src/grabowski_task_reconcile.py": "884c80f2f4049b3f328198a60c55106034a1bf7cf64b036b52f25df767a5ecb1",
       "src/grabowski_tasks.py": "e89ead62ffcb8bb927d1cf8fd83ae216999acd62b1ae36fb403a1abfc9031ff7",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",

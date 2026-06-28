@@ -4,6 +4,7 @@ import grabowski_operator_core
 import grabowski_checkouts
 import grabowski_runtime_extensions
 import grabowski_read_surface
+import grabowski_self_deploy
 import grabowski_fleet
 import grabowski_artifacts
 import grabowski_operations

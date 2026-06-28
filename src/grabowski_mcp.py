@@ -2412,6 +2412,61 @@ def _deployment_metadata_impl() -> dict[str, Any]:
     }
 
 
+def _runtime_tool_contract_summary() -> dict[str, Any]:
+    expected: list[str] = []
+    manifest_error: str | None = None
+    try:
+        payload = json.loads(
+            _ensure_regular_text_file(DEPLOYMENT_MANIFEST, 2_000_000).decode(
+                "utf-8"
+            )
+        )
+        contract = payload.get("entrypoint_contract", {})
+        raw_expected = contract.get("expected_tools", [])
+        if not isinstance(raw_expected, list) or not all(
+            isinstance(item, str) for item in raw_expected
+        ):
+            raise ValueError("deployment manifest expected_tools is not a string list")
+        expected = sorted(set(raw_expected))
+    except Exception as exc:
+        manifest_error = f"{type(exc).__name__}: {exc}"
+
+    manager = getattr(mcp, "_tool_manager", None)
+    raw_registered = getattr(manager, "_tools", {})
+    registered = (
+        sorted(str(name) for name in raw_registered)
+        if isinstance(raw_registered, dict)
+        else []
+    )
+
+    def names_sha256(names: list[str]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                names,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    expected_set = set(expected)
+    registered_set = set(registered)
+    return {
+        "expected_tool_count": len(expected),
+        "registered_tool_count": len(registered),
+        "name_hash_contract": "sha256-json-sorted-utf8-v1",
+        "expected_names_sha256": names_sha256(expected),
+        "registered_names_sha256": names_sha256(registered),
+        "runtime_matches_deployment_contract": (
+            manifest_error is None and expected_set == registered_set
+        ),
+        "missing_from_runtime": sorted(expected_set - registered_set)[:50],
+        "unexpected_in_runtime": sorted(registered_set - expected_set)[:50],
+        "manifest_error": manifest_error,
+        "client_snapshot_observable": False,
+        "refresh_required_when_client_count_or_hash_differs": True,
+    }
+
+
 @mcp.tool(name="grabowski_status", annotations=READ_ANNOTATIONS)
 def grabowski_status() -> dict[str, Any]:
     """Return Grabowski's bounded read/write policy and current local state."""
@@ -2438,6 +2493,7 @@ def grabowski_status() -> dict[str, Any]:
         "latest_complete_bundles_path": str(BUNDLE_REGISTRY),
         "latest_complete_bundles_exists": BUNDLE_REGISTRY.is_file(),
         "deployment": _deployment_metadata(),
+        "tool_contract": _runtime_tool_contract_summary(),
         "forbidden_capabilities": policy.get("forbidden_capabilities", []),
         "kill_switch": _kill_switch_state(),
         "audit": _verify_audit_log(AUDIT_LOG),
