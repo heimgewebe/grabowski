@@ -135,6 +135,7 @@ def _read_environment() -> dict[str, str]:
     environment.update(
         {
             "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
             "GIT_PAGER": "cat",
             "PAGER": "cat",
             "GH_PROMPT_DISABLED": "1",
@@ -233,6 +234,8 @@ def _git_command(repo: Path, *arguments: str) -> list[str]:
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
+        "core.fsmonitor=false",
+        "-c",
         "protocol.file.allow=never",
         "-C",
         str(repo),
@@ -258,11 +261,14 @@ def _validate_pr(pr: int) -> int:
 
 
 def _parse_json_result(result: dict[str, Any]) -> dict[str, Any]:
-    if result["returncode"] != 0:
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str) or not stdout.strip():
         return result
     try:
-        payload = json.loads(result["stdout"])
+        payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
+        if result.get("returncode") != 0:
+            return result
         return {**result, "json_valid": False, "json_error": str(exc)}
     return {**result, "json_valid": True, "data": payload, "stdout": ""}
 

@@ -109,6 +109,7 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(argv[0], "git")
         self.assertIn("diff.external=", argv)
         self.assertIn("core.hooksPath=/dev/null", argv)
+        self.assertIn("core.fsmonitor=false", argv)
         self.assertIn("protocol.file.allow=never", argv)
         self.assertEqual(argv[-2:], ["status", "--short"])
 
@@ -127,6 +128,7 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertNotIn("GIT_EXTERNAL_DIFF", environment)
         self.assertNotIn("GIT_ASKPASS", environment)
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
         self.assertEqual(environment["GIT_PAGER"], "cat")
         self.assertEqual(environment["GH_PROMPT_DISABLED"], "1")
 
@@ -227,6 +229,18 @@ class ReadSurfaceTests(unittest.TestCase):
         parsed = read_surface._parse_json_result(result)
         self.assertTrue(parsed["json_valid"])
         self.assertEqual(parsed["data"], {"number": 7})
+        self.assertEqual(parsed["stdout"], "")
+
+    def test_json_result_parses_valid_output_with_nonzero_status(self) -> None:
+        result = {
+            "returncode": 8,
+            "stdout": json.dumps([{"name": "pending", "state": "PENDING"}]),
+            "stderr": "",
+        }
+        parsed = read_surface._parse_json_result(result)
+        self.assertEqual(parsed["returncode"], 8)
+        self.assertTrue(parsed["json_valid"])
+        self.assertEqual(parsed["data"][0]["state"], "PENDING")
         self.assertEqual(parsed["stdout"], "")
 
     def test_contract_contains_all_read_tools(self) -> None:

@@ -1226,7 +1226,7 @@
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "e982a1753dcb20b8c579960e8ed3e932d23c26587f8245f3e2ebae44b5ba76ac",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
-      "src/grabowski_read_surface.py": "e422ed78031793623513fbb215348809e3ac3bc874e68140d7f4b4278aebd260",
+      "src/grabowski_read_surface.py": "72e06deea2e156afe94a956fee5f3497c983b2f7abab825aba22d118ed504c71",
       "src/grabowski_recovery.py": "5da3dddbf900a9be0e302337a7bdba7926e3da085cc27eabc10cd4b645d66c24",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
       "src/grabowski_runtime.py": "2c2e56f3a10c4d55ea529e1e46c58d94777a533f76458af177afbbd8c27848a8",
