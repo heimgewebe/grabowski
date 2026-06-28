@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "ea5bcd2b4f2d343f5353ed46327f08dd1954cde5dc0b5f3ff23c4e8dcdca6749",
+  "capability_source_sha256": "d2d2c13221e5e2b54c562a03458041a3dc3fd8d6d32d242591f6965bac1f4ffc",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "b71d156258ccc1d5e64bd88db3572f77d834970abf838c157343ee3c5dc318f9",
+  "contract_sha256": "ccef480118e427f11891120cd06dd399344c14e2801014b51f9467dae0dfd498",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -327,6 +327,61 @@
       "reversibility": "git-branch-switch",
       "risk_class": "medium",
       "tool": "grabowski_git_branch"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Return a deterministic inventory of linked Git checkouts and lifecycle state.",
+      "effects": [],
+      "id": "grabowski_checkout_inventory",
+      "purpose": "Return deterministic linked-checkout inventory with retention, task, process and resource coordination state.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_checkout_inventory"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Assign explicit retention ownership to one temporary linked Git checkout.",
+      "effects": [
+        "state-create",
+        "resource-lease"
+      ],
+      "id": "grabowski_checkout_retain",
+      "purpose": "Assign explicit retention ownership to one temporary linked Git checkout.",
+      "read_only": false,
+      "reversibility": "retention-update",
+      "risk_class": "medium",
+      "tool": "grabowski_checkout_retain"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Archive one clean temporary linked checkout by creating durable recovery refs.",
+      "effects": [
+        "git-reference-create",
+        "state-create",
+        "resource-lease"
+      ],
+      "id": "grabowski_checkout_archive",
+      "purpose": "Archive one clean temporary linked Git checkout by creating durable recovery refs without deleting branches.",
+      "read_only": false,
+      "reversibility": "git-worktree-add-from-recovery-ref",
+      "risk_class": "medium",
+      "tool": "grabowski_checkout_archive"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Plan or apply cleanup for one archived linked checkout; apply requires a prior dry run.",
+      "effects": [
+        "working-tree-remove",
+        "state-change",
+        "resource-lease"
+      ],
+      "id": "grabowski_checkout_cleanup",
+      "purpose": "Plan or apply cleanup for an archived linked checkout; apply requires a persisted dry run.",
+      "read_only": false,
+      "reversibility": "git-worktree-add-from-recovery-ref",
+      "risk_class": "high",
+      "tool": "grabowski_checkout_cleanup"
     },
     {
       "category": "remote-version-control",

@@ -25,6 +25,7 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_recovery.py
 >$(PYTHON) -m py_compile src/grabowski_tasks.py
 >$(PYTHON) -m py_compile src/grabowski_resources.py
+>$(PYTHON) -m py_compile src/grabowski_checkouts.py
 >$(PYTHON) -m py_compile src/grabowski_task_reconcile.py
 >$(PYTHON) -m py_compile src/grabowski_workers.py
 >$(PYTHON) -m py_compile src/grabowski_worker_process.py

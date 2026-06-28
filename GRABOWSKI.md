@@ -24,6 +24,7 @@ The live context is authoritative for the running deployment, active policy, ava
 - `docs/generated/operator-context.v1.json`
 - `contracts/capability-catalog.v1.json`
 - `docs/control-plane.md`
+- `docs/checkout-lifecycle.md`
 - `docs/privileged-broker-bootstrap.md`
 
 ## Truth hierarchy

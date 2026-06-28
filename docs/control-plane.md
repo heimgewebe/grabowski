@@ -28,6 +28,17 @@ Ein Rezept besteht aus geordneten Phasen:
 
 Parameter dürfen nur als vollständige Tokens `${name}` eingesetzt werden. Teilinterpolation und Shell-Templates sind verboten. Scheitert eine verpflichtende Action oder ein Postflight, laufen Rollback-Schritte in umgekehrter Reihenfolge. Ergebnisse und Parameter-Hash werden auditiert.
 
+## Temporäre Git-Checkouts
+
+Verlinkte Worktrees werden über `grabowski_checkout_inventory`,
+`grabowski_checkout_retain`, `grabowski_checkout_archive` und
+`grabowski_checkout_cleanup` verwaltet. Cleanup ist Dry-Run-first: Apply
+benötigt Plan-ID und Plan-Hash eines frischen Dry-Runs. Archivierung erzeugt
+dauerhafte Recovery-Refs unter `refs/grabowski/checkouts/...`; Branches werden
+nicht gelöscht und es wird keine forcierte Dateisystemlöschung verwendet.
+
+Details: [`docs/checkout-lifecycle.md`](checkout-lifecycle.md).
+
 ## Privilegierter Broker
 
 `config/privileged-actions.example.json` definiert root-eigene argv-Vorlagen. Alle Beispielaktionen sind deaktiviert. Der Broker besteht aus:

@@ -358,6 +358,7 @@ class RuntimeContractTests(unittest.TestCase):
             "grabowski_privileged",
             "grabowski_tasks",
             "grabowski_resources",
+            "grabowski_checkouts",
             "grabowski_artifacts",
             "grabowski_workers",
         ):
@@ -385,6 +386,10 @@ class RuntimeContractTests(unittest.TestCase):
             "grabowski_resource_release",
             "grabowski_resource_inspect",
             "grabowski_resource_list",
+            "grabowski_checkout_inventory",
+            "grabowski_checkout_retain",
+            "grabowski_checkout_archive",
+            "grabowski_checkout_cleanup",
         ):
             self.assertIn(tool, expected)
 
