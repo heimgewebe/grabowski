@@ -130,6 +130,11 @@ def _paths_related(first: Path, second: Path) -> bool:
     return _path_inside(first, second) or _path_inside(second, first)
 
 
+def _path_inside_any(path: Path, roots: Iterable[Path]) -> bool:
+    """Return true only when path is equal to or below one coordination root."""
+    return any(_path_inside(path, root) for root in roots)
+
+
 def _safe_path(raw: str | Path, *, must_exist: bool) -> Path:
     path = Path(raw).expanduser()
     if not path.is_absolute():
@@ -708,7 +713,7 @@ def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
         cwd = row["cwd"]
         try:
             cwd_path = _safe_path(cwd, must_exist=False)
-            related = any(_paths_related(cwd_path, path) for path in paths)
+            related = _path_inside_any(cwd_path, paths)
         except (OSError, ValueError):
             pass
         resource_keys: list[str] = []
@@ -752,7 +757,7 @@ def _processes_under(paths: list[Path]) -> list[dict[str, Any]]:
             cwd = _safe_path(cwd_raw.removesuffix(" (deleted)"), must_exist=False)
         except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError):
             continue
-        if not any(_paths_related(cwd, path) for path in paths):
+        if not _path_inside_any(cwd, paths):
             continue
         command = ""
         try:
