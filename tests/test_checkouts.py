@@ -107,6 +107,58 @@ class CheckoutLifecycleTests(unittest.TestCase):
             "topic",
         )
 
+    def test_parent_directory_is_not_a_checkout_process_scope(self) -> None:
+        parent = self.root
+        self.assertFalse(
+            checkouts._path_inside_any(parent, [self.checkout, self.repo])
+        )
+        self.assertTrue(
+            checkouts._path_inside_any(self.checkout, [self.checkout, self.repo])
+        )
+        self.assertTrue(
+            checkouts._path_inside_any(self.checkout / "nested", [self.checkout])
+        )
+
+    def test_task_in_parent_directory_does_not_block_child_checkout(self) -> None:
+        with checkouts.tasks._database() as connection:
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    task_id, host, unit, attempt, state, resume_policy,
+                    argv_json, argv_sha256, cwd, runtime_seconds,
+                    cpu_weight, io_weight, memory_max_bytes,
+                    created_at_unix, updated_at_unix, launcher_json,
+                    last_observation_json, resource_keys_json, lease_owner_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "c" * 24,
+                    "local",
+                    "grabowski-task-" + "c" * 24 + "-a1.service",
+                    1,
+                    "running",
+                    "manual",
+                    '["/bin/true"]',
+                    "d" * 64,
+                    str(self.root),
+                    60,
+                    100,
+                    100,
+                    None,
+                    int(time.time()),
+                    int(time.time()),
+                    "{}",
+                    None,
+                    "[]",
+                    "task:" + "c" * 24,
+                ),
+            )
+            connection.commit()
+        self.assertEqual(
+            checkouts._task_records([self.checkout, self.repo]),
+            [],
+        )
+
     def test_inventory_is_deterministic_and_shows_linked_checkout(self) -> None:
         first = checkouts.checkout_inventory(
             self.repo,

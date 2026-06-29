@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed checkout coordination so a process or task in a parent directory no
+  longer blocks every descendant worktree; only working directories equal to
+  or below an actual coordination root count as blockers.
 - Hardened the typed read surface with streaming output bounds, single-object
   Git revision resolution, schema-visible argument limits, compact Core profile
   categories, live tool-contract fingerprints, and delayed self-deployment.
@@ -38,4 +41,3 @@
   verification, and unprivileged privileged-action references.
 - Added typed reversible filesystem removal/restoration and a separate
   deliberate irreversible removal capability, both behind explicit capability,
-  audit, protected-root and kill-switch gates.
