@@ -62,6 +62,16 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _redact_reason(text: str) -> str:
+    redact_text = getattr(operator, "_redact_text", None)
+    if callable(redact_text):
+        return redact_text(text)
+    redact = getattr(operator, "_redact", None)
+    if callable(redact):
+        return redact(text)
+    return text
+
+
 def _is_terminal_state(state: str) -> bool:
     return state in {"completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}
 
@@ -734,19 +744,94 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     return {"task": _public(stored), "audit": audit}
 
 
-def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
-    if not isinstance(auto_resume, bool):
-        raise ValueError("auto_resume must be boolean")
+def _reconcile_candidate_rows(task_id: str = "") -> list[dict[str, Any]]:
+    if task_id:
+        record = _row(task_id)
+        return [record] if record["state"] in {"launching", "running"} else []
     with _database() as connection:
         rows = connection.execute(
             "SELECT * FROM tasks WHERE state IN ('launching', 'running') "
             "ORDER BY created_at_unix, task_id"
         ).fetchall()
-    refreshed: list[dict[str, Any]] = []
-    resumed: list[dict[str, Any]] = []
+    return [dict(row) for row in rows]
+
+
+def _reconcile_blocker(record: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any] | None:
+    if observation["state"] == "running":
+        return None
+    if observation["state"] == "completed":
+        return {
+            "task_id": record["task_id"],
+            "resume_policy": record["resume_policy"],
+            "reason": "completed task does not require resume",
+        }
+    if observation["state"] == "outcome_unknown":
+        return {
+            "task_id": record["task_id"],
+            "resume_policy": record["resume_policy"],
+            "reason": "outcome_unknown requires verification before retry",
+        }
+    if record["resume_policy"] != "retry-safe":
+        return {
+            "task_id": record["task_id"],
+            "resume_policy": record["resume_policy"],
+            "reason": "automatic resume requires retry-safe policy",
+        }
+    return None
+
+
+def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
+    if not isinstance(task_id, str):
+        raise ValueError("task_id must be a string")
+    if task_id:
+        _validate_task_id(task_id)
+    rows = _reconcile_candidate_rows(task_id)
+    observations: list[dict[str, Any]] = []
+    would_refresh: list[dict[str, Any]] = []
+    would_release: list[str] = []
+    would_resume: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
-    for raw in rows:
-        record = dict(raw)
+    for record in rows:
+        observation = _observe(record)
+        item = {
+            "task_id": record["task_id"],
+            "current_state": record["state"],
+            "observed_state": observation["state"],
+            "resume_policy": record["resume_policy"],
+            "resource_keys": _record_resource_keys(record),
+        }
+        observations.append(item)
+        if observation["state"] != record["state"]:
+            would_refresh.append(item)
+        if observation["state"] not in {"launching", "running"}:
+            would_release.append(record["task_id"])
+        blocker = _reconcile_blocker(record, observation)
+        if blocker is not None:
+            blocked.append(blocker)
+        elif observation["state"] != "running":
+            would_resume.append(item)
+    return {
+        "mode": "check",
+        "task_id": task_id,
+        "scanned": len(rows),
+        "observations": observations,
+        "would_refresh": would_refresh,
+        "would_release": would_release,
+        "would_resume": would_resume,
+        "blocked": blocked,
+        "checked_at_unix": _now(),
+    }
+
+
+def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
+    if not isinstance(task_id, str):
+        raise ValueError("task_id must be a string")
+    if task_id:
+        _validate_task_id(task_id)
+    rows = _reconcile_candidate_rows(task_id)
+    refreshed: list[dict[str, Any]] = []
+    released: list[str] = []
+    for record in rows:
         observation = _observe(record)
         stored = _set_state(
             record["task_id"],
@@ -755,24 +840,62 @@ def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
         )
         if observation["state"] not in {"launching", "running"}:
             _release_record_resources(stored)
+            released.append(stored["task_id"])
         refreshed.append(_public(stored))
-        if not auto_resume or observation["state"] == "running":
+    return {
+        "mode": "refresh",
+        "task_id": task_id,
+        "scanned": len(rows),
+        "refreshed": refreshed,
+        "released": released,
+        "resumed": [],
+        "blocked": [],
+        "checked_at_unix": _now(),
+    }
+
+
+def reconcile_tasks_resume(
+    *,
+    task_id: str = "",
+    max_resumes: int = 1,
+    reason: str = "",
+) -> dict[str, Any]:
+    if not isinstance(task_id, str):
+        raise ValueError("task_id must be a string")
+    if task_id:
+        _validate_task_id(task_id)
+    if not isinstance(max_resumes, int) or not 1 <= max_resumes <= 50:
+        raise ValueError("max_resumes must be between 1 and 50")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("reason is required for task reconcile resume")
+    rows = _reconcile_candidate_rows(task_id)
+    refreshed: list[dict[str, Any]] = []
+    released: list[str] = []
+    resumed: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for record in rows:
+        observation = _observe(record)
+        stored = _set_state(
+            record["task_id"],
+            observation["state"],
+            observation=observation,
+        )
+        if observation["state"] not in {"launching", "running"}:
+            _release_record_resources(stored)
+            released.append(stored["task_id"])
+        refreshed.append(_public(stored))
+        if observation["state"] == "running":
             continue
-        if observation["state"] == "outcome_unknown":
+        blocker = _reconcile_blocker(stored, observation)
+        if blocker is not None:
+            blocked.append(blocker)
+            continue
+        if len(resumed) >= max_resumes:
             blocked.append(
                 {
                     "task_id": stored["task_id"],
                     "resume_policy": stored["resume_policy"],
-                    "reason": "outcome_unknown requires verification before retry",
-                }
-            )
-            continue
-        if stored["resume_policy"] != "retry-safe":
-            blocked.append(
-                {
-                    "task_id": stored["task_id"],
-                    "resume_policy": stored["resume_policy"],
-                    "reason": "automatic resume requires retry-safe policy",
+                    "reason": "max_resumes reached",
                 }
             )
             continue
@@ -783,17 +906,93 @@ def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
                 {
                     "task_id": stored["task_id"],
                     "resume_policy": stored["resume_policy"],
-                    "reason": operator._redact_text(str(exc)),
+                    "reason": _redact_reason(str(exc)),
                 }
             )
     return {
-        "auto_resume": auto_resume,
+        "mode": "resume",
+        "task_id": task_id,
+        "max_resumes": max_resumes,
+        "reason": _redact_reason(reason.strip()),
         "scanned": len(rows),
         "refreshed": refreshed,
+        "released": released,
         "resumed": resumed,
         "blocked": blocked,
         "checked_at_unix": _now(),
     }
+
+
+def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
+    if not isinstance(auto_resume, bool):
+        raise ValueError("auto_resume must be boolean")
+    if auto_resume:
+        result = reconcile_tasks_resume(
+            max_resumes=50,
+            reason="legacy auto_resume reconcile",
+        )
+    else:
+        result = reconcile_tasks_refresh()
+    return {
+        "auto_resume": auto_resume,
+        "scanned": result["scanned"],
+        "refreshed": result["refreshed"],
+        "resumed": result["resumed"],
+        "blocked": result["blocked"],
+        "checked_at_unix": result["checked_at_unix"],
+    }
+
+
+@mcp.tool(name="grabowski_task_reconcile_check", annotations=READ_ONLY)
+def grabowski_task_reconcile_check(task_id: str = "") -> dict[str, Any]:
+    """Read-only reconcile preview for persistent tasks."""
+    operator._require_operator_capability("durable_job")
+    return reconcile_tasks_check(task_id=task_id)
+
+
+@mcp.tool(name="grabowski_task_reconcile_refresh", annotations=MUTATING)
+def grabowski_task_reconcile_refresh(task_id: str = "") -> dict[str, Any]:
+    """Refresh persistent task states without resuming processes."""
+    operator._require_operator_mutation("durable_job")
+    result = reconcile_tasks_refresh(task_id=task_id)
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "task-reconcile-refresh",
+            "task_id": task_id,
+            "scanned": result["scanned"],
+            "released_count": len(result["released"]),
+        }
+    )
+    return result
+
+
+@mcp.tool(name="grabowski_task_reconcile_resume", annotations=MUTATING)
+def grabowski_task_reconcile_resume(
+    task_id: str = "",
+    max_resumes: int = 1,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Resume retry-safe tasks after reconcile verification."""
+    operator._require_operator_mutation("durable_job")
+    result = reconcile_tasks_resume(
+        task_id=task_id,
+        max_resumes=max_resumes,
+        reason=reason,
+    )
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "task-reconcile-resume",
+            "task_id": task_id,
+            "max_resumes": max_resumes,
+            "reason": result["reason"],
+            "scanned": result["scanned"],
+            "resumed_count": len(result["resumed"]),
+            "blocked_count": len(result["blocked"]),
+        }
+    )
+    return result
 
 
 @mcp.tool(name="grabowski_task_reconcile", annotations=MUTATING)
