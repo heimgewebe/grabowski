@@ -783,6 +783,46 @@
       "tool": "grabowski_task_list"
     },
     {
+      "category": "task",
+      "description": "Read-only reconcile preview for persistent tasks.",
+      "effects": [],
+      "id": "grabowski_task_reconcile_check",
+      "purpose": "Preview reconcile effects for persistent task records without mutating state.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_reconcile_check"
+    },
+    {
+      "category": "task",
+      "description": "Refresh persistent task states without resuming processes.",
+      "effects": [
+        "state-refresh",
+        "lease-release"
+      ],
+      "id": "grabowski_task_reconcile_refresh",
+      "purpose": "Refresh persistent task records and release terminal leases without resuming processes.",
+      "read_only": false,
+      "reversibility": "conditional",
+      "risk_class": "medium",
+      "tool": "grabowski_task_reconcile_refresh"
+    },
+    {
+      "category": "task",
+      "description": "Resume retry-safe tasks after reconcile verification.",
+      "effects": [
+        "state-refresh",
+        "lease-release",
+        "possible-process-start"
+      ],
+      "id": "grabowski_task_reconcile_resume",
+      "purpose": "Resume bounded retry-safe tasks after reconcile verification.",
+      "read_only": false,
+      "reversibility": "conditional",
+      "risk_class": "high",
+      "tool": "grabowski_task_reconcile_resume"
+    },
+    {
       "category": "recovery",
       "description": "Evaluate the fail-closed recovery gate for power-worker activation.",
       "effects": [],
@@ -865,7 +905,7 @@
         "possible-process-start"
       ],
       "id": "grabowski_task_reconcile",
-      "purpose": "Reconcile persistent task records with systemd units and safely resume retry-safe tasks.",
+      "purpose": "Legacy reconcile entrypoint; prefer check, refresh or resume for narrower semantics.",
       "read_only": false,
       "reversibility": "conditional",
       "risk_class": "high",
@@ -1132,6 +1172,9 @@
       "grabowski_task_cancel",
       "grabowski_task_resume",
       "grabowski_task_list",
+      "grabowski_task_reconcile_check",
+      "grabowski_task_reconcile_refresh",
+      "grabowski_task_reconcile_resume",
       "grabowski_recovery_status",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",
@@ -1228,7 +1271,7 @@
   "sources": {
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "ca26900e53e495664e798c6b38632d1345a47569f527a6569934ffac56b2b712"
+      "sha256": "bf9c76d748a1e4df146620893dcd05efb8870727228759623ae62ae4d90b6149"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1236,11 +1279,11 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "5855b475409cf26ac0b80fae00d28dc98f20b1f44a3f106520d143b1364625ed"
+      "sha256": "e4c4bc31b6da33c21ebb0633c7e8cb3191a89e2a9dda4857f6d9c0d7589fb628"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "ca26900e53e495664e798c6b38632d1345a47569f527a6569934ffac56b2b712",
+      "src/grabowski_capabilities.py": "bf9c76d748a1e4df146620893dcd05efb8870727228759623ae62ae4d90b6149",
       "src/grabowski_checkouts.py": "628c51240e773330e5958dd83ff4b30b651ed411d10fbf0b24764c07fe107342",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
       "src/grabowski_mcp.py": "7ca59e133096f120f0a5cb1c89c3500a1f7da9fe06a94f7a16cd5693f76ac30f",
@@ -1254,7 +1297,7 @@
       "src/grabowski_runtime_extensions.py": "3092fc1e9031cc2d3beb9e6e1e2a43ea31d68fe07cc6186055d06dacb56e87ed",
       "src/grabowski_self_deploy.py": "1c3e33310eecf259c636c6250f1f01618a0e0589ca85c2a9f8ed84cf025a9674",
       "src/grabowski_task_reconcile.py": "884c80f2f4049b3f328198a60c55106034a1bf7cf64b036b52f25df767a5ecb1",
-      "src/grabowski_tasks.py": "e89ead62ffcb8bb927d1cf8fd83ae216999acd62b1ae36fb403a1abfc9031ff7",
+      "src/grabowski_tasks.py": "2f2587263c2d1ab607582163951cccf2a8cf833a7d16b3c9269efb1909794974",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "50f069b6a14fd4a1686de3cfec8dad1d5d835ef41ccc3669744f24699a8fd0dc"
     }

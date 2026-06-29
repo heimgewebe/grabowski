@@ -75,13 +75,16 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_task_cancel` | task | no | medium | Stop one task process group while retaining its persistent record. |
 | `grabowski_task_resume` | task | no | variable | Recreate a missing or stopped task unit from its persistent record. |
 | `grabowski_task_list` | task | yes | low | List recent persistent task records with optional state filtering. |
+| `grabowski_task_reconcile_check` | task | yes | low | Preview reconcile effects for persistent task records without mutating state. |
+| `grabowski_task_reconcile_refresh` | task | no | medium | Refresh persistent task records and release terminal leases without resuming processes. |
+| `grabowski_task_reconcile_resume` | task | no | high | Resume bounded retry-safe tasks after reconcile verification. |
 | `grabowski_recovery_status` | recovery | yes | low | Evaluate the fail-closed recovery gate for power-worker activation. |
 | `grabowski_resource_acquire` | resource | no | medium | Atomically acquire typed resource leases for one owner. |
 | `grabowski_resource_renew` | resource | no | medium | Renew live resource leases owned by one owner. |
 | `grabowski_resource_release` | resource | no | high | Release owner-bound resource leases with an explicit force override. |
 | `grabowski_resource_inspect` | resource | yes | low | Inspect one typed resource lease without returning private metadata. |
 | `grabowski_resource_list` | resource | yes | low | List bounded typed resource leases with optional owner filtering. |
-| `grabowski_task_reconcile` | task | no | high | Reconcile persistent task records with systemd units and safely resume retry-safe tasks. |
+| `grabowski_task_reconcile` | task | no | high | Legacy reconcile entrypoint; prefer check, refresh or resume for narrower semantics. |
 | `grabowski_artifact_stat` | artifact | yes | low | Read regular-file size and SHA-256 on one registered fleet host. |
 | `grabowski_artifact_push` | artifact | no | high | Push one hash-bound regular file to a registered SSH fleet host. |
 | `grabowski_artifact_pull` | artifact | no | high | Pull one hash-bound regular file from a registered SSH fleet host. |

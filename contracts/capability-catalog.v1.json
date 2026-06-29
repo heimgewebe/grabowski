@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "ca26900e53e495664e798c6b38632d1345a47569f527a6569934ffac56b2b712",
+  "capability_source_sha256": "bf9c76d748a1e4df146620893dcd05efb8870727228759623ae62ae4d90b6149",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "5855b475409cf26ac0b80fae00d28dc98f20b1f44a3f106520d143b1364625ed",
+  "contract_sha256": "e4c4bc31b6da33c21ebb0633c7e8cb3191a89e2a9dda4857f6d9c0d7589fb628",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -795,6 +795,46 @@
       "tool": "grabowski_task_list"
     },
     {
+      "category": "task",
+      "description": "Read-only reconcile preview for persistent tasks.",
+      "effects": [],
+      "id": "grabowski_task_reconcile_check",
+      "purpose": "Preview reconcile effects for persistent task records without mutating state.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_reconcile_check"
+    },
+    {
+      "category": "task",
+      "description": "Refresh persistent task states without resuming processes.",
+      "effects": [
+        "state-refresh",
+        "lease-release"
+      ],
+      "id": "grabowski_task_reconcile_refresh",
+      "purpose": "Refresh persistent task records and release terminal leases without resuming processes.",
+      "read_only": false,
+      "reversibility": "conditional",
+      "risk_class": "medium",
+      "tool": "grabowski_task_reconcile_refresh"
+    },
+    {
+      "category": "task",
+      "description": "Resume retry-safe tasks after reconcile verification.",
+      "effects": [
+        "state-refresh",
+        "lease-release",
+        "possible-process-start"
+      ],
+      "id": "grabowski_task_reconcile_resume",
+      "purpose": "Resume bounded retry-safe tasks after reconcile verification.",
+      "read_only": false,
+      "reversibility": "conditional",
+      "risk_class": "high",
+      "tool": "grabowski_task_reconcile_resume"
+    },
+    {
       "category": "recovery",
       "description": "Evaluate the fail-closed recovery gate for power-worker activation.",
       "effects": [],
@@ -877,7 +917,7 @@
         "possible-process-start"
       ],
       "id": "grabowski_task_reconcile",
-      "purpose": "Reconcile persistent task records with systemd units and safely resume retry-safe tasks.",
+      "purpose": "Legacy reconcile entrypoint; prefer check, refresh or resume for narrower semantics.",
       "read_only": false,
       "reversibility": "conditional",
       "risk_class": "high",

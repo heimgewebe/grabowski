@@ -318,6 +318,87 @@ class TaskTests(unittest.TestCase):
             result["blocked"][0]["resume_policy"], "verify-then-retry"
         )
 
+    def test_reconcile_check_is_read_only_preview(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 140}
+        ):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="retry-safe",
+                resource_keys=["service:preview.service"],
+            )
+        task = started["task"]
+        missing = _launcher(returncode=1)
+        missing["stderr"] = "unit not found"
+        with patch.object(tasks, "_dispatch", return_value=missing):
+            result = tasks.reconcile_tasks_check()
+        self.assertEqual(result["scanned"], 1)
+        self.assertEqual(result["would_release"], [task["task_id"]])
+        self.assertEqual(result["would_resume"], [])
+        self.assertIn("outcome_unknown", result["blocked"][0]["reason"])
+        listed = tasks.grabowski_task_list()
+        self.assertEqual(listed["tasks"][0]["state"], "running")
+        self.assertIsNotNone(tasks.resources.inspect_resource("service:preview.service"))
+
+    def test_reconcile_refresh_does_not_resume_processes(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 141}
+        ):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="retry-safe",
+                resource_keys=["service:refresh.service"],
+            )
+        missing = _launcher(returncode=1)
+        missing["stderr"] = "unit not found"
+        with patch.object(tasks, "_dispatch", return_value=missing) as dispatch:
+            result = tasks.reconcile_tasks_refresh()
+        self.assertEqual(dispatch.call_count, 1)
+        self.assertEqual(result["resumed"], [])
+        self.assertEqual(result["released"], [started["task"]["task_id"]])
+        self.assertEqual(result["refreshed"][0]["state"], "outcome_unknown")
+        self.assertIsNone(tasks.resources.inspect_resource("service:refresh.service"))
+
+    def test_reconcile_resume_requires_reason(self) -> None:
+        with self.assertRaisesRegex(ValueError, "reason is required"):
+            tasks.reconcile_tasks_resume()
+
+    def test_reconcile_does_not_resume_completed_tasks(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 142}
+        ):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="retry-safe",
+            )
+        completed = _launcher()
+        completed["stdout"] = (
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
+        )
+        with patch.object(tasks, "_dispatch", return_value=completed):
+            result = tasks.reconcile_tasks_resume(
+                reason="test completed no-resume", max_resumes=1
+            )
+        self.assertEqual(result["resumed"], [])
+        self.assertEqual(result["blocked"][0]["task_id"], started["task"]["task_id"])
+        self.assertIn("completed", result["blocked"][0]["reason"])
+
     def test_schema_v1_database_migrates_without_losing_records(self) -> None:
         self.database.parent.mkdir(parents=True)
         connection = sqlite3.connect(self.database)
@@ -398,6 +479,9 @@ class RuntimeContractTests(unittest.TestCase):
             "grabowski_task_cancel",
             "grabowski_task_resume",
             "grabowski_task_list",
+            "grabowski_task_reconcile_check",
+            "grabowski_task_reconcile_refresh",
+            "grabowski_task_reconcile_resume",
             "grabowski_task_reconcile",
             "grabowski_resource_acquire",
             "grabowski_resource_renew",

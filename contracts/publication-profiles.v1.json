@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "5855b475409cf26ac0b80fae00d28dc98f20b1f44a3f106520d143b1364625ed"
+    "sha256": "e4c4bc31b6da33c21ebb0633c7e8cb3191a89e2a9dda4857f6d9c0d7589fb628"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "bd957fcbeebf89f1fa5e84e29300648e068391e09813cd25d8d5076e40faac49"
+    "sha256": "ed1764c05740d29f05b0ec29f3db6aadc031b27f1f6db556b79531c73cd6fe31"
   },
   "counts": {
     "core": 17,
-    "full": 81,
-    "operator": 66
+    "full": 84,
+    "operator": 69
   },
   "profiles": {
     "core": [
@@ -96,6 +96,9 @@
       "grabowski_task_cancel",
       "grabowski_task_resume",
       "grabowski_task_list",
+      "grabowski_task_reconcile_check",
+      "grabowski_task_reconcile_refresh",
+      "grabowski_task_reconcile_resume",
       "grabowski_recovery_status",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",
@@ -165,6 +168,9 @@
       "grabowski_task_cancel",
       "grabowski_task_resume",
       "grabowski_task_list",
+      "grabowski_task_reconcile_check",
+      "grabowski_task_reconcile_refresh",
+      "grabowski_task_reconcile_resume",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",
       "grabowski_resource_release",
