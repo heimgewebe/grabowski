@@ -48,6 +48,11 @@ NORMAL_POLICY = json.loads(
         encoding="utf-8"
     )
 )
+OBSERVE_POLICY = json.loads(
+    (ROOT / "config" / "access.example.json").read_text(
+        encoding="utf-8"
+    )
+)
 TRUSTED_POLICY = json.loads(
     (ROOT / "config" / "access.trusted-owner.example.json").read_text(
         encoding="utf-8"
@@ -64,6 +69,30 @@ class TrustedOwnerTests(unittest.TestCase):
         invalid["trusted_owner"] = "yes"
         with self.assertRaisesRegex(RuntimeError, "trusted_owner"):
             base._validate_policy(invalid)
+
+
+    def test_observe_profile_denies_sensitive_and_mutating_capabilities(self) -> None:
+        base._validate_policy(OBSERVE_POLICY)
+        with patch.object(base, "_load_policy", return_value=OBSERVE_POLICY):
+            self.assertEqual(base._active_profile(OBSERVE_POLICY)["name"], "observe")
+            for capability in (
+                "file_write",
+                "secret_reveal",
+                "file_destroy",
+                "terminal_execute",
+                "process_signal",
+                "durable_job",
+                "resource_lease",
+            ):
+                with self.subTest(capability=capability):
+                    if capability in {"terminal_execute", "process_signal", "durable_job", "resource_lease"}:
+                        with self.assertRaisesRegex(PermissionError, "not enabled"):
+                            operator._require_operator_capability(capability)
+                    else:
+                        with self.assertRaisesRegex(PermissionError, "not enabled"):
+                            base._require_capability(capability)
+            self.assertIn("process_inspect", operator._operator_capabilities())
+            self.assertIn("port_inspect", operator._operator_capabilities())
 
     def test_privilege_frontends_are_profile_gated(self) -> None:
         executable = sorted(operator.PRIVILEGE_ESCALATORS)[0]

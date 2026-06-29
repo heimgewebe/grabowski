@@ -70,6 +70,29 @@ kurzlebige Single-Use-Referenzen für den root-eigenen Socket-Broker. Der Broker
 führt ausschließlich konfigurierte argv-Templates aus; sein Host-Bootstrap ist
 eine explizite Systemoperation.
 
+## Staged Capability Profiles
+
+`config/access.example.json` now uses `observe` as its repository-default
+profile. `observe` enables only bounded reads, audit verification, bundle
+lookup, process inspection and port inspection. It deliberately excludes
+`file_write`, `terminal_execute`, secret capabilities, irreversible file
+destroy, process signals, durable jobs, resource leases, GitHub CLI and generic
+service control.
+
+`maintain` is intentionally conservative. Current implementation capabilities
+are still coarse in several places: enabling `durable_job`, `resource_lease`,
+`git_cli`, `github_cli` or `user_service_control` would also unlock mutating
+tools. Therefore `maintain` does not pretend to provide safe reconcile refresh,
+resource renew or checkout inventory until those paths get separate tool-level
+read/write gates.
+
+`mutate` enables bounded repository/operator mutations with audit and
+preconditions, but excludes terminal execution, secret reveal/use/export,
+browser profile reads, tmux input, process signals and irreversible destroy.
+`break-glass` is the explicit high-risk profile for those excluded operations.
+The live policy is not changed by these examples; staged profile adoption must
+be a separate deployment decision with rollback evidence.
+
 ## Trusted Owner
 
 Für den allein kontrollierten Heim-PC ist `trusted-owner` das vorgesehene

@@ -262,7 +262,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
             f"- Secret roots: {format_policy_values('secret_roots')}",
             f"- Browser profile roots: {format_policy_values('browser_profile_roots')}",
             f"- Secret export roots: {format_policy_values('secret_export_roots')}",
-            f"- Forbidden capabilities: {', '.join(f'`{item}`' for item in policy.get('forbidden_capabilities', []))}",
+            f"- Forbidden capabilities: {format_policy_values('forbidden_capabilities')}",
             "",
             "## Update contract",
             "",

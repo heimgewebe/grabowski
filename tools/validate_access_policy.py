@@ -101,6 +101,8 @@ forbidden_private_names = {
     "private_local_transfer",
     "private_safe_consumption",
 }
+staged_profile_names = {"observe", "maintain", "mutate", "break-glass"}
+default_safe_profiles = {"observe", "maintain"}
 
 
 def require_string_list(path: Path, data: dict, key: str) -> None:
@@ -206,6 +208,14 @@ def validate_policy(path: Path) -> None:
     active = data.get("active_profile", data.get("mode"))
     if active not in profiles:
         raise SystemExit(f"{path}: active profile is not defined: {active!r}")
+    if not trusted_owner and path.name != "access.trusted-owner.example.json":
+        missing_staged = sorted(staged_profile_names - set(profiles))
+        if missing_staged:
+            raise SystemExit(f"{path}: missing staged profiles: {missing_staged}")
+    if path.name == "access.example.json" and active not in default_safe_profiles:
+        raise SystemExit(
+            f"{path}: default example must activate observe or maintain, got {active!r}"
+        )
     for name, profile in profiles.items():
         if not isinstance(profile, dict):
             raise SystemExit(f"{path}: profile {name} must be an object.")

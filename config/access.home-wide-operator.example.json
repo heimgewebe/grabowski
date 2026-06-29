@@ -1,7 +1,7 @@
 {
   "version": 2,
   "mode": "home-wide-operator",
-  "active_profile": "home-wide-operator",
+  "active_profile": "break-glass",
   "read_roots": [
     "${HOME}"
   ],
@@ -28,11 +28,11 @@
   "secret_export_roots": [
     "${HOME}/grabowski-secret-exports"
   ],
-  "max_read_bytes": 2000000,
-  "max_write_bytes": 2000000,
-  "max_list_entries": 1000,
-  "max_secret_use_output_bytes": 250000,
-  "max_secret_use_seconds": 30,
+  "max_read_bytes": 33554432,
+  "max_write_bytes": 33554432,
+  "max_list_entries": 100000,
+  "max_secret_use_output_bytes": 33554432,
+  "max_secret_use_seconds": 3600,
   "forbid_symlinks": true,
   "forbidden_components": [
     ".git"
@@ -47,13 +47,7 @@
     "*.kdbx",
     "credentials.json"
   ],
-  "forbidden_capabilities": [
-    "file_delete",
-    "file_destroy",
-    "file_move",
-    "chmod",
-    "chown"
-  ],
+  "forbidden_capabilities": [],
   "capability_definitions": {
     "file_read": "Read bounded, non-secret text and metadata inside configured roots.",
     "file_write": "Create and replace bounded text files with hash preconditions, audit and quarantine.",
@@ -83,8 +77,95 @@
     "gui_worker": "Start and control isolated Xvfb GUI workers without a remote display listener."
   },
   "profiles": {
-    "home-wide-operator": {
-      "description": "Example only: home-wide operator profile for a deliberate local cutover.",
+    "observe": {
+      "description": "Read/status profile. It intentionally omits coarse capabilities that currently unlock mutating tools.",
+      "read_roots": [
+        "${HOME}"
+      ],
+      "write_roots": [],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
+      ],
+      "secret_roots": [],
+      "browser_profile_roots": [],
+      "secret_export_roots": [],
+      "max_read_bytes": 2000000,
+      "max_write_bytes": 2000000,
+      "max_list_entries": 500,
+      "max_secret_use_output_bytes": 250000,
+      "max_secret_use_seconds": 30,
+      "capabilities": [
+        "file_read",
+        "audit_verify",
+        "bundle_registry",
+        "process_inspect",
+        "port_inspect"
+      ]
+    },
+    "maintain": {
+      "description": "Conservative maintenance profile. Until tool-level read/write capability splits exist, it remains read-mostly and does not grant durable_job, resource_lease or git_cli.",
+      "read_roots": [
+        "${HOME}"
+      ],
+      "write_roots": [],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
+      ],
+      "secret_roots": [],
+      "browser_profile_roots": [],
+      "secret_export_roots": [],
+      "max_read_bytes": 2000000,
+      "max_write_bytes": 2000000,
+      "max_list_entries": 500,
+      "max_secret_use_output_bytes": 250000,
+      "max_secret_use_seconds": 30,
+      "capabilities": [
+        "file_read",
+        "audit_verify",
+        "bundle_registry",
+        "process_inspect",
+        "port_inspect"
+      ]
+    },
+    "mutate": {
+      "description": "Bounded mutation profile for repository and operator state changes with audit and preconditions. It excludes terminal, secrets, tmux, process signals and irreversible destroy.",
+      "read_roots": [
+        "${HOME}"
+      ],
+      "write_roots": [
+        "${HOME}"
+      ],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
+      ],
+      "secret_roots": [],
+      "browser_profile_roots": [],
+      "secret_export_roots": [],
+      "max_read_bytes": 2000000,
+      "max_write_bytes": 2000000,
+      "max_list_entries": 500,
+      "max_secret_use_output_bytes": 250000,
+      "max_secret_use_seconds": 30,
+      "capabilities": [
+        "file_read",
+        "file_write",
+        "audit_verify",
+        "rollback_text",
+        "bundle_registry",
+        "durable_job",
+        "git_cli",
+        "github_cli",
+        "user_service_control",
+        "resource_lease",
+        "artifact_transfer",
+        "browser_worker",
+        "gui_worker",
+        "process_inspect",
+        "port_inspect"
+      ]
+    },
+    "break-glass": {
+      "description": "Explicit high-risk profile for terminal execution, secret reveal/use/export, browser profiles, tmux, process signals and destructive file operations.",
       "read_roots": [
         "${HOME}"
       ],
@@ -111,36 +192,41 @@
       "secret_export_roots": [
         "${HOME}/grabowski-secret-exports"
       ],
-      "max_read_bytes": 2000000,
-      "max_write_bytes": 2000000,
-      "max_list_entries": 1000,
-      "max_secret_use_output_bytes": 250000,
-      "max_secret_use_seconds": 30,
+      "max_read_bytes": 33554432,
+      "max_write_bytes": 33554432,
+      "max_list_entries": 100000,
+      "max_secret_use_output_bytes": 33554432,
+      "max_secret_use_seconds": 3600,
       "capabilities": [
         "file_read",
         "file_write",
         "audit_verify",
         "rollback_text",
         "bundle_registry",
+        "durable_job",
+        "git_cli",
+        "github_cli",
+        "user_service_control",
+        "resource_lease",
+        "artifact_transfer",
+        "browser_worker",
+        "gui_worker",
+        "process_inspect",
+        "port_inspect",
         "secret_inspect",
         "secret_reveal",
         "secret_use",
         "secret_export",
         "browser_profile_read",
         "terminal_execute",
-        "durable_job",
-        "resource_lease",
-        "artifact_transfer",
-        "browser_worker",
-        "gui_worker",
-        "git_cli",
-        "github_cli",
-        "user_service_control",
         "tmux_interaction",
-        "process_inspect",
         "process_signal",
-        "port_inspect",
-        "privileged_reference"
+        "privileged_reference",
+        "file_delete",
+        "file_destroy",
+        "file_move",
+        "chmod",
+        "chown"
       ]
     }
   }
