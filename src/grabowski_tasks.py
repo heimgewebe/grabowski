@@ -927,12 +927,26 @@ def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
     if not isinstance(auto_resume, bool):
         raise ValueError("auto_resume must be boolean")
     if auto_resume:
-        result = reconcile_tasks_resume(
-            max_resumes=50,
-            reason="legacy auto_resume reconcile",
-        )
-    else:
+        preview = reconcile_tasks_check()
         result = reconcile_tasks_refresh()
+        disabled = [
+            {
+                "task_id": item["task_id"],
+                "resume_policy": item["resume_policy"],
+                "reason": "legacy auto_resume reconcile is disabled; use explicit resume mode",
+            }
+            for item in preview["would_resume"]
+        ]
+        return {
+            "auto_resume": auto_resume,
+            "legacy_auto_resume_disabled": True,
+            "scanned": result["scanned"],
+            "refreshed": result["refreshed"],
+            "resumed": [],
+            "blocked": [*preview["blocked"], *disabled],
+            "checked_at_unix": result["checked_at_unix"],
+        }
+    result = reconcile_tasks_refresh()
     return {
         "auto_resume": auto_resume,
         "scanned": result["scanned"],
