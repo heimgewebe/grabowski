@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grabowski.local/contracts/operator-friction-event.v1.schema.json",
+  "title": "Grabowski Operator Friction Event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "recorded_at_unix",
+    "kind",
+    "surface",
+    "operation",
+    "symptom",
+    "suspected_trigger",
+    "fallback",
+    "resolved",
+    "notes"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "event_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "recorded_at_unix": {"type": "integer", "minimum": 0},
+    "kind": {
+      "type": "string",
+      "enum": [
+        "platform_filter",
+        "connector_snapshot",
+        "fail_closed_gate",
+        "execution_context",
+        "ci_contract",
+        "operator_bug",
+        "user_input",
+        "network",
+        "unknown"
+      ]
+    },
+    "surface": {
+      "type": "string",
+      "enum": [
+        "chat_tool",
+        "connector",
+        "runtime",
+        "terminal",
+        "local_shell",
+        "github",
+        "ci",
+        "fleet",
+        "recovery",
+        "filesystem",
+        "unknown"
+      ]
+    },
+    "operation": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "symptom": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "suspected_trigger": {"type": "string", "maxLength": 2000},
+    "fallback": {"type": "string", "maxLength": 2000},
+    "resolved": {"type": "boolean"},
+    "notes": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"type": "string", "maxLength": 500}
+    }
+  }
+}

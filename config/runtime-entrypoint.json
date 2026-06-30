@@ -68,6 +68,8 @@
     "grabowski_task_reconcile_resume",
     "grabowski_recovery_status",
     "grabowski_recovery_server_probe",
+    "grabowski_friction_record",
+    "grabowski_friction_summary",
     "grabowski_resource_acquire",
     "grabowski_resource_renew",
     "grabowski_resource_release",
@@ -138,6 +140,10 @@
     {
       "module": "grabowski_recovery",
       "source": "src/grabowski_recovery.py"
+    },
+    {
+      "module": "grabowski_friction",
+      "source": "src/grabowski_friction.py"
     },
     {
       "module": "grabowski_resources",

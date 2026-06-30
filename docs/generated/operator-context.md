@@ -80,6 +80,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_task_reconcile_resume` | task | no | high | Resume bounded retry-safe tasks after reconcile verification. |
 | `grabowski_recovery_status` | recovery | yes | low | Evaluate the fail-closed recovery gate for power-worker activation. |
 | `grabowski_recovery_server_probe` | recovery | no | high | Produce fresh server recovery evidence. |
+| `grabowski_friction_record` | operations-observability | no | medium | Record one bounded operator-friction event for later analysis. |
+| `grabowski_friction_summary` | operations-observability | yes | low | Summarize recent bounded operator-friction events. |
 | `grabowski_resource_acquire` | resource | no | medium | Atomically acquire typed resource leases for one owner. |
 | `grabowski_resource_renew` | resource | no | medium | Renew live resource leases owned by one owner. |
 | `grabowski_resource_release` | resource | no | high | Release owner-bound resource leases with an explicit force override. |
