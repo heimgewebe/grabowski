@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import sqlite3
 from pathlib import Path
@@ -43,6 +44,7 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_tasks as tasks
+import grabowski_task_reconcile as task_reconcile_cli
 
 
 LOCAL_HOST = {
@@ -305,12 +307,14 @@ class TaskTests(unittest.TestCase):
         self.assertIn("outcome_unknown", result["blocked"][0]["reason"])
         self.assertIsNone(tasks.resources.inspect_resource("display:12"))
 
-    def test_reconcile_blocks_unverified_policy(self) -> None:
+    def test_reconcile_resume_blocks_unverified_policy(self) -> None:
         started = self._start()
         missing = _launcher(returncode=1)
         missing["stderr"] = "unit not found"
         with patch.object(tasks, "_dispatch", return_value=missing):
-            result = tasks.reconcile_tasks(auto_resume=True)
+            result = tasks.reconcile_tasks_resume(
+                reason="test unsafe policy block", max_resumes=1
+            )
         self.assertEqual(result["scanned"], 1)
         self.assertEqual(result["resumed"], [])
         self.assertEqual(result["blocked"][0]["task_id"], started["task"]["task_id"])
@@ -372,6 +376,150 @@ class TaskTests(unittest.TestCase):
     def test_reconcile_resume_requires_reason(self) -> None:
         with self.assertRaisesRegex(ValueError, "reason is required"):
             tasks.reconcile_tasks_resume()
+
+    def test_reconcile_cli_check_mode_is_read_only(self) -> None:
+        preview = {"mode": "check", "scanned": 0}
+        with (
+            patch.object(
+                task_reconcile_cli.grabowski_tasks,
+                "reconcile_tasks_check",
+                return_value=preview,
+            ) as check,
+            patch.object(
+                task_reconcile_cli.grabowski_tasks, "reconcile_tasks_refresh"
+            ) as refresh,
+            patch.object(
+                task_reconcile_cli.grabowski_tasks, "reconcile_tasks_resume"
+            ) as resume,
+            patch.object(
+                task_reconcile_cli.grabowski_tasks.base, "_append_audit"
+            ) as audit,
+            patch("builtins.print") as output,
+        ):
+            self.assertEqual(task_reconcile_cli.main(["--mode", "check"]), 0)
+        check.assert_called_once_with(task_id="")
+        refresh.assert_not_called()
+        resume.assert_not_called()
+        audit.assert_not_called()
+        self.assertIn('"mode": "check"', output.call_args.args[0])
+
+    def test_reconcile_cli_refresh_does_not_resume_processes(self) -> None:
+        task_id = "a" * 24
+        refreshed = {"mode": "refresh", "scanned": 0}
+        with (
+            patch.object(
+                task_reconcile_cli.grabowski_tasks,
+                "reconcile_tasks_refresh",
+                return_value=refreshed,
+            ) as refresh,
+            patch.object(
+                task_reconcile_cli.grabowski_tasks, "reconcile_tasks_resume"
+            ) as resume,
+            patch.object(
+                task_reconcile_cli.grabowski_tasks.base, "_append_audit"
+            ) as audit,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(
+                task_reconcile_cli.main(["--mode", "refresh", "--task-id", task_id]),
+                0,
+            )
+        refresh.assert_called_once_with(task_id=task_id)
+        resume.assert_not_called()
+        audit.assert_not_called()
+
+    def test_reconcile_cli_resume_requires_reason(self) -> None:
+        with patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as raised:
+                task_reconcile_cli.main(["--mode", "resume"])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_reconcile_cli_resume_bounds_max_resumes(self) -> None:
+        for value in ("0", "51"):
+            with self.subTest(value=value):
+                with patch("sys.stderr", new_callable=io.StringIO):
+                    with self.assertRaises(SystemExit) as raised:
+                        task_reconcile_cli.main(
+                            [
+                                "--mode",
+                                "resume",
+                                "--reason",
+                                "bounded test",
+                                "--max-resumes",
+                                value,
+                            ]
+                        )
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_reconcile_cli_rejects_legacy_auto_resume(self) -> None:
+        legacy = "--auto-" + "resume"
+        with patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as raised:
+                task_reconcile_cli.main([legacy])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_reconcile_cli_rejects_unsupported_expected_state_hash(self) -> None:
+        with patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as raised:
+                task_reconcile_cli.main(
+                    [
+                        "--mode",
+                        "resume",
+                        "--reason",
+                        "precondition test",
+                        "--expected-state-hash",
+                        "a" * 64,
+                    ]
+                )
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_reconcile_cli_resume_is_explicit_bounded_and_audited(self) -> None:
+        result = {
+            "mode": "resume",
+            "task_id": "",
+            "max_resumes": 2,
+            "reason": "operator proof",
+            "scanned": 2,
+            "refreshed": [],
+            "released": [],
+            "resumed": [{"task_id": "a" * 24}],
+            "blocked": [{"task_id": "b" * 24}],
+            "checked_at_unix": 1234,
+        }
+        with (
+            patch.object(
+                task_reconcile_cli.grabowski_tasks,
+                "reconcile_tasks_resume",
+                return_value=result,
+            ) as resume,
+            patch.object(
+                task_reconcile_cli.grabowski_tasks.base, "_append_audit"
+            ) as audit,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(
+                task_reconcile_cli.main(
+                    [
+                        "--mode",
+                        "resume",
+                        "--reason",
+                        "operator proof",
+                        "--max-resumes",
+                        "2",
+                    ]
+                ),
+                0,
+            )
+        resume.assert_called_once_with(
+            task_id="", max_resumes=2, reason="operator proof"
+        )
+        audit.assert_called_once()
+        audit_record = audit.call_args.args[0]
+        self.assertEqual(audit_record["mode"], "resume")
+        self.assertEqual(audit_record["reason"], "operator proof")
+        self.assertEqual(audit_record["max_resumes"], 2)
+        self.assertEqual(audit_record["resumed_count"], 1)
+        self.assertEqual(audit_record["blocked_count"], 1)
 
     def test_reconcile_does_not_resume_completed_tasks(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
@@ -449,6 +597,15 @@ class TaskTests(unittest.TestCase):
 
 
 class RuntimeContractTests(unittest.TestCase):
+    def test_reconcile_service_example_uses_refresh_not_resume(self) -> None:
+        source = (
+            ROOT / "systemd" / "grabowski-reconcile-tasks.service.example"
+        ).read_text(encoding="utf-8")
+        legacy = "--auto-" + "resume"
+        self.assertNotIn(legacy, source)
+        self.assertIn("--mode refresh", source)
+        self.assertNotIn("--mode resume", source)
+
     def test_runtime_registers_control_plane_and_tasks(self) -> None:
         source = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
         for module in (

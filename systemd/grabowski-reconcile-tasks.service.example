@@ -4,7 +4,7 @@ After=default.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python -m grabowski_task_reconcile --auto-resume
+ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python -m grabowski_task_reconcile --mode refresh
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
