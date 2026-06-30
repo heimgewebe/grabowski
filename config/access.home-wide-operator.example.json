@@ -86,8 +86,20 @@
       "write_excluded_roots": [
         "${HOME}/repos/merges"
       ],
-      "secret_roots": [],
-      "browser_profile_roots": [],
+      "secret_roots": [
+        "${HOME}/.ssh",
+        "${HOME}/.gnupg",
+        "${HOME}/.aws",
+        "${HOME}/.kube",
+        "${HOME}/.password-store",
+        "${HOME}/.local/share/keyrings"
+      ],
+      "browser_profile_roots": [
+        "${HOME}/.mozilla/firefox",
+        "${HOME}/.config/BraveSoftware/Brave-Browser",
+        "${HOME}/.config/google-chrome",
+        "${HOME}/.config/chromium"
+      ],
       "secret_export_roots": [],
       "max_read_bytes": 2000000,
       "max_write_bytes": 2000000,
@@ -111,8 +123,20 @@
       "write_excluded_roots": [
         "${HOME}/repos/merges"
       ],
-      "secret_roots": [],
-      "browser_profile_roots": [],
+      "secret_roots": [
+        "${HOME}/.ssh",
+        "${HOME}/.gnupg",
+        "${HOME}/.aws",
+        "${HOME}/.kube",
+        "${HOME}/.password-store",
+        "${HOME}/.local/share/keyrings"
+      ],
+      "browser_profile_roots": [
+        "${HOME}/.mozilla/firefox",
+        "${HOME}/.config/BraveSoftware/Brave-Browser",
+        "${HOME}/.config/google-chrome",
+        "${HOME}/.config/chromium"
+      ],
       "secret_export_roots": [],
       "max_read_bytes": 2000000,
       "max_write_bytes": 2000000,
@@ -138,8 +162,20 @@
       "write_excluded_roots": [
         "${HOME}/repos/merges"
       ],
-      "secret_roots": [],
-      "browser_profile_roots": [],
+      "secret_roots": [
+        "${HOME}/.ssh",
+        "${HOME}/.gnupg",
+        "${HOME}/.aws",
+        "${HOME}/.kube",
+        "${HOME}/.password-store",
+        "${HOME}/.local/share/keyrings"
+      ],
+      "browser_profile_roots": [
+        "${HOME}/.mozilla/firefox",
+        "${HOME}/.config/BraveSoftware/Brave-Browser",
+        "${HOME}/.config/google-chrome",
+        "${HOME}/.config/chromium"
+      ],
       "secret_export_roots": [],
       "max_read_bytes": 2000000,
       "max_write_bytes": 2000000,

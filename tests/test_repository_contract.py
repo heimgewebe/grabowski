@@ -291,6 +291,31 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("browser_profile_read", policy["capability_definitions"])
         self.assertEqual(policy["forbidden_components"], [".git"])
 
+    def test_home_wide_profiles_with_home_roots_keep_typed_roots(self) -> None:
+        policy = json.loads(
+            (
+                ROOT / "config" / "access.home-wide-operator.example.json"
+            ).read_text(encoding="utf-8")
+        )
+        expected_secret_roots = set(policy["secret_roots"])
+        expected_browser_roots = set(policy["browser_profile_roots"])
+        for profile_name, profile in policy["profiles"].items():
+            if (
+                "${HOME}" not in profile["read_roots"]
+                and "${HOME}" not in profile["write_roots"]
+            ):
+                continue
+            with self.subTest(profile=profile_name, root_type="secret"):
+                self.assertTrue(
+                    expected_secret_roots.issubset(set(profile["secret_roots"]))
+                )
+            with self.subTest(profile=profile_name, root_type="browser"):
+                self.assertTrue(
+                    expected_browser_roots.issubset(
+                        set(profile["browser_profile_roots"])
+                    )
+                )
+
     def test_access_policy_schema_versions_are_separate(self) -> None:
         v1 = json.loads(
             (

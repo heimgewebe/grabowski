@@ -130,6 +130,29 @@ def require_capabilities(path: Path, label: str, capabilities: list[str]) -> Non
         raise SystemExit(f"{path}: {label} uses retired private capabilities: {private}")
 
 
+def has_home_wide_root(data: dict) -> bool:
+    return "${HOME}" in data["read_roots"] or "${HOME}" in data["write_roots"]
+
+
+def require_home_wide_typed_roots(path: Path, label: str, data: dict) -> None:
+    if not has_home_wide_root(data):
+        return
+    missing_secrets = sorted(target_secret_roots - set(data["secret_roots"]))
+    if missing_secrets:
+        raise SystemExit(
+            f"{path}: {label} uses ${{HOME}} as a read/write root "
+            f"without typed secret roots: {missing_secrets}"
+        )
+    missing_browser_roots = sorted(
+        target_browser_roots - set(data["browser_profile_roots"])
+    )
+    if missing_browser_roots:
+        raise SystemExit(
+            f"{path}: {label} uses ${{HOME}} as a read/write root "
+            f"without typed browser profile roots: {missing_browser_roots}"
+        )
+
+
 def validate_policy(path: Path) -> None:
     data = json.loads(path.read_text(encoding="utf-8"))
     for key, expected_type in required.items():
@@ -166,6 +189,7 @@ def validate_policy(path: Path) -> None:
         missing = sorted(target_browser_roots - set(data["browser_profile_roots"]))
         if missing:
             raise SystemExit(f"{path}: missing top-level browser roots: {missing}")
+    require_home_wide_typed_roots(path, "policy", data)
 
     sensitive_denials = sorted(
         set(data["forbidden_components"]) & target_sensitive_components
@@ -240,6 +264,7 @@ def validate_policy(path: Path) -> None:
                 f"{path}: profile {name} must exclude ${{HOME}}/repos/merges."
             )
         require_capabilities(path, f"profile {name}", profile["capabilities"])
+        require_home_wide_typed_roots(path, f"profile {name}", profile)
         capabilities = set(profile["capabilities"])
         if secret_capabilities & capabilities:
             missing = sorted(target_secret_roots - set(profile["secret_roots"]))
@@ -262,8 +287,13 @@ def validate_policy(path: Path) -> None:
                 )
 
 
-for schema in SCHEMAS:
-    json.loads(schema.read_text(encoding="utf-8"))
-for policy in POLICIES:
-    validate_policy(policy)
-print("PASS: access policy examples satisfy the repository contract")
+def main() -> None:
+    for schema in SCHEMAS:
+        json.loads(schema.read_text(encoding="utf-8"))
+    for policy in POLICIES:
+        validate_policy(policy)
+    print("PASS: access policy examples satisfy the repository contract")
+
+
+if __name__ == "__main__":
+    main()
