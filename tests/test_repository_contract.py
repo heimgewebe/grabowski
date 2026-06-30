@@ -196,33 +196,54 @@ class RepositoryContractTests(unittest.TestCase):
                 ROOT / "config" / "access.example.json"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(policy["active_profile"], "bounded-read-write")
+        self.assertEqual(policy["active_profile"], "observe")
         self.assertEqual(policy["version"], 2)
-        self.assertIn("bounded-read-write", policy["profiles"])
-        self.assertIn("home-wide-operator", policy["profiles"])
-        self.assertIn(
-            "terminal_execute",
-            policy["profiles"]["home-wide-operator"]["capabilities"],
+        self.assertEqual(
+            set(policy["profiles"]),
+            {"observe", "maintain", "mutate", "break-glass"},
         )
+        observe_caps = set(policy["profiles"]["observe"]["capabilities"])
+        maintain_caps = set(policy["profiles"]["maintain"]["capabilities"])
+        mutate_caps = set(policy["profiles"]["mutate"]["capabilities"])
+        break_glass_caps = set(policy["profiles"]["break-glass"]["capabilities"])
+        for capability in ("file_read", "audit_verify", "bundle_registry"):
+            self.assertIn(capability, observe_caps)
+            self.assertIn(capability, maintain_caps)
         for capability in (
-            "secret_inspect",
+            "file_write",
+            "terminal_execute",
+            "secret_reveal",
+            "file_destroy",
+            "process_signal",
+            "durable_job",
+            "resource_lease",
+            "git_cli",
+            "github_cli",
+            "user_service_control",
+        ):
+            self.assertNotIn(capability, observe_caps)
+            self.assertNotIn(capability, maintain_caps)
+        for capability in (
+            "file_write",
+            "durable_job",
+            "resource_lease",
+            "git_cli",
+            "github_cli",
+            "user_service_control",
+        ):
+            self.assertIn(capability, mutate_caps)
+        for capability in (
+            "terminal_execute",
             "secret_reveal",
             "secret_use",
             "secret_export",
             "browser_profile_read",
+            "file_destroy",
+            "process_signal",
+            "tmux_interaction",
         ):
-            self.assertIn(
-                capability,
-                policy["profiles"]["home-wide-operator"]["capabilities"],
-            )
-            self.assertNotIn(
-                capability,
-                policy["profiles"]["bounded-read-write"]["capabilities"],
-            )
-        self.assertNotIn(
-            "terminal_execute",
-            policy["profiles"]["bounded-read-write"]["capabilities"],
-        )
+            self.assertNotIn(capability, mutate_caps)
+            self.assertIn(capability, break_glass_caps)
         target_secret_roots = {
             "${HOME}/.ssh",
             "${HOME}/.gnupg",
@@ -239,17 +260,12 @@ class RepositoryContractTests(unittest.TestCase):
         }
         self.assertTrue(
             target_secret_roots.issubset(
-                set(policy["profiles"]["home-wide-operator"]["secret_roots"])
+                set(policy["profiles"]["break-glass"]["secret_roots"])
             )
         )
         self.assertTrue(
             target_browser_roots.issubset(
-                set(policy["profiles"]["home-wide-operator"]["browser_profile_roots"])
-            )
-        )
-        self.assertTrue(
-            target_secret_roots.isdisjoint(
-                set(policy["profiles"]["home-wide-operator"]["write_excluded_roots"])
+                set(policy["profiles"]["break-glass"]["browser_profile_roots"])
             )
         )
         self.assertEqual(policy["forbidden_components"], [".git"])
@@ -262,13 +278,46 @@ class RepositoryContractTests(unittest.TestCase):
                 ROOT / "config" / "access.home-wide-operator.example.json"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(policy["active_profile"], "home-wide-operator")
+        self.assertEqual(policy["active_profile"], "break-glass")
         self.assertEqual(policy["version"], 2)
         self.assertEqual(policy["read_roots"], ["${HOME}"])
+        self.assertEqual(
+            set(policy["profiles"]),
+            {"observe", "maintain", "mutate", "break-glass"},
+        )
+        self.assertIn(
+            "terminal_execute",
+            policy["profiles"]["break-glass"]["capabilities"],
+        )
         self.assertIn("privileged_reference", policy["capability_definitions"])
         self.assertIn("secret_use", policy["capability_definitions"])
         self.assertIn("browser_profile_read", policy["capability_definitions"])
         self.assertEqual(policy["forbidden_components"], [".git"])
+
+    def test_home_wide_profiles_with_home_roots_keep_typed_roots(self) -> None:
+        policy = json.loads(
+            (
+                ROOT / "config" / "access.home-wide-operator.example.json"
+            ).read_text(encoding="utf-8")
+        )
+        expected_secret_roots = set(policy["secret_roots"])
+        expected_browser_roots = set(policy["browser_profile_roots"])
+        for profile_name, profile in policy["profiles"].items():
+            if (
+                "${HOME}" not in profile["read_roots"]
+                and "${HOME}" not in profile["write_roots"]
+            ):
+                continue
+            with self.subTest(profile=profile_name, root_type="secret"):
+                self.assertTrue(
+                    expected_secret_roots.issubset(set(profile["secret_roots"]))
+                )
+            with self.subTest(profile=profile_name, root_type="browser"):
+                self.assertTrue(
+                    expected_browser_roots.issubset(
+                        set(profile["browser_profile_roots"])
+                    )
+                )
 
     def test_access_policy_schema_versions_are_separate(self) -> None:
         v1 = json.loads(

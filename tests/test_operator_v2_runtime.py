@@ -256,6 +256,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     "Unknown access capabilities",
                 ),
                 ({"max_read_bytes": 0}, "Invalid access policy limit"),
+                ({"active_profile": "missing"}, "Active access profile is not defined"),
                 (
                     {"profiles": {"strict": {**strict["profiles"]["strict"], "forbid_symlinks": False}}},
                     "Unknown access profile fields",

@@ -101,6 +101,8 @@ forbidden_private_names = {
     "private_local_transfer",
     "private_safe_consumption",
 }
+staged_profile_names = {"observe", "maintain", "mutate", "break-glass"}
+default_safe_profiles = {"observe", "maintain"}
 
 
 def require_string_list(path: Path, data: dict, key: str) -> None:
@@ -126,6 +128,29 @@ def require_capabilities(path: Path, label: str, capabilities: list[str]) -> Non
     private = sorted(set(capabilities) & forbidden_private_names)
     if private:
         raise SystemExit(f"{path}: {label} uses retired private capabilities: {private}")
+
+
+def has_home_wide_root(data: dict) -> bool:
+    return "${HOME}" in data["read_roots"] or "${HOME}" in data["write_roots"]
+
+
+def require_home_wide_typed_roots(path: Path, label: str, data: dict) -> None:
+    if not has_home_wide_root(data):
+        return
+    missing_secrets = sorted(target_secret_roots - set(data["secret_roots"]))
+    if missing_secrets:
+        raise SystemExit(
+            f"{path}: {label} uses ${{HOME}} as a read/write root "
+            f"without typed secret roots: {missing_secrets}"
+        )
+    missing_browser_roots = sorted(
+        target_browser_roots - set(data["browser_profile_roots"])
+    )
+    if missing_browser_roots:
+        raise SystemExit(
+            f"{path}: {label} uses ${{HOME}} as a read/write root "
+            f"without typed browser profile roots: {missing_browser_roots}"
+        )
 
 
 def validate_policy(path: Path) -> None:
@@ -164,6 +189,7 @@ def validate_policy(path: Path) -> None:
         missing = sorted(target_browser_roots - set(data["browser_profile_roots"]))
         if missing:
             raise SystemExit(f"{path}: missing top-level browser roots: {missing}")
+    require_home_wide_typed_roots(path, "policy", data)
 
     sensitive_denials = sorted(
         set(data["forbidden_components"]) & target_sensitive_components
@@ -206,6 +232,14 @@ def validate_policy(path: Path) -> None:
     active = data.get("active_profile", data.get("mode"))
     if active not in profiles:
         raise SystemExit(f"{path}: active profile is not defined: {active!r}")
+    if not trusted_owner and path.name != "access.trusted-owner.example.json":
+        missing_staged = sorted(staged_profile_names - set(profiles))
+        if missing_staged:
+            raise SystemExit(f"{path}: missing staged profiles: {missing_staged}")
+    if path.name == "access.example.json" and active not in default_safe_profiles:
+        raise SystemExit(
+            f"{path}: default example must activate observe or maintain, got {active!r}"
+        )
     for name, profile in profiles.items():
         if not isinstance(profile, dict):
             raise SystemExit(f"{path}: profile {name} must be an object.")
@@ -230,6 +264,7 @@ def validate_policy(path: Path) -> None:
                 f"{path}: profile {name} must exclude ${{HOME}}/repos/merges."
             )
         require_capabilities(path, f"profile {name}", profile["capabilities"])
+        require_home_wide_typed_roots(path, f"profile {name}", profile)
         capabilities = set(profile["capabilities"])
         if secret_capabilities & capabilities:
             missing = sorted(target_secret_roots - set(profile["secret_roots"]))
@@ -252,8 +287,13 @@ def validate_policy(path: Path) -> None:
                 )
 
 
-for schema in SCHEMAS:
-    json.loads(schema.read_text(encoding="utf-8"))
-for policy in POLICIES:
-    validate_policy(policy)
-print("PASS: access policy examples satisfy the repository contract")
+def main() -> None:
+    for schema in SCHEMAS:
+        json.loads(schema.read_text(encoding="utf-8"))
+    for policy in POLICIES:
+        validate_policy(policy)
+    print("PASS: access policy examples satisfy the repository contract")
+
+
+if __name__ == "__main__":
+    main()

@@ -1108,26 +1108,22 @@
   "kind": "repository-operator-context",
   "policy_contract": {
     "access_profiles": [
-      "bounded-read-write",
-      "home-wide-operator"
+      "break-glass",
+      "maintain",
+      "mutate",
+      "observe"
     ],
-    "active_profile": "bounded-read-write",
+    "active_profile": "observe",
     "browser_profile_roots": [],
     "capabilities": [
       "file_read",
-      "file_write",
       "audit_verify",
-      "rollback_text",
-      "bundle_registry"
+      "bundle_registry",
+      "process_inspect",
+      "port_inspect"
     ],
-    "forbidden_capabilities": [
-      "file_delete",
-      "file_destroy",
-      "file_move",
-      "chmod",
-      "chown"
-    ],
-    "mode": "bounded-read-write",
+    "forbidden_capabilities": [],
+    "mode": "observe",
     "read_roots": [
       "${HOME}/repos",
       "${HOME}/grabowski-workspace",
@@ -1138,10 +1134,7 @@
     "write_excluded_roots": [
       "${HOME}/repos/merges"
     ],
-    "write_roots": [
-      "${HOME}/repos",
-      "${HOME}/grabowski-workspace"
-    ]
+    "write_roots": []
   },
   "purpose": "Deterministic repository contract for the Grabowski operator. Live state is returned by the grabowski_context MCP tool.",
   "runtime_contract": {
@@ -1319,7 +1312,7 @@
     },
     "policy_example": {
       "path": "config/access.example.json",
-      "sha256": "6e2b0ecf2a4a4d0b3740a14f63a760e947335487034cbc039523dae0e9f0edaa"
+      "sha256": "16c1e9c6dc58fa9bc77181edcca8b339ea7b33cac23987bd4d55f5408a00f584"
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",

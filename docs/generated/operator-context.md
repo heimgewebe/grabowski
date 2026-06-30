@@ -102,16 +102,16 @@ All expected tools are declared and classified; no orphan declarations or profil
 
 ## Policy contract
 
-- Mode: `bounded-read-write`
-- Active profile: `bounded-read-write`
-- Capabilities: `file_read`, `file_write`, `audit_verify`, `rollback_text`, `bundle_registry`
+- Mode: `observe`
+- Active profile: `observe`
+- Capabilities: `file_read`, `audit_verify`, `bundle_registry`, `process_inspect`, `port_inspect`
 - Read roots: `${HOME}/repos`, `${HOME}/grabowski-workspace`, `${HOME}/.local/state/grabowski`
-- Write roots: `${HOME}/repos`, `${HOME}/grabowski-workspace`
+- Write roots: `none`
 - Read-only exclusions: `${HOME}/repos/merges`
 - Secret roots: `none`
 - Browser profile roots: `none`
 - Secret export roots: `none`
-- Forbidden capabilities: `file_delete`, `file_destroy`, `file_move`, `chmod`, `chown`
+- Forbidden capabilities: `none`
 
 ## Update contract
 
