@@ -112,6 +112,11 @@ class TaskTests(unittest.TestCase):
                 memory_max_bytes=64 * 1024 * 1024,
             )
         launch = dispatch.call_args.args[1]
+        descriptions = [item for item in launch if item.startswith("--description=")]
+        self.assertEqual(1, len(descriptions))
+        self.assertIn("Grabowski task grabowski-task-", descriptions[0])
+        self.assertIn(" argv=", descriptions[0])
+        self.assertNotIn("\n", descriptions[0])
         self.assertIn("--slice=grabowski-tasks.slice", launch)
         self.assertIn("--property=CPUWeight=50", launch)
         self.assertIn("--property=IOWeight=25", launch)

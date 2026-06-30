@@ -363,6 +363,7 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
     argv = [
         "systemd-run",
         "--user",
+        f"--description={operator._systemd_safe_description('task', unit, record['argv_sha256'])}",
         "--unit",
         unit,
         "--slice=grabowski-tasks.slice",

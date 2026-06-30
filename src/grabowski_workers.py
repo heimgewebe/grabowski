@@ -219,9 +219,11 @@ def _write_config(directory: Path, config: dict[str, Any]) -> Path:
 
 
 def _launch_argv(record: dict[str, Any], writable_paths: list[Path]) -> list[str]:
+    argv_hash = operator._argv_hash(json.loads(record["argv_json"]))
     argv = [
         "systemd-run",
         "--user",
+        f"--description={operator._systemd_safe_description('browser-worker', record['unit'], argv_hash)}",
         "--unit",
         record["unit"],
         "--slice=grabowski-workers.slice",

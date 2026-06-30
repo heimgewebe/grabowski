@@ -1327,7 +1327,7 @@
       "src/grabowski_friction.py": "830551ef1bd8459106f22a95865244fea49e9c64303632eeac17dfde732f3628",
       "src/grabowski_mcp.py": "fc924ff9247f2f85f8d3887e43dc3eb8bd105442ae25ea49efbc0b0f15f3d160",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
-      "src/grabowski_operator.py": "e982a1753dcb20b8c579960e8ed3e932d23c26587f8245f3e2ebae44b5ba76ac",
+      "src/grabowski_operator.py": "a2ded1c251b2b478a70dc4186ef004b009d1d34c1b931b1c1d8f9ac2ff3911fd",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
       "src/grabowski_read_surface.py": "1e8147ea845e8a9cc5ab723140dc996965f7aebb2183af74164de30d24f97928",
       "src/grabowski_recovery.py": "8d409953b30bad2a7b4059295b46f09076ab7e0271184628f914cee246606746",
@@ -1336,9 +1336,9 @@
       "src/grabowski_runtime_extensions.py": "3092fc1e9031cc2d3beb9e6e1e2a43ea31d68fe07cc6186055d06dacb56e87ed",
       "src/grabowski_self_deploy.py": "1c3e33310eecf259c636c6250f1f01618a0e0589ca85c2a9f8ed84cf025a9674",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "ce1215fd2db5434fb75a45e90c1c44702cac7461d76cd1c4a357a5a5cb67ffda",
+      "src/grabowski_tasks.py": "559a1ef7423c4b59b656bf6ea228a294f998f3086c19cf52412407bc6d6ed036",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
-      "src/grabowski_workers.py": "50f069b6a14fd4a1686de3cfec8dad1d5d835ef41ccc3669744f24699a8fd0dc"
+      "src/grabowski_workers.py": "d7936328f8967aba1b2b853547e4e3422899a3454e6459e32e0ef6a51e5d8aa2"
     }
   }
 }
