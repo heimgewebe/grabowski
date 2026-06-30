@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "eeb80b62f04cb55dc2f359716cc382884f3c18070a8df5eef843baa21ae06f1b",
+  "capability_source_sha256": "b9dd9232ddf8ae699bb08bbaf67212867d2197747097854fa42713d9a9d9742f",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "e4c4bc31b6da33c21ebb0633c7e8cb3191a89e2a9dda4857f6d9c0d7589fb628",
+  "contract_sha256": "8def53c77f007dac95c1a71c25f10cd7e48f63946905563895689366c325c308",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -844,6 +844,19 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_recovery_status"
+    },
+    {
+      "category": "recovery",
+      "description": "Produce fresh server recovery evidence through a fixed SSH-tunnelled restic probe.",
+      "effects": [
+        "recovery-marker-write"
+      ],
+      "id": "grabowski_recovery_server_probe",
+      "purpose": "Produce fresh server recovery evidence.",
+      "read_only": false,
+      "reversibility": "new-snapshot-retained",
+      "risk_class": "high",
+      "tool": "grabowski_recovery_server_probe"
     },
     {
       "category": "resource",

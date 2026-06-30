@@ -324,6 +324,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_recovery_server_probe": {
+        "category": "recovery",
+        "purpose": "Produce fresh server recovery evidence.",
+        "risk_class": "high",
+        "effects": ["recovery-marker-write"],
+        "reversibility": "new-snapshot-retained",
+    },
     "grabowski_task_start": {
         "category": "task",
         "purpose": "Start a persistent local or fleet task in its own systemd unit.",
