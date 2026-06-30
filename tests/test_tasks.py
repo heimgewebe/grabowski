@@ -279,7 +279,7 @@ class TaskTests(unittest.TestCase):
             tasks.resources.inspect_resource("service:example.service")
         )
 
-    def test_reconcile_auto_resumes_only_retry_safe(self) -> None:
+    def test_legacy_reconcile_auto_resume_is_disabled_compatibility_path(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ), patch.object(tasks.base, "_append_audit"), patch.object(
@@ -301,10 +301,17 @@ class TaskTests(unittest.TestCase):
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 133}
         ):
             result = tasks.reconcile_tasks(auto_resume=True)
+        self.assertTrue(result["legacy_auto_resume_disabled"])
         self.assertEqual(result["scanned"], 1)
         self.assertEqual(result["resumed"], [])
         self.assertEqual(result["blocked"][0]["task_id"], started["task"]["task_id"])
         self.assertIn("outcome_unknown", result["blocked"][0]["reason"])
+        self.assertTrue(
+            all(
+                "legacy auto_resume reconcile is disabled" in item["reason"]
+                for item in result["blocked"][1:]
+            )
+        )
         self.assertIsNone(tasks.resources.inspect_resource("display:12"))
 
     def test_reconcile_resume_blocks_unverified_policy(self) -> None:

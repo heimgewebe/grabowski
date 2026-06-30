@@ -6,7 +6,7 @@ Dieser Slice ergänzt den Control-Plane-Kern um die verbleibenden unprivilegiert
 
 `grabowski_resources` verwaltet persistente, typisierte Leases für Repositories, Pfade, Ports, Dienste, Browserprofile und Displays. Die SQLite-Datenbank verwendet WAL, `synchronous=FULL`, restriktive Rechte und atomare Mehrfachbelegung. Persistente Tasks erwerben deklarierte Leases vor Start oder Resume und geben sie bei Fehlstart, Abbruch oder terminaler Beobachtung frei.
 
-`grabowski_task_reconcile` gleicht Taskdatensätze mit User-systemd-Units ab. Nur `retry-safe` darf automatisch wiederaufgenommen werden; das Recovery-Gate gilt nur für erkannte Power-Aufgaben; normale User-Space-Tasks starten unabhängig vom Backup-Nachweis. Beispiel-Units ermöglichen Reconciliation nach Boot und periodisch.
+`grabowski_task_reconcile` gleicht Taskdatensätze mit User-systemd-Units ab. Der Legacy-Einstieg bleibt als Kompatibilitätspfad erhalten, führt aber nur noch Zustandsabgleich und Lease-Pflege aus; `auto_resume=True` wird als deaktivierter Legacy-Pfad markiert und startet keine Prozesse. Wiederanlauf erfolgt ausschließlich über den expliziten Resume-Pfad mit Begründung und Bound. Beispiel-Units verwenden periodisch `--mode refresh`.
 
 ## Artefakte
 

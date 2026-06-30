@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "bf9c76d748a1e4df146620893dcd05efb8870727228759623ae62ae4d90b6149",
+  "capability_source_sha256": "eeb80b62f04cb55dc2f359716cc382884f3c18070a8df5eef843baa21ae06f1b",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "e4c4bc31b6da33c21ebb0633c7e8cb3191a89e2a9dda4857f6d9c0d7589fb628",
   "integrity": {
@@ -913,14 +913,13 @@
       "description": "Reconcile persistent tasks after process loss or host restart.",
       "effects": [
         "state-refresh",
-        "lease-release",
-        "possible-process-start"
+        "lease-release"
       ],
       "id": "grabowski_task_reconcile",
-      "purpose": "Legacy reconcile entrypoint; prefer check, refresh or resume for narrower semantics.",
+      "purpose": "Legacy compatibility entrypoint; refreshes state only and never resumes processes.",
       "read_only": false,
       "reversibility": "conditional",
-      "risk_class": "high",
+      "risk_class": "medium",
       "tool": "grabowski_task_reconcile"
     },
     {

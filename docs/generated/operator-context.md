@@ -84,7 +84,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_resource_release` | resource | no | high | Release owner-bound resource leases with an explicit force override. |
 | `grabowski_resource_inspect` | resource | yes | low | Inspect one typed resource lease without returning private metadata. |
 | `grabowski_resource_list` | resource | yes | low | List bounded typed resource leases with optional owner filtering. |
-| `grabowski_task_reconcile` | task | no | high | Legacy reconcile entrypoint; prefer check, refresh or resume for narrower semantics. |
+| `grabowski_task_reconcile` | task | no | medium | Legacy compatibility entrypoint; refreshes state only and never resumes processes. |
 | `grabowski_artifact_stat` | artifact | yes | low | Read regular-file size and SHA-256 on one registered fleet host. |
 | `grabowski_artifact_push` | artifact | no | high | Push one hash-bound regular file to a registered SSH fleet host. |
 | `grabowski_artifact_pull` | artifact | no | high | Pull one hash-bound regular file from a registered SSH fleet host. |

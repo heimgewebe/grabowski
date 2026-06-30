@@ -389,9 +389,9 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_task_reconcile": {
         "category": "task",
-        "purpose": "Legacy reconcile entrypoint; prefer check, refresh or resume for narrower semantics.",
-        "risk_class": "high",
-        "effects": ["state-refresh", "lease-release", "possible-process-start"],
+        "purpose": "Legacy compatibility entrypoint; refreshes state only and never resumes processes.",
+        "risk_class": "medium",
+        "effects": ["state-refresh", "lease-release"],
         "reversibility": "conditional",
     },
     "grabowski_resource_acquire": {

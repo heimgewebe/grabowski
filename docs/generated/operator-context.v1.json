@@ -901,14 +901,13 @@
       "description": "Reconcile persistent tasks after process loss or host restart.",
       "effects": [
         "state-refresh",
-        "lease-release",
-        "possible-process-start"
+        "lease-release"
       ],
       "id": "grabowski_task_reconcile",
-      "purpose": "Legacy reconcile entrypoint; prefer check, refresh or resume for narrower semantics.",
+      "purpose": "Legacy compatibility entrypoint; refreshes state only and never resumes processes.",
       "read_only": false,
       "reversibility": "conditional",
-      "risk_class": "high",
+      "risk_class": "medium",
       "tool": "grabowski_task_reconcile"
     },
     {
@@ -1271,7 +1270,7 @@
   "sources": {
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "bf9c76d748a1e4df146620893dcd05efb8870727228759623ae62ae4d90b6149"
+      "sha256": "eeb80b62f04cb55dc2f359716cc382884f3c18070a8df5eef843baa21ae06f1b"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1283,7 +1282,7 @@
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "bf9c76d748a1e4df146620893dcd05efb8870727228759623ae62ae4d90b6149",
+      "src/grabowski_capabilities.py": "eeb80b62f04cb55dc2f359716cc382884f3c18070a8df5eef843baa21ae06f1b",
       "src/grabowski_checkouts.py": "628c51240e773330e5958dd83ff4b30b651ed411d10fbf0b24764c07fe107342",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
       "src/grabowski_mcp.py": "7ca59e133096f120f0a5cb1c89c3500a1f7da9fe06a94f7a16cd5693f76ac30f",
