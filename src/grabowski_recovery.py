@@ -157,17 +157,39 @@ def _pick_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_for_tcp(port: int, process: subprocess.Popen[bytes], *, timeout_seconds: float = 10.0) -> None:
+def _wait_for_tcp(
+    port: int,
+    process: subprocess.Popen[bytes],
+    *,
+    stderr_path: Path | None = None,
+    timeout_seconds: float = 10.0,
+) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError("ssh recovery tunnel exited before becoming ready")
+            details = _process_error_details(process, stderr_path=stderr_path)
+            raise RuntimeError(f"ssh recovery tunnel exited before becoming ready: {details}")
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
         except OSError:
             time.sleep(0.1)
-    raise RuntimeError("ssh recovery tunnel did not become ready")
+    details = _process_error_details(process, stderr_path=stderr_path)
+    raise RuntimeError(f"ssh recovery tunnel did not become ready: {details}")
+
+
+def _read_bounded_text(path: Path, *, max_bytes: int = 4000) -> str:
+    if not path.exists() or not path.is_file() or path.is_symlink():
+        return ""
+    data = path.read_bytes()[:max_bytes]
+    return data.decode("utf-8", errors="replace")
+
+
+def _process_error_details(process: subprocess.Popen[bytes], *, stderr_path: Path | None) -> dict[str, Any]:
+    return {
+        "returncode": process.poll(),
+        "stderr": _read_bounded_text(stderr_path) if stderr_path is not None else "",
+    }
 
 
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:
@@ -246,6 +268,10 @@ def server_recovery_probe() -> dict[str, Any]:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"server-recovery-{completed_at_unix}.log"
     port = _pick_local_port()
+    tunnel_stdout_path = log_dir / f"server-recovery-{completed_at_unix}.tunnel.stdout"
+    tunnel_stderr_path = log_dir / f"server-recovery-{completed_at_unix}.tunnel.stderr"
+    tunnel_stdout = tunnel_stdout_path.open("wb")
+    tunnel_stderr = tunnel_stderr_path.open("wb")
     tunnel = subprocess.Popen(
         [
             SSH_BIN,
@@ -256,11 +282,11 @@ def server_recovery_probe() -> dict[str, Any]:
             SERVER_RECOVERY_HOST,
         ],
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=tunnel_stdout,
+        stderr=tunnel_stderr,
     )
     try:
-        _wait_for_tcp(port, tunnel)
+        _wait_for_tcp(port, tunnel, stderr_path=tunnel_stderr_path)
         with tempfile.TemporaryDirectory(prefix="grabowski-server-recovery-") as work_raw, tempfile.TemporaryDirectory(prefix="grabowski-server-restore-") as restore_raw:
             work = Path(work_raw)
             restore = Path(restore_raw)
@@ -271,7 +297,8 @@ def server_recovery_probe() -> dict[str, Any]:
             sentinel_sha256 = _sha256_file(sentinel)
             env = dict(os.environ)
             env.update({
-                "RESTIC_REPOSITORY": f"rest:http://{SERVER_RECOVERY_REST_USER}@127.0.0.1:{port}/{SERVER_RECOVERY_REPO_PATH}",
+                "RESTIC_REPOSITORY": f"rest:http://127.0.0.1:{port}/{SERVER_RECOVERY_REPO_PATH}",
+                "RESTIC_REST_USERNAME": SERVER_RECOVERY_REST_USER,
                 "RESTIC_REST_PASSWORD": http_password,
                 "RESTIC_PASSWORD_FILE": str(SERVER_RECOVERY_REPOSITORY_PASSWORD),
             })
@@ -302,6 +329,8 @@ def server_recovery_probe() -> dict[str, Any]:
             _write_server_marker(completed_at_unix=completed_at_unix, snapshot_id=snapshot_id[:8])
     finally:
         _terminate_process(tunnel)
+        tunnel_stdout.close()
+        tunnel_stderr.close()
     log_sha256 = _sha256_file(log_path) if log_path.exists() else None
     marker = _server_marker()
     audit_record = {
@@ -312,6 +341,7 @@ def server_recovery_probe() -> dict[str, Any]:
         "restore_probe_valid": True,
         "repository_check_valid": True,
         "log_sha256": log_sha256,
+        "tunnel_stderr_sha256": _sha256_file(tunnel_stderr_path) if tunnel_stderr_path.exists() else None,
     }
     base._append_audit(audit_record)
     return {
@@ -325,6 +355,8 @@ def server_recovery_probe() -> dict[str, Any]:
         "marker_path": str(SERVER_RECOVERY),
         "log_path": str(log_path),
         "log_sha256": log_sha256,
+        "tunnel_stderr_path": str(tunnel_stderr_path),
+        "tunnel_stderr_sha256": _sha256_file(tunnel_stderr_path) if tunnel_stderr_path.exists() else None,
     }
 
 
