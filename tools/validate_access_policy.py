@@ -34,6 +34,7 @@ required = {
 known_capabilities = {
     "file_read",
     "file_write",
+    "friction_record",
     "audit_verify",
     "rollback_text",
     "bundle_registry",
