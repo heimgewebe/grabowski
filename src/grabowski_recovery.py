@@ -146,7 +146,7 @@ def _read_secret_text(path: Path) -> str:
     if not _bounded_file(path):
         raise RuntimeError(f"secret file is missing or invalid: {path}")
     value = path.read_text(encoding="utf-8").strip()
-    if not value or "\\x00" in value or "\n" in value or "\r" in value:
+    if not value or chr(0) in value or "\n" in value or "\r" in value:
         raise RuntimeError(f"secret file has an invalid shape: {path}")
     return value
 
