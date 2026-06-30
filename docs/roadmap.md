@@ -23,7 +23,7 @@ Status: v2 foundation implemented in repository; durable execution hardening in 
 
 ## GRABOWSKI-EVIDENCE-001
 
-Status: Slice A implemented on `feat/grabowski-local-evidence`; pilot measurement pending.
+Status: Slice A implemented on `main`; pilot measurement pending under GRABOWSKI-EVIDENCE-002.
 
 - versionierte Job- und Result-Contracts,
 - read-only Repo-State-, Diff- und Referenzbundles,
@@ -36,9 +36,21 @@ Status: Slice A implemented on `feat/grabowski-local-evidence`; pilot measuremen
 Der Ausbau beginnt erst nach einem realen Pilot mit messbarer Reduktion von
 manuellen Evidenzschritten oder übertragenem Kontext.
 
+
+## GRABOWSKI-EVIDENCE-002
+
+Status: registered; real pilot records pending.
+
+- Pilot-Record-Schema: `contracts/local-evidence-pilot-record.v1.schema.json`,
+- Pilot-Record-Log: `docs/evidence-pilot.records.jsonl`,
+- Pilot-Guide: `docs/local-evidence-pilot.md`,
+- vorhandene `grabowski-local-evidence-*`-Bundles gelten als technische Fixtures,
+- fünf historische Baseline-Fälle und fünf prospektive echte Aufgaben bleiben offen,
+- keine MCP-Integration, Prüfprofile oder Knowledge-Selector-Erweiterung vor bestandenem Pilot-Gate.
+
 ## GRABOWSKI-OPERATOR-V2
 
-Status: foundation implemented in repository; live cutover remains explicit.
+Status: live in the deployed runtime; follow-up work is typed agent/fleet integration, not cutover.
 
 - Access-Profile und Capabilities,
 - Home-weites Operator-Beispiel ohne Live-Mutation,
@@ -72,7 +84,7 @@ Status: foundation implemented in repository; live cutover remains explicit.
 
 ## GRABOWSKI-DEPLOY-001
 
-Status: implemented in repository; live cutover requires explicit deployment.
+Status: implemented and live in the deployed runtime; follow-up work is deployment transaction recovery hardening.
 
 - reproduzierbares Deployment aus diesem Repo,
 - atomarer Runtime-Wechsel,
@@ -101,7 +113,7 @@ Status: implemented in repository; live cutover requires explicit deployment.
 
 ## GRABOWSKI-CONTROL-PLANE-001
 
-Status: typed user-space control plane implemented; privileged execution remains fail-closed until an externally installed root-owned broker is approved.
+Status: typed user-space control plane implemented; root-owned privileged broker is installed and fail-closed, with broader privileged actions still gated by recovery evidence.
 
 - registrierte lokale und SSH-Ziele für `heim-pc`, `heimserver` und `heimberry`,
 - argv-only Fleet-Ausführung mit Batch-SSH, deaktivierten Forwardings und Zeitgrenzen,
@@ -113,14 +125,14 @@ Status: typed user-space control plane implemented; privileged execution remains
 
 ## GRABOWSKI-OPERATOR-COMPLETION-001
 
-Status: implemented in repository; live policy migration and connector refresh remain explicit.
+Status: implemented and live; Reconcile now uses explicit check/refresh/resume semantics and legacy auto-resume is disabled as a compatibility path.
 
 - atomare Ressourcenleases für Repo, Pfad, Port, Dienst, Browserprofil und Display,
 - verlustfreie Task-DB-Migration und lease-gebundene persistente Tasks,
-- Boot-/Perioden-Reconciliation mit Auto-Resume nur für `retry-safe`; Recovery-Gates nur für Power-Effekte,
+- Boot-/Perioden-Reconciliation mit explizitem Refresh ohne stillen Wiederanlauf,
 - hashgebundener Artefakttransport mit Ziel-CAS und atomarer Publikation,
 - agenteneigene Browserworker mit Loopback-CDP,
 - isolierte Xvfb-GUI-Worker ohne Remote-Display-Listener,
 - MCP-unabhängiger, inhaltsfreier Rootbroker-Status.
 
-Hostseitig offen bleiben die bewusste Rootbroker-Installation, Xvfb-Bereitstellung, Reconcile-Unit-Aktivierung und der Connector-Snapshot-Refresh.
+Hostseitig offen bleiben frische Server-Recovery-Evidence, Xvfb-Bereitstellung für breitere GUI-Workflows und der nächste Connector-Snapshot-Refresh nach neuen Toolverträgen.

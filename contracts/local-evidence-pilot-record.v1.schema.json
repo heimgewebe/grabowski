@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grabowski.local/contracts/local-evidence-pilot-record.v1.schema.json",
+  "title": "Grabowski Local Evidence Pilot Record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "repo",
+    "task_class",
+    "manual_evidence_steps",
+    "bundle_bytes",
+    "files_selected",
+    "files_added_manually",
+    "false_positive_files",
+    "missing_relevant_files",
+    "follow_up_commands",
+    "result_status",
+    "useful",
+    "notes"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "repo": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "task_class": {
+      "type": "string",
+      "enum": [
+        "pr-review",
+        "dirty-worktree-analysis",
+        "contract-doc-audit",
+        "runtime-diagnosis-with-repo",
+        "large-repo-task",
+        "other"
+      ]
+    },
+    "manual_evidence_steps": {"type": "integer", "minimum": 0, "maximum": 1000},
+    "bundle_bytes": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+    "files_selected": {"type": "integer", "minimum": 0, "maximum": 10000},
+    "files_added_manually": {"type": "integer", "minimum": 0, "maximum": 10000},
+    "false_positive_files": {"type": "integer", "minimum": 0, "maximum": 10000},
+    "missing_relevant_files": {"type": "integer", "minimum": 0, "maximum": 10000},
+    "follow_up_commands": {"type": "integer", "minimum": 0, "maximum": 1000},
+    "result_status": {"type": "string", "enum": ["complete", "partial", "rejected", "not-used"]},
+    "useful": {"type": "boolean"},
+    "notes": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {"type": "string", "maxLength": 500}
+    }
+  }
+}
