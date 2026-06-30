@@ -1,25 +1,37 @@
 {
-  "version": 2,
-  "mode": "observe",
   "active_profile": "observe",
-  "read_roots": [
-    "${HOME}/repos",
-    "${HOME}/grabowski-workspace",
-    "${HOME}/.local/state/grabowski"
-  ],
-  "write_roots": [],
-  "write_excluded_roots": [
-    "${HOME}/repos/merges"
-  ],
-  "secret_roots": [],
   "browser_profile_roots": [],
-  "secret_export_roots": [],
-  "max_read_bytes": 2000000,
-  "max_write_bytes": 2000000,
-  "max_list_entries": 500,
-  "max_secret_use_output_bytes": 250000,
-  "max_secret_use_seconds": 30,
+  "capability_definitions": {
+    "artifact_transfer": "Transfer regular files with hash-bound source and destination preconditions.",
+    "audit_verify": "Verify the tamper-evident write audit chain.",
+    "browser_profile_read": "Read bounded browser profile metadata and text under explicit browser profile roots; binary databases are metadata-only.",
+    "browser_worker": "Start and control isolated agent-owned browser workers with loopback-only debugging.",
+    "bundle_registry": "Read the curated Lens/repoLens latest-complete bundle registry.",
+    "durable_job": "Start, inspect and cancel bounded transient user-systemd jobs.",
+    "file_delete": "Remove regular files or empty directories into quarantine for audit-backed restoration.",
+    "file_destroy": "Irreversibly remove regular files or empty directories only through a separate explicit capability.",
+    "file_read": "Read bounded, non-secret text and metadata inside configured roots.",
+    "file_write": "Create and replace bounded text files with hash preconditions, audit and quarantine.",
+    "friction_record": "Append bounded operator-friction events to the local friction ledger.",
+    "git_cli": "Run guarded Git commands inside a repository.",
+    "github_cli": "Run GitHub CLI with redacted output.",
+    "gui_worker": "Start and control isolated Xvfb GUI workers without a remote display listener.",
+    "port_inspect": "Inspect listening sockets.",
+    "privileged_reference": "Create non-executable references for future privileged actions.",
+    "process_inspect": "Inspect current-user processes.",
+    "process_signal": "Signal current-user processes with protected PID checks.",
+    "resource_lease": "Acquire, renew, inspect and release typed collision-control resource leases.",
+    "rollback_text": "Restore a quarantined preimage from an audited replace transaction.",
+    "secret_export": "Atomically create a local 0600 copy inside configured secret export roots with a source hash precondition.",
+    "secret_inspect": "Inspect metadata and bounded directory listings under explicit secret roots without returning file content.",
+    "secret_reveal": "Break-glass reveal only with a current SHA-256, justification and explicit context-exposure acknowledgement; prefer secret_use.",
+    "secret_use": "Run bounded argv-only commands with a secret supplied through an inherited file descriptor or restrictive temporary fallback.",
+    "terminal_execute": "Run bounded non-interactive argv-only commands without shell expansion.",
+    "tmux_interaction": "Read or send literal input to existing tmux panes.",
+    "user_service_control": "Inspect and control user-level systemd units."
+  },
   "forbid_symlinks": true,
+  "forbidden_capabilities": [],
   "forbidden_components": [
     ".git"
   ],
@@ -33,163 +45,20 @@
     "*.kdbx",
     "credentials.json"
   ],
-  "forbidden_capabilities": [],
-  "capability_definitions": {
-    "file_read": "Read bounded, non-secret text and metadata inside configured roots.",
-    "file_write": "Create and replace bounded text files with hash preconditions, audit and quarantine.",
-    "file_delete": "Remove regular files or empty directories into quarantine for audit-backed restoration.",
-    "file_destroy": "Irreversibly remove regular files or empty directories only through a separate explicit capability.",
-    "audit_verify": "Verify the tamper-evident write audit chain.",
-    "rollback_text": "Restore a quarantined preimage from an audited replace transaction.",
-    "bundle_registry": "Read the curated Lens/repoLens latest-complete bundle registry.",
-    "secret_inspect": "Inspect metadata and bounded directory listings under explicit secret roots without returning file content.",
-    "secret_reveal": "Break-glass reveal only with a current SHA-256, justification and explicit context-exposure acknowledgement; prefer secret_use.",
-    "secret_use": "Run bounded argv-only commands with a secret supplied through an inherited file descriptor or restrictive temporary fallback.",
-    "secret_export": "Atomically create a local 0600 copy inside configured secret export roots with a source hash precondition.",
-    "browser_profile_read": "Read bounded browser profile metadata and text under explicit browser profile roots; binary databases are metadata-only.",
-    "terminal_execute": "Run bounded non-interactive argv-only commands without shell expansion.",
-    "durable_job": "Start, inspect and cancel bounded transient user-systemd jobs.",
-    "git_cli": "Run guarded Git commands inside a repository.",
-    "github_cli": "Run GitHub CLI with redacted output.",
-    "user_service_control": "Inspect and control user-level systemd units.",
-    "tmux_interaction": "Read or send literal input to existing tmux panes.",
-    "process_inspect": "Inspect current-user processes.",
-    "process_signal": "Signal current-user processes with protected PID checks.",
-    "port_inspect": "Inspect listening sockets.",
-    "privileged_reference": "Create non-executable references for future privileged actions.",
-    "resource_lease": "Acquire, renew, inspect and release typed collision-control resource leases.",
-    "artifact_transfer": "Transfer regular files with hash-bound source and destination preconditions.",
-    "browser_worker": "Start and control isolated agent-owned browser workers with loopback-only debugging.",
-    "gui_worker": "Start and control isolated Xvfb GUI workers without a remote display listener."
-  },
+  "max_list_entries": 500,
+  "max_read_bytes": 2000000,
+  "max_secret_use_output_bytes": 250000,
+  "max_secret_use_seconds": 30,
+  "max_write_bytes": 2000000,
+  "mode": "observe",
   "profiles": {
-    "observe": {
-      "description": "Read/status profile. It intentionally omits coarse capabilities that currently unlock mutating tools.",
-      "read_roots": [
-        "${HOME}/repos",
-        "${HOME}/grabowski-workspace",
-        "${HOME}/.local/state/grabowski"
-      ],
-      "write_roots": [],
-      "write_excluded_roots": [
-        "${HOME}/repos/merges"
-      ],
-      "secret_roots": [],
-      "browser_profile_roots": [],
-      "secret_export_roots": [],
-      "max_read_bytes": 2000000,
-      "max_write_bytes": 2000000,
-      "max_list_entries": 500,
-      "max_secret_use_output_bytes": 250000,
-      "max_secret_use_seconds": 30,
-      "capabilities": [
-        "file_read",
-        "audit_verify",
-        "bundle_registry",
-        "process_inspect",
-        "port_inspect"
-      ]
-    },
-    "maintain": {
-      "description": "Conservative maintenance profile. Until tool-level read/write capability splits exist, it remains read-mostly and does not grant durable_job, resource_lease or git_cli.",
-      "read_roots": [
-        "${HOME}/repos",
-        "${HOME}/grabowski-workspace",
-        "${HOME}/.local/state/grabowski"
-      ],
-      "write_roots": [],
-      "write_excluded_roots": [
-        "${HOME}/repos/merges"
-      ],
-      "secret_roots": [],
-      "browser_profile_roots": [],
-      "secret_export_roots": [],
-      "max_read_bytes": 2000000,
-      "max_write_bytes": 2000000,
-      "max_list_entries": 500,
-      "max_secret_use_output_bytes": 250000,
-      "max_secret_use_seconds": 30,
-      "capabilities": [
-        "file_read",
-        "audit_verify",
-        "bundle_registry",
-        "process_inspect",
-        "port_inspect"
-      ]
-    },
-    "mutate": {
-      "description": "Bounded mutation profile for repository and operator state changes with audit and preconditions. It excludes terminal, secrets, tmux, process signals and irreversible destroy.",
-      "read_roots": [
-        "${HOME}/repos",
-        "${HOME}/grabowski-workspace",
-        "${HOME}/.local/state/grabowski"
-      ],
-      "write_roots": [
-        "${HOME}/repos",
-        "${HOME}/grabowski-workspace"
-      ],
-      "write_excluded_roots": [
-        "${HOME}/repos/merges"
-      ],
-      "secret_roots": [],
-      "browser_profile_roots": [],
-      "secret_export_roots": [],
-      "max_read_bytes": 2000000,
-      "max_write_bytes": 2000000,
-      "max_list_entries": 500,
-      "max_secret_use_output_bytes": 250000,
-      "max_secret_use_seconds": 30,
-      "capabilities": [
-        "file_read",
-        "file_write",
-        "audit_verify",
-        "rollback_text",
-        "bundle_registry",
-        "durable_job",
-        "git_cli",
-        "github_cli",
-        "user_service_control",
-        "resource_lease",
-        "artifact_transfer",
-        "browser_worker",
-        "gui_worker",
-        "process_inspect",
-        "port_inspect"
-      ]
-    },
     "break-glass": {
-      "description": "Explicit high-risk profile for terminal execution, secret reveal/use/export, browser profiles, tmux, process signals and destructive file operations.",
-      "read_roots": [
-        "${HOME}"
-      ],
-      "write_roots": [
-        "${HOME}"
-      ],
-      "write_excluded_roots": [
-        "${HOME}/repos/merges"
-      ],
-      "secret_roots": [
-        "${HOME}/.ssh",
-        "${HOME}/.gnupg",
-        "${HOME}/.aws",
-        "${HOME}/.kube",
-        "${HOME}/.password-store",
-        "${HOME}/.local/share/keyrings"
-      ],
       "browser_profile_roots": [
         "${HOME}/.mozilla/firefox",
         "${HOME}/.config/BraveSoftware/Brave-Browser",
         "${HOME}/.config/google-chrome",
         "${HOME}/.config/chromium"
       ],
-      "secret_export_roots": [
-        "${HOME}/grabowski-secret-exports"
-      ],
-      "max_read_bytes": 33554432,
-      "max_write_bytes": 33554432,
-      "max_list_entries": 100000,
-      "max_secret_use_output_bytes": 33554432,
-      "max_secret_use_seconds": 3600,
       "capabilities": [
         "file_read",
         "file_write",
@@ -219,8 +88,144 @@
         "file_destroy",
         "file_move",
         "chmod",
-        "chown"
+        "chown",
+        "friction_record"
+      ],
+      "description": "Explicit high-risk profile for terminal execution, secret reveal/use/export, browser profiles, tmux, process signals and destructive file operations.",
+      "max_list_entries": 100000,
+      "max_read_bytes": 33554432,
+      "max_secret_use_output_bytes": 33554432,
+      "max_secret_use_seconds": 3600,
+      "max_write_bytes": 33554432,
+      "read_roots": [
+        "${HOME}"
+      ],
+      "secret_export_roots": [
+        "${HOME}/grabowski-secret-exports"
+      ],
+      "secret_roots": [
+        "${HOME}/.ssh",
+        "${HOME}/.gnupg",
+        "${HOME}/.aws",
+        "${HOME}/.kube",
+        "${HOME}/.password-store",
+        "${HOME}/.local/share/keyrings"
+      ],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
+      ],
+      "write_roots": [
+        "${HOME}"
       ]
+    },
+    "maintain": {
+      "browser_profile_roots": [],
+      "capabilities": [
+        "file_read",
+        "audit_verify",
+        "bundle_registry",
+        "process_inspect",
+        "port_inspect",
+        "friction_record"
+      ],
+      "description": "Conservative maintenance profile. Until tool-level read/write capability splits exist, it remains read-mostly and does not grant durable_job, resource_lease or git_cli.",
+      "max_list_entries": 500,
+      "max_read_bytes": 2000000,
+      "max_secret_use_output_bytes": 250000,
+      "max_secret_use_seconds": 30,
+      "max_write_bytes": 2000000,
+      "read_roots": [
+        "${HOME}/repos",
+        "${HOME}/grabowski-workspace",
+        "${HOME}/.local/state/grabowski"
+      ],
+      "secret_export_roots": [],
+      "secret_roots": [],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
+      ],
+      "write_roots": []
+    },
+    "mutate": {
+      "browser_profile_roots": [],
+      "capabilities": [
+        "file_read",
+        "file_write",
+        "audit_verify",
+        "rollback_text",
+        "bundle_registry",
+        "durable_job",
+        "git_cli",
+        "github_cli",
+        "user_service_control",
+        "resource_lease",
+        "artifact_transfer",
+        "browser_worker",
+        "gui_worker",
+        "process_inspect",
+        "port_inspect",
+        "friction_record"
+      ],
+      "description": "Bounded mutation profile for repository and operator state changes with audit and preconditions. It excludes terminal, secrets, tmux, process signals and irreversible destroy.",
+      "max_list_entries": 500,
+      "max_read_bytes": 2000000,
+      "max_secret_use_output_bytes": 250000,
+      "max_secret_use_seconds": 30,
+      "max_write_bytes": 2000000,
+      "read_roots": [
+        "${HOME}/repos",
+        "${HOME}/grabowski-workspace",
+        "${HOME}/.local/state/grabowski"
+      ],
+      "secret_export_roots": [],
+      "secret_roots": [],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
+      ],
+      "write_roots": [
+        "${HOME}/repos",
+        "${HOME}/grabowski-workspace"
+      ]
+    },
+    "observe": {
+      "browser_profile_roots": [],
+      "capabilities": [
+        "file_read",
+        "audit_verify",
+        "bundle_registry",
+        "process_inspect",
+        "port_inspect",
+        "friction_record"
+      ],
+      "description": "Read/status profile. It intentionally omits coarse capabilities that currently unlock mutating tools.",
+      "max_list_entries": 500,
+      "max_read_bytes": 2000000,
+      "max_secret_use_output_bytes": 250000,
+      "max_secret_use_seconds": 30,
+      "max_write_bytes": 2000000,
+      "read_roots": [
+        "${HOME}/repos",
+        "${HOME}/grabowski-workspace",
+        "${HOME}/.local/state/grabowski"
+      ],
+      "secret_export_roots": [],
+      "secret_roots": [],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
+      ],
+      "write_roots": []
     }
-  }
+  },
+  "read_roots": [
+    "${HOME}/repos",
+    "${HOME}/grabowski-workspace",
+    "${HOME}/.local/state/grabowski"
+  ],
+  "secret_export_roots": [],
+  "secret_roots": [],
+  "version": 2,
+  "write_excluded_roots": [
+    "${HOME}/repos/merges"
+  ],
+  "write_roots": []
 }

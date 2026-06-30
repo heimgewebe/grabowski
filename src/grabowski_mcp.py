@@ -41,6 +41,7 @@ AUDIT_APPEND_LOCK = threading.RLock()
 BASE_CAPABILITIES = (
     "file_read",
     "file_write",
+    "friction_record",
     "audit_verify",
     "rollback_text",
     "bundle_registry",

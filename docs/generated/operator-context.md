@@ -104,7 +104,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 
 - Mode: `observe`
 - Active profile: `observe`
-- Capabilities: `file_read`, `audit_verify`, `bundle_registry`, `process_inspect`, `port_inspect`
+- Capabilities: `file_read`, `audit_verify`, `bundle_registry`, `process_inspect`, `port_inspect`, `friction_record`
 - Read roots: `${HOME}/repos`, `${HOME}/grabowski-workspace`, `${HOME}/.local/state/grabowski`
 - Write roots: `none`
 - Read-only exclusions: `${HOME}/repos/merges`
