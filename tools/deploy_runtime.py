@@ -13,7 +13,6 @@ from pathlib import Path
 import re
 import select
 import shlex
-import shutil
 import stat as statmod
 import subprocess
 import sys
@@ -37,7 +36,7 @@ ENTRYPOINT_CONTRACT_RELATIVE = Path("config/runtime-entrypoint.json")
 RELEASES_DIR_NAME = "grabowski-mcp-releases"
 MANIFEST_NAME = "deployment-manifest.json"
 INCOMPLETE_MARKER = "deployment-incomplete.json"
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
 MCP_PROTOCOL_VERSIONS = (
     "2025-06-18",
     "2025-03-26",
@@ -395,21 +394,43 @@ def parse_runtime_lock(path: Path) -> dict[str, str]:
 
 
 @dataclass(frozen=True)
+class RuntimeSource:
+    module: str
+    source: Path
+
+    def to_manifest(self) -> dict[str, str]:
+        return {"module": self.module, "source": self.source.as_posix()}
+
+
+@dataclass(frozen=True)
 class RuntimeContract:
     schema_version: int
     mode: str
     expected_tools: tuple[str, ...]
     source: Path
     module: str
+    supporting_sources: tuple[RuntimeSource, ...] = ()
+
+    @property
+    def sources(self) -> tuple[RuntimeSource, ...]:
+        return (
+            RuntimeSource(module=self.module, source=self.source),
+            *self.supporting_sources,
+        )
 
     def to_manifest(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "schema_version": self.schema_version,
             "mode": self.mode,
             "expected_tools": list(self.expected_tools),
             "source": self.source.as_posix(),
             "module": self.module,
         }
+        if self.schema_version >= 2:
+            result["supporting_sources"] = [
+                item.to_manifest() for item in self.supporting_sources
+            ]
+        return result
 
     def command_argv(self, release_path: Path, python_exe: Path) -> list[str]:
         return [str(python_exe), "-m", self.module]
@@ -432,26 +453,74 @@ def load_contract_bytes(data: bytes) -> RuntimeContract:
         fail(f"Runtime-Entry-Point-Contract ist ungültig: {exc}")
     if not isinstance(raw, dict):
         fail("Runtime-Entry-Point-Contract ist kein Objekt")
-    if raw.get("schema_version") != 1:
-        fail("Runtime-Entry-Point-Contract benötigt schema_version 1")
+    schema_version = raw.get("schema_version")
+    if schema_version not in {1, 2}:
+        fail("Runtime-Entry-Point-Contract benötigt schema_version 1 oder 2")
     mode = raw.get("mode")
     if mode != "module":
         fail(f"Nicht unterstützter Entry-Point-Modus: {mode!r}")
     tools = raw.get("expected_tools")
-    if not isinstance(tools, list) or not tools or not all(isinstance(item, str) and item for item in tools):
-        fail("Runtime-Entry-Point-Contract benötigt expected_tools als nichtleere Stringliste")
+    if (
+        not isinstance(tools, list)
+        or not tools
+        or not all(isinstance(item, str) and item for item in tools)
+        or len(set(tools)) != len(tools)
+    ):
+        fail(
+            "Runtime-Entry-Point-Contract benötigt eindeutige expected_tools "
+            "als nichtleere Stringliste"
+        )
     source = _relative_path(str(raw.get("source", "")), "source")
     if source.as_posix() == ".":
         fail("Runtime-Entry-Point-Contract benötigt source")
     module = raw.get("module")
-    if not isinstance(module, str) or not MODULE_RE.match(module):
+    if not isinstance(module, str) or not MODULE_RE.fullmatch(module):
         fail(f"Ungültiges Modul im Runtime-Entry-Point-Contract: {module!r}")
+
+    raw_supporting = raw.get("supporting_sources", [])
+    if schema_version == 1 and raw_supporting:
+        fail("supporting_sources benötigt schema_version 2")
+    if not isinstance(raw_supporting, list):
+        fail("supporting_sources muss eine Liste sein")
+
+    supporting: list[RuntimeSource] = []
+    seen_modules = {module}
+    seen_paths = {source}
+    for index, item in enumerate(raw_supporting):
+        if not isinstance(item, dict) or set(item) != {"module", "source"}:
+            fail(
+                f"supporting_sources[{index}] muss exakt module und source "
+                "enthalten"
+            )
+        supporting_module = item.get("module")
+        if (
+            not isinstance(supporting_module, str)
+            or not MODULE_RE.fullmatch(supporting_module)
+        ):
+            fail(f"Ungültiges supporting_sources-Modul: {supporting_module!r}")
+        supporting_path = _relative_path(
+            str(item.get("source", "")),
+            f"supporting_sources[{index}].source",
+        )
+        if supporting_path.as_posix() == ".":
+            fail(f"supporting_sources[{index}] benötigt source")
+        if supporting_module in seen_modules:
+            fail(f"Doppeltes Runtime-Modul: {supporting_module}")
+        if supporting_path in seen_paths:
+            fail(f"Doppelter Runtime-Quellpfad: {supporting_path}")
+        seen_modules.add(supporting_module)
+        seen_paths.add(supporting_path)
+        supporting.append(
+            RuntimeSource(module=supporting_module, source=supporting_path)
+        )
+
     return RuntimeContract(
-        schema_version=1,
+        schema_version=schema_version,
         mode="module",
         module=module,
         source=source,
         expected_tools=tuple(tools),
+        supporting_sources=tuple(supporting),
     )
 
 
@@ -469,6 +538,7 @@ class Snapshot:
     runtime_input_bytes: bytes
     runtime_lock_bytes: bytes
     source_bytes: bytes
+    supporting_source_bytes: dict[str, bytes] = field(default_factory=dict)
 
     @property
     def contract_sha256(self) -> str:
@@ -485,6 +555,26 @@ class Snapshot:
     @property
     def source_sha256(self) -> str:
         return sha256_bytes(self.source_bytes)
+
+    @property
+    def source_sha256s(self) -> dict[str, str]:
+        values = {self.contract.module: self.source_sha256}
+        values.update(
+            {
+                module: sha256_bytes(data)
+                for module, data in self.supporting_source_bytes.items()
+            }
+        )
+        return dict(sorted(values.items()))
+
+    @property
+    def source_set_sha256(self) -> str:
+        encoded = json.dumps(
+            self.source_sha256s,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return sha256_bytes(encoded)
 
 
 def git_head(repo: Path) -> str:
@@ -533,6 +623,10 @@ def snapshot_from_git(repo: Path) -> Snapshot:
         runtime_input_bytes=git_show(repo, repo_head, RUNTIME_INPUT_RELATIVE),
         runtime_lock_bytes=git_show(repo, repo_head, RUNTIME_LOCK_RELATIVE),
         source_bytes=git_show(repo, repo_head, contract.source),
+        supporting_source_bytes={
+            source.module: git_show(repo, repo_head, source.source)
+            for source in contract.supporting_sources
+        },
     )
 
 
@@ -550,6 +644,10 @@ def snapshot_from_worktree(repo: Path) -> Snapshot:
         runtime_input_bytes=(repo / RUNTIME_INPUT_RELATIVE).read_bytes(),
         runtime_lock_bytes=(repo / RUNTIME_LOCK_RELATIVE).read_bytes(),
         source_bytes=(repo / contract.source).read_bytes(),
+        supporting_source_bytes={
+            source.module: (repo / source.source).read_bytes()
+            for source in contract.supporting_sources
+        },
     )
 
 
@@ -694,7 +792,16 @@ def write_snapshot_inputs(snapshot: Snapshot, release_path: Path) -> dict[str, s
     files["runtime_input"].write_bytes(snapshot.runtime_input_bytes)
     files["runtime_lock"].write_bytes(snapshot.runtime_lock_bytes)
     files["source"].write_bytes(snapshot.source_bytes)
-    return {key: str(path) for key, path in files.items()}
+    supporting_paths: dict[str, str] = {}
+    for source in snapshot.contract.supporting_sources:
+        supporting_path = inputs / source.source
+        supporting_path.parent.mkdir(parents=True, exist_ok=True)
+        supporting_path.write_bytes(snapshot.supporting_source_bytes[source.module])
+        supporting_paths[source.module] = str(supporting_path)
+    result = {key: str(path) for key, path in files.items()}
+    if supporting_paths:
+        result["supporting_sources"] = dict(sorted(supporting_paths.items()))
+    return result
 
 
 def pip_env() -> dict[str, str]:
@@ -790,18 +897,23 @@ def module_destination(
 
 
 def install_runtime_source(snapshot: Snapshot, release_path: Path, python_exe: Path) -> Path:
-    destination = module_destination(
-        site_packages_path(python_exe),
-        snapshot.contract.module,
-    )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(snapshot.source_bytes)
-    run(
-        [str(python_exe), "-m", "py_compile", str(destination)],
-        timeout=TIMEOUTS["python"],
-        env=pip_env(),
-    )
-    return destination
+    site_packages = site_packages_path(python_exe)
+    installed: list[Path] = []
+    for source in snapshot.contract.sources:
+        destination = module_destination(site_packages, source.module)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.module == snapshot.contract.module:
+            data = snapshot.source_bytes
+        else:
+            data = snapshot.supporting_source_bytes[source.module]
+        destination.write_bytes(data)
+        run(
+            [str(python_exe), "-m", "py_compile", str(destination)],
+            timeout=TIMEOUTS["python"],
+            env=pip_env(),
+        )
+        installed.append(destination)
+    return installed[0]
 
 
 def is_within(path: Path, root: Path) -> bool:
@@ -1175,6 +1287,8 @@ def write_manifest(
         "entrypoint_contract": snapshot.contract.to_manifest(),
         "entrypoint_contract_sha256": snapshot.contract_sha256,
         "source_sha256": snapshot.source_sha256,
+        "source_sha256s": snapshot.source_sha256s,
+        "source_set_sha256": snapshot.source_set_sha256,
         "runtime_input_sha256": snapshot.runtime_input_sha256,
         "runtime_lock_sha256": snapshot.runtime_lock_sha256,
         "snapshot_paths": input_paths,
@@ -1224,6 +1338,8 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
         "source_sha256": str,
         "runtime_input_sha256": str,
         "runtime_lock_sha256": str,
+        "source_sha256s": dict,
+        "source_set_sha256": str,
         "snapshot_paths": dict,
         "immutable_release_path": str,
         "expected_stable_runtime_path": str,
@@ -1256,27 +1372,76 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
         "source_sha256",
         "runtime_input_sha256",
         "runtime_lock_sha256",
+        "source_set_sha256",
     ):
         if not _is_lower_hex(manifest.get(key), 64):
             errors.append(key)
     contract = manifest.get("entrypoint_contract")
+    contract_modules: set[str] = set()
     if not isinstance(contract, dict):
         errors.append("entrypoint_contract")
     else:
-        if contract.get("schema_version") != 1 or contract.get("mode") != "module":
+        if contract.get("schema_version") not in {1, 2} or contract.get("mode") != "module":
             errors.append("entrypoint_contract")
-        if not isinstance(contract.get("module"), str) or not MODULE_RE.match(contract["module"]):
+        if not isinstance(contract.get("module"), str) or not MODULE_RE.fullmatch(contract["module"]):
             errors.append("entrypoint_contract")
+        else:
+            contract_modules.add(contract["module"])
         if not isinstance(contract.get("source"), str):
             errors.append("entrypoint_contract")
         tools = contract.get("expected_tools")
-        if not isinstance(tools, list) or not tools or not all(isinstance(item, str) and item for item in tools):
+        if (
+            not isinstance(tools, list)
+            or not tools
+            or not all(isinstance(item, str) and item for item in tools)
+            or len(set(tools)) != len(tools)
+        ):
             errors.append("entrypoint_contract")
+        supporting_sources = contract.get("supporting_sources", [])
+        if contract.get("schema_version") == 1 and supporting_sources:
+            errors.append("entrypoint_contract")
+        if not isinstance(supporting_sources, list):
+            errors.append("entrypoint_contract")
+        else:
+            for item in supporting_sources:
+                if not isinstance(item, dict) or set(item) != {"module", "source"}:
+                    errors.append("entrypoint_contract")
+                    continue
+                module = item.get("module")
+                source = item.get("source")
+                if not isinstance(module, str) or not MODULE_RE.fullmatch(module):
+                    errors.append("entrypoint_contract")
+                elif module in contract_modules:
+                    errors.append("entrypoint_contract")
+                else:
+                    contract_modules.add(module)
+                if not isinstance(source, str):
+                    errors.append("entrypoint_contract")
+    source_hashes = manifest.get("source_sha256s")
+    if (
+        not isinstance(source_hashes, dict)
+        or not contract_modules
+        or set(source_hashes) != contract_modules
+        or not all(_is_lower_hex(value, 64) for value in source_hashes.values())
+    ):
+        errors.append("source_sha256s")
     snapshot_paths = manifest.get("snapshot_paths")
-    if not isinstance(snapshot_paths, dict) or set(snapshot_paths) != {
-        "runtime_entrypoint", "runtime_input", "runtime_lock", "source"
-    } or not all(isinstance(value, str) for value in snapshot_paths.values()):
+    if not isinstance(snapshot_paths, dict) or not all(isinstance(value, str) for value in snapshot_paths.values()):
         errors.append("snapshot_paths")
+    else:
+        expected_keys = {"runtime_entrypoint", "runtime_input", "runtime_lock", "source"}
+        if contract_modules and len(contract_modules) > 1:
+            expected_keys.add("supporting_sources")
+        if set(snapshot_paths) != expected_keys:
+            errors.append("snapshot_paths")
+        supporting_paths = snapshot_paths.get("supporting_sources")
+        if "supporting_sources" in expected_keys:
+            if (
+                not isinstance(supporting_paths, dict)
+                or set(supporting_paths) != (contract_modules - {contract.get("module") if isinstance(contract, dict) else None})
+                or not all(isinstance(value, str) for value in supporting_paths.values())
+            ):
+                errors.append("snapshot_paths")
     created = manifest.get("created_at_unix")
     if not isinstance(created, int) or isinstance(created, bool) or created <= 0:
         errors.append("created_at_unix")
@@ -1296,6 +1461,8 @@ def verify_manifest(
     expected = {
         "repo_head": snapshot.repo_head,
         "source_sha256": snapshot.source_sha256,
+        "source_sha256s": snapshot.source_sha256s,
+        "source_set_sha256": snapshot.source_set_sha256,
         "runtime_input_sha256": snapshot.runtime_input_sha256,
         "runtime_lock_sha256": snapshot.runtime_lock_sha256,
         "entrypoint_contract_sha256": snapshot.contract_sha256,
@@ -1393,13 +1560,27 @@ def verify_final_release_artifacts(
         input_root / snapshot.contract.source,
         real_release,
     )
-
     checks = {
         contract_path: snapshot.contract_sha256,
         runtime_input_path: snapshot.runtime_input_sha256,
         runtime_lock_path: snapshot.runtime_lock_sha256,
         source_path: snapshot.source_sha256,
     }
+    if snapshot.contract.supporting_sources:
+        snapshot_paths = manifest.get("snapshot_paths")
+        supporting_paths = snapshot_paths.get("supporting_sources") if isinstance(snapshot_paths, dict) else None
+        if not isinstance(supporting_paths, dict):
+            fail("Manifest enthält keine supporting_sources-Snapshotpfade")
+        for source in snapshot.contract.supporting_sources:
+            raw_path = supporting_paths.get(source.module)
+            if not isinstance(raw_path, str):
+                fail(f"Manifest enthält keinen Snapshotpfad für {source.module}")
+            supporting_path = normalize_managed_path(Path(raw_path), allowed_root=real_release)
+            expected_path = input_root / source.source
+            if supporting_path != expected_path:
+                fail("Supporting-Source-Snapshotpfad entspricht nicht dem erwarteten Pfad")
+            checks[supporting_path] = snapshot.source_sha256s[source.module]
+
     for path, expected_hash in checks.items():
         if sha256(path) != expected_hash:
             fail(f"Finales Releaseartefakt driftete nach Aktivierung: {path}")
@@ -1433,6 +1614,21 @@ def verify_final_release_artifacts(
         fail("Manifest-Entry-Point entspricht nicht der aktuellen Modulauflösung")
     if sha256(imported_module) != snapshot.source_sha256:
         fail("Importierte Moduldatei entspricht nicht dem Source-Snapshot")
+    for source in snapshot.contract.supporting_sources:
+        imported_supporting = import_module_path(release_python, source.module)
+        expected_supporting = module_destination(
+            site_packages_path(release_python),
+            source.module,
+            create_packages=False,
+        )
+        require_file(expected_supporting, f"Erwartetes Release-Modul {source.module}")
+        if imported_supporting.resolve(strict=True) != expected_supporting.resolve(strict=True):
+            fail(
+                "Importierter Supporting-Modulpfad entspricht nicht dem erwarteten "
+                f"Release-Ziel: {imported_supporting} != {expected_supporting}"
+            )
+        if sha256(imported_supporting) != snapshot.source_sha256s[source.module]:
+            fail(f"Importierte Supporting-Moduldatei driftete: {source.module}")
 
     process_exe_value = process.get("exe") if isinstance(process, dict) else None
     if (
@@ -2314,6 +2510,8 @@ def verify_apply_snapshot_unchanged(repo: Path, snapshot: Snapshot, release_path
         input_root / RUNTIME_LOCK_RELATIVE.name: snapshot.runtime_lock_sha256,
         input_root / snapshot.contract.source: snapshot.source_sha256,
     }
+    for source in snapshot.contract.supporting_sources:
+        checks[input_root / source.source] = snapshot.source_sha256s[source.module]
     for path, expected in checks.items():
         if sha256(path) != expected:
             fail(f"Release-Snapshot driftete vor Aktivierung: {path}")
