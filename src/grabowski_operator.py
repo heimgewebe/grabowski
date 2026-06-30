@@ -461,6 +461,28 @@ def _validate_unit(unit: str, *, job_only: bool = False) -> str:
     return unit
 
 
+def _systemd_safe_description(
+    kind: str,
+    unit: str,
+    argv_sha256: str | None = None,
+) -> str:
+    """Return a bounded single-line Description= value for systemd-run."""
+    if not re.fullmatch(r"[a-z][a-z0-9-]{1,40}", kind):
+        raise ValueError("Invalid systemd description kind")
+    name = _validate_unit(unit)
+    parts = ["Grabowski", kind, name]
+    if argv_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", argv_sha256):
+            raise ValueError("Invalid argv sha256")
+        parts.append(f"argv={argv_sha256[:12]}")
+    value = " ".join(parts)
+    if any(item in value for item in ("\n", "\r", "\x00")):
+        raise ValueError("Invalid systemd description")
+    if len(value.encode("utf-8")) > 200:
+        raise ValueError("Systemd description is too large")
+    return value
+
+
 def _jobs_root() -> Path:
     if JOBS_DIR.is_symlink():
         raise PermissionError(f"Jobs directory may not be a symlink: {JOBS_DIR}")
@@ -669,6 +691,7 @@ def grabowski_job_start(
         [
             "systemd-run",
             "--user",
+            f"--description={_systemd_safe_description('job', unit, metadata['argv_sha256'])}",
             "--unit",
             unit,
             "--property=Type=exec",

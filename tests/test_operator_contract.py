@@ -202,6 +202,34 @@ class OperatorContractTests(unittest.TestCase):
         self.assertIn("--property=KillMode=control-group", source)
         self.assertIn("--property=StandardOutput=append:", source)
         self.assertIn("--property=StandardError=append:", source)
+        self.assertIn("--description=", source)
+
+    def test_systemd_description_is_bounded_single_line_metadata(self) -> None:
+        operator = _load_operator_module()
+        digest = "a" * 64
+
+        description = operator._systemd_safe_description(
+            "job",
+            "grabowski-job-deadbeefcafe.service",
+            digest,
+        )
+
+        self.assertEqual(
+            "Grabowski job grabowski-job-deadbeefcafe.service argv=aaaaaaaaaaaa",
+            description,
+        )
+        self.assertNotIn("\n", description)
+        self.assertNotIn("\r", description)
+        self.assertLessEqual(len(description.encode("utf-8")), 200)
+
+    def test_systemd_description_rejects_payload_like_values(self) -> None:
+        operator = _load_operator_module()
+        with self.assertRaises(ValueError):
+            operator._systemd_safe_description("job\n[Service]", "grabowski-job-x.service")
+        with self.assertRaises(ValueError):
+            operator._systemd_safe_description("job", "grabowski-job-x.service\n[Service]")
+        with self.assertRaises(ValueError):
+            operator._systemd_safe_description("job", "grabowski-job-x.service", "bad")
 
     def test_secret_bearing_argv_is_redacted_in_results(self) -> None:
         source = SOURCE.read_text(encoding="utf-8")

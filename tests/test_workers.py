@@ -84,6 +84,11 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("--remote-debugging-address=127.0.0.1", worker["argv"])
         self.assertIn("--remote-debugging-port=9222", worker["argv"])
         launch = run.call_args.args[0]
+        descriptions = [item for item in launch if item.startswith("--description=")]
+        self.assertEqual(1, len(descriptions))
+        self.assertIn("Grabowski browser-worker grabowski-browser-worker-", descriptions[0])
+        self.assertIn(" argv=", descriptions[0])
+        self.assertNotIn("\n", descriptions[0])
         self.assertIn("--slice=grabowski-workers.slice", launch)
         self.assertIn("--property=NoNewPrivileges=yes", launch)
         self.assertEqual(
