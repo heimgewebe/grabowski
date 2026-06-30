@@ -331,6 +331,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["recovery-marker-write"],
         "reversibility": "new-snapshot-retained",
     },
+    "grabowski_friction_record": {
+        "category": "operations-observability",
+        "purpose": "Record one bounded operator-friction event for later analysis.",
+        "risk_class": "medium",
+        "effects": ["state-append", "audit-record"],
+        "reversibility": "append-only-observation",
+    },
+    "grabowski_friction_summary": {
+        "category": "operations-observability",
+        "purpose": "Summarize recent bounded operator-friction events.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_task_start": {
         "category": "task",
         "purpose": "Start a persistent local or fleet task in its own systemd unit.",

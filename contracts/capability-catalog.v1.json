@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "b9dd9232ddf8ae699bb08bbaf67212867d2197747097854fa42713d9a9d9742f",
+  "capability_source_sha256": "bfd79437095dfb3cb1551d2c3b3bf58f6b4f2e85ebd40515e16c51fb96523557",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "8def53c77f007dac95c1a71c25f10cd7e48f63946905563895689366c325c308",
+  "contract_sha256": "09f95be76d910de4a134550d50b72c4636632cdb0c83929508a6db79bafba35b",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -857,6 +857,31 @@
       "reversibility": "new-snapshot-retained",
       "risk_class": "high",
       "tool": "grabowski_recovery_server_probe"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Record one bounded operator-friction event for later analysis.",
+      "effects": [
+        "state-append",
+        "audit-record"
+      ],
+      "id": "grabowski_friction_record",
+      "purpose": "Record one bounded operator-friction event for later analysis.",
+      "read_only": false,
+      "reversibility": "append-only-observation",
+      "risk_class": "medium",
+      "tool": "grabowski_friction_record"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Summarize recent bounded operator-friction events.",
+      "effects": [],
+      "id": "grabowski_friction_summary",
+      "purpose": "Summarize recent bounded operator-friction events.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_friction_summary"
     },
     {
       "category": "resource",
