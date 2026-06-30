@@ -95,7 +95,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 84)
+        self.assertEqual(len(tools), 85)
         legacy_tools = {
             "grabowski_status",
             "grabowski_context",
@@ -137,6 +137,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("grabowski_restore_removed_path", tools)
         self.assertIn("grabowski_destroy_path", tools)
         self.assertIn("grabowski_privileged_action_reference", tools)
+        self.assertIn("grabowski_recovery_server_probe", tools)
         supporting = {item["module"]: item["source"] for item in contract["supporting_sources"]}
         self.assertEqual(supporting["grabowski_operator_core"], "src/grabowski_operator.py")
         self.assertEqual(supporting["grabowski_read_surface"], "src/grabowski_read_surface.py")
