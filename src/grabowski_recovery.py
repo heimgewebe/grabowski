@@ -8,6 +8,7 @@ from pathlib import Path
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -49,6 +50,7 @@ RESTIC_BIN = os.environ.get("GRABOWSKI_RESTIC_BIN", "/usr/bin/restic")
 SSH_BIN = os.environ.get("GRABOWSKI_SSH_BIN", "/usr/bin/ssh")
 SERVER_RECOVERY_CHECK_SUBSET = os.environ.get("GRABOWSKI_SERVER_RECOVERY_CHECK_SUBSET", "1/100")
 SERVER_RECOVERY_TIMEOUT_SECONDS = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_TIMEOUT_SECONDS", "300"))
+SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES", "4096"))
 
 
 def _bounded_file(path: Path) -> bool:
@@ -157,17 +159,86 @@ def _pick_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_for_tcp(port: int, process: subprocess.Popen[bytes], *, timeout_seconds: float = 10.0) -> None:
+class _BoundedPipeCapture:
+    def __init__(self, *, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.total_bytes = 0
+        self.stored_bytes = 0
+        self.truncated = False
+        self._chunks: list[bytes] = []
+        self._thread: threading.Thread | None = None
+
+    def start(self, stream: Any) -> None:
+        self._thread = threading.Thread(target=self._drain, args=(stream,), daemon=True)
+        self._thread.start()
+
+    def _drain(self, stream: Any) -> None:
+        try:
+            while True:
+                chunk = stream.read(1024)
+                if not chunk:
+                    break
+                self.total_bytes += len(chunk)
+                remaining = max(0, self.max_bytes - self.stored_bytes)
+                if remaining:
+                    kept = chunk[:remaining]
+                    self._chunks.append(kept)
+                    self.stored_bytes += len(kept)
+                if len(chunk) > remaining:
+                    self.truncated = True
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def finish(self, *, timeout_seconds: float = 5.0) -> bytes:
+        if self._thread is not None:
+            self._thread.join(timeout=timeout_seconds)
+        if self.total_bytes > self.stored_bytes:
+            self.truncated = True
+        return b"".join(self._chunks)
+
+    def text(self) -> str:
+        return b"".join(self._chunks).decode("utf-8", errors="replace")
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "total_bytes": self.total_bytes,
+            "stored_bytes": self.stored_bytes,
+            "truncated": self.truncated,
+        }
+
+
+def _wait_for_tcp(
+    port: int,
+    process: subprocess.Popen[bytes],
+    *,
+    stderr_capture: _BoundedPipeCapture | None = None,
+    timeout_seconds: float = 10.0,
+) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError("ssh recovery tunnel exited before becoming ready")
+            details = _process_error_details(process, stderr_capture=stderr_capture)
+            raise RuntimeError(f"ssh recovery tunnel exited before becoming ready: {details}")
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
         except OSError:
             time.sleep(0.1)
-    raise RuntimeError("ssh recovery tunnel did not become ready")
+    details = _process_error_details(process, stderr_capture=stderr_capture)
+    raise RuntimeError(f"ssh recovery tunnel did not become ready: {details}")
+
+
+def _process_error_details(process: subprocess.Popen[bytes], *, stderr_capture: _BoundedPipeCapture | None) -> dict[str, Any]:
+    if stderr_capture is not None:
+        stderr_capture.finish(timeout_seconds=1.0)
+    return {
+        "returncode": process.poll(),
+        "stderr": stderr_capture.text() if stderr_capture is not None else "",
+        "stderr_capture": stderr_capture.metadata() if stderr_capture is not None else None,
+    }
 
 
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:
@@ -246,6 +317,8 @@ def server_recovery_probe() -> dict[str, Any]:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"server-recovery-{completed_at_unix}.log"
     port = _pick_local_port()
+    tunnel_stdout_path = log_dir / f"server-recovery-{completed_at_unix}.tunnel.stdout"
+    tunnel_stderr_path = log_dir / f"server-recovery-{completed_at_unix}.tunnel.stderr"
     tunnel = subprocess.Popen(
         [
             SSH_BIN,
@@ -256,11 +329,15 @@ def server_recovery_probe() -> dict[str, Any]:
             SERVER_RECOVERY_HOST,
         ],
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    tunnel_stdout_capture = _BoundedPipeCapture(max_bytes=SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES)
+    tunnel_stderr_capture = _BoundedPipeCapture(max_bytes=SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES)
+    tunnel_stdout_capture.start(tunnel.stdout)
+    tunnel_stderr_capture.start(tunnel.stderr)
     try:
-        _wait_for_tcp(port, tunnel)
+        _wait_for_tcp(port, tunnel, stderr_capture=tunnel_stderr_capture)
         with tempfile.TemporaryDirectory(prefix="grabowski-server-recovery-") as work_raw, tempfile.TemporaryDirectory(prefix="grabowski-server-restore-") as restore_raw:
             work = Path(work_raw)
             restore = Path(restore_raw)
@@ -271,7 +348,8 @@ def server_recovery_probe() -> dict[str, Any]:
             sentinel_sha256 = _sha256_file(sentinel)
             env = dict(os.environ)
             env.update({
-                "RESTIC_REPOSITORY": f"rest:http://{SERVER_RECOVERY_REST_USER}@127.0.0.1:{port}/{SERVER_RECOVERY_REPO_PATH}",
+                "RESTIC_REPOSITORY": f"rest:http://127.0.0.1:{port}/{SERVER_RECOVERY_REPO_PATH}",
+                "RESTIC_REST_USERNAME": SERVER_RECOVERY_REST_USER,
                 "RESTIC_REST_PASSWORD": http_password,
                 "RESTIC_PASSWORD_FILE": str(SERVER_RECOVERY_REPOSITORY_PASSWORD),
             })
@@ -302,6 +380,8 @@ def server_recovery_probe() -> dict[str, Any]:
             _write_server_marker(completed_at_unix=completed_at_unix, snapshot_id=snapshot_id[:8])
     finally:
         _terminate_process(tunnel)
+        tunnel_stdout_path.write_bytes(tunnel_stdout_capture.finish())
+        tunnel_stderr_path.write_bytes(tunnel_stderr_capture.finish())
     log_sha256 = _sha256_file(log_path) if log_path.exists() else None
     marker = _server_marker()
     audit_record = {
@@ -312,6 +392,8 @@ def server_recovery_probe() -> dict[str, Any]:
         "restore_probe_valid": True,
         "repository_check_valid": True,
         "log_sha256": log_sha256,
+        "tunnel_stderr_sha256": _sha256_file(tunnel_stderr_path) if tunnel_stderr_path.exists() else None,
+        "tunnel_stderr_capture": tunnel_stderr_capture.metadata(),
     }
     base._append_audit(audit_record)
     return {
@@ -325,6 +407,10 @@ def server_recovery_probe() -> dict[str, Any]:
         "marker_path": str(SERVER_RECOVERY),
         "log_path": str(log_path),
         "log_sha256": log_sha256,
+        "tunnel_stderr_path": str(tunnel_stderr_path),
+        "tunnel_stderr_sha256": _sha256_file(tunnel_stderr_path) if tunnel_stderr_path.exists() else None,
+        "tunnel_stdout_capture": tunnel_stdout_capture.metadata(),
+        "tunnel_stderr_capture": tunnel_stderr_capture.metadata(),
     }
 
 
