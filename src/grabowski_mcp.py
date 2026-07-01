@@ -2468,6 +2468,31 @@ def _runtime_tool_contract_summary() -> dict[str, Any]:
     }
 
 
+def _operator_relay_protocol() -> dict[str, Any]:
+    return {
+        "name": "Operator Relay v0",
+        "doc_path": "docs/blocked-action-protocol-v0.md",
+        "rule": "Typed Grabowski first; if blocked, one bounded Micro-Task; then read receipt before next step.",
+        "fallback_order": [
+            "typed_grabowski_tool",
+            "grabowski_micro_task",
+            "codex_or_aider_once_for_code_patch",
+            "claude_review",
+            "agy_or_tmux_session_resume",
+            "bureau_memory_prioritization",
+            "grabowski_git_audit",
+        ],
+        "does_not_establish": [
+            "new_privileges",
+            "automatic_merge",
+            "automatic_push",
+            "automatic_deploy",
+            "free_shell_as_default_path",
+            "durable_agent_autonomy",
+        ],
+    }
+
+
 @mcp.tool(name="grabowski_status", annotations=READ_ANNOTATIONS)
 def grabowski_status() -> dict[str, Any]:
     """Return Grabowski's bounded read/write policy and current local state."""
@@ -2494,6 +2519,7 @@ def grabowski_status() -> dict[str, Any]:
         "latest_complete_bundles_path": str(BUNDLE_REGISTRY),
         "latest_complete_bundles_exists": BUNDLE_REGISTRY.is_file(),
         "deployment": _deployment_metadata(),
+        "operating_protocol": _operator_relay_protocol(),
         "tool_contract": _runtime_tool_contract_summary(),
         "forbidden_capabilities": policy.get("forbidden_capabilities", []),
         "kill_switch": _kill_switch_state(),

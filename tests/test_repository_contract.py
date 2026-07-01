@@ -59,6 +59,18 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('"registered_names_sha256"', source)
         self.assertIn('"client_snapshot_observable": False', source)
 
+    def test_status_surfaces_operator_relay_protocol(self) -> None:
+        source = (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
+        self.assertIn("def _operator_relay_protocol()", source)
+        self.assertIn('"operating_protocol": _operator_relay_protocol()', source)
+        self.assertIn('"Operator Relay v0"', source)
+        self.assertIn('"typed_grabowski_tool"', source)
+        self.assertIn('"grabowski_micro_task"', source)
+        self.assertIn('"codex_or_aider_once_for_code_patch"', source)
+        self.assertIn('"automatic_merge"', source)
+        self.assertIn('"automatic_push"', source)
+        self.assertIn('"automatic_deploy"', source)
+
     def test_status_exposes_deployment_provenance(self) -> None:
         source = (
             ROOT / "src" / "grabowski_mcp.py"
