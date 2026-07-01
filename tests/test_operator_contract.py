@@ -254,6 +254,40 @@ class OperatorContractTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "bad-chain"):
                 operator._require_operator_mutation("git_cli")
 
+    def test_operator_mutation_gate_uses_operator_capabilities_only(self) -> None:
+        operator_capabilities = _load_operator_module().OPERATOR_CAPABILITIES
+        allowed = set(operator_capabilities)
+        violations: list[str] = []
+
+        for path in sorted((ROOT / "src").glob("grabowski*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                function = node.func
+                is_operator_gate = (
+                    isinstance(function, ast.Attribute)
+                    and function.attr == "_require_operator_mutation"
+                ) or (
+                    isinstance(function, ast.Name)
+                    and function.id == "_require_operator_mutation"
+                )
+                if not is_operator_gate:
+                    continue
+                if not node.args or not isinstance(node.args[0], ast.Constant):
+                    violations.append(f"{path.relative_to(ROOT)}:{node.lineno}: non-literal capability")
+                    continue
+                capability = node.args[0].value
+                if not isinstance(capability, str):
+                    violations.append(f"{path.relative_to(ROOT)}:{node.lineno}: non-string capability")
+                    continue
+                if capability not in allowed:
+                    violations.append(
+                        f"{path.relative_to(ROOT)}:{node.lineno}: {capability} is not an operator capability"
+                    )
+
+        self.assertEqual([], violations)
+
     def test_privileged_action_tool_is_reference_only(self) -> None:
         source = SOURCE.read_text(encoding="utf-8")
         self.assertIn("PRIVILEGED_REFERENCE_ACTIONS", source)
