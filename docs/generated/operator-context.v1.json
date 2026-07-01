@@ -1324,7 +1324,7 @@
       "src/grabowski_capabilities.py": "bfd79437095dfb3cb1551d2c3b3bf58f6b4f2e85ebd40515e16c51fb96523557",
       "src/grabowski_checkouts.py": "628c51240e773330e5958dd83ff4b30b651ed411d10fbf0b24764c07fe107342",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
-      "src/grabowski_friction.py": "830551ef1bd8459106f22a95865244fea49e9c64303632eeac17dfde732f3628",
+      "src/grabowski_friction.py": "d67b979ee30bbd1e812857acfddb34e1daca0b60c6ef99226db2bcd2b38ed20a",
       "src/grabowski_mcp.py": "fc924ff9247f2f85f8d3887e43dc3eb8bd105442ae25ea49efbc0b0f15f3d160",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "a2ded1c251b2b478a70dc4186ef004b009d1d34c1b931b1c1d8f9ac2ff3911fd",
