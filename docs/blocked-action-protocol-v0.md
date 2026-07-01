@@ -70,7 +70,12 @@ Danach wird nach Aufgabenklasse geroutet.
    - tmux ist Standard fuer vorhandene Sessions, Capture und Resume-Kontexte.
    - agy ist fuer Session/Resume nur dann besser, wenn der Ruecknahmebeleg klarer ist.
 
-8. **Goose / Qwen / Aider**
+8. **Patch file relay**
+   - Lokale Patchdateien werden mit `tools/operator_patch_relay.py` geprueft und bei expliziter Entscheidung angewendet.
+   - Der Relay schreibt ein JSON-Receipt; manueller Patchdownload durch den Nutzer ist nur der letzte Notausgang.
+   - Der Relay merged, pusht und deployt nicht.
+
+9. **Goose / Qwen / Aider**
    - Goose und Qwen sind optionale lokale Agent-Alternativen, nicht der Standardpfad.
    - Aider bleibt ein bounded Patch-Fallback mit deaktiviertem Auto-Commit.
 
@@ -81,6 +86,7 @@ Danach wird nach Aufgabenklasse geroutet.
 | Status/Health blockiert | engeres Typed Tool oder Micro-Task | geringes Risiko, sofort pruefbar | Status JSON oder Logtail |
 | kurzer Shell-Griff blockiert | Grabowski Micro-Task | bleibt unter Grabowski-Audit | task_id, status, logs |
 | komplexer Code-/Repo-Slice | Codex exec/review | Standard fuer anspruchsvolle Repo-Arbeit | diff, changed files, Tests |
+| lokaler Patch aus Chat/Artefakt | operator_patch_relay.py | prueft und wendet lokal mit Head- und Dirty-Gates an | JSON-Receipt plus Git-Diff |
 | Review-/Architekturunsicherheit | Claude Review | bessere Kontrastpruefung | Review mit konkreten Befunden |
 | interaktive Sessionfrage | tmux capture, agy bei besserem Resume | Resume-naehe | Capture-Auszug, naechste Eingabe |
 | lokale Mikro-Reasoning-Frage | Ollama API mit qwen coder | lokal, billig und begrenzt | kurze Antwort oder Vorschlagsliste |
@@ -188,7 +194,7 @@ Ollama ist Standard fuer lokale Mikro-Reasoning-Aufgaben ueber die HTTP API, bev
 
 ### Aider
 
-Aider bleibt ein Kandidat fuer Patch-Slices. Aider wird gegen Codex anhand von Diff-Qualitaet, Scope-Treue und Testbelegen verglichen, nicht anhand von Versprechen.
+Lokale Patchdateien sollen zuerst ueber `tools/operator_patch_relay.py` laufen. Aider bleibt ein Kandidat fuer Patch-Slices. Aider wird gegen Codex anhand von Diff-Qualitaet, Scope-Treue und Testbelegen verglichen, nicht anhand von Versprechen.
 
 ## Risikoklassen
 

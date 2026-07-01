@@ -70,9 +70,15 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('"codex_exec_or_codex_review"', source)
         self.assertIn('"agy_print"', source)
         self.assertIn('"ollama_api_qwen_coder"', source)
+        self.assertIn('"operator_patch_relay"', source)
         self.assertIn('"automatic_merge"', source)
         self.assertIn('"automatic_push"', source)
         self.assertIn('"automatic_deploy"', source)
+
+    def test_operator_patch_relay_is_syntax_checked(self) -> None:
+        self.assertTrue((ROOT / "tools" / "operator_patch_relay.py").is_file())
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("tools/operator_patch_relay.py", makefile)
 
     def test_status_exposes_deployment_provenance(self) -> None:
         source = (

@@ -95,6 +95,10 @@ class OperatorContextTests(unittest.TestCase):
             "blocked_action_protocol",
             context["sources"],
         )
+        self.assertEqual(
+            protocol["routing_roles"]["patch_file_relay"],
+            "operator_patch_relay",
+        )
         self.assertIn(
             "automatic_merge",
             protocol["does_not_establish"],

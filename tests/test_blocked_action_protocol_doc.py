@@ -40,6 +40,8 @@ class BlockedActionProtocolDocTests(unittest.TestCase):
             "Ollama API mit qwen coder",
             "tmux ist Standard",
             "bounded Patch-Fallback",
+            "operator_patch_relay.py",
+            "manueller Patchdownload durch den Nutzer ist nur der letzte Notausgang",
         ):
             self.assertIn(phrase, self.text)
         for stale_phrase in (

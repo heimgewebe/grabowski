@@ -32,6 +32,7 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_workers.py
 >$(PYTHON) -m py_compile src/grabowski_worker_process.py
 >$(PYTHON) -m py_compile tools/build_operator_context.py
+>$(PYTHON) -m py_compile tools/operator_patch_relay.py
 >$(PYTHON) -m py_compile tools/build_publication_profiles.py
 >$(PYTHON) -m py_compile tools/run_scheduled_deploy.py
 >$(PYTHON) -m py_compile tools/deploy_runtime.py
