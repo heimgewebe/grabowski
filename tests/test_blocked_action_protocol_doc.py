@@ -21,16 +21,34 @@ class BlockedActionProtocolDocTests(unittest.TestCase):
         ):
             self.assertIn(phrase, self.text)
 
-    def test_fallback_order_keeps_grabowski_close_to_operation(self) -> None:
+    def test_control_loop_keeps_grabowski_close_to_operation(self) -> None:
         self.assertLess(
             self.text.index("**Typed Grabowski Tool**"),
             self.text.index("**Grabowski Micro-Task**"),
         )
         self.assertLess(
             self.text.index("**Grabowski Micro-Task**"),
-            self.text.index("**Codex Once**"),
+            self.text.index("**Receipt before next step**"),
         )
         self.assertIn("Danach sind `task_status` und `task_logs` Pflicht.", self.text)
+        self.assertIn("Danach wird nach Aufgabenklasse geroutet.", self.text)
+
+    def test_routing_roles_match_live_operator_protocol(self) -> None:
+        for phrase in (
+            "Codex exec/review",
+            "agy --print",
+            "Ollama API mit qwen coder",
+            "tmux ist Standard",
+            "bounded Patch-Fallback",
+        ):
+            self.assertIn(phrase, self.text)
+        for stale_phrase in (
+            "Codex Once",
+            "Beste Wahl fuer kleine Repo-Code-Slices",
+            "agy / tmux Session",
+            "Lokale KI / Goose / Ollama / Aider",
+        ):
+            self.assertNotIn(stale_phrase, self.text)
 
     def test_resume_requires_evidence_before_next_step(self) -> None:
         for phrase in (

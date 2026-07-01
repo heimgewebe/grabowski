@@ -35,7 +35,7 @@ Die kleinste Handlung muss beantworten:
 4. Woran erkennt ChatGPT danach Erfolg, Fehler oder Blockade?
 5. Welche Information braucht ChatGPT, um den naechsten Griff selbst zu entscheiden?
 
-## Fallback-Leiter
+## Kontrollschleife und Routing
 
 1. **Typed Grabowski Tool**
    - Erste Wahl fuer Status, Git-Status, Service-Status, Logs, Runtime-Health, Audit und andere schmale Operationen.
@@ -46,22 +46,33 @@ Die kleinste Handlung muss beantworten:
    - Muss begrenzt sein durch `cwd`, `runtime_seconds`, Memorylimit und optional gueltige `resource_keys`.
    - Danach sind `task_status` und `task_logs` Pflicht.
 
-3. **Codex Once**
-   - Beste Wahl fuer kleine Repo-Code-Slices.
+3. **Receipt before next step**
+   - Nach jedem Ersatzgriff wird zuerst Status, Logs, Diff, Testausgabe oder ein anderes Receipt gelesen.
+   - Erst danach entscheidet ChatGPT den naechsten Griff.
+
+Danach wird nach Aufgabenklasse geroutet.
+
+4. **Codex exec/review**
+   - Standard fuer komplexe Code- und Repo-Slices.
    - Auftrag endet nach Diff, Test oder Stop-Bericht.
    - Default: kein Commit, kein Push, kein Merge.
 
-4. **Claude Review**
+5. **agy print / Ollama API**
+   - `agy --print` ist Standard fuer schnelle leichte Denk-, Sortier- und Klassifikationsgriffe.
+   - Ollama API mit qwen coder ist Standard fuer lokale Mikro-Reasoning- und Shell-Vorschlagsgriffe ohne Cloud.
+   - Beide erzeugen kurze Receipts; sie treffen keine Merge-, Push- oder Deploy-Entscheidungen.
+
+6. **Claude Review**
    - Beste Wahl fuer Architektur-, Sicherheits- oder Review-Fragen.
    - Default: lesen, bewerten, Risiken benennen; keine Mutation.
 
-5. **agy / tmux Session**
-   - Geeignet fuer interaktive Arbeitsraeume und Resume-Kontexte.
-   - Nicht Standard fuer Maschinenreceipts, solange keine klare Resultatdatei oder Loggrenze existiert.
+7. **tmux / agy Session**
+   - tmux ist Standard fuer vorhandene Sessions, Capture und Resume-Kontexte.
+   - agy ist fuer Session/Resume nur dann besser, wenn der Ruecknahmebeleg klarer ist.
 
-6. **Lokale KI / Goose / Ollama / Aider**
-   - Nur fuer niedrigriskante Recherche, einfache Patches oder Vergleichstests.
-   - Nicht primaerer Executor ohne vorherigen Beleg besserer Rueckaufnahmequalitaet.
+8. **Goose / Qwen / Aider**
+   - Goose und Qwen sind optionale lokale Agent-Alternativen, nicht der Standardpfad.
+   - Aider bleibt ein bounded Patch-Fallback mit deaktiviertem Auto-Commit.
 
 ## Executor-Matrix
 
@@ -69,10 +80,10 @@ Die kleinste Handlung muss beantworten:
 | --- | --- | --- | --- |
 | Status/Health blockiert | engeres Typed Tool oder Micro-Task | geringes Risiko, sofort pruefbar | Status JSON oder Logtail |
 | kurzer Shell-Griff blockiert | Grabowski Micro-Task | bleibt unter Grabowski-Audit | task_id, status, logs |
-| Dateipatch blockiert | Codex Once | spezialisiert auf Repo-Diffs | diff, changed files, Tests |
-| Architekturunsicherheit | Claude Review | bessere Kontrastpruefung | Review mit konkreten Befunden |
-| interaktive Sessionfrage | agy oder tmux capture | Resume-naehe | Capture-Auszug, naechste Eingabe |
-| einfache lokale Suche | lokale KI oder Micro-Task | billig und begrenzt | Trefferliste mit Pfaden |
+| komplexer Code-/Repo-Slice | Codex exec/review | Standard fuer anspruchsvolle Repo-Arbeit | diff, changed files, Tests |
+| Review-/Architekturunsicherheit | Claude Review | bessere Kontrastpruefung | Review mit konkreten Befunden |
+| interaktive Sessionfrage | tmux capture, agy bei besserem Resume | Resume-naehe | Capture-Auszug, naechste Eingabe |
+| lokale Mikro-Reasoning-Frage | Ollama API mit qwen coder | lokal, billig und begrenzt | kurze Antwort oder Vorschlagsliste |
 
 ## Micro-Handoff Contract
 
@@ -161,7 +172,7 @@ Freie Fantasietypen sind ungueltig. Ein fehlgeschlagener Resource-Key ist kein P
 
 ### Codex
 
-Codex ist der primaere Helfer fuer Code-Slices. Der richtige Modus ist `once`: begrenzte Dateien, kein Commit, kein Push, Stop nach Diff oder Test.
+Codex ist der primaere Helfer fuer komplexe Code- und Repo-Slices. Der richtige Modus ist `exec` oder `review`: begrenzter Scope, kein Commit, kein Push, Stop nach Diff oder Test.
 
 ### Claude
 
@@ -169,11 +180,11 @@ Claude ist Review- und Architekturhelfer. Claude soll schwierige Invarianten, Si
 
 ### agy
 
-agy ist interessant fuer interaktive Arbeitsraeume und Resume, aber nur dann besser als Grabowski Micro-Tasks, wenn der Ruecknahmebeleg klarer ist.
+agy ist Standard fuer schnelle leichte One-Shots per `agy --print`. Fuer interaktive Arbeitsraeume und Resume ist agy nur dann besser als tmux, wenn der Ruecknahmebeleg klarer ist.
 
 ### Lokale KI / Goose / Ollama
 
-Lokale KI ist optional fuer niedrigriskante Such- und Vergleichsaufgaben. Sie darf nicht zum heimlichen Daueroperator werden.
+Ollama ist Standard fuer lokale Mikro-Reasoning-Aufgaben ueber die HTTP API, bevorzugt mit qwen coder. Lokale KI darf nicht zum heimlichen Daueroperator werden.
 
 ### Aider
 

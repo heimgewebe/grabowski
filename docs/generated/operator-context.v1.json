@@ -1338,7 +1338,7 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "d8424942f15277f410a349b11c783f04ff83908f4ab4afed2b8a0c4c920c0e5c"
+      "sha256": "d58313c3b9fdc835e2380a826fd9dae605abd57b4e1fa50be71e5990aadf0361"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
