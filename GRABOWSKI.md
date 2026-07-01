@@ -79,3 +79,12 @@ For a self-update that restarts operator and tunnel, prefer `grabowski_runtime_d
 - duplicate tools are present.
 
 The live context tools compute runtime and checkout state on every call. Static prose is therefore not trusted as a substitute for current evidence.
+
+
+## PR review gate
+
+Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Run `python3 tools/pr_review_gate.py --pr <number> --self-review <path> --json` and treat a BLOCK verdict as merge-blocking.
+
+The gate requires Codex review evidence or an explicit unavailable reason, a head-SHA-bound Grabowski self-review, iterative review evidence, terminal triage for every finding at every severity, and green checks. Complex or risk-sensitive changes require Claude review evidence.
+
+Allowed terminal finding states are `fixed`, `accepted`, `false_positive`, `deferred_with_reason`, and `not_applicable`; accepted or deferred findings require reasons. Blocking findings cannot be merely accepted or deferred. Severity values `p0`, `p1`, `high`, and `critical` are treated as blocking for this purpose. Pending, cancelled, or missing checks block the gate.
