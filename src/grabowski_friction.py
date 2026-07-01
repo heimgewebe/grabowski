@@ -201,7 +201,7 @@ def grabowski_friction_record(
     notes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Record one bounded operator-friction event for later analysis."""
-    operator._require_operator_mutation("friction_record")
+    base._require_mutations_enabled("friction_record")
     return record_friction_event(
         kind=kind,
         surface=surface,

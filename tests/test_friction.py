@@ -25,6 +25,8 @@ class FrictionLedgerContractTests(unittest.TestCase):
         self.assertIn('MAX_TEXT_BYTES = 2000', source)
         self.assertIn('MAX_NOTE_COUNT = 20', source)
         self.assertIn('operator._redact(text)', source)
+        self.assertIn('base._require_mutations_enabled("friction_record")', source)
+        self.assertNotIn('operator._require_operator_mutation("friction_record")', source)
 
 
 if __name__ == "__main__":
