@@ -72,6 +72,34 @@ class OperatorContextTests(unittest.TestCase):
         self.assertIn('grabowski_context(profile="concise")', entry)
         self.assertIn("make context-refresh", entry)
         self.assertIn("make validate", entry)
+        self.assertIn("docs/blocked-action-protocol-v0.md", entry)
+        self.assertIn("Operator Relay v0", entry)
+
+    def test_operator_relay_protocol_is_in_generated_context(self) -> None:
+        context = json.loads(CONTEXT.read_text(encoding="utf-8"))
+        protocol = context["operating_protocol"]
+        self.assertEqual(protocol["name"], "Operator Relay v0")
+        self.assertEqual(
+            protocol["doc_path"],
+            "docs/blocked-action-protocol-v0.md",
+        )
+        self.assertEqual(
+            protocol["fallback_order"][:4],
+            [
+                "typed_grabowski_tool",
+                "grabowski_micro_task",
+                "codex_or_aider_once_for_code_patch",
+                "claude_review",
+            ],
+        )
+        self.assertIn(
+            "blocked_action_protocol",
+            context["sources"],
+        )
+        self.assertIn(
+            "automatic_merge",
+            protocol["does_not_establish"],
+        )
 
     def test_branch_control_is_typed_and_guarded(self) -> None:
         source = (

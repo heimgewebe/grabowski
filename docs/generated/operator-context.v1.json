@@ -1106,6 +1106,28 @@
     "undeclared_tools": []
   },
   "kind": "repository-operator-context",
+  "operating_protocol": {
+    "doc_path": "docs/blocked-action-protocol-v0.md",
+    "does_not_establish": [
+      "new_privileges",
+      "automatic_merge",
+      "automatic_push",
+      "automatic_deploy",
+      "free_shell_as_default_path",
+      "durable_agent_autonomy"
+    ],
+    "fallback_order": [
+      "typed_grabowski_tool",
+      "grabowski_micro_task",
+      "codex_or_aider_once_for_code_patch",
+      "claude_review",
+      "agy_or_tmux_session_resume",
+      "bureau_memory_prioritization",
+      "grabowski_git_audit"
+    ],
+    "name": "Operator Relay v0",
+    "rule": "Use a typed Grabowski tool first. If blocked, run one bounded Grabowski Micro-Task and read task_status/task_logs or another receipt before deciding the next step."
+  },
   "policy_contract": {
     "access_profiles": [
       "break-glass",
@@ -1307,6 +1329,10 @@
   },
   "schema_version": 1,
   "sources": {
+    "blocked_action_protocol": {
+      "path": "docs/blocked-action-protocol-v0.md",
+      "sha256": "d8424942f15277f410a349b11c783f04ff83908f4ab4afed2b8a0c4c920c0e5c"
+    },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
       "sha256": "bfd79437095dfb3cb1551d2c3b3bf58f6b4f2e85ebd40515e16c51fb96523557"

@@ -35,6 +35,7 @@ The live tools are authoritative for the running deployment, active policy, avai
 - `docs/control-plane.md`
 - `docs/checkout-lifecycle.md`
 - `docs/typed-read-surface.md`
+- `docs/blocked-action-protocol-v0.md`
 - `docs/privileged-broker-bootstrap.md`
 
 ## Truth hierarchy
@@ -52,6 +53,8 @@ A mismatch must remain visible. Do not silently treat an older checkout or conne
 ## Operating rule
 
 Use the narrowest typed read operation that can establish current state. Before a mutation establish the target, intended result, validation, stop condition and rollback path. Prefer typed operations over generic shell, Git, GitHub or service commands when a typed operation exists.
+
+Operator Relay v0 is the fallback rule for blocked ChatGPT/Grabowski actions: try a typed Grabowski tool first; if that is blocked, use one bounded Grabowski Micro-Task; then read status, logs, diff or another receipt before deciding the next step. Code patches go to Codex or Aider only as bounded one-shot work without commit or push; Claude is for review; agy/tmux is for session and resume. Details: `docs/blocked-action-protocol-v0.md`.
 
 Generic operator tools remain available as fallback mechanisms; they are not the default diagnostic route. A failed read is classified and reviewed rather than automatically repeated through a broader tool.
 
