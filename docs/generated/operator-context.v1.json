@@ -1128,6 +1128,7 @@
       "local_micro_reasoning": "ollama_api_qwen_coder",
       "memory_prioritization": "bureau",
       "patch_fallback": "aider_no_auto_commit",
+      "patch_file_relay": "operator_patch_relay",
       "quick_light_reasoning": "agy_print",
       "security_or_architecture_review": "claude",
       "session_resume": "tmux_first_agy_when_useful",
@@ -1338,7 +1339,7 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "d58313c3b9fdc835e2380a826fd9dae605abd57b4e1fa50be71e5990aadf0361"
+      "sha256": "eea709104129d8ab92349290c8e515a21b16f976cef2333d99c7abf857709cc7"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
@@ -1358,7 +1359,7 @@
       "src/grabowski_checkouts.py": "628c51240e773330e5958dd83ff4b30b651ed411d10fbf0b24764c07fe107342",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
       "src/grabowski_friction.py": "d67b979ee30bbd1e812857acfddb34e1daca0b60c6ef99226db2bcd2b38ed20a",
-      "src/grabowski_mcp.py": "64f6e13adf8e9a0777a17f68d03a833656f5601bd2938b380d942632d25d53eb",
+      "src/grabowski_mcp.py": "023d1d167b2e28f863256a527c5a967cb70c691d6cf131552c1367fe102fa8c6",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "a2ded1c251b2b478a70dc4186ef004b009d1d34c1b931b1c1d8f9ac2ff3911fd",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",

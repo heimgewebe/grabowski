@@ -37,3 +37,22 @@ Example:
 ## Review loop
 
 Periodically run `grabowski_friction_summary`. Recurring `platform_filter` entries should become typed tools or smaller workflows. Recurring `connector_snapshot` entries require a connector refresh gate. Recurring `fail_closed_gate` entries usually mean the gate is doing its job; improve the runbook, not the permission surface.
+
+## Task failure classification loop
+
+`docs/operator-optimization-plan.md` makes failure signal quality the first optimization slice. Failed persistent tasks are not automatically friction events: a failed task can be an expected red-phase test, a superseded repair attempt, a command-shape error, an environment/tooling problem or a live actionable failure.
+
+A periodic review should classify failed task records without resuming them. Minimum fields:
+
+```json
+{
+  "task_id": "task id",
+  "repo": "repo or cwd",
+  "failure_class": "expected_red_phase|superseded|contract_error|environment_tooling|platform_filter|policy_gate|actionable|unknown",
+  "still_relevant": true,
+  "superseded_by_green_run": false,
+  "next_action": "inspect|ignore_with_reason|create_followup|tighten_tool|stop"
+}
+```
+
+Classification is a read-only signal operation. It does not authorize resume, cleanup, commit, push, merge, deploy or policy elevation.

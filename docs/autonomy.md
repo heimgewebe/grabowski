@@ -5,6 +5,20 @@
 Der Operator-Einstiegspunkt erweitert Grabowski vom Dateiwerkzeug zum lokalen
 Operator für Repo-, CI-, Terminal- und Betriebsarbeit.
 
+## Optimierungsgrenze
+
+Autonomie ist kein Selbstzweck. Die kanonische Optimierungsrichtung steht in
+`docs/operator-optimization-plan.md`: Grabowski soll mehr Aufgaben tragen, aber
+nur wenn die einzelnen Griffe kleiner, typisierter, receipt-gebunden und
+rücknehmbar werden.
+
+`trusted-owner` bleibt ein supervisiertes Vollprofil. Es ist nicht die Zielnorm
+für unbeaufsichtigte oder resident laufende Autonomie. Neue Dauer- oder
+Agentenpfade müssen einer Autonomieklasse zugeordnet werden, zum Beispiel
+`repo_operator`, `infra_operator`, `creative_autonomy`, `secret_sensitive` oder
+`fleet_sensitive`. Eine Klasse darf nicht still in eine riskantere Klasse
+wechseln.
+
 ## Terminalmodell
 
 `grabowski_terminal_run` erzeugt einen neuen nicht-interaktiven Prozess. Das

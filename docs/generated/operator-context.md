@@ -12,6 +12,7 @@ This document describes the repository contract. Current runtime state must be r
 - Complex code task: Codex exec/review by default, bounded and stopped at diff or test evidence.
 - Quick light reasoning: agy `--print`.
 - Local micro reasoning: Ollama API with qwen coder.
+- Patch file relay: local patch files use `tools/operator_patch_relay.py` for check/apply receipts before user manual execution.
 - Review: Claude for architecture and safety review.
 - Session: tmux first; agy only when available and better for resume.
 

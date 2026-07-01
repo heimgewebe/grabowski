@@ -2486,6 +2486,7 @@ def _operator_relay_protocol() -> dict[str, Any]:
             "security_or_architecture_review": "claude",
             "session_resume": "tmux_first_agy_when_useful",
             "memory_prioritization": "bureau",
+            "patch_file_relay": "operator_patch_relay",
             "patch_fallback": "aider_no_auto_commit",
             "audit": "grabowski_git",
         },
