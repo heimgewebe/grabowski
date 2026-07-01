@@ -10,7 +10,7 @@ These: Grabowski is operationally useful because it gives ChatGPT a local, audit
 
 Antithese: The same control surface is dangerous when operational convenience is confused with durable autonomy. The live `trusted-owner` profile intentionally has broad host reach; that is acceptable for supervised operator work, but not as the default for self-directed long-running autonomy.
 
-Synthese: Optimize Grabowski by shrinking unsupervised blast radius while increasing evidence density. The next phase is not more power first; it is narrower defaults, cleaner receipts, classified failures and explicit elevation paths.
+Synthese: Optimize Grabowski by preserving full supervised capability while routing lower-risk work through safer defaults and explicit elevation. The next phase is not less function; it is clearer mode selection, cleaner receipts, classified failures and reversible elevation paths.
 
 ## Audit basis
 
@@ -84,18 +84,20 @@ Includes:
 
 Primary risk: losing useful unfinished work.
 
-### Class C: Capability narrowing
+### Class C: Capability routing without functionality loss
 
-Purpose: make `observe` the normal automation profile and keep `trusted-owner` as supervised elevation.
+Purpose: keep full supervised functionality available while preventing low-risk, resident or self-directed work from silently inheriting `trusted-owner` authority. `observe` is a candidate default for read-only automation, not a blanket replacement for the operator's full working mode.
 
 Includes:
 
-- narrower default profile proposal,
-- explicit elevation and rollback notes,
-- tool-level split where one broad capability currently unlocks both read and write behavior,
-- regression tests that generic tools cannot cross typed secret/browser roots.
+- define which workflows require `trusted-owner` to remain functional,
+- define which workflows can run under `observe` or another lower-risk profile without loss,
+- require explicit elevation and rollback notes for mutating, fleet, secret or service-control work,
+- split coarse capabilities where one broad capability currently unlocks both read and write behavior,
+- regression tests that generic tools cannot cross typed secret/browser roots,
+- a parity gate: no live default change unless routine operator workflows still work or have an explicit, fast elevation path.
 
-Primary risk: breaking legitimate operator workflows through over-tightening.
+Primary risk: over-tightening that damages useful functionality; the counter-risk is leaving broad authority attached to autonomous or low-risk work.
 
 ### Class D: Fleet containment
 
@@ -196,19 +198,22 @@ Exit criteria:
 - operator can answer which Grabowski worktrees are live, retained, archived or cleanup candidates,
 - every cleanup apply has a prior dry-run plan hash.
 
-### GOPT-003: Narrow-default operating profile
+### GOPT-003: Function-preserving capability routing
 
 Deliverables:
 
-- propose a live migration from `trusted-owner` default to `observe` or a similarly narrow profile,
-- define explicit elevation to `maintain`, `mutate` and `break-glass`,
+- audit which workflows genuinely require `trusted-owner` and which do not,
+- propose a routing model where read-only/resident/self-directed work starts in the least-authority profile that preserves function,
+- keep `trusted-owner` available for supervised full-power operation and make elevation explicit rather than hidden,
+- define explicit elevation to `maintain`, `mutate`, `trusted-owner` and `break-glass`,
 - split coarse capabilities where read and write behavior are currently tied,
 - keep rollback instructions before any deployment.
 
 Exit criteria:
 
-- normal read-only audit tasks work without `trusted-owner`,
-- mutating repo work requires an explicit profile/elevation decision,
+- routine read-only audit tasks work without `trusted-owner`,
+- routine supervised operator work is not blocked; if a lower profile blocks it, there is an explicit fast elevation path,
+- mutating repo, fleet, secret and service-control work requires a visible profile/elevation decision,
 - the previous trusted-owner policy can be restored with evidence.
 
 ### GOPT-004: Fleet allowlist hardening
@@ -297,7 +302,7 @@ Exit criteria:
 2. GOPT-002 Checkout hygiene dry-run.
 3. GOPT-005 Agent receipt standard.
 4. GOPT-006 Redaction tuning.
-5. GOPT-003 Narrow-default profile.
+5. GOPT-003 Function-preserving capability routing.
 6. GOPT-004 Fleet allowlist hardening.
 7. GOPT-007 Runtime lifecycle map.
 8. GOPT-008 Autonomy class registry.
@@ -321,7 +326,7 @@ Every slice should state:
 
 Grabowski is optimized when:
 
-- routine audits no longer require `trusted-owner`,
+- routine audits no longer require `trusted-owner`, while supervised full-function work retains an explicit elevation path,
 - remote fleet effects are host-role-specific,
 - failed tasks are classified instead of merely accumulated,
 - worktree state is legible,
