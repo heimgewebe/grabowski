@@ -42,6 +42,9 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_rollback_text` | audit | no | medium | Restore a quarantined preimage from an audited replace transaction. |
 | `grabowski_verify_audit` | audit | yes | low | Verify the tamper-evident write audit hash chain. |
 | `latest_complete_bundles` | knowledge | yes | low | Read the curated latest-complete Lens and repoLens bundle registry. |
+| `rlens_bundle_discover` | knowledge | yes | low | Discover current rLens/repoLens bundles from the immutable local merges area. |
+| `rlens_bundle_status` | knowledge | yes | low | Read bounded manifest, health and sidecar status for one rLens bundle. |
+| `rlens_freshness_check` | knowledge | yes | low | Compare one rLens bundle commit with the current local repository HEAD. |
 | `grabowski_runtime_health` | context | yes | low | Read minimal deployment, audit and kill-switch health without path inventories. |
 | `grabowski_deployment_identity` | context | yes | low | Read bounded runtime identity and integrity flags without local paths. |
 | `grabowski_contract_drift` | context | yes | low | Read bounded runtime-contract and capability-catalog drift. |
