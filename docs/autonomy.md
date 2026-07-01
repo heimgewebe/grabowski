@@ -12,10 +12,13 @@ Autonomie ist kein Selbstzweck. Die kanonische Optimierungsrichtung steht in
 nur wenn die einzelnen Griffe kleiner, typisierter, receipt-gebunden und
 rücknehmbar werden.
 
-`trusted-owner` bleibt ein supervisiertes Vollprofil. Es ist nicht die Zielnorm
-für unbeaufsichtigte oder resident laufende Autonomie. Neue Dauer- oder
-Agentenpfade müssen einer Autonomieklasse zugeordnet werden, zum Beispiel
-`repo_operator`, `infra_operator`, `creative_autonomy`, `secret_sensitive` oder
+`trusted-owner` bleibt ein supervisiertes Vollprofil und darf nicht durch
+einen engeren Modus ersetzt werden, wenn dadurch legitime Operator-Arbeit
+funktional beschädigt wird. Der engere Modus ist ein Routingziel für
+unbeaufsichtigte, resident laufende oder eindeutig read-only Arbeit, nicht
+ein Dogma gegen Funktionalität. Neue Dauer- oder Agentenpfade müssen einer
+Autonomieklasse zugeordnet werden, zum Beispiel `repo_operator`,
+`infra_operator`, `creative_autonomy`, `secret_sensitive` oder
 `fleet_sensitive`. Eine Klasse darf nicht still in eine riskantere Klasse
 wechseln.
 

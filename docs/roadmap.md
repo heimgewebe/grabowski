@@ -7,7 +7,7 @@ Status: registered plan; implementation slices must remain operator-reviewed and
 - canonical plan: `docs/operator-optimization-plan.md`,
 - first priority: failed-task and friction signal classification,
 - second priority: checkout/worktree hygiene through inventory, retention and archive-first cleanup,
-- third priority: agent receipts, redaction tuning, narrow-default profile and fleet allowlist hardening,
+- third priority: agent receipts, redaction tuning, function-preserving capability routing and fleet allowlist hardening,
 - this roadmap entry authorizes no live policy change, cleanup, merge, push or deploy by itself.
 
 ## GRABOWSKI-POWER-001

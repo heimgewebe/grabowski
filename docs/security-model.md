@@ -95,9 +95,10 @@ be a separate deployment decision with rollback evidence.
 
 ## Optimization target
 
-`docs/operator-optimization-plan.md` narrows the next security objective:
-`trusted-owner` should remain a supervised elevation profile, not the quiet
-normal form for resident or self-directed autonomy.
+`docs/operator-optimization-plan.md` narrows the next security objective without
+turning restriction into a goal. `trusted-owner` should remain available for
+supervised full-function operation; lower-authority profiles are routing targets
+for read-only, resident or self-directed work when they preserve function.
 
 The security optimization order is deliberately signal-first:
 
@@ -105,12 +106,12 @@ The security optimization order is deliberately signal-first:
 2. make checkout/worktree state legible before cleanup,
 3. standardize agent receipts before increasing delegation,
 4. fix benign redaction false positives without weakening secret redaction,
-5. only then propose a live profile migration from `trusted-owner` toward a
-   narrower default.
+5. only then propose function-preserving capability routing with an explicit
+   elevation path where lower authority would block legitimate work.
 
-A narrow profile rollout must be reversible. A roadmap entry or optimization
-plan does not authorize a live policy change, fleet mutation, secret operation,
-cleanup apply, merge, push or deploy.
+A routing rollout must be reversible. A roadmap entry or optimization plan does
+not authorize a live policy change, fleet mutation, secret operation, cleanup
+apply, merge, push or deploy.
 
 ## Trusted Owner
 
