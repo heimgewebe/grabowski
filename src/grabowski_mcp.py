@@ -2472,16 +2472,23 @@ def _operator_relay_protocol() -> dict[str, Any]:
     return {
         "name": "Operator Relay v0",
         "doc_path": "docs/blocked-action-protocol-v0.md",
-        "rule": "Typed Grabowski first; if blocked, one bounded Micro-Task; then read receipt before next step.",
-        "fallback_order": [
+        "rule": "ChatGPT stays operator. Run the Grabowski control loop first, then route helper work by task class.",
+        "control_loop": [
             "typed_grabowski_tool",
             "grabowski_micro_task",
-            "codex_or_aider_once_for_code_patch",
-            "claude_review",
-            "agy_or_tmux_session_resume",
-            "bureau_memory_prioritization",
-            "grabowski_git_audit",
+            "receipt_before_next_step",
         ],
+        "routing_roles": {
+            "complex_code_task": "codex_exec_or_codex_review",
+            "quick_light_reasoning": "agy_print",
+            "local_micro_reasoning": "ollama_api_qwen_coder",
+            "shell_or_git_grip": "grabowski_task",
+            "security_or_architecture_review": "claude",
+            "session_resume": "tmux_first_agy_when_useful",
+            "memory_prioritization": "bureau",
+            "patch_fallback": "aider_no_auto_commit",
+            "audit": "grabowski_git",
+        },
         "does_not_establish": [
             "new_privileges",
             "automatic_merge",

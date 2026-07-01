@@ -203,19 +203,25 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
             "name": "Operator Relay v0",
             "doc_path": "docs/blocked-action-protocol-v0.md",
             "rule": (
-                "Use a typed Grabowski tool first. If blocked, run one bounded "
-                "Grabowski Micro-Task and read task_status/task_logs or another "
-                "receipt before deciding the next step."
+                "Keep ChatGPT as operator. Run the Grabowski control loop first, "
+                "then route bounded helper work by task class."
             ),
-            "fallback_order": [
+            "control_loop": [
                 "typed_grabowski_tool",
                 "grabowski_micro_task",
-                "codex_or_aider_once_for_code_patch",
-                "claude_review",
-                "agy_or_tmux_session_resume",
-                "bureau_memory_prioritization",
-                "grabowski_git_audit",
+                "receipt_before_next_step",
             ],
+            "routing_roles": {
+                "complex_code_task": "codex_exec_or_codex_review",
+                "quick_light_reasoning": "agy_print",
+                "local_micro_reasoning": "ollama_api_qwen_coder",
+                "shell_or_git_grip": "grabowski_task",
+                "security_or_architecture_review": "claude",
+                "session_resume": "tmux_first_agy_when_useful",
+                "memory_prioritization": "bureau",
+                "patch_fallback": "aider_no_auto_commit",
+                "audit": "grabowski_git",
+            },
             "does_not_establish": [
                 "new_privileges",
                 "automatic_merge",
@@ -259,10 +265,12 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
         "",
         "- Name: `Operator Relay v0`",
         "- Source: `docs/blocked-action-protocol-v0.md`",
-        "- Rule: typed Grabowski tool first; if blocked, one bounded Grabowski Micro-Task; then read status, logs, diff or another receipt before deciding the next step.",
-        "- Code fallback: Codex or Aider one-shot, no commit, no push, stop after diff or tests.",
-        "- Review fallback: Claude for architecture and safety review.",
-        "- Session fallback: agy/tmux for session and resume context.",
+        "- Control loop: typed Grabowski tool first; if blocked, one bounded Grabowski Micro-Task; then read a receipt before deciding the next step.",
+        "- Complex code task: Codex exec/review by default, bounded and stopped at diff or test evidence.",
+        "- Quick light reasoning: agy `--print`.",
+        "- Local micro reasoning: Ollama API with qwen coder.",
+        "- Review: Claude for architecture and safety review.",
+        "- Session: tmux first; agy only when available and better for resume.",
         "",
         "## Contract integrity",
         "",
