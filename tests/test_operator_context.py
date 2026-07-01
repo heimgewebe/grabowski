@@ -84,12 +84,11 @@ class OperatorContextTests(unittest.TestCase):
             "docs/blocked-action-protocol-v0.md",
         )
         self.assertEqual(
-            protocol["fallback_order"][:4],
+            protocol["control_loop"],
             [
                 "typed_grabowski_tool",
                 "grabowski_micro_task",
-                "codex_or_aider_once_for_code_patch",
-                "claude_review",
+                "receipt_before_next_step",
             ],
         )
         self.assertIn(

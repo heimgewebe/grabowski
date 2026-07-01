@@ -8,10 +8,12 @@ This document describes the repository contract. Current runtime state must be r
 
 - Name: `Operator Relay v0`
 - Source: `docs/blocked-action-protocol-v0.md`
-- Rule: typed Grabowski tool first; if blocked, one bounded Grabowski Micro-Task; then read status, logs, diff or another receipt before deciding the next step.
-- Code fallback: Codex or Aider one-shot, no commit, no push, stop after diff or tests.
-- Review fallback: Claude for architecture and safety review.
-- Session fallback: agy/tmux for session and resume context.
+- Control loop: typed Grabowski tool first; if blocked, one bounded Grabowski Micro-Task; then read a receipt before deciding the next step.
+- Complex code task: Codex exec/review by default, bounded and stopped at diff or test evidence.
+- Quick light reasoning: agy `--print`.
+- Local micro reasoning: Ollama API with qwen coder.
+- Review: Claude for architecture and safety review.
+- Session: tmux first; agy only when available and better for resume.
 
 ## Contract integrity
 
