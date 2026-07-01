@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "bfd79437095dfb3cb1551d2c3b3bf58f6b4f2e85ebd40515e16c51fb96523557",
+  "capability_source_sha256": "f8643d440e66ca5f2ce9567f22da647abd4e3d900016c63d5a9f6cfde3e47bde",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "09f95be76d910de4a134550d50b72c4636632cdb0c83929508a6db79bafba35b",
+  "contract_sha256": "fc5541415367f48933c1739c0b30028ae9c069630e51bd6850634f6755e13e6e",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -237,6 +237,39 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "latest_complete_bundles"
+    },
+    {
+      "category": "knowledge",
+      "description": "Discover current rLens/repoLens bundles from the immutable local merges area.",
+      "effects": [],
+      "id": "rlens_bundle_discover",
+      "purpose": "Discover current rLens/repoLens bundles from the immutable local merges area.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_bundle_discover"
+    },
+    {
+      "category": "knowledge",
+      "description": "Return bounded manifest, health and sidecar status for one rLens bundle.",
+      "effects": [],
+      "id": "rlens_bundle_status",
+      "purpose": "Read bounded manifest, health and sidecar status for one rLens bundle.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_bundle_status"
+    },
+    {
+      "category": "knowledge",
+      "description": "Compare one rLens bundle commit with the current local repository HEAD.",
+      "effects": [],
+      "id": "rlens_freshness_check",
+      "purpose": "Compare one rLens bundle commit with the current local repository HEAD.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_freshness_check"
     },
     {
       "category": "context",

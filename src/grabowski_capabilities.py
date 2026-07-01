@@ -135,6 +135,27 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "rlens_bundle_discover": {
+        "category": "knowledge",
+        "purpose": "Discover current rLens/repoLens bundles from the immutable local merges area.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "rlens_bundle_status": {
+        "category": "knowledge",
+        "purpose": "Read bounded manifest, health and sidecar status for one rLens bundle.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "rlens_freshness_check": {
+        "category": "knowledge",
+        "purpose": "Compare one rLens bundle commit with the current local repository HEAD.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_terminal_run": {
         "category": "command",
         "purpose": "Run one bounded non-interactive command as the current user.",

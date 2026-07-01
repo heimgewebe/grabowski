@@ -1,20 +1,23 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "09f95be76d910de4a134550d50b72c4636632cdb0c83929508a6db79bafba35b"
+    "sha256": "fc5541415367f48933c1739c0b30028ae9c069630e51bd6850634f6755e13e6e"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "b4934e20b32a25eafff36731cf52b14bdfcc93e900f963fe12c93d65a8e755f1"
+    "sha256": "549eaaf94639f3b0fb8011a3bf67db02c47d9479c95121018d7cd016befb7aad"
   },
   "counts": {
-    "core": 17,
-    "full": 87,
-    "operator": 72
+    "core": 20,
+    "full": 90,
+    "operator": 75
   },
   "profiles": {
     "core": [
       "grabowski_verify_audit",
+      "rlens_bundle_discover",
+      "rlens_bundle_status",
+      "rlens_freshness_check",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -51,6 +54,9 @@
       "grabowski_rollback_text",
       "grabowski_verify_audit",
       "latest_complete_bundles",
+      "rlens_bundle_discover",
+      "rlens_bundle_status",
+      "rlens_freshness_check",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -139,6 +145,9 @@
       "grabowski_destroy_path",
       "grabowski_rollback_text",
       "latest_complete_bundles",
+      "rlens_bundle_discover",
+      "rlens_bundle_status",
+      "rlens_freshness_check",
       "grabowski_runtime_health",
       "grabowski_contract_drift",
       "grabowski_runtime_deploy_schedule",
@@ -222,7 +231,10 @@
         "grabowski_runtime_health",
         "grabowski_service_logs",
         "grabowski_service_status",
-        "grabowski_verify_audit"
+        "grabowski_verify_audit",
+        "rlens_bundle_discover",
+        "rlens_bundle_status",
+        "rlens_freshness_check"
       ],
       "read_only": true,
       "risk_classes": [
@@ -236,7 +248,10 @@
     "operator": {
       "orientation_tools": [
         "grabowski_contract_drift",
-        "grabowski_runtime_health"
+        "grabowski_runtime_health",
+        "rlens_bundle_discover",
+        "rlens_bundle_status",
+        "rlens_freshness_check"
       ],
       "selection": "all tools not in core plus orientation tools"
     }

@@ -32,10 +32,16 @@ CORE_TOOLS = {
     "grabowski_fleet_list",
     "grabowski_privileged_broker_status",
     "grabowski_recovery_status",
+    "rlens_bundle_discover",
+    "rlens_bundle_status",
+    "rlens_freshness_check",
 }
 OPERATOR_ORIENTATION_TOOLS = {
     "grabowski_runtime_health",
     "grabowski_contract_drift",
+    "rlens_bundle_discover",
+    "rlens_bundle_status",
+    "rlens_freshness_check",
 }
 
 

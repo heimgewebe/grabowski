@@ -35,6 +35,7 @@ AUDIT_LOG = STATE_DIR / "write-audit.jsonl"
 QUARANTINE_DIR = STATE_DIR / "quarantine"
 KILL_SWITCH_PATH = STATE_DIR / "operator-kill-switch"
 BUNDLE_REGISTRY = STATE_DIR / "rlens-latest-complete-bundles.tsv"
+MERGES_ROOT = HOME / "repos" / "merges"
 AUDIT_SCHEMA_VERSION = 2
 MAX_AUDIT_BYTES = 16 * 1024 * 1024
 AUDIT_APPEND_LOCK = threading.RLock()
@@ -3613,6 +3614,279 @@ def grabowski_verify_audit() -> dict[str, Any]:
     """Verify the tamper-evident write audit hash chain."""
     _require_capability("audit_verify")
     return _verify_audit_log(AUDIT_LOG)
+
+
+_BUNDLE_MANIFEST_SUFFIX = "_merge.bundle.manifest.json"
+_BUNDLE_HEALTH_SUFFIX = "_merge.bundle_health.post.json"
+_BUNDLE_SURFACE_SUFFIX = "_merge.bundle_surface_validation.json"
+_BUNDLE_OUTPUT_HEALTH_SUFFIX = "_merge.output_health.json"
+_RLENS_STEM_RE = re.compile(r"[A-Za-z0-9_.-]{1,160}\Z")
+_RLENS_REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,120}\Z")
+
+
+def _rlens_json(path: Path, *, max_bytes: int = 2_000_000) -> dict[str, Any]:
+    data = _ensure_regular_text_file(path, max_bytes)
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid rLens JSON artifact: {path.name}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"rLens artifact must be a JSON object: {path.name}")
+    return value
+
+
+def _rlens_validate_repo(repo: str | None) -> str | None:
+    if repo is None or repo == "":
+        return None
+    if not isinstance(repo, str) or not _RLENS_REPO_RE.fullmatch(repo):
+        raise ValueError("repo must be a simple repository name")
+    return repo
+
+
+def _rlens_validate_stem(stem: str) -> str:
+    if not isinstance(stem, str) or not _RLENS_STEM_RE.fullmatch(stem):
+        raise ValueError("stem must be a simple rLens bundle stem")
+    return stem
+
+
+def _rlens_repo_from_stem(stem: str) -> str:
+    if "-max-" in stem:
+        return stem.split("-max-", 1)[0]
+    if "-full-max-" in stem:
+        return stem.split("-full-max-", 1)[0]
+    return stem.split("-", 1)[0]
+
+
+def _rlens_stem_from_manifest(path: Path) -> str:
+    name = path.name
+    if not name.endswith(_BUNDLE_MANIFEST_SUFFIX):
+        raise ValueError("not an rLens bundle manifest")
+    return name[: -len(_BUNDLE_MANIFEST_SUFFIX)]
+
+
+def _rlens_manifest_path(stem: str) -> Path:
+    stem = _rlens_validate_stem(stem)
+    path = MERGES_ROOT / f"{stem}{_BUNDLE_MANIFEST_SUFFIX}"
+    try:
+        resolved = path.resolve(strict=False)
+    except RuntimeError as exc:
+        raise PermissionError("Invalid rLens manifest path") from exc
+    root = MERGES_ROOT.resolve(strict=False)
+    if resolved != root and root not in resolved.parents:
+        raise PermissionError("rLens manifest path escaped merges root")
+    return path
+
+
+def _rlens_sidecar_path(stem: str, suffix: str) -> Path:
+    return MERGES_ROOT / f"{stem}{suffix}"
+
+
+def _rlens_sidecar_status(path: Path, *, keys: tuple[str, ...]) -> dict[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        return {"exists": False, "path": str(path)}
+    doc = _rlens_json(path)
+    result: dict[str, Any] = {"exists": True, "path": str(path)}
+    for key in keys:
+        if key in doc:
+            result[key] = doc[key]
+    return result
+
+
+def _rlens_manifest_summary(path: Path) -> dict[str, Any]:
+    stem = _rlens_stem_from_manifest(path)
+    repo = _rlens_repo_from_stem(stem)
+    doc = _rlens_json(path)
+    artifacts = doc.get("artifacts") if isinstance(doc.get("artifacts"), list) else []
+    roles = sorted(
+        item.get("role") for item in artifacts
+        if isinstance(item, dict) and isinstance(item.get("role"), str)
+    )
+    runtime = (doc.get("generator") or {}).get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    stat = path.stat()
+    health_path = _rlens_sidecar_path(stem, _BUNDLE_HEALTH_SUFFIX)
+    health = _rlens_sidecar_status(
+        health_path,
+        keys=("status", "evidence_level", "range_ref_resolution_status"),
+    )
+    return {
+        "repo": repo,
+        "stem": stem,
+        "manifest_path": str(path),
+        "manifest_mtime_unix": int(stat.st_mtime),
+        "run_id": doc.get("run_id"),
+        "created_at": doc.get("created_at"),
+        "artifact_count": len(artifacts),
+        "artifact_roles": roles,
+        "git_commit": runtime.get("git_commit"),
+        "git_dirty": runtime.get("git_dirty"),
+        "post_emit_health": health,
+    }
+
+
+def _rlens_iter_manifests(repo: str | None = None) -> list[Path]:
+    repo = _rlens_validate_repo(repo)
+    if not MERGES_ROOT.is_dir() or MERGES_ROOT.is_symlink():
+        return []
+    manifests = [
+        path for path in MERGES_ROOT.glob(f"*{_BUNDLE_MANIFEST_SUFFIX}")
+        if path.is_file() and not path.is_symlink()
+    ]
+    if repo is not None:
+        manifests = [
+            path for path in manifests
+            if _rlens_repo_from_stem(_rlens_stem_from_manifest(path)) == repo
+        ]
+    manifests.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    return manifests
+
+
+def _rlens_git(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
+    completed = subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+
+
+@mcp.tool(name="rlens_bundle_discover", annotations=READ_ANNOTATIONS)
+def rlens_bundle_discover(repo: str | None = None, max_candidates: int = 20) -> dict[str, Any]:
+    """Discover current rLens/repoLens bundles from the immutable local merges area."""
+    _require_capability("bundle_registry")
+    if not isinstance(max_candidates, int) or not 1 <= max_candidates <= 100:
+        raise ValueError("max_candidates must be between 1 and 100")
+    manifests = _rlens_iter_manifests(repo)
+    candidates = [_rlens_manifest_summary(path) for path in manifests[:max_candidates]]
+    return {
+        "kind": "grabowski.rlens_bundle_discovery",
+        "schema_version": 1,
+        "merges_root": str(MERGES_ROOT),
+        "repo_filter": _rlens_validate_repo(repo),
+        "exists": MERGES_ROOT.is_dir() and not MERGES_ROOT.is_symlink(),
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "registry_cache": {
+            "path": str(BUNDLE_REGISTRY),
+            "exists": BUNDLE_REGISTRY.is_file(),
+            "authority": "legacy_cache",
+        },
+        "does_not_establish": [
+            "bundle_freshness_against_live_repo",
+            "repo_understood",
+            "claims_true",
+            "runtime_correctness",
+        ],
+    }
+
+
+@mcp.tool(name="rlens_bundle_status", annotations=READ_ANNOTATIONS)
+def rlens_bundle_status(stem: str) -> dict[str, Any]:
+    """Return bounded manifest, health and sidecar status for one rLens bundle."""
+    _require_capability("bundle_registry")
+    stem = _rlens_validate_stem(stem)
+    manifest_path = _rlens_manifest_path(stem)
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        return {"kind": "grabowski.rlens_bundle_status", "stem": stem, "exists": False}
+    summary = _rlens_manifest_summary(manifest_path)
+    surface = _rlens_sidecar_status(
+        _rlens_sidecar_path(stem, _BUNDLE_SURFACE_SUFFIX),
+        keys=("status", "bundle_run_id"),
+    )
+    output_health = _rlens_sidecar_status(
+        _rlens_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX),
+        keys=("verdict", "run_id", "created_at"),
+    )
+    return {
+        "kind": "grabowski.rlens_bundle_status",
+        "schema_version": 1,
+        "exists": True,
+        **summary,
+        "bundle_surface_validation": surface,
+        "output_health": output_health,
+        "authority": "artifact_metadata_only",
+        "does_not_establish": [
+            "bundle_freshness_against_live_repo",
+            "repo_understood",
+            "claims_true",
+            "review_complete",
+            "runtime_correctness",
+        ],
+    }
+
+
+@mcp.tool(name="rlens_freshness_check", annotations=READ_ANNOTATIONS)
+def rlens_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
+    """Compare one rLens bundle commit with the current local repository HEAD."""
+    _require_capability("bundle_registry")
+    repo = _rlens_validate_repo(repo) or ""
+    if stem is None or stem == "":
+        manifests = _rlens_iter_manifests(repo)
+        if not manifests:
+            return {
+                "kind": "grabowski.rlens_freshness_check",
+                "repo": repo,
+                "freshness": "unknown",
+                "reason": "no_bundle_found",
+            }
+        stem = _rlens_stem_from_manifest(manifests[0])
+    stem = _rlens_validate_stem(stem)
+    status = rlens_bundle_status(stem)
+    bundle_commit = status.get("git_commit") if status.get("exists") else None
+    bundle_dirty = status.get("git_dirty") if status.get("exists") else None
+    repo_path = (HOME / "repos" / repo).resolve(strict=False)
+    live: dict[str, Any] = {"repo_path": str(repo_path), "exists": repo_path.is_dir()}
+    if not repo_path.is_dir() or repo_path.is_symlink():
+        freshness = "unknown"
+        reason = "repo_missing_or_invalid"
+    else:
+        head_rc, head, head_err = _rlens_git(repo_path, ["rev-parse", "HEAD"])
+        dirty_rc, dirty_out, dirty_err = _rlens_git(repo_path, ["status", "--porcelain"])
+        live.update({
+            "head_returncode": head_rc,
+            "head": head if head_rc == 0 else None,
+            "dirty_returncode": dirty_rc,
+            "dirty": bool(dirty_out) if dirty_rc == 0 else None,
+            "error": head_err or dirty_err or None,
+        })
+        if head_rc != 0 or dirty_rc != 0 or not isinstance(bundle_commit, str):
+            freshness = "unknown"
+            reason = "git_or_bundle_commit_unavailable"
+        elif bundle_commit != head:
+            freshness = "stale_head"
+            reason = "bundle_commit_differs_from_live_head"
+        elif live["dirty"] or bundle_dirty:
+            freshness = "fresh_dirty_unverified"
+            reason = "commit_matches_but_dirty_worktree_identity_is_not_proven"
+        else:
+            freshness = "fresh_exact"
+            reason = "bundle_commit_matches_clean_live_head"
+    return {
+        "kind": "grabowski.rlens_freshness_check",
+        "schema_version": 1,
+        "repo": repo,
+        "stem": stem,
+        "bundle": {
+            "exists": status.get("exists", False),
+            "git_commit": bundle_commit,
+            "git_dirty": bundle_dirty,
+            "post_emit_health": status.get("post_emit_health"),
+        },
+        "live_repo": live,
+        "freshness": freshness,
+        "reason": reason,
+        "does_not_establish": [
+            "dirty_worktree_identity",
+            "runtime_correctness",
+            "repo_understood",
+            "claims_true",
+        ],
+    }
 
 
 @mcp.tool(name="latest_complete_bundles", annotations=READ_ANNOTATIONS)
