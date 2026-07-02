@@ -3694,6 +3694,31 @@ def _rlens_sidecar_status(path: Path, *, keys: tuple[str, ...]) -> dict[str, Any
     return result
 
 
+def _rlens_output_health_status(path: Path) -> dict[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        return {"exists": False, "path": str(path)}
+    doc = _rlens_json(path)
+    result: dict[str, Any] = {"exists": True, "path": str(path)}
+    for key in ("verdict", "run_id", "created_at", "warnings", "dependencies"):
+        if key in doc:
+            result[key] = doc[key]
+    checks = doc.get("checks")
+    if isinstance(checks, dict):
+        status = checks.get("range_ref_resolution_status")
+        if isinstance(status, str):
+            result["range_ref_resolution_status"] = status
+        resolution = checks.get("range_ref_resolution")
+        if isinstance(resolution, dict):
+            bounded = {
+                key: resolution[key]
+                for key in ("status", "reason", "validation")
+                if key in resolution
+            }
+            if bounded:
+                result["range_ref_resolution"] = bounded
+    return result
+
+
 def _rlens_manifest_summary(path: Path) -> dict[str, Any]:
     stem = _rlens_stem_from_manifest(path)
     repo = _rlens_repo_from_stem(stem)
@@ -3724,6 +3749,9 @@ def _rlens_manifest_summary(path: Path) -> dict[str, Any]:
         "git_commit": runtime.get("git_commit"),
         "git_dirty": runtime.get("git_dirty"),
         "post_emit_health": health,
+        "output_health": _rlens_output_health_status(
+            _rlens_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX)
+        ),
     }
 
 
@@ -3800,9 +3828,8 @@ def rlens_bundle_status(stem: str) -> dict[str, Any]:
         _rlens_sidecar_path(stem, _BUNDLE_SURFACE_SUFFIX),
         keys=("status", "bundle_run_id"),
     )
-    output_health = _rlens_sidecar_status(
-        _rlens_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX),
-        keys=("verdict", "run_id", "created_at"),
+    output_health = _rlens_output_health_status(
+        _rlens_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX)
     )
     return {
         "kind": "grabowski.rlens_bundle_status",
