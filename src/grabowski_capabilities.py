@@ -156,6 +156,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "rlens_context_pack": {
+        "category": "knowledge",
+        "purpose": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_terminal_run": {
         "category": "command",
         "purpose": "Run one bounded non-interactive command as the current user.",

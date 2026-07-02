@@ -3889,6 +3889,200 @@ def rlens_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
     }
 
 
+
+_RLENS_TASK_PROFILE_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}\Z")
+
+
+def _rlens_validate_task_profile(task_profile: str) -> str:
+    if not isinstance(task_profile, str) or not _RLENS_TASK_PROFILE_RE.fullmatch(task_profile):
+        raise ValueError("task_profile must be a simple rLens task profile")
+    return task_profile
+
+
+def _rlens_file_sha256(path: Path) -> str:
+    return hashlib.sha256(_ensure_regular_text_file(path, 2_000_000)).hexdigest()
+
+
+def _rlens_agent_preflight(task_profile: str, manifest_path: Path) -> dict[str, Any]:
+    """Run Lenskit's own agent-consumption preflight when the local CLI is available."""
+    lenskit_repo = (HOME / "repos" / "lenskit").resolve(strict=False)
+    if not lenskit_repo.is_dir() or lenskit_repo.is_symlink():
+        return {
+            "status": "unknown",
+            "available": False,
+            "reason": "lenskit_repo_missing_or_invalid",
+        }
+    command = [
+        "python3",
+        "-m",
+        "merger.lenskit.cli.main",
+        "agent-consumption",
+        "preflight",
+        "--task-profile",
+        task_profile,
+        "--bundle-manifest",
+        str(manifest_path),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=lenskit_repo,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    stdout = completed.stdout[:500_000]
+    stderr = completed.stderr[:20_000]
+    if completed.returncode not in {0, 1} or not stdout.strip():
+        return {
+            "status": "unknown",
+            "available": True,
+            "returncode": completed.returncode,
+            "stderr": _redact_sensitive_text(stderr)[0],
+            "reason": "lenskit_preflight_failed",
+        }
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {
+            "status": "unknown",
+            "available": True,
+            "returncode": completed.returncode,
+            "reason": "lenskit_preflight_invalid_json",
+        }
+    if not isinstance(value, dict):
+        return {
+            "status": "unknown",
+            "available": True,
+            "returncode": completed.returncode,
+            "reason": "lenskit_preflight_non_object",
+        }
+    value["available"] = True
+    value["returncode"] = completed.returncode
+    return value
+
+
+@mcp.tool(name="rlens_context_pack", annotations=READ_ANNOTATIONS)
+def rlens_context_pack(
+    repo: str,
+    task_profile: str = "basic_repo_question",
+    stem: str | None = None,
+) -> dict[str, Any]:
+    """Build a bounded rLens context pack for agent handoff and Bureau receipts."""
+    _require_capability("bundle_registry")
+    repo = _rlens_validate_repo(repo) or ""
+    task_profile = _rlens_validate_task_profile(task_profile)
+    freshness = rlens_freshness_check(repo, stem)
+    selected_stem = freshness.get("stem")
+    if not isinstance(selected_stem, str):
+        return {
+            "kind": "grabowski.rlens_context_pack",
+            "schema_version": 1,
+            "repo": repo,
+            "task_profile": task_profile,
+            "available": False,
+            "freshness": freshness,
+            "reason": "no_bundle_available",
+            "does_not_establish": [
+                "actual_agent_reading",
+                "repo_understood",
+                "claims_true",
+                "runtime_correctness",
+            ],
+        }
+    status = rlens_bundle_status(selected_stem)
+    status_repo = status.get("repo") if isinstance(status, dict) else None
+    if status.get("exists") and status_repo != repo:
+        return {
+            "kind": "grabowski.rlens_context_pack",
+            "schema_version": 1,
+            "repo": repo,
+            "task_profile": task_profile,
+            "stem": selected_stem,
+            "available": False,
+            "freshness": freshness,
+            "reason": "bundle_repo_mismatch",
+            "bundle_repo": status_repo,
+            "does_not_establish": [
+                "actual_agent_reading",
+                "repo_understood",
+                "claims_true",
+                "runtime_correctness",
+            ],
+        }
+    manifest_path = _rlens_manifest_path(selected_stem)
+    manifest_sha = _rlens_file_sha256(manifest_path) if manifest_path.is_file() else None
+    preflight = _rlens_agent_preflight(task_profile, manifest_path)
+    preflight_status = preflight.get("status") if isinstance(preflight.get("status"), str) else "unknown"
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    live = freshness.get("live_repo") if isinstance(freshness.get("live_repo"), dict) else {}
+    bundle = freshness.get("bundle") if isinstance(freshness.get("bundle"), dict) else {}
+    context_ref = {
+        "schema_version": 1,
+        "repo": repo,
+        "stem": selected_stem,
+        "manifest_sha256": manifest_sha,
+        "bundle_commit": bundle.get("git_commit"),
+        "live_commit_at_claim": live.get("head"),
+        "freshness_status": freshness.get("freshness", "unknown"),
+        "task_profile": task_profile,
+        "preflight_status": preflight_status,
+        "source": "grabowski.rlens_context_pack",
+        "generated_at": generated_at,
+        "does_not_establish": [
+            "actual_agent_reading",
+            "answer_correct",
+            "repo_understood",
+            "claims_true",
+            "review_complete",
+            "runtime_correctness",
+        ],
+    }
+    return {
+        "kind": "grabowski.rlens_context_pack",
+        "schema_version": 1,
+        "repo": repo,
+        "task_profile": task_profile,
+        "stem": selected_stem,
+        "available": True,
+        "context_ref": context_ref,
+        "freshness": freshness,
+        "bundle_status": {
+            "exists": status.get("exists"),
+            "artifact_count": status.get("artifact_count"),
+            "artifact_roles": status.get("artifact_roles"),
+            "post_emit_health": status.get("post_emit_health"),
+            "bundle_surface_validation": status.get("bundle_surface_validation"),
+            "output_health": status.get("output_health"),
+        },
+        "preflight": {
+            "available": preflight.get("available", False),
+            "status": preflight_status,
+            "required_reading": preflight.get("required_reading"),
+            "answer_compliance_template": preflight.get("answer_compliance_template"),
+            "does_not_establish": preflight.get("does_not_establish"),
+            "error_reason": preflight.get("reason"),
+        },
+        "agent_handoff": {
+            "default_surface": "context_pack_metadata_only",
+            "raw_canonical_dump_included": False,
+            "requires_answer_compliance": preflight_status in {"pass", "warn"},
+            "recommended_next_step": "Use required_reading and answer_compliance_template; cite ranges from Lenskit when making content claims.",
+        },
+        "does_not_establish": [
+            "actual_agent_reading",
+            "answer_correct",
+            "repo_understood",
+            "claims_true",
+            "test_sufficiency",
+            "review_complete",
+            "runtime_correctness",
+        ],
+    }
+
+
 @mcp.tool(name="latest_complete_bundles", annotations=READ_ANNOTATIONS)
 def latest_complete_bundles() -> dict[str, Any]:
     """Return the curated latest-complete Lens/repoLens bundle registry."""
