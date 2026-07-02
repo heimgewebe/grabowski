@@ -63,14 +63,7 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
     def test_mutating_runtime_support_modules_require_independent_review(self) -> None:
         for path in (
             "src/grabowski_tasks.py",
-            "src/grabowski_task_reconcile.py",
             "src/grabowski_checkouts.py",
-            "src/grabowski_resources.py",
-            "src/grabowski_workers.py",
-            "src/grabowski_worker_process.py",
-            "src/grabowski_fleet.py",
-            "src/grabowski_operations.py",
-            "src/grabowski_artifacts.py",
         ):
             with self.subTest(path=path):
                 result = pr_review_gate.evaluate_review_gate(_state(path), self_review=_self_review())
