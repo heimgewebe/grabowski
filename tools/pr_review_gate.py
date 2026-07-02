@@ -65,9 +65,6 @@ def _actor_text(item: dict[str, Any]) -> str:
                     parts.append(value)
         elif isinstance(actor, str):
             parts.append(actor)
-    body = item.get("body")
-    if isinstance(body, str):
-        parts.append(body[:4096])
     return " ".join(parts).lower()
 
 
@@ -206,10 +203,9 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
 
     if not checks:
         failures.append("no status checks observed")
-    blocking_buckets = {"fail", "pending", "cancel"}
     blocking_checks = [
         check for check in checks
-        if isinstance(check, dict) and check.get("bucket") in blocking_buckets
+        if isinstance(check, dict) and check.get("bucket") != "pass"
     ]
     if blocking_checks:
         failures.append(f"{len(blocking_checks)} non-green check(s)")

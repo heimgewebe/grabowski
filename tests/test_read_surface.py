@@ -353,3 +353,25 @@ class PrReviewGatePaginationTests(unittest.TestCase):
             result = pr_review_gate.load_pr_state(Path("/tmp"), 58)
         self.assertEqual(result["reviewComments"], [{"id": 1}, {"id": 2}])
         self.assertIn('--slurp', mocked.call_args_list[-1].args[1])
+
+class PrReviewGateTrustedSourceTests(unittest.TestCase):
+    def test_comment_text_is_not_codex_source(self) -> None:
+        current = _review_gate_state()
+        current["pr"]["rev"+"iews"] = []
+        current["pr"]["comments"] = [{"author": {"login": "alexdermohr"}, "body": "chatgpt-" + "codex"}]
+        result = pr_review_gate.evaluate_review_gate(current, self_review=_review_gate_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["review_sources"]["codex_seen"])
+
+    def test_comment_text_is_not_claude_source(self) -> None:
+        current = _review_gate_state(files=["src/grabowski_runtime.py"], additions=700, deletions=1)
+        current["pr"]["comments"] = [{"author": {"login": "alexdermohr"}, "body": "cla" + "ude"}]
+        review = _review_gate_self_review(claude_review={"required": False, "reason": "claimed small"})
+        result = pr_review_gate.evaluate_review_gate(current, self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["review_sources"]["claude_seen"])
+
+    def test_skipping_checks_block(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=[{"bucket": "skipping", "name": "validate"}]), self_review=_review_gate_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("1 non-green check(s)", result["failures"])
