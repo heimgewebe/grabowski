@@ -292,7 +292,7 @@ class PrReviewGateTests(unittest.TestCase):
     def test_blocks_complex_pr_without_claude_review(self) -> None:
         result = pr_review_gate.evaluate_review_gate(_review_gate_state(files=["src/grabowski_runtime.py"], additions=700, deletions=1), self_review=_review_gate_self_review(claude_review={"required": False, "reason": "claimed small"}))
         self.assertEqual(result["verdict"], "BLOCK")
-        self.assertIn("Claude review is required but not recorded", result["failures"])
+        self.assertIn("Claude review is required but not observed on current head", result["failures"])
 
     def test_head_sha_must_match(self) -> None:
         result = pr_review_gate.evaluate_review_gate(_review_gate_state(), self_review=_review_gate_self_review(head_sha="c" * 40))
@@ -375,3 +375,33 @@ class PrReviewGateTrustedSourceTests(unittest.TestCase):
         result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=[{"bucket": "skipping", "name": "validate"}]), self_review=_review_gate_self_review())
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("1 non-green check(s)", result["failures"])
+
+
+class PrReviewGateCurrentHeadEvidenceTests(unittest.TestCase):
+    def test_old_codex_review_does_not_satisfy_current_head(self) -> None:
+        current = _review_gate_state()
+        current["pr"]["reviews"] = [{"author": {"login": "chatgpt-codex-connector"}, "commit": {"oid": "d" * 40}}]
+        result = pr_review_gate.evaluate_review_gate(current, self_review=_review_gate_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["review_sources"]["codex_seen"])
+        self.assertIn("Codex review was not observed", result["failures"])
+
+    def test_self_reported_claude_collection_does_not_satisfy_complex_pr(self) -> None:
+        current = _review_gate_state(files=["src/grabowski_runtime.py"], additions=700, deletions=1)
+        current["pr"]["reviews"] = [{"author": {"login": "chatgpt-codex-connector"}, "commit": {"oid": REVIEW_GATE_HEAD}}]
+        review = _review_gate_self_review(claude_review={"required": True, "collected": True, "reason": "self reported"})
+        result = pr_review_gate.evaluate_review_gate(current, self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["review_sources"]["claude_seen"])
+        self.assertIn("Claude review is required but not observed on current head", result["failures"])
+
+    def test_current_head_claude_actor_satisfies_complex_pr(self) -> None:
+        current = _review_gate_state(files=["src/grabowski_runtime.py"], additions=700, deletions=1)
+        current["pr"]["reviews"] = [
+            {"author": {"login": "chatgpt-codex-connector"}, "commit": {"oid": REVIEW_GATE_HEAD}},
+            {"author": {"login": "claude-code-review"}, "commit": {"oid": REVIEW_GATE_HEAD}},
+        ]
+        review = _review_gate_self_review(claude_review={"required": True, "reason": "complex"})
+        result = pr_review_gate.evaluate_review_gate(current, self_review=review)
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertTrue(result["review_sources"]["claude_seen"])

@@ -216,10 +216,9 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
 
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
     claude_required = complexity["complex"] or (isinstance(claude, dict) and claude.get("required") is True)
-    claude_recorded = isinstance(claude, dict) and claude.get("collected") is True
     claude_not_required = isinstance(claude, dict) and claude.get("required") is False and bool(claude.get("reason"))
-    if claude_required and not (claude_seen or claude_recorded):
-        failures.append("Claude review is required but not recorded")
+    if claude_required and not claude_seen:
+        failures.append("Claude review is required but not observed on current head")
     if not claude_required and not claude_not_required:
         warnings.append("Claude non-requirement reason is not recorded")
 
@@ -238,7 +237,7 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
         "failures": failures,
         "warnings": warnings,
         "repo_pr": {"number": pr.get("number"), "title": pr.get("title"), "url": pr.get("url"), "head_sha": pr.get("headRefOid"), "base_sha": pr.get("baseRefOid")},
-        "review_sources": {"codex_seen": codex_seen, "claude_seen": claude_seen, "review_item_count": len(items)},
+        "review_sources": {"codex_seen": codex_seen, "claude_seen": claude_seen, "review_item_count": len(all_review_items), "current_head_review_item_count": len(items)},
         "complexity": complexity,
     }
 
