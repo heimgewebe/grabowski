@@ -86,6 +86,21 @@ class RlensBundleToolTests(unittest.TestCase):
         (self.merges / f"{stem}_merge.output_health.json").write_text(json.dumps({
             "verdict": "pass",
             "run_id": f"{stem}-run",
+            "created_at": "2026-07-01T00:00:00Z",
+            "warnings": [],
+            "dependencies": {
+                "jsonschema": {
+                    "available": True,
+                    "effect": "full_validation_available",
+                }
+            },
+            "checks": {
+                "range_ref_resolution_status": "ok",
+                "range_ref_resolution": {
+                    "status": "ok",
+                    "validation": {"mode": "jsonschema", "reason": "available"},
+                },
+            },
         }), encoding="utf-8")
         return manifest
 
@@ -111,6 +126,8 @@ class RlensBundleToolTests(unittest.TestCase):
         candidate = result["candidates"][0]
         self.assertEqual(candidate["repo"], "demo-repo")
         self.assertEqual(candidate["post_emit_health"]["status"], "pass")
+        self.assertEqual(candidate["output_health"]["range_ref_resolution_status"], "ok")
+        self.assertTrue(candidate["output_health"]["dependencies"]["jsonschema"]["available"])
         self.assertIn("canonical_md", candidate["artifact_roles"])
         self.assertIn("bundle_freshness_against_live_repo", result["does_not_establish"])
 
@@ -122,8 +139,53 @@ class RlensBundleToolTests(unittest.TestCase):
         self.assertTrue(result["exists"])
         self.assertEqual(result["post_emit_health"]["evidence_level"], "range_strict")
         self.assertEqual(result["output_health"]["verdict"], "pass")
+        self.assertEqual(result["output_health"]["range_ref_resolution_status"], "ok")
+        self.assertEqual(result["output_health"]["range_ref_resolution"]["validation"]["mode"], "jsonschema")
+        self.assertEqual(result["output_health"]["dependencies"]["jsonschema"]["effect"], "full_validation_available")
         self.assertEqual(result["authority"], "artifact_metadata_only")
         self.assertIn("claims_true", result["does_not_establish"])
+
+    def test_bundle_status_surfaces_output_health_dependency_degradation(self) -> None:
+        stem = "demo-repo-max-260701-1200"
+        self._write_bundle(stem)
+        degraded = {
+            "verdict": "warn",
+            "run_id": f"{stem}-run",
+            "warnings": ["range_ref schema validation skipped"],
+            "dependencies": {
+                "jsonschema": {
+                    "available": False,
+                    "required_for": ["range_ref_schema"],
+                    "effect": "validation_degraded",
+                }
+            },
+            "checks": {
+                "range_ref_resolution_status": "environment_error",
+                "range_ref_resolution": {
+                    "status": "environment_error",
+                    "reason": "range_ref schema validation skipped",
+                    "validation": {
+                        "mode": "skipped_unavailable",
+                        "engine": "range_resolver",
+                        "reason": "dependency_unavailable",
+                    },
+                },
+            },
+        }
+        (self.merges / f"{stem}_merge.output_health.json").write_text(
+            json.dumps(degraded), encoding="utf-8"
+        )
+
+        result = mcp.rlens_bundle_status(stem)
+
+        self.assertEqual(result["output_health"]["verdict"], "warn")
+        self.assertEqual(result["output_health"]["range_ref_resolution_status"], "environment_error")
+        self.assertFalse(result["output_health"]["dependencies"]["jsonschema"]["available"])
+        self.assertEqual(result["output_health"]["dependencies"]["jsonschema"]["effect"], "validation_degraded")
+        self.assertEqual(
+            result["output_health"]["range_ref_resolution"]["validation"]["reason"],
+            "dependency_unavailable",
+        )
 
     def test_freshness_check_reports_fresh_exact_for_matching_clean_head(self) -> None:
         _repo, head = self._git_repo("demo-repo")
