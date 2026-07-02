@@ -20,6 +20,8 @@ RISK_PATH_PREFIXES = (
     "src/grabowski_privileged.py",
     "src/grabowski_recovery.py",
     "src/grabowski_self_deploy.py",
+    "src/grabowski_tasks.py",
+    "src/grabowski_checkouts.py",
     "tools/pr_review_gate.py",
 )
 PR_FIELDS = ("number", "title", "state", "isDraft", "mergeStateStatus", "headRefOid", "baseRefOid", "url", "reviewDecision", "changedFiles", "additions", "deletions", "files", "reviews", "latestReviews", "comments")
