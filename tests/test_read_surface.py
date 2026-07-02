@@ -411,7 +411,7 @@ class PrReviewGateCurrentHeadEvidenceTests(unittest.TestCase):
         current = _review_gate_state(files=["src/grabowski_runtime.py"], additions=700, deletions=1)
         current["pr"]["reviews"] = [
             {"author": {"login": "chatgpt-codex-connector"}, "commit": {"oid": REVIEW_GATE_HEAD}},
-            {"author": {"login": "claude-code-review"}, "commit": {"oid": REVIEW_GATE_HEAD}},
+            {"author": {"login": "claude-code"}, "commit": {"oid": REVIEW_GATE_HEAD}},
         ]
         review = _review_gate_self_review(claude_review={"required": True, "reason": "complex"})
         result = pr_review_gate.evaluate_review_gate(current, self_review=review)

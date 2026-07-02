@@ -11,8 +11,8 @@ from typing import Any
 
 TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reason", "not_applicable"}
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
-CODEX_MARKERS = ("codex", "chatgpt-codex")
-CLAUDE_MARKERS = ("claude", "anthropic")
+TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
+TRUSTED_CLAUDE_ACTORS = {"claude", "claude[bot]", "claude-code", "claude-code[bot]", "anthropic", "anthropic[bot]"}
 RISK_PATH_MARKERS = ("auth", "access", "security", "deploy", "runtime", "systemd", "migration", "database", "policy", "capabilit", "operator", "mcp", "privileged", "audit", "rollback", "secret", "broker")
 RISK_PATH_PREFIXES = (
     "src/grabowski_mcp.py",
@@ -75,22 +75,21 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     return {"pr": view, "checks": checks, "reviewComments": review_comments, "prReviews": pr_reviews}
 
 
-def _actor_text(item: dict[str, Any]) -> str:
-    parts: list[str] = []
+def _actor_logins(item: dict[str, Any]) -> set[str]:
+    logins: set[str] = set()
     for key in ("author", "user", "actor"):
         actor = item.get(key)
         if isinstance(actor, dict):
-            for field in ("login", "name"):
-                value = actor.get(field)
-                if isinstance(value, str):
-                    parts.append(value)
-        elif isinstance(actor, str):
-            parts.append(actor)
-    return " ".join(parts).lower()
+            value = actor.get("login")
+            if isinstance(value, str) and value.strip():
+                logins.add(value.strip().lower())
+        elif isinstance(actor, str) and actor.strip():
+            logins.add(actor.strip().lower())
+    return logins
 
 
-def _has_marker(items: list[dict[str, Any]], markers: tuple[str, ...]) -> bool:
-    return any(any(marker in _actor_text(item) for marker in markers) for item in items)
+def _has_trusted_actor(items: list[dict[str, Any]], trusted_actors: set[str]) -> bool:
+    return any(bool(_actor_logins(item) & trusted_actors) for item in items)
 
 
 def _item_head_sha(item: dict[str, Any]) -> str:
@@ -193,8 +192,8 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     checks = state.get("checks") if isinstance(state.get("checks"), list) else []
     all_review_items = _review_items(pr)
     items = _current_head_items(pr, all_review_items)
-    codex_seen = _has_marker(items, CODEX_MARKERS)
-    claude_seen = _has_marker(items, CLAUDE_MARKERS)
+    codex_seen = _has_trusted_actor(items, TRUSTED_CODEX_ACTORS)
+    claude_seen = _has_trusted_actor(items, TRUSTED_CLAUDE_ACTORS)
     complexity = classify_complexity(pr, self_review)
     failures: list[str] = []
     warnings: list[str] = []
@@ -205,6 +204,9 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
         failures.append("PR is already merged")
     if pr.get("isDraft") is True:
         failures.append("PR is draft")
+    merge_state = pr.get("mergeStateStatus")
+    if isinstance(merge_state, str) and merge_state and merge_state != "CLEAN":
+        failures.append(f"GitHub mergeStateStatus is {merge_state}, not CLEAN")
     if not codex_seen:
         codex = self_review.get("codex_review") if isinstance(self_review, dict) else None
         if isinstance(codex, dict) and codex.get("unavailable_reason"):
