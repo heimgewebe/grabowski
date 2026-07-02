@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import json
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -117,7 +116,11 @@ def main() -> int:
         if status_before.strip() and not args.allow_dirty:
             raise RelayError("repo is dirty; pass --allow-dirty to override")
 
-        check_result = run_git(repo, ["apply", "--check", str(patch)])
+        check_args = ["apply", "--check"]
+        if args.three_way:
+            check_args.append("--3way")
+        check_args.append(str(patch))
+        check_result = run_git(repo, check_args)
         receipt["check_returncode"] = check_result.returncode
         receipt["check_stdout"] = check_result.stdout[-4000:]
         receipt["check_stderr"] = check_result.stderr[-4000:]

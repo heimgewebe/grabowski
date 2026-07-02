@@ -92,15 +92,14 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
     fd = os.open(path, flags, 0o600)
     try:
-        with os.fdopen(fd, "a", encoding="utf-8") as handle:
-            handle.write(line)
-            handle.flush()
-            os.fsync(handle.fileno())
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        handle = os.fdopen(fd, "a", encoding="utf-8")
+    except Exception:
+        os.close(fd)
+        raise
+    with handle:
+        handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def record_friction_event(
@@ -146,26 +145,33 @@ def record_friction_event(
     }
 
 
-def _load_events(limit: int) -> list[dict[str, Any]]:
+def _load_events(limit: int) -> tuple[list[dict[str, Any]], int]:
     if not FRICTION_LOG.exists():
-        return []
+        return [], 0
     if FRICTION_LOG.is_symlink() or not FRICTION_LOG.is_file():
         raise RuntimeError("friction log is not a regular file")
     lines = FRICTION_LOG.read_text(encoding="utf-8").splitlines()
     events: list[dict[str, Any]] = []
+    invalid = 0
     for line in lines[-limit:]:
         if not line.strip():
             continue
-        value = json.loads(line)
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            invalid += 1
+            continue
         if isinstance(value, dict):
             events.append(value)
-    return events
+        else:
+            invalid += 1
+    return events, invalid
 
 
 def friction_summary(*, limit: int = 50) -> dict[str, Any]:
     if not isinstance(limit, int) or limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500")
-    events = _load_events(limit)
+    events, invalid_lines = _load_events(limit)
     by_kind: dict[str, int] = {}
     by_surface: dict[str, int] = {}
     unresolved = 0
@@ -182,6 +188,7 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
         "exists": FRICTION_LOG.exists(),
         "limit": limit,
         "returned": len(events),
+        "invalid_lines": invalid_lines,
         "unresolved": unresolved,
         "by_kind": dict(sorted(by_kind.items())),
         "by_surface": dict(sorted(by_surface.items())),

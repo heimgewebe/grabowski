@@ -78,7 +78,8 @@ class RepositoryContractTests(unittest.TestCase):
     def test_operator_patch_relay_is_syntax_checked(self) -> None:
         self.assertTrue((ROOT / "tools" / "operator_patch_relay.py").is_file())
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
-        self.assertIn("tools/operator_patch_relay.py", makefile)
+        self.assertIn("$(wildcard tools/*.py)", makefile)
+        self.assertIn("$(wildcard src/*.py)", makefile)
 
     def test_status_exposes_deployment_provenance(self) -> None:
         source = (

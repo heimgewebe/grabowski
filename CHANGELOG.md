@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Fixed rLens stem-to-repo mapping so `-full-max-` bundles resolve to their
+  base repository instead of a `<repo>-full` phantom, keeping discovery
+  filters and context-pack repo gates usable for full-max bundles.
+- Fixed the operator patch relay so `--three-way` also applies to the
+  `git apply --check` gate; previously 3-way patches were rejected before the
+  apply step could run.
+- Fixed a double-close of the friction-ledger file descriptor and made
+  `grabowski_friction_summary` tolerate corrupt log lines, reporting them as
+  `invalid_lines` instead of failing the whole summary.
+- Surfaced the failing deployment phase in the dual-service
+  `PRIMARY-DEPLOY-ERROR` output.
+- Made the Makefile `syntax` target compile every file under `src/` and
+  `tools/` via wildcards; previously six files were silently skipped.
+- Declared all runtime modules in `pyproject.toml` `py-modules` so a package
+  install matches the repository module set.
+- Added a read-only rLens bundle surface: discovery, per-bundle status,
+  freshness check against the live repository HEAD, and a bounded context
+  pack with Lenskit preflight for agent handoff.
+- Added a bounded operator-friction ledger with typed record/summary tools,
+  a versioned event schema and hash-free audit trail entries.
+- Added the blocked-action protocol (Operator Relay v0) with routed helper
+  roles, a bounded local patch relay with JSON receipts, and status surfacing
+  of the operating protocol.
+- Added a read-only safety observer with journal classification, severity
+  rules, bounded reports and health output.
+- Added operator-completion foundations: atomic resource leases, persistent
+  lease-bound tasks with explicit reconcile check/refresh/resume semantics,
+  hash-bound artifact transport, and isolated browser/GUI workers.
+- Added component watchdogs with restart budgets for tunnel and operator
+  services, plus dual-service deployment with rollback phases.
 - Fixed checkout coordination so a process or task in a parent directory no
   longer blocks every descendant worktree; only working directories equal to
   or below an actual coordination root count as blockers.
@@ -41,3 +71,4 @@
   verification, and unprivileged privileged-action references.
 - Added typed reversible filesystem removal/restoration and a separate
   deliberate irreversible removal capability, both behind explicit capability,
+  audit, protected-root and kill-switch gates.

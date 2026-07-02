@@ -183,6 +183,26 @@ class RlensBundleToolTests(unittest.TestCase):
         self.assertEqual(result["bundle_repo"], "other-repo")
 
 
+    def test_full_max_stem_maps_to_base_repo(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-full-max-260701-1200", commit=head)
+
+        discovery = mcp.rlens_bundle_discover(repo="demo-repo")
+
+        self.assertEqual(discovery["candidate_count"], 1)
+        self.assertEqual(discovery["candidates"][0]["repo"], "demo-repo")
+
+        preflight = {"status": "pass"}
+        with patch.object(mcp, "_rlens_agent_preflight", return_value=preflight):
+            result = mcp.rlens_context_pack(
+                "demo-repo",
+                "basic_repo_question",
+                "demo-repo-full-max-260701-1200",
+            )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["context_ref"]["repo"], "demo-repo")
+
     def test_context_pack_reports_missing_bundle(self) -> None:
         result = mcp.rlens_context_pack("missing-repo", "basic_repo_question")
         self.assertFalse(result["available"])

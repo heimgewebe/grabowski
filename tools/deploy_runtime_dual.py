@@ -710,7 +710,9 @@ def deploy_url(
     except Exception as original:
         print(
             "PRIMARY-DEPLOY-ERROR: "
-            + json.dumps(_error_summary(original), sort_keys=True),
+            + json.dumps(
+                {"phase": phase, **_error_summary(original)}, sort_keys=True
+            ),
             file=sys.stderr,
         )
         rollback_url(

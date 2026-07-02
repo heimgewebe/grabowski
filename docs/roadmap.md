@@ -1,5 +1,17 @@
 # Roadmap
 
+## GRABOWSKI-AUDIT-2026-07
+
+Status: findings fixed on audit branch; remaining recommendations tracked in the audit report.
+
+- canonical report: `docs/repo-audit-2026-07.md`,
+- fixed: rLens full-max stem mapping, patch-relay 3-way check gate,
+  friction-ledger fd handling and corrupt-line tolerance, deploy phase in
+  error output, Makefile syntax coverage, `py-modules` completeness,
+  truncated changelog entry,
+- open recommendations: CI matrix extension to Python 3.13, structured
+  timeout results for rLens subprocess calls.
+
 ## GRABOWSKI-OPTIMIZE-001
 
 Status: registered plan; implementation slices must remain operator-reviewed and evidence-bound.
@@ -72,6 +84,8 @@ Status: live in the deployed runtime; follow-up work is typed agent/fleet integr
 
 ## GRABOWSKI-GIT-001
 
+Status: partially implemented; generic `grabowski_git`, typed branch operations and the audited checkout lifecycle are live, broader typed Git write operations remain open.
+
 - Git-Lese- und Schreiboperationen,
 - Worktrees,
 - Commit und Push,
@@ -79,12 +93,16 @@ Status: live in the deployed runtime; follow-up work is typed agent/fleet integr
 
 ## GRABOWSKI-KNOWLEDGE-001
 
+Status: first slice implemented; rLens bundle discovery, status, freshness check and bounded context pack are live, while Atlas inventory queries and repository symbol search remain open.
+
 - Lenskit- und Atlas-native Abfragen,
 - Repo-Symbolsuche,
 - Bundle-Freshness,
 - strukturierte Codeanalyse.
 
 ## GRABOWSKI-OPS-001
+
+Status: partially implemented; user-service control, process and port diagnostics are live, while host power actions, downloads and document/media operations remain open.
 
 - User-Services,
 - Hoststeuerung,
@@ -109,6 +127,8 @@ Status: implemented and live in the deployed runtime; follow-up work is deployme
 
 ## GRABOWSKI-DEPLOY-002
 
+Status: registered; the persistent transaction journal and recovery path are not implemented yet.
+
 - persistentes Deployment-Transaktionsjournal,
 - atomare Phasenfortschreibung mit Datei- und Directory-`fsync`,
 - Recovery von ursprünglichem Pointer und Legacy-Backup nach SIGKILL, Stromausfall oder Neustart,
@@ -116,6 +136,8 @@ Status: implemented and live in the deployed runtime; follow-up work is deployme
 - optionaler systemd-Recovery-Service nach eigenem Design-Gate.
 
 ## GRABOWSKI-FLEET-001
+
+Status: open; the typed in-repo fleet registry exists under GRABOWSKI-CONTROL-PLANE-001, but the Heimgewebe role and metarepo registration remain undecided.
 
 - Heimgewebe-Rolle bestimmen,
 - Fleet-Registrierung im Metarepo,

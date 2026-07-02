@@ -14,4 +14,26 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["grabowski_mcp", "grabowski_operator"]
+py-modules = [
+  "grabowski_artifacts",
+  "grabowski_capabilities",
+  "grabowski_checkouts",
+  "grabowski_fleet",
+  "grabowski_friction",
+  "grabowski_mcp",
+  "grabowski_operations",
+  "grabowski_operator",
+  "grabowski_privileged",
+  "grabowski_privileged_broker",
+  "grabowski_privileged_status_core",
+  "grabowski_read_surface",
+  "grabowski_recovery",
+  "grabowski_resources",
+  "grabowski_runtime",
+  "grabowski_runtime_extensions",
+  "grabowski_self_deploy",
+  "grabowski_task_reconcile",
+  "grabowski_tasks",
+  "grabowski_worker_process",
+  "grabowski_workers",
+]
