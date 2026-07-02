@@ -222,6 +222,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
                 "patch_file_relay": "operator_patch_relay",
                 "patch_fallback": "aider_no_auto_commit",
                 "audit": "grabowski_git",
+                "repo_state_context": "steuerboard_operator_report",
             },
             "does_not_establish": [
                 "new_privileges",
@@ -230,6 +231,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
                 "automatic_deploy",
                 "free_shell_as_default_path",
                 "durable_agent_autonomy",
+                "steuerboard_report_action_approval",
             ],
         },
         "runtime_contract": {
@@ -273,6 +275,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
         "- Patch file relay: local patch files use `tools/operator_patch_relay.py` for check/apply receipts before user manual execution.",
         "- Review: Claude for architecture and safety review.",
         "- Session: tmux first; agy only when available and better for resume.",
+        "- Steuerboard: `operator report` is a lightweight read-only repo-state context signal; no separate trial/noise logging; never an approval gate.",
         "",
         "## Contract integrity",
         "",

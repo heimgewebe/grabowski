@@ -56,6 +56,8 @@ Use the narrowest typed read operation that can establish current state. Before 
 
 Operator Relay v0 is the fallback rule for blocked ChatGPT/Grabowski actions: try a typed Grabowski tool first; if that is blocked, use one bounded Grabowski Micro-Task; then read status, logs, diff or another receipt before deciding the next step. For helper routing, use Codex as the default for complex code or repo tasks, agy `--print` for quick light reasoning, Ollama API with qwen coder for local micro-reasoning, Claude for review, tmux first for session/resume, Bureau for prioritization, and Grabowski + Git for audit. Local patch files should go through `tools/operator_patch_relay.py` for check/apply receipts before asking the user to download and run a patch manually. Aider remains a bounded patch fallback with no auto-commit. Details: `docs/blocked-action-protocol-v0.md`.
 
+`steuerboard operator report --branch-warning-threshold 5 --json` is available as a lightweight read-only context signal for repo, PR, branch, pull, switch and merge-prep work when the target state matters. The probe run is accepted; do not keep a separate useful-signal/decision-change/noise trial log. Only target-relevant fields count. The report is not an approval gate and does not replace Git status, PR checks, review gates or action readiness.
+
 Generic operator tools remain available as fallback mechanisms; they are not the default diagnostic route. A failed read is classified and reviewed rather than automatically repeated through a broader tool.
 
 For a self-update that restarts operator and tunnel, prefer `grabowski_runtime_deploy_schedule` over a foreground `make deploy`. It binds the expected commit and returns a durable job before the delayed cutover begins.
