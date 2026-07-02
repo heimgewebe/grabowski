@@ -13,7 +13,7 @@ TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reaso
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
 CODEX_MARKERS = ("codex", "chatgpt-codex")
 CLAUDE_MARKERS = ("claude", "anthropic")
-RISK_PATH_MARKERS = ("auth", "access", "security", "deploy", "runtime", "systemd", "migration", "database", "policy", "capabilit")
+RISK_PATH_MARKERS = ('src/grabowski', 'auth', 'access', 'security', 'deploy', 'runtime', 'systemd', 'migration', 'database', 'policy', 'capabilit')
 PR_FIELDS = ("number", "title", "state", "isDraft", "mergeStateStatus", "headRefOid", "baseRefOid", "url", "reviewDecision", "changedFiles", "additions", "deletions", "files", "reviews", "latestReviews", "comments")
 CHECK_FIELDS = ("bucket", "completedAt", "description", "event", "link", "name", "startedAt", "state", "workflow")
 
