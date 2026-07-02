@@ -237,6 +237,8 @@ REVIEW_GATE_BASE = "b" * 40
 
 
 def _review_gate_state(*, files=None, additions=10, deletions=2, reviews=None, checks=None):
+    default_files = files if files is not None else ["src/example.py"]
+    default_reviews = [{"author": {"login": "chatgpt-codex-connector"}, "body": "reviewed", "commit_id": REVIEW_GATE_HEAD}]
     return {
         "pr": {
             "number": 12,
@@ -245,11 +247,11 @@ def _review_gate_state(*, files=None, additions=10, deletions=2, reviews=None, c
             "isDraft": False,
             "headRefOid": REVIEW_GATE_HEAD,
             "baseRefOid": REVIEW_GATE_BASE,
-            "changedFiles": len(files or ["src/example.py"]),
+            "changedFiles": len(default_files),
             "additions": additions,
             "deletions": deletions,
-            "files": [{"path": path} for path in (files or ["src/example.py"])],
-            "reviews": reviews or [{"author": {"login": "chatgpt-codex-connector"}, "body": "reviewed", "commit_id": REVIEW_GATE_HEAD}],
+            "files": [{"path": path} for path in default_files],
+            "reviews": reviews if reviews is not None else default_reviews,
             "latestReviews": [],
             "comments": [],
         },
@@ -308,7 +310,14 @@ class PrReviewGateTests(unittest.TestCase):
 class PrReviewGateCommentSourceTests(unittest.TestCase):
     def test_comment_sources_count_for_codex(self) -> None:
         current = _review_gate_state(reviews=[])
-        current["reviewComments"] = [{"user": {"login": "chatgpt-codex-connector"}, "body": "reviewed"}]
+        current["reviewComments"] = [{"user": {"login": "chatgpt-codex-connector"}, "body": "reviewed", "commit_id": REVIEW_GATE_HEAD}]
+        result = pr_review_gate.evaluate_review_gate(current, self_review=_review_gate_self_review())
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertTrue(result["review_sources"]["codex_seen"])
+
+    def test_rest_pr_review_commit_id_counts_for_codex(self) -> None:
+        current = _review_gate_state(reviews=[])
+        current["prReviews"] = [{"user": {"login": "chatgpt-codex-connector"}, "body": "reviewed", "commit_id": REVIEW_GATE_HEAD}]
         result = pr_review_gate.evaluate_review_gate(current, self_review=_review_gate_self_review())
         self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["review_sources"]["codex_seen"])
@@ -342,16 +351,19 @@ class PrReviewGateCancelTests(unittest.TestCase):
 
 
 class PrReviewGatePaginationTests(unittest.TestCase):
-    def test_load_state_flattens_comment_pages(self) -> None:
+    def test_load_state_flattens_comment_and_review_pages(self) -> None:
         calls = [
             {"number": 58, "reviews": [], "latestReviews": [], "comments": []},
             [{"bucket": "pass", "name": "validate"}],
             {"nameWithOwner": "heimgewebe/grabowski"},
             [[{"id": 1}], [{"id": 2}]],
+            [[{"id": 3, "commit_id": REVIEW_GATE_HEAD}]],
         ]
         with patch.object(pr_review_gate, "_run_json", side_effect=calls) as mocked:
             result = pr_review_gate.load_pr_state(Path("/tmp"), 58)
         self.assertEqual(result["reviewComments"], [{"id": 1}, {"id": 2}])
+        self.assertEqual(result["prReviews"], [{"id": 3, "commit_id": REVIEW_GATE_HEAD}])
+        self.assertIn('--slurp', mocked.call_args_list[-2].args[1])
         self.assertIn('--slurp', mocked.call_args_list[-1].args[1])
 
 class PrReviewGateTrustedSourceTests(unittest.TestCase):
@@ -405,3 +417,20 @@ class PrReviewGateCurrentHeadEvidenceTests(unittest.TestCase):
         result = pr_review_gate.evaluate_review_gate(current, self_review=review)
         self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["review_sources"]["claude_seen"])
+
+class PrReviewGateRiskPathTests(unittest.TestCase):
+    def test_core_grabowski_paths_require_independent_review(self) -> None:
+        for path in (
+            "src/grabowski_mcp.py",
+            "src/grabowski_operator.py",
+            "src/grabowski_privileged.py",
+            "tools/pr_review_gate.py",
+        ):
+            with self.subTest(path=path):
+                current = _review_gate_state(files=[path], additions=3, deletions=1)
+                review = _review_gate_self_review(claude_review={"required": False, "reason": "small diff"})
+                result = pr_review_gate.evaluate_review_gate(current, self_review=review)
+                self.assertEqual(result["verdict"], "BLOCK")
+                self.assertIn("risk path touched", result["complexity"]["reasons"])
+                self.assertIn("Claude review is required but not observed on current head", result["failures"])
+

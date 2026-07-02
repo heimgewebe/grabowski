@@ -13,7 +13,15 @@ TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reaso
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
 CODEX_MARKERS = ("codex", "chatgpt-codex")
 CLAUDE_MARKERS = ("claude", "anthropic")
-RISK_PATH_MARKERS = ('src/grabowski', 'auth', 'access', 'security', 'deploy', 'runtime', 'systemd', 'migration', 'database', 'policy', 'capabilit')
+RISK_PATH_MARKERS = ("auth", "access", "security", "deploy", "runtime", "systemd", "migration", "database", "policy", "capabilit", "operator", "mcp", "privileged", "audit", "rollback", "secret", "broker")
+RISK_PATH_PREFIXES = (
+    "src/grabowski_mcp.py",
+    "src/grabowski_operator.py",
+    "src/grabowski_privileged.py",
+    "src/grabowski_recovery.py",
+    "src/grabowski_self_deploy.py",
+    "tools/pr_review_gate.py",
+)
 PR_FIELDS = ("number", "title", "state", "isDraft", "mergeStateStatus", "headRefOid", "baseRefOid", "url", "reviewDecision", "changedFiles", "additions", "deletions", "files", "reviews", "latestReviews", "comments")
 CHECK_FIELDS = ("bucket", "completedAt", "description", "event", "link", "name", "startedAt", "state", "workflow")
 
@@ -37,21 +45,32 @@ def _run_json(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> An
     return json.loads(completed.stdout)
 
 
+def _flatten_github_pages(raw: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if isinstance(raw, list):
+        for page in raw:
+            if isinstance(page, list):
+                items.extend(item for item in page if isinstance(item, dict))
+            elif isinstance(page, dict):
+                items.append(page)
+    elif isinstance(raw, dict):
+        items.append(raw)
+    return items
+
+
 def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     view = _run_json(repo, ["gh", "pr", "view", str(pr), "--json", ",".join(PR_FIELDS)])
     checks = _run_json(repo, ["gh", "pr", "checks", str(pr), "--json", ",".join(CHECK_FIELDS)], allow_nonzero=True)
     repo_info = _run_json(repo, ["gh", "repo", "view", "--json", "nameWithOwner"])
     name = repo_info.get("nameWithOwner") if isinstance(repo_info, dict) else None
-    review_comments = []
+    review_comments: list[dict[str, Any]] = []
+    pr_reviews: list[dict[str, Any]] = []
     if isinstance(name, str) and "/" in name:
         raw_review_comments = _run_json(repo, ["gh", "api", f"repos/{name}/pulls/{pr}/comments", "--paginate", "--slurp"], allow_nonzero=True)
-        if isinstance(raw_review_comments, list):
-            for page in raw_review_comments:
-                if isinstance(page, list):
-                    review_comments.extend(item for item in page if isinstance(item, dict))
-                elif isinstance(page, dict):
-                    review_comments.append(page)
-    return {"pr": view, "checks": checks, "reviewComments": review_comments}
+        review_comments = _flatten_github_pages(raw_review_comments)
+        raw_pr_reviews = _run_json(repo, ["gh", "api", f"repos/{name}/pulls/{pr}/reviews", "--paginate", "--slurp"], allow_nonzero=True)
+        pr_reviews = _flatten_github_pages(raw_pr_reviews)
+    return {"pr": view, "checks": checks, "reviewComments": review_comments, "prReviews": pr_reviews}
 
 
 def _actor_text(item: dict[str, Any]) -> str:
@@ -95,7 +114,7 @@ def _current_head_items(pr: dict[str, Any], items: list[dict[str, Any]]) -> list
 
 def _review_items(pr: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for bucket in ("reviews", "latestReviews", "comments", "reviewComments"):
+    for bucket in ("reviews", "latestReviews", "comments", "reviewComments", "prReviews"):
         raw = pr.get(bucket)
         if isinstance(raw, list):
             items.extend(item for item in raw if isinstance(item, dict))
@@ -116,6 +135,11 @@ def _paths(pr: dict[str, Any]) -> list[str]:
     return paths
 
 
+def _is_risk_path(path: str) -> bool:
+    normalized = path.lower().lstrip("./")
+    return any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES) or any(marker in normalized for marker in RISK_PATH_MARKERS)
+
+
 def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) -> dict[str, Any]:
     changed_files = int(pr.get("changedFiles") or 0)
     changed_lines = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
@@ -124,7 +148,7 @@ def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) 
         reasons.append("many files")
     if changed_lines > 500:
         reasons.append("large diff")
-    if any(any(marker in path.lower() for marker in RISK_PATH_MARKERS) for path in _paths(pr)):
+    if any(_is_risk_path(path) for path in _paths(pr)):
         reasons.append("risk path touched")
     if isinstance(self_review, dict):
         uncertainty = self_review.get("uncertainty")
@@ -160,8 +184,10 @@ def _terminal(item: dict[str, Any]) -> bool:
 
 def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] | None = None) -> dict[str, Any]:
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
-    if isinstance(pr, dict) and isinstance(state.get("reviewComments"), list):
-        pr = {**pr, "reviewComments": state["reviewComments"]}
+    if isinstance(pr, dict):
+        extra_reviews = {key: state[key] for key in ("reviewComments", "prReviews") if isinstance(state.get(key), list)}
+        if extra_reviews:
+            pr = {**pr, **extra_reviews}
     checks = state.get("checks") if isinstance(state.get("checks"), list) else []
     all_review_items = _review_items(pr)
     items = _current_head_items(pr, all_review_items)

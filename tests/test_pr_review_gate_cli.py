@@ -42,7 +42,7 @@ class PrReviewGateCliTests(unittest.TestCase):
                 "changedFiles": 1,
                 "additions": 1,
                 "deletions": 0,
-                "files": [{"path": "tools/pr_review_gate.py"}],
+                "files": [{"path": "docs/low_risk_note.md"}],
                 "reviews": [],
                 "latestReviews": [],
                 "comments": [],
