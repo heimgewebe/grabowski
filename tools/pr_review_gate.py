@@ -137,7 +137,7 @@ def _terminal(item: dict[str, Any]) -> bool:
     return True
 
 
-def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] | None = None, require_codex: bool = True) -> dict[str, Any]:
+def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] | None = None) -> dict[str, Any]:
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     if isinstance(pr, dict) and isinstance(state.get("reviewComments"), list):
         pr = {**pr, "reviewComments": state["reviewComments"]}
@@ -155,7 +155,7 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
         failures.append("PR is already merged")
     if pr.get("isDraft") is True:
         failures.append("PR is draft")
-    if require_codex and not codex_seen:
+    if not codex_seen:
         codex = self_review.get("codex_review") if isinstance(self_review, dict) else None
         if isinstance(codex, dict) and codex.get("unavailable_reason"):
             warnings.append("Codex review unavailable but explained")
@@ -239,13 +239,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--pr", type=int, required=True)
     parser.add_argument("--self-review")
-    parser.add_argument("--allow-missing-codex", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     repo = args.repo.resolve()
     try:
         self_review = load_self_review(resolve_inside_repo(repo, args.self_review))
-        result = evaluate_review_gate(load_pr_state(repo, args.pr), self_review=self_review, require_codex=not args.allow_missing_codex)
+        result = evaluate_review_gate(load_pr_state(repo, args.pr), self_review=self_review)
     except Exception as exc:
         result = {"schema_version": 1, "verdict": "BLOCK", "failures": [str(exc)], "warnings": []}
     if args.json:
