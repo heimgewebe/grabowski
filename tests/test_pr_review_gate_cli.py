@@ -47,7 +47,7 @@ class PrReviewGateCliTests(unittest.TestCase):
                 "latestReviews": [],
                 "comments": [],
             },
-            "checks": [{"bucket": "pass", "name": "validate"}],
+            "checks": [{"bucket": "pass", "name": "validate (3.10)"}, {"bucket": "pass", "name": "validate (3.12)"}],
             "reviewComments": [],
         }
         review = {
@@ -82,7 +82,7 @@ class PrReviewGateCliTests(unittest.TestCase):
                 "latestReviews": [],
                 "comments": [],
             },
-            "checks": [{"bucket": "pass", "name": "validate"}],
+            "checks": [{"bucket": "pass", "name": "validate (3.10)"}, {"bucket": "pass", "name": "validate (3.12)"}],
             "reviewComments": [],
         }
         review = {

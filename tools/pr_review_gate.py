@@ -5,12 +5,16 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Any
 
 TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reason", "not_applicable"}
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
+STRONG_SEVERITIES = {"p0", "p1", "high", "critical"}
+BLOCKING_REVIEW_STATES = {"CHANGES_REQUESTED", "DISMISSED", "PENDING"}
+EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude", "claude[bot]", "claude-code", "claude-code[bot]", "anthropic", "anthropic[bot]"}
 RISK_PATH_MARKERS = ("auth", "access", "security", "deploy", "runtime", "systemd", "migration", "database", "policy", "capabilit", "operator", "mcp", "privileged", "audit", "rollback", "secret", "broker")
@@ -24,7 +28,7 @@ RISK_PATH_PREFIXES = (
     "src/grabowski_checkouts.py",
     "tools/pr_review_gate.py",
 )
-PR_FIELDS = ("number", "title", "state", "isDraft", "mergeStateStatus", "headRefOid", "baseRefOid", "url", "reviewDecision", "changedFiles", "additions", "deletions", "files", "reviews", "latestReviews", "comments")
+PR_FIELDS = ("number", "title", "state", "isDraft", "mergeStateStatus", "mergeable", "headRefOid", "baseRefOid", "url", "reviewDecision", "changedFiles", "additions", "deletions", "files", "reviews", "latestReviews", "comments")
 CHECK_FIELDS = ("bucket", "completedAt", "description", "event", "link", "name", "startedAt", "state", "workflow")
 
 
@@ -38,13 +42,46 @@ def _env() -> dict[str, str]:
     return env
 
 
+def _command_label(argv: list[str]) -> str:
+    visible = argv[:4]
+    suffix = " ..." if len(argv) > 4 else ""
+    return " ".join(visible) + suffix
+
+
+def _brief_error(text: str) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) > 240:
+        return collapsed[:237] + "..."
+    return collapsed
+
+
 def _run_json(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> Any:
-    completed = subprocess.run(argv, cwd=repo, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_env(), timeout=90)
+    if argv and argv[0] == "gh" and shutil.which("gh") is None:
+        raise GateInputError("gh CLI is not available in PATH")
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=repo,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_env(),
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout = int(exc.timeout or 90)
+        raise RuntimeError(f"command timed out after {timeout}s: {_command_label(argv)}") from exc
     if completed.returncode != 0 and not allow_nonzero:
-        raise RuntimeError(completed.stderr.strip() or f"command failed: {' '.join(argv)}")
+        detail = _brief_error(completed.stderr)
+        raise RuntimeError(detail or f"command failed: {_command_label(argv)}")
     if not completed.stdout.strip():
         return [] if allow_nonzero else {}
-    return json.loads(completed.stdout)
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"command did not return JSON: {_command_label(argv)}") from exc
 
 
 def _flatten_github_pages(raw: Any) -> list[dict[str, Any]]:
@@ -88,8 +125,24 @@ def _actor_logins(item: dict[str, Any]) -> set[str]:
     return logins
 
 
+def _review_state(item: dict[str, Any]) -> str:
+    value = item.get("state")
+    if isinstance(value, str):
+        return value.strip().upper()
+    return ""
+
+
+def _trusted_review_items(items: list[dict[str, Any]], trusted_actors: set[str]) -> list[dict[str, Any]]:
+    return [item for item in items if bool(_actor_logins(item) & trusted_actors)]
+
+
+def _blocking_review_states(items: list[dict[str, Any]], trusted_actors: set[str]) -> list[str]:
+    states = {state for item in _trusted_review_items(items, trusted_actors) if (state := _review_state(item)) in BLOCKING_REVIEW_STATES}
+    return sorted(states)
+
+
 def _has_trusted_actor(items: list[dict[str, Any]], trusted_actors: set[str]) -> bool:
-    return any(bool(_actor_logins(item) & trusted_actors) for item in items)
+    return any(_review_state(item) not in BLOCKING_REVIEW_STATES for item in _trusted_review_items(items, trusted_actors))
 
 
 def _item_head_sha(item: dict[str, Any]) -> str:
@@ -164,7 +217,12 @@ def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) 
 def load_self_review(path: Path | None) -> dict[str, Any] | None:
     if path is None:
         return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not path.is_file():
+        raise GateInputError(f"self-review file does not exist: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise GateInputError(f"self-review file is not valid JSON: {path}") from exc
     if not isinstance(payload, dict):
         raise GateInputError("self-review must be a JSON object")
     return payload
@@ -177,7 +235,7 @@ def _terminal(item: dict[str, Any]) -> bool:
     if status in {"accepted", "deferred_with_reason"} and not item.get("reason"):
         return False
     severity = str(item.get("severity") or "").lower()
-    strong = severity in {"p0", "p1", "high", "critical"}
+    strong = severity in STRONG_SEVERITIES
     if (item.get("materiality") == "blocking" or strong) and status in {"accepted", "deferred_with_reason"}:
         return False
     return True
@@ -192,6 +250,8 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     checks = state.get("checks") if isinstance(state.get("checks"), list) else []
     all_review_items = _review_items(pr)
     items = _current_head_items(pr, all_review_items)
+    codex_blocking_states = _blocking_review_states(items, TRUSTED_CODEX_ACTORS)
+    claude_blocking_states = _blocking_review_states(items, TRUSTED_CLAUDE_ACTORS)
     codex_seen = _has_trusted_actor(items, TRUSTED_CODEX_ACTORS)
     claude_seen = _has_trusted_actor(items, TRUSTED_CLAUDE_ACTORS)
     complexity = classify_complexity(pr, self_review)
@@ -207,7 +267,14 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     merge_state = pr.get("mergeStateStatus")
     if isinstance(merge_state, str) and merge_state and merge_state != "CLEAN":
         failures.append(f"GitHub mergeStateStatus is {merge_state}, not CLEAN")
-    if not codex_seen:
+    mergeable = pr.get("mergeable")
+    if isinstance(mergeable, str) and mergeable and mergeable != "MERGEABLE":
+        failures.append(f"GitHub mergeable is {mergeable}, not MERGEABLE")
+    if codex_blocking_states:
+        failures.append(f"Codex review has blocking state(s): {', '.join(codex_blocking_states)}")
+    if claude_blocking_states:
+        failures.append(f"Claude review has blocking state(s): {', '.join(claude_blocking_states)}")
+    if not codex_seen and not codex_blocking_states:
         codex = self_review.get("codex_review") if isinstance(self_review, dict) else None
         if isinstance(codex, dict) and codex.get("unavailable_reason"):
             warnings.append("Codex review unavailable but explained")
@@ -247,13 +314,21 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
     claude_required = complexity["complex"] or (isinstance(claude, dict) and claude.get("required") is True)
     claude_not_required = isinstance(claude, dict) and claude.get("required") is False and bool(claude.get("reason"))
-    if claude_required and not claude_seen:
+    if claude_required and not claude_seen and not claude_blocking_states:
         failures.append("Claude review is required but not observed on current head")
     if not claude_required and not claude_not_required:
         warnings.append("Claude non-requirement reason is not recorded")
 
     if not checks:
         failures.append("no status checks observed")
+    observed_expected_checks = {
+        check.get("name")
+        for check in checks
+        if isinstance(check, dict) and check.get("name") in EXPECTED_CHECK_NAMES
+    }
+    missing_expected_checks = [name for name in EXPECTED_CHECK_NAMES if name not in observed_expected_checks]
+    if missing_expected_checks:
+        failures.append(f"expected check(s) missing: {', '.join(missing_expected_checks)}")
     blocking_checks = [
         check for check in checks
         if isinstance(check, dict) and check.get("bucket") != "pass"

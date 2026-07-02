@@ -218,8 +218,6 @@ class ReadSurfaceTests(unittest.TestCase):
         supporting = {item["module"]: item["source"] for item in contract["supporting_sources"]}
         self.assertEqual(supporting["grabowski_read_surface"], "src/grabowski_read_surface.py")
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 # PR review gate tests live here to avoid relying on tool-file discovery in older runtimes.
@@ -236,7 +234,14 @@ REVIEW_GATE_HEAD = "a" * 40
 REVIEW_GATE_BASE = "b" * 40
 
 
-def _review_gate_state(*, files=None, additions=10, deletions=2, reviews=None, checks=None):
+def _review_gate_checks(*, py310="pass", py312="pass"):
+    return [
+        {"bucket": py310, "name": "validate (3.10)"},
+        {"bucket": py312, "name": "validate (3.12)"},
+    ]
+
+
+def _review_gate_state(*, files=None, additions=10, deletions=2, reviews=None, checks=None, mergeable="MERGEABLE"):
     default_files = files if files is not None else ["src/example.py"]
     default_reviews = [{"author": {"login": "chatgpt-codex-connector"}, "body": "reviewed", "commit_id": REVIEW_GATE_HEAD}]
     return {
@@ -247,6 +252,7 @@ def _review_gate_state(*, files=None, additions=10, deletions=2, reviews=None, c
             "isDraft": False,
             "headRefOid": REVIEW_GATE_HEAD,
             "baseRefOid": REVIEW_GATE_BASE,
+            "mergeable": mergeable,
             "changedFiles": len(default_files),
             "additions": additions,
             "deletions": deletions,
@@ -255,7 +261,7 @@ def _review_gate_state(*, files=None, additions=10, deletions=2, reviews=None, c
             "latestReviews": [],
             "comments": [],
         },
-        "checks": checks if checks is not None else [{"bucket": "pass", "name": "validate"}],
+        "checks": checks if checks is not None else _review_gate_checks(),
     }
 
 
@@ -302,7 +308,7 @@ class PrReviewGateTests(unittest.TestCase):
         self.assertIn("self-review head_sha mismatch", result["failures"])
 
     def test_failing_checks_block(self) -> None:
-        result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=[{"bucket": "fail", "name": "validate"}]), self_review=_review_gate_self_review())
+        result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=_review_gate_checks(py312="fail")), self_review=_review_gate_self_review())
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("1 non-green check(s)", result["failures"])
 
@@ -345,7 +351,7 @@ class PrReviewGateClaudeFindingTests(unittest.TestCase):
 
 class PrReviewGateCancelTests(unittest.TestCase):
     def test_cancelled_checks_block(self) -> None:
-        result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=[{"bucket": "cancel", "name": "validate"}]), self_review=_review_gate_self_review())
+        result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=_review_gate_checks(py312="cancel")), self_review=_review_gate_self_review())
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("1 non-green check(s)", result["failures"])
 
@@ -354,7 +360,7 @@ class PrReviewGatePaginationTests(unittest.TestCase):
     def test_load_state_flattens_comment_and_review_pages(self) -> None:
         calls = [
             {"number": 58, "reviews": [], "latestReviews": [], "comments": []},
-            [{"bucket": "pass", "name": "validate"}],
+            _review_gate_checks(),
             {"nameWithOwner": "heimgewebe/grabowski"},
             [[{"id": 1}], [{"id": 2}]],
             [[{"id": 3, "commit_id": REVIEW_GATE_HEAD}]],
@@ -384,7 +390,7 @@ class PrReviewGateTrustedSourceTests(unittest.TestCase):
         self.assertFalse(result["review_sources"]["claude_seen"])
 
     def test_skipping_checks_block(self) -> None:
-        result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=[{"bucket": "skipping", "name": "validate"}]), self_review=_review_gate_self_review())
+        result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=_review_gate_checks(py312="skipping")), self_review=_review_gate_self_review())
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("1 non-green check(s)", result["failures"])
 
@@ -434,3 +440,55 @@ class PrReviewGateRiskPathTests(unittest.TestCase):
                 self.assertIn("risk path touched", result["complexity"]["reasons"])
                 self.assertIn("Claude review is required but not observed on current head", result["failures"])
 
+class PrReviewGateStateAndCheckTests(unittest.TestCase):
+    def test_trusted_codex_changes_requested_blocks(self) -> None:
+        current = _review_gate_state(reviews=[{"author": {"login": "chatgpt-codex-connector"}, "commit_id": REVIEW_GATE_HEAD, "state": "CHANGES_REQUESTED"}])
+        result = pr_review_gate.evaluate_review_gate(current, self_review=_review_gate_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["review_sources"]["codex_seen"])
+        self.assertIn("Codex review has blocking state(s): CHANGES_REQUESTED", result["failures"])
+
+    def test_required_claude_pending_blocks(self) -> None:
+        current = _review_gate_state(reviews=[
+            {"author": {"login": "chatgpt-codex-connector"}, "commit_id": REVIEW_GATE_HEAD},
+            {"author": {"login": "claude-code"}, "commit_id": REVIEW_GATE_HEAD, "state": "PENDING"},
+        ])
+        result = pr_review_gate.evaluate_review_gate(current, self_review=_review_gate_self_review(claude_review={"required": True, "reason": "risk"}))
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["review_sources"]["claude_seen"])
+        self.assertIn("Claude review has blocking state(s): PENDING", result["failures"])
+
+    def test_untrusted_actor_with_codex_name_does_not_count(self) -> None:
+        current = _review_gate_state(reviews=[{"author": {"login": "not-chatgpt-codex-connector"}, "commit_id": REVIEW_GATE_HEAD}])
+        result = pr_review_gate.evaluate_review_gate(current, self_review=_review_gate_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["review_sources"]["codex_seen"])
+        self.assertIn("Codex review was not observed", result["failures"])
+
+    def test_missing_expected_matrix_check_blocks(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=[{"bucket": "pass", "name": "validate (3.10)"}]), self_review=_review_gate_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("expected check(s) missing: validate (3.12)", result["failures"])
+
+    def test_expected_matrix_checks_pass_without_missing_check_block(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(_review_gate_state(), self_review=_review_gate_self_review())
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertFalse(any("expected check(s) missing" in failure for failure in result["failures"]))
+
+    def test_expected_py312_non_pass_states_block(self) -> None:
+        for bucket in ("fail", "pending", "cancel", "skipping"):
+            with self.subTest(bucket=bucket):
+                result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=_review_gate_checks(py312=bucket)), self_review=_review_gate_self_review())
+                self.assertEqual(result["verdict"], "BLOCK")
+                self.assertIn("1 non-green check(s)", result["failures"])
+
+    def test_mergeable_conflicting_or_unknown_blocks(self) -> None:
+        for mergeable in ("CONFLICTING", "UNKNOWN"):
+            with self.subTest(mergeable=mergeable):
+                result = pr_review_gate.evaluate_review_gate(_review_gate_state(mergeable=mergeable), self_review=_review_gate_self_review())
+                self.assertEqual(result["verdict"], "BLOCK")
+                self.assertIn(f"GitHub mergeable is {mergeable}, not MERGEABLE", result["failures"])
+
+
+if __name__ == "__main__":
+    unittest.main()
