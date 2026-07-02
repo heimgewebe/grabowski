@@ -35,6 +35,7 @@ CORE_TOOLS = {
     "rlens_bundle_discover",
     "rlens_bundle_status",
     "rlens_freshness_check",
+    "rlens_context_pack",
 }
 OPERATOR_ORIENTATION_TOOLS = {
     "grabowski_runtime_health",
@@ -42,6 +43,7 @@ OPERATOR_ORIENTATION_TOOLS = {
     "rlens_bundle_discover",
     "rlens_bundle_status",
     "rlens_freshness_check",
+    "rlens_context_pack",
 }
 
 

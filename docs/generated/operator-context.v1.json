@@ -260,6 +260,17 @@
       "tool": "rlens_freshness_check"
     },
     {
+      "category": "knowledge",
+      "description": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",
+      "effects": [],
+      "id": "rlens_context_pack",
+      "purpose": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_context_pack"
+    },
+    {
       "category": "context",
       "description": "Return minimal Grabowski deployment, audit and kill-switch health.",
       "effects": [],
@@ -1224,6 +1235,7 @@
       "rlens_bundle_discover",
       "rlens_bundle_status",
       "rlens_freshness_check",
+      "rlens_context_pack",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -1379,7 +1391,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "f8643d440e66ca5f2ce9567f22da647abd4e3d900016c63d5a9f6cfde3e47bde"
+      "sha256": "f6457418e784976154e86a97f2d51aefec2b9e392f60d3ac0c526373a5849fa5"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1387,15 +1399,15 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "fc5541415367f48933c1739c0b30028ae9c069630e51bd6850634f6755e13e6e"
+      "sha256": "e585ae45db77ccdac0875506053140cf3cf33390ef371ae3f44ec636738f5e7f"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "f8643d440e66ca5f2ce9567f22da647abd4e3d900016c63d5a9f6cfde3e47bde",
+      "src/grabowski_capabilities.py": "f6457418e784976154e86a97f2d51aefec2b9e392f60d3ac0c526373a5849fa5",
       "src/grabowski_checkouts.py": "628c51240e773330e5958dd83ff4b30b651ed411d10fbf0b24764c07fe107342",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
       "src/grabowski_friction.py": "d67b979ee30bbd1e812857acfddb34e1daca0b60c6ef99226db2bcd2b38ed20a",
-      "src/grabowski_mcp.py": "9d2541d257bbf26e8474e14ebeb45ced94fe56ed2556d5ca59c9791ce9f128d0",
+      "src/grabowski_mcp.py": "417ff3cc9e969eb7788612ffab90093517946bc797367f633f62228bfb26acda",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "a2ded1c251b2b478a70dc4186ef004b009d1d34c1b931b1c1d8f9ac2ff3911fd",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",

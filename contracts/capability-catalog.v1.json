@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "f8643d440e66ca5f2ce9567f22da647abd4e3d900016c63d5a9f6cfde3e47bde",
+  "capability_source_sha256": "f6457418e784976154e86a97f2d51aefec2b9e392f60d3ac0c526373a5849fa5",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "fc5541415367f48933c1739c0b30028ae9c069630e51bd6850634f6755e13e6e",
+  "contract_sha256": "e585ae45db77ccdac0875506053140cf3cf33390ef371ae3f44ec636738f5e7f",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -270,6 +270,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "rlens_freshness_check"
+    },
+    {
+      "category": "knowledge",
+      "description": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",
+      "effects": [],
+      "id": "rlens_context_pack",
+      "purpose": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_context_pack"
     },
     {
       "category": "context",

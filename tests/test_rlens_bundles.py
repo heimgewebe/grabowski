@@ -149,6 +149,45 @@ class RlensBundleToolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mcp.rlens_bundle_discover(repo="../demo")
 
+    def test_context_pack_builds_context_ref(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        manifest = self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        manifest_sha = __import__("hashlib").sha256(manifest.read_bytes()).hexdigest()
+        preflight = {"status": "pass", "answer_compliance_template": {"task_profile": "basic_repo_question"}}
+
+        with patch.object(mcp, "_rlens_agent_preflight", return_value=preflight):
+            result = mcp.rlens_context_pack("demo-repo", "basic_repo_question")
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["preflight"]["status"], "pass")
+        self.assertEqual(result["freshness"]["freshness"], "fresh_exact")
+        ref = result["context_ref"]
+        self.assertEqual(ref["repo"], "demo-repo")
+        self.assertEqual(ref["stem"], "demo-repo-max-260701-1200")
+        self.assertEqual(ref["manifest_sha256"], manifest_sha)
+        self.assertEqual(ref["bundle_commit"], head)
+        self.assertEqual(ref["live_commit_at_claim"], head)
+        self.assertEqual(ref["preflight_status"], "pass")
+    def test_context_pack_rejects_cross_repo_stem(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("other-repo-max-260701-1200", commit=head)
+
+        result = mcp.rlens_context_pack(
+            "demo-repo",
+            "basic_repo_question",
+            "other-repo-max-260701-1200",
+        )
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "bundle_repo_mismatch")
+        self.assertEqual(result["bundle_repo"], "other-repo")
+
+
+    def test_context_pack_reports_missing_bundle(self) -> None:
+        result = mcp.rlens_context_pack("missing-repo", "basic_repo_question")
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "no_bundle_available")
+
 
 if __name__ == "__main__":
     unittest.main()
