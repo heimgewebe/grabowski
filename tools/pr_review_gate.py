@@ -72,6 +72,27 @@ def _has_marker(items: list[dict[str, Any]], markers: tuple[str, ...]) -> bool:
     return any(any(marker in _actor_text(item) for marker in markers) for item in items)
 
 
+def _item_head_sha(item: dict[str, Any]) -> str:
+    for key in ("commit_id", "commitId", "commitOID", "commitOid"):
+        value = item.get(key)
+        if isinstance(value, str):
+            return value
+    commit = item.get("commit")
+    if isinstance(commit, dict):
+        for key in ("oid", "id"):
+            value = commit.get(key)
+            if isinstance(value, str):
+                return value
+    return ""
+
+
+def _current_head_items(pr: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    head = pr.get("headRefOid")
+    if not isinstance(head, str) or not head:
+        return []
+    return [item for item in items if _item_head_sha(item) == head]
+
+
 def _review_items(pr: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for bucket in ("reviews", "latestReviews", "comments", "reviewComments"):
@@ -142,7 +163,8 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     if isinstance(pr, dict) and isinstance(state.get("reviewComments"), list):
         pr = {**pr, "reviewComments": state["reviewComments"]}
     checks = state.get("checks") if isinstance(state.get("checks"), list) else []
-    items = _review_items(pr)
+    all_review_items = _review_items(pr)
+    items = _current_head_items(pr, all_review_items)
     codex_seen = _has_marker(items, CODEX_MARKERS)
     claude_seen = _has_marker(items, CLAUDE_MARKERS)
     complexity = classify_complexity(pr, self_review)

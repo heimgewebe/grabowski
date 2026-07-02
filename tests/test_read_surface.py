@@ -249,7 +249,7 @@ def _review_gate_state(*, files=None, additions=10, deletions=2, reviews=None, c
             "additions": additions,
             "deletions": deletions,
             "files": [{"path": path} for path in (files or ["src/example.py"])],
-            "reviews": reviews or [{"author": {"login": "chatgpt-codex-connector"}, "body": "reviewed"}],
+            "reviews": reviews or [{"author": {"login": "chatgpt-codex-connector"}, "body": "reviewed", "commit_id": REVIEW_GATE_HEAD}],
             "latestReviews": [],
             "comments": [],
         },
