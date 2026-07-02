@@ -2490,6 +2490,7 @@ def _operator_relay_protocol() -> dict[str, Any]:
             "patch_file_relay": "operator_patch_relay",
             "patch_fallback": "aider_no_auto_commit",
             "audit": "grabowski_git",
+            "repo_state_context": "steuerboard_operator_report",
         },
         "does_not_establish": [
             "new_privileges",
@@ -2498,6 +2499,7 @@ def _operator_relay_protocol() -> dict[str, Any]:
             "automatic_deploy",
             "free_shell_as_default_path",
             "durable_agent_autonomy",
+            "steuerboard_report_action_approval",
         ],
     }
 

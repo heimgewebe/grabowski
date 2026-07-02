@@ -320,7 +320,7 @@ Every slice should state:
 - tests or read-only receipts,
 - rollback or stop condition,
 - whether Operator-Lab Run Card is required,
-- Steuerboard signal: operation, target_repo, useful_signal, changed_decision and noise.
+- Lightweight repo-state context signal when target state matters; no separate trial metric after the accepted probe run.
 
 ## Success definition
 

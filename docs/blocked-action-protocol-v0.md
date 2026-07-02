@@ -50,6 +50,12 @@ Die kleinste Handlung muss beantworten:
    - Nach jedem Ersatzgriff wird zuerst Status, Logs, Diff, Testausgabe oder ein anderes Receipt gelesen.
    - Erst danach entscheidet ChatGPT den naechsten Griff.
 
+3a. **Steuerboard context signal**
+   - Bei Repo-, PR-, Branch-, Pull-, Switch- und Merge-Prep-Arbeit kann `steuerboard operator report --branch-warning-threshold 5 --json` als leichter read-only Kontextgriff genutzt werden, wenn die Zielrepo-Lage relevant ist.
+   - Der Probelauf gilt als bestanden; es wird keine separate `useful_signal`/`changed_decision`/`noise` Trial-Metrik weitergefuehrt.
+   - Nur zielbezogene Felder zaehlen. Globale Branch-Drift ist Kontext, kein Alarm.
+   - Der Report ist kein Gate, keine Genehmigung und kein Ersatz fuer Git-Status, PR-Checks, Review-Gates oder Action-Readiness.
+
 Danach wird nach Aufgabenklasse geroutet.
 
 4. **Codex exec/review**
@@ -84,6 +90,7 @@ Danach wird nach Aufgabenklasse geroutet.
 | Blockierte Klasse | Primaerer Ersatz | Warum | Ruecknahmebeleg |
 | --- | --- | --- | --- |
 | Status/Health blockiert | engeres Typed Tool oder Micro-Task | geringes Risiko, sofort pruefbar | Status JSON oder Logtail |
+| Repo-/Branch-Lage fuer Zielrepo unklar | Steuerboard operator report | leichtes read-only Lagebild ohne Freigabe | operator-report JSON, nur zielrelevante Felder |
 | kurzer Shell-Griff blockiert | Grabowski Micro-Task | bleibt unter Grabowski-Audit | task_id, status, logs |
 | komplexer Code-/Repo-Slice | Codex exec/review | Standard fuer anspruchsvolle Repo-Arbeit | diff, changed files, Tests |
 | lokaler Patch aus Chat/Artefakt | operator_patch_relay.py | prueft und wendet lokal mit Head- und Dirty-Gates an | JSON-Receipt plus Git-Diff |

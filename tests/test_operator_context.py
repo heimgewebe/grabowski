@@ -103,6 +103,14 @@ class OperatorContextTests(unittest.TestCase):
             "automatic_merge",
             protocol["does_not_establish"],
         )
+        self.assertEqual(
+            protocol["routing_roles"]["repo_state_context"],
+            "steuerboard_operator_report",
+        )
+        self.assertIn(
+            "steuerboard_report_action_approval",
+            protocol["does_not_establish"],
+        )
 
     def test_branch_control_is_typed_and_guarded(self) -> None:
         source = (

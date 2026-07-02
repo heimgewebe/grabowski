@@ -15,6 +15,7 @@ This document describes the repository contract. Current runtime state must be r
 - Patch file relay: local patch files use `tools/operator_patch_relay.py` for check/apply receipts before user manual execution.
 - Review: Claude for architecture and safety review.
 - Session: tmux first; agy only when available and better for resume.
+- Steuerboard: `operator report` is a lightweight read-only repo-state context signal; no separate trial/noise logging; never an approval gate.
 
 ## Contract integrity
 
