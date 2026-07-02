@@ -64,3 +64,38 @@ class PrReviewGateCliTests(unittest.TestCase):
         result = pr_review_gate.evaluate_review_gate(state, self_review=review)
         self.assertEqual(result["verdict"], "PASS")
         self.assertIn("Codex review unavailable but explained", result["warnings"])
+
+    def test_core_grabowski_paths_require_independent_review(self) -> None:
+        head = "a" * 40
+        state = {
+            "pr": {
+                "number": 58,
+                "state": "OPEN",
+                "isDraft": False,
+                "headRefOid": head,
+                "baseRefOid": "b" * 40,
+                "changedFiles": 1,
+                "additions": 1,
+                "deletions": 0,
+                "files": [{"path": "src/grabowski_mcp.py"}],
+                "reviews": [{"author": {"login": "chatgpt-codex-connector"}, "commit_id": head}],
+                "latestReviews": [],
+                "comments": [],
+            },
+            "checks": [{"bucket": "pass", "name": "validate"}],
+            "reviewComments": [],
+        }
+        review = {
+            "head_sha": head,
+            "diff_reviewed": True,
+            "all_findings_triaged": True,
+            "review_iterations": [{"n": 1, "summary": "reviewed", "material_findings": 0}],
+            "stop_reason": "clean_pass",
+            "findings": [],
+            "material_findings_remaining": 0,
+            "claude_review": {"required": False, "reason": "claimed small"},
+        }
+        result = pr_review_gate.evaluate_review_gate(state, self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("risk path touched", result["complexity"]["reasons"])
+        self.assertIn("Claude review is required but not observed on current head", result["failures"])
