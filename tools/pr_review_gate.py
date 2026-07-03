@@ -315,6 +315,20 @@ def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any) -> list[str
     return failures
 
 
+def _material_findings_remaining(self_review: dict[str, Any], failures: list[str]) -> int | None:
+    if "material_findings_remaining" not in self_review:
+        failures.append("self-review material_findings_remaining is missing")
+        return None
+    remaining = self_review.get("material_findings_remaining")
+    if isinstance(remaining, bool) or not isinstance(remaining, int):
+        failures.append("self-review material_findings_remaining must be an integer")
+        return None
+    if remaining < 0:
+        failures.append("self-review material_findings_remaining must not be negative")
+        return None
+    return remaining
+
+
 def _terminal(item: dict[str, Any]) -> bool:
     status = item.get("status")
     if status not in TERMINAL_STATUSES:
@@ -396,10 +410,10 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
             for index, finding in enumerate(findings):
                 if not isinstance(finding, dict) or not _terminal(finding):
                     failures.append(f"finding {index} is not terminally triaged")
-        remaining = self_review.get("material_findings_remaining")
+        remaining = _material_findings_remaining(self_review, failures)
         residual = self_review.get("residual_risk")
         accepted_residual = isinstance(residual, dict) and residual.get("accepted") is True and bool(residual.get("reason"))
-        if isinstance(remaining, int) and remaining > 0 and not accepted_residual:
+        if remaining is not None and remaining > 0 and not accepted_residual:
             failures.append("material findings remain without accepted residual-risk reason")
 
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
