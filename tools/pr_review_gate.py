@@ -227,6 +227,94 @@ def load_self_review(path: Path | None) -> dict[str, Any] | None:
     return payload
 
 
+def load_claude_evidence(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    if not path.is_file():
+        raise GateInputError(f"Claude evidence file does not exist: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise GateInputError(f"Claude evidence file is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise GateInputError("Claude evidence must be a JSON object")
+    return payload
+
+
+def _valid_sha256(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(char in "0123456789abcdef" for char in value.lower())
+
+
+def _claude_ultrareview_command_matches(command: Any, pr_number: Any) -> bool:
+    if not isinstance(command, list) or len(command) < 3:
+        return False
+    first = command[0]
+    second = command[1]
+    if not isinstance(first, str) or Path(first).name != "claude":
+        return False
+    if second != "ultrareview":
+        return False
+    index = 2
+    while index < len(command):
+        value = command[index]
+        if value == "--timeout":
+            index += 2
+            continue
+        if value == "--json":
+            index += 1
+            continue
+        if isinstance(value, str) and value.startswith("-"):
+            index += 1
+            continue
+        return str(value) == str(pr_number)
+    return False
+
+
+def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any) -> list[str]:
+    if evidence is None:
+        return []
+    if not isinstance(evidence, dict):
+        return ["evidence is not a JSON object"]
+    failures: list[str] = []
+    head = pr.get("headRefOid")
+    pr_number = pr.get("number")
+    if evidence.get("schema_version") != 1:
+        failures.append("schema_version is not 1")
+    if evidence.get("kind") != "claude_ultrareview":
+        failures.append("kind is not claude_ultrareview")
+    if pr_number is not None and str(evidence.get("pr")) != str(pr_number):
+        failures.append("pr number mismatch")
+    if not isinstance(head, str) or not head:
+        failures.append("PR headRefOid is missing")
+    else:
+        if evidence.get("head_sha") != head:
+            failures.append("head_sha mismatch")
+        if evidence.get("expected_head_sha") != head:
+            failures.append("expected_head_sha mismatch")
+    if evidence.get("tool") != "claude-code":
+        failures.append("tool is not claude-code")
+    if not isinstance(evidence.get("tool_version"), str) or not evidence.get("tool_version"):
+        failures.append("tool_version is missing")
+    if not _claude_ultrareview_command_matches(evidence.get("command"), pr_number):
+        failures.append("command is not claude ultrareview for this PR")
+    if evidence.get("exit_code") != 0:
+        failures.append(f"exit_code is {evidence.get('exit_code')}, not 0")
+    if evidence.get("json_ok") is not True:
+        failures.append("json_ok is not true")
+    if evidence.get("verdict") != "PASS":
+        failures.append(f"verdict is {evidence.get('verdict')}, not PASS")
+    if evidence.get("finding_count") != 0:
+        failures.append(f"finding_count is {evidence.get('finding_count')}, not 0")
+    if evidence.get("findings_triaged") is not True:
+        failures.append("findings_triaged is not true")
+    for key in ("stdout_sha256", "stderr_sha256"):
+        if not _valid_sha256(evidence.get(key)):
+            failures.append(f"{key} is missing or invalid")
+    return failures
+
+
 def _terminal(item: dict[str, Any]) -> bool:
     status = item.get("status")
     if status not in TERMINAL_STATUSES:
@@ -240,7 +328,7 @@ def _terminal(item: dict[str, Any]) -> bool:
     return True
 
 
-def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] | None = None) -> dict[str, Any]:
+def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] | None = None, claude_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     if isinstance(pr, dict):
         extra_reviews = {key: state[key] for key in ("reviewComments", "prReviews") if isinstance(state.get(key), list)}
@@ -253,6 +341,8 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     claude_blocking_states = _blocking_review_states(items, TRUSTED_CLAUDE_ACTORS)
     codex_seen = _has_trusted_actor(items, TRUSTED_CODEX_ACTORS)
     claude_seen = _has_trusted_actor(items, TRUSTED_CLAUDE_ACTORS)
+    claude_cli_failures = _claude_cli_evidence_failures(pr, claude_evidence)
+    claude_cli_seen = claude_evidence is not None and not claude_cli_failures
     complexity = classify_complexity(pr, self_review)
     failures: list[str] = []
     warnings: list[str] = []
@@ -273,6 +363,8 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
         failures.append(f"Codex review has blocking state(s): {', '.join(codex_blocking_states)}")
     if claude_blocking_states:
         failures.append(f"Claude review has blocking state(s): {', '.join(claude_blocking_states)}")
+    for failure in claude_cli_failures:
+        failures.append(f"Claude CLI evidence invalid: {failure}")
     if not codex_seen and not codex_blocking_states:
         codex = self_review.get("codex_review") if isinstance(self_review, dict) else None
         if isinstance(codex, dict) and codex.get("unavailable_reason"):
@@ -313,7 +405,7 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
     claude_required = complexity["complex"] or (isinstance(claude, dict) and claude.get("required") is True)
     claude_not_required = isinstance(claude, dict) and claude.get("required") is False and bool(claude.get("reason"))
-    if claude_required and not claude_seen and not claude_blocking_states:
+    if claude_required and not (claude_seen or claude_cli_seen) and not claude_blocking_states:
         failures.append("Claude review is required but not observed on current head")
     if not claude_required and not claude_not_required:
         warnings.append("Claude non-requirement reason is not recorded")
@@ -341,12 +433,12 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
         "failures": failures,
         "warnings": warnings,
         "repo_pr": {"number": pr.get("number"), "title": pr.get("title"), "url": pr.get("url"), "head_sha": pr.get("headRefOid"), "base_sha": pr.get("baseRefOid")},
-        "review_sources": {"codex_seen": codex_seen, "claude_seen": claude_seen, "review_item_count": len(all_review_items), "current_head_review_item_count": len(items)},
+        "review_sources": {"codex_seen": codex_seen, "claude_seen": claude_seen, "claude_cli_seen": claude_cli_seen, "review_item_count": len(all_review_items), "current_head_review_item_count": len(items)},
         "complexity": complexity,
     }
 
 
-def resolve_inside_repo(repo: Path, raw: str | None) -> Path | None:
+def resolve_inside_repo(repo: Path, raw: str | None, *, label: str = "self-review") -> Path | None:
     if not raw:
         return None
     candidate = Path(raw)
@@ -355,7 +447,7 @@ def resolve_inside_repo(repo: Path, raw: str | None) -> Path | None:
     resolved = candidate.resolve()
     root = repo.resolve()
     if resolved != root and root not in resolved.parents:
-        raise GateInputError("self-review path must stay inside repo")
+        raise GateInputError(f"{label} path must stay inside repo")
     return resolved
 
 
@@ -364,12 +456,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--pr", type=int, required=True)
     parser.add_argument("--self-review")
+    parser.add_argument("--claude-evidence")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     repo = args.repo.resolve()
     try:
-        self_review = load_self_review(resolve_inside_repo(repo, args.self_review))
-        result = evaluate_review_gate(load_pr_state(repo, args.pr), self_review=self_review)
+        self_review = load_self_review(resolve_inside_repo(repo, args.self_review, label="self-review"))
+        claude_evidence = load_claude_evidence(resolve_inside_repo(repo, args.claude_evidence, label="Claude evidence"))
+        result = evaluate_review_gate(load_pr_state(repo, args.pr), self_review=self_review, claude_evidence=claude_evidence)
     except Exception as exc:
         result = {"schema_version": 1, "verdict": "BLOCK", "failures": [str(exc)], "warnings": []}
     if args.json:

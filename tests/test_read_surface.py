@@ -281,6 +281,30 @@ def _review_gate_self_review(**overrides):
     return payload
 
 
+def _review_gate_claude_evidence(**overrides):
+    payload = {
+        "schema_version": 1,
+        "kind": "claude_ultrareview",
+        "repo": "heimgewebe/grabowski",
+        "pr": 12,
+        "head_sha": REVIEW_GATE_HEAD,
+        "expected_head_sha": REVIEW_GATE_HEAD,
+        "tool": "claude-code",
+        "tool_version": "2.1.197 (Claude Code)",
+        "command": ["claude", "ultrareview", "12", "--json", "--timeout", "30"],
+        "exit_code": 0,
+        "json_ok": True,
+        "json_shape": "list",
+        "finding_count": 0,
+        "findings_triaged": True,
+        "verdict": "PASS",
+        "stdout_sha256": "0" * 64,
+        "stderr_sha256": "1" * 64,
+    }
+    payload.update(overrides)
+    return payload
+
+
 class PrReviewGateTests(unittest.TestCase):
     def test_blocks_low_severity_findings_without_terminal_state(self) -> None:
         review = _review_gate_self_review(findings=[{"id": "p3", "severity": "p3", "status": "fixed"}, {"id": "info", "severity": "info", "status": "untriaged"}])
@@ -424,6 +448,36 @@ class PrReviewGateCurrentHeadEvidenceTests(unittest.TestCase):
         result = pr_review_gate.evaluate_review_gate(current, self_review=review)
         self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["review_sources"]["claude_seen"])
+
+    def test_current_head_claude_cli_evidence_satisfies_complex_pr(self) -> None:
+        current = _review_gate_state(files=["src/grabowski_runtime.py"], additions=700, deletions=1)
+        current["pr"]["reviews"] = [{"author": {"login": "chatgpt-codex-connector"}, "commit": {"oid": REVIEW_GATE_HEAD}}]
+        review = _review_gate_self_review(claude_review={"required": True, "reason": "complex"})
+        result = pr_review_gate.evaluate_review_gate(current, self_review=review, claude_evidence=_review_gate_claude_evidence())
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertFalse(result["review_sources"]["claude_seen"])
+        self.assertTrue(result["review_sources"]["claude_cli_seen"])
+
+    def test_claude_cli_head_mismatch_blocks(self) -> None:
+        current = _review_gate_state(files=["src/grabowski_runtime.py"], additions=700, deletions=1)
+        current["pr"]["reviews"] = [{"author": {"login": "chatgpt-codex-connector"}, "commit": {"oid": REVIEW_GATE_HEAD}}]
+        review = _review_gate_self_review(claude_review={"required": True, "reason": "complex"})
+        evidence = _review_gate_claude_evidence(head_sha="d" * 40)
+        result = pr_review_gate.evaluate_review_gate(current, self_review=review, claude_evidence=evidence)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["review_sources"]["claude_cli_seen"])
+        self.assertIn("Claude CLI evidence invalid: head_sha mismatch", result["failures"])
+
+    def test_claude_cli_findings_block(self) -> None:
+        current = _review_gate_state(files=["src/grabowski_runtime.py"], additions=700, deletions=1)
+        current["pr"]["reviews"] = [{"author": {"login": "chatgpt-codex-connector"}, "commit": {"oid": REVIEW_GATE_HEAD}}]
+        review = _review_gate_self_review(claude_review={"required": True, "reason": "complex"})
+        evidence = _review_gate_claude_evidence(verdict="BLOCK", finding_count=1, findings_triaged=False)
+        result = pr_review_gate.evaluate_review_gate(current, self_review=review, claude_evidence=evidence)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("Claude CLI evidence invalid: verdict is BLOCK, not PASS", result["failures"])
+        self.assertIn("Claude CLI evidence invalid: finding_count is 1, not 0", result["failures"])
+
 
 class PrReviewGateRiskPathTests(unittest.TestCase):
     def test_core_grabowski_paths_require_independent_review(self) -> None:

@@ -29,6 +29,7 @@ class PrReviewGateCliTests(unittest.TestCase):
         marker = "cod" + "ex"
         self.assertNotIn("--allow-missing-" + marker, source)
         self.assertNotIn("require_" + marker, source)
+        self.assertIn("--claude-evidence", source)
 
     def test_unavailable_review_reason_warns_but_no_cli_bypass_exists(self) -> None:
         marker = "cod" + "ex"
