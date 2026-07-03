@@ -171,6 +171,46 @@ class CheckoutLifecycleTests(unittest.TestCase):
 
         self.assertEqual(archive["audit"]["coordination_checked"]["processes"], 0)
 
+
+    def test_archive_preserves_repo_scoped_task_blocker(self) -> None:
+        with checkouts.tasks._database() as connection:
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    task_id, host, unit, attempt, state, resume_policy,
+                    argv_json, argv_sha256, cwd, runtime_seconds,
+                    cpu_weight, io_weight, memory_max_bytes,
+                    created_at_unix, updated_at_unix, launcher_json,
+                    last_observation_json, resource_keys_json, lease_owner_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "e" * 24,
+                    "local",
+                    "grabowski-task-" + "e" * 24 + "-a1.service",
+                    1,
+                    "running",
+                    "manual",
+                    '["/bin/true"]',
+                    "f" * 64,
+                    str(self.repo),
+                    60,
+                    100,
+                    100,
+                    None,
+                    int(time.time()),
+                    int(time.time()),
+                    "{}",
+                    None,
+                    json.dumps([f"repo:{self.repo}"]),
+                    "task:" + "e" * 24,
+                ),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "tasks=1"):
+            self._archive()
+
     def test_inventory_is_deterministic_and_shows_linked_checkout(self) -> None:
         first = checkouts.checkout_inventory(
             self.repo,

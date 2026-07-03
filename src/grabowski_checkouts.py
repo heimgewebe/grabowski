@@ -825,7 +825,7 @@ def _linked_checkout_coordination(
                 continue
             lease = {**lease, "blocking": owner is None or lease["owner_id"] != owner}
             resource_blockers.append(lease)
-    task_blockers = _task_records([checkout_path]) if include_tasks else []
+    task_blockers = _task_records([checkout_path, repo_path]) if include_tasks else []
     process_blockers = _processes_under([checkout_path]) if include_processes else []
     return _coordination_result(resource_blockers, task_blockers, process_blockers)
 
