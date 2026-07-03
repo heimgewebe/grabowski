@@ -37,6 +37,17 @@ GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT=/tmp/grabowski-chronik-smoke
 
 If no state root is given, events use the normal Grabowski state root. Do not use the normal state root for smoke tests.
 
+## Activation model
+
+The current writer reads these switches from the running Grabowski process environment. Setting the variables on a child command, in a shell, or inside the durable task payload does not enable writing for `grabowski_task_start`, because task-state updates happen in the already-running MCP process.
+
+Therefore a real `grabowski_task_start` activation smoke is not authorized by this runbook unless one of these seams exists:
+
+- the Grabowski service is deliberately restarted with a temporary state root, then reverted and restarted again, or
+- a future per-task opt-in flag is added to the task API and persisted with the task record.
+
+Until then, only the isolated writer smoke below is allowed.
+
 ## Safe temporary smoke
 
 Use a temporary state root and the deployed runtime interpreter.
@@ -102,9 +113,14 @@ This runbook does not authorize:
 
 ## Escalation rule
 
-A real activation test using `grabowski_task_start` is allowed only after the temporary smoke and demo-view check pass.
+Do not run a real `grabowski_task_start` activation smoke merely by setting environment variables on the task command. That does not affect the MCP process that writes task-state events.
 
-The real task test must still use a temporary state root and must not enable auto-flush.
+A real task smoke requires a separate activation seam:
+
+1. temporary service-level environment plus explicit revert, or
+2. a future per-task opt-in flag in `grabowski_task_start`.
+
+The second option is preferred. The first option is operationally riskier because a failed revert could leave the writer globally enabled.
 
 ## Exit criteria
 
