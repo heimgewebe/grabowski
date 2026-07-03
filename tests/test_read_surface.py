@@ -218,5 +218,6 @@ class ReadSurfaceTests(unittest.TestCase):
         supporting = {item["module"]: item["source"] for item in contract["supporting_sources"]}
         self.assertEqual(supporting["grabowski_read_surface"], "src/grabowski_read_surface.py")
 
+
 if __name__ == "__main__":
     unittest.main()
