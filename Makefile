@@ -14,6 +14,7 @@ syntax:
 >$(PYTHON) -m py_compile src/grabowski_mcp.py
 >$(PYTHON) -m py_compile src/grabowski_operator.py
 >$(PYTHON) -m py_compile src/grabowski_capabilities.py
+>$(PYTHON) -m py_compile src/grabowski_chronik.py
 >$(PYTHON) -m py_compile src/grabowski_runtime_extensions.py
 >$(PYTHON) -m py_compile src/grabowski_read_surface.py
 >$(PYTHON) -m py_compile src/grabowski_self_deploy.py
