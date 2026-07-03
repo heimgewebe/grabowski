@@ -1356,6 +1356,10 @@
         "source": "src/grabowski_tasks.py"
       },
       {
+        "module": "grabowski_chronik",
+        "source": "src/grabowski_chronik.py"
+      },
+      {
         "module": "grabowski_recovery",
         "source": "src/grabowski_recovery.py"
       },
@@ -1401,12 +1405,13 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "e585ae45db77ccdac0875506053140cf3cf33390ef371ae3f44ec636738f5e7f"
+      "sha256": "b6a33c817201f03884150f494f0a9fd77a3cfbe84862bbacfa2748098c3c8514"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
       "src/grabowski_capabilities.py": "f6457418e784976154e86a97f2d51aefec2b9e392f60d3ac0c526373a5849fa5",
       "src/grabowski_checkouts.py": "628c51240e773330e5958dd83ff4b30b651ed411d10fbf0b24764c07fe107342",
+      "src/grabowski_chronik.py": "d05d9cc3b76ec3918fd5eeb0c5eb80b0746918a4b625ae7c29da0c9a7f83b288",
       "src/grabowski_fleet.py": "1ae94cb9bb62707aa62dd4d592dc5fa85652e2f5db361d339ca60bc6ac3a4c4f",
       "src/grabowski_friction.py": "d67b979ee30bbd1e812857acfddb34e1daca0b60c6ef99226db2bcd2b38ed20a",
       "src/grabowski_mcp.py": "c2f669c8ba1e0a6166263e363e31ca4d9fbc3b0b8c118ea307c1c062e9c0d563",
@@ -1420,7 +1425,7 @@
       "src/grabowski_runtime_extensions.py": "3092fc1e9031cc2d3beb9e6e1e2a43ea31d68fe07cc6186055d06dacb56e87ed",
       "src/grabowski_self_deploy.py": "1c3e33310eecf259c636c6250f1f01618a0e0589ca85c2a9f8ed84cf025a9674",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "559a1ef7423c4b59b656bf6ea228a294f998f3086c19cf52412407bc6d6ed036",
+      "src/grabowski_tasks.py": "3394c728fd476838dd1d8e1cb447a0cb2b25219372eeda0661f1d0cf36a65270",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "d7936328f8967aba1b2b853547e4e3422899a3454e6459e32e0ef6a51e5d8aa2"
     }

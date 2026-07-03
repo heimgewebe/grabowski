@@ -13,6 +13,7 @@ from typing import Any
 
 import grabowski_fleet as fleet
 import grabowski_mcp as base
+import grabowski_chronik as chronik
 import grabowski_recovery as recovery
 import grabowski_resources as resources
 try:
@@ -464,6 +465,7 @@ def _set_state(
         connection.commit()
     updated = _row(task_id)
     _write_outcome_receipt(updated, state, observation)
+    chronik.record_task_state_safely(updated, state)
     return updated
 
 

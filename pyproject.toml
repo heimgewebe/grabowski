@@ -14,4 +14,4 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["grabowski_mcp", "grabowski_operator"]
+py-modules = ["grabowski_mcp", "grabowski_operator", "grabowski_chronik"]
