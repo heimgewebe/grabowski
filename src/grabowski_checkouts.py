@@ -768,6 +768,25 @@ def _processes_under(paths: list[Path]) -> list[dict[str, Any]]:
     return sorted(records, key=lambda item: item["pid"])
 
 
+def _coordination_result(
+    resource_blockers: list[dict[str, Any]],
+    task_blockers: list[dict[str, Any]],
+    process_blockers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    blocking_resources = [item for item in resource_blockers if item["blocking"]]
+    return {
+        "resource_leases": resource_blockers,
+        "tasks": task_blockers,
+        "processes": process_blockers,
+        "blocking": bool(blocking_resources or task_blockers or process_blockers),
+        "blocking_counts": {
+            "resource_leases": len(blocking_resources),
+            "tasks": len(task_blockers),
+            "processes": len(process_blockers),
+        },
+    }
+
+
 def _coordination(
     paths: list[Path],
     *,
@@ -786,18 +805,29 @@ def _coordination(
             resource_blockers.append(lease)
     task_blockers = _task_records(paths) if include_tasks else []
     process_blockers = _processes_under(paths) if include_processes else []
-    blocking_resources = [item for item in resource_blockers if item["blocking"]]
-    return {
-        "resource_leases": resource_blockers,
-        "tasks": task_blockers,
-        "processes": process_blockers,
-        "blocking": bool(blocking_resources or task_blockers or process_blockers),
-        "blocking_counts": {
-            "resource_leases": len(blocking_resources),
-            "tasks": len(task_blockers),
-            "processes": len(process_blockers),
-        },
-    }
+    return _coordination_result(resource_blockers, task_blockers, process_blockers)
+
+
+def _linked_checkout_coordination(
+    checkout_path: Path,
+    repo_path: Path,
+    *,
+    owner_id: str | None = None,
+    include_processes: bool = True,
+    include_tasks: bool = True,
+    include_resources: bool = True,
+) -> dict[str, Any]:
+    owner = _owner(owner_id) if owner_id is not None else None
+    resource_blockers: list[dict[str, Any]] = []
+    if include_resources:
+        for lease in _read_resource_leases():
+            if not _resource_related(lease["resource_key"], [checkout_path, repo_path]):
+                continue
+            lease = {**lease, "blocking": owner is None or lease["owner_id"] != owner}
+            resource_blockers.append(lease)
+    task_blockers = _task_records([checkout_path]) if include_tasks else []
+    process_blockers = _processes_under([checkout_path]) if include_processes else []
+    return _coordination_result(resource_blockers, task_blockers, process_blockers)
 
 
 def _require_no_blockers(coordination: dict[str, Any]) -> None:
@@ -827,8 +857,9 @@ def checkout_inventory(
     for record in records:
         checkout_path = Path(record["path"])
         status = _worktree_status(record)
-        coordination = _coordination(
-            [checkout_path, top_level],
+        coordination = _linked_checkout_coordination(
+            checkout_path,
+            top_level,
             include_processes=include_processes,
             include_tasks=include_tasks,
             include_resources=include_resources,
@@ -1087,8 +1118,9 @@ def grabowski_checkout_archive(
     owner = _owner(owner_id)
     until = _retention_until(retention_until_unix)
     archive_purpose = _purpose(purpose)
-    coordination = _coordination(
-        [checkout, top_level],
+    coordination = _linked_checkout_coordination(
+        checkout,
+        top_level,
         owner_id=owner,
         include_processes=True,
         include_tasks=True,
@@ -1256,8 +1288,9 @@ def _cleanup_plan(
     verified_refs = _verify_recovery_refs(top_level, archive["recovery_refs"])
     if not all(item["present"] for item in verified_refs):
         raise RuntimeError("Checkout recovery refs are missing or mismatched")
-    coordination = _coordination(
-        [checkout, top_level],
+    coordination = _linked_checkout_coordination(
+        checkout,
+        top_level,
         owner_id=owner,
         include_processes=True,
         include_tasks=True,

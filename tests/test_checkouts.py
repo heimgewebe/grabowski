@@ -159,6 +159,18 @@ class CheckoutLifecycleTests(unittest.TestCase):
             [],
         )
 
+
+    def test_archive_ignores_processes_in_main_checkout(self) -> None:
+        def fake_processes(paths: list[Path]) -> list[dict[str, object]]:
+            if any(path == self.repo for path in paths):
+                return [{"pid": 123, "cwd": str(self.repo), "command": "shell"}]
+            return []
+
+        with patch.object(checkouts, "_processes_under", side_effect=fake_processes):
+            archive = self._archive()
+
+        self.assertEqual(archive["audit"]["coordination_checked"]["processes"], 0)
+
     def test_inventory_is_deterministic_and_shows_linked_checkout(self) -> None:
         first = checkouts.checkout_inventory(
             self.repo,
