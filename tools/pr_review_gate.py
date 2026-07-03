@@ -384,6 +384,60 @@ def _valid_iteration(item: Any) -> bool:
     return True
 
 
+def _external_review_failures(pr: dict[str, Any], external_review: Any, *, required: bool) -> list[str]:
+    if not required:
+        if external_review is None:
+            return []
+        if not isinstance(external_review, dict):
+            return ["external_review is not a JSON object"]
+        failures: list[str] = []
+        if external_review.get("required") is False and not external_review.get("reason"):
+            failures.append("external_review required=false lacks reason")
+        findings = external_review.get("findings", [])
+        if not isinstance(findings, list):
+            failures.append("external_review.findings is not a list")
+        else:
+            for index, finding in enumerate(findings):
+                if not isinstance(finding, dict) or not _terminal(finding):
+                    failures.append(f"external_review finding {index} is not terminally triaged")
+        return failures
+
+    if external_review is None:
+        return ["external review is required but evidence is missing"]
+    if not isinstance(external_review, dict):
+        return ["external_review is not a JSON object"]
+
+    failures: list[str] = []
+    head = pr.get("headRefOid")
+    if external_review.get("required") is not True:
+        failures.append("external_review.required is not true")
+    if not isinstance(head, str) or not head:
+        failures.append("PR headRefOid is missing")
+    elif external_review.get("prompt_head_sha") != head:
+        failures.append("external_review.prompt_head_sha mismatch")
+    if external_review.get("diff_prompt_provided") is not True:
+        failures.append("external_review.diff_prompt_provided is not true")
+    if external_review.get("prompt_includes_diff") is not True and external_review.get("prompt_includes_patch") is not True:
+        failures.append("external_review prompt does not assert diff/patch inclusion")
+    if external_review.get("external_reviews_triaged") is not True:
+        failures.append("external_review.external_reviews_triaged is not true")
+
+    reviews_received = external_review.get("reviews_received")
+    if isinstance(reviews_received, bool) or not isinstance(reviews_received, int):
+        failures.append("external_review.reviews_received must be an integer")
+    elif reviews_received <= 0:
+        failures.append("external_review.reviews_received must be positive when required")
+
+    findings = external_review.get("findings", [])
+    if not isinstance(findings, list):
+        failures.append("external_review.findings is not a list")
+    else:
+        for index, finding in enumerate(findings):
+            if not isinstance(finding, dict) or not _terminal(finding):
+                failures.append(f"external_review finding {index} is not terminally triaged")
+    return failures
+
+
 def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] | None = None, claude_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     if isinstance(pr, dict):
@@ -471,6 +525,14 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     if not claude_required and not claude_not_required:
         warnings.append("Claude non-requirement reason is not recorded")
 
+    external_review = self_review.get("external_review") if isinstance(self_review, dict) else None
+    external_required = complexity["complex"] or (isinstance(external_review, dict) and external_review.get("required") is True)
+    external_not_required = isinstance(external_review, dict) and external_review.get("required") is False and bool(external_review.get("reason"))
+    for failure in _external_review_failures(pr, external_review, required=external_required):
+        failures.append(f"External review evidence invalid: {failure}")
+    if not external_required and not external_not_required:
+        warnings.append("External review non-requirement reason is not recorded")
+
     if not checks:
         failures.append("no status checks observed")
     observed_expected_checks = {
@@ -494,7 +556,15 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
         "failures": failures,
         "warnings": warnings,
         "repo_pr": {"number": pr.get("number"), "title": pr.get("title"), "url": pr.get("url"), "head_sha": pr.get("headRefOid"), "base_sha": pr.get("baseRefOid")},
-        "review_sources": {"codex_seen": codex_seen, "claude_seen": claude_seen, "claude_cli_seen": claude_cli_seen, "review_item_count": len(all_review_items), "current_head_review_item_count": len(items)},
+        "review_sources": {
+            "codex_seen": codex_seen,
+            "claude_seen": claude_seen,
+            "claude_cli_seen": claude_cli_seen,
+            "external_review_required": external_required,
+            "external_reviews_received": external_review.get("reviews_received") if isinstance(external_review, dict) else None,
+            "review_item_count": len(all_review_items),
+            "current_head_review_item_count": len(items),
+        },
         "complexity": complexity,
     }
 
