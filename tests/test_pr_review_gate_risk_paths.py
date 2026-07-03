@@ -31,6 +31,8 @@ def _state(path: str) -> dict:
             "number": 58,
             "state": "OPEN",
             "isDraft": False,
+            "mergeStateStatus": "CLEAN",
+            "mergeable": "MERGEABLE",
             "headRefOid": HEAD,
             "baseRefOid": BASE,
             "changedFiles": 1,
@@ -41,7 +43,7 @@ def _state(path: str) -> dict:
             "latestReviews": [],
             "comments": [],
         },
-        "checks": [{"bucket": "pass", "name": "validate"}],
+        "checks": [{"bucket": "pass", "name": "validate (3.10)"}, {"bucket": "pass", "name": "validate (3.12)"}],
         "reviewComments": [],
     }
 
@@ -64,6 +66,8 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
         for path in (
             "src/grabowski_tasks.py",
             "src/grabowski_checkouts.py",
+            "src/grabowski_operations.py",
+            "src/grabowski_artifacts.py",
         ):
             with self.subTest(path=path):
                 result = pr_review_gate.evaluate_review_gate(_state(path), self_review=_self_review())

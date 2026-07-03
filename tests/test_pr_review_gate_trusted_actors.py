@@ -56,7 +56,7 @@ def _state(*, actor: str = "chatgpt-codex-connector", merge_state: str = "CLEAN"
             "latestReviews": [],
             "comments": [],
         },
-        "checks": [{"bucket": "pass", "name": "validate"}],
+        "checks": [{"bucket": "pass", "name": "validate (3.10)"}, {"bucket": "pass", "name": "validate (3.12)"}],
         "reviewComments": [],
     }
 

@@ -83,8 +83,8 @@ The live context tools compute runtime and checkout state on every call. Static 
 
 ## PR review gate
 
-Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Run `python3 tools/pr_review_gate.py --pr <number> --self-review <path> --json` and treat a BLOCK verdict as merge-blocking.
+Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Run `python3 tools/pr_review_gate.py --pr <number> --self-review <path> --claude-evidence <path> --json` when Claude evidence is required, or omit `--claude-evidence` only when the gate should block on missing Claude evidence. Treat a BLOCK verdict as merge-blocking.
 
-The gate requires Codex review evidence or an explicit unavailable reason, a head-SHA-bound Grabowski self-review, iterative review evidence, terminal triage for every finding at every severity, and green checks. Complex or risk-sensitive changes require Claude review evidence.
+The gate requires Codex review evidence from a trusted review object for the current head, or an explicit `codex_review.unavailable_reason` after a documented trigger/collection attempt; unavailable Codex is only a warning path and does not waive the rest of the gate. It also requires a head-SHA-bound Grabowski self-review, iterative review evidence, terminal triage for every finding at every severity, and expected green checks named `validate (3.10)` and `validate (3.12)`. Complex or risk-sensitive changes require Claude review evidence, provided either by a current-head trusted Claude review or by a valid `--claude-evidence` receipt.
 
 Allowed terminal finding states are `fixed`, `accepted`, `false_positive`, `deferred_with_reason`, and `not_applicable`; accepted or deferred findings require reasons. Blocking findings cannot be merely accepted or deferred. Severity values `p0`, `p1`, `high`, and `critical` are treated as blocking for this purpose. Pending, cancelled, or missing checks block the gate.

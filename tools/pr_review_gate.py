@@ -110,7 +110,7 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
         review_comments = _flatten_github_pages(raw_review_comments)
         raw_pr_reviews = _run_json(repo, ["gh", "api", f"repos/{name}/pulls/{pr}/reviews", "--paginate", "--slurp"], allow_nonzero=True)
         pr_reviews = _flatten_github_pages(raw_pr_reviews)
-    return {"pr": view, "checks": checks, "reviewComments": review_comments, "prReviews": pr_reviews}
+    return {"pr": view, "checks": checks, "reviewComments": review_comments, "prReviews": pr_reviews, "repoName": name}
 
 
 def _actor_logins(item: dict[str, Any]) -> set[str]:
@@ -169,7 +169,7 @@ def _current_head_items(pr: dict[str, Any], items: list[dict[str, Any]]) -> list
 
 def _review_items(pr: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for bucket in ("reviews", "latestReviews", "comments", "reviewComments", "prReviews"):
+    for bucket in ("reviews", "latestReviews", "prReviews"):
         raw = pr.get(bucket)
         if isinstance(raw, list):
             items.extend(item for item in raw if isinstance(item, dict))
@@ -252,29 +252,51 @@ def _valid_sha256(value: Any) -> bool:
 def _claude_ultrareview_command_matches(command: Any, pr_number: Any) -> bool:
     if not isinstance(command, list) or len(command) < 3:
         return False
-    first = command[0]
-    second = command[1]
-    if not isinstance(first, str) or Path(first).name != "claude":
+    if not all(isinstance(item, str) for item in command):
         return False
-    if second != "ultrareview":
+    if Path(command[0]).name != "claude" or command[1] != "ultrareview":
         return False
+
+    seen_json = False
+    seen_timeout = False
+    seen_pr = False
     index = 2
     while index < len(command):
         value = command[index]
+        if value == "--json":
+            if seen_json:
+                return False
+            seen_json = True
+            index += 1
+            continue
         if value == "--timeout":
+            if seen_timeout or index + 1 >= len(command):
+                return False
+            timeout_value = command[index + 1]
+            if timeout_value.startswith("-") or not timeout_value.isdigit():
+                return False
+            seen_timeout = True
             index += 2
             continue
-        if value == "--json":
+        if value.startswith("--timeout="):
+            if seen_timeout:
+                return False
+            timeout_value = value.split("=", 1)[1]
+            if not timeout_value.isdigit():
+                return False
+            seen_timeout = True
             index += 1
             continue
-        if isinstance(value, str) and value.startswith("-"):
-            index += 1
-            continue
-        return str(value) == str(pr_number)
-    return False
+        if value.startswith("-"):
+            return False
+        if seen_pr or value != str(pr_number):
+            return False
+        seen_pr = True
+        index += 1
+    return seen_pr and seen_json and seen_timeout
 
 
-def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any) -> list[str]:
+def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any, *, repo_name: str | None = None) -> list[str]:
     if evidence is None:
         return []
     if not isinstance(evidence, dict):
@@ -286,6 +308,8 @@ def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any) -> list[str
         failures.append("schema_version is not 1")
     if evidence.get("kind") != "claude_ultrareview":
         failures.append("kind is not claude_ultrareview")
+    if repo_name is not None and evidence.get("repo") != repo_name:
+        failures.append("repo mismatch")
     if pr_number is not None and str(evidence.get("pr")) != str(pr_number):
         failures.append("pr number mismatch")
     if not isinstance(head, str) or not head:
@@ -339,7 +363,8 @@ def _terminal(item: dict[str, Any]) -> bool:
         return False
     severity = str(item.get("severity") or "").lower()
     strong = severity in STRONG_SEVERITIES
-    if (item.get("materiality") == "blocking" or strong) and status in {"accepted", "deferred_with_reason"}:
+    materiality = str(item.get("materiality") or "").lower()
+    if (materiality == "blocking" or strong) and status in {"accepted", "deferred_with_reason"}:
         return False
     return True
 
@@ -372,7 +397,8 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     claude_blocking_states = _blocking_review_states(items, TRUSTED_CLAUDE_ACTORS)
     codex_seen = _has_trusted_actor(items, TRUSTED_CODEX_ACTORS)
     claude_seen = _has_trusted_actor(items, TRUSTED_CLAUDE_ACTORS)
-    claude_cli_failures = _claude_cli_evidence_failures(pr, claude_evidence)
+    repo_name = state.get("repoName") if isinstance(state.get("repoName"), str) else None
+    claude_cli_failures = _claude_cli_evidence_failures(pr, claude_evidence, repo_name=repo_name)
     claude_cli_seen = claude_evidence is not None and not claude_cli_failures
     complexity = classify_complexity(pr, self_review)
     failures: list[str] = []
