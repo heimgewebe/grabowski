@@ -38,13 +38,14 @@ def _self_review() -> dict:
     }
 
 
-def _state(*, actor: str = "chatgpt-codex-connector", merge_state: str = "CLEAN") -> dict:
+def _state(*, actor: str = "chatgpt-codex-connector", merge_state: str = "CLEAN", mergeable: str = "MERGEABLE") -> dict:
     return {
         "pr": {
             "number": 58,
             "state": "OPEN",
             "isDraft": False,
             "mergeStateStatus": merge_state,
+            "mergeable": mergeable,
             "headRefOid": HEAD,
             "baseRefOid": BASE,
             "changedFiles": 1,
@@ -65,6 +66,12 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         result = pr_review_gate.evaluate_review_gate(_state(merge_state="BLOCKED"), self_review=_self_review())
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("GitHub mergeStateStatus is BLOCKED, not CLEAN", result["failures"])
+
+
+    def test_mergeable_must_be_mergeable(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(_state(mergeable="UNKNOWN"), self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("GitHub mergeable is UNKNOWN, not MERGEABLE", result["failures"])
 
     def test_untrusted_codex_substring_actor_does_not_satisfy_review(self) -> None:
         result = pr_review_gate.evaluate_review_gate(_state(actor="friendly-codex-bot"), self_review=_self_review())

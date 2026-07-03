@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 from typing import Any
 
 TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reason", "not_applicable"}
@@ -16,7 +15,7 @@ STRONG_SEVERITIES = {"p0", "p1", "high", "critical"}
 BLOCKING_REVIEW_STATES = {"CHANGES_REQUESTED", "DISMISSED", "PENDING"}
 EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
-TRUSTED_CLAUDE_ACTORS = {"claude", "claude[bot]", "claude-code", "claude-code[bot]", "anthropic", "anthropic[bot]"}
+TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 RISK_PATH_MARKERS = ("auth", "access", "security", "deploy", "runtime", "systemd", "migration", "database", "policy", "capabilit", "operator", "mcp", "privileged", "audit", "rollback", "secret", "broker")
 RISK_PATH_PREFIXES = (
     "src/grabowski_mcp.py",
@@ -265,10 +264,10 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     if pr.get("isDraft") is True:
         failures.append("PR is draft")
     merge_state = pr.get("mergeStateStatus")
-    if isinstance(merge_state, str) and merge_state and merge_state != "CLEAN":
+    if merge_state != "CLEAN":
         failures.append(f"GitHub mergeStateStatus is {merge_state}, not CLEAN")
     mergeable = pr.get("mergeable")
-    if isinstance(mergeable, str) and mergeable and mergeable != "MERGEABLE":
+    if mergeable != "MERGEABLE":
         failures.append(f"GitHub mergeable is {mergeable}, not MERGEABLE")
     if codex_blocking_states:
         failures.append(f"Codex review has blocking state(s): {', '.join(codex_blocking_states)}")

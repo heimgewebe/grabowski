@@ -241,7 +241,7 @@ def _review_gate_checks(*, py310="pass", py312="pass"):
     ]
 
 
-def _review_gate_state(*, files=None, additions=10, deletions=2, reviews=None, checks=None, mergeable="MERGEABLE"):
+def _review_gate_state(*, files=None, additions=10, deletions=2, reviews=None, checks=None, mergeable="MERGEABLE", merge_state="CLEAN"):
     default_files = files if files is not None else ["src/example.py"]
     default_reviews = [{"author": {"login": "chatgpt-codex-connector"}, "body": "reviewed", "commit_id": REVIEW_GATE_HEAD}]
     return {
@@ -250,6 +250,7 @@ def _review_gate_state(*, files=None, additions=10, deletions=2, reviews=None, c
             "title": "review gate",
             "state": "OPEN",
             "isDraft": False,
+            "mergeStateStatus": merge_state,
             "headRefOid": REVIEW_GATE_HEAD,
             "baseRefOid": REVIEW_GATE_BASE,
             "mergeable": mergeable,
@@ -417,7 +418,7 @@ class PrReviewGateCurrentHeadEvidenceTests(unittest.TestCase):
         current = _review_gate_state(files=["src/grabowski_runtime.py"], additions=700, deletions=1)
         current["pr"]["reviews"] = [
             {"author": {"login": "chatgpt-codex-connector"}, "commit": {"oid": REVIEW_GATE_HEAD}},
-            {"author": {"login": "claude-code"}, "commit": {"oid": REVIEW_GATE_HEAD}},
+            {"author": {"login": "claude-code[bot]"}, "commit": {"oid": REVIEW_GATE_HEAD}},
         ]
         review = _review_gate_self_review(claude_review={"required": True, "reason": "complex"})
         result = pr_review_gate.evaluate_review_gate(current, self_review=review)
@@ -451,7 +452,7 @@ class PrReviewGateStateAndCheckTests(unittest.TestCase):
     def test_required_claude_pending_blocks(self) -> None:
         current = _review_gate_state(reviews=[
             {"author": {"login": "chatgpt-codex-connector"}, "commit_id": REVIEW_GATE_HEAD},
-            {"author": {"login": "claude-code"}, "commit_id": REVIEW_GATE_HEAD, "state": "PENDING"},
+            {"author": {"login": "claude-code[bot]"}, "commit_id": REVIEW_GATE_HEAD, "state": "PENDING"},
         ])
         result = pr_review_gate.evaluate_review_gate(current, self_review=_review_gate_self_review(claude_review={"required": True, "reason": "risk"}))
         self.assertEqual(result["verdict"], "BLOCK")
@@ -481,6 +482,28 @@ class PrReviewGateStateAndCheckTests(unittest.TestCase):
                 result = pr_review_gate.evaluate_review_gate(_review_gate_state(checks=_review_gate_checks(py312=bucket)), self_review=_review_gate_self_review())
                 self.assertEqual(result["verdict"], "BLOCK")
                 self.assertIn("1 non-green check(s)", result["failures"])
+
+
+    def test_missing_merge_metadata_blocks(self) -> None:
+        current = _review_gate_state()
+        current["pr"].pop("mergeStateStatus")
+        current["pr"].pop("mergeable")
+        result = pr_review_gate.evaluate_review_gate(current, self_review=_review_gate_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("GitHub mergeStateStatus is None, not CLEAN", result["failures"])
+        self.assertIn("GitHub mergeable is None, not MERGEABLE", result["failures"])
+
+    def test_bare_claude_login_does_not_satisfy_complex_pr(self) -> None:
+        current = _review_gate_state(files=["src/grabowski_runtime.py"], additions=700, deletions=1)
+        current["pr"]["reviews"] = [
+            {"author": {"login": "chatgpt-codex-connector"}, "commit": {"oid": REVIEW_GATE_HEAD}},
+            {"author": {"login": "claude-code"}, "commit": {"oid": REVIEW_GATE_HEAD}},
+        ]
+        review = _review_gate_self_review(claude_review={"required": True, "reason": "complex"})
+        result = pr_review_gate.evaluate_review_gate(current, self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["review_sources"]["claude_seen"])
+        self.assertIn("Claude review is required but not observed on current head", result["failures"])
 
     def test_mergeable_conflicting_or_unknown_blocks(self) -> None:
         for mergeable in ("CONFLICTING", "UNKNOWN"):
