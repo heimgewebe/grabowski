@@ -39,14 +39,16 @@ If no state root is given, events use the normal Grabowski state root. Do not us
 
 ## Activation model
 
-The current writer reads these switches from the running Grabowski process environment. Setting the variables on a child command, in a shell, or inside the durable task payload does not enable writing for `grabowski_task_start`, because task-state updates happen in the already-running MCP process.
+The global environment switches are still available for isolated writer smoke tests, but they are not the preferred path for real tasks. A real `grabowski_task_start` smoke should use task-local opt-in parameters so the writer decision is persisted with the task record and does not depend on service-level environment.
 
-Therefore a real `grabowski_task_start` activation smoke is not authorized by this runbook unless one of these seams exists:
+Use these task parameters for a real smoke:
 
-- the Grabowski service is deliberately restarted with a temporary state root, then reverted and restarted again, or
-- a future per-task opt-in flag is added to the task API and persisted with the task record.
+```text
+chronik_outbox=True
+chronik_outbox_state_root=/tmp/grabowski-chronik-smoke
+```
 
-Until then, only the isolated writer smoke below is allowed.
+The state root is accepted only when `chronik_outbox` is true. This prevents accidental path configuration without activation.
 
 ## Safe temporary smoke
 
@@ -113,14 +115,7 @@ This runbook does not authorize:
 
 ## Escalation rule
 
-Do not run a real `grabowski_task_start` activation smoke merely by setting environment variables on the task command. That does not affect the MCP process that writes task-state events.
-
-A real task smoke requires a separate activation seam:
-
-1. temporary service-level environment plus explicit revert, or
-2. a future per-task opt-in flag in `grabowski_task_start`.
-
-The second option is preferred. The first option is operationally riskier because a failed revert could leave the writer globally enabled.
+A real `grabowski_task_start` activation smoke is allowed only with `chronik_outbox=True` and a temporary `chronik_outbox_state_root`. Do not use service-level environment for this smoke unless the task-local seam is broken and the service-level path has its own explicit revert plan.
 
 ## Exit criteria
 

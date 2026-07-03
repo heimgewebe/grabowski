@@ -186,7 +186,9 @@ def _database() -> sqlite3.Connection:
             external_run_id TEXT,
             execution_envelope_sha256 TEXT,
             acceptance_json TEXT NOT NULL DEFAULT '[]',
-            request_sha256 TEXT
+            request_sha256 TEXT,
+            chronik_outbox_enabled INTEGER NOT NULL DEFAULT 0,
+            chronik_outbox_state_root TEXT
         )
         """
     )
@@ -216,6 +218,14 @@ def _database() -> sqlite3.Connection:
     elif current["value"] != "2":
         connection.close()
         raise RuntimeError("Unsupported task database schema")
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+    if "chronik_outbox_enabled" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN chronik_outbox_enabled "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    if "chronik_outbox_state_root" not in columns:
+        connection.execute("ALTER TABLE tasks ADD COLUMN chronik_outbox_state_root TEXT")
     connection.commit()
     try:
         os.chmod(TASK_DB, 0o600)
@@ -299,6 +309,23 @@ def _validate_memory(value: int | None) -> int | None:
     if not isinstance(value, int) or value < 16 * 1024 * 1024:
         raise ValueError("memory_max_bytes must be at least 16 MiB")
     return value
+
+
+def _validate_chronik_outbox(
+    enabled: bool,
+    state_root: str | None,
+) -> tuple[int, str | None]:
+    if not isinstance(enabled, bool):
+        raise ValueError("chronik_outbox must be boolean")
+    if state_root in {None, ""}:
+        return (1 if enabled else 0), None
+    if not enabled:
+        raise ValueError("chronik_outbox_state_root requires chronik_outbox")
+    if not isinstance(state_root, str) or not state_root.startswith("/"):
+        raise ValueError("chronik_outbox_state_root must be an absolute path")
+    if len(state_root.encode("utf-8")) > 4096 or "\x00" in state_root:
+        raise ValueError("chronik_outbox_state_root is too large or contains NUL")
+    return 1, state_root
 
 
 def _validate_resume_policy(value: str) -> str:
@@ -423,6 +450,8 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
         ),
         "resource_keys": _record_resource_keys(record),
         "lease_owner_id": record.get("lease_owner_id"),
+        "chronik_outbox_enabled": bool(record.get("chronik_outbox_enabled")),
+        "chronik_outbox_state_root": record.get("chronik_outbox_state_root"),
     }
 
 
@@ -512,6 +541,8 @@ def grabowski_task_start(
     io_weight: int = 100,
     memory_max_bytes: int | None = None,
     resource_keys: list[str] | None = None,
+    chronik_outbox: bool = False,
+    chronik_outbox_state_root: str | None = None,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit."""
     operator._require_operator_mutation("durable_job")
@@ -523,6 +554,10 @@ def grabowski_task_start(
     policy = _validate_resume_policy(resume_policy)
     cpu, io = _validate_weights(cpu_weight, io_weight)
     memory = _validate_memory(memory_max_bytes)
+    chronik_enabled, chronik_state_root = _validate_chronik_outbox(
+        chronik_outbox,
+        chronik_outbox_state_root,
+    )
     task_resources = _resource_keys(resource_keys)
     task_id = uuid.uuid4().hex[:24]
     lease_owner = _lease_owner(task_id)
@@ -549,6 +584,8 @@ def grabowski_task_start(
         "last_observation_json": None,
         "resource_keys_json": _canonical_json(task_resources),
         "lease_owner_id": lease_owner,
+        "chronik_outbox_enabled": chronik_enabled,
+        "chronik_outbox_state_root": chronik_state_root,
     }
     lease_result = None
     if task_resources:
@@ -571,13 +608,15 @@ def grabowski_task_start(
                 argv_json, argv_sha256, cwd, runtime_seconds,
                 cpu_weight, io_weight, memory_max_bytes,
                 created_at_unix, updated_at_unix, launcher_json,
-                last_observation_json, resource_keys_json, lease_owner_id
+                last_observation_json, resource_keys_json, lease_owner_id,
+                chronik_outbox_enabled, chronik_outbox_state_root
             ) VALUES(
                 :task_id, :host, :unit, :attempt, :state, :resume_policy,
                 :argv_json, :argv_sha256, :cwd, :runtime_seconds,
                 :cpu_weight, :io_weight, :memory_max_bytes,
                 :created_at_unix, :updated_at_unix, :launcher_json,
-                :last_observation_json, :resource_keys_json, :lease_owner_id
+                :last_observation_json, :resource_keys_json, :lease_owner_id,
+                :chronik_outbox_enabled, :chronik_outbox_state_root
             )
             """,
                 record,

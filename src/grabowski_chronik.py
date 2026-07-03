@@ -9,12 +9,29 @@ from typing import Any
 
 ENABLED_ENV = "GRABOWSKI_CHRONIK_AGENT_RUN_OUTBOX"
 STATE_ROOT_ENV = "GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT"
+TASK_ENABLED_FIELD = "chronik_outbox_enabled"
+TASK_STATE_ROOT_FIELD = "chronik_outbox_state_root"
 TRUTHY = {"1", "true", "yes", "on"}
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}
 
 
 def enabled() -> bool:
     return os.environ.get(ENABLED_ENV, "").strip().lower() in TRUTHY
+
+
+def task_enabled(record: dict[str, Any]) -> bool:
+    value = record.get(TASK_ENABLED_FIELD)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in TRUTHY
+    return False
+
+
+def record_enabled(record: dict[str, Any]) -> bool:
+    return enabled() or task_enabled(record)
 
 
 def canonical_json(value: Any) -> str:
@@ -30,8 +47,14 @@ def now_z() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def state_root() -> Path:
-    raw = os.environ.get(STATE_ROOT_ENV)
+def state_root(record: dict[str, Any] | None = None) -> Path:
+    raw = None
+    if record is not None:
+        candidate = record.get(TASK_STATE_ROOT_FIELD)
+        if isinstance(candidate, str) and candidate.strip():
+            raw = candidate
+    if raw is None:
+        raw = os.environ.get(STATE_ROOT_ENV)
     return Path(raw).expanduser() if raw else Path.home() / ".local" / "state"
 
 
@@ -70,9 +93,9 @@ def build_event(record: dict[str, Any], state: str) -> dict[str, Any] | None:
     }
 
 
-def outbox_path(event: dict[str, Any]) -> Path:
+def outbox_path(event: dict[str, Any], root: Path | None = None) -> Path:
     rid = event["source"]["run_id"].replace("/", "_")
-    return state_root() / "grabowski" / "chronik-outbox" / f"grabowski_{rid}.jsonl"
+    return (root or state_root()) / "grabowski" / "chronik-outbox" / f"grabowski_{rid}.jsonl"
 
 
 def append_unique(path: Path, event: dict[str, Any]) -> bool:
@@ -94,12 +117,12 @@ def append_unique(path: Path, event: dict[str, Any]) -> bool:
 
 
 def record_task_state(record: dict[str, Any], state: str) -> dict[str, Any]:
-    if not enabled():
+    if not record_enabled(record):
         return {"enabled": False, "written": False}
     event = build_event(record, state)
     if event is None:
         return {"enabled": True, "written": False}
-    path = outbox_path(event)
+    path = outbox_path(event, state_root(record))
     return {"enabled": True, "written": append_unique(path, event), "path": str(path), "kind": event["kind"]}
 
 
@@ -107,4 +130,4 @@ def record_task_state_safely(record: dict[str, Any], state: str) -> dict[str, An
     try:
         return record_task_state(record, state)
     except Exception as exc:
-        return {"enabled": enabled(), "written": False, "error": str(exc)}
+        return {"enabled": record_enabled(record), "written": False, "error": str(exc)}
