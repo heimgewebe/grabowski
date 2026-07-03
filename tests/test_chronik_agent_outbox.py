@@ -13,12 +13,14 @@ if str(SRC) not in sys.path:
 import grabowski_chronik as chronik
 
 
-def record():
-    return {
+def record(**overrides):
+    value = {
         "task_id": "a" * 24,
         "unit": "grabowski-task-" + "a" * 24 + "-a1.service",
         "attempt": 1,
     }
+    value.update(overrides)
+    return value
 
 
 class ChronikAgentOutboxTests(unittest.TestCase):
@@ -53,6 +55,20 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         os.environ[chronik.STATE_ROOT_ENV] = str(self.root)
         self.assertEqual(chronik.record_task_state(record(), "running"), {"enabled": False, "written": False})
         self.assertEqual(list(self.root.rglob("*.jsonl")), [])
+
+    def test_task_opt_in_writes_without_global_environment(self):
+        os.environ.pop(chronik.ENABLED_ENV, None)
+        os.environ.pop(chronik.STATE_ROOT_ENV, None)
+        result = chronik.record_task_state(
+            record(
+                chronik_outbox_enabled=1,
+                chronik_outbox_state_root=str(self.root),
+            ),
+            "running",
+        )
+        self.assertTrue(result["written"])
+        event = json.loads(self.lines()[0])
+        self.assertEqual(event["kind"], "agent.run.started")
 
     def test_started_event_when_enabled(self):
         self.enable()

@@ -135,11 +135,55 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(task["attempt"], 1)
         self.assertEqual(task["host"], "local")
         self.assertEqual(task["argv"], ["/bin/echo", "ok"])
+        self.assertFalse(task["chronik_outbox_enabled"])
+        self.assertIsNone(task["chronik_outbox_state_root"])
         self.assertTrue(self.database.is_file())
         self.assertEqual(self.database.stat().st_mode & 0o777, 0o600)
         listed = tasks.grabowski_task_list()
         self.assertEqual(listed["count"], 1)
         self.assertEqual(listed["tasks"][0]["task_id"], task["task_id"])
+
+    def test_start_chronik_outbox_opt_in_writes_without_global_env(self) -> None:
+        outbox_root = self.root / "chronik-state"
+        with patch.dict(
+            "os.environ",
+            {
+                tasks.chronik.ENABLED_ENV: "",
+                tasks.chronik.STATE_ROOT_ENV: "",
+            },
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 140}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                chronik_outbox=True,
+                chronik_outbox_state_root=str(outbox_root),
+            )
+        task = result["task"]
+        self.assertTrue(task["chronik_outbox_enabled"])
+        self.assertEqual(task["chronik_outbox_state_root"], str(outbox_root))
+        files = sorted(outbox_root.rglob("*.jsonl"))
+        self.assertEqual(len(files), 1)
+        event = json.loads(files[0].read_text().splitlines()[0])
+        self.assertEqual(event["kind"], "agent.run.started")
+
+    def test_start_rejects_chronik_state_root_without_opt_in(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 141}
+        ):
+            with self.assertRaisesRegex(ValueError, "requires chronik_outbox"):
+                tasks.grabowski_task_start(
+                    "local",
+                    ["/bin/true"],
+                    cwd=str(self.root),
+                    runtime_seconds=60,
+                    chronik_outbox_state_root=str(self.root / "chronik-state"),
+                )
 
     def test_collected_success_unit_maps_to_completed_not_unknown(self) -> None:
         started = self._start()
@@ -598,6 +642,8 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(version, "2")
         self.assertIn("resource_keys_json", columns)
         self.assertIn("lease_owner_id", columns)
+        self.assertIn("chronik_outbox_enabled", columns)
+        self.assertIn("chronik_outbox_state_root", columns)
 
     def test_database_rejects_symlink(self) -> None:
         target = self.root / "real.sqlite3"
