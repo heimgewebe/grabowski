@@ -25,6 +25,8 @@ RISK_PATH_PREFIXES = (
     "src/grabowski_self_deploy.py",
     "src/grabowski_tasks.py",
     "src/grabowski_checkouts.py",
+    "src/grabowski_operations.py",
+    "src/grabowski_artifacts.py",
     "tools/pr_review_gate.py",
 )
 PR_FIELDS = ("number", "title", "state", "isDraft", "mergeStateStatus", "mergeable", "headRefOid", "baseRefOid", "url", "reviewDecision", "changedFiles", "additions", "deletions", "files", "reviews", "latestReviews", "comments")
@@ -342,6 +344,21 @@ def _terminal(item: dict[str, Any]) -> bool:
     return True
 
 
+def _valid_iteration(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    n = item.get("n")
+    if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+        return False
+    summary = item.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return False
+    material = item.get("material_findings")
+    if isinstance(material, bool) or not isinstance(material, int) or material < 0:
+        return False
+    return True
+
+
 def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] | None = None, claude_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     if isinstance(pr, dict):
@@ -401,6 +418,10 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
         iterations = self_review.get("review_iterations")
         if not isinstance(iterations, list) or not iterations:
             failures.append("self-review has no review_iterations")
+        else:
+            for index, iteration in enumerate(iterations):
+                if not _valid_iteration(iteration):
+                    failures.append(f"review_iteration {index} lacks required evidence")
         if self_review.get("stop_reason") not in STOP_REASONS:
             failures.append("self-review stop_reason is missing or invalid")
         findings = self_review.get("findings", [])
