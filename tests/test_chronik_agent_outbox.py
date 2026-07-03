@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,6 +109,81 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         result = chronik.record_task_state_safely(record(), "running")
         self.assertFalse(result["written"])
         self.assertIn("error", result)
+
+
+class PlexerFlushTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.old_url = os.environ.get(chronik.PLEXER_EVENTS_URL_ENV)
+
+    def tearDown(self):
+        if self.old_url is None:
+            os.environ.pop(chronik.PLEXER_EVENTS_URL_ENV, None)
+        else:
+            os.environ[chronik.PLEXER_EVENTS_URL_ENV] = self.old_url
+        self.tmp.cleanup()
+
+    def test_plexer_url_normalization(self):
+        self.assertEqual(
+            chronik.plexer_events_url("http://plexer.local"),
+            "http://plexer.local/v1/events",
+        )
+        self.assertEqual(
+            chronik.plexer_events_url("http://plexer.local/v1/events/"),
+            "http://plexer.local/v1/events",
+        )
+
+    def test_missing_plexer_url_is_non_blocking(self):
+        os.environ.pop(chronik.PLEXER_EVENTS_URL_ENV, None)
+        result = chronik.send_event_to_plexer_safely({"kind": "agent.run.completed"})
+        self.assertFalse(result["configured"])
+        self.assertFalse(result["sent"])
+
+    def test_send_event_posts_json_to_plexer(self):
+        class Response:
+            status = 202
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def getcode(self):
+                return self.status
+
+        seen = {}
+
+        def fake_urlopen(request, timeout):
+            seen["url"] = request.full_url
+            seen["body"] = request.data.decode("utf-8")
+            seen["timeout"] = timeout
+            return Response()
+
+        event = {"schema_version": "agent-run-event.v0", "kind": "agent.run.completed", "data": {"result": "completed"}}
+        with patch.object(chronik, "urlopen", fake_urlopen):
+            result = chronik.send_event_to_plexer(event, url="http://plexer.local", timeout_seconds=2.5)
+
+        self.assertTrue(result["sent"])
+        self.assertEqual(result["status_code"], 202)
+        self.assertEqual(seen["url"], "http://plexer.local/v1/events")
+        self.assertEqual(json.loads(seen["body"]), event)
+        self.assertEqual(seen["timeout"], 2.5)
+
+    def test_flush_outbox_file_is_non_destructive(self):
+        event = chronik.build_event(record(), "completed")
+        self.assertIsNotNone(event)
+        path = self.root / "event.jsonl"
+        path.write_text(chronik.canonical_json(event) + "\n", encoding="utf-8")
+
+        with patch.object(chronik, "send_event_to_plexer_safely", return_value={"sent": True}):
+            result = chronik.flush_outbox_file_to_plexer(path, url="http://plexer.local")
+
+        self.assertEqual(result["events"], 1)
+        self.assertEqual(result["sent"], 1)
+        self.assertTrue(path.exists())
+        self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 1)
 
 
 if __name__ == "__main__":
