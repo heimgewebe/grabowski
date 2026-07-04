@@ -47,6 +47,9 @@ Rules:
 - Each review entry must include `source`, `review_sha256`, `verdict`, and integer `finding_count >= 0`.
 - `external_reviews_triaged` must be true.
 - `findings` must be a list, and every finding must be terminally triaged with the same terminal status rules as Grabowski self-review findings.
+- A review with `verdict != "PASS"` or `finding_count > 0` must be covered by terminal top-level `findings[]`; `findings: []` cannot hide a documented external blocker.
+- `external_reviews_triaged=true` states that triage happened; it does not replace finding records.
+- V1 uses count coverage rather than finding IDs: reported external findings must be no greater than terminal top-level findings, and a non-PASS review with `finding_count: 0` counts as one reported finding.
 - A complex/risky PR cannot be unblocked by setting `required=false` in evidence.
 - A trivial PR with no external evidence does not block. If voluntary external evidence is passed, its findings are still validated.
 

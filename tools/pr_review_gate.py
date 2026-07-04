@@ -511,6 +511,7 @@ def _external_review_failures(
         failures.append("prompt_includes_diff is not true")
 
     reviews = external_review.get("reviews")
+    reported_external_findings = 0
     if not isinstance(reviews, list):
         failures.append("reviews is not a list")
     elif required and not reviews:
@@ -531,16 +532,42 @@ def _external_review_failures(
             finding_count = review.get("finding_count")
             if isinstance(finding_count, bool) or not isinstance(finding_count, int) or finding_count < 0:
                 failures.append(f"review {index} finding_count must be an integer >= 0")
+            elif verdict in EXTERNAL_REVIEW_VERDICTS:
+                reported_external_findings += finding_count if verdict == "PASS" or finding_count > 0 else 1
 
     if external_review.get("external_reviews_triaged") is not True:
         failures.append("external_reviews_triaged is not true")
     findings = external_review.get("findings")
+    terminal_external_findings = 0
     if not isinstance(findings, list):
         failures.append("findings is not a list")
     else:
         for index, finding in enumerate(findings):
             if not isinstance(finding, dict) or not _terminal(finding):
                 failures.append(f"external_review finding {index} is not terminally triaged")
+            else:
+                terminal_external_findings += 1
+
+    if isinstance(reviews, list):
+        for index, review in enumerate(reviews):
+            if not isinstance(review, dict):
+                continue
+            verdict = review.get("verdict")
+            finding_count = review.get("finding_count")
+            if (
+                verdict in {"NEEDS_CHANGE", "BLOCK"}
+                and isinstance(finding_count, int)
+                and not isinstance(finding_count, bool)
+                and finding_count >= 0
+                and terminal_external_findings == 0
+            ):
+                failures.append(f"review {index} verdict is {verdict} without terminal finding coverage")
+        if reported_external_findings > terminal_external_findings:
+            failures.append(
+                "external reviews report "
+                f"{reported_external_findings} finding(s) but only "
+                f"{terminal_external_findings} terminal finding(s) are recorded"
+            )
     return failures
 
 

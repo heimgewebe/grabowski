@@ -86,6 +86,15 @@ def _external(**overrides: object) -> dict[str, object]:
     return data
 
 
+def _terminal_external_finding() -> dict[str, object]:
+    return {
+        "status": "fixed",
+        "severity": "p2",
+        "materiality": "material",
+        "reason": "addressed in follow-up patch",
+    }
+
+
 def _has_failure(result: dict[str, object], needle: str) -> bool:
     return any(needle in str(item) for item in result.get("failures", []))
 
@@ -105,6 +114,71 @@ class ExternalReviewGateTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["review_sources"]["external_review_required"])
         self.assertEqual(result["review_sources"]["external_reviews_received"], 1)
+
+
+    def test_complex_risk_path_block_verdict_without_terminal_finding_coverage_blocks(self) -> None:
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"),
+            self_review=_self_review(),
+            external_review_evidence=_external(
+                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "BLOCK", "finding_count": 0}],
+                external_reviews_triaged=True,
+                findings=[],
+            ),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "review 0 verdict is BLOCK without terminal finding coverage"), result["failures"])
+
+    def test_complex_risk_path_needs_change_without_terminal_finding_coverage_blocks(self) -> None:
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"),
+            self_review=_self_review(),
+            external_review_evidence=_external(
+                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "NEEDS_CHANGE", "finding_count": 0}],
+                external_reviews_triaged=True,
+                findings=[],
+            ),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "review 0 verdict is NEEDS_CHANGE without terminal finding coverage"), result["failures"])
+
+    def test_complex_risk_path_pass_with_reported_finding_without_terminal_finding_blocks(self) -> None:
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"),
+            self_review=_self_review(),
+            external_review_evidence=_external(
+                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1}],
+                external_reviews_triaged=True,
+                findings=[],
+            ),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "external reviews report 1 finding(s) but only 0 terminal finding(s) are recorded"), result["failures"])
+
+    def test_complex_risk_path_reported_finding_with_matching_terminal_finding_passes(self) -> None:
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"),
+            self_review=_self_review(),
+            external_review_evidence=_external(
+                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1}],
+                external_reviews_triaged=True,
+                findings=[_terminal_external_finding()],
+            ),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+
+    def test_complex_risk_path_two_reported_findings_with_one_terminal_finding_blocks(self) -> None:
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"),
+            self_review=_self_review(),
+            external_review_evidence=_external(
+                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 2}],
+                external_reviews_triaged=True,
+                findings=[_terminal_external_finding()],
+            ),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "external reviews report 2 finding(s) but only 1 terminal finding(s) are recorded"), result["failures"])
 
     def test_invalid_external_evidence_cases_block(self) -> None:
         cases = [
