@@ -14,6 +14,10 @@ Dieses Protokoll legt fest, wie mit blockierten ChatGPT/Grabowski-Operationen um
 
 Es etabliert keinen neuen Privilegienpfad, keine dauerhafte Agentenautonomie und keinen Ersatz fuer bestehende Grabowski-Policies. Es beschreibt eine Betriebsregel: direkt ausfuehren, falls eng genug; sonst einen einzelnen Griff abgeben; danach Ergebnis pruefen und wieder aufnehmen.
 
+## Nutzer-Eskalationsgrenze
+
+Der Nutzer ist Entscheidungsinstanz, nicht Standard-Executor. Bei Plattformblockade muss ChatGPT zuerst interne Relay-Pfade nutzen: engeres Typed Tool, Grabowski Micro-Task, Codex, Claude, agy, lokale KI oder Patch-Relay. Nutzerkontakt ist Entscheidungseskalation, kein Ersatz fuer einen blockierten Griff.
+
 ## Nicht-Ziele
 
 - Keine freie Shell als getarnte Schleuse.

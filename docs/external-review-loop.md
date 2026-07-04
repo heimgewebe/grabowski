@@ -5,7 +5,7 @@
 The external loop is separate from Grabowski self-review. Self-review remains internal evidence; external review evidence is passed with its own CLI argument:
 
 ```bash
-tools/pr_review_gate.py \
+python3 tools/pr_review_gate.py \
   --pr 70 \
   --self-review evidence/self-review.json \
   --claude-evidence evidence/claude.json \
