@@ -1,3 +1,8 @@
 from __future__ import annotations
 
-from grabowski_operator import *  # noqa: F403
+import importlib
+from typing import Any
+
+
+def __getattr__(name: str) -> Any:
+    return getattr(importlib.import_module("grabowski_operator"), name)
