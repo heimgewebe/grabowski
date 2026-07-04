@@ -708,9 +708,11 @@ def deploy_url(
         print(f"Release:         {build.release_path}")
         print(f"Legacy-Backup:   {activation.legacy_backup}")
     except Exception as original:
+        primary_error = _error_summary(original)
+        primary_error.setdefault("phase", phase)
         print(
             "PRIMARY-DEPLOY-ERROR: "
-            + json.dumps(_error_summary(original), sort_keys=True),
+            + json.dumps(primary_error, sort_keys=True),
             file=sys.stderr,
         )
         rollback_url(
