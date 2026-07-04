@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,26 @@ BLOCKING_REVIEW_STATES = {"CHANGES_REQUESTED", "DISMISSED", "PENDING"}
 EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
-RISK_PATH_MARKERS = ("auth", "access", "security", "deploy", "runtime", "systemd", "migration", "database", "policy", "capabilit", "operator", "mcp", "privileged", "audit", "rollback", "secret", "broker")
+EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
+RISK_PATH_MARKERS = (
+    "auth",
+    "access",
+    "security",
+    "deploy",
+    "runtime",
+    "systemd",
+    "migration",
+    "database",
+    "policy",
+    "capabilit",
+    "operator",
+    "mcp",
+    "privileged",
+    "audit",
+    "rollback",
+    "secret",
+    "broker",
+)
 RISK_PATH_PREFIXES = (
     "src/grabowski_mcp.py",
     "src/grabowski_operator.py",
@@ -29,7 +49,25 @@ RISK_PATH_PREFIXES = (
     "src/grabowski_artifacts.py",
     "tools/pr_review_gate.py",
 )
-PR_FIELDS = ("number", "title", "state", "isDraft", "mergeStateStatus", "mergeable", "headRefOid", "baseRefOid", "url", "reviewDecision", "changedFiles", "additions", "deletions", "files", "reviews", "latestReviews", "comments")
+PR_FIELDS = (
+    "number",
+    "title",
+    "state",
+    "isDraft",
+    "mergeStateStatus",
+    "mergeable",
+    "headRefOid",
+    "baseRefOid",
+    "url",
+    "reviewDecision",
+    "changedFiles",
+    "additions",
+    "deletions",
+    "files",
+    "reviews",
+    "latestReviews",
+    "comments",
+)
 CHECK_FIELDS = ("bucket", "completedAt", "description", "event", "link", "name", "startedAt", "state", "workflow")
 
 
@@ -57,6 +95,16 @@ def _brief_error(text: str) -> str:
 
 
 def _run_json(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> Any:
+    text = _run_text(repo, argv, allow_nonzero=allow_nonzero)
+    if not text.strip():
+        return [] if allow_nonzero else {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"command did not return JSON: {_command_label(argv)}") from exc
+
+
+def _run_text(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> str:
     if argv and argv[0] == "gh" and shutil.which("gh") is None:
         raise GateInputError("gh CLI is not available in PATH")
     try:
@@ -77,12 +125,11 @@ def _run_json(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> An
     if completed.returncode != 0 and not allow_nonzero:
         detail = _brief_error(completed.stderr)
         raise RuntimeError(detail or f"command failed: {_command_label(argv)}")
-    if not completed.stdout.strip():
-        return [] if allow_nonzero else {}
-    try:
-        return json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"command did not return JSON: {_command_label(argv)}") from exc
+    return completed.stdout
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _flatten_github_pages(raw: Any) -> list[dict[str, Any]]:
@@ -110,7 +157,19 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
         review_comments = _flatten_github_pages(raw_review_comments)
         raw_pr_reviews = _run_json(repo, ["gh", "api", f"repos/{name}/pulls/{pr}/reviews", "--paginate", "--slurp"], allow_nonzero=True)
         pr_reviews = _flatten_github_pages(raw_pr_reviews)
-    return {"pr": view, "checks": checks, "reviewComments": review_comments, "prReviews": pr_reviews, "repoName": name}
+    pr_diff_sha256: str | None = None
+    try:
+        pr_diff_sha256 = _sha256_text(_run_text(repo, ["gh", "pr", "diff", str(pr)]))
+    except RuntimeError:
+        pr_diff_sha256 = None
+    return {
+        "pr": view,
+        "checks": checks,
+        "reviewComments": review_comments,
+        "prReviews": pr_reviews,
+        "repoName": name,
+        "pr_diff_sha256": pr_diff_sha256,
+    }
 
 
 def _actor_logins(item: dict[str, Any]) -> set[str]:
@@ -215,32 +274,30 @@ def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) 
     return {"complex": bool(reasons), "reasons": reasons, "changed_files": changed_files, "changed_lines": changed_lines}
 
 
-def load_self_review(path: Path | None) -> dict[str, Any] | None:
+def _load_json_file(path: Path | None, *, label: str) -> dict[str, Any] | None:
     if path is None:
         return None
     if not path.is_file():
-        raise GateInputError(f"self-review file does not exist: {path}")
+        raise GateInputError(f"{label} file does not exist: {path}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise GateInputError(f"self-review file is not valid JSON: {path}") from exc
+        raise GateInputError(f"{label} file is not valid JSON: {path}") from exc
     if not isinstance(payload, dict):
-        raise GateInputError("self-review must be a JSON object")
+        raise GateInputError(f"{label} must be a JSON object")
     return payload
+
+
+def load_self_review(path: Path | None) -> dict[str, Any] | None:
+    return _load_json_file(path, label="self-review")
 
 
 def load_claude_evidence(path: Path | None) -> dict[str, Any] | None:
-    if path is None:
-        return None
-    if not path.is_file():
-        raise GateInputError(f"Claude evidence file does not exist: {path}")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise GateInputError(f"Claude evidence file is not valid JSON: {path}") from exc
-    if not isinstance(payload, dict):
-        raise GateInputError("Claude evidence must be a JSON object")
-    return payload
+    return _load_json_file(path, label="Claude evidence")
+
+
+def load_external_review_evidence(path: Path | None) -> dict[str, Any] | None:
+    return _load_json_file(path, label="external review evidence")
 
 
 def _valid_sha256(value: Any) -> bool:
@@ -384,53 +441,102 @@ def _valid_iteration(item: Any) -> bool:
     return True
 
 
-def _external_review_failures(pr: dict[str, Any], external_review: Any, *, required: bool) -> list[str]:
-    if not required:
-        if external_review is None:
-            return []
-        if not isinstance(external_review, dict):
-            return ["external_review is not a JSON object"]
-        failures: list[str] = []
-        if external_review.get("required") is False and not external_review.get("reason"):
-            failures.append("external_review required=false lacks reason")
-        findings = external_review.get("findings", [])
-        if not isinstance(findings, list):
-            failures.append("external_review.findings is not a list")
-        else:
-            for index, finding in enumerate(findings):
-                if not isinstance(finding, dict) or not _terminal(finding):
-                    failures.append(f"external_review finding {index} is not terminally triaged")
-        return failures
+def _legacy_external_finding_failures(external_review: dict[str, Any]) -> list[str]:
+    findings = external_review.get("findings", [])
+    if not isinstance(findings, list):
+        return ["external_review.findings is not a list"]
+    failures: list[str] = []
+    for index, finding in enumerate(findings):
+        if not isinstance(finding, dict) or not _terminal(finding):
+            failures.append(f"external_review finding {index} is not terminally triaged")
+    return failures
 
-    if external_review is None:
-        return ["external review is required but evidence is missing"]
+
+def _external_review_count(external_review: Any) -> int | None:
     if not isinstance(external_review, dict):
-        return ["external_review is not a JSON object"]
+        return None
+    reviews = external_review.get("reviews")
+    if isinstance(reviews, list):
+        return len(reviews)
+    reviews_received = external_review.get("reviews_received")
+    if isinstance(reviews_received, bool) or not isinstance(reviews_received, int):
+        return None
+    return reviews_received
+
+
+def _external_review_failures(
+    state: dict[str, Any],
+    pr: dict[str, Any],
+    external_review: Any,
+    *,
+    required: bool,
+    repo_name: str | None = None,
+) -> list[str]:
+    if external_review is None:
+        return ["external review is required but evidence is missing"] if required else []
+    if not isinstance(external_review, dict):
+        return ["external review evidence is not a JSON object"]
 
     failures: list[str] = []
     head = pr.get("headRefOid")
-    if external_review.get("required") is not True:
-        failures.append("external_review.required is not true")
+    pr_number = pr.get("number")
+
+    if required and external_review.get("required") is False:
+        failures.append("external_review.required=false cannot disable required external review")
+    if external_review.get("schema_version") != 1:
+        failures.append("schema_version is not 1")
+    if external_review.get("kind") != "external_review":
+        failures.append("kind is not external_review")
+    if repo_name is not None and external_review.get("repo") != repo_name:
+        failures.append("repo mismatch")
+    if pr_number is not None and str(external_review.get("pr")) != str(pr_number):
+        failures.append("pr number mismatch")
     if not isinstance(head, str) or not head:
         failures.append("PR headRefOid is missing")
-    elif external_review.get("prompt_head_sha") != head:
-        failures.append("external_review.prompt_head_sha mismatch")
-    if external_review.get("diff_prompt_provided") is not True:
-        failures.append("external_review.diff_prompt_provided is not true")
-    if external_review.get("prompt_includes_diff") is not True and external_review.get("prompt_includes_patch") is not True:
-        failures.append("external_review prompt does not assert diff/patch inclusion")
+    elif external_review.get("head_sha") != head:
+        failures.append("head_sha mismatch")
+
+    diff_sha256 = external_review.get("diff_sha256")
+    if not _valid_sha256(diff_sha256):
+        failures.append("diff_sha256 is missing or invalid")
+    else:
+        current_diff_sha256 = state.get("pr_diff_sha256")
+        if not _valid_sha256(current_diff_sha256):
+            failures.append("current PR diff hash is unavailable")
+        elif str(diff_sha256).lower() != str(current_diff_sha256).lower():
+            failures.append("diff_sha256 mismatch")
+    if not _valid_sha256(external_review.get("prompt_sha256")):
+        failures.append("prompt_sha256 is missing or invalid")
+    if external_review.get("prompt_includes_diff") is not True:
+        failures.append("prompt_includes_diff is not true")
+
+    reviews = external_review.get("reviews")
+    if not isinstance(reviews, list):
+        failures.append("reviews is not a list")
+    elif required and not reviews:
+        failures.append("reviews must be non-empty when required")
+    elif isinstance(reviews, list):
+        for index, review in enumerate(reviews):
+            if not isinstance(review, dict):
+                failures.append(f"review {index} is not a JSON object")
+                continue
+            source = review.get("source")
+            if not isinstance(source, str) or not source.strip():
+                failures.append(f"review {index} source is missing")
+            if not _valid_sha256(review.get("review_sha256")):
+                failures.append(f"review {index} review_sha256 is missing or invalid")
+            verdict = review.get("verdict")
+            if verdict not in EXTERNAL_REVIEW_VERDICTS:
+                failures.append(f"review {index} verdict is invalid")
+            finding_count = review.get("finding_count")
+            if isinstance(finding_count, bool) or not isinstance(finding_count, int) or finding_count < 0:
+                failures.append(f"review {index} finding_count must be an integer >= 0")
+
     if external_review.get("external_reviews_triaged") is not True:
-        failures.append("external_review.external_reviews_triaged is not true")
-
-    reviews_received = external_review.get("reviews_received")
-    if isinstance(reviews_received, bool) or not isinstance(reviews_received, int):
-        failures.append("external_review.reviews_received must be an integer")
-    elif reviews_received <= 0:
-        failures.append("external_review.reviews_received must be positive when required")
-
-    findings = external_review.get("findings", [])
+        failures.append("external_reviews_triaged is not true")
+    findings = external_review.get("findings")
     if not isinstance(findings, list):
-        failures.append("external_review.findings is not a list")
+        failures.append("findings is not a list")
     else:
         for index, finding in enumerate(findings):
             if not isinstance(finding, dict) or not _terminal(finding):
@@ -438,7 +544,13 @@ def _external_review_failures(pr: dict[str, Any], external_review: Any, *, requi
     return failures
 
 
-def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] | None = None, claude_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+def evaluate_review_gate(
+    state: dict[str, Any],
+    *,
+    self_review: dict[str, Any] | None = None,
+    claude_evidence: dict[str, Any] | None = None,
+    external_review_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     if isinstance(pr, dict):
         extra_reviews = {key: state[key] for key in ("reviewComments", "prReviews") if isinstance(state.get(key), list)}
@@ -525,13 +637,22 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
     if not claude_required and not claude_not_required:
         warnings.append("Claude non-requirement reason is not recorded")
 
-    external_review = self_review.get("external_review") if isinstance(self_review, dict) else None
+    deprecated_external_review = self_review.get("external_review") if isinstance(self_review, dict) else None
+    external_review = external_review_evidence
+    fallback_used = False
+    if external_review is None and isinstance(deprecated_external_review, dict):
+        if deprecated_external_review.get("schema_version") == 1 or deprecated_external_review.get("kind") == "external_review":
+            external_review = deprecated_external_review
+            fallback_used = True
+        elif not complexity["complex"] and deprecated_external_review.get("required") is False:
+            for failure in _legacy_external_finding_failures(deprecated_external_review):
+                failures.append(f"External review evidence invalid: {failure}")
+    if fallback_used:
+        warnings.append("Deprecated self_review.external_review fallback used; pass --external-review-evidence instead")
+
     external_required = complexity["complex"] or (isinstance(external_review, dict) and external_review.get("required") is True)
-    external_not_required = isinstance(external_review, dict) and external_review.get("required") is False and bool(external_review.get("reason"))
-    for failure in _external_review_failures(pr, external_review, required=external_required):
+    for failure in _external_review_failures(state, pr, external_review, required=external_required, repo_name=repo_name):
         failures.append(f"External review evidence invalid: {failure}")
-    if not external_required and not external_not_required:
-        warnings.append("External review non-requirement reason is not recorded")
 
     if not checks:
         failures.append("no status checks observed")
@@ -561,7 +682,7 @@ def evaluate_review_gate(state: dict[str, Any], *, self_review: dict[str, Any] |
             "claude_seen": claude_seen,
             "claude_cli_seen": claude_cli_seen,
             "external_review_required": external_required,
-            "external_reviews_received": external_review.get("reviews_received") if isinstance(external_review, dict) else None,
+            "external_reviews_received": _external_review_count(external_review),
             "review_item_count": len(all_review_items),
             "current_head_review_item_count": len(items),
         },
@@ -588,13 +709,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pr", type=int, required=True)
     parser.add_argument("--self-review")
     parser.add_argument("--claude-evidence")
+    parser.add_argument("--external-review-evidence")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     repo = args.repo.resolve()
     try:
         self_review = load_self_review(resolve_inside_repo(repo, args.self_review, label="self-review"))
         claude_evidence = load_claude_evidence(resolve_inside_repo(repo, args.claude_evidence, label="Claude evidence"))
-        result = evaluate_review_gate(load_pr_state(repo, args.pr), self_review=self_review, claude_evidence=claude_evidence)
+        external_review_evidence = load_external_review_evidence(resolve_inside_repo(repo, args.external_review_evidence, label="external review evidence"))
+        result = evaluate_review_gate(
+            load_pr_state(repo, args.pr),
+            self_review=self_review,
+            claude_evidence=claude_evidence,
+            external_review_evidence=external_review_evidence,
+        )
     except Exception as exc:
         result = {"schema_version": 1, "verdict": "BLOCK", "failures": [str(exc)], "warnings": []}
     if args.json:
