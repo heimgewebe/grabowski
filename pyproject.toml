@@ -30,7 +30,6 @@ py-modules = [
   "grabowski_read_surface",
   "grabowski_recovery",
   "grabowski_resources",
-  "grabowski_runtime",
   "grabowski_runtime_extensions",
   "grabowski_self_deploy",
   "grabowski_task_reconcile",
