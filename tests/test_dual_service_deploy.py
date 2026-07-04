@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -369,6 +371,51 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "rollback",
             ],
         )
+
+    def test_primary_error_preserves_inner_phase_and_records_deploy_phase(self) -> None:
+        stderr = io.StringIO()
+
+        def stop(unit: str):
+            if unit == dual.OPERATOR_SERVICE:
+                raise core.DeployError(
+                    "helper timed out",
+                    phase="command-timeout",
+                )
+            return observation(False)
+
+        def rollback(*args, **kwargs):
+            raise core.DeployError("rolled back")
+
+        with (
+            mock.patch.object(
+                dual,
+                "preflight_url",
+                return_value=(
+                    self.snapshot(),
+                    RUNTIME,
+                    dual.ProfileTopology("url", server_url_count=1),
+                ),
+            ),
+            mock.patch.object(core, "build_release", return_value=self.build()),
+            mock.patch.object(core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(core, "verify_manifest"),
+            mock.patch.object(core, "capture_pointer", return_value=SimpleNamespace()),
+            mock.patch.object(dual, "stop_service", side_effect=stop),
+            mock.patch.object(dual, "rollback_url", side_effect=rollback),
+            mock.patch("sys.stderr", stderr),
+        ):
+            with self.assertRaises(core.DeployError):
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+
+        error_line = next(
+            line
+            for line in stderr.getvalue().splitlines()
+            if line.startswith("PRIMARY-DEPLOY-ERROR: ")
+        )
+        payload = json.loads(error_line.removeprefix("PRIMARY-DEPLOY-ERROR: "))
+
+        self.assertEqual(payload["phase"], "command-timeout")
+        self.assertEqual(payload["deploy_phase"], "stop-operator")
 
     def test_rollback_stops_both_restores_then_starts_operator_before_tunnel(self) -> None:
         events: list[str] = []
