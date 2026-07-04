@@ -73,14 +73,14 @@ class OperatorPatchRelayTests(unittest.TestCase):
 
     def test_three_way_flag_reaches_check_and_apply(self) -> None:
         target = self.repo / "file.txt"
-        target.write_text("line1\nline2\nline3\n", encoding="utf-8")
+        target.write_text("line1\nline2\nline3\nline4\nline5\nline6\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.repo), "commit", "-am", "multi-line base"], check=True, stdout=subprocess.PIPE)
-        target.write_text("line1\nlineX\nline3\n", encoding="utf-8")
+        target.write_text("line1\nLINE2\nline3\nline4\nline5\nline6\n", encoding="utf-8")
         diff = subprocess.check_output(["git", "-C", str(self.repo), "diff", "--", "file.txt"], text=True)
         self.patch.write_text(diff, encoding="utf-8")
         subprocess.run(["git", "-C", str(self.repo), "checkout", "--", "file.txt"], check=True)
-        target.write_text("line1\nline2\nline3b\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(self.repo), "commit", "-am", "non-overlapping context change"], check=True, stdout=subprocess.PIPE)
+        target.write_text("line1\nline2\nline3\ncur4\nline5\nline6\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-am", "context edit"], check=True, stdout=subprocess.PIPE)
 
         plain = self._relay("--mode", "apply")
         self.assertNotEqual(plain.returncode, 0)
@@ -90,7 +90,7 @@ class OperatorPatchRelayTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         receipt = self._receipt()
         self.assertEqual(receipt["state"], "applied")
-        self.assertEqual(target.read_text(encoding="utf-8"), "line1\nlineX\nline3b\n")
+        self.assertEqual(target.read_text(encoding="utf-8"), "line1\nLINE2\nline3\ncur4\nline5\nline6\n")
 
     def test_dirty_repo_is_rejected_without_override(self) -> None:
         (self.repo / "other.txt").write_text("dirty\n", encoding="utf-8")
