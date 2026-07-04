@@ -41,6 +41,12 @@ def run_git(repo: Path, args: list[str], check: bool = False) -> subprocess.Comp
     return result
 
 
+def changed_file_names(repo: Path) -> list[str]:
+    worktree = run_git(repo, ["diff", "--name-only"], check=True).stdout.splitlines()
+    staged = run_git(repo, ["diff", "--cached", "--name-only"], check=True).stdout.splitlines()
+    return sorted(set(worktree) | set(staged))
+
+
 def write_receipt(path: Path | None, receipt: dict[str, Any]) -> None:
     payload = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
     if path is None:
@@ -141,7 +147,7 @@ def main() -> int:
 
         head_after = run_git(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
         status_after = run_git(repo, ["status", "--short", "--untracked-files=normal"], check=True).stdout.splitlines()
-        changed_files = run_git(repo, ["diff", "--name-only"], check=True).stdout.splitlines()
+        changed_files = changed_file_names(repo)
         receipt.update(
             {
                 "head_after": head_after,
