@@ -710,6 +710,7 @@ def deploy_url(
     except Exception as original:
         primary_error = _error_summary(original)
         primary_error.setdefault("phase", phase)
+        primary_error["deploy_phase"] = phase
         print(
             "PRIMARY-DEPLOY-ERROR: "
             + json.dumps(primary_error, sort_keys=True),
