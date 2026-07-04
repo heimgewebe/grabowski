@@ -47,6 +47,11 @@ def changed_file_names(repo: Path) -> list[str]:
     return sorted(set(worktree) | set(staged))
 
 
+def check_reported_conflicts(result: subprocess.CompletedProcess[str]) -> bool:
+    output = "\n".join([result.stdout, result.stderr]).lower()
+    return "with conflicts" in output
+
+
 def write_receipt(path: Path | None, receipt: dict[str, Any]) -> None:
     payload = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
     if path is None:
@@ -130,8 +135,11 @@ def main() -> int:
         receipt["check_returncode"] = check_result.returncode
         receipt["check_stdout"] = check_result.stdout[-4000:]
         receipt["check_stderr"] = check_result.stderr[-4000:]
+        receipt["check_conflicts"] = bool(args.three_way and check_reported_conflicts(check_result))
         if check_result.returncode != 0:
             raise RelayError("git apply --check failed", returncode=1)
+        if receipt["check_conflicts"]:
+            raise RelayError("git apply --check --3way reported conflicts", returncode=1)
 
         if args.mode == "apply":
             apply_args = ["apply"]
