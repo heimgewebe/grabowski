@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import json
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +39,23 @@ def run_git(repo: Path, args: list[str], check: bool = False) -> subprocess.Comp
     if check and result.returncode != 0:
         raise RelayError(result.stderr.strip() or result.stdout.strip() or "git command failed")
     return result
+
+
+def changed_file_names(repo: Path) -> list[str]:
+    worktree = run_git(repo, ["diff", "--name-only"], check=True).stdout.splitlines()
+    staged = run_git(repo, ["diff", "--cached", "--name-only"], check=True).stdout.splitlines()
+    return sorted(set(worktree) | set(staged))
+
+
+def check_reported_conflicts(result: subprocess.CompletedProcess[str]) -> bool:
+    lines = "\n".join([result.stdout, result.stderr]).splitlines()
+    for line in lines:
+        status = line.strip().lower()
+        if status.startswith("applied patch to ") and (
+            status.endswith(" with conflicts.") or status.endswith(" with conflicts")
+        ):
+            return True
+    return False
 
 
 def write_receipt(path: Path | None, receipt: dict[str, Any]) -> None:
@@ -117,12 +133,19 @@ def main() -> int:
         if status_before.strip() and not args.allow_dirty:
             raise RelayError("repo is dirty; pass --allow-dirty to override")
 
-        check_result = run_git(repo, ["apply", "--check", str(patch)])
+        check_args = ["apply", "--check"]
+        if args.three_way:
+            check_args.append("--3way")
+        check_args.append(str(patch))
+        check_result = run_git(repo, check_args)
         receipt["check_returncode"] = check_result.returncode
         receipt["check_stdout"] = check_result.stdout[-4000:]
         receipt["check_stderr"] = check_result.stderr[-4000:]
+        receipt["check_conflicts"] = bool(args.three_way and check_reported_conflicts(check_result))
         if check_result.returncode != 0:
             raise RelayError("git apply --check failed", returncode=1)
+        if receipt["check_conflicts"]:
+            raise RelayError("git apply --check --3way reported conflicts", returncode=1)
 
         if args.mode == "apply":
             apply_args = ["apply"]
@@ -138,7 +161,7 @@ def main() -> int:
 
         head_after = run_git(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
         status_after = run_git(repo, ["status", "--short", "--untracked-files=normal"], check=True).stdout.splitlines()
-        changed_files = run_git(repo, ["diff", "--name-only"], check=True).stdout.splitlines()
+        changed_files = changed_file_names(repo)
         receipt.update(
             {
                 "head_after": head_after,
