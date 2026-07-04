@@ -90,6 +90,7 @@ class OperatorPatchRelayTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         receipt = self._receipt()
         self.assertEqual(receipt["state"], "applied")
+        self.assertEqual(receipt["changed_files"], ["file.txt"])
         self.assertEqual(target.read_text(encoding="utf-8"), "line1\nLINE2\nline3\ncur4\nline5\nline6\n")
 
     def test_dirty_repo_is_rejected_without_override(self) -> None:
