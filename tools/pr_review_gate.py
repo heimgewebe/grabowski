@@ -69,6 +69,7 @@ PR_FIELDS = (
     "comments",
 )
 CHECK_FIELDS = ("bucket", "completedAt", "description", "event", "link", "name", "startedAt", "state", "workflow")
+MAX_EVIDENCE_BYTES = 1_000_000
 
 
 class GateInputError(RuntimeError):
@@ -279,6 +280,9 @@ def _load_json_file(path: Path | None, *, label: str) -> dict[str, Any] | None:
         return None
     if not path.is_file():
         raise GateInputError(f"{label} file does not exist: {path}")
+    size = path.stat().st_size
+    if size > MAX_EVIDENCE_BYTES:
+        raise GateInputError(f"{label} file exceeds {MAX_EVIDENCE_BYTES} bytes: {path}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -300,10 +304,19 @@ def load_external_review_evidence(path: Path | None) -> dict[str, Any] | None:
     return _load_json_file(path, label="external review evidence")
 
 
+def _normalize_sha256(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if len(normalized) != 64:
+        return None
+    if not all(char in "0123456789abcdef" for char in normalized):
+        return None
+    return normalized
+
+
 def _valid_sha256(value: Any) -> bool:
-    if not isinstance(value, str) or len(value) != 64:
-        return False
-    return all(char in "0123456789abcdef" for char in value.lower())
+    return _normalize_sha256(value) is not None
 
 
 def _claude_ultrareview_command_matches(command: Any, pr_number: Any) -> bool:
@@ -361,13 +374,15 @@ def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any, *, repo_nam
     failures: list[str] = []
     head = pr.get("headRefOid")
     pr_number = pr.get("number")
-    if evidence.get("schema_version") != 1:
-        failures.append("schema_version is not 1")
+    schema_version = evidence.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
+        failures.append("schema_version is not integer 1")
     if evidence.get("kind") != "claude_ultrareview":
         failures.append("kind is not claude_ultrareview")
     if repo_name is not None and evidence.get("repo") != repo_name:
         failures.append("repo mismatch")
-    if pr_number is not None and str(evidence.get("pr")) != str(pr_number):
+    evidence_pr = evidence.get("pr")
+    if pr_number is not None and (isinstance(evidence_pr, bool) or not isinstance(evidence_pr, int) or evidence_pr != pr_number):
         failures.append("pr number mismatch")
     if not isinstance(head, str) or not head:
         failures.append("PR headRefOid is missing")
@@ -458,10 +473,7 @@ def _external_review_count(external_review: Any) -> int | None:
     reviews = external_review.get("reviews")
     if isinstance(reviews, list):
         return len(reviews)
-    reviews_received = external_review.get("reviews_received")
-    if isinstance(reviews_received, bool) or not isinstance(reviews_received, int):
-        return None
-    return reviews_received
+    return None
 
 
 def _external_review_failures(
@@ -483,13 +495,15 @@ def _external_review_failures(
 
     if required and external_review.get("required") is False:
         failures.append("external_review.required=false cannot disable required external review")
-    if external_review.get("schema_version") != 1:
-        failures.append("schema_version is not 1")
+    schema_version = external_review.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
+        failures.append("schema_version is not integer 1")
     if external_review.get("kind") != "external_review":
         failures.append("kind is not external_review")
     if repo_name is not None and external_review.get("repo") != repo_name:
         failures.append("repo mismatch")
-    if pr_number is not None and str(external_review.get("pr")) != str(pr_number):
+    evidence_pr = external_review.get("pr")
+    if pr_number is not None and (isinstance(evidence_pr, bool) or not isinstance(evidence_pr, int) or evidence_pr != pr_number):
         failures.append("pr number mismatch")
     if not isinstance(head, str) or not head:
         failures.append("PR headRefOid is missing")
@@ -503,7 +517,7 @@ def _external_review_failures(
         current_diff_sha256 = state.get("pr_diff_sha256")
         if not _valid_sha256(current_diff_sha256):
             failures.append("current PR diff hash is unavailable")
-        elif str(diff_sha256).lower() != str(current_diff_sha256).lower():
+        elif _normalize_sha256(diff_sha256) != _normalize_sha256(current_diff_sha256):
             failures.append("diff_sha256 mismatch")
     if not _valid_sha256(external_review.get("prompt_sha256")):
         failures.append("prompt_sha256 is missing or invalid")
@@ -532,8 +546,10 @@ def _external_review_failures(
             finding_count = review.get("finding_count")
             if isinstance(finding_count, bool) or not isinstance(finding_count, int) or finding_count < 0:
                 failures.append(f"review {index} finding_count must be an integer >= 0")
-            elif verdict in EXTERNAL_REVIEW_VERDICTS:
-                reported_external_findings += finding_count if verdict == "PASS" or finding_count > 0 else 1
+            elif verdict == "PASS":
+                reported_external_findings += finding_count
+            elif verdict in {"NEEDS_CHANGE", "BLOCK"}:
+                reported_external_findings += max(1, finding_count)
 
     if external_review.get("external_reviews_triaged") is not True:
         failures.append("external_reviews_triaged is not true")
@@ -668,10 +684,12 @@ def evaluate_review_gate(
     external_review = external_review_evidence
     fallback_used = False
     if external_review is None and isinstance(deprecated_external_review, dict):
-        if deprecated_external_review.get("schema_version") == 1 or deprecated_external_review.get("kind") == "external_review":
+        if complexity["complex"]:
+            warnings.append("Deprecated self_review.external_review ignored for complex PR; pass --external-review-evidence instead")
+        elif deprecated_external_review.get("schema_version") == 1 or deprecated_external_review.get("kind") == "external_review":
             external_review = deprecated_external_review
             fallback_used = True
-        elif not complexity["complex"] and deprecated_external_review.get("required") is False:
+        elif deprecated_external_review.get("required") is False:
             for failure in _legacy_external_finding_failures(deprecated_external_review):
                 failures.append(f"External review evidence invalid: {failure}")
     if fallback_used:

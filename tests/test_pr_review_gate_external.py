@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -180,9 +181,66 @@ class ExternalReviewGateTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertTrue(_has_failure(result, "external reviews report 2 finding(s) but only 1 terminal finding(s) are recorded"), result["failures"])
 
+    def test_complex_risk_path_needs_change_requires_matching_terminal_finding_count(self) -> None:
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"),
+            self_review=_self_review(),
+            external_review_evidence=_external(
+                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "NEEDS_CHANGE", "finding_count": 2}],
+                external_reviews_triaged=True,
+                findings=[_terminal_external_finding()],
+            ),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "external reviews report 2 finding(s) but only 1 terminal finding(s) are recorded"), result["failures"])
+
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"),
+            self_review=_self_review(),
+            external_review_evidence=_external(
+                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "NEEDS_CHANGE", "finding_count": 2}],
+                external_reviews_triaged=True,
+                findings=[_terminal_external_finding(), _terminal_external_finding()],
+            ),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+
+    def test_complex_risk_path_block_zero_count_passes_with_one_terminal_finding(self) -> None:
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"),
+            self_review=_self_review(),
+            external_review_evidence=_external(
+                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "BLOCK", "finding_count": 0}],
+                external_reviews_triaged=True,
+                findings=[_terminal_external_finding()],
+            ),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+
+    def test_deprecated_embedded_external_review_does_not_satisfy_complex_path(self) -> None:
+        self_review = _self_review()
+        self_review["external_review"] = _external()
+        result = gate.evaluate_review_gate(_state("tools/pr_review_gate.py"), self_review=self_review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
+        self.assertIn(
+            "Deprecated self_review.external_review ignored for complex PR; pass --external-review-evidence instead",
+            result["warnings"],
+        )
+
+    def test_external_review_evidence_file_size_limit_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "external-review.json"
+            path.write_text("{" + (" " * gate.MAX_EVIDENCE_BYTES) + "}", encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateInputError, "external review evidence file exceeds"):
+                gate.load_external_review_evidence(path)
+
     def test_invalid_external_evidence_cases_block(self) -> None:
         cases = [
             ("required false", _state("tools/pr_review_gate.py"), _external(required=False), "required=false cannot disable"),
+            ("bool schema version", _state("tools/pr_review_gate.py"), _external(schema_version=True), "schema_version is not integer 1"),
+            ("bool pr number", _state("tools/pr_review_gate.py"), _external(pr=True), "pr number mismatch"),
+            ("string pr number", _state("tools/pr_review_gate.py"), _external(pr="7"), "pr number mismatch"),
             ("wrong head", _state("tools/pr_review_gate.py"), _external(head_sha="b" * 40), "head_sha mismatch"),
             ("wrong diff", _state("tools/pr_review_gate.py"), _external(diff_sha256="3" * 64), "diff_sha256 mismatch"),
             ("missing diff", _state("tools/pr_review_gate.py", diff_sha=None), _external(), "current PR diff hash is unavailable"),
@@ -190,6 +248,8 @@ class ExternalReviewGateTests(unittest.TestCase):
             ("empty reviews", _state("tools/pr_review_gate.py"), _external(reviews=[]), "reviews must be non-empty"),
             ("reviews not list", _state("tools/pr_review_gate.py"), _external(reviews={"source": "chatgpt"}), "reviews is not a list"),
             ("bool finding count", _state("tools/pr_review_gate.py"), _external(reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": True}]), "finding_count must be an integer"),
+            ("non-string source", _state("tools/pr_review_gate.py"), _external(reviews=[{"source": 123, "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 0}]), "source is missing"),
+            ("non-string verdict", _state("tools/pr_review_gate.py"), _external(reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": 123, "finding_count": 0}]), "verdict is invalid"),
             ("not triaged", _state("tools/pr_review_gate.py"), _external(external_reviews_triaged=False), "external_reviews_triaged is not true"),
             ("findings not list", _state("tools/pr_review_gate.py"), _external(findings={"status": "fixed"}), "findings is not a list"),
             ("untriaged finding", _state("tools/pr_review_gate.py"), _external(findings=[{"status": "open", "severity": "low"}]), "external_review finding 0 is not terminally triaged"),
