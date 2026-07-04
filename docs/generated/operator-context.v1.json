@@ -1393,7 +1393,7 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "bb73d763f9f1556841fec341f5a64bea94d64406fd0c01ab3a1b17b2e517c954"
+      "sha256": "a56e717c0c0441f45654e44936d5f4a45e85a68a4ff1f90cc5f4bb0ab206346c"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",

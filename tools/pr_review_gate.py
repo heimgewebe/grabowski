@@ -69,7 +69,7 @@ PR_FIELDS = (
     "comments",
 )
 CHECK_FIELDS = ("bucket", "completedAt", "description", "event", "link", "name", "startedAt", "state", "workflow")
-MAX_EVIDENCE_BYTES = 1_000_000
+MAX_JSON_EVIDENCE_BYTES = 1_000_000
 
 
 class GateInputError(RuntimeError):
@@ -159,10 +159,11 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
         raw_pr_reviews = _run_json(repo, ["gh", "api", f"repos/{name}/pulls/{pr}/reviews", "--paginate", "--slurp"], allow_nonzero=True)
         pr_reviews = _flatten_github_pages(raw_pr_reviews)
     pr_diff_sha256: str | None = None
+    pr_diff_error: str | None = None
     try:
         pr_diff_sha256 = _sha256_text(_run_text(repo, ["gh", "pr", "diff", str(pr)]))
-    except RuntimeError:
-        pr_diff_sha256 = None
+    except RuntimeError as exc:
+        pr_diff_error = _brief_error(str(exc))
     return {
         "pr": view,
         "checks": checks,
@@ -170,6 +171,7 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
         "prReviews": pr_reviews,
         "repoName": name,
         "pr_diff_sha256": pr_diff_sha256,
+        "pr_diff_error": pr_diff_error,
     }
 
 
@@ -281,8 +283,8 @@ def _load_json_file(path: Path | None, *, label: str) -> dict[str, Any] | None:
     if not path.is_file():
         raise GateInputError(f"{label} file does not exist: {path}")
     size = path.stat().st_size
-    if size > MAX_EVIDENCE_BYTES:
-        raise GateInputError(f"{label} file exceeds {MAX_EVIDENCE_BYTES} bytes: {path}")
+    if size > MAX_JSON_EVIDENCE_BYTES:
+        raise GateInputError(f"{label} file exceeds {MAX_JSON_EVIDENCE_BYTES} bytes: {path}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -476,6 +478,14 @@ def _external_review_count(external_review: Any) -> int | None:
     return None
 
 
+def _reported_external_finding_count(verdict: Any, finding_count: int) -> int:
+    if verdict == "PASS":
+        return finding_count
+    if verdict in {"NEEDS_CHANGE", "BLOCK"}:
+        return max(1, finding_count)
+    return 0
+
+
 def _external_review_failures(
     state: dict[str, Any],
     pr: dict[str, Any],
@@ -493,8 +503,12 @@ def _external_review_failures(
     head = pr.get("headRefOid")
     pr_number = pr.get("number")
 
-    if required and external_review.get("required") is False:
-        failures.append("external_review.required=false cannot disable required external review")
+    if "required" in external_review:
+        evidence_required = external_review.get("required")
+        if not isinstance(evidence_required, bool):
+            failures.append("external_review.required must be a bool")
+        elif required and evidence_required is False:
+            failures.append("external_review.required=false cannot disable required external review")
     schema_version = external_review.get("schema_version")
     if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
         failures.append("schema_version is not integer 1")
@@ -516,7 +530,11 @@ def _external_review_failures(
     else:
         current_diff_sha256 = state.get("pr_diff_sha256")
         if not _valid_sha256(current_diff_sha256):
-            failures.append("current PR diff hash is unavailable")
+            pr_diff_error = state.get("pr_diff_error")
+            if isinstance(pr_diff_error, str) and pr_diff_error.strip():
+                failures.append(f"current PR diff hash is unavailable: {_brief_error(pr_diff_error)}")
+            else:
+                failures.append("current PR diff hash is unavailable")
         elif _normalize_sha256(diff_sha256) != _normalize_sha256(current_diff_sha256):
             failures.append("diff_sha256 mismatch")
     if not _valid_sha256(external_review.get("prompt_sha256")):
@@ -546,10 +564,8 @@ def _external_review_failures(
             finding_count = review.get("finding_count")
             if isinstance(finding_count, bool) or not isinstance(finding_count, int) or finding_count < 0:
                 failures.append(f"review {index} finding_count must be an integer >= 0")
-            elif verdict == "PASS":
-                reported_external_findings += finding_count
-            elif verdict in {"NEEDS_CHANGE", "BLOCK"}:
-                reported_external_findings += max(1, finding_count)
+            else:
+                reported_external_findings += _reported_external_finding_count(verdict, finding_count)
 
     if external_review.get("external_reviews_triaged") is not True:
         failures.append("external_reviews_triaged is not true")
@@ -682,18 +698,8 @@ def evaluate_review_gate(
 
     deprecated_external_review = self_review.get("external_review") if isinstance(self_review, dict) else None
     external_review = external_review_evidence
-    fallback_used = False
-    if external_review is None and isinstance(deprecated_external_review, dict):
-        if complexity["complex"]:
-            warnings.append("Deprecated self_review.external_review ignored for complex PR; pass --external-review-evidence instead")
-        elif deprecated_external_review.get("schema_version") == 1 or deprecated_external_review.get("kind") == "external_review":
-            external_review = deprecated_external_review
-            fallback_used = True
-        elif deprecated_external_review.get("required") is False:
-            for failure in _legacy_external_finding_failures(deprecated_external_review):
-                failures.append(f"External review evidence invalid: {failure}")
-    if fallback_used:
-        warnings.append("Deprecated self_review.external_review fallback used; pass --external-review-evidence instead")
+    if isinstance(deprecated_external_review, dict):
+        warnings.append("Deprecated self_review.external_review ignored; pass --external-review-evidence instead")
 
     external_required = complexity["complex"] or (isinstance(external_review, dict) and external_review.get("required") is True)
     for failure in _external_review_failures(state, pr, external_review, required=external_required, repo_name=repo_name):

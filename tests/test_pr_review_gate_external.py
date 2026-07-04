@@ -217,6 +217,54 @@ class ExternalReviewGateTests(unittest.TestCase):
         )
         self.assertEqual(result["verdict"], "PASS")
 
+    def test_sha256_normalization_accepts_uppercase_and_whitespace(self) -> None:
+        diff_sha = "ab" * 32
+        prompt_sha = "cd" * 32
+        review_sha = "ef" * 32
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py", diff_sha=diff_sha),
+            self_review=_self_review(),
+            external_review_evidence=_external(
+                diff_sha256=f"  {diff_sha.upper()}\n",
+                prompt_sha256=f"\t{prompt_sha.upper()}  ",
+                reviews=[
+                    {
+                        "source": "chatgpt",
+                        "review_sha256": f"  {review_sha.upper()}\t",
+                        "verdict": "PASS",
+                        "finding_count": 0,
+                    }
+                ],
+            ),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+
+    def test_mixed_review_counts_require_two_terminal_findings(self) -> None:
+        reviews = [
+            {"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1},
+            {"source": "claude", "review_sha256": "3" * 64, "verdict": "BLOCK", "finding_count": 0},
+        ]
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"),
+            self_review=_self_review(),
+            external_review_evidence=_external(reviews=reviews, findings=[_terminal_external_finding()]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(
+            _has_failure(result, "external reviews report 2 finding(s) but only 1 terminal finding(s) are recorded"),
+            result["failures"],
+        )
+
+        result = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"),
+            self_review=_self_review(),
+            external_review_evidence=_external(
+                reviews=reviews,
+                findings=[_terminal_external_finding(), _terminal_external_finding()],
+            ),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+
     def test_deprecated_embedded_external_review_does_not_satisfy_complex_path(self) -> None:
         self_review = _self_review()
         self_review["external_review"] = _external()
@@ -224,20 +272,51 @@ class ExternalReviewGateTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
         self.assertIn(
-            "Deprecated self_review.external_review ignored for complex PR; pass --external-review-evidence instead",
+            "Deprecated self_review.external_review ignored; pass --external-review-evidence instead",
             result["warnings"],
         )
+        self.assertIsNone(result["review_sources"]["external_reviews_received"])
 
-    def test_external_review_evidence_file_size_limit_blocks(self) -> None:
+    def test_trivial_embedded_external_review_is_ignored_with_warning(self) -> None:
+        self_review = _self_review()
+        self_review["external_review"] = _external()
+        result = gate.evaluate_review_gate(_state(), self_review=self_review)
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertIn(
+            "Deprecated self_review.external_review ignored; pass --external-review-evidence instead",
+            result["warnings"],
+        )
+        self.assertIsNone(result["review_sources"]["external_reviews_received"])
+
+    def test_json_evidence_file_size_limit_blocks_all_loaders(self) -> None:
+        loaders = [
+            ("self-review", gate.load_self_review, "self-review.json"),
+            ("Claude evidence", gate.load_claude_evidence, "claude.json"),
+            ("external review evidence", gate.load_external_review_evidence, "external-review.json"),
+        ]
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "external-review.json"
-            path.write_text("{" + (" " * gate.MAX_EVIDENCE_BYTES) + "}", encoding="utf-8")
-            with self.assertRaisesRegex(gate.GateInputError, "external review evidence file exceeds"):
-                gate.load_external_review_evidence(path)
+            for label, loader, filename in loaders:
+                with self.subTest(label=label):
+                    path = Path(tmpdir) / filename
+                    path.write_text("{" + (" " * gate.MAX_JSON_EVIDENCE_BYTES) + "}", encoding="utf-8")
+                    with self.assertRaisesRegex(gate.GateInputError, f"{label} file exceeds"):
+                        loader(path)
+
+    def test_missing_current_diff_hash_reports_error_detail(self) -> None:
+        state = _state("tools/pr_review_gate.py", diff_sha=None)
+        state["pr_diff_error"] = "gh pr diff failed"
+        result = gate.evaluate_review_gate(state, self_review=_self_review(), external_review_evidence=_external())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(
+            _has_failure(result, "current PR diff hash is unavailable: gh pr diff failed"),
+            result["failures"],
+        )
 
     def test_invalid_external_evidence_cases_block(self) -> None:
         cases = [
             ("required false", _state("tools/pr_review_gate.py"), _external(required=False), "required=false cannot disable"),
+            ("required string false", _state("tools/pr_review_gate.py"), _external(required="false"), "external_review.required must be a bool"),
+            ("required zero", _state("tools/pr_review_gate.py"), _external(required=0), "external_review.required must be a bool"),
             ("bool schema version", _state("tools/pr_review_gate.py"), _external(schema_version=True), "schema_version is not integer 1"),
             ("bool pr number", _state("tools/pr_review_gate.py"), _external(pr=True), "pr number mismatch"),
             ("string pr number", _state("tools/pr_review_gate.py"), _external(pr="7"), "pr number mismatch"),
