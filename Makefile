@@ -11,42 +11,7 @@ DEPLOY_TOOL_PYTHON := $(DEPLOY_TOOLING_VENV)/bin/python
 validate: syntax test policy context-check profiles-check runtime-lock deploy-tooling-check secrets
 
 syntax:
->$(PYTHON) -m py_compile src/grabowski_mcp.py
->$(PYTHON) -m py_compile src/grabowski_operator.py
->$(PYTHON) -m py_compile src/grabowski_capabilities.py
->$(PYTHON) -m py_compile src/grabowski_chronik.py
->$(PYTHON) -m py_compile src/grabowski_runtime_extensions.py
->$(PYTHON) -m py_compile src/grabowski_read_surface.py
->$(PYTHON) -m py_compile src/grabowski_self_deploy.py
->$(PYTHON) -m py_compile src/grabowski_runtime.py
->$(PYTHON) -m py_compile src/grabowski_fleet.py
->$(PYTHON) -m py_compile src/grabowski_artifacts.py
->$(PYTHON) -m py_compile src/grabowski_operations.py
->$(PYTHON) -m py_compile src/grabowski_privileged.py
->$(PYTHON) -m py_compile src/grabowski_privileged_status_core.py
->$(PYTHON) -m py_compile src/grabowski_privileged_broker.py
->$(PYTHON) -m py_compile src/grabowski_recovery.py
->$(PYTHON) -m py_compile src/grabowski_tasks.py
->$(PYTHON) -m py_compile src/grabowski_resources.py
->$(PYTHON) -m py_compile src/grabowski_checkouts.py
->$(PYTHON) -m py_compile src/grabowski_task_reconcile.py
->$(PYTHON) -m py_compile src/grabowski_workers.py
->$(PYTHON) -m py_compile src/grabowski_worker_process.py
->$(PYTHON) -m py_compile tools/build_operator_context.py
->$(PYTHON) -m py_compile tools/operator_patch_relay.py
->$(PYTHON) -m py_compile tools/build_publication_profiles.py
->$(PYTHON) -m py_compile tools/run_scheduled_deploy.py
->$(PYTHON) -m py_compile tools/deploy_runtime.py
->$(PYTHON) -m py_compile tools/deploy_runtime_dual.py
->$(PYTHON) -m py_compile tools/watchdog_runtime.py
->$(PYTHON) -m py_compile tools/validate_runtime_lock.py
->$(PYTHON) -m py_compile tools/build_local_evidence.py
->$(PYTHON) -m py_compile tools/connector_probe.py
->$(PYTHON) -m py_compile tools/grabowski_fleet_cli.py
->$(PYTHON) -m py_compile tools/grabowski_recipe_cli.py
->$(PYTHON) -m py_compile tools/grabowski_privileged_status.py
->$(PYTHON) -m py_compile tools/grabowski_privileged_broker.py
->$(PYTHON) -m py_compile tools/grabowski_privileged_request.py
+>$(PYTHON) -m py_compile $(wildcard src/*.py) $(wildcard tools/*.py)
 
 test:
 >set -eu; test_home="$(CURDIR)/build/test-home"; rm -rf "$$test_home"; trap 'rm -rf "$$test_home"' EXIT; install -d -m 700 "$$test_home/.config/grabowski"; install -m 600 config/access.home-wide-operator.example.json "$$test_home/.config/grabowski/access.json"; HOME="$$test_home" $(PYTHON) -m unittest discover -s tests -v
