@@ -11,6 +11,7 @@ DEPLOY_TOOL_PYTHON := $(DEPLOY_TOOLING_VENV)/bin/python
 validate: syntax test policy context-check profiles-check runtime-lock deploy-tooling-check secrets
 
 syntax:
+>$(PYTHON) -m py_compile tools/operator_patch_relay.py
 >$(PYTHON) -m py_compile $(wildcard src/*.py) $(wildcard tools/*.py)
 
 test:
