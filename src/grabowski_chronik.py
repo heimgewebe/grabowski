@@ -6,9 +6,12 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 ENABLED_ENV = "GRABOWSKI_CHRONIK_AGENT_RUN_OUTBOX"
 STATE_ROOT_ENV = "GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT"
+PLEXER_EVENTS_URL_ENV = "GRABOWSKI_PLEXER_EVENTS_URL"
 TASK_ENABLED_FIELD = "chronik_outbox_enabled"
 TASK_STATE_ROOT_FIELD = "chronik_outbox_state_root"
 TRUTHY = {"1", "true", "yes", "on"}
@@ -131,3 +134,70 @@ def record_task_state_safely(record: dict[str, Any], state: str) -> dict[str, An
         return record_task_state(record, state)
     except Exception as exc:
         return {"enabled": record_enabled(record), "written": False, "error": str(exc)}
+
+
+def plexer_events_url(raw: str | None = None) -> str | None:
+    value = raw if raw is not None else os.environ.get(PLEXER_EVENTS_URL_ENV)
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip().rstrip("/")
+    if not stripped:
+        return None
+    if stripped.endswith("/v1/events"):
+        return stripped
+    return f"{stripped}/v1/events"
+
+
+def send_event_to_plexer(
+    event: dict[str, Any],
+    url: str | None = None,
+    timeout_seconds: float = 5.0,
+) -> dict[str, Any]:
+    target = plexer_events_url(url)
+    if target is None:
+        return {"configured": False, "sent": False, "retryable": False}
+    request = Request(
+        target,
+        data=canonical_json(event).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            status_code = int(getattr(response, "status", response.getcode()))
+        return {"configured": True, "sent": 200 <= status_code < 300, "retryable": status_code == 429 or status_code >= 500, "status_code": status_code}
+    except HTTPError as exc:
+        return {"configured": True, "sent": False, "retryable": exc.code == 429 or exc.code >= 500, "status_code": exc.code, "error": str(exc)}
+    except (TimeoutError, URLError, OSError) as exc:
+        return {"configured": True, "sent": False, "retryable": True, "error": str(exc)}
+
+
+def send_event_to_plexer_safely(
+    event: dict[str, Any],
+    url: str | None = None,
+    timeout_seconds: float = 5.0,
+) -> dict[str, Any]:
+    try:
+        return send_event_to_plexer(event, url=url, timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        return {"configured": plexer_events_url(url) is not None, "sent": False, "retryable": True, "error": str(exc)}
+
+
+def flush_outbox_file_to_plexer(
+    path: Path,
+    url: str | None = None,
+    timeout_seconds: float = 5.0,
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            results.append({"line": line_number, "sent": False, "retryable": False, "error": f"invalid json: {exc}"})
+            continue
+        result = send_event_to_plexer_safely(event, url=url, timeout_seconds=timeout_seconds)
+        result["line"] = line_number
+        results.append(result)
+    return {"events": len(results), "sent": sum(1 for result in results if result.get("sent") is True), "results": results}
