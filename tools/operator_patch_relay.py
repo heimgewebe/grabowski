@@ -48,8 +48,14 @@ def changed_file_names(repo: Path) -> list[str]:
 
 
 def check_reported_conflicts(result: subprocess.CompletedProcess[str]) -> bool:
-    output = "\n".join([result.stdout, result.stderr]).lower()
-    return "with conflicts" in output
+    lines = "\n".join([result.stdout, result.stderr]).splitlines()
+    for line in lines:
+        status = line.strip().lower()
+        if status.startswith("applied patch to ") and (
+            status.endswith(" with conflicts.") or status.endswith(" with conflicts")
+        ):
+            return True
+    return False
 
 
 def write_receipt(path: Path | None, receipt: dict[str, Any]) -> None:
