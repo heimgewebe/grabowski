@@ -98,6 +98,36 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("repo parameter must be a non-empty string", result["output"]["error"])
         self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
 
+    def test_repo_orient_blocks_expected_branch_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "repo-orient",
+                {"repo": tmp, "expected_branch": "feat/operator-grip-foundation-v1"},
+                command_runner=FakeGit(branch="main", dirty=False),
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("expected_branch mismatch", result["output"]["error"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["expected_branch"])
+        self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
+
+    def test_post_merge_sync_validates_target_branch_before_orienting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit()
+            result = grips.run_grip(
+                "post-merge-sync",
+                {"repo": tmp, "target_branch": ""},
+                command_runner=fake,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("target_branch parameter must be a non-empty string", result["output"]["error"])
+        self.assertEqual([], fake.calls)
+        self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
+
     def test_post_merge_sync_is_dry_run_only_in_foundation_slice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = grips.run_grip(

@@ -244,6 +244,10 @@ def _run_repo_orient(
             f"actual={orientation['branch']} expected={expected}",
         )
         orientation["expected_branch_match"] = matches
+        if not matches:
+            raise GripPreflightError(
+                f"expected_branch mismatch: actual={orientation['branch']} expected={expected}"
+            )
     else:
         _check(receipt, "expected_branch", "skip", "no expected_branch parameter")
         orientation["expected_branch_match"] = None
@@ -297,15 +301,16 @@ def _run_post_merge_sync(
     receipt: Receipt,
     runner: CommandRunner,
 ) -> dict[str, Any]:
+    target = parameters.get("target_branch")
+    if not isinstance(target, str) or not target.strip():
+        raise GripPreflightError("target_branch parameter must be a non-empty string")
+    target = target.strip()
     dry_run = parameters.get("dry_run", True)
     if dry_run is not True:
         _check(receipt, "dry_run_only", "fail", "post-merge-sync foundation grip is dry-run only")
         raise GripPreflightError("post-merge-sync is dry-run only in GRIP-001")
     _check(receipt, "dry_run_only", "pass", "no mutation will be executed")
     orientation = _run_repo_orient(spec, parameters, receipt, runner)
-    target = parameters.get("target_branch")
-    if not isinstance(target, str) or not target:
-        raise GripPreflightError("target_branch parameter must be a non-empty string")
     commands = [
         ["git", "fetch", "origin"],
         ["git", "switch", target],
