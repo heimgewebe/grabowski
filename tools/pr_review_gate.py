@@ -18,6 +18,7 @@ EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
+SELF_REVIEW_DIFF_BYPASS_REASON = "legacy unit seam without live PR diff"
 RISK_PATH_MARKERS = (
     "auth",
     "access",
@@ -130,8 +131,37 @@ def _run_text(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> st
     return completed.stdout
 
 
+def _run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> bytes:
+    if argv and argv[0] == "gh" and shutil.which("gh") is None:
+        raise GateInputError("gh CLI is not available in PATH")
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=repo,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            env=_env(),
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout = int(exc.timeout or 90)
+        raise RuntimeError(f"command timed out after {timeout}s: {_command_label(argv)}") from exc
+    if completed.returncode != 0 and not allow_nonzero:
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        detail = _brief_error(stderr)
+        raise RuntimeError(detail or f"command failed: {_command_label(argv)}")
+    return completed.stdout
+
+
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _flatten_github_pages(raw: Any) -> list[dict[str, Any]]:
@@ -162,7 +192,7 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     pr_diff_sha256: str | None = None
     pr_diff_error: str | None = None
     try:
-        pr_diff_sha256 = _sha256_text(_run_text(repo, ["gh", "pr", "diff", str(pr)]))
+        pr_diff_sha256 = _sha256_bytes(_run_bytes(repo, ["gh", "pr", "diff", str(pr)]))
     except RuntimeError as exc:
         pr_diff_error = _brief_error(str(exc))
     return {
@@ -416,6 +446,45 @@ def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any, *, repo_nam
     return failures
 
 
+def _self_review_diff_bound(state: dict[str, Any], self_review: dict[str, Any]) -> bool:
+    current_diff_sha256 = state.get("pr_diff_sha256")
+    evidence_diff_sha256 = self_review.get("diff_sha256")
+    return (
+        state.get("pr_diff_bypass") is not True
+        and _valid_sha256(current_diff_sha256)
+        and _valid_sha256(evidence_diff_sha256)
+        and _normalize_sha256(evidence_diff_sha256) == _normalize_sha256(current_diff_sha256)
+    )
+
+
+def _self_review_diff_failures(state: dict[str, Any], self_review: dict[str, Any]) -> list[str]:
+    if state.get("pr_diff_bypass") is True:
+        reason = state.get("pr_diff_bypass_reason")
+        if reason == SELF_REVIEW_DIFF_BYPASS_REASON:
+            return []
+        return [
+            "self-review diff binding bypass requires "
+            f"pr_diff_bypass_reason={SELF_REVIEW_DIFF_BYPASS_REASON!r}"
+        ]
+
+    failures: list[str] = []
+    current_diff_sha256 = state.get("pr_diff_sha256")
+    if not _valid_sha256(current_diff_sha256):
+        pr_diff_error = state.get("pr_diff_error")
+        if isinstance(pr_diff_error, str) and pr_diff_error.strip():
+            failures.append(f"current PR diff hash is unavailable: {_brief_error(pr_diff_error)}")
+        else:
+            failures.append("current PR diff hash is unavailable")
+
+    evidence_diff_sha256 = self_review.get("diff_sha256")
+    if not _valid_sha256(evidence_diff_sha256):
+        failures.append("self-review diff_sha256 is missing or invalid")
+    elif _valid_sha256(current_diff_sha256) and not _self_review_diff_bound(state, self_review):
+        failures.append("self-review diff_sha256 mismatch")
+
+    return failures
+
+
 def _material_findings_remaining(self_review: dict[str, Any], failures: list[str]) -> int | None:
     if "material_findings_remaining" not in self_review:
         failures.append("self-review material_findings_remaining is missing")
@@ -665,6 +734,7 @@ def evaluate_review_gate(
             failures.append("self-review head_sha mismatch")
         if self_review.get("diff_reviewed") is not True:
             failures.append("self-review does not assert diff_reviewed=true")
+        failures.extend(_self_review_diff_failures(state, self_review))
         if self_review.get("all_findings_triaged") is not True:
             failures.append("self-review does not assert all_findings_triaged=true")
         iterations = self_review.get("review_iterations")
@@ -696,6 +766,9 @@ def evaluate_review_gate(
         failures.append("Claude review is required but not observed on current head")
     if not claude_required and not claude_not_required:
         warnings.append("Claude non-requirement reason is not recorded")
+
+    if state.get("pr_diff_bypass") is True:
+        warnings.append("Self-review diff binding bypass was requested")
 
     deprecated_external_review = self_review.get("external_review") if isinstance(self_review, dict) else None
     external_review = external_review_evidence
@@ -735,6 +808,9 @@ def evaluate_review_gate(
             "claude_cli_seen": claude_cli_seen,
             "external_review_required": external_required,
             "external_reviews_received": _external_review_count(external_review),
+            "self_review_diff_bound": isinstance(self_review, dict)
+            and _self_review_diff_bound(state, self_review),
+            "self_review_diff_bypass_used": state.get("pr_diff_bypass") is True,
             "review_item_count": len(all_review_items),
             "current_head_review_item_count": len(items),
         },

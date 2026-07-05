@@ -34,6 +34,8 @@ class PrReviewGateCliTests(unittest.TestCase):
     def test_unavailable_review_reason_warns_but_no_cli_bypass_exists(self) -> None:
         marker = "cod" + "ex"
         state = {
+            "pr_diff_bypass": True,
+            "pr_diff_bypass_reason": "legacy unit seam without live PR diff",
             "pr": {
                 "number": 58,
                 "state": "OPEN",
@@ -71,6 +73,8 @@ class PrReviewGateCliTests(unittest.TestCase):
     def test_core_grabowski_paths_require_independent_review(self) -> None:
         head = "a" * 40
         state = {
+            "pr_diff_bypass": True,
+            "pr_diff_bypass_reason": "legacy unit seam without live PR diff",
             "pr": {
                 "number": 58,
                 "state": "OPEN",
@@ -110,6 +114,8 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         head = "a" * 40
         return {
             "repoName": "heimgewebe/grabowski",
+            "pr_diff_bypass": True,
+            "pr_diff_bypass_reason": "legacy unit seam without live PR diff",
             "pr": {
                 "number": 58,
                 "state": "OPEN",

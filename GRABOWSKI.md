@@ -87,6 +87,16 @@ The live context tools compute runtime and checkout state on every call. Static 
 
 Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Run `python3 tools/pr_review_gate.py --pr <number> --self-review <path> --claude-evidence <path> --json` when Claude evidence is required, or omit `--claude-evidence` only when the gate should block on missing Claude evidence. Treat a BLOCK verdict as merge-blocking.
 
-The gate requires Codex review evidence from a trusted review object for the current head, or an explicit `codex_review.unavailable_reason` after a documented trigger/collection attempt; unavailable Codex is only a warning path and does not waive the rest of the gate. It also requires a head-SHA-bound Grabowski self-review, iterative review evidence, terminal triage for every finding at every severity, and expected green checks named `validate (3.10)` and `validate (3.12)`. Complex or risk-sensitive changes require Claude review evidence, provided either by a current-head trusted Claude review or by a valid `--claude-evidence` receipt.
+The gate requires Codex review evidence from a trusted review object for the current head, or an explicit `codex_review.unavailable_reason` after a documented trigger/collection attempt; unavailable Codex is only a warning path and does not waive the rest of the gate. It also requires a head-SHA- and `gh pr diff` SHA-256-bound Grabowski self-review, iterative review evidence, terminal triage for every finding at every severity, and expected green checks named `validate (3.10)` and `validate (3.12)`. Complex or risk-sensitive changes require Claude review evidence, provided either by a current-head trusted Claude review or by a valid `--claude-evidence` receipt.
+
+Self-review evidence must use the same diff source as the gate:
+
+```bash
+gh pr diff <number> --repo <owner>/<repo> > evidence/pr-<number>.diff
+sha256sum evidence/pr-<number>.diff
+# macOS: shasum -a 256 evidence/pr-<number>.diff
+```
+
+The self-review JSON must include `head_sha`, `diff_sha256`, `diff_reviewed: true`, `all_findings_triaged: true`, non-empty `review_iterations`, terminal `findings`, `material_findings_remaining`, and a `stop_reason`. A PR comment is not self-review evidence. Existing self-review evidence without `diff_sha256` must be regenerated against the current head and current `gh pr diff` output before merge.
 
 Allowed terminal finding states are `fixed`, `accepted`, `false_positive`, `deferred_with_reason`, and `not_applicable`; accepted or deferred findings require reasons. Blocking findings cannot be merely accepted or deferred. Severity values `p0`, `p1`, `high`, and `critical` are treated as blocking for this purpose. Pending, cancelled, or missing checks block the gate.
