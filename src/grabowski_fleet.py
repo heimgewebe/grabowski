@@ -24,6 +24,7 @@ FLEET_CONFIG = Path(os.environ.get(
 )).expanduser()
 HOST_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 SSH_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}\Z")
+PRODUCTION_ROLE = "production"
 
 
 def _load_object(path: Path) -> dict[str, Any]:
@@ -109,16 +110,26 @@ def _safe_argv(argv: list[str]) -> list[str]:
     return validated
 
 
+def _ensure_command_allowed(name: str, host: dict[str, Any], command: list[str]) -> None:
+    allowlist = host["command_allowlist"]
+    executable = Path(command[0]).name
+    if "*" in allowlist:
+        if PRODUCTION_ROLE in host["roles"]:
+            raise PermissionError(
+                f"Fleet host {name} has production role; wildcard command_allowlist is not allowed"
+            )
+        return
+    if command[0] not in allowlist and executable not in allowlist:
+        raise PermissionError(f"Executable is not allowed for fleet host {name}: {command[0]}")
+
+
 def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
                    max_output_bytes: int) -> dict[str, Any]:
     host = fleet_host(name)
     command = _safe_argv(argv)
     timeout = operator._timeout(timeout_seconds)
     output_limit = operator._output_limit(max_output_bytes)
-    allowlist = host["command_allowlist"]
-    executable = Path(command[0]).name
-    if "*" not in allowlist and command[0] not in allowlist and executable not in allowlist:
-        raise PermissionError(f"Executable is not allowed for fleet host {name}: {command[0]}")
+    _ensure_command_allowed(name, host, command)
     if host["transport"] == "local":
         result = operator._run(command, cwd=HOME, timeout_seconds=timeout,
                                max_output_bytes=output_limit)

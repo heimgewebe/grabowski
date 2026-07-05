@@ -110,6 +110,72 @@ class FleetTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unsafe SSH target"):
                     fleet.load_fleet()
 
+    def test_production_host_rejects_wildcard_allowlist_at_run_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "fleet.json"
+            _write(config, {
+                "schema_version": 1,
+                "hosts": {
+                    "prod": {
+                        "transport": "ssh",
+                        "target": "prod.example",
+                        "enabled": True,
+                        "roles": ["vps", "production"],
+                        "command_allowlist": ["*"],
+                    }
+                },
+            })
+            with patch.object(fleet, "FLEET_CONFIG", config), patch.object(
+                fleet.operator, "_run"
+            ) as run:
+                with self.assertRaisesRegex(PermissionError, "wildcard command_allowlist"):
+                    fleet.run_fleet_host(
+                        "prod",
+                        ["hostname"],
+                        timeout_seconds=10,
+                        max_output_bytes=1000,
+                    )
+            run.assert_not_called()
+
+    def test_production_host_can_use_explicit_ssh_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "fleet.json"
+            _write(config, {
+                "schema_version": 1,
+                "hosts": {
+                    "prod": {
+                        "transport": "ssh",
+                        "target": "prod.example",
+                        "enabled": True,
+                        "roles": ["vps", "production"],
+                        "command_allowlist": ["hostname"],
+                        "connect_timeout_seconds": 7,
+                    }
+                },
+            })
+            completed = {
+                "returncode": 0,
+                "stdout": "prod\n",
+                "stderr": "",
+                "timed_out": False,
+            }
+            with (
+                patch.object(fleet, "FLEET_CONFIG", config),
+                patch.object(fleet.shutil, "which", return_value="/usr/bin/ssh"),
+                patch.object(fleet.operator, "_run", return_value=completed) as run,
+            ):
+                result = fleet.run_fleet_host(
+                    "prod",
+                    ["hostname"],
+                    timeout_seconds=10,
+                    max_output_bytes=1000,
+                )
+
+            self.assertEqual(result["transport"], "ssh")
+            self.assertEqual(result["roles"], ["vps", "production"])
+            call_argv = run.call_args.args[0]
+            self.assertEqual(call_argv[-2:], ["prod.example", "exec hostname"])
+
 
 class OperationTests(unittest.TestCase):
     def _config(self, path: Path) -> None:
