@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
+GithubRunner = Callable[[Path, list[str]], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,15 @@ GRIP_SPECS: dict[str, GripSpec] = {
         required_parameters=("repo", "branch", "expected_head"),
         acceptance_ids=("acceptance-1", "acceptance-2"),
         runner="branch_publish",
+    ),
+    "pr-create-or-update": GripSpec(
+        name="pr-create-or-update",
+        version="1.0",
+        summary="Create or update an open PR for the current published work branch.",
+        effect=MUTATING,
+        required_parameters=("repo", "branch", "base", "expected_head", "title"),
+        acceptance_ids=("acceptance-1", "acceptance-2"),
+        runner="pr_create_or_update",
     ),
 }
 
@@ -152,6 +162,45 @@ def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
     }
 
 
+def _default_github_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
+    command = ["gh", *argv]
+    env = os.environ.copy()
+    for key in (
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_ASKPASS",
+        "PAGER",
+    ):
+        env.pop(key, None)
+    env.update({"GH_PROMPT_DISABLED": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "PAGER": "cat"})
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "returncode": 124,
+            "stdout": (exc.stdout or "").rstrip("\n") if isinstance(exc.stdout, str) else "",
+            "stderr": "gh command timed out after 30 seconds",
+            "argv": command,
+        }
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout.rstrip("\n"),
+        "stderr": completed.stderr.rstrip("\n"),
+        "argv": command,
+    }
+
+
 def _new_receipt(spec: GripSpec, parameters: dict[str, Any]) -> Receipt:
     return {
         "kind": GRIP_RECEIPT_KIND,
@@ -209,6 +258,24 @@ def _git(repo: Path, runner: CommandRunner, argv: list[str]) -> dict[str, Any]:
 
 def _git_optional(repo: Path, runner: CommandRunner, argv: list[str]) -> dict[str, Any]:
     return runner(repo, argv)
+
+
+def _github(repo: Path, runner: GithubRunner, argv: list[str]) -> dict[str, Any]:
+    result = runner(repo, argv)
+    if int(result.get("returncode", 1)) != 0:
+        message = result.get("stderr") or result.get("stdout") or "gh command failed"
+        raise GripActionError(str(message))
+    return result
+
+
+def _json_stdout(result: dict[str, Any]) -> Any:
+    raw = str(result.get("stdout", "")).strip()
+    if not raw:
+        raise GripActionError("expected JSON output from gh command")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise GripActionError("invalid JSON output from gh command") from exc
 
 
 def _orient(repo: Path, runner: CommandRunner) -> dict[str, Any]:
@@ -421,11 +488,133 @@ def _run_branch_publish(
     }
 
 
+def _open_pr_from_stdout(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise GripActionError("unexpected PR lookup output")
+    return value
+
+
+def _run_pr_create_or_update(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    repo = _repo_path(parameters)
+    branch = _short_branch_name(parameters, "branch")
+    base = _short_branch_name(parameters, "base")
+    title = _string_parameter(parameters, "title")
+    expected_head = _sha_parameter(parameters, "expected_head")
+    body_value = parameters.get("body", "")
+    if body_value is None:
+        body = ""
+    elif isinstance(body_value, str):
+        body = body_value
+    else:
+        raise GripPreflightError("body parameter must be a string when provided")
+    protected = parameters.get("protected_branches", ["main", "master"])
+    if not isinstance(protected, list) or not all(isinstance(item, str) for item in protected):
+        raise GripPreflightError("protected_branches must be a list of strings")
+    if branch in set(protected):
+        _check(receipt, "protected_head_branch", "fail", f"branch={branch}")
+        raise GripPreflightError("pr-create-or-update refuses protected head branches")
+    _check(receipt, "protected_head_branch", "pass", f"branch={branch}")
+    orientation = _run_repo_orient(spec, parameters, receipt, runner)
+    if orientation["branch"] != branch:
+        _check(receipt, "head_branch", "fail", f"actual={orientation['branch']} expected={branch}")
+        raise GripPreflightError(f"branch mismatch: actual={orientation['branch']} expected={branch}")
+    _check(receipt, "head_branch", "pass", branch)
+    if orientation["head"] != expected_head:
+        _check(receipt, "expected_head", "fail", f"actual={orientation['head']} expected={expected_head}")
+        raise GripPreflightError(f"expected_head mismatch: actual={orientation['head']} expected={expected_head}")
+    _check(receipt, "expected_head", "pass", expected_head)
+    allow_dirty = bool(parameters.get("allow_dirty", False))
+    if orientation["dirty"] and not allow_dirty:
+        _check(receipt, "clean_worktree", "fail", "dirty worktree")
+        raise GripPreflightError("pr-create-or-update requires a clean worktree unless allow_dirty=true")
+    _check(
+        receipt,
+        "clean_worktree",
+        "pass" if not orientation["dirty"] else "warn",
+        "clean" if not orientation["dirty"] else "allow_dirty=true",
+    )
+    remote = parameters.get("remote", "origin")
+    if not isinstance(remote, str) or not remote.strip():
+        raise GripPreflightError("remote parameter must be a non-empty string")
+    remote = remote.strip()
+    remote_ref = f"refs/heads/{branch}"
+    remote_result = _git(repo, runner, ["ls-remote", remote, remote_ref])
+    remote_line = str(remote_result.get("stdout", "")).splitlines()[0] if remote_result.get("stdout") else ""
+    remote_head = remote_line.split()[0] if remote_line.split() else ""
+    if remote_head != expected_head:
+        _check(receipt, "remote_head", "fail", f"actual={remote_head} expected={expected_head}")
+        raise GripPreflightError("remote branch does not match expected_head")
+    _check(receipt, "remote_head", "pass", remote_head)
+    lookup = _json_stdout(_github(
+        repo,
+        github_runner,
+        [
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "number,url,baseRefName,headRefName,headRefOid",
+            "--jq",
+            ".[0] // null",
+        ],
+    ))
+    existing = _open_pr_from_stdout(lookup)
+    if existing is not None:
+        if existing.get("baseRefName") != base:
+            _check(receipt, "base_branch", "fail", f"actual={existing.get('baseRefName')} expected={base}")
+            raise GripPreflightError("existing PR base does not match requested base")
+        if existing.get("headRefOid") != expected_head:
+            _check(receipt, "pr_head", "fail", f"actual={existing.get('headRefOid')} expected={expected_head}")
+            raise GripPreflightError("existing PR head does not match expected_head")
+        _check(receipt, "existing_pr", "pass", str(existing.get("number")))
+        edit_args = ["pr", "edit", str(existing["number"]), "--title", title]
+        if body:
+            edit_args.extend(["--body", body])
+        _github(repo, github_runner, edit_args)
+        action = "updated"
+        view_target = str(existing["number"])
+    else:
+        _check(receipt, "existing_pr", "skip", "no open PR for branch")
+        _github(repo, github_runner, ["pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body])
+        action = "created"
+        view_target = branch
+    viewed = _json_stdout(_github(
+        repo,
+        github_runner,
+        [
+            "pr",
+            "view",
+            view_target,
+            "--json",
+            "number,url,state,baseRefName,headRefName,headRefOid,isDraft,mergeable",
+        ],
+    ))
+    if not isinstance(viewed, dict):
+        raise GripActionError("unexpected PR view output")
+    if viewed.get("baseRefName") != base or viewed.get("headRefName") != branch or viewed.get("headRefOid") != expected_head:
+        _check(receipt, "pr_verify", "fail", json.dumps(viewed, sort_keys=True))
+        raise GripActionError("PR verification did not match requested branch/base/head")
+    _check(receipt, "pr_verify", "pass", str(viewed.get("number")))
+    return {"action": action, "pr": viewed, "branch": branch, "base": base, "head": expected_head}
+
+
 _RUNNERS = {
     "repo_orient": _run_repo_orient,
     "pr_check_readiness": _run_pr_check_readiness,
     "post_merge_sync": _run_post_merge_sync,
     "branch_publish": _run_branch_publish,
+    "pr_create_or_update": _run_pr_create_or_update,
 }
 
 
@@ -435,6 +624,7 @@ def run_grip(
     *,
     allow_mutation: bool = False,
     command_runner: CommandRunner | None = None,
+    github_runner: GithubRunner | None = None,
 ) -> dict[str, Any]:
     parameters = dict(parameters or {})
     spec = GRIP_SPECS.get(name)
@@ -467,7 +657,17 @@ def run_grip(
             )
         _check(receipt, "mutation_allowed", "pass", f"effect={spec.effect}")
         action = _RUNNERS[spec.runner]
-        output = action(spec, parameters, receipt, command_runner or _default_command_runner)
+        command = command_runner or _default_command_runner
+        if spec.runner == "pr_create_or_update":
+            output = action(
+                spec,
+                parameters,
+                receipt,
+                command,
+                github_runner or _default_github_runner,
+            )
+        else:
+            output = action(spec, parameters, receipt, command)
         return _finish(receipt, "passed", "action", output)
     except GripPreflightError as exc:
         return _finish(receipt, "blocked", "preflight", {"error": str(exc)})
