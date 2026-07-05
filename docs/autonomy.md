@@ -12,6 +12,14 @@ Autonomie ist kein Selbstzweck. Die kanonische Optimierungsrichtung steht in
 nur wenn die einzelnen Griffe kleiner, typisierter, receipt-gebunden und
 rücknehmbar werden.
 
+`docs/operator-focus-protocol-v1.md` begrenzt die Nutzung von Steuerboard,
+Bureau, Cabinet und anderen Lageflächen während eines laufenden
+Operator-Durchlaufs. Solange ein aktiver Arbeitsgegenstand existiert, dürfen
+Boards Kontext, Abhängigkeiten, Kollisionen und Receipts liefern, aber keinen
+stillen Taskwechsel auslösen. Sichtbarkeit ist keine Priorität; offene Tasks
+sind Nebenfunde, bis der aktive Arbeitsgegenstand abgeschlossen, blockiert oder
+ausdrücklich ersetzt wurde.
+
 `docs/operator-grip-foundation-plan-v1.md` konkretisiert den naechsten
 Ausbauschritt: Grabowski soll nicht enger gemacht werden, sondern bessere
 benannte Griffe bekommen. Merge, Deploy, Push, Cleanup, Fleet-Aktionen,
