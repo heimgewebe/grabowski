@@ -59,6 +59,15 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=("acceptance-1", "acceptance-2"),
         runner="post_merge_sync",
     ),
+    "branch-publish": GripSpec(
+        name="branch-publish",
+        version="1.0",
+        summary="Publish the current HEAD to a work branch with expected-head verification.",
+        effect=MUTATING,
+        required_parameters=("repo", "branch", "expected_head"),
+        acceptance_ids=("acceptance-1", "acceptance-2"),
+        runner="branch_publish",
+    ),
 }
 
 
@@ -295,16 +304,37 @@ def _run_pr_check_readiness(
     }
 
 
+def _string_parameter(parameters: dict[str, Any], name: str) -> str:
+    value = parameters.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise GripPreflightError(f"{name} parameter must be a non-empty string")
+    return value.strip()
+
+
+def _sha_parameter(parameters: dict[str, Any], name: str) -> str:
+    value = _string_parameter(parameters, name)
+    hex_digits = set("0123456789abcdef")
+    if len(value) not in (40, 64) or any(char not in hex_digits for char in value.lower()):
+        raise GripPreflightError(f"{name} parameter must be a 40 or 64 character hex SHA")
+    return value
+
+
+def _short_branch_name(parameters: dict[str, Any], name: str) -> str:
+    branch = _string_parameter(parameters, name)
+    if branch.startswith("refs/"):
+        raise GripPreflightError(f"{name} parameter must be a short branch name, not a ref")
+    if ":" in branch or branch.startswith("-"):
+        raise GripPreflightError(f"{name} parameter must be a safe short branch name")
+    return branch
+
+
 def _run_post_merge_sync(
     spec: GripSpec,
     parameters: dict[str, Any],
     receipt: Receipt,
     runner: CommandRunner,
 ) -> dict[str, Any]:
-    target = parameters.get("target_branch")
-    if not isinstance(target, str) or not target.strip():
-        raise GripPreflightError("target_branch parameter must be a non-empty string")
-    target = target.strip()
+    target = _string_parameter(parameters, "target_branch")
     dry_run = parameters.get("dry_run", True)
     if dry_run is not True:
         _check(receipt, "dry_run_only", "fail", "post-merge-sync foundation grip is dry-run only")
@@ -324,10 +354,78 @@ def _run_post_merge_sync(
     }
 
 
+def _run_branch_publish(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    branch = _short_branch_name(parameters, "branch")
+    expected_head = _sha_parameter(parameters, "expected_head")
+    remote = parameters.get("remote", "origin")
+    if not isinstance(remote, str) or not remote.strip():
+        raise GripPreflightError("remote parameter must be a non-empty string")
+    remote = remote.strip()
+    protected = parameters.get("protected_branches", ["main", "master"])
+    if not isinstance(protected, list) or not all(isinstance(item, str) for item in protected):
+        raise GripPreflightError("protected_branches must be a list of strings")
+    if branch in set(protected):
+        _check(receipt, "protected_branch", "fail", f"branch={branch}")
+        raise GripPreflightError("branch-publish refuses protected branches")
+    _check(receipt, "protected_branch", "pass", f"branch={branch}")
+    orientation = _run_repo_orient(spec, parameters, receipt, runner)
+    if orientation["branch"] != branch:
+        _check(
+            receipt,
+            "publish_branch",
+            "fail",
+            f"actual={orientation['branch']} target={branch}",
+        )
+        raise GripPreflightError(
+            f"branch mismatch: actual={orientation['branch']} target={branch}"
+        )
+    _check(receipt, "publish_branch", "pass", branch)
+    if orientation["head"] != expected_head:
+        _check(
+            receipt,
+            "expected_head",
+            "fail",
+            f"actual={orientation['head']} expected={expected_head}",
+        )
+        raise GripPreflightError(
+            f"expected_head mismatch: actual={orientation['head']} expected={expected_head}"
+        )
+    _check(receipt, "expected_head", "pass", expected_head)
+    allow_dirty = bool(parameters.get("allow_dirty", False))
+    if orientation["dirty"] and not allow_dirty:
+        _check(receipt, "clean_worktree", "fail", "dirty worktree")
+        raise GripPreflightError("branch-publish requires a clean worktree unless allow_dirty=true")
+    _check(receipt, "clean_worktree", "pass" if not orientation["dirty"] else "warn", "clean" if not orientation["dirty"] else "allow_dirty=true")
+    ref = f"refs/heads/{branch}"
+    push = _git(repo=Path(orientation["root"]), runner=runner, argv=["push", remote, f"HEAD:{branch}"])
+    remote_result = _git(repo=Path(orientation["root"]), runner=runner, argv=["ls-remote", remote, ref])
+    remote_line = str(remote_result.get("stdout", "")).splitlines()[0] if remote_result.get("stdout") else ""
+    remote_head = remote_line.split()[0] if remote_line.split() else ""
+    if remote_head != expected_head:
+        _check(receipt, "remote_head", "fail", f"actual={remote_head} expected={expected_head}")
+        raise GripActionError("remote head did not match expected_head after push")
+    _check(receipt, "remote_head", "pass", remote_head)
+    return {
+        "branch": branch,
+        "head": expected_head,
+        "remote": remote,
+        "ref": ref,
+        "remote_head": remote_head,
+        "push_stdout": push.get("stdout", ""),
+        "push_stderr": push.get("stderr", ""),
+    }
+
+
 _RUNNERS = {
     "repo_orient": _run_repo_orient,
     "pr_check_readiness": _run_pr_check_readiness,
     "post_merge_sync": _run_post_merge_sync,
+    "branch_publish": _run_branch_publish,
 }
 
 

@@ -11,10 +11,20 @@ import grabowski_grips as grips
 
 
 class FakeGit:
-    def __init__(self, *, branch: str = "feat/work", dirty: bool = False, upstream: str | None = "origin/feat/work"):
+    def __init__(
+        self,
+        *,
+        branch: str = "feat/work",
+        dirty: bool = False,
+        upstream: str | None = "origin/feat/work",
+        head: str = "a" * 40,
+        remote_head: str | None = None,
+    ):
         self.branch = branch
         self.dirty = dirty
         self.upstream = upstream
+        self.head = head
+        self.remote_head = remote_head or head
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
@@ -24,7 +34,7 @@ class FakeGit:
         if argv == ["rev-parse", "--abbrev-ref", "HEAD"]:
             return {"returncode": 0, "stdout": self.branch, "stderr": ""}
         if argv == ["rev-parse", "HEAD"]:
-            return {"returncode": 0, "stdout": "a" * 40, "stderr": ""}
+            return {"returncode": 0, "stdout": self.head, "stderr": ""}
         if argv == ["status", "--short", "--branch"]:
             body = "\n M src/example.py" if self.dirty else ""
             upstream = self.upstream or ""
@@ -33,17 +43,22 @@ class FakeGit:
             if self.upstream is None:
                 return {"returncode": 128, "stdout": "", "stderr": "no upstream"}
             return {"returncode": 0, "stdout": self.upstream, "stderr": ""}
+        if argv == ["push", "origin", f"HEAD:{self.branch}"]:
+            return {"returncode": 0, "stdout": "", "stderr": "pushed"}
+        if argv == ["ls-remote", "origin", f"refs/heads/{self.branch}"]:
+            return {"returncode": 0, "stdout": f"{self.remote_head}\trefs/heads/{self.branch}", "stderr": ""}
         return {"returncode": 1, "stdout": "", "stderr": f"unexpected command: {argv}"}
 
 
 class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
-        names = {item["name"] for item in listed}
-        self.assertEqual({"post-merge-sync", "pr-check-readiness", "repo-orient"}, names)
+        specs = {item["name"]: item for item in listed}
+        self.assertEqual({"branch-publish", "post-merge-sync", "pr-check-readiness", "repo-orient"}, set(specs))
         for item in listed:
             self.assertIn("acceptance_ids", item)
-            self.assertEqual("read_only", item["effect"])
+        self.assertEqual("mutating", specs["branch-publish"]["effect"])
+        self.assertEqual("read_only", specs["repo-orient"]["effect"])
 
     def test_repo_orient_emits_pass_receipt_and_git_facts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,6 +142,90 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("target_branch parameter must be a non-empty string", result["output"]["error"])
         self.assertEqual([], fake.calls)
         self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
+
+    def test_branch_publish_requires_allow_mutation(self) -> None:
+        result = grips.run_grip(
+            "branch-publish",
+            {"repo": ".", "branch": "feat/work", "expected_head": "a" * 40},
+            command_runner=FakeGit(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("allow_mutation", result["output"]["error"])
+
+    def test_branch_publish_pushes_and_verifies_remote_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", head="a" * 40),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("action", result["receipt"]["phase"])
+        self.assertEqual("a" * 40, result["output"]["remote_head"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["remote_head"])
+
+    def test_branch_publish_rejects_fully_qualified_branch_ref_before_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit(branch="refs/heads/main")
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "refs/heads/main", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("short branch name", result["output"]["error"])
+        self.assertEqual([], fake.calls)
+
+    def test_branch_publish_rejects_malformed_expected_head_before_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit(branch="feat/work")
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "not-a-sha"},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("hex SHA", result["output"]["error"])
+        self.assertEqual([], fake.calls)
+
+    def test_branch_publish_blocks_protected_branch_before_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit(branch="main")
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "main", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("protected branches", result["output"]["error"])
+        self.assertEqual([], fake.calls)
+
+    def test_branch_publish_blocks_expected_head_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "b" * 40},
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", head="a" * 40),
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("expected_head mismatch", result["output"]["error"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["expected_head"])
 
     def test_post_merge_sync_is_dry_run_only_in_foundation_slice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
