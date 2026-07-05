@@ -116,5 +116,38 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("git command failed", result["output"]["error"])
 
 
+    def test_default_runner_disables_prompt_pager_fsmonitor_and_bounds_runtime(self) -> None:
+        calls: dict[str, object] = {}
+
+        class Completed:
+            returncode = 0
+            stdout = "ok\n"
+            stderr = ""
+
+        def fake_run(argv: list[str], **kwargs: object) -> Completed:
+            calls["argv"] = argv
+            calls.update(kwargs)
+            return Completed()
+
+        original = grips.subprocess.run
+        try:
+            grips.subprocess.run = fake_run  # type: ignore[assignment]
+            result = grips._default_command_runner(Path("/tmp/repo"), ["status", "--short"])
+        finally:
+            grips.subprocess.run = original  # type: ignore[assignment]
+
+        env = calls["env"]
+        self.assertIsInstance(env, dict)
+        self.assertEqual(0, result["returncode"])
+        self.assertEqual(30, calls["timeout"])
+        self.assertEqual("0", env["GIT_TERMINAL_PROMPT"])
+        self.assertEqual("0", env["GIT_OPTIONAL_LOCKS"])
+        self.assertEqual("1", env["GIT_CONFIG_COUNT"])
+        self.assertEqual("core.fsmonitor", env["GIT_CONFIG_KEY_0"])
+        self.assertEqual("false", env["GIT_CONFIG_VALUE_0"])
+        self.assertEqual("cat", env["GIT_PAGER"])
+        self.assertEqual("cat", env["PAGER"])
+
+
 if __name__ == "__main__":
     unittest.main()

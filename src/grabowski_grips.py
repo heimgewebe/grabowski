@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 from typing import Any, Callable
@@ -82,17 +83,50 @@ def utc_now() -> str:
 
 
 def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
-    completed = subprocess.run(
-        ["git", "--no-optional-locks", "-C", str(repo), *argv],
-        text=True,
-        capture_output=True,
-        check=False,
+    command = ["git", "--no-optional-locks", "-C", str(repo), *argv]
+    env = os.environ.copy()
+    for key in (
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_ASKPASS",
+        "PAGER",
+    ):
+        env.pop(key, None)
+    env.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+        }
     )
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "returncode": 124,
+            "stdout": (exc.stdout or "").rstrip("\n") if isinstance(exc.stdout, str) else "",
+            "stderr": "git command timed out after 30 seconds",
+            "argv": command,
+        }
     return {
         "returncode": completed.returncode,
         "stdout": completed.stdout.rstrip("\n"),
         "stderr": completed.stderr.rstrip("\n"),
-        "argv": ["git", "--no-optional-locks", "-C", str(repo), *argv],
+        "argv": command,
     }
 
 
