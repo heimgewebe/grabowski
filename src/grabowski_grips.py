@@ -341,6 +341,37 @@ def _check_results(parameters: dict[str, Any]) -> dict[str, str]:
         result[key] = value.lower()
     return result
 
+def _is_hex_sha(value: Any, *, lengths: tuple[int, ...]) -> bool:
+    if not isinstance(value, str) or len(value) not in lengths:
+        return False
+    hex_digits = set("0123456789abcdef")
+    return all(char in hex_digits for char in value.lower())
+
+
+def _external_review_evidence_errors(evidence: Any, *, expected_head: str | None) -> list[str]:
+    if not isinstance(evidence, dict):
+        return ["external review evidence must be a structured object"]
+    errors: list[str] = []
+    head_sha = evidence.get("head_sha")
+    if not _is_hex_sha(head_sha, lengths=(40,)):
+        errors.append("head_sha must be a 40 character hex SHA")
+    elif expected_head is not None and head_sha != expected_head:
+        errors.append("head_sha does not match expected_head")
+    if not _is_hex_sha(evidence.get("diff_sha256"), lengths=(64,)):
+        errors.append("diff_sha256 must be a 64 character hex SHA")
+    reviews = evidence.get("reviews")
+    if not isinstance(reviews, list) or not reviews or not all(isinstance(item, dict) for item in reviews):
+        errors.append("reviews must be a non-empty list of review objects")
+    elif not any(item.get("verdict") for item in reviews):
+        errors.append("at least one review must include a verdict")
+    if evidence.get("external_reviews_triaged") is not True:
+        errors.append("external_reviews_triaged must be true")
+    findings = evidence.get("findings", [])
+    if not isinstance(findings, list) or not all(isinstance(item, dict) for item in findings):
+        errors.append("findings must be a list of finding objects")
+    return errors
+
+
 
 def _string_list_parameter(parameters: dict[str, Any], name: str, default: list[str] | None = None) -> list[str]:
     raw = parameters.get(name, default or [])
@@ -418,7 +449,10 @@ def _run_pr_check_readiness(
         if normalized_review in {"CHANGES_REQUESTED", "REQUEST_CHANGES"}:
             _check(receipt, "review_decision", "fail", normalized_review)
             blocking_reasons.append("review changes requested")
-        elif normalized_review in {"APPROVED", "", "REVIEW_REQUIRED", "COMMENTED"}:
+        elif normalized_review == "REVIEW_REQUIRED":
+            _check(receipt, "review_decision", "fail", normalized_review)
+            blocking_reasons.append("review approval required")
+        elif normalized_review in {"APPROVED", "", "COMMENTED"}:
             _check(receipt, "review_decision", "pass" if normalized_review == "APPROVED" else "warn", normalized_review or "empty")
             if normalized_review != "APPROVED":
                 warnings.append("review is not approved")
@@ -437,7 +471,13 @@ def _run_pr_check_readiness(
         _check(receipt, "external_review_evidence", "fail", "external review required but no evidence provided")
         blocking_reasons.append("external review evidence missing")
     elif external_review_required:
-        _check(receipt, "external_review_evidence", "pass", "provided")
+        expected_head_for_review = expected_head if isinstance(expected_head, str) else None
+        evidence_errors = _external_review_evidence_errors(external_review_evidence, expected_head=expected_head_for_review)
+        if evidence_errors:
+            _check(receipt, "external_review_evidence", "fail", "; ".join(evidence_errors))
+            blocking_reasons.append("external review evidence invalid")
+        else:
+            _check(receipt, "external_review_evidence", "pass", "structured evidence provided")
     else:
         _check(receipt, "external_review_evidence", "skip", "not required")
     ready = branch_is_work and upstream_set and clean_ok and not blocking_reasons

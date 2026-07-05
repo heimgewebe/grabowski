@@ -180,6 +180,61 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("ready", result["output"]["verdict"])
         self.assertEqual([], result["output"]["blocking_reasons"])
 
+    def test_pr_check_readiness_blocks_review_required_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "pr-check-readiness",
+                {"repo": tmp, "review_decision": "REVIEW_REQUIRED"},
+                command_runner=FakeGit(branch="feat/work", dirty=False),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertFalse(result["output"]["ready"])
+        self.assertEqual("blocked", result["output"]["verdict"])
+        self.assertIn("review approval required", result["output"]["blocking_reasons"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["review_decision"])
+
+    def test_pr_check_readiness_blocks_unstructured_external_review_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "pr-check-readiness",
+                {"repo": tmp, "external_review_required": True, "external_review_evidence": "todo"},
+                command_runner=FakeGit(branch="feat/work", dirty=False),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertFalse(result["output"]["ready"])
+        self.assertIn("external review evidence invalid", result["output"]["blocking_reasons"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["external_review_evidence"])
+
+    def test_pr_check_readiness_accepts_structured_external_review_evidence(self) -> None:
+        head = "a" * 40
+        evidence = {
+            "head_sha": head,
+            "diff_sha256": "0" * 64,
+            "reviews": [{"source": "external-llm", "verdict": "PASS", "review_sha256": "1" * 64}],
+            "external_reviews_triaged": True,
+            "findings": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "pr-check-readiness",
+                {
+                    "repo": tmp,
+                    "expected_head": head,
+                    "external_review_required": True,
+                    "external_review_evidence": evidence,
+                },
+                command_runner=FakeGit(branch="feat/work", dirty=False, head=head),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["ready"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["external_review_evidence"])
+
     def test_preflight_blocks_missing_required_parameter_with_receipt(self) -> None:
         result = grips.run_grip("repo-orient", {}, command_runner=FakeGit())
 
