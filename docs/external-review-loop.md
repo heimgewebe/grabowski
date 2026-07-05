@@ -4,6 +4,14 @@
 
 The external loop is separate from Grabowski self-review. Self-review remains internal evidence; external review evidence is passed with its own CLI argument:
 
+## Evidence, not comments
+
+A GitHub PR comment that says the operator checked the PR is not review evidence and must not be treated as a merge gate.
+
+Before merge, Grabowski must run its own review against the current PR head and current PR diff. That review has to inspect the diff itself, record review iterations, record material findings, and terminally triage every finding. A comment may summarize the result for visibility, but it is only a pointer to the real evidence.
+
+For complex, risky, important, security-sensitive, runtime-sensitive, deploy-sensitive, or high-uncertainty PRs, Grabowski must also start an external review loop before merge by handing the user a portable review packet. The packet must contain repo, PR number, current head SHA, diff hash when available, risk reason, exact reviewer instructions, and the full PR diff or a bounded diff artifact suitable for another model. Required external review remains blocking until returned findings are triaged and supplied as external review evidence, unless the user consciously overrides that gate outside this automated policy.
+
 ```bash
 python3 tools/pr_review_gate.py \
   --pr <PR_NUMBER> \
