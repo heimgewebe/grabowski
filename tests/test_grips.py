@@ -79,11 +79,18 @@ class FakeGh:
         return {"returncode": 1, "stdout": "", "stderr": f"unexpected gh command: {argv}"}
 
 
+class GripParserTests(unittest.TestCase):
+    def test_parse_worktree_porcelain(self) -> None:
+        parsed = grips._parse_worktree_porcelain("worktree /repo/main\nbranch refs/heads/main\nworktree /repo/feat\nbranch refs/heads/feat/x\n")
+        self.assertEqual(["/repo/main", "/repo/feat"], [item["path"] for item in parsed])
+        self.assertEqual("feat/x", parsed[1]["branch"])
+
+
 class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}
-        self.assertEqual({"branch-publish", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient"}, set(specs))
+        self.assertEqual({"branch-publish", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "worktree-orient"}, set(specs))
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
