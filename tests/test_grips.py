@@ -90,6 +90,14 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("missing required parameters", result["output"]["error"])
         self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
 
+    def test_preflight_blocks_non_json_parameter_with_receipt(self) -> None:
+        result = grips.run_grip("repo-orient", {"repo": Path(".")}, command_runner=FakeGit())
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("repo parameter must be a non-empty string", result["output"]["error"])
+        self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
+
     def test_post_merge_sync_is_dry_run_only_in_foundation_slice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = grips.run_grip(
@@ -114,7 +122,6 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("failed", result["receipt"]["status"])
         self.assertEqual("action", result["receipt"]["phase"])
         self.assertIn("git command failed", result["output"]["error"])
-
 
     def test_default_runner_disables_prompt_pager_fsmonitor_and_bounds_runtime(self) -> None:
         calls: dict[str, object] = {}

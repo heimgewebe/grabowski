@@ -70,8 +70,21 @@ class GripActionError(RuntimeError):
     pass
 
 
+def _json_compatible(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    return {
+        "__non_json_type__": f"{type(value).__module__}.{type(value).__qualname__}",
+        "repr": repr(value),
+    }
+
+
 def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(_json_compatible(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def sha256_json(value: Any) -> str:
