@@ -40,6 +40,7 @@ RISK_PATH_MARKERS = (
 RISK_PATH_PREFIXES = (
     "src/grabowski_mcp.py",
     "src/grabowski_operator.py",
+    "src/grabowski_grips.py",
     "src/grabowski_privileged.py",
     "src/grabowski_recovery.py",
     "src/grabowski_self_deploy.py",

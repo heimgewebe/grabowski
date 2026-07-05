@@ -12,6 +12,13 @@ Autonomie ist kein Selbstzweck. Die kanonische Optimierungsrichtung steht in
 nur wenn die einzelnen Griffe kleiner, typisierter, receipt-gebunden und
 rücknehmbar werden.
 
+`docs/operator-grip-foundation-plan-v1.md` konkretisiert den naechsten
+Ausbauschritt: Grabowski soll nicht enger gemacht werden, sondern bessere
+benannte Griffe bekommen. Merge, Deploy, Push, Cleanup, Fleet-Aktionen,
+Service-Restarts und Secret-Pfade sind keine pauschalen Tabus; sie muessen als
+Ziel, Scope und Receipt sichtbar werden, damit Ausfaelle verhindert werden,
+ohne legitime Operatorarbeit kuenstlich zu bremsen.
+
 `trusted-owner` bleibt ein supervisiertes Vollprofil und darf nicht durch
 einen engeren Modus ersetzt werden, wenn dadurch legitime Operator-Arbeit
 funktional beschädigt wird. Der engere Modus ist ein Routingziel für
