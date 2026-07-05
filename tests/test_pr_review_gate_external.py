@@ -54,10 +54,11 @@ def _state(path: str = "README.md", *, diff_sha: str | None = DIFF_SHA) -> dict[
     return state
 
 
-def _self_review() -> dict[str, object]:
+def _self_review(*, diff_sha: str = DIFF_SHA) -> dict[str, object]:
     return {
         "head_sha": HEAD,
         "diff_reviewed": True,
+        "diff_sha256": diff_sha,
         "all_findings_triaged": True,
         "review_iterations": [{"n": 1, "summary": "diff reviewed", "material_findings": 0}],
         "stop_reason": "clean_pass",
@@ -223,7 +224,7 @@ class ExternalReviewGateTests(unittest.TestCase):
         review_sha = "ef" * 32
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py", diff_sha=diff_sha),
-            self_review=_self_review(),
+            self_review=_self_review(diff_sha=diff_sha),
             external_review_evidence=_external(
                 diff_sha256=f"  {diff_sha.upper()}\n",
                 prompt_sha256=f"\t{prompt_sha.upper()}  ",
