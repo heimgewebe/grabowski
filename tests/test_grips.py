@@ -168,6 +168,36 @@ class GripFoundationTests(unittest.TestCase):
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["remote_head"])
 
+    def test_branch_publish_rejects_fully_qualified_branch_ref_before_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit(branch="refs/heads/main")
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "refs/heads/main", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("short branch name", result["output"]["error"])
+        self.assertEqual([], fake.calls)
+
+    def test_branch_publish_rejects_malformed_expected_head_before_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit(branch="feat/work")
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "not-a-sha"},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("hex SHA", result["output"]["error"])
+        self.assertEqual([], fake.calls)
+
     def test_branch_publish_blocks_protected_branch_before_git(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fake = FakeGit(branch="main")

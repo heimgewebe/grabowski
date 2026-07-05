@@ -311,6 +311,23 @@ def _string_parameter(parameters: dict[str, Any], name: str) -> str:
     return value.strip()
 
 
+def _sha_parameter(parameters: dict[str, Any], name: str) -> str:
+    value = _string_parameter(parameters, name)
+    hex_digits = set("0123456789abcdef")
+    if len(value) not in (40, 64) or any(char not in hex_digits for char in value.lower()):
+        raise GripPreflightError(f"{name} parameter must be a 40 or 64 character hex SHA")
+    return value
+
+
+def _short_branch_name(parameters: dict[str, Any], name: str) -> str:
+    branch = _string_parameter(parameters, name)
+    if branch.startswith("refs/"):
+        raise GripPreflightError(f"{name} parameter must be a short branch name, not a ref")
+    if ":" in branch or branch.startswith("-"):
+        raise GripPreflightError(f"{name} parameter must be a safe short branch name")
+    return branch
+
+
 def _run_post_merge_sync(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -337,16 +354,14 @@ def _run_post_merge_sync(
     }
 
 
-
-
 def _run_branch_publish(
     spec: GripSpec,
     parameters: dict[str, Any],
     receipt: Receipt,
     runner: CommandRunner,
 ) -> dict[str, Any]:
-    branch = _string_parameter(parameters, "branch")
-    expected_head = _string_parameter(parameters, "expected_head")
+    branch = _short_branch_name(parameters, "branch")
+    expected_head = _sha_parameter(parameters, "expected_head")
     remote = parameters.get("remote", "origin")
     if not isinstance(remote, str) or not remote.strip():
         raise GripPreflightError("remote parameter must be a non-empty string")
@@ -404,6 +419,7 @@ def _run_branch_publish(
         "push_stdout": push.get("stdout", ""),
         "push_stderr": push.get("stderr", ""),
     }
+
 
 _RUNNERS = {
     "repo_orient": _run_repo_orient,
