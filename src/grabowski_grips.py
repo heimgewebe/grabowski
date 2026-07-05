@@ -330,6 +330,25 @@ def _run_repo_orient(
     return orientation
 
 
+def _check_results(parameters: dict[str, Any]) -> dict[str, str]:
+    raw = parameters.get("check_results", {})
+    if not isinstance(raw, dict):
+        raise GripPreflightError("check_results must be a dictionary of check name to state")
+    result: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise GripPreflightError("check_results must map strings to strings")
+        result[key] = value.lower()
+    return result
+
+
+def _string_list_parameter(parameters: dict[str, Any], name: str, default: list[str] | None = None) -> list[str]:
+    raw = parameters.get(name, default or [])
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise GripPreflightError(f"{name} must be a list of strings")
+    return raw
+
+
 def _run_pr_check_readiness(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -344,30 +363,97 @@ def _run_pr_check_readiness(
     upstream_set = orientation["upstream"] is not None
     clean_required = bool(parameters.get("require_clean", False))
     clean_ok = not orientation["dirty"] if clean_required else True
+    blocking_reasons: list[str] = []
+    warnings: list[str] = []
     _check(
         receipt,
         "work_branch",
         "pass" if branch_is_work else "fail",
         f"branch={orientation['branch']}",
     )
+    if not branch_is_work:
+        blocking_reasons.append("protected branch is not a PR work branch")
     _check(
         receipt,
         "upstream",
         "pass" if upstream_set else "warn",
         orientation["upstream"] or "no upstream configured",
     )
+    if not upstream_set:
+        warnings.append("no upstream configured")
     _check(
         receipt,
         "cleanliness",
         "pass" if clean_ok else "fail",
         "clean required" if clean_required else "clean not required",
     )
-    ready = branch_is_work and upstream_set and clean_ok
+    if not clean_ok:
+        blocking_reasons.append("worktree is dirty")
+    expected_head = parameters.get("expected_head")
+    if expected_head is not None:
+        expected_head = _sha_parameter(parameters, "expected_head")
+        head_ok = orientation["head"] == expected_head
+        _check(receipt, "expected_head", "pass" if head_ok else "fail", f"actual={orientation['head']} expected={expected_head}")
+        if not head_ok:
+            blocking_reasons.append("expected_head mismatch")
+    required_checks = _string_list_parameter(parameters, "required_checks")
+    check_results = _check_results(parameters)
+    missing_checks = [name for name in required_checks if name not in check_results]
+    failing_checks = [name for name in required_checks if check_results.get(name) not in (None, "success", "pass", "passed")]
+    if required_checks:
+        checks_ok = not missing_checks and not failing_checks
+        detail = f"required={required_checks} missing={missing_checks} failing={failing_checks}"
+        _check(receipt, "required_checks", "pass" if checks_ok else "fail", detail)
+        if missing_checks:
+            blocking_reasons.append("required checks missing")
+        if failing_checks:
+            blocking_reasons.append("required checks failing")
+    else:
+        _check(receipt, "required_checks", "skip", "no required_checks parameter")
+    review_decision = parameters.get("review_decision")
+    if review_decision is not None:
+        if not isinstance(review_decision, str):
+            raise GripPreflightError("review_decision must be a string when provided")
+        normalized_review = review_decision.upper()
+        if normalized_review in {"CHANGES_REQUESTED", "REQUEST_CHANGES"}:
+            _check(receipt, "review_decision", "fail", normalized_review)
+            blocking_reasons.append("review changes requested")
+        elif normalized_review in {"APPROVED", "", "REVIEW_REQUIRED", "COMMENTED"}:
+            _check(receipt, "review_decision", "pass" if normalized_review == "APPROVED" else "warn", normalized_review or "empty")
+            if normalized_review != "APPROVED":
+                warnings.append("review is not approved")
+        else:
+            _check(receipt, "review_decision", "warn", normalized_review)
+            warnings.append("unknown review decision")
+    unresolved_findings = _string_list_parameter(parameters, "unresolved_findings")
+    if unresolved_findings:
+        _check(receipt, "unresolved_findings", "fail", ", ".join(unresolved_findings))
+        blocking_reasons.append("unresolved review findings")
+    else:
+        _check(receipt, "unresolved_findings", "pass", "none")
+    external_review_required = bool(parameters.get("external_review_required", False))
+    external_review_evidence = parameters.get("external_review_evidence")
+    if external_review_required and not external_review_evidence:
+        _check(receipt, "external_review_evidence", "fail", "external review required but no evidence provided")
+        blocking_reasons.append("external review evidence missing")
+    elif external_review_required:
+        _check(receipt, "external_review_evidence", "pass", "provided")
+    else:
+        _check(receipt, "external_review_evidence", "skip", "not required")
+    ready = branch_is_work and upstream_set and clean_ok and not blocking_reasons
+    verdict = "ready" if ready else "blocked"
     return {
         "ready": ready,
+        "verdict": verdict,
+        "blocking_reasons": blocking_reasons,
+        "warnings": warnings,
         "orientation": orientation,
         "protected_branches": protected,
         "require_clean": clean_required,
+        "required_checks": required_checks,
+        "check_results": check_results,
+        "unresolved_findings": unresolved_findings,
+        "external_review_required": external_review_required,
     }
 
 
