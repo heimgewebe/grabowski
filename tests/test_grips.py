@@ -86,6 +86,27 @@ class GripParserTests(unittest.TestCase):
         self.assertEqual("feat/x", parsed[1]["branch"])
 
 
+class WorktreeOrientReceiptTests(unittest.TestCase):
+    def test_worktree_orient_receipt_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {"returncode": 0, "stdout": f"worktree {repo}\nbranch refs/heads/main", "stderr": ""}
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## main", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("worktree-orient", result["receipt"]["grip"]["name"])
+        self.assertIn("receipt_sha256", result["receipt"])
+        self.assertIn("worktrees", result["output"])
+        self.assertIn("next_safe_grip", result["output"])
+
+
 class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
