@@ -427,6 +427,7 @@ class WorktreeOrientReceiptTests(unittest.TestCase):
             [""],
             [" main"],
             ["main "],
+            ["refs/heads/main"],
             ["main", "main"],
         ]
         for protected in invalid_values:

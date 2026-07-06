@@ -486,10 +486,10 @@ def _run_worktree_orient(
     if not protected:
         _check(receipt, "protected_branches_valid", "fail", "empty list")
         raise GripPreflightError("protected_branches must not be empty")
-    invalid_protected = [item for item in protected if not item or item != item.strip()]
+    invalid_protected = [item for item in protected if not item or item != item.strip() or item.startswith("refs/")]
     if invalid_protected:
-        _check(receipt, "protected_branches_valid", "fail", "branch names must be non-empty and trimmed")
-        raise GripPreflightError("protected_branches entries must be non-empty trimmed strings")
+        _check(receipt, "protected_branches_valid", "fail", "branch names must be non-empty trimmed short names")
+        raise GripPreflightError("protected_branches entries must be non-empty trimmed short branch names")
     if len(set(protected)) != len(protected):
         _check(receipt, "protected_branches_valid", "fail", "duplicate branch names")
         raise GripPreflightError("protected_branches entries must be unique")
