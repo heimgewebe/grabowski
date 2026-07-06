@@ -104,7 +104,7 @@ class WorktreeOrientReceiptTests(unittest.TestCase):
         self.assertEqual("worktree-orient", result["receipt"]["grip"]["name"])
         self.assertIn("receipt_sha256", result["receipt"])
         self.assertIn("worktrees", result["output"])
-        self.assertEqual("repo-orient", result["output"]["next_safe_grip"]["name"])
+        self.assertEqual("pr-check-readiness", result["output"]["next_safe_grip"]["name"])
         self.assertEqual([], result["output"]["cleanup_candidates"])
 
     def test_worktree_orient_does_not_mark_unobservable_clean(self) -> None:
@@ -133,7 +133,7 @@ class WorktreeOrientReceiptTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual([str(feature)], result["output"]["unobservable_worktrees"])
         self.assertEqual([], result["output"]["stale_candidates"])
-        self.assertEqual("repo-orient", result["output"]["next_safe_grip"]["name"])
+        self.assertIsNone(result["output"]["next_safe_grip"]["name"])
 
 
 class GripFoundationTests(unittest.TestCase):
@@ -576,4 +576,5 @@ class WorktreeOrientCleanupTests(unittest.TestCase):
             [item["path"] for item in result["output"]["cleanup_candidates"]],
         )
         self.assertTrue(all(item["cleanup_allowed"] is False for item in result["output"]["cleanup_candidates"]))
-        self.assertEqual("repo-orient", result["output"]["next_safe_grip"]["name"])
+        self.assertIn("old", result["output"]["cleanup_candidates"][0]["reason"])
+        self.assertIsNone(result["output"]["next_safe_grip"]["name"])

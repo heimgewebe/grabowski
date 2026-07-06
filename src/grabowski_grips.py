@@ -452,7 +452,7 @@ def _run_worktree_orient(
     detached_worktrees: list[str] = []
     stale_candidates: list[str] = []
     cleanup_candidates: list[dict[str, Any]] = []
-    cleanup_candidate_paths: set[str] = set()
+    cleanup_candidate_index: dict[str, dict[str, Any]] = {}
     canonical_checkout: str | None = None
 
     def add_cleanup_candidate(path: str, branch: str | None, reason: str) -> None:
@@ -460,17 +460,24 @@ def _run_worktree_orient(
             return
         if path not in stale_candidates:
             stale_candidates.append(path)
-        if path in cleanup_candidate_paths:
+        existing = cleanup_candidate_index.get(path)
+        if existing is not None:
+            reasons = existing.setdefault("reasons", [])
+            if reason not in reasons:
+                reasons.append(reason)
+                existing["reason"] = "; ".join(reasons)
+            if branch and not existing.get("branch"):
+                existing["branch"] = branch
             return
-        cleanup_candidate_paths.add(path)
-        cleanup_candidates.append(
-            {
-                "path": path,
-                "branch": branch,
-                "reason": reason,
-                "cleanup_allowed": False,
-            }
-        )
+        record: dict[str, Any] = {
+            "path": path,
+            "branch": branch,
+            "reason": reason,
+            "reasons": [reason],
+            "cleanup_allowed": False,
+        }
+        cleanup_candidate_index[path] = record
+        cleanup_candidates.append(record)
 
     for entry in entries:
         path_value = str(entry.get("path", ""))
@@ -499,12 +506,13 @@ def _run_worktree_orient(
             add_cleanup_candidate(path_value, branch, str(entry.get("prunable_reason") or "git marks worktree prunable"))
     if canonical_checkout is None and worktrees:
         canonical_checkout = str(worktrees[0].get("path"))
+    blocked_by_worktree_review = bool(stale_candidates or unobservable_worktrees)
     next_safe_grip = {
-        "name": "repo-orient",
+        "name": None if blocked_by_worktree_review else "pr-check-readiness",
         "reason": (
-            "manual review is required before cleanup; repo-orient is the next read-only fallback"
-            if stale_candidates or unobservable_worktrees
-            else "no cleanup candidates observed; repo orientation is the next safe read-only grip"
+            "manual review is required before cleanup; no automatic next grip is recommended"
+            if blocked_by_worktree_review
+            else "no cleanup candidates observed; pr-check-readiness is the next safe read-only grip"
         ),
         "effect": READ_ONLY,
     }
