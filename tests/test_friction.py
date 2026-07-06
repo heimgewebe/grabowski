@@ -24,9 +24,196 @@ class FrictionLedgerContractTests(unittest.TestCase):
         self.assertIn('name="grabowski_friction_summary"', source)
         self.assertIn('MAX_TEXT_BYTES = 2000', source)
         self.assertIn('MAX_NOTE_COUNT = 20', source)
+        self.assertIn('FAILURE_CLASSES = frozenset({', source)
+        self.assertIn('def classify_friction_event', source)
+        self.assertIn('invalid_lines', source)
+        self.assertIn('def _bounded_event', source)
         self.assertIn('operator._redact(text)', source)
         self.assertIn('base._require_mutations_enabled("friction_record")', source)
         self.assertNotIn('operator._require_operator_mutation("friction_record")', source)
+
+
+
+
+class FrictionFailureRuntimeTests(unittest.TestCase):
+    def _load_module(self):
+        sys_mod = __import__("sys")
+        types_mod = __import__("types")
+        tempfile_mod = __import__("tempfile")
+        util = __import__("importlib.util", fromlist=["spec_from_file_location", "module_from_spec"])
+        temporary = tempfile_mod.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+
+        fake_base = types_mod.ModuleType("grabowski_mcp")
+        fake_base._append_audit = lambda payload: None
+        fake_base._require_mutations_enabled = lambda capability: None
+
+        class FakeMCP:
+            def tool(self, *args, **kwargs):
+                return lambda function: function
+
+        fake_operator = types_mod.ModuleType("grabowski_operator_core")
+        fake_operator.mcp = FakeMCP()
+        fake_operator.READ_ONLY = {}
+        fake_operator.MUTATING = {}
+        fake_operator.STATE_DIR = root / "state"
+        fake_operator._redact = lambda value: value
+
+        old_base = sys_mod.modules.get("grabowski_mcp")
+        old_core = sys_mod.modules.get("grabowski_operator_core")
+        sys_mod.modules["grabowski_mcp"] = fake_base
+        sys_mod.modules["grabowski_operator_core"] = fake_operator
+
+        name = f"_gopt001_friction_{id(self)}"
+        spec = util.spec_from_file_location(name, ROOT / "src/grabowski_friction.py")
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = util.module_from_spec(spec)
+        sys_mod.modules[name] = module
+        spec.loader.exec_module(module)
+
+        def restore_modules() -> None:
+            if old_base is None:
+                sys_mod.modules.pop("grabowski_mcp", None)
+            else:
+                sys_mod.modules["grabowski_mcp"] = old_base
+            if old_core is None:
+                sys_mod.modules.pop("grabowski_operator_core", None)
+            else:
+                sys_mod.modules["grabowski_operator_core"] = old_core
+            sys_mod.modules.pop(name, None)
+
+        self.addCleanup(restore_modules)
+        module.FRICTION_LOG = root / "state" / "friction" / "events.jsonl"
+        return module
+
+    def test_classifies_and_keeps_corrupt_lines_bounded(self) -> None:
+        module = self._load_module()
+        self.assertEqual(
+            module.classify_friction_event({"kind": "ci_contract", "symptom": "contract drift"}),
+            "contract_error",
+        )
+        self.assertEqual(
+            module.classify_friction_event({"kind": "ci_contract", "symptom": "expected red-phase"}),
+            "expected_red_phase",
+        )
+        self.assertEqual(
+            module.classify_friction_event({"kind": "fail_closed_gate", "symptom": "gate closed"}),
+            "policy_gate",
+        )
+        self.assertEqual(
+            module.classify_friction_event({"kind": "platform_filter", "symptom": "rejected"}),
+            "platform_filter",
+        )
+
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "event_id": "bug-1",
+                "kind": "operator_bug",
+                "surface": "runtime",
+                "operation": "bounded operation",
+                "symptom": "unexpected exception",
+                "resolved": False,
+            },
+            {
+                "event_id": "filter-1",
+                "kind": "platform_filter",
+                "surface": "chat_tool",
+                "operation": "narrow operation",
+                "symptom": "rejected",
+                "resolved": False,
+            },
+        ]
+        module.FRICTION_LOG.write_text(
+            "not json\n"
+            + json.dumps(events[0], sort_keys=True)
+            + "\n"
+            + json.dumps(["not", "event"])
+            + "\n"
+            + json.dumps(events[1], sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        summary = module.friction_summary(limit=10)
+        self.assertEqual(summary["invalid_lines"], 1)
+        self.assertEqual(summary["non_event_lines"], 1)
+        self.assertEqual(summary["returned"], 2)
+        classification = summary["failure_classification"]
+        self.assertEqual(classification["authority"], "read_only_evidence")
+        self.assertEqual(classification["by_failure_class"]["actionable_failure"], 1)
+        self.assertEqual(classification["by_failure_class"]["platform_filter"], 1)
+        self.assertEqual(classification["decision_required_count"], 2)
+        self.assertIn("task_resume_permission", classification["does_not_establish"])
+        self.assertNotIn("raw_lines", summary)
+        self.assertNotIn("raw_lines", classification)
+
+    def test_failure_class_config_is_consistent(self) -> None:
+        module = self._load_module()
+        self.assertEqual(set(module.FAILURE_CLASS_DECISIONS), module.FAILURE_CLASSES)
+        self.assertLessEqual(module.ACTION_REQUIRED_FAILURE_CLASSES, module.FAILURE_CLASSES)
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "ci_contract",
+                    "symptom": "expected red-phase superseded by PR 83",
+                }
+            ),
+            "superseded",
+        )
+
+    def test_summary_limit_counts_recent_valid_events(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        old = {"event_id": "old", "kind": "operator_bug", "surface": "runtime"}
+        first = {"event_id": "first", "kind": "platform_filter", "surface": "chat_tool"}
+        second = {"event_id": "second", "kind": "ci_contract", "surface": "ci"}
+        module.FRICTION_LOG.write_text(
+            json.dumps(old, sort_keys=True)
+            + "\n"
+            + json.dumps(first, sort_keys=True)
+            + "\n"
+            + "not json\n"
+            + json.dumps(["not", "event"])
+            + "\n"
+            + json.dumps(second, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        summary = module.friction_summary(limit=2)
+        self.assertEqual(summary["limit_scope"], "recent_valid_events")
+        self.assertEqual(summary["returned"], 2)
+        self.assertEqual(summary["invalid_lines"], 1)
+        self.assertEqual(summary["non_event_lines"], 1)
+        self.assertEqual(
+            [event["event_id"] for event in summary["events"]],
+            ["first", "second"],
+        )
+
+    def test_summary_events_are_bounded(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "event_id": "legacy",
+            "kind": "foreign-kind",
+            "surface": "foreign-surface",
+            "operation": "legacy operation",
+            "symptom": "x" * 400,
+            "notes": ["private note body"],
+            "resolved": False,
+        }
+        module.FRICTION_LOG.write_text(
+            json.dumps(event, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        summary = module.friction_summary(limit=1)
+        rendered = json.dumps(summary["events"], sort_keys=True)
+        self.assertNotIn("private note body", rendered)
+        self.assertEqual(summary["by_kind"]["unknown"], 1)
+        self.assertEqual(summary["by_surface"]["unknown"], 1)
+        self.assertLessEqual(len(summary["events"][0]["symptom"]), 240)
+        self.assertEqual(summary["events"][0]["notes_count"], 1)
 
 
 if __name__ == "__main__":
