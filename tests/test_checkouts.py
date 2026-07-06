@@ -232,6 +232,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(linked["head"], self.head)
         self.assertEqual(linked["branch"], "topic")
         self.assertFalse(linked["status"]["dirty"])
+        self.assertEqual(linked["lifecycle_state"], "unclassified_clean")
+        self.assertEqual(linked["hygiene_mark"], "unknown")
+        self.assertFalse(linked["cleanup_candidate"])
+        self.assertFalse(linked["lifecycle_decision"]["requires_cleanup_dry_run"])
+        self.assertIn("permission_to_cleanup", linked["lifecycle_decision"]["does_not_establish"])
 
     def test_archive_creates_recovery_refs_and_preserves_branch(self) -> None:
         result = self._archive()
@@ -251,6 +256,43 @@ class CheckoutLifecycleTests(unittest.TestCase):
         manifest = json.loads(Path(archive["manifest_path"]).read_text(encoding="utf-8"))
         self.assertTrue(manifest["rollback"]["branch_preserved"])
         self.assertEqual(manifest["cleanup"]["tool"], "grabowski_checkout_cleanup")
+
+    def test_inventory_marks_retained_clean_checkout(self) -> None:
+        retained_until = int(time.time()) + 3600
+        checkouts.grabowski_checkout_retain(
+            str(self.repo),
+            str(self.checkout),
+            "owner-a",
+            "keep for review",
+            retained_until,
+            self.head,
+            "topic",
+        )
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        self.assertEqual(linked["lifecycle_state"], "retained")
+        self.assertEqual(linked["hygiene_mark"], "retained")
+        self.assertTrue(linked["lifecycle_decision"]["retention_active"])
+        self.assertFalse(linked["cleanup_candidate"])
+
+    def test_inventory_marks_archived_checkout_as_cleanup_candidate(self) -> None:
+        self._archive()
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        self.assertEqual(linked["lifecycle_state"], "cleanup_candidate")
+        self.assertEqual(linked["hygiene_mark"], "obsolete")
+        self.assertTrue(linked["cleanup_candidate"])
+        self.assertTrue(linked["lifecycle_decision"]["requires_cleanup_dry_run"])
 
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         archive = self._archive()["archive"]
