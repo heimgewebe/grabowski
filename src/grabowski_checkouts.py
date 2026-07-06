@@ -841,6 +841,136 @@ def _require_no_blockers(coordination: dict[str, Any]) -> None:
     )
 
 
+def _retention_active(lifecycle: dict[str, Any], now: int) -> bool:
+    retention = lifecycle.get("retention")
+    return bool(
+        isinstance(retention, dict)
+        and isinstance(retention.get("retention_until_unix"), int)
+        and retention["retention_until_unix"] > now
+    )
+
+
+def _archive_matches_checkout(
+    record: dict[str, Any], lifecycle: dict[str, Any]
+) -> bool:
+    archive = lifecycle.get("latest_archive")
+    return bool(
+        isinstance(archive, dict)
+        and archive.get("cleaned_at_unix") is None
+        and archive.get("head") == record.get("head")
+        and archive.get("branch") == record.get("branch")
+    )
+
+
+def _checkout_lifecycle_decision(
+    record: dict[str, Any],
+    status: dict[str, Any],
+    lifecycle: dict[str, Any],
+    coordination: dict[str, Any],
+    *,
+    exists: bool,
+    now: int,
+) -> dict[str, Any]:
+    """Classify one checkout without authorizing cleanup by classification alone."""
+    retention = lifecycle.get("retention")
+    archive = lifecycle.get("latest_archive")
+    retention_is_active = _retention_active(lifecycle, now)
+    archive_present = isinstance(archive, dict)
+    archive_open = archive_present and archive.get("cleaned_at_unix") is None
+    archive_matches = _archive_matches_checkout(record, lifecycle)
+    blocking = bool(coordination.get("blocking"))
+    reasons: list[str] = []
+    cleanup_candidate = False
+    requires_cleanup_dry_run = False
+
+    if record["is_main"]:
+        state = "main"
+        hygiene_mark = "primary"
+        next_step = "no_cleanup"
+        reasons.append("main worktree is never a temporary checkout cleanup target")
+    elif record["bare"]:
+        state = "unobservable"
+        hygiene_mark = "unknown"
+        next_step = "inspect_bare_worktree_before_lifecycle_action"
+        reasons.append("bare worktree cannot be classified as a normal linked checkout")
+    elif record["prunable"] or not exists:
+        state = "prunable_or_missing"
+        hygiene_mark = "obsolete"
+        next_step = "review_git_worktree_prune_separately"
+        reasons.append("git reports the worktree as prunable or the path is missing")
+    elif status["dirty"] is True:
+        state = "dirty"
+        hygiene_mark = "dirty"
+        next_step = "review_or_retain_dirty_checkout_before_archive"
+        reasons.append("checkout has staged, unstaged or untracked entries")
+        if retention_is_active:
+            reasons.append("active retention exists but does not make dirty state clean")
+    elif status["dirty"] is not False:
+        state = "unobservable"
+        hygiene_mark = "unknown"
+        next_step = "repair_status_observability_before_lifecycle_action"
+        reasons.append("git status could not prove whether the checkout is clean")
+    elif archive_present and not archive_open:
+        state = "archive_closed"
+        hygiene_mark = "unknown"
+        next_step = "inspect_restored_or_recreated_checkout_before_cleanup"
+        reasons.append("latest archive record is already marked cleaned")
+    elif archive_present and not archive_matches:
+        state = "archive_drifted"
+        hygiene_mark = "unknown"
+        next_step = "refresh_archive_or_retain_before_cleanup"
+        reasons.append("latest archive does not match current checkout head or branch")
+    elif archive_present and blocking:
+        state = "archived_blocked"
+        hygiene_mark = "archived"
+        next_step = "resolve_coordination_blockers_before_cleanup_dry_run"
+        reasons.append("checkout is archived but active coordination blocks cleanup")
+    elif archive_present:
+        state = "cleanup_candidate"
+        hygiene_mark = "obsolete"
+        cleanup_candidate = True
+        requires_cleanup_dry_run = True
+        next_step = "run_checkout_cleanup_dry_run_before_apply"
+        reasons.append("clean linked checkout has matching open recovery archive")
+    elif retention_is_active:
+        state = "retained"
+        hygiene_mark = "retained"
+        next_step = "wait_for_retention_or_owner_review_before_archive"
+        reasons.append("active retention owner protects this checkout")
+    elif blocking:
+        state = "blocked_unarchived"
+        hygiene_mark = "unknown"
+        next_step = "resolve_coordination_blockers_before_archive"
+        reasons.append("active coordination exists and no recovery archive is present")
+    else:
+        state = "unclassified_clean"
+        hygiene_mark = "unknown"
+        next_step = "decide_retain_or_archive_using_external_truth"
+        reasons.append(
+            "clean linked checkout has no retention or archive; local inventory does not prove it is obsolete"
+        )
+
+    return {
+        "state": state,
+        "hygiene_mark": hygiene_mark,
+        "retention_active": retention_is_active,
+        "retention_owner_id": retention.get("owner_id") if isinstance(retention, dict) else None,
+        "archive_present": archive_present,
+        "archive_open": bool(archive_open),
+        "archive_matches_checkout": bool(archive_matches),
+        "coordination_blocking": blocking,
+        "cleanup_candidate": cleanup_candidate,
+        "requires_cleanup_dry_run": requires_cleanup_dry_run,
+        "recommended_next_step": next_step,
+        "reasons": reasons,
+        "does_not_establish": [
+            "permission_to_cleanup",
+            "branch_is_obsolete",
+            "safe_to_delete_branch",
+        ],
+    }
+
+
 def checkout_inventory(
     repo: str | Path,
     *,
@@ -853,6 +983,7 @@ def checkout_inventory(
     keys = [record["checkout_key"] for record in records]
     retention = _retention_records(keys)
     archives = _latest_archives(keys)
+    now = _now()
     worktrees: list[dict[str, Any]] = []
     for record in records:
         checkout_path = Path(record["path"])
@@ -868,21 +999,26 @@ def checkout_inventory(
             "retention": retention.get(record["checkout_key"]),
             "latest_archive": archives.get(record["checkout_key"]),
         }
-        cleanup_candidate = bool(
-            record["is_linked"]
-            and not record["bare"]
-            and not record["prunable"]
-            and status["dirty"] is False
-            and lifecycle["latest_archive"] is not None
+        exists = checkout_path.exists()
+        decision = _checkout_lifecycle_decision(
+            record,
+            status,
+            lifecycle,
+            coordination,
+            exists=exists,
+            now=now,
         )
         worktrees.append(
             {
                 **record,
-                "exists": checkout_path.exists(),
+                "exists": exists,
                 "status": status,
                 "coordination": coordination,
                 "lifecycle": lifecycle,
-                "cleanup_candidate": cleanup_candidate,
+                "lifecycle_state": decision["state"],
+                "hygiene_mark": decision["hygiene_mark"],
+                "lifecycle_decision": decision,
+                "cleanup_candidate": decision["cleanup_candidate"],
             }
         )
     body = {
