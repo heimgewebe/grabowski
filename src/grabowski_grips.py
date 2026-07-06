@@ -447,36 +447,68 @@ def _run_worktree_orient(
     _check(receipt, "worktree_list", "pass" if entries else "warn", f"count={len(entries)}")
     worktrees: list[dict[str, Any]] = []
     dirty_worktrees: list[str] = []
+    unobservable_worktrees: list[str] = []
     active_feature_worktrees: list[str] = []
     stale_candidates: list[str] = []
+    cleanup_candidates: list[dict[str, Any]] = []
     canonical_checkout: str | None = None
     for entry in entries:
         path_value = str(entry.get("path", ""))
         branch = str(entry.get("branch", "")) if entry.get("branch") else None
         status = _worktree_status(Path(path_value), runner) if path_value else {"dirty": False, "status_available": False}
+        status_available = bool(status.get("status_available"))
         dirty = bool(status.get("dirty"))
         record = {**entry, **status, "branch": branch}
         worktrees.append(record)
         if branch in protected and canonical_checkout is None:
             canonical_checkout = path_value
+        if not status_available and path_value:
+            unobservable_worktrees.append(path_value)
         if dirty:
             dirty_worktrees.append(path_value)
         if branch and branch not in protected:
             active_feature_worktrees.append(path_value)
-            if not dirty:
+            if status_available and not dirty:
                 stale_candidates.append(path_value)
-        if entry.get("prunable") and path_value not in stale_candidates:
-            stale_candidates.append(path_value)
+                cleanup_candidates.append(
+                    {
+                        "path": path_value,
+                        "branch": branch,
+                        "reason": "feature worktree has no local status entries",
+                        "cleanup_allowed": False,
+                    }
+                )
+        if entry.get("prunable") and path_value:
+            if path_value not in stale_candidates:
+                stale_candidates.append(path_value)
+            cleanup_candidates.append(
+                {
+                    "path": path_value,
+                    "branch": branch,
+                    "reason": str(entry.get("prunable_reason") or "git marks worktree prunable"),
+                    "cleanup_allowed": False,
+                }
+            )
     if canonical_checkout is None and worktrees:
         canonical_checkout = str(worktrees[0].get("path"))
-    next_safe_grip = "cleanup-plan" if stale_candidates else "repo-orient"
+    next_safe_grip = {
+        "name": "worktree-orient" if stale_candidates or unobservable_worktrees else "repo-orient",
+        "reason": (
+            "review cleanup_candidates and unobservable_worktrees; this grip does not mutate"
+            if stale_candidates or unobservable_worktrees
+            else "no cleanup candidates observed; repo orientation is the next safe read-only grip"
+        ),
+        "effect": READ_ONLY,
+    }
     return {
         "repo": str(repo),
         "canonical_checkout": canonical_checkout,
         "runtime_matching_worktree": None,
         "active_feature_worktrees": active_feature_worktrees,
         "dirty_worktrees": dirty_worktrees,
+        "unobservable_worktrees": unobservable_worktrees,
         "stale_candidates": stale_candidates,
+        "cleanup_candidates": cleanup_candidates,
         "worktrees": worktrees,
         "next_safe_grip": next_safe_grip,
     }

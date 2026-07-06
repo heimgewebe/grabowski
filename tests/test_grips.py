@@ -104,7 +104,36 @@ class WorktreeOrientReceiptTests(unittest.TestCase):
         self.assertEqual("worktree-orient", result["receipt"]["grip"]["name"])
         self.assertIn("receipt_sha256", result["receipt"])
         self.assertIn("worktrees", result["output"])
-        self.assertIn("next_safe_grip", result["output"])
+        self.assertEqual("repo-orient", result["output"]["next_safe_grip"]["name"])
+        self.assertEqual([], result["output"]["cleanup_candidates"])
+
+    def test_worktree_orient_does_not_mark_unobservable_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            feature = repo / "feature"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {repo}\nbranch refs/heads/main\n"
+                            f"worktree {feature}\nbranch refs/heads/feat/x\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"] and _repo == repo:
+                    return {"returncode": 0, "stdout": "## main", "stderr": ""}
+                if argv == ["status", "--short", "--branch"] and _repo == feature:
+                    return {"returncode": 128, "stdout": "", "stderr": "missing worktree"}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual([str(feature)], result["output"]["unobservable_worktrees"])
+        self.assertEqual([], result["output"]["stale_candidates"])
+        self.assertEqual("worktree-orient", result["output"]["next_safe_grip"]["name"])
 
 
 class GripFoundationTests(unittest.TestCase):
