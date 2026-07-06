@@ -79,11 +79,424 @@ class FakeGh:
         return {"returncode": 1, "stdout": "", "stderr": f"unexpected gh command: {argv}"}
 
 
+class GripParserTests(unittest.TestCase):
+    def test_parse_worktree_porcelain(self) -> None:
+        parsed = grips._parse_worktree_porcelain(
+            "worktree /repo/main\n"
+            "HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "branch refs/heads/main\n"
+            "worktree /repo/feat path\n"
+            "branch refs/heads/feat/x\n"
+        )
+
+        self.assertEqual(["/repo/main", "/repo/feat path"], [item["path"] for item in parsed])
+        self.assertEqual("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", parsed[0]["head"])
+        self.assertEqual("main", parsed[0]["branch"])
+        self.assertEqual("feat/x", parsed[1]["branch"])
+
+    def test_parse_worktree_porcelain_preserves_flags_reasons_and_unknowns(self) -> None:
+        parsed = grips._parse_worktree_porcelain(
+            "worktree /repo/prunable\n"
+            "prunable\n"
+            "locked needs review\n"
+            "bare\n"
+            "unknown value\n"
+            "worktree /repo/detached\n"
+            "detached\n"
+            "locked\n"
+            "prunable stale reason  \n"
+            "unknown value  \n"
+        )
+
+        self.assertTrue(parsed[0]["prunable"])
+        self.assertEqual("", parsed[0]["prunable_reason"])
+        self.assertTrue(parsed[0]["locked"])
+        self.assertEqual("needs review", parsed[0]["locked_reason"])
+        self.assertTrue(parsed[0]["bare"])
+        self.assertEqual(["unknown value"], parsed[0]["unknown_fields"])
+        self.assertTrue(parsed[1]["detached"])
+        self.assertEqual("", parsed[1]["locked_reason"])
+        self.assertEqual("stale reason  ", parsed[1]["prunable_reason"])
+        self.assertEqual(["unknown value  "], parsed[1]["unknown_fields"])
+
+
+class WorktreeOrientReceiptTests(unittest.TestCase):
+    def test_worktree_orient_receipt_shape_main_only_has_no_next_pr_grip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {"returncode": 0, "stdout": f"worktree {repo}\nbranch refs/heads/main", "stderr": ""}
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## main", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("worktree-orient", result["receipt"]["grip"]["name"])
+        self.assertIn("receipt_sha256", result["receipt"])
+        self.assertIn("worktrees", result["output"])
+        self.assertNotIn("runtime_matching_worktree", result["output"])
+        self.assertEqual(str(repo), result["output"]["canonical_checkout"])
+        self.assertEqual("matches requested repo path", result["output"]["canonical_checkout_reason"])
+        self.assertIsNone(result["output"]["next_safe_grip"]["name"])
+        self.assertEqual([], result["output"]["cleanup_candidates"])
+        self.assertEqual("pass", checks["protected_branches_valid"])
+        self.assertEqual("pass", checks["worktree_status_read"])
+        self.assertEqual("pass", checks["status_unavailable_count"])
+        self.assertEqual("pass", checks["classification_degraded"])
+
+    def test_worktree_orient_does_not_mark_unobservable_clean_or_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            feature = repo / "feature"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {repo}\nbranch refs/heads/main\n"
+                            f"worktree {feature}\nbranch refs/heads/feat/x\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"] and _repo == repo:
+                    return {"returncode": 0, "stdout": "## main", "stderr": ""}
+                if argv == ["status", "--short", "--branch"] and _repo == feature:
+                    return {"returncode": 128, "stdout": None, "stderr": "missing worktree"}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual([str(feature)], result["output"]["active_feature_worktrees"])
+        self.assertEqual([], result["output"]["clean_feature_worktrees"])
+        self.assertEqual([str(feature)], result["output"]["unobservable_worktrees"])
+        self.assertEqual([], result["output"]["stale_candidates"])
+        self.assertEqual([], result["output"]["cleanup_candidates"])
+        self.assertIsNone(result["output"]["worktrees"][1]["dirty"])
+        self.assertFalse(result["output"]["worktrees"][1]["status_available"])
+        self.assertEqual("missing worktree", result["output"]["worktrees"][1]["status_error"])
+        self.assertIsNone(result["output"]["next_safe_grip"]["name"])
+        self.assertEqual("warn", checks["worktree_status_read"])
+        self.assertEqual("warn", checks["status_unavailable_count"])
+        self.assertEqual("warn", checks["classification_degraded"])
+
+    def test_worktree_orient_prunable_unobservable_is_not_cleanup_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            stale = repo / "stale"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {repo}\nbranch refs/heads/main\n"
+                            f"worktree {stale}\nbranch refs/heads/feat/stale\nprunable gone\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"] and _repo == repo:
+                    return {"returncode": 0, "stdout": "## main", "stderr": ""}
+                if argv == ["status", "--short", "--branch"] and _repo == stale:
+                    return {"returncode": 128, "stdout": None, "stderr": "missing worktree"}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual([str(stale)], result["output"]["unobservable_worktrees"])
+        self.assertEqual([str(stale)], result["output"]["prunable_worktrees"])
+        self.assertEqual([], result["output"]["stale_candidates"])
+        self.assertEqual([], result["output"]["cleanup_candidates"])
+        self.assertIsNone(result["output"]["worktrees"][1]["dirty"])
+        self.assertEqual(
+            "prunable marker present but status unavailable",
+            result["output"]["worktrees"][1]["classification_degraded_reason"],
+        )
+        self.assertIsNone(result["output"]["next_safe_grip"]["name"])
+        self.assertEqual("warn", checks["classification_degraded"])
+
+    def test_worktree_orient_clean_feature_is_readiness_target_not_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            feature = repo / "feature"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {repo}\nbranch refs/heads/main\n"
+                            f"worktree {feature}\nbranch refs/heads/feat/x\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## clean", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        self.assertEqual([str(feature)], result["output"]["active_feature_worktrees"])
+        self.assertEqual([str(feature)], result["output"]["clean_feature_worktrees"])
+        self.assertEqual([], result["output"]["stale_candidates"])
+        self.assertEqual([], result["output"]["cleanup_candidates"])
+        self.assertEqual(0, result["output"]["cleanup_candidate_count"])
+        self.assertEqual("pr-check-readiness", result["output"]["next_safe_grip"]["name"])
+        self.assertEqual({"repo": str(feature)}, result["output"]["next_safe_grip"]["parameters"])
+
+    def test_worktree_orient_one_clean_one_dirty_feature_has_no_automatic_next_grip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            clean = repo / "clean"
+            dirty = repo / "dirty"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {repo}\nbranch refs/heads/main\n"
+                            f"worktree {clean}\nbranch refs/heads/feat/clean\n"
+                            f"worktree {dirty}\nbranch refs/heads/feat/dirty\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"] and _repo == dirty:
+                    return {"returncode": 0, "stdout": "## feat/dirty\n M src/example.py", "stderr": ""}
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## clean", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        self.assertEqual([str(clean), str(dirty)], result["output"]["active_feature_worktrees"])
+        self.assertEqual([str(clean)], result["output"]["clean_feature_worktrees"])
+        self.assertEqual([str(dirty)], result["output"]["dirty_worktrees"])
+        self.assertIsNone(result["output"]["next_safe_grip"]["name"])
+
+    def test_worktree_orient_canonical_checkout_prefers_requested_repo_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            other = repo / "other"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {other}\nbranch refs/heads/main\n"
+                            f"worktree {repo}\nbranch refs/heads/feat/x\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## clean", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        self.assertEqual(str(repo), result["output"]["canonical_checkout"])
+        self.assertEqual("matches requested repo path", result["output"]["canonical_checkout_reason"])
+
+    def test_worktree_orient_canonical_checkout_falls_back_to_first_protected_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            main = repo / "main-checkout"
+            feature = repo / "feature"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {feature}\nbranch refs/heads/feat/x\n"
+                            f"worktree {main}\nbranch refs/heads/main\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## clean", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        self.assertEqual(str(main), result["output"]["canonical_checkout"])
+        self.assertEqual(
+            "first protected branch worktree by protected_branches order",
+            result["output"]["canonical_checkout_reason"],
+        )
+
+    def test_worktree_orient_canonical_checkout_respects_protected_branches_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            release = repo / "release-checkout"
+            main = repo / "main-checkout"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {release}\nbranch refs/heads/release\n"
+                            f"worktree {main}\nbranch refs/heads/main\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## clean", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip(
+                "worktree-orient",
+                {"repo": str(repo), "protected_branches": ["main", "release"]},
+                command_runner=runner,
+            )
+
+        self.assertEqual(str(main), result["output"]["canonical_checkout"])
+        self.assertEqual(
+            "first protected branch worktree by protected_branches order",
+            result["output"]["canonical_checkout_reason"],
+        )
+
+    def test_worktree_orient_canonical_checkout_falls_back_to_first_listed_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            other = repo / "other"
+            feature = repo / "feature"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {other}\nbranch refs/heads/dev\n"
+                            f"worktree {feature}\nbranch refs/heads/feat/x\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## clean", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip(
+                "worktree-orient",
+                {"repo": str(repo), "protected_branches": ["main", "master"]},
+                command_runner=runner,
+            )
+
+        self.assertEqual(str(other), result["output"]["canonical_checkout"])
+        self.assertEqual("fallback to first listed worktree", result["output"]["canonical_checkout_reason"])
+
+    def test_worktree_orient_multiple_clean_features_have_no_automatic_next_grip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            first = repo / "first"
+            second = repo / "second"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {repo}\nbranch refs/heads/main\n"
+                            f"worktree {first}\nbranch refs/heads/feat/a\n"
+                            f"worktree {second}\nbranch refs/heads/feat/b\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## clean", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        self.assertEqual([str(first), str(second)], result["output"]["clean_feature_worktrees"])
+        self.assertIsNone(result["output"]["next_safe_grip"]["name"])
+
+    def test_worktree_orient_invalid_protected_branches_block_before_git_worktree_list(self) -> None:
+        invalid_values = [
+            [],
+            [""],
+            [" main"],
+            ["main "],
+            ["refs/heads/main"],
+            ["main", "main"],
+        ]
+        for protected in invalid_values:
+            with self.subTest(protected=protected):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = Path(tmp)
+                    calls: list[list[str]] = []
+
+                    def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                        calls.append(argv)
+                        return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+                    result = grips.run_grip(
+                        "worktree-orient",
+                        {"repo": str(repo), "protected_branches": protected},
+                        command_runner=runner,
+                    )
+
+                checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+                self.assertEqual("blocked", result["receipt"]["status"])
+                self.assertEqual("fail", checks["protected_branches_valid"])
+                self.assertEqual([], calls)
+
+
+class WorktreeOrientCleanupTests(unittest.TestCase):
+    def test_prunable_worktrees_are_cleanup_candidates_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            feature = repo / "feature"
+            detached = repo / "detached"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {repo}\nbranch refs/heads/main\n"
+                            f"worktree {feature}\nbranch refs/heads/feat/x\nprunable\n"
+                            f"worktree {detached}\ndetached\nprunable old\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## clean", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual([str(detached)], result["output"]["detached_worktrees"])
+        self.assertEqual([str(feature), str(detached)], result["output"]["prunable_worktrees"])
+        self.assertEqual([str(feature), str(detached)], result["output"]["stale_candidates"])
+        self.assertEqual(
+            [str(feature), str(detached)],
+            [item["path"] for item in result["output"]["cleanup_candidates"]],
+        )
+        self.assertEqual(2, result["output"]["cleanup_candidate_count"])
+        self.assertTrue(all(item["cleanup_allowed"] is False for item in result["output"]["cleanup_candidates"]))
+        self.assertIn("git marks worktree prunable", result["output"]["cleanup_candidates"][0]["reason"])
+        self.assertEqual("old", result["output"]["cleanup_candidates"][1]["reason"])
+        self.assertNotIn("detached worktree", result["output"]["cleanup_candidates"][1]["reason"])
+        self.assertIsNone(result["output"]["next_safe_grip"]["name"])
+
+
 class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}
-        self.assertEqual({"branch-publish", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient"}, set(specs))
+        self.assertEqual({"branch-publish", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "worktree-orient"}, set(specs))
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
@@ -481,7 +894,6 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("false", env["GIT_CONFIG_VALUE_0"])
         self.assertEqual("cat", env["GIT_PAGER"])
         self.assertEqual("cat", env["PAGER"])
-
 
 if __name__ == "__main__":
     unittest.main()
