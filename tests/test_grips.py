@@ -133,7 +133,7 @@ class WorktreeOrientReceiptTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual([str(feature)], result["output"]["unobservable_worktrees"])
         self.assertEqual([], result["output"]["stale_candidates"])
-        self.assertEqual("worktree-orient", result["output"]["next_safe_grip"]["name"])
+        self.assertEqual("repo-orient", result["output"]["next_safe_grip"]["name"])
 
 
 class GripFoundationTests(unittest.TestCase):
@@ -542,3 +542,38 @@ class GripFoundationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorktreeOrientCleanupTests(unittest.TestCase):
+    def test_detached_and_prunable_are_cleanup_candidates_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            feature = repo / "feature"
+            detached = repo / "detached"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {repo}\nbranch refs/heads/main\n"
+                            f"worktree {feature}\nbranch refs/heads/feat/x\nprunable old\n"
+                            f"worktree {detached}\ndetached\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## clean", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual([str(detached)], result["output"]["detached_worktrees"])
+        self.assertEqual([str(feature), str(detached)], result["output"]["stale_candidates"])
+        self.assertEqual(
+            [str(feature), str(detached)],
+            [item["path"] for item in result["output"]["cleanup_candidates"]],
+        )
+        self.assertTrue(all(item["cleanup_allowed"] is False for item in result["output"]["cleanup_candidates"]))
+        self.assertEqual("repo-orient", result["output"]["next_safe_grip"]["name"])

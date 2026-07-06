@@ -449,12 +449,33 @@ def _run_worktree_orient(
     dirty_worktrees: list[str] = []
     unobservable_worktrees: list[str] = []
     active_feature_worktrees: list[str] = []
+    detached_worktrees: list[str] = []
     stale_candidates: list[str] = []
     cleanup_candidates: list[dict[str, Any]] = []
+    cleanup_candidate_paths: set[str] = set()
     canonical_checkout: str | None = None
+
+    def add_cleanup_candidate(path: str, branch: str | None, reason: str) -> None:
+        if not path:
+            return
+        if path not in stale_candidates:
+            stale_candidates.append(path)
+        if path in cleanup_candidate_paths:
+            return
+        cleanup_candidate_paths.add(path)
+        cleanup_candidates.append(
+            {
+                "path": path,
+                "branch": branch,
+                "reason": reason,
+                "cleanup_allowed": False,
+            }
+        )
+
     for entry in entries:
         path_value = str(entry.get("path", ""))
         branch = str(entry.get("branch", "")) if entry.get("branch") else None
+        detached = bool(entry.get("detached"))
         status = _worktree_status(Path(path_value), runner) if path_value else {"dirty": False, "status_available": False}
         status_available = bool(status.get("status_available"))
         dirty = bool(status.get("dirty"))
@@ -462,6 +483,8 @@ def _run_worktree_orient(
         worktrees.append(record)
         if branch in protected and canonical_checkout is None:
             canonical_checkout = path_value
+        if detached and path_value:
+            detached_worktrees.append(path_value)
         if not status_available and path_value:
             unobservable_worktrees.append(path_value)
         if dirty:
@@ -469,32 +492,17 @@ def _run_worktree_orient(
         if branch and branch not in protected:
             active_feature_worktrees.append(path_value)
             if status_available and not dirty:
-                stale_candidates.append(path_value)
-                cleanup_candidates.append(
-                    {
-                        "path": path_value,
-                        "branch": branch,
-                        "reason": "feature worktree has no local status entries",
-                        "cleanup_allowed": False,
-                    }
-                )
+                add_cleanup_candidate(path_value, branch, "feature worktree has no local status entries")
+        if detached and status_available and not dirty:
+            add_cleanup_candidate(path_value, None, "detached worktree has no local status entries")
         if entry.get("prunable") and path_value:
-            if path_value not in stale_candidates:
-                stale_candidates.append(path_value)
-            cleanup_candidates.append(
-                {
-                    "path": path_value,
-                    "branch": branch,
-                    "reason": str(entry.get("prunable_reason") or "git marks worktree prunable"),
-                    "cleanup_allowed": False,
-                }
-            )
+            add_cleanup_candidate(path_value, branch, str(entry.get("prunable_reason") or "git marks worktree prunable"))
     if canonical_checkout is None and worktrees:
         canonical_checkout = str(worktrees[0].get("path"))
     next_safe_grip = {
-        "name": "worktree-orient" if stale_candidates or unobservable_worktrees else "repo-orient",
+        "name": "repo-orient",
         "reason": (
-            "review cleanup_candidates and unobservable_worktrees; this grip does not mutate"
+            "manual review is required before cleanup; repo-orient is the next read-only fallback"
             if stale_candidates or unobservable_worktrees
             else "no cleanup candidates observed; repo orientation is the next safe read-only grip"
         ),
@@ -505,6 +513,7 @@ def _run_worktree_orient(
         "canonical_checkout": canonical_checkout,
         "runtime_matching_worktree": None,
         "active_feature_worktrees": active_feature_worktrees,
+        "detached_worktrees": detached_worktrees,
         "dirty_worktrees": dirty_worktrees,
         "unobservable_worktrees": unobservable_worktrees,
         "stale_candidates": stale_candidates,
