@@ -518,10 +518,11 @@ def _run_worktree_orient(
 
     canonical_checkout: str | None = None
     canonical_checkout_reason: str | None = None
+    repo_resolved = repo.resolve()
 
     def same_resolved_path(path_value: str) -> bool:
         try:
-            return Path(path_value).expanduser().resolve() == repo
+            return Path(path_value).expanduser().resolve() == repo_resolved
         except OSError:
             return False
 
@@ -563,7 +564,12 @@ def _run_worktree_orient(
         status = (
             _worktree_status(Path(path_value), runner)
             if path_value
-            else {"dirty": None, "status_available": False, "status_error": "missing worktree path"}
+            else {
+                "dirty": None,
+                "status_available": False,
+                "status_error": "missing worktree path",
+                "status_returncode": 1,
+            }
         )
         status_available = bool(status.get("status_available"))
         dirty = status.get("dirty") is True
@@ -618,11 +624,14 @@ def _run_worktree_orient(
         worktrees.append(record)
 
     if canonical_checkout is None:
-        for record in worktrees:
-            if record.get("is_protected"):
-                canonical_checkout = str(record.get("path"))
-                canonical_checkout_reason = "first protected branch worktree"
-                record["is_canonical"] = True
+        for protected_branch in protected:
+            for record in worktrees:
+                if record.get("path") and record.get("branch") == protected_branch:
+                    canonical_checkout = str(record.get("path"))
+                    canonical_checkout_reason = "first protected branch worktree by protected_branches order"
+                    record["is_canonical"] = True
+                    break
+            if canonical_checkout is not None:
                 break
 
     if canonical_checkout is None and worktrees:

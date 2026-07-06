@@ -329,7 +329,42 @@ class WorktreeOrientReceiptTests(unittest.TestCase):
             result = grips.run_grip("worktree-orient", {"repo": str(repo)}, command_runner=runner)
 
         self.assertEqual(str(main), result["output"]["canonical_checkout"])
-        self.assertEqual("first protected branch worktree", result["output"]["canonical_checkout_reason"])
+        self.assertEqual(
+            "first protected branch worktree by protected_branches order",
+            result["output"]["canonical_checkout_reason"],
+        )
+
+    def test_worktree_orient_canonical_checkout_respects_protected_branches_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            release = repo / "release-checkout"
+            main = repo / "main-checkout"
+
+            def runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["worktree", "list", "--porcelain"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": (
+                            f"worktree {release}\nbranch refs/heads/release\n"
+                            f"worktree {main}\nbranch refs/heads/main\n"
+                        ),
+                        "stderr": "",
+                    }
+                if argv == ["status", "--short", "--branch"]:
+                    return {"returncode": 0, "stdout": "## clean", "stderr": ""}
+                return {"returncode": 1, "stdout": "", "stderr": "unexpected"}
+
+            result = grips.run_grip(
+                "worktree-orient",
+                {"repo": str(repo), "protected_branches": ["main", "release"]},
+                command_runner=runner,
+            )
+
+        self.assertEqual(str(main), result["output"]["canonical_checkout"])
+        self.assertEqual(
+            "first protected branch worktree by protected_branches order",
+            result["output"]["canonical_checkout_reason"],
+        )
 
     def test_worktree_orient_canonical_checkout_falls_back_to_first_listed_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
