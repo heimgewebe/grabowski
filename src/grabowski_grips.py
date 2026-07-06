@@ -396,7 +396,7 @@ def _parse_worktree_porcelain(value: str) -> list[dict[str, str | bool | list[st
     current: dict[str, str | bool | list[str]] | None = None
 
     for raw_line in value.splitlines():
-        if raw_line == "":
+        if not raw_line:
             continue
 
         if raw_line.startswith("worktree "):
@@ -421,16 +421,18 @@ def _parse_worktree_porcelain(value: str) -> list[dict[str, str | bool | list[st
             current["locked_reason"] = ""
         elif raw_line.startswith("locked "):
             current["locked"] = True
-            current["locked_reason"] = raw_line[len("locked ") :]
+            current["locked_reason"] = raw_line.removeprefix("locked ")
         elif raw_line == "prunable":
             current["prunable"] = True
             current["prunable_reason"] = ""
         elif raw_line.startswith("prunable "):
             current["prunable"] = True
-            current["prunable_reason"] = raw_line[len("prunable ") :]
+            current["prunable_reason"] = raw_line.removeprefix("prunable ")
         else:
-            unknown = current.setdefault("unknown_fields", [])
-            assert isinstance(unknown, list)
+            unknown = current.get("unknown_fields")
+            if not isinstance(unknown, list):
+                unknown = []
+                current["unknown_fields"] = unknown
             unknown.append(raw_line)
 
     if current is not None:
@@ -451,13 +453,16 @@ def _worktree_status(path: Path, runner: CommandRunner) -> dict[str, Any]:
     lines = [line for line in stdout.splitlines() if line] if status_available else []
     body = [line for line in lines[1:] if line]
     error_raw = status.get("stderr") or status.get("stdout") or "git status failed"
+    if not isinstance(error_raw, str):
+        error_raw = f"git status failed with non-text output ({type(error_raw).__name__})"
     return {
         "path": str(path),
         "dirty": bool(body) if status_available else None,
         "status_header": lines[0] if lines else "",
         "status_entries": body,
         "status_available": status_available,
-        "status_error": "" if status_available else str(error_raw),
+        "status_error": "" if status_available else error_raw,
+        "status_returncode": returncode,
     }
 
 
@@ -481,10 +486,20 @@ def _run_worktree_orient(
     if not protected:
         _check(receipt, "protected_branches_valid", "fail", "empty list")
         raise GripPreflightError("protected_branches must not be empty")
+    invalid_protected = [item for item in protected if not item or item != item.strip()]
+    if invalid_protected:
+        _check(receipt, "protected_branches_valid", "fail", "branch names must be non-empty and trimmed")
+        raise GripPreflightError("protected_branches entries must be non-empty trimmed strings")
+    if len(set(protected)) != len(protected):
+        _check(receipt, "protected_branches_valid", "fail", "duplicate branch names")
+        raise GripPreflightError("protected_branches entries must be unique")
     _check(receipt, "protected_branches_valid", "pass", ", ".join(protected))
 
-    raw = _git(repo, runner, ["worktree", "list", "--porcelain"])["stdout"]
-    entries = _parse_worktree_porcelain(str(raw))
+    worktree_result = _git(repo, runner, ["worktree", "list", "--porcelain"])
+    raw = worktree_result.get("stdout")
+    if not isinstance(raw, str):
+        raise GripActionError("git worktree porcelain output must be text")
+    entries = _parse_worktree_porcelain(raw)
     _check(receipt, "worktree_list", "pass" if entries else "warn", f"count={len(entries)}")
 
     worktrees: list[dict[str, Any]] = []
@@ -499,15 +514,22 @@ def _run_worktree_orient(
     stale_candidates: list[str] = []
     cleanup_candidates: list[dict[str, Any]] = []
     cleanup_candidate_index: dict[str, dict[str, Any]] = {}
+    stale_candidate_seen: set[str] = set()
 
     canonical_checkout: str | None = None
     canonical_checkout_reason: str | None = None
-    repo_str = str(repo)
+
+    def same_resolved_path(path_value: str) -> bool:
+        try:
+            return Path(path_value).expanduser().resolve() == repo
+        except OSError:
+            return False
 
     def add_cleanup_candidate(path_value: str, branch: str | None, reason: str) -> None:
         if not path_value:
             return
-        if path_value not in stale_candidates:
+        if path_value not in stale_candidate_seen:
+            stale_candidate_seen.add(path_value)
             stale_candidates.append(path_value)
 
         existing = cleanup_candidate_index.get(path_value)
@@ -559,7 +581,7 @@ def _run_worktree_orient(
             "is_cleanup_candidate": False,
         }
 
-        if path_value == repo_str and canonical_checkout is None:
+        if same_resolved_path(path_value) and canonical_checkout is None:
             canonical_checkout = path_value
             canonical_checkout_reason = "matches requested repo path"
             record["is_canonical"] = True
@@ -583,18 +605,21 @@ def _run_worktree_orient(
                 clean_feature_worktrees.append(path_value)
 
         if prunable and path_value:
-            add_cleanup_candidate(
-                path_value,
-                branch,
-                str(entry.get("prunable_reason") or "git marks worktree prunable"),
-            )
-            record["is_cleanup_candidate"] = True
+            if status_available:
+                add_cleanup_candidate(
+                    path_value,
+                    branch,
+                    str(entry.get("prunable_reason") or "git marks worktree prunable"),
+                )
+                record["is_cleanup_candidate"] = True
+            else:
+                record["classification_degraded_reason"] = "prunable marker present but status unavailable"
 
         worktrees.append(record)
 
     if canonical_checkout is None:
         for record in worktrees:
-            if record.get("branch") in protected:
+            if record.get("is_protected"):
                 canonical_checkout = str(record.get("path"))
                 canonical_checkout_reason = "first protected branch worktree"
                 record["is_canonical"] = True
@@ -633,7 +658,7 @@ def _run_worktree_orient(
             "reason": "manual review is required before cleanup or unknown-status worktree handling; no automatic next grip is recommended",
             "effect": READ_ONLY,
         }
-    elif len(clean_feature_worktrees) == 1:
+    elif len(active_feature_worktrees) == 1 and len(clean_feature_worktrees) == 1:
         next_safe_grip = {
             "name": "pr-check-readiness",
             "parameters": {"repo": clean_feature_worktrees[0]},
