@@ -24,9 +24,10 @@ class FrictionLedgerContractTests(unittest.TestCase):
         self.assertIn('name="grabowski_friction_summary"', source)
         self.assertIn('MAX_TEXT_BYTES = 2000', source)
         self.assertIn('MAX_NOTE_COUNT = 20', source)
-        self.assertIn('FAILURE_CLASSES = {', source)
+        self.assertIn('FAILURE_CLASSES = frozenset({', source)
         self.assertIn('def classify_friction_event', source)
         self.assertIn('invalid_lines', source)
+        self.assertIn('def _bounded_event', source)
         self.assertIn('operator._redact(text)', source)
         self.assertIn('base._require_mutations_enabled("friction_record")', source)
         self.assertNotIn('operator._require_operator_mutation("friction_record")', source)
@@ -147,6 +148,72 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertIn("task_resume_permission", classification["does_not_establish"])
         self.assertNotIn("raw_lines", summary)
         self.assertNotIn("raw_lines", classification)
+
+    def test_failure_class_config_is_consistent(self) -> None:
+        module = self._load_module()
+        self.assertEqual(set(module.FAILURE_CLASS_DECISIONS), module.FAILURE_CLASSES)
+        self.assertLessEqual(module.ACTION_REQUIRED_FAILURE_CLASSES, module.FAILURE_CLASSES)
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "ci_contract",
+                    "symptom": "expected red-phase superseded by PR 83",
+                }
+            ),
+            "superseded",
+        )
+
+    def test_summary_limit_counts_recent_valid_events(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        old = {"event_id": "old", "kind": "operator_bug", "surface": "runtime"}
+        first = {"event_id": "first", "kind": "platform_filter", "surface": "chat_tool"}
+        second = {"event_id": "second", "kind": "ci_contract", "surface": "ci"}
+        module.FRICTION_LOG.write_text(
+            json.dumps(old, sort_keys=True)
+            + "\n"
+            + json.dumps(first, sort_keys=True)
+            + "\n"
+            + "not json\n"
+            + json.dumps(["not", "event"])
+            + "\n"
+            + json.dumps(second, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        summary = module.friction_summary(limit=2)
+        self.assertEqual(summary["limit_scope"], "recent_valid_events")
+        self.assertEqual(summary["returned"], 2)
+        self.assertEqual(summary["invalid_lines"], 1)
+        self.assertEqual(summary["non_event_lines"], 1)
+        self.assertEqual(
+            [event["event_id"] for event in summary["events"]],
+            ["first", "second"],
+        )
+
+    def test_summary_events_are_bounded(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "event_id": "legacy",
+            "kind": "foreign-kind",
+            "surface": "foreign-surface",
+            "operation": "legacy operation",
+            "symptom": "x" * 400,
+            "notes": ["private note body"],
+            "resolved": False,
+        }
+        module.FRICTION_LOG.write_text(
+            json.dumps(event, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        summary = module.friction_summary(limit=1)
+        rendered = json.dumps(summary["events"], sort_keys=True)
+        self.assertNotIn("private note body", rendered)
+        self.assertEqual(summary["by_kind"]["unknown"], 1)
+        self.assertEqual(summary["by_surface"]["unknown"], 1)
+        self.assertLessEqual(len(summary["events"][0]["symptom"]), 240)
+        self.assertEqual(summary["events"][0]["notes_count"], 1)
 
 
 if __name__ == "__main__":

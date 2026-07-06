@@ -47,7 +47,7 @@ FRICTION_SURFACES = {
     "filesystem",
     "unknown",
 }
-FAILURE_CLASSES = {
+FAILURE_CLASSES = frozenset({
     "contract_error",
     "expected_red_phase",
     "superseded",
@@ -56,7 +56,7 @@ FAILURE_CLASSES = {
     "policy_gate",
     "actionable_failure",
     "unknown",
-}
+})
 FAILURE_CLASS_DECISIONS = {
     "contract_error": (
         "Inspect contract drift and decide whether producer or consumer must change."
@@ -85,24 +85,27 @@ FAILURE_CLASS_DECISIONS = {
         "Assign a concrete owner and next patch or test step before attempting "
         "another run."
     ),
-    "unknown": "Gather bounded context and reclassify before treating the signal as actionable.",
+    "unknown": (
+        "Gather bounded context and reclassify before treating the signal "
+        "as actionable."
+    ),
 }
-CLASSIFICATION_DOES_NOT_ESTABLISH = [
+CLASSIFICATION_DOES_NOT_ESTABLISH = (
     "task_resume_permission",
     "root_cause",
     "merge_readiness",
     "policy_exception",
     "raw_log_safety",
-]
-ACTION_REQUIRED_FAILURE_CLASSES = {
+)
+ACTION_REQUIRED_FAILURE_CLASSES = frozenset({
     "contract_error",
     "environment_tooling",
     "platform_filter",
     "policy_gate",
     "actionable_failure",
     "unknown",
-}
-EXPECTED_RED_PHASE_TERMS = (
+})
+EXPECTED_RED_PHASE_TERMS = frozenset({
     "expected red-phase",
     "expected red phase",
     "red-phase",
@@ -110,15 +113,15 @@ EXPECTED_RED_PHASE_TERMS = (
     "red test",
     "red first",
     "failing first",
-)
-SUPERSEDED_TERMS = (
+})
+SUPERSEDED_TERMS = frozenset({
     "superseded",
     "obsolete",
     "closed by",
     "replaced by",
     "merged elsewhere",
     "already fixed",
-)
+})
 MAX_TEXT_BYTES = 2000
 MAX_NOTE_COUNT = 20
 
@@ -194,6 +197,12 @@ def _bounded_summary_text(value: Any, *, max_chars: int = 240) -> str:
     return text[: max_chars - 1] + "…"
 
 
+def _known_enum_value(value: Any, allowed: set[str]) -> str:
+    if isinstance(value, str) and value in allowed:
+        return value
+    return "unknown"
+
+
 def _event_haystack(event: dict[str, Any]) -> str:
     parts: list[str] = []
     for key in (
@@ -212,8 +221,28 @@ def _event_haystack(event: dict[str, Any]) -> str:
         for note in notes:
             value = _redacted_string(note)
             if value:
-                parts.append(value)
+                parts.append(value[:500])
     return " ".join(parts).lower()
+
+
+def _bounded_event(event: dict[str, Any]) -> dict[str, Any]:
+    notes = event.get("notes")
+    return {
+        "event_id": _bounded_summary_text(event.get("event_id"), max_chars=80),
+        "recorded_at_unix": (
+            event.get("recorded_at_unix")
+            if isinstance(event.get("recorded_at_unix"), int)
+            else None
+        ),
+        "kind": _known_enum_value(event.get("kind"), FRICTION_KINDS),
+        "surface": _known_enum_value(event.get("surface"), FRICTION_SURFACES),
+        "operation": _bounded_summary_text(event.get("operation"), max_chars=160),
+        "symptom": _bounded_summary_text(event.get("symptom")),
+        "suspected_trigger": _bounded_summary_text(event.get("suspected_trigger")),
+        "fallback": _bounded_summary_text(event.get("fallback")),
+        "resolved": event.get("resolved") is True,
+        "notes_count": len(notes) if isinstance(notes, list) else 0,
+    }
 
 
 def classify_friction_event(event: dict[str, Any]) -> str:
@@ -230,7 +259,7 @@ def classify_friction_event(event: dict[str, Any]) -> str:
     if any(term in haystack for term in EXPECTED_RED_PHASE_TERMS):
         return "expected_red_phase"
 
-    kind = str(event.get("kind", "unknown"))
+    kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
     if kind == "platform_filter":
         return "platform_filter"
     if kind == "fail_closed_gate":
@@ -248,8 +277,8 @@ def _decision_event(event: dict[str, Any], failure_class: str) -> dict[str, Any]
     return {
         "event_id": _bounded_summary_text(event.get("event_id"), max_chars=80),
         "failure_class": failure_class,
-        "kind": _bounded_summary_text(event.get("kind"), max_chars=80) or "unknown",
-        "surface": _bounded_summary_text(event.get("surface"), max_chars=80) or "unknown",
+        "kind": _known_enum_value(event.get("kind"), FRICTION_KINDS),
+        "surface": _known_enum_value(event.get("surface"), FRICTION_SURFACES),
         "operation": _bounded_summary_text(event.get("operation"), max_chars=160),
         "symptom": _bounded_summary_text(event.get("symptom")),
         "next_decision": FAILURE_CLASS_DECISIONS[failure_class],
@@ -283,13 +312,14 @@ def classify_failure_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "authority": "read_only_evidence",
-        "does_not_establish": CLASSIFICATION_DOES_NOT_ESTABLISH,
+        "does_not_establish": list(CLASSIFICATION_DOES_NOT_ESTABLISH),
         "by_failure_class": dict(sorted(by_failure_class.items())),
         "unresolved_by_failure_class": dict(sorted(unresolved_by_failure_class.items())),
         "decision_required_count": len(decision_required_events),
         "decision_required_events": decision_required_events[:20],
         "decision_required_events_truncated": len(decision_required_events) > 20,
         "recurring_failure_classes": recurring_failure_classes,
+        "recurring_scope": "recent_valid_events",
         "next_decisions_by_class": dict(sorted(FAILURE_CLASS_DECISIONS.items())),
     }
 
@@ -348,11 +378,13 @@ def _load_event_records(limit: int) -> dict[str, Any]:
     if FRICTION_LOG.is_symlink() or not FRICTION_LOG.is_file():
         raise RuntimeError("friction log is not a regular file")
     lines = FRICTION_LOG.read_text(encoding="utf-8").splitlines()
-    events: list[dict[str, Any]] = []
+    reversed_events: list[dict[str, Any]] = []
     scanned_lines = 0
     invalid_lines = 0
     non_event_lines = 0
-    for line in lines[-limit:]:
+    for line in reversed(lines):
+        if len(reversed_events) >= limit:
+            break
         if not line.strip():
             continue
         scanned_lines += 1
@@ -362,9 +394,10 @@ def _load_event_records(limit: int) -> dict[str, Any]:
             invalid_lines += 1
             continue
         if isinstance(value, dict):
-            events.append(value)
+            reversed_events.append(value)
         else:
             non_event_lines += 1
+    events = list(reversed(reversed_events))
     return {
         "events": events,
         "scanned_lines": scanned_lines,
@@ -386,8 +419,8 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
     by_surface: dict[str, int] = {}
     unresolved = 0
     for event in events:
-        kind = str(event.get("kind", "unknown"))
-        surface = str(event.get("surface", "unknown"))
+        kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
+        surface = _known_enum_value(event.get("surface"), FRICTION_SURFACES)
         by_kind[kind] = by_kind.get(kind, 0) + 1
         by_surface[surface] = by_surface.get(surface, 0) + 1
         if event.get("resolved") is not True:
@@ -397,6 +430,7 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
         "path": str(FRICTION_LOG),
         "exists": FRICTION_LOG.exists(),
         "limit": limit,
+        "limit_scope": "recent_valid_events",
         "scanned_lines": records["scanned_lines"],
         "invalid_lines": records["invalid_lines"],
         "non_event_lines": records["non_event_lines"],
@@ -405,7 +439,7 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
         "by_kind": dict(sorted(by_kind.items())),
         "by_surface": dict(sorted(by_surface.items())),
         "failure_classification": classify_failure_events(events),
-        "events": events,
+        "events": [_bounded_event(event) for event in events],
     }
 
 
