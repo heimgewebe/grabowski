@@ -1754,3 +1754,330 @@ class ScoutGripTests(unittest.TestCase):
         self.assertIn("scout", listed)
         self.assertEqual(listed["scout"]["effect"], grips.READ_ONLY)
         self.assertTrue(listed["scout"]["availability"]["available"])
+
+
+CAPTAIN_HEAD = "b" * 40
+CAPTAIN_DIFF = "c" * 64
+
+
+def captain_action(**overrides) -> dict[str, object]:
+    action: dict[str, object] = {
+        "action": "pr-merge",
+        "high_impact": True,
+        "role": "captain",
+        "target": {"repo": "heimgewebe/grabowski", "pr": 96},
+        "scope": {
+            "allowed_effects": ["merge pull request 96 into main"],
+            "forbidden_effects": ["force-push", "branch-deletion"],
+            "boundaries": "single pull request in heimgewebe/grabowski",
+            "max_targets": 1,
+        },
+        "risk": {
+            "risk_level": "high",
+            "irreversibility": "reversible",
+            "recovery_path": "revert the merge commit on main",
+        },
+        "target_change": None,
+        "receipt_path": "receipts/captain/pr-merge.json",
+    }
+    action.update(overrides)
+    return action
+
+
+def captain_parameters(actions: list[dict[str, object]] | None = None, **overrides) -> dict[str, object]:
+    projection = {"schema_version": 1, "healthy": True, "generated_at": "2026-07-07T12:00:00Z"}
+    parameters: dict[str, object] = {
+        "actions": actions if actions is not None else [captain_action()],
+        "status_projection": projection,
+        "status_projection_fresh": True,
+        "status_projection_source": "bureau status-projection",
+        "status_projection_sha256": grips.sha256_json(projection),
+        "expected_head": CAPTAIN_HEAD,
+        "diff_sha256": CAPTAIN_DIFF,
+        "execution_authority": {"granted_by": "alex", "reference": "captain decision record 2026-07-07"},
+        "review_evidence": {
+            "head_sha": CAPTAIN_HEAD,
+            "diff_sha256": CAPTAIN_DIFF,
+            "reviews": [{"reviewer": "external-review", "verdict": "PASS"}],
+            "external_reviews_triaged": True,
+            "findings": [],
+        },
+        "ci_evidence": {"state": "passed", "head_sha": CAPTAIN_HEAD, "source": "github-actions"},
+        "human_authorization": {"authorized_by": "alex", "statement": "manual captain decision still pending"},
+    }
+    parameters.update(overrides)
+    return parameters
+
+
+class CaptainAuthorityPathTests(unittest.TestCase):
+    def run_captain(self, parameters: dict[str, object]) -> dict[str, object]:
+        return grips.grip_run("captain-preflight", parameters, profile="captain", command_runner=FakeGit())
+
+    def gate(self, result: dict[str, object], gate_id: str) -> dict[str, object]:
+        return next(item for item in result["output"]["gates"] if item["id"] == gate_id)
+
+    def test_all_gates_pass_yields_only_manual_decision_and_no_execution(self) -> None:
+        result = self.run_captain(captain_parameters())
+
+        output = result["output"]
+        self.assertEqual([gate["id"] for gate in output["gates"]], list(grips.CAPTAIN_GATE_IDS))
+        self.assertTrue(all(gate["status"] == "pass" for gate in output["gates"]))
+        self.assertEqual("ready_for_manual_captain_decision", output["decision"])
+        self.assertEqual("blocked", output["status"])
+        self.assertEqual("blocked", output["receipt_status"])
+        self.assertEqual(["captain_execution_not_implemented_in_this_slice"], output["blocked_reasons"])
+        self.assertEqual("blocked", result["receipt"]["status"])
+        action = output["actions"][0]
+        self.assertEqual("not-performed", action["execution"])
+        self.assertEqual("blocked", action["captain_receipt"]["status"])
+        self.assertTrue(grips._is_sha256_hex(action["receipt_sha256"]))
+        self.assertEqual(action["captain_receipt"]["recovery_path"], "revert the merge commit on main")
+        self.assertIn("privileged execution is not implemented", output["why_no_mutation"])
+
+    def test_top_level_receipt_follows_receipt_status_when_blocked(self) -> None:
+        result = self.run_captain(captain_parameters(review_evidence=None))
+
+        self.assertEqual("blocked", result["output"]["receipt_status"])
+        self.assertEqual("blocked", result["output"]["status"])
+        self.assertEqual(result["output"]["receipt_status"], result["receipt"]["status"])
+        self.assertEqual("blocked", result["output"]["decision"])
+
+    def test_blocks_without_status_projection_object(self) -> None:
+        parameters = captain_parameters()
+        for key in ("status_projection", "status_projection_fresh", "status_projection_source", "status_projection_sha256"):
+            parameters.pop(key)
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", result["output"]["decision"])
+        self.assertIn("fresh_status_projection_unavailable", result["output"]["blocked_reasons"])
+        self.assertEqual("blocked", self.gate(result, "status-projection-fresh")["status"])
+
+    def test_blocks_stale_status_projection(self) -> None:
+        result = self.run_captain(captain_parameters(status_projection_fresh=False))
+
+        self.assertEqual("blocked", result["output"]["decision"])
+        self.assertIn("fresh_status_projection_unavailable", result["output"]["blocked_reasons"])
+        self.assertTrue(result["output"]["status_projection"]["used"])
+
+    def test_blocks_invalid_status_projection_sha256(self) -> None:
+        result = self.run_captain(captain_parameters(status_projection_sha256="zz" * 32))
+
+        self.assertIn("status_projection_sha256_invalid", result["output"]["blocked_reasons"])
+        self.assertEqual("blocked", result["output"]["decision"])
+
+    def test_blocks_status_projection_hash_drift(self) -> None:
+        result = self.run_captain(captain_parameters(status_projection_sha256="d" * 64))
+
+        self.assertIn("status_projection_sha256_mismatch", result["output"]["blocked_reasons"])
+        self.assertEqual("blocked", result["output"]["decision"])
+
+    def test_blocks_missing_status_projection_source(self) -> None:
+        result = self.run_captain(captain_parameters(status_projection_source="  "))
+
+        self.assertIn("status_projection_source_missing", result["output"]["blocked_reasons"])
+
+    def test_allow_execution_alone_never_grants_authority(self) -> None:
+        parameters = captain_parameters(allow_execution=True)
+        parameters.pop("execution_authority")
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", result["output"]["decision"])
+        self.assertIn("execution_authority_missing", result["output"]["blocked_reasons"])
+        self.assertEqual("blocked", self.gate(result, "execution-authority-present")["status"])
+
+    def test_blocks_incomplete_execution_authority(self) -> None:
+        result = self.run_captain(captain_parameters(execution_authority={"granted_by": "alex"}))
+
+        self.assertEqual("blocked", self.gate(result, "execution-authority-present")["status"])
+
+    def test_blocks_missing_review_evidence(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("review_evidence")
+        result = self.run_captain(parameters)
+
+        self.assertIn("review_evidence_missing", result["output"]["blocked_reasons"])
+
+    def test_blocks_review_evidence_for_other_head(self) -> None:
+        parameters = captain_parameters()
+        parameters["review_evidence"]["head_sha"] = "e" * 40
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", self.gate(result, "review-evidence-present")["status"])
+
+    def test_blocks_missing_diff_binding(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("diff_sha256")
+        result = self.run_captain(parameters)
+
+        self.assertIn("diff_binding_missing_or_invalid", result["output"]["blocked_reasons"])
+
+    def test_blocks_diff_hash_mismatch_with_review_evidence(self) -> None:
+        result = self.run_captain(captain_parameters(diff_sha256="f" * 64))
+
+        blocked = result["output"]["blocked_reasons"]
+        self.assertTrue("diff_sha256_mismatch" in blocked or any("diff_sha256" in reason for reason in blocked))
+        self.assertEqual("blocked", result["output"]["decision"])
+
+    def test_blocks_missing_or_failed_ci_evidence(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("ci_evidence")
+        result = self.run_captain(parameters)
+        self.assertIn("ci_evidence_missing", result["output"]["blocked_reasons"])
+
+        failed = self.run_captain(
+            captain_parameters(ci_evidence={"state": "failed", "head_sha": CAPTAIN_HEAD, "source": "github-actions"})
+        )
+        self.assertEqual("blocked", self.gate(failed, "ci-green")["status"])
+
+    def test_blocks_missing_human_authorization(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("human_authorization")
+        result = self.run_captain(parameters)
+
+        self.assertIn("human_authorization_missing", result["output"]["blocked_reasons"])
+
+    def test_blocks_missing_recovery_and_irreversibility(self) -> None:
+        result = self.run_captain(captain_parameters([captain_action(risk={"risk_level": "high"})]))
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("risk requires recovery_path or irreversibility", result["output"]["error"])
+
+    def test_irreversible_requires_irreversibility_record(self) -> None:
+        action = captain_action(risk={"risk_level": "high", "irreversibility": "irreversible"})
+        result = self.run_captain(captain_parameters([action]))
+        self.assertIn("irreversibility_record is required", result["output"]["error"])
+
+        action["irreversibility_record"] = {"reason": "merge rewrites main history context", "accepted_by": "alex"}
+        recorded = self.run_captain(captain_parameters([action]))
+        self.assertEqual("ready_for_manual_captain_decision", recorded["output"]["decision"])
+
+    def test_rejects_unknown_high_impact_like_action(self) -> None:
+        result = self.run_captain(captain_parameters([captain_action(action="database-drop")]))
+
+        self.assertIn("must be an explicit high-impact Captain action", result["output"]["error"])
+
+    def test_rejects_normal_mechanic_action(self) -> None:
+        result = self.run_captain(captain_parameters([captain_action(action="branch-publish")]))
+
+        self.assertIn("is a normal mechanic action", result["output"]["error"])
+
+    def test_rejects_nested_orchestration_grips(self) -> None:
+        for name in ("mechanic-loop", "captain-preflight"):
+            result = self.run_captain(captain_parameters([captain_action(action=name)]))
+            self.assertIn("must not nest orchestration grips", result["output"]["error"])
+
+    def test_rejects_non_captain_role(self) -> None:
+        result = self.run_captain(captain_parameters([captain_action(role="mechanic")]))
+
+        self.assertIn("role must be captain", result["output"]["error"])
+
+    def test_pr_merge_requires_repo_and_positive_integer_pr(self) -> None:
+        for target in (
+            {"pr": 96},
+            {"repo": "heimgewebe/grabowski"},
+            {"repo": "grabowski", "pr": 96},
+            {"repo": "heimgewebe/grabowski", "pr": 0},
+            {"repo": "heimgewebe/grabowski", "pr": -3},
+            {"repo": "heimgewebe/grabowski", "pr": "96"},
+            {"repo": "heimgewebe/grabowski", "pr": True},
+        ):
+            result = self.run_captain(captain_parameters([captain_action(target=target)]))
+            self.assertEqual("blocked", result["receipt"]["status"])
+            self.assertIn("target", result["output"]["error"])
+
+    def test_runtime_deploy_requires_runtime_target(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={"service": "grabowski-mcp"},
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        result = self.run_captain(captain_parameters([action]))
+        self.assertIn("environment or runtime_target", result["output"]["error"])
+
+        action["target"] = {"service": "grabowski-mcp", "environment": "heim-pc"}
+        parameters = captain_parameters([action])
+        for key in ("status_projection", "status_projection_fresh", "status_projection_source", "status_projection_sha256"):
+            parameters.pop(key)
+        blocked = self.run_captain(parameters)
+        self.assertIn("fresh_status_projection_unavailable", blocked["output"]["blocked_reasons"])
+        self.assertTrue(blocked["output"]["actions"][0]["requires_status_projection"])
+
+    def test_service_restart_requires_host_and_concrete_unit(self) -> None:
+        base = {"action": "service-restart", "receipt_path": "receipts/captain/service-restart.json"}
+        for target in ({"unit": "grabowski-mcp.service"}, {"host": "heim-pc"}, {"host": "heim-pc", "unit": "*"}, {"host": "heim-pc", "unit": "all"}):
+            result = self.run_captain(captain_parameters([captain_action(**base, target=target)]))
+            self.assertEqual("blocked", result["receipt"]["status"])
+            self.assertIn("target", result["output"]["error"])
+
+    def test_fleet_mutation_requires_concrete_target_and_explicit_operation(self) -> None:
+        base = {"action": "fleet-mutation", "receipt_path": "receipts/captain/fleet-mutation.json"}
+        for target in (
+            {"operation": "rotate-worker-tokens"},
+            {"fleet_target": "*", "operation": "rotate-worker-tokens"},
+            {"fleet_target": "browser-workers", "operation": "update"},
+            {"fleet_target": "browser-workers", "operation": "any"},
+        ):
+            result = self.run_captain(captain_parameters([captain_action(**base, target=target)]))
+            self.assertEqual("blocked", result["receipt"]["status"])
+            self.assertIn("target", result["output"]["error"])
+
+    def test_cleanup_apply_requires_cleanup_target_and_location(self) -> None:
+        base = {"action": "cleanup-apply", "receipt_path": "receipts/captain/cleanup-apply.json"}
+        for target in ({"repo": "heimgewebe/grabowski"}, {"cleanup_target": "stale worktrees"}):
+            result = self.run_captain(captain_parameters([captain_action(**base, target=target)]))
+            self.assertEqual("blocked", result["receipt"]["status"])
+            self.assertIn("target", result["output"]["error"])
+
+    def test_target_change_required_needs_non_empty_record(self) -> None:
+        result = self.run_captain(
+            captain_parameters([captain_action(target_change_required=True, target_change={})])
+        )
+
+        self.assertIn("target_change record must be a non-empty object", result["output"]["error"])
+
+    def test_scope_without_effect_boundaries_blocks(self) -> None:
+        result = self.run_captain(captain_parameters([captain_action(scope={"operation": "preflight only"})]))
+
+        self.assertEqual("blocked", self.gate(result, "scope-bound")["status"])
+        self.assertEqual("blocked", result["output"]["decision"])
+
+    def test_does_not_establish_lists_safety_non_claims(self) -> None:
+        result = self.run_captain(captain_parameters())
+
+        claims = set(result["output"]["does_not_establish"])
+        self.assertLessEqual(
+            {
+                "automatic_merge_authority",
+                "automatic_deploy_authority",
+                "service_restart_safety",
+                "fleet_mutation_safety",
+                "cleanup_safety",
+                "runtime_correctness",
+                "semantic_correctness",
+                "review_completeness",
+                "production_safety",
+                "privileged_execution",
+            },
+            claims,
+        )
+        self.assertTrue(any("allow_execution" in claim for claim in result["output"]["non_claims"]))
+
+    def test_mechanic_loop_still_cannot_dispatch_captain_actions(self) -> None:
+        for name in sorted(grips.CAPTAIN_HIGH_IMPACT_ACTIONS) + ["captain-preflight"]:
+            result = grips.run_grip(
+                "mechanic-loop",
+                {
+                    "actions": [
+                        {
+                            "action": name,
+                            "target": {"repo": "heimgewebe/grabowski"},
+                            "scope": {"operation": "attempt"},
+                            "receipt_path": "receipts/mechanic/forbidden.json",
+                        }
+                    ]
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+            self.assertEqual("blocked", result["receipt"]["status"])

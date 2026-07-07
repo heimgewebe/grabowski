@@ -124,8 +124,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "captain-preflight": GripSpec(
         name="captain-preflight",
-        version="1.0",
-        summary="Preflight high-impact Captain actions without executing privileged mutations.",
+        version="1.1",
+        summary="Evaluate Captain authority gates for high-impact actions without executing privileged mutations.",
         effect=READ_ONLY,
         required_parameters=("actions",),
         acceptance_ids=("high-impact-marked", "recovery-or-irreversibility", "target-change-record"),
@@ -210,6 +210,47 @@ GRIP_SURFACE_CAPTAIN_ONLY = frozenset({"captain-preflight"})
 MECHANIC_FORBIDDEN_EFFECTS = tuple(sorted(CAPTAIN_HIGH_IMPACT_ACTIONS | {"force-push", "secret-mutation", "database-migration", "privileged-broker-mutation"}))
 MECHANIC_MAX_ACTIONS = 10
 CAPTAIN_MAX_ACTIONS = 10
+CAPTAIN_SCOPE_RECOMMENDED_KEYS = ("allowed_effects", "forbidden_effects", "boundaries", "max_targets")
+CAPTAIN_WILDCARD_TOKENS = frozenset({"*", "all", "any", "every", "wildcard"})
+CAPTAIN_GENERIC_OPERATIONS = frozenset({"mutate", "change", "update", "apply", "operate", "do", "run"})
+CAPTAIN_GATE_IDS = (
+    "high-impact-marked",
+    "target-bound",
+    "scope-bound",
+    "target-change-record",
+    "recovery-or-irreversibility",
+    "status-projection-fresh",
+    "execution-authority-present",
+    "review-evidence-present",
+    "diff-bound",
+    "ci-green",
+    "human-authorization-present",
+)
+CAPTAIN_DOES_NOT_ESTABLISH = (
+    "automatic_merge_authority",
+    "automatic_deploy_authority",
+    "service_restart_safety",
+    "fleet_mutation_safety",
+    "cleanup_safety",
+    "runtime_correctness",
+    "semantic_correctness",
+    "review_completeness",
+    "production_safety",
+    "privileged_execution",
+)
+CAPTAIN_NON_CLAIMS = (
+    "does not execute privileged mutations; no merge, deploy, restart, fleet mutation or cleanup happens here",
+    "does not treat status projection as runtime truth; projection is evidence only",
+    "does not treat CI green as production safety",
+    "does not treat review approval as semantic correctness",
+    "does not grant execution because allow_execution or any other parameter is set",
+    "human authorization is recorded evidence, never an automatic execution release",
+)
+CAPTAIN_NO_MUTATION_REASON = (
+    "captain-preflight is a read-only authority evaluation; privileged execution is not "
+    "implemented in this slice, so every receipt stays blocked and any real high-impact "
+    "action requires a separate, explicitly authorized path"
+)
 
 
 class GripPreflightError(ValueError):
@@ -1944,6 +1985,63 @@ def _run_mechanic_loop(
     }
 
 
+def _captain_wildcardish(value: Any) -> bool:
+    if not isinstance(value, str):
+        return True
+    stripped = value.strip().lower()
+    return not stripped or stripped in CAPTAIN_WILDCARD_TOKENS or "*" in stripped or "?" in stripped
+
+
+def _captain_target_string(target: dict[str, Any], key: str, *, index: int) -> str:
+    value = target.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise GripPreflightError(f"actions[{index}].target.{key} must be a non-empty string")
+    return value.strip()
+
+
+def _validate_captain_target(action_name: str, target: dict[str, Any], *, index: int) -> None:
+    if action_name == "pr-merge":
+        repo = _captain_target_string(target, "repo", index=index)
+        if _captain_wildcardish(repo) or "/" not in repo or any(char.isspace() for char in repo):
+            raise GripPreflightError(f"actions[{index}].target.repo must name exactly one owner/repo")
+        pr = target.get("pr")
+        if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
+            raise GripPreflightError(f"actions[{index}].target.pr must be a positive integer")
+    elif action_name == "runtime-deploy":
+        if not any(isinstance(target.get(key), str) and target[key].strip() for key in ("repo", "service")):
+            raise GripPreflightError(f"actions[{index}].target requires repo or service for runtime-deploy")
+        if not any(isinstance(target.get(key), str) and target[key].strip() for key in ("environment", "runtime_target")):
+            raise GripPreflightError(f"actions[{index}].target requires environment or runtime_target for runtime-deploy")
+    elif action_name == "service-restart":
+        _captain_target_string(target, "host", index=index)
+        unit = _captain_target_string(target, "unit", index=index)
+        if _captain_wildcardish(unit):
+            raise GripPreflightError(f"actions[{index}].target.unit must name one concrete unit, not a wildcard")
+    elif action_name == "fleet-mutation":
+        fleet_target = _captain_target_string(target, "fleet_target", index=index)
+        if _captain_wildcardish(fleet_target):
+            raise GripPreflightError(f"actions[{index}].target.fleet_target must be concrete, not a wildcard")
+        operation = _captain_target_string(target, "operation", index=index)
+        if _captain_wildcardish(operation) or operation.strip().lower() in CAPTAIN_GENERIC_OPERATIONS:
+            raise GripPreflightError(f"actions[{index}].target.operation must be an explicit operation, not a generic verb")
+    elif action_name == "cleanup-apply":
+        _captain_target_string(target, "cleanup_target", index=index)
+        if not any(isinstance(target.get(key), str) and target[key].strip() for key in ("repo", "checkout_path")):
+            raise GripPreflightError(f"actions[{index}].target requires repo or checkout_path for cleanup-apply")
+
+
+def _captain_scope_findings(scope: dict[str, Any], *, index: int) -> list[str]:
+    for key in ("allowed_effects", "forbidden_effects"):
+        value = scope.get(key)
+        if value is not None and (not isinstance(value, list) or not all(isinstance(entry, str) for entry in value)):
+            raise GripPreflightError(f"actions[{index}].scope.{key} must be a list of strings when provided")
+    if not any(key in scope for key in CAPTAIN_SCOPE_RECOMMENDED_KEYS):
+        return [
+            f"actions[{index}].scope declares none of {', '.join(CAPTAIN_SCOPE_RECOMMENDED_KEYS)}"
+        ]
+    return []
+
+
 def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
     value = parameters.get("actions")
     if not isinstance(value, list) or not value:
@@ -1955,12 +2053,21 @@ def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             raise GripPreflightError(f"actions[{index}] must be an object")
         action_name = _normal_action_name(item, index=index)
+        if action_name == "mechanic-loop" or action_name in GRIP_SURFACE_CAPTAIN_ONLY:
+            raise GripPreflightError(f"actions[{index}].action must not nest orchestration grips: {action_name}")
+        if action_name in MECHANIC_NORMAL_GRIPS:
+            raise GripPreflightError(f"actions[{index}].action is a normal mechanic action, not a Captain high-impact action: {action_name}")
         if action_name not in CAPTAIN_HIGH_IMPACT_ACTIONS:
             raise GripPreflightError(f"actions[{index}].action must be an explicit high-impact Captain action")
         if item.get("high_impact") is not True:
             raise GripPreflightError(f"actions[{index}].high_impact must be true")
+        role = item.get("role")
+        if role is not None and role != "captain":
+            raise GripPreflightError(f"actions[{index}].role must be captain when provided")
         target = _bound_mapping(item.get("target"), context=f"actions[{index}]", name="target")
+        _validate_captain_target(action_name, target, index=index)
         scope = _bound_mapping(item.get("scope"), context=f"actions[{index}]", name="scope")
+        scope_findings = _captain_scope_findings(scope, index=index)
         risk = _bound_mapping(item.get("risk"), context=f"actions[{index}]", name="risk")
         recovery_path = risk.get("recovery_path")
         irreversibility = risk.get("irreversibility")
@@ -1977,6 +2084,8 @@ def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
         target_change = item.get("target_change")
         if target_change_required and not isinstance(target_change, dict):
             raise GripPreflightError(f"actions[{index}].target_change record is required")
+        if target_change_required and not target_change:
+            raise GripPreflightError(f"actions[{index}].target_change record must be a non-empty object")
         if target_change is not None and not isinstance(target_change, dict):
             raise GripPreflightError(f"actions[{index}].target_change must be an object or null")
         receipt_path = _relative_receipt_path(item.get("receipt_path"), context=f"actions[{index}]")
@@ -1985,11 +2094,17 @@ def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
                 "index": index,
                 "action": action_name,
                 "high_impact": True,
+                "role": "captain",
                 "target": target,
                 "scope": scope,
+                "scope_findings": scope_findings,
                 "risk": risk,
+                "recovery_path": risk.get("recovery_path"),
+                "irreversibility": risk.get("irreversibility"),
+                "requires_status_projection": True,
                 "target_change": target_change,
                 "receipt_path": receipt_path,
+                "execution": "not-performed",
                 "envelope": {
                     "schema_version": 1,
                     "role": "captain",
@@ -2007,6 +2122,197 @@ def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
     return actions
 
 
+def _captain_gate(gate_id: str, status: str, reason: str, details: Any = None) -> dict[str, Any]:
+    gate: dict[str, Any] = {"id": gate_id, "status": status, "reason": reason}
+    if details is not None:
+        gate["details"] = details
+    return gate
+
+
+def _captain_status_projection_gate(parameters: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    fresh = _mechanic_bool(parameters, "status_projection_fresh", False)
+    projection = parameters.get("status_projection")
+    source = parameters.get("status_projection_source")
+    declared_sha = parameters.get("status_projection_sha256")
+    info: dict[str, Any] = {"used": False, "fresh": fresh, "source": None, "sha256": None}
+    problems: list[str] = []
+    if projection is None:
+        problems.append("fresh_status_projection_unavailable")
+    elif not isinstance(projection, dict) or not projection:
+        problems.append("status_projection_not_a_non_empty_object")
+    else:
+        info["used"] = True
+        if not isinstance(source, str) or not source.strip():
+            problems.append("status_projection_source_missing")
+        else:
+            info["source"] = source.strip()
+        if declared_sha is None:
+            problems.append("status_projection_sha256_missing")
+        elif not _is_sha256_hex(declared_sha):
+            problems.append("status_projection_sha256_invalid")
+        elif declared_sha != sha256_json(projection):
+            problems.append("status_projection_sha256_mismatch")
+        else:
+            info["sha256"] = declared_sha
+        if not fresh:
+            problems.append("fresh_status_projection_unavailable")
+    if problems:
+        return (
+            _captain_gate(
+                "status-projection-fresh",
+                "blocked",
+                "status projection is missing, stale or not hash-bound; projection is required evidence",
+                problems,
+            ),
+            info,
+        )
+    return (
+        _captain_gate(
+            "status-projection-fresh",
+            "pass",
+            "fresh status projection with source and matching sha256; evidence only, not runtime truth",
+        ),
+        info,
+    )
+
+
+def _captain_evidence_object(parameters: dict[str, Any], name: str) -> dict[str, Any] | None:
+    value = parameters.get(name)
+    if isinstance(value, dict) and value:
+        return value
+    return None
+
+
+def _captain_execution_authority_gate(parameters: dict[str, Any]) -> dict[str, Any]:
+    evidence = _captain_evidence_object(parameters, "execution_authority")
+    if evidence is None:
+        return _captain_gate(
+            "execution-authority-present",
+            "blocked",
+            "execution_authority evidence object is missing; allow_execution alone never grants authority",
+            ["execution_authority_missing"],
+        )
+    problems = []
+    if not isinstance(evidence.get("granted_by"), str) or not evidence["granted_by"].strip():
+        problems.append("execution_authority.granted_by must be a non-empty string")
+    if not isinstance(evidence.get("reference"), str) or not evidence["reference"].strip():
+        problems.append("execution_authority.reference must be a non-empty string")
+    if problems:
+        return _captain_gate("execution-authority-present", "blocked", "execution_authority evidence is incomplete", problems)
+    return _captain_gate(
+        "execution-authority-present",
+        "pass",
+        "execution authority evidence recorded; it authorizes evaluation, not execution",
+    )
+
+
+def _captain_review_evidence_gate(parameters: dict[str, Any]) -> dict[str, Any]:
+    evidence = parameters.get("review_evidence")
+    expected_head = parameters.get("expected_head")
+    if expected_head is not None and not _is_hex_sha(expected_head, lengths=(40,)):
+        return _captain_gate("review-evidence-present", "blocked", "expected_head must be a 40 character hex SHA when provided")
+    if evidence is None:
+        return _captain_gate(
+            "review-evidence-present",
+            "blocked",
+            "review_evidence is missing",
+            ["review_evidence_missing"],
+        )
+    errors = _external_review_evidence_errors(evidence, expected_head=expected_head if isinstance(expected_head, str) else None)
+    if errors:
+        return _captain_gate("review-evidence-present", "blocked", "review_evidence is invalid", errors)
+    return _captain_gate(
+        "review-evidence-present",
+        "pass",
+        "triaged external review evidence recorded; review is a gate, not semantic correctness",
+    )
+
+
+def _captain_diff_bound_gate(parameters: dict[str, Any]) -> dict[str, Any]:
+    diff_sha = parameters.get("diff_sha256")
+    if not _is_sha256_hex(diff_sha):
+        return _captain_gate(
+            "diff-bound",
+            "blocked",
+            "diff_sha256 must be a valid SHA-256 hex digest binding the reviewed diff",
+            ["diff_binding_missing_or_invalid"],
+        )
+    evidence = parameters.get("review_evidence")
+    if isinstance(evidence, dict) and _is_sha256_hex(evidence.get("diff_sha256")) and evidence["diff_sha256"] != diff_sha:
+        return _captain_gate("diff-bound", "blocked", "diff_sha256 does not match review_evidence.diff_sha256", ["diff_sha256_mismatch"])
+    return _captain_gate("diff-bound", "pass", "decision is bound to one reviewed diff hash")
+
+
+def _captain_ci_gate(parameters: dict[str, Any]) -> dict[str, Any]:
+    evidence = _captain_evidence_object(parameters, "ci_evidence")
+    if evidence is None:
+        return _captain_gate("ci-green", "blocked", "ci_evidence is missing", ["ci_evidence_missing"])
+    problems = []
+    if evidence.get("state") != "passed":
+        problems.append("ci_evidence.state must be passed")
+    if not _is_hex_sha(evidence.get("head_sha"), lengths=(40,)):
+        problems.append("ci_evidence.head_sha must be a 40 character hex SHA")
+    if not isinstance(evidence.get("source"), str) or not evidence["source"].strip():
+        problems.append("ci_evidence.source must be a non-empty string")
+    review = parameters.get("review_evidence")
+    if (
+        not problems
+        and isinstance(review, dict)
+        and _is_hex_sha(review.get("head_sha"), lengths=(40,))
+        and review["head_sha"] != evidence.get("head_sha")
+    ):
+        problems.append("ci_evidence.head_sha does not match review_evidence.head_sha")
+    if problems:
+        return _captain_gate("ci-green", "blocked", "CI evidence is missing or not green for the bound head", problems)
+    return _captain_gate("ci-green", "pass", "CI is green for the bound head; CI proves those jobs only, not production safety")
+
+
+def _captain_human_authorization_gate(parameters: dict[str, Any]) -> dict[str, Any]:
+    evidence = _captain_evidence_object(parameters, "human_authorization")
+    if evidence is None:
+        return _captain_gate(
+            "human-authorization-present",
+            "blocked",
+            "human_authorization evidence is missing",
+            ["human_authorization_missing"],
+        )
+    problems = []
+    if not isinstance(evidence.get("authorized_by"), str) or not evidence["authorized_by"].strip():
+        problems.append("human_authorization.authorized_by must be a non-empty string")
+    if not any(isinstance(evidence.get(key), str) and evidence[key].strip() for key in ("statement", "reference")):
+        problems.append("human_authorization requires statement or reference")
+    if problems:
+        return _captain_gate("human-authorization-present", "blocked", "human_authorization evidence is incomplete", problems)
+    return _captain_gate(
+        "human-authorization-present",
+        "pass",
+        "human authorization is recorded as evidence; it is not an automatic execution release",
+    )
+
+
+def _captain_action_record(action: dict[str, Any], *, decision: str, projection_info: dict[str, Any]) -> dict[str, Any]:
+    captain_receipt = {
+        "schema_version": 1,
+        "role": "captain",
+        "action": action["action"],
+        "high_impact": True,
+        "target": action["target"],
+        "scope": action["scope"],
+        "risk": action["risk"],
+        "recovery_path": action["recovery_path"],
+        "irreversibility": action["irreversibility"],
+        "target_change": action["target_change"],
+        "status_projection_sha256": projection_info.get("sha256"),
+        "status": "blocked",
+        "decision": decision,
+        "execution": "not-performed",
+        "receipt_path": action["receipt_path"],
+        "does_not_establish": list(CAPTAIN_DOES_NOT_ESTABLISH),
+    }
+    captain_receipt["receipt_sha256"] = _mechanic_record_sha256(captain_receipt)
+    return {**action, "captain_receipt": captain_receipt, "receipt_sha256": captain_receipt["receipt_sha256"]}
+
+
 def _run_captain_preflight(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -2014,41 +2320,59 @@ def _run_captain_preflight(
     runner: CommandRunner,
 ) -> dict[str, Any]:
     actions = _captain_actions(parameters)
-    status_projection_fresh = _mechanic_bool(parameters, "status_projection_fresh", False)
-    allow_execution = _mechanic_bool(parameters, "allow_execution", False)
+    _mechanic_bool(parameters, "allow_execution", False)
+    action_names = ", ".join(action["action"] for action in actions)
+    scope_findings = [finding for action in actions for finding in action["scope_findings"]]
+    projection_gate, projection_info = _captain_status_projection_gate(parameters)
+    gates = [
+        _captain_gate("high-impact-marked", "pass", f"all requested actions are marked high-impact: {action_names}"),
+        _captain_gate("target-bound", "pass", "every action carries a concrete, action-specific target"),
+        (
+            _captain_gate("scope-bound", "blocked", "scope must declare visible effect boundaries", scope_findings)
+            if scope_findings
+            else _captain_gate("scope-bound", "pass", "every action declares a visible scope with effect boundaries")
+        ),
+        _captain_gate("target-change-record", "pass", "target changes are explicit records or null"),
+        _captain_gate("recovery-or-irreversibility", "pass", "risk records include recovery or irreversibility; a precondition, not proof of safe execution"),
+        projection_gate,
+        _captain_execution_authority_gate(parameters),
+        _captain_review_evidence_gate(parameters),
+        _captain_diff_bound_gate(parameters),
+        _captain_ci_gate(parameters),
+        _captain_human_authorization_gate(parameters),
+    ]
     blocked_reasons: list[str] = []
-    if not status_projection_fresh:
-        blocked_reasons.append("fresh_status_projection_unavailable")
-    if not allow_execution:
-        blocked_reasons.append("privileged_execution_disabled")
-    _check(receipt, "high-impact-marked", "pass", ", ".join(action["action"] for action in actions))
+    for gate in gates:
+        if gate["status"] == "pass":
+            continue
+        details = gate.get("details")
+        if isinstance(details, list) and details:
+            blocked_reasons.extend(str(entry) for entry in details)
+        else:
+            blocked_reasons.append(f"{gate['id']}: {gate['reason']}")
+    all_gates_pass = not blocked_reasons
+    decision = "ready_for_manual_captain_decision" if all_gates_pass else "blocked"
+    if all_gates_pass:
+        blocked_reasons = ["captain_execution_not_implemented_in_this_slice"]
+    for gate in gates:
+        _check(receipt, f"captain-gate-{gate['id']}", "pass" if gate["status"] == "pass" else "fail", str(gate["reason"]))
+    _check(receipt, "high-impact-marked", "pass", action_names)
     _check(receipt, "recovery-or-irreversibility", "pass", "risk records include recovery or irreversibility")
     _check(receipt, "target-change-record", "pass", "target changes are explicit or null")
-    aggregate_status = "blocked" if blocked_reasons else "passed"
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": "captain",
-        "decision": "blocked" if blocked_reasons else "plan_only",
-        "status": aggregate_status,
-        "receipt_status": aggregate_status,
+        "decision": decision,
+        "status": "blocked",
+        "receipt_status": "blocked",
         "blocked_reasons": blocked_reasons,
+        "gates": gates,
+        "status_projection": projection_info,
         "high_impact_action_allowlist": sorted(CAPTAIN_HIGH_IMPACT_ACTIONS),
-        "actions": actions,
-        "does_not_establish": [
-            "automatic_merge_authority",
-            "automatic_deploy_authority",
-            "service_restart_safety",
-            "fleet_mutation_safety",
-            "cleanup_safety",
-            "runtime_correctness",
-            "semantic_correctness",
-            "review_completeness",
-        ],
-        "non_claims": [
-            "does not execute privileged mutations",
-            "does not treat CI as production safety",
-            "does not treat review approval as semantic correctness",
-        ],
+        "actions": [_captain_action_record(action, decision=decision, projection_info=projection_info) for action in actions],
+        "why_no_mutation": CAPTAIN_NO_MUTATION_REASON,
+        "does_not_establish": list(CAPTAIN_DOES_NOT_ESTABLISH),
+        "non_claims": list(CAPTAIN_NON_CLAIMS),
     }
 
 
