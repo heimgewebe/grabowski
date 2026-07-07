@@ -112,6 +112,25 @@ GRIP_SPECS: dict[str, GripSpec] = {
         runner="scout",
         uses_github=True,
     ),
+    "mechanic-loop": GripSpec(
+        name="mechanic-loop",
+        version="1.0",
+        summary="Run a bounded sequence of normal receipt-bound grips.",
+        effect=MUTATING,
+        required_parameters=("actions",),
+        acceptance_ids=("normal-grips-only", "scope-visible", "receipt-per-grip"),
+        runner="mechanic_loop",
+        uses_github=True,
+    ),
+    "captain-preflight": GripSpec(
+        name="captain-preflight",
+        version="1.0",
+        summary="Preflight high-impact Captain actions without executing privileged mutations.",
+        effect=READ_ONLY,
+        required_parameters=("actions",),
+        acceptance_ids=("high-impact-marked", "recovery-or-irreversibility", "target-change-record"),
+        runner="captain_preflight",
+    ),
     "branch-publish": GripSpec(
         name="branch-publish",
         version="1.0",
@@ -140,6 +159,8 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "worktree-orient",
         "situation",
         "scout",
+        "mechanic-loop",
+        "captain-preflight",
         "pr-check-readiness",
         "post-merge-sync",
         "branch-publish",
@@ -153,6 +174,8 @@ GRIP_SURFACE_TARGETS = {
     "worktree-orient": "repository worktree inventory",
     "situation": "repository and PR situation snapshot",
     "scout": "change-only repository, PR and runtime drift signal",
+    "mechanic-loop": "bounded normal grip action sequence",
+    "captain-preflight": "high-impact Captain action preflight only",
     "pr-check-readiness": "pull request readiness evidence",
     "post-merge-sync": "post-merge local checkout sync",
     "branch-publish": "git branch publication",
@@ -162,6 +185,31 @@ GRIP_SURFACE_RECOVERY_PATHS = {
     READ_ONLY: "rerun the grip with the same inputs; no local recovery should be required",
     MUTATING: "inspect the emitted receipt, verify target/scope, then use git/GitHub rollback or retry from the recorded head",
 }
+MECHANIC_NORMAL_GRIPS = frozenset(
+    {
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync",
+        "branch-publish",
+        "pr-create-or-update",
+    }
+)
+CAPTAIN_HIGH_IMPACT_ACTIONS = frozenset(
+    {
+        "pr-merge",
+        "runtime-deploy",
+        "service-restart",
+        "fleet-mutation",
+        "cleanup-apply",
+    }
+)
+GRIP_SURFACE_CAPTAIN_ONLY = frozenset({"captain-preflight"})
+MECHANIC_FORBIDDEN_EFFECTS = tuple(sorted(CAPTAIN_HIGH_IMPACT_ACTIONS | {"force-push", "secret-mutation", "database-migration", "privileged-broker-mutation"}))
+MECHANIC_MAX_ACTIONS = 10
+CAPTAIN_MAX_ACTIONS = 10
 
 
 class GripPreflightError(ValueError):
@@ -437,6 +485,9 @@ def _is_hex_sha(value: Any, *, lengths: tuple[int, ...]) -> bool:
         return False
     hex_digits = set("0123456789abcdef")
     return all(char in hex_digits for char in value.lower())
+
+def _is_sha256_hex(value: Any) -> bool:
+    return _is_hex_sha(value, lengths=(64,))
 
 
 def _external_review_evidence_errors(evidence: Any, *, expected_head: str | None) -> list[str]:
@@ -1593,6 +1644,414 @@ def _run_scout(
     }
 
 
+
+def _mechanic_bool(parameters: dict[str, Any], name: str, default: bool = False) -> bool:
+    value = parameters.get(name, default)
+    if not isinstance(value, bool):
+        raise GripPreflightError(f"{name} must be a boolean when provided")
+    return value
+
+
+def _relative_receipt_path(value: Any, *, context: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise GripPreflightError(f"{context}.receipt_path must be a non-empty relative path")
+    candidate = Path(value.strip())
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise GripPreflightError(f"{context}.receipt_path must stay inside the repository")
+    if ".git" in candidate.parts:
+        raise GripPreflightError(f"{context}.receipt_path must not target .git")
+    if not candidate.parts or candidate.parts[0] != "receipts":
+        raise GripPreflightError(f"{context}.receipt_path must stay under receipts/")
+    return candidate.as_posix()
+
+
+def _bound_mapping(value: Any, *, context: str, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or not value:
+        raise GripPreflightError(f"{context}.{name} must be a non-empty object")
+    return dict(value)
+
+
+def _normal_action_name(item: dict[str, Any], *, index: int) -> str:
+    raw = item.get("action")
+    if not isinstance(raw, str) or not raw.strip():
+        raise GripPreflightError(f"actions[{index}].action must be a non-empty string")
+    action_name = raw.strip()
+    alias = item.get("grip")
+    if alias is not None:
+        if not isinstance(alias, str) or not alias.strip():
+            raise GripPreflightError(f"actions[{index}].grip alias must be a non-empty string when provided")
+        if alias.strip() != action_name:
+            raise GripPreflightError(f"actions[{index}].grip alias must match action")
+    return action_name
+
+
+def _validate_mechanic_target_matches_parameters(
+    action_name: str,
+    parameters: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    index: int,
+) -> None:
+    if action_name == "branch-publish":
+        branch = parameters.get("branch")
+        if target.get("branch") != branch:
+            raise GripPreflightError(f"actions[{index}].target.branch must match parameters.branch")
+        remote = target.get("remote")
+        if remote is not None and remote != "origin":
+            raise GripPreflightError(f"actions[{index}].target.remote must be origin for branch-publish")
+    if action_name == "pr-create-or-update":
+        for key in ("base", "head", "branch"):
+            if key in target and key in parameters and target.get(key) != parameters.get(key):
+                raise GripPreflightError(f"actions[{index}].target.{key} must match parameters.{key}")
+
+
+def _mechanic_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
+    value = parameters.get("actions")
+    if not isinstance(value, list) or not value:
+        raise GripPreflightError("actions must be a non-empty list")
+    if len(value) > MECHANIC_MAX_ACTIONS:
+        raise GripPreflightError(f"actions may contain at most {MECHANIC_MAX_ACTIONS} entries")
+    actions: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise GripPreflightError(f"actions[{index}] must be an object")
+        action_name = _normal_action_name(item, index=index)
+        if action_name == "mechanic-loop" or action_name in GRIP_SURFACE_CAPTAIN_ONLY:
+            raise GripPreflightError(f"actions[{index}].action is not dispatchable by mechanic-loop: {action_name}")
+        if action_name in CAPTAIN_HIGH_IMPACT_ACTIONS:
+            raise GripPreflightError(f"actions[{index}].action requires Captain: {action_name}")
+        if action_name not in MECHANIC_NORMAL_GRIPS:
+            raise GripPreflightError(f"actions[{index}].action is not a normal mechanic action: {action_name}")
+        spec = GRIP_SPECS.get(action_name)
+        if spec is None:
+            raise GripPreflightError(f"actions[{index}].action is not dispatchable by mechanic-loop: {action_name}")
+        parameters_value = item.get("parameters", {})
+        if not isinstance(parameters_value, dict):
+            raise GripPreflightError(f"actions[{index}].parameters must be an object when provided")
+        allow_mutation = item.get("allow_mutation", False)
+        if not isinstance(allow_mutation, bool):
+            raise GripPreflightError(f"actions[{index}].allow_mutation must be a boolean when provided")
+        target = _bound_mapping(item.get("target"), context=f"actions[{index}]", name="target")
+        scope = _bound_mapping(item.get("scope"), context=f"actions[{index}]", name="scope")
+        receipt_path = _relative_receipt_path(item.get("receipt_path"), context=f"actions[{index}]")
+        risk_level = item.get("risk_level", "normal")
+        if risk_level != "normal":
+            raise GripPreflightError(f"actions[{index}].risk_level must be normal for mechanic actions")
+        forbidden = scope.get("forbidden_effects")
+        if forbidden is not None and (not isinstance(forbidden, list) or not all(isinstance(entry, str) for entry in forbidden)):
+            raise GripPreflightError(f"actions[{index}].scope.forbidden_effects must be a list of strings when provided")
+        _validate_mechanic_target_matches_parameters(action_name, parameters_value, target, index=index)
+        actions.append(
+            {
+                "index": index,
+                "action": action_name,
+                "grip": action_name,
+                "parameters": dict(parameters_value),
+                "allow_mutation": allow_mutation,
+                "target": target,
+                "scope": scope,
+                "receipt_path": receipt_path,
+                "risk_level": risk_level,
+                "effect": spec.effect,
+                "envelope": {
+                    "schema_version": 1,
+                    "role": "mechanic",
+                    "action": action_name,
+                    "target": target,
+                    "scope": scope,
+                    "risk_level": "normal",
+                    "requires_captain": False,
+                    "receipt_required": True,
+                    "receipt_path": receipt_path,
+                    "created_at": utc_now(),
+                },
+            }
+        )
+    return actions
+
+
+def _mechanic_record_sha256(record: dict[str, Any]) -> str:
+    return sha256_json({key: value for key, value in record.items() if key != "receipt_sha256"})
+
+
+def _mechanic_child_error_record(
+    action: dict[str, Any],
+    child: Any,
+    *,
+    error: str,
+) -> dict[str, Any]:
+    mechanic_receipt = {
+        "schema_version": 1,
+        "role": "mechanic",
+        "action": action["action"],
+        "target": action["target"],
+        "scope": action["scope"],
+        "status": "blocked",
+        "child_receipt_error": error,
+        "receipt_path": action["receipt_path"],
+        "does_not_establish": [
+            "merge_readiness",
+            "runtime_correctness",
+            "review_completeness",
+            "deployment_safety",
+        ],
+    }
+    mechanic_receipt["receipt_sha256"] = _mechanic_record_sha256(mechanic_receipt)
+    return {
+        "index": action["index"],
+        "action": action["action"],
+        "grip": action["grip"],
+        "effect": action["effect"],
+        "target": action["target"],
+        "scope": action["scope"],
+        "risk_level": action["risk_level"],
+        "allow_mutation": action["allow_mutation"],
+        "receipt_path": action["receipt_path"],
+        "receipt_sha256": mechanic_receipt["receipt_sha256"],
+        "child_receipt_sha256": None,
+        "receipt_status": "blocked",
+        "receipt_phase": None,
+        "receipt_error": error,
+        "envelope": action["envelope"],
+        "mechanic_receipt": mechanic_receipt,
+        "receipt": child.get("receipt") if isinstance(child, dict) else None,
+        "output": child.get("output", {}) if isinstance(child, dict) else {},
+    }
+
+
+def _run_mechanic_loop(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    actions = _mechanic_actions(parameters)
+    continue_on_blocked = _mechanic_bool(parameters, "continue_on_blocked", False)
+    _check(receipt, "normal-grips-only", "pass", ", ".join(action["action"] for action in actions))
+
+    records: list[dict[str, Any]] = []
+    stopped_after: int | None = None
+    stopped_at_action: str | None = None
+    any_child_not_passed = False
+    for action in actions:
+        child = run_grip(
+            str(action["grip"]),
+            dict(action["parameters"]),
+            allow_mutation=bool(action["allow_mutation"]),
+            command_runner=runner,
+            github_runner=github_runner,
+        )
+        raw_child_receipt = child.get("receipt") if isinstance(child, dict) else None
+        child_status: str | None = None
+        child_receipt_sha: str | None = None
+        child_receipt = raw_child_receipt if isinstance(raw_child_receipt, dict) else None
+        child_error: str | None = None
+        if child_receipt is None:
+            child_error = f"actions[{action['index']}].child receipt is missing or invalid"
+        else:
+            raw_child_status = child_receipt.get("status")
+            if not isinstance(raw_child_status, str):
+                child_error = f"actions[{action['index']}].child receipt status is missing or invalid"
+            else:
+                child_status = raw_child_status
+            raw_child_receipt_sha = child_receipt.get("receipt_sha256")
+            if not _is_sha256_hex(raw_child_receipt_sha):
+                child_error = f"actions[{action['index']}].child receipt hash is missing or invalid"
+            else:
+                child_receipt_sha = raw_child_receipt_sha
+        if child_error is not None:
+            records.append(_mechanic_child_error_record(action, child, error=child_error))
+            any_child_not_passed = True
+            if stopped_after is None:
+                stopped_after = action["index"]
+                stopped_at_action = str(action["action"])
+            if not continue_on_blocked:
+                break
+            continue
+        assert child_receipt is not None
+        assert child_status is not None
+        assert child_receipt_sha is not None
+        mechanic_receipt = {
+            "schema_version": 1,
+            "role": "mechanic",
+            "action": action["action"],
+            "target": action["target"],
+            "scope": action["scope"],
+            "status": child_status,
+            "child_receipt_sha256": child_receipt_sha,
+            "receipt_path": action["receipt_path"],
+            "does_not_establish": [
+                "merge_readiness",
+                "runtime_correctness",
+                "review_completeness",
+                "deployment_safety",
+            ],
+        }
+        mechanic_receipt["receipt_sha256"] = _mechanic_record_sha256(mechanic_receipt)
+        record = {
+            "index": action["index"],
+            "action": action["action"],
+            "grip": action["grip"],
+            "effect": action["effect"],
+            "target": action["target"],
+            "scope": action["scope"],
+            "risk_level": action["risk_level"],
+            "allow_mutation": action["allow_mutation"],
+            "receipt_path": action["receipt_path"],
+            "receipt_sha256": mechanic_receipt["receipt_sha256"],
+            "child_receipt_sha256": child_receipt_sha,
+            "receipt_status": child_status,
+            "receipt_phase": child_receipt.get("phase"),
+            "envelope": action["envelope"],
+            "mechanic_receipt": mechanic_receipt,
+            "receipt": child_receipt,
+            "output": child.get("output", {}),
+        }
+        records.append(record)
+        if child_status != "passed":
+            any_child_not_passed = True
+            if stopped_after is None:
+                stopped_after = action["index"]
+                stopped_at_action = str(action["action"])
+            if not continue_on_blocked:
+                break
+
+    scope_visible = all(isinstance(record.get("target"), dict) and isinstance(record.get("scope"), dict) for record in records)
+    receipt_bound = all(_is_sha256_hex(record.get("receipt_sha256")) for record in records)
+    _check(receipt, "scope-visible", "pass" if scope_visible else "fail", f"actions={len(records)}")
+    _check(receipt, "receipt-per-grip", "pass" if receipt_bound else "fail", f"actions={len(records)}")
+    return {
+        "schema_version": 1,
+        "profile": "mechanic",
+        "normal_action_allowlist": sorted(MECHANIC_NORMAL_GRIPS),
+        "forbidden_effects": list(MECHANIC_FORBIDDEN_EFFECTS),
+        "requested_action_count": len(actions),
+        "executed_action_count": len(records),
+        "status": "blocked" if any_child_not_passed else "passed",
+        "receipt_status": "blocked" if any_child_not_passed else "passed",
+        "complete": not any_child_not_passed and len(records) == len(actions),
+        "stopped_after": stopped_after,
+        "stopped_at_index": stopped_after,
+        "stopped_at_action": stopped_at_action,
+        "continue_on_blocked": continue_on_blocked,
+        "actions": records,
+        "non_claims": [
+            "does not expose generic shell execution",
+            "does not run Captain-only high-impact actions",
+            "does not bypass child grip receipts",
+        ],
+    }
+
+
+def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
+    value = parameters.get("actions")
+    if not isinstance(value, list) or not value:
+        raise GripPreflightError("actions must be a non-empty list")
+    if len(value) > CAPTAIN_MAX_ACTIONS:
+        raise GripPreflightError(f"actions may contain at most {CAPTAIN_MAX_ACTIONS} entries")
+    actions: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise GripPreflightError(f"actions[{index}] must be an object")
+        action_name = _normal_action_name(item, index=index)
+        if action_name not in CAPTAIN_HIGH_IMPACT_ACTIONS:
+            raise GripPreflightError(f"actions[{index}].action must be an explicit high-impact Captain action")
+        if item.get("high_impact") is not True:
+            raise GripPreflightError(f"actions[{index}].high_impact must be true")
+        target = _bound_mapping(item.get("target"), context=f"actions[{index}]", name="target")
+        scope = _bound_mapping(item.get("scope"), context=f"actions[{index}]", name="scope")
+        risk = _bound_mapping(item.get("risk"), context=f"actions[{index}]", name="risk")
+        recovery_path = risk.get("recovery_path")
+        irreversibility = risk.get("irreversibility")
+        if irreversibility is not None and irreversibility not in {"reversible", "irreversible"}:
+            raise GripPreflightError(f"actions[{index}].risk.irreversibility must be reversible or irreversible")
+        if not isinstance(recovery_path, str) or not recovery_path.strip():
+            if not isinstance(irreversibility, str) or not irreversibility.strip():
+                raise GripPreflightError(f"actions[{index}].risk requires recovery_path or irreversibility")
+        if irreversibility == "irreversible" and not isinstance(item.get("irreversibility_record"), dict):
+            raise GripPreflightError(f"actions[{index}].irreversibility_record is required for irreversible actions")
+        target_change_required = item.get("target_change_required", False)
+        if not isinstance(target_change_required, bool):
+            raise GripPreflightError(f"actions[{index}].target_change_required must be a boolean when provided")
+        target_change = item.get("target_change")
+        if target_change_required and not isinstance(target_change, dict):
+            raise GripPreflightError(f"actions[{index}].target_change record is required")
+        if target_change is not None and not isinstance(target_change, dict):
+            raise GripPreflightError(f"actions[{index}].target_change must be an object or null")
+        receipt_path = _relative_receipt_path(item.get("receipt_path"), context=f"actions[{index}]")
+        actions.append(
+            {
+                "index": index,
+                "action": action_name,
+                "high_impact": True,
+                "target": target,
+                "scope": scope,
+                "risk": risk,
+                "target_change": target_change,
+                "receipt_path": receipt_path,
+                "envelope": {
+                    "schema_version": 1,
+                    "role": "captain",
+                    "action": action_name,
+                    "high_impact": True,
+                    "target": target,
+                    "scope": scope,
+                    "target_change": target_change,
+                    "risk": risk,
+                    "receipt_path": receipt_path,
+                    "created_at": utc_now(),
+                },
+            }
+        )
+    return actions
+
+
+def _run_captain_preflight(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    actions = _captain_actions(parameters)
+    status_projection_fresh = _mechanic_bool(parameters, "status_projection_fresh", False)
+    allow_execution = _mechanic_bool(parameters, "allow_execution", False)
+    blocked_reasons: list[str] = []
+    if not status_projection_fresh:
+        blocked_reasons.append("fresh_status_projection_unavailable")
+    if not allow_execution:
+        blocked_reasons.append("privileged_execution_disabled")
+    _check(receipt, "high-impact-marked", "pass", ", ".join(action["action"] for action in actions))
+    _check(receipt, "recovery-or-irreversibility", "pass", "risk records include recovery or irreversibility")
+    _check(receipt, "target-change-record", "pass", "target changes are explicit or null")
+    aggregate_status = "blocked" if blocked_reasons else "passed"
+    return {
+        "schema_version": 1,
+        "profile": "captain",
+        "decision": "blocked" if blocked_reasons else "plan_only",
+        "status": aggregate_status,
+        "receipt_status": aggregate_status,
+        "blocked_reasons": blocked_reasons,
+        "high_impact_action_allowlist": sorted(CAPTAIN_HIGH_IMPACT_ACTIONS),
+        "actions": actions,
+        "does_not_establish": [
+            "automatic_merge_authority",
+            "automatic_deploy_authority",
+            "service_restart_safety",
+            "fleet_mutation_safety",
+            "cleanup_safety",
+            "runtime_correctness",
+            "semantic_correctness",
+            "review_completeness",
+        ],
+        "non_claims": [
+            "does not execute privileged mutations",
+            "does not treat CI as production safety",
+            "does not treat review approval as semantic correctness",
+        ],
+    }
+
+
 _RUNNERS = {
     "repo_orient": _run_repo_orient,
     "pr_check_readiness": _run_pr_check_readiness,
@@ -1600,6 +2059,8 @@ _RUNNERS = {
     "post_merge_sync": _run_post_merge_sync,
     "situation": _run_situation,
     "scout": _run_scout,
+    "mechanic_loop": _run_mechanic_loop,
+    "captain_preflight": _run_captain_preflight,
     "branch_publish": _run_branch_publish,
     "pr_create_or_update": _run_pr_create_or_update,
 }
@@ -1655,7 +2116,12 @@ def run_grip(
             )
         else:
             output = action(spec, parameters, receipt, command)
-        return _finish(receipt, "passed", "action", output)
+        final_status = "passed"
+        if isinstance(output, dict):
+            requested_status = output.get("receipt_status")
+            if requested_status in {"passed", "blocked", "failed"}:
+                final_status = requested_status
+        return _finish(receipt, final_status, "action", output)
     except GripPreflightError as exc:
         return _finish(receipt, "blocked", "preflight", {"error": str(exc)})
     except GripActionError as exc:
@@ -1667,6 +2133,12 @@ def _surface_availability(spec: GripSpec, profile: str) -> dict[str, Any]:
         return {
             "available": False,
             "reason": "not exposed by grip surface allowlist",
+            "requires_allow_mutation": False,
+        }
+    if spec.name in GRIP_SURFACE_CAPTAIN_ONLY and profile != "captain":
+        return {
+            "available": False,
+            "reason": f"profile {profile} cannot run captain-only grips",
             "requires_allow_mutation": False,
         }
     if spec.effect == MUTATING and profile not in GRIP_SURFACE_MUTATING_PROFILES:
