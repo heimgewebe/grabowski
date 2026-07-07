@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, Callable
 
@@ -100,6 +101,16 @@ GRIP_SPECS: dict[str, GripSpec] = {
         runner="situation",
         uses_github=True,
     ),
+    "scout": GripSpec(
+        name="scout",
+        version="1.0",
+        summary="Report only actionable changes across repository, PR and runtime signals.",
+        effect=READ_ONLY,
+        required_parameters=("repo",),
+        acceptance_ids=("only-changes", "pr-and-runtime-drift", "disable-switch", "no-mutation"),
+        runner="scout",
+        uses_github=True,
+    ),
     "branch-publish": GripSpec(
         name="branch-publish",
         version="1.0",
@@ -127,6 +138,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "repo-orient",
         "worktree-orient",
         "situation",
+        "scout",
         "pr-check-readiness",
         "post-merge-sync",
         "branch-publish",
@@ -139,6 +151,7 @@ GRIP_SURFACE_TARGETS = {
     "repo-orient": "repository checkout",
     "worktree-orient": "repository worktree inventory",
     "situation": "repository and PR situation snapshot",
+    "scout": "change-only repository, PR and runtime drift signal",
     "pr-check-readiness": "pull request readiness evidence",
     "post-merge-sync": "post-merge local checkout sync",
     "branch-publish": "git branch publication",
@@ -1436,12 +1449,148 @@ def _run_pr_create_or_update(
     return {"action": action, "pr": viewed, "branch": branch, "base": base, "head": expected_head}
 
 
+def _github_repo_from_remote_url(value: str) -> str | None:
+    text = value.strip()
+    if text.endswith(".git"):
+        text = text[:-4]
+    if text.startswith("git@github.com:"):
+        path = text.removeprefix("git@github.com:")
+    else:
+        marker = "github.com/"
+        if marker not in text:
+            return None
+        path = text.split(marker, 1)[1]
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 2:
+        return None
+    if not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts[:2]):
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _scout_bool(parameters: dict[str, Any], name: str, default: bool = False) -> bool:
+    value = parameters.get(name, default)
+    if not isinstance(value, bool):
+        raise GripPreflightError(f"{name} must be a boolean when provided")
+    return value
+
+
+def _scout_string_list(parameters: dict[str, Any], name: str) -> list[str]:
+    value = parameters.get(name, [])
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise GripPreflightError(f"{name} must be a list of non-empty strings when provided")
+    return [item.strip() for item in value]
+
+
+def _scout_change(category: str, summary: str, details: dict[str, Any]) -> dict[str, Any]:
+    return {"category": category, "summary": summary, "details": details}
+
+
+def _scout_pr_changes(pr_items: Any, *, branch: str, head: str) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    if not isinstance(pr_items, list):
+        return changes
+    for item in pr_items:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number")
+        title = item.get("title")
+        pr_branch = item.get("headRefName")
+        pr_head = item.get("headRefOid")
+        merge_state = item.get("mergeStateStatus")
+        decision = item.get("reviewDecision")
+        if item.get("isDraft") is True:
+            changes.append(_scout_change("pr_drift", "open PR is still draft", {"number": number, "title": title}))
+        if isinstance(merge_state, str) and merge_state not in {"CLEAN", "UNKNOWN", ""}:
+            changes.append(_scout_change("pr_drift", "open PR merge state changed", {"number": number, "merge_state": merge_state}))
+        if pr_branch == branch and isinstance(pr_head, str) and pr_head and pr_head != head:
+            changes.append(_scout_change("pr_drift", "local branch head differs from open PR head", {"number": number, "local_head": head, "pr_head": pr_head}))
+        if isinstance(decision, str) and decision.upper() in {"CHANGES_REQUESTED", "REQUEST_CHANGES", "REVIEW_REQUIRED"}:
+            changes.append(_scout_change("stale_review", "open PR review state requires attention", {"number": number, "review_decision": decision}))
+    return changes
+
+
+def _run_scout(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    if _scout_bool(parameters, "disabled", False):
+        _check(receipt, "disable-switch", "pass", "scout disabled by parameter")
+        return {"enabled": False, "changes": [], "change_count": 0, "non_claims": ["disabled scout performs no observation"]}
+
+    repo = _repo_path(parameters)
+    if not repo.exists() or not repo.is_dir():
+        raise GripPreflightError(f"repo does not exist: {repo}")
+    _check(receipt, "disable-switch", "pass", "scout enabled")
+    _check(receipt, "no-mutation", "pass", "uses read-only git and gh observations only")
+
+    _git(repo, runner, ["rev-parse", "--show-toplevel"])
+    branch = _git(repo, runner, ["rev-parse", "--abbrev-ref", "HEAD"])["stdout"]
+    head = _git(repo, runner, ["rev-parse", "HEAD"])["stdout"]
+    origin_main_result = _git_optional(repo, runner, ["rev-parse", "origin/main"])
+    origin_main = str(origin_main_result.get("stdout", "")).strip() if int(origin_main_result.get("returncode", 1)) == 0 else ""
+    changes: list[dict[str, Any]] = []
+
+    runtime_head = parameters.get("runtime_head")
+    if runtime_head is not None:
+        if not isinstance(runtime_head, str) or not re.fullmatch(r"[0-9a-f]{40,64}", runtime_head):
+            raise GripPreflightError("runtime_head must be a 40-64 character lowercase hex string when provided")
+        if origin_main and runtime_head != origin_main:
+            changes.append(_scout_change("runtime_main_drift", "runtime head differs from origin/main", {"runtime_head": runtime_head, "origin_main": origin_main}))
+
+    upstream = _git_optional(repo, runner, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    if int(upstream.get("returncode", 1)) == 0:
+        upstream_name = str(upstream.get("stdout", "")).strip()
+        counts = _git_optional(repo, runner, ["rev-list", "--left-right", "--count", f"{upstream_name}...HEAD"])
+        if int(counts.get("returncode", 1)) == 0:
+            parts = str(counts.get("stdout", "")).split()
+            if len(parts) == 2 and all(part.isdigit() for part in parts):
+                behind, ahead = (int(parts[0]), int(parts[1]))
+                if ahead > 0:
+                    changes.append(_scout_change("unpushed_branch", "local branch has commits not present upstream", {"branch": branch, "upstream": upstream_name, "ahead": ahead, "behind": behind}))
+
+    remote = _git_optional(repo, runner, ["remote", "get-url", "origin"])
+    github_repo = parameters.get("github_repo")
+    if github_repo is None and int(remote.get("returncode", 1)) == 0:
+        github_repo = _github_repo_from_remote_url(str(remote.get("stdout", "")))
+    if github_repo is not None:
+        if not isinstance(github_repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", github_repo):
+            raise GripPreflightError("github_repo must have owner/repo form when provided")
+        pr_result = _github(repo, github_runner, ["pr", "list", "--repo", github_repo, "--state", "open", "--json", "number,title,headRefName,headRefOid,isDraft,mergeStateStatus,reviewDecision,updatedAt"])
+        changes.extend(_scout_pr_changes(_json_stdout(pr_result), branch=branch, head=head))
+
+    for raw_path in _scout_string_list(parameters, "receipt_paths"):
+        candidate = Path(raw_path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise GripPreflightError("receipt_paths entries must be relative paths inside the repository")
+        if not (repo / candidate).is_file():
+            changes.append(_scout_change("missing_receipt", "expected receipt file is missing", {"path": candidate.as_posix()}))
+
+    _check(receipt, "only-changes", "pass", f"changes={len(changes)}")
+    _check(receipt, "pr-and-runtime-drift", "pass", "scout evaluated PR, runtime, branch and receipt signals")
+    return {
+        "enabled": True,
+        "change_count": len(changes),
+        "changes": changes,
+        "non_claims": [
+            "does not mutate repositories",
+            "does not refresh runtime state",
+            "does not close or merge pull requests",
+            "does not create receipts",
+        ],
+    }
+
+
 _RUNNERS = {
     "repo_orient": _run_repo_orient,
     "pr_check_readiness": _run_pr_check_readiness,
     "worktree_orient": _run_worktree_orient,
     "post_merge_sync": _run_post_merge_sync,
     "situation": _run_situation,
+    "scout": _run_scout,
     "branch_publish": _run_branch_publish,
     "pr_create_or_update": _run_pr_create_or_update,
 }

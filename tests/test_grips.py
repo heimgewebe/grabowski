@@ -522,7 +522,7 @@ class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}
-        self.assertEqual({"branch-publish", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "situation", "worktree-orient"}, set(specs))
+        self.assertEqual({"branch-publish", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "scout", "situation", "worktree-orient"}, set(specs))
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
@@ -1201,3 +1201,107 @@ class GripFoundationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScoutGripTests(unittest.TestCase):
+    class FakeScoutGit:
+        def __init__(self, repo: Path):
+            self.repo = repo
+            self.calls: list[tuple[str, ...]] = []
+            self.head = "b" * 40
+            self.origin_main = "c" * 40
+
+        def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+            self.calls.append(tuple(argv))
+            if argv == ["rev-parse", "--show-toplevel"]:
+                return {"returncode": 0, "stdout": str(self.repo), "stderr": ""}
+            if argv == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return {"returncode": 0, "stdout": "feat/scout", "stderr": ""}
+            if argv == ["rev-parse", "HEAD"]:
+                return {"returncode": 0, "stdout": self.head, "stderr": ""}
+            if argv == ["rev-parse", "origin/main"]:
+                return {"returncode": 0, "stdout": self.origin_main, "stderr": ""}
+            if argv == ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]:
+                return {"returncode": 0, "stdout": "origin/feat/scout", "stderr": ""}
+            if argv == ["rev-list", "--left-right", "--count", "origin/feat/scout...HEAD"]:
+                return {"returncode": 0, "stdout": "0\t2", "stderr": ""}
+            if argv == ["remote", "get-url", "origin"]:
+                return {"returncode": 0, "stdout": "git@github.com:heimgewebe/grabowski.git", "stderr": ""}
+            return {"returncode": 1, "stdout": "", "stderr": f"unexpected command: {argv}"}
+
+    class FakeScoutGh:
+        def __init__(self, head: str):
+            self.head = head
+            self.calls: list[tuple[str, ...]] = []
+
+        def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+            self.calls.append(tuple(argv))
+            if argv[:2] == ["pr", "list"]:
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps([
+                        {
+                            "number": 92,
+                            "title": "Scout branch",
+                            "headRefName": "feat/scout",
+                            "headRefOid": "d" * 40,
+                            "isDraft": False,
+                            "mergeStateStatus": "CLEAN",
+                            "reviewDecision": "CHANGES_REQUESTED",
+                            "updatedAt": "2026-07-07T08:00:00Z",
+                        },
+                    ]),
+                    "stderr": "",
+                }
+            return {"returncode": 1, "stdout": "", "stderr": f"unexpected gh command: {argv}"}
+
+    def test_scout_reports_only_changes_across_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            fake_git = self.FakeScoutGit(repo)
+            fake_gh = self.FakeScoutGh(fake_git.head)
+            result = grips.run_grip(
+                "scout",
+                {
+                    "repo": str(repo),
+                    "runtime_head": "e" * 40,
+                    "receipt_paths": ["receipts/missing.json"],
+                },
+                command_runner=fake_git,
+                github_runner=fake_gh,
+            )
+        self.assertEqual(result["receipt"]["status"], "passed")
+        output = result["output"]
+        self.assertEqual(set(output), {"enabled", "change_count", "changes", "non_claims"})
+        categories = {item["category"] for item in output["changes"]}
+        self.assertIn("runtime_main_drift", categories)
+        self.assertIn("unpushed_branch", categories)
+        self.assertIn("pr_drift", categories)
+        self.assertIn("stale_review", categories)
+        self.assertIn("missing_receipt", categories)
+        self.assertEqual(output["change_count"], len(output["changes"]))
+        mutating_terms = {"push", "merge", "commit", "checkout", "switch"}
+        self.assertFalse(any(call and call[0] in mutating_terms for call in fake_git.calls))
+
+    def test_scout_can_be_disabled_without_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            fake_git = self.FakeScoutGit(repo)
+            fake_gh = self.FakeScoutGh(fake_git.head)
+            result = grips.run_grip(
+                "scout",
+                {"repo": str(repo), "disabled": True},
+                command_runner=fake_git,
+                github_runner=fake_gh,
+            )
+        self.assertEqual(result["receipt"]["status"], "passed")
+        self.assertFalse(result["output"]["enabled"])
+        self.assertEqual(result["output"]["changes"], [])
+        self.assertEqual(fake_git.calls, [])
+        self.assertEqual(fake_gh.calls, [])
+
+    def test_scout_is_exposed_on_surface_as_read_only(self) -> None:
+        listed = {item["name"]: item for item in grips.list_grips("observer")}
+        self.assertIn("scout", listed)
+        self.assertEqual(listed["scout"]["effect"], grips.READ_ONLY)
+        self.assertTrue(listed["scout"]["availability"]["available"])
