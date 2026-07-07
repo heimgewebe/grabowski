@@ -496,11 +496,83 @@ class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}
-        self.assertEqual({"branch-publish", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "worktree-orient"}, set(specs))
+        self.assertEqual({"branch-publish", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "situation", "worktree-orient"}, set(specs))
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
         self.assertEqual("read_only", specs["repo-orient"]["effect"])
+
+
+    def test_situation_grip_reports_core_state_and_next_safe_grip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_gh = FakeGh(existing=None)
+            result = grips.run_grip(
+                "situation",
+                {
+                    "repo": tmp,
+                    "include_pr": True,
+                    "bureau_task": {"id": "GRABOWSKI-OPERATOR-SURFACE-V1-T001", "state": "planned"},
+                    "blockers": [],
+                    "jobs": [],
+                },
+                command_runner=FakeGit(branch="feat/situation-grip-v1", dirty=False),
+                github_runner=fake_gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("situation", result["receipt"]["grip"]["name"])
+        self.assertEqual("feat/situation-grip-v1", result["output"]["repo"]["branch"])
+        self.assertFalse(result["output"]["repo"]["dirty"])
+        self.assertFalse(result["output"]["pr"]["available"])
+        self.assertEqual("worktree-orient", result["output"]["next_safe_grip"]["name"])
+        self.assertIn("does not mutate repositories", result["output"]["non_claims"])
+        self.assertEqual(64, len(result["output"]["snapshot_digest"]["grip_catalog_sha256"]))
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["snapshot_digest"])
+        self.assertEqual("pass", checks["next_safe_grip"])
+
+    def test_situation_grip_warns_on_stale_digest_and_dirty_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "situation",
+                {"repo": tmp, "include_pr": False, "expected_grip_catalog_sha256": "0" * 64},
+                command_runner=FakeGit(branch="feat/work", dirty=True),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("repo-orient", result["output"]["next_safe_grip"]["name"])
+        self.assertIsNotNone(result["output"]["snapshot_digest"]["stale_warning"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("warn", checks["repo_state"])
+        self.assertEqual("warn", checks["snapshot_digest"])
+
+    def test_situation_grip_uses_open_pr_when_available(self) -> None:
+        existing = {
+            "number": 132,
+            "url": "https://github.com/heimgewebe/grabowski/pull/132",
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": "feat/work",
+            "headRefOid": "a" * 40,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "situation",
+                {"repo": tmp},
+                command_runner=FakeGit(branch="feat/work", dirty=False, head="a" * 40),
+                github_runner=FakeGh(existing=existing),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["pr"]["available"])
+        self.assertEqual(132, result["output"]["pr"]["number"])
+        self.assertEqual({"SUCCESS": 1}, result["output"]["pr"]["check_state_counts"])
+        self.assertEqual("pr-check-readiness", result["output"]["next_safe_grip"]["name"])
 
     def test_repo_orient_emits_pass_receipt_and_git_facts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

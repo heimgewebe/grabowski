@@ -69,6 +69,15 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=("acceptance-1", "acceptance-2"),
         runner="post_merge_sync",
     ),
+    "situation": GripSpec(
+        name="situation",
+        version="1.0",
+        summary="Summarize repo, PR, Bureau and grip context without mutating anything.",
+        effect=READ_ONLY,
+        required_parameters=("repo",),
+        acceptance_ids=("situation-readonly", "core-state-fields", "snapshot-digest", "next-safe-grip", "tests"),
+        runner="situation",
+    ),
     "branch-publish": GripSpec(
         name="branch-publish",
         version="1.0",
@@ -709,6 +718,155 @@ def _run_worktree_orient(
     }
 
 
+
+def _grip_catalog_digest() -> str:
+    catalog = {
+        name: {
+            "version": spec.version,
+            "effect": spec.effect,
+            "required_parameters": list(spec.required_parameters),
+            "acceptance_ids": list(spec.acceptance_ids),
+        }
+        for name, spec in sorted(GRIP_SPECS.items())
+    }
+    return sha256_json(catalog)
+
+
+def _source_object(parameters: dict[str, Any], name: str) -> dict[str, Any]:
+    value = parameters.get(name)
+    if value is None:
+        return {"available": False, "reason": f"{name} parameter not provided"}
+    if not isinstance(value, dict):
+        raise GripPreflightError(f"{name} must be an object when provided")
+    return {"available": True, "value": value}
+
+
+def _source_list(parameters: dict[str, Any], name: str) -> dict[str, Any]:
+    value = parameters.get(name)
+    if value is None:
+        return {"available": False, "items": [], "reason": f"{name} parameter not provided"}
+    if not isinstance(value, list):
+        raise GripPreflightError(f"{name} must be a list when provided")
+    return {"available": True, "items": value}
+
+
+def _run_situation(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    repo = _repo_path(parameters)
+    if not repo.exists():
+        _check(receipt, "repo_exists", "fail", str(repo))
+        raise GripPreflightError(f"repo does not exist: {repo}")
+    _check(receipt, "repo_exists", "pass", str(repo))
+    orientation = _orient(repo, runner)
+    _check(receipt, "repo_state", "pass" if not orientation["dirty"] else "warn", f"branch={orientation['branch']} dirty={orientation['dirty']}")
+
+    digest = _grip_catalog_digest()
+    expected_digest = parameters.get("expected_grip_catalog_sha256")
+    stale_warning = None
+    if expected_digest is not None:
+        if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+            raise GripPreflightError("expected_grip_catalog_sha256 must be a 64 character string when provided")
+        if expected_digest != digest:
+            stale_warning = "expected grip catalog digest differs from runtime grip catalog digest"
+    _check(receipt, "snapshot_digest", "warn" if stale_warning else "pass", stale_warning or digest)
+
+    pr_summary: dict[str, Any] = {"available": False, "reason": "PR lookup skipped"}
+    if parameters.get("include_pr", True) is not False:
+        pr_result = github_runner(
+            repo,
+            [
+                "pr", "list", "--head", str(orientation["branch"]), "--state", "open",
+                "--json", "number,url,state,baseRefName,headRefName,headRefOid,isDraft,mergeable,reviewDecision,statusCheckRollup",
+                "--jq", ".[0] // null",
+            ],
+        )
+        if int(pr_result.get("returncode", 1)) == 0:
+            raw = str(pr_result.get("stdout", "")).strip()
+            try:
+                parsed = json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                parsed = None
+                pr_summary = {"available": False, "reason": "PR lookup returned invalid JSON"}
+            if isinstance(parsed, dict):
+                checks = parsed.get("statusCheckRollup")
+                states: list[str] = []
+                if isinstance(checks, list):
+                    for item in checks:
+                        if isinstance(item, dict):
+                            state = item.get("conclusion") or item.get("status") or item.get("state")
+                            if isinstance(state, str):
+                                states.append(state)
+                pr_summary = {
+                    "available": True,
+                    "number": parsed.get("number"),
+                    "url": parsed.get("url"),
+                    "state": parsed.get("state"),
+                    "base": parsed.get("baseRefName"),
+                    "head": parsed.get("headRefName"),
+                    "head_oid": parsed.get("headRefOid"),
+                    "is_draft": parsed.get("isDraft"),
+                    "mergeable": parsed.get("mergeable"),
+                    "review_decision": parsed.get("reviewDecision"),
+                    "check_state_counts": {state: states.count(state) for state in sorted(set(states))},
+                }
+            elif pr_summary.get("reason") is None or pr_summary.get("reason") == "PR lookup skipped":
+                pr_summary = {"available": False, "reason": "no open PR for current branch"}
+        else:
+            pr_summary = {"available": False, "reason": str(pr_result.get("stderr") or pr_result.get("stdout") or "PR lookup unavailable")}
+    _check(receipt, "pr_state", "pass" if pr_summary.get("available") else "warn", str(pr_summary.get("number") or pr_summary.get("reason")))
+
+    non_claims = ["does not refresh connectors", "does not mutate repositories", "does not dispatch work", "does not complete Bureau tasks"]
+    if orientation["dirty"]:
+        next_safe = {
+            "name": "repo-orient",
+            "parameters": {"repo": str(repo), "expected_branch": orientation["branch"]},
+            "reason": "checkout is dirty; stay read-only until the dirty state is reviewed",
+            "preconditions": ["same repo path", "same branch"],
+            "does_not_establish": non_claims,
+        }
+    elif pr_summary.get("available"):
+        next_safe = {
+            "name": "pr-check-readiness",
+            "parameters": {"repo": str(repo), "expected_head": orientation["head"]},
+            "reason": "open PR exists for current branch and checkout is clean",
+            "preconditions": ["PR head is re-read before acting", "checks and reviews are re-read before acting"],
+            "does_not_establish": non_claims,
+        }
+    else:
+        next_safe = {
+            "name": "worktree-orient",
+            "parameters": {"repo": str(repo)},
+            "reason": "no open PR was observed; orient worktrees before choosing an action target",
+            "preconditions": ["worktree list remains readable"],
+            "does_not_establish": non_claims,
+        }
+    _check(receipt, "next_safe_grip", "pass", str(next_safe["name"]))
+
+    return {
+        "repo": orientation,
+        "pr": pr_summary,
+        "bureau": {
+            "task": _source_object(parameters, "bureau_task"),
+            "run": _source_object(parameters, "bureau_run"),
+            "blockers": _source_list(parameters, "blockers"),
+        },
+        "jobs": _source_list(parameters, "jobs"),
+        "snapshot_digest": {
+            "generated_at": utc_now(),
+            "grip_catalog_sha256": digest,
+            "expected_grip_catalog_sha256": expected_digest,
+            "stale_warning": stale_warning,
+            "source_identity": {"module": __name__, "receipt_schema_version": GRIP_RECEIPT_SCHEMA_VERSION},
+        },
+        "next_safe_grip": next_safe,
+        "non_claims": non_claims,
+    }
+
 def _run_pr_check_readiness(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -1069,6 +1227,7 @@ _RUNNERS = {
     "pr_check_readiness": _run_pr_check_readiness,
     "worktree_orient": _run_worktree_orient,
     "post_merge_sync": _run_post_merge_sync,
+    "situation": _run_situation,
     "branch_publish": _run_branch_publish,
     "pr_create_or_update": _run_pr_create_or_update,
 }
@@ -1114,7 +1273,7 @@ def run_grip(
         _check(receipt, "mutation_allowed", "pass", f"effect={spec.effect}")
         action = _RUNNERS[spec.runner]
         command = command_runner or _default_command_runner
-        if spec.runner == "pr_create_or_update":
+        if spec.runner in {"pr_create_or_update", "situation"}:
             output = action(
                 spec,
                 parameters,
