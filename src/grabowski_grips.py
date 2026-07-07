@@ -11,6 +11,7 @@ import re
 import subprocess
 from typing import Any, Callable
 
+import grabowski_repobrief
 
 Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -409,6 +410,14 @@ def _run_repo_orient(
     else:
         _check(receipt, "expected_branch", "skip", "no expected_branch parameter")
         orientation["expected_branch_match"] = None
+    try:
+        rb = grabowski_repobrief.context(repo, runner, orientation, parameters)
+    except Exception as exc:
+        rb = {"available": False, "status": "error", "reason": str(exc)}
+    orientation["repobrief_context"] = rb
+    rb_status = str(rb.get("status") or "unknown")
+    rb_check = "pass" if rb.get("available") else ("skip" if rb_status == "excluded" else "warn")
+    _check(receipt, "repobrief_context", rb_check, rb_status)
     return orientation
 
 
