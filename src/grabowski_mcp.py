@@ -27,6 +27,8 @@ import uuid
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+import grabowski_grips
+
 APP_NAME = "Grabowski"
 HOME = Path.home().resolve()
 STATE_DIR = HOME / ".local" / "state" / "grabowski"
@@ -4119,6 +4121,32 @@ def rlens_context_pack(
             "runtime_correctness",
         ],
     }
+
+
+@mcp.tool(name="grip_list", annotations=READ_ANNOTATIONS)
+def grip_list(profile: str = "operator") -> dict[str, Any]:
+    """Return the first-class allowed Grabowski grip surface."""
+    _require_capability("file_read")
+    return grabowski_grips.grip_list(profile)
+
+
+@mcp.tool(name="grip_run", annotations=CREATE_ANNOTATIONS)
+def grip_run(
+    name: str,
+    parameters: dict[str, Any] | None = None,
+    profile: str = "operator",
+    allow_mutation: bool = False,
+) -> dict[str, Any]:
+    """Run one allowlisted Grabowski grip and return its receipt-bound result."""
+    _require_capability("terminal_execute")
+    if allow_mutation:
+        _require_mutations_enabled("terminal_execute")
+    return grabowski_grips.grip_run(
+        name,
+        parameters or {},
+        profile=profile,
+        allow_mutation=allow_mutation,
+    )
 
 
 @mcp.tool(name="latest_complete_bundles", annotations=READ_ANNOTATIONS)

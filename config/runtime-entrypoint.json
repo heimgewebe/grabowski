@@ -2,6 +2,8 @@
   "expected_tools": [
     "grabowski_status",
     "grabowski_context",
+    "grip_list",
+    "grip_run",
     "grabowski_list_directory",
     "grabowski_stat",
     "grabowski_read_text",
@@ -104,6 +106,10 @@
     {
       "module": "grabowski_mcp",
       "source": "src/grabowski_mcp.py"
+    },
+    {
+      "module": "grabowski_grips",
+      "source": "src/grabowski_grips.py"
     },
     {
       "module": "grabowski_capabilities",

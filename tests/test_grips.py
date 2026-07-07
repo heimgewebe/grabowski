@@ -527,6 +527,71 @@ class GripFoundationTests(unittest.TestCase):
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
         self.assertEqual("read_only", specs["repo-orient"]["effect"])
+        for field in (
+            "purpose",
+            "target",
+            "scope",
+            "effect_class",
+            "risk",
+            "recovery_path",
+            "preconditions",
+            "expected_receipt_shape",
+            "availability",
+        ):
+            self.assertIn(field, specs["repo-orient"])
+        self.assertEqual("operator", specs["repo-orient"]["profile"])
+
+    def test_grip_list_profile_visibility(self) -> None:
+        surface = grips.grip_list(profile="observer")
+        by_name = {item["name"]: item for item in surface["grips"]}
+
+        self.assertEqual("observer", surface["profile"])
+        self.assertFalse(by_name["branch-publish"]["availability"]["available"])
+        self.assertTrue(by_name["repo-orient"]["availability"]["available"])
+        self.assertIn("does not expose generic shell execution", surface["non_claims"])
+
+    def test_grip_run_rejects_unknown_surface_grip(self) -> None:
+        result = grips.grip_run("do-everything", {"repo": "."})
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("surface allowlist", result["output"]["error"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["surface_allowlist"])
+
+    def test_grip_run_dispatches_read_only_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.grip_run(
+                "repo-orient",
+                {"repo": tmp},
+                command_runner=FakeGit(branch="feat/surface", dirty=False),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("repo-orient", result["receipt"]["grip"]["name"])
+        self.assertEqual("read_only", result["receipt"]["grip"]["effect"])
+
+    def test_grip_run_keeps_mutating_grips_receipt_gated(self) -> None:
+        result = grips.grip_run(
+            "branch-publish",
+            {"repo": ".", "branch": "feat/test", "expected_head": "a" * 40},
+            command_runner=FakeGit(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("branch-publish", result["receipt"]["grip"]["name"])
+        self.assertIn("allow_mutation=true", result["output"]["error"])
+
+    def test_grip_run_observer_profile_rejects_mutating_grip(self) -> None:
+        result = grips.grip_run(
+            "branch-publish",
+            {"repo": ".", "branch": "feat/test", "expected_head": "a" * 40},
+            profile="observer",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("profile observer cannot run mutating grips", result["output"]["error"])
 
 
     def test_situation_grip_reports_core_state_and_next_safe_grip(self) -> None:

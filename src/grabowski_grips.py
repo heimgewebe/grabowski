@@ -122,6 +122,34 @@ GRIP_SPECS: dict[str, GripSpec] = {
 }
 
 
+GRIP_SURFACE_ALLOWLIST = frozenset(
+    {
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "pr-check-readiness",
+        "post-merge-sync",
+        "branch-publish",
+        "pr-create-or-update",
+    }
+)
+GRIP_SURFACE_PROFILES = {"observer", "operator", "captain"}
+GRIP_SURFACE_MUTATING_PROFILES = {"operator", "captain"}
+GRIP_SURFACE_TARGETS = {
+    "repo-orient": "repository checkout",
+    "worktree-orient": "repository worktree inventory",
+    "situation": "repository and PR situation snapshot",
+    "pr-check-readiness": "pull request readiness evidence",
+    "post-merge-sync": "post-merge local checkout sync",
+    "branch-publish": "git branch publication",
+    "pr-create-or-update": "GitHub pull request metadata",
+}
+GRIP_SURFACE_RECOVERY_PATHS = {
+    READ_ONLY: "rerun the grip with the same inputs; no local recovery should be required",
+    MUTATING: "inspect the emitted receipt, verify target/scope, then use git/GitHub rollback or retry from the recorded head",
+}
+
+
 class GripPreflightError(ValueError):
     pass
 
@@ -1476,15 +1504,138 @@ def run_grip(
         return _finish(receipt, "failed", "action", {"error": str(exc)})
 
 
-def list_grips() -> list[dict[str, Any]]:
-    return [
-        {
-            "name": spec.name,
-            "version": spec.version,
-            "summary": spec.summary,
-            "effect": spec.effect,
-            "required_parameters": list(spec.required_parameters),
-            "acceptance_ids": list(spec.acceptance_ids),
+def _surface_availability(spec: GripSpec, profile: str) -> dict[str, Any]:
+    if spec.name not in GRIP_SURFACE_ALLOWLIST:
+        return {
+            "available": False,
+            "reason": "not exposed by grip surface allowlist",
+            "requires_allow_mutation": False,
         }
+    if spec.effect == MUTATING and profile not in GRIP_SURFACE_MUTATING_PROFILES:
+        return {
+            "available": False,
+            "reason": f"profile {profile} cannot run mutating grips",
+            "requires_allow_mutation": True,
+        }
+    return {
+        "available": True,
+        "reason": "allowed by current grip surface profile",
+        "requires_allow_mutation": spec.effect == MUTATING,
+    }
+
+
+def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
+    availability = _surface_availability(spec, profile)
+    required = ", ".join(spec.required_parameters) or "none"
+    return {
+        "name": spec.name,
+        "version": spec.version,
+        "summary": spec.summary,
+        "purpose": spec.summary,
+        "target": GRIP_SURFACE_TARGETS.get(spec.name, "narrow Grabowski grip target"),
+        "scope": "observation only" if spec.effect == READ_ONLY else "bounded write through a named grip runner",
+        "effect": spec.effect,
+        "effect_class": "read-only" if spec.effect == READ_ONLY else "mutating",
+        "risk": "low" if spec.effect == READ_ONLY else "medium",
+        "recovery_path": GRIP_SURFACE_RECOVERY_PATHS[spec.effect],
+        "preconditions": [
+            f"required parameters: {required}",
+            "grip name is present in GRIP_SURFACE_ALLOWLIST",
+            "mutating grips require allow_mutation=true and an eligible profile",
+        ],
+        "required_parameters": list(spec.required_parameters),
+        "acceptance_ids": list(spec.acceptance_ids),
+        "uses_github": spec.uses_github,
+        "profile": profile,
+        "availability": availability,
+        "expected_receipt_shape": {
+            "kind": GRIP_RECEIPT_KIND,
+            "schema_version": GRIP_RECEIPT_SCHEMA_VERSION,
+            "required_top_level_fields": [
+                "kind",
+                "schema_version",
+                "grip",
+                "parameters_sha256",
+                "status",
+                "phase",
+                "checks",
+                "output",
+            ],
+            "mutating_receipt_contract": "mutating grips must return a blocked, failed or passed receipt; they may not bypass run_grip",
+        },
+    }
+
+
+def _validate_surface_profile(profile: str) -> str:
+    if profile not in GRIP_SURFACE_PROFILES:
+        raise GripPreflightError(
+            f"unknown grip surface profile: {profile}; expected one of {sorted(GRIP_SURFACE_PROFILES)}"
+        )
+    return profile
+
+
+def list_grips(profile: str = "operator") -> list[dict[str, Any]]:
+    profile = _validate_surface_profile(profile)
+    return [
+        _surface_grip_contract(spec, profile)
         for spec in sorted(GRIP_SPECS.values(), key=lambda item: item.name)
+        if spec.name in GRIP_SURFACE_ALLOWLIST
     ]
+
+
+def grip_list(profile: str = "operator") -> dict[str, Any]:
+    profile = _validate_surface_profile(profile)
+    return {
+        "profile": profile,
+        "allowlist": sorted(GRIP_SURFACE_ALLOWLIST),
+        "grips": list_grips(profile),
+        "non_claims": [
+            "does not expose generic shell execution",
+            "does not grant mutation without allow_mutation",
+            "does not replace receipt review",
+        ],
+    }
+
+
+def _blocked_surface_receipt(name: str, parameters: dict[str, Any], reason: str) -> dict[str, Any]:
+    spec = GripSpec(
+        name=name,
+        version="0",
+        summary="grip surface dispatch rejected",
+        effect=READ_ONLY,
+        required_parameters=(),
+        acceptance_ids=("grip-run-allowlist",),
+        runner="surface_reject",
+    )
+    receipt = _new_receipt(spec, parameters)
+    _check(receipt, "surface_allowlist", "fail", reason)
+    return _finish(receipt, "blocked", "preflight", {"error": reason})
+
+
+def grip_run(
+    name: str,
+    parameters: dict[str, Any] | None = None,
+    *,
+    profile: str = "operator",
+    allow_mutation: bool = False,
+    command_runner: CommandRunner | None = None,
+    github_runner: GithubRunner | None = None,
+) -> dict[str, Any]:
+    parameters = dict(parameters or {})
+    try:
+        profile = _validate_surface_profile(profile)
+    except GripPreflightError as exc:
+        return _blocked_surface_receipt(name, parameters, str(exc))
+    spec = GRIP_SPECS.get(name)
+    if spec is None or name not in GRIP_SURFACE_ALLOWLIST:
+        return _blocked_surface_receipt(name, parameters, f"grip is not exposed by surface allowlist: {name}")
+    availability = _surface_availability(spec, profile)
+    if not availability["available"]:
+        return _blocked_surface_receipt(name, parameters, str(availability["reason"]))
+    return run_grip(
+        name,
+        parameters,
+        allow_mutation=allow_mutation,
+        command_runner=command_runner,
+        github_runner=github_runner,
+    )

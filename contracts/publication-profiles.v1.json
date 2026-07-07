@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "b6a33c817201f03884150f494f0a9fd77a3cfbe84862bbacfa2748098c3c8514"
+    "sha256": "8d28e0163706f73e60d0831f37bb0ea603c7ca7bd912e6083884fb83956f4b5a"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "fad1bc1e79e1e1b101fd1c0e5ce323160598b4ccf91f67298e91063232f23c41"
+    "sha256": "d0a92875ae917b8a40930fb6a46a50fc383b7bb2e70df44734ae878ef841ec75"
   },
   "counts": {
     "core": 21,
-    "full": 91,
-    "operator": 76
+    "full": 93,
+    "operator": 78
   },
   "profiles": {
     "core": [
@@ -39,6 +39,8 @@
     "full": [
       "grabowski_status",
       "grabowski_context",
+      "grip_list",
+      "grip_run",
       "grabowski_list_directory",
       "grabowski_stat",
       "grabowski_read_text",
@@ -132,6 +134,8 @@
     "operator": [
       "grabowski_status",
       "grabowski_context",
+      "grip_list",
+      "grip_run",
       "grabowski_list_directory",
       "grabowski_stat",
       "grabowski_read_text",
