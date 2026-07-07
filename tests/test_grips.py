@@ -642,7 +642,7 @@ class GripFoundationTests(unittest.TestCase):
     def test_mechanic_loop_rejects_non_normal_or_recursive_grip(self) -> None:
         result = grips.run_grip(
             "mechanic-loop",
-            {"actions": [{"grip": "mechanic-loop", "parameters": {"actions": []}}]},
+            {"actions": [{"action": "mechanic-loop", "parameters": {"actions": []}}]},
             allow_mutation=True,
             command_runner=FakeGit(),
             github_runner=FakeGh(),
@@ -775,7 +775,7 @@ class GripFoundationTests(unittest.TestCase):
             command_runner=FakeGit(),
         )
 
-        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("blocked", result["receipt"]["status"])
         self.assertEqual("blocked", result["output"]["decision"])
         self.assertIn("fresh_status_projection_unavailable", result["output"]["blocked_reasons"])
         self.assertIn("service-restart", result["output"]["high_impact_action_allowlist"])
@@ -891,7 +891,121 @@ class GripFoundationTests(unittest.TestCase):
             grips.run_grip = original
 
         self.assertEqual("blocked", result["receipt"]["status"])
-        self.assertIn("child receipt is missing or invalid", result["output"]["error"])
+        self.assertEqual("action", result["receipt"]["phase"])
+        self.assertEqual("blocked", result["output"]["status"])
+        self.assertEqual(1, result["output"]["executed_action_count"])
+        self.assertIn("child receipt is missing or invalid", result["output"]["actions"][0]["receipt_error"])
+        self.assertEqual(64, len(result["output"]["actions"][0]["receipt_sha256"]))
+
+    def test_mechanic_loop_blocks_child_without_sha256_hex_receipt(self) -> None:
+        original = grips.run_grip
+
+        def fake_child(*args, **kwargs):
+            if args and args[0] == "repo-orient":
+                return {"receipt": {"status": "passed", "phase": "action", "receipt_sha256": "z" * 64}, "output": {}}
+            return original(*args, **kwargs)
+
+        try:
+            grips.run_grip = fake_child
+            result = original(
+                "mechanic-loop",
+                {
+                    "actions": [
+                        {
+                            "action": "repo-orient",
+                            "parameters": {"repo": "."},
+                            "target": {"repo": "heimgewebe/grabowski"},
+                            "scope": {"operation": "read"},
+                            "receipt_path": "receipts/mechanic/repo-orient.json",
+                        }
+                    ]
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+        finally:
+            grips.run_grip = original
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("action", result["receipt"]["phase"])
+        self.assertIn("child receipt hash is missing or invalid", result["output"]["actions"][0]["receipt_error"])
+        self.assertIsNone(result["output"]["actions"][0]["child_receipt_sha256"])
+
+    def test_mechanic_loop_rejects_grip_alias_mismatch(self) -> None:
+        result = grips.run_grip(
+            "mechanic-loop",
+            {
+                "actions": [
+                    {
+                        "action": "repo-orient",
+                        "grip": "pr-check-readiness",
+                        "parameters": {"repo": "."},
+                        "target": {"repo": "heimgewebe/grabowski"},
+                        "scope": {"operation": "read"},
+                        "receipt_path": "receipts/mechanic/repo-orient.json",
+                    }
+                ]
+            },
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=FakeGh(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("grip alias must match action", result["output"]["error"])
+
+    def test_mechanic_loop_rejects_receipt_path_outside_receipts(self) -> None:
+        invalid_paths = ["mechanic/repo-orient.json", ".git/receipts/repo-orient.json"]
+        for receipt_path in invalid_paths:
+            with self.subTest(receipt_path=receipt_path):
+                result = grips.run_grip(
+                    "mechanic-loop",
+                    {
+                        "actions": [
+                            {
+                                "action": "repo-orient",
+                                "parameters": {"repo": "."},
+                                "target": {"repo": "heimgewebe/grabowski"},
+                                "scope": {"operation": "read"},
+                                "receipt_path": receipt_path,
+                            }
+                        ]
+                    },
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=FakeGh(),
+                )
+
+                self.assertEqual("blocked", result["receipt"]["status"])
+
+    def test_captain_preflight_rejects_unknown_irreversibility(self) -> None:
+        result = grips.grip_run(
+            "captain-preflight",
+            {
+                "actions": [
+                    {
+                        "action": "pr-merge",
+                        "high_impact": True,
+                        "target": {"repo": "heimgewebe/grabowski", "pr": 1},
+                        "scope": {"operation": "preflight only"},
+                        "risk": {"risk_level": "high", "irreversibility": "maybe"},
+                        "target_change": None,
+                        "receipt_path": "receipts/captain/pr-merge.json",
+                    }
+                ]
+            },
+            profile="captain",
+            command_runner=FakeGit(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("irreversibility must be reversible or irreversible", result["output"]["error"])
+
+    def test_mechanic_allowlists_do_not_overlap_captain_surfaces(self) -> None:
+        self.assertLessEqual(grips.MECHANIC_NORMAL_GRIPS, grips.GRIP_SPECS.keys())
+        self.assertTrue(grips.MECHANIC_NORMAL_GRIPS.isdisjoint(grips.GRIP_SURFACE_CAPTAIN_ONLY))
+        self.assertTrue(grips.MECHANIC_NORMAL_GRIPS.isdisjoint(grips.CAPTAIN_HIGH_IMPACT_ACTIONS))
 
     def test_mechanic_loop_continue_on_blocked_runs_remaining_but_parent_blocks(self) -> None:
         head = "a" * 40

@@ -486,6 +486,9 @@ def _is_hex_sha(value: Any, *, lengths: tuple[int, ...]) -> bool:
     hex_digits = set("0123456789abcdef")
     return all(char in hex_digits for char in value.lower())
 
+def _is_sha256_hex(value: Any) -> bool:
+    return _is_hex_sha(value, lengths=(64,))
+
 
 def _external_review_evidence_errors(evidence: Any, *, expected_head: str | None) -> list[str]:
     if not isinstance(evidence, dict):
@@ -1655,6 +1658,10 @@ def _relative_receipt_path(value: Any, *, context: str) -> str:
     candidate = Path(value.strip())
     if candidate.is_absolute() or ".." in candidate.parts:
         raise GripPreflightError(f"{context}.receipt_path must stay inside the repository")
+    if ".git" in candidate.parts:
+        raise GripPreflightError(f"{context}.receipt_path must not target .git")
+    if not candidate.parts or candidate.parts[0] != "receipts":
+        raise GripPreflightError(f"{context}.receipt_path must stay under receipts/")
     return candidate.as_posix()
 
 
@@ -1665,10 +1672,17 @@ def _bound_mapping(value: Any, *, context: str, name: str) -> dict[str, Any]:
 
 
 def _normal_action_name(item: dict[str, Any], *, index: int) -> str:
-    raw = item.get("action", item.get("grip"))
+    raw = item.get("action")
     if not isinstance(raw, str) or not raw.strip():
         raise GripPreflightError(f"actions[{index}].action must be a non-empty string")
-    return raw.strip()
+    action_name = raw.strip()
+    alias = item.get("grip")
+    if alias is not None:
+        if not isinstance(alias, str) or not alias.strip():
+            raise GripPreflightError(f"actions[{index}].grip alias must be a non-empty string when provided")
+        if alias.strip() != action_name:
+            raise GripPreflightError(f"actions[{index}].grip alias must match action")
+    return action_name
 
 
 def _validate_mechanic_target_matches_parameters(
@@ -1760,6 +1774,51 @@ def _mechanic_record_sha256(record: dict[str, Any]) -> str:
     return sha256_json({key: value for key, value in record.items() if key != "receipt_sha256"})
 
 
+def _mechanic_child_error_record(
+    action: dict[str, Any],
+    child: Any,
+    *,
+    error: str,
+) -> dict[str, Any]:
+    mechanic_receipt = {
+        "schema_version": 1,
+        "role": "mechanic",
+        "action": action["action"],
+        "target": action["target"],
+        "scope": action["scope"],
+        "status": "blocked",
+        "child_receipt_error": error,
+        "receipt_path": action["receipt_path"],
+        "does_not_establish": [
+            "merge_readiness",
+            "runtime_correctness",
+            "review_completeness",
+            "deployment_safety",
+        ],
+    }
+    mechanic_receipt["receipt_sha256"] = _mechanic_record_sha256(mechanic_receipt)
+    return {
+        "index": action["index"],
+        "action": action["action"],
+        "grip": action["grip"],
+        "effect": action["effect"],
+        "target": action["target"],
+        "scope": action["scope"],
+        "risk_level": action["risk_level"],
+        "allow_mutation": action["allow_mutation"],
+        "receipt_path": action["receipt_path"],
+        "receipt_sha256": mechanic_receipt["receipt_sha256"],
+        "child_receipt_sha256": None,
+        "receipt_status": "blocked",
+        "receipt_phase": None,
+        "receipt_error": error,
+        "envelope": action["envelope"],
+        "mechanic_receipt": mechanic_receipt,
+        "receipt": child.get("receipt") if isinstance(child, dict) else None,
+        "output": child.get("output", {}) if isinstance(child, dict) else {},
+    }
+
+
 def _run_mechanic_loop(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -1784,15 +1843,35 @@ def _run_mechanic_loop(
             github_runner=github_runner,
         )
         raw_child_receipt = child.get("receipt") if isinstance(child, dict) else None
-        if not isinstance(raw_child_receipt, dict):
-            raise GripPreflightError(f"actions[{action['index']}].child receipt is missing or invalid")
-        child_receipt = raw_child_receipt
-        child_status = child_receipt.get("status")
-        if not isinstance(child_status, str):
-            raise GripPreflightError(f"actions[{action['index']}].child receipt status is missing or invalid")
-        child_receipt_sha = child_receipt.get("receipt_sha256")
-        if not isinstance(child_receipt_sha, str) or len(child_receipt_sha) != 64:
-            raise GripPreflightError(f"actions[{action['index']}].child receipt hash is missing or invalid")
+        child_status: str | None = None
+        child_receipt_sha: str | None = None
+        child_receipt = raw_child_receipt if isinstance(raw_child_receipt, dict) else None
+        child_error: str | None = None
+        if child_receipt is None:
+            child_error = f"actions[{action['index']}].child receipt is missing or invalid"
+        else:
+            raw_child_status = child_receipt.get("status")
+            if not isinstance(raw_child_status, str):
+                child_error = f"actions[{action['index']}].child receipt status is missing or invalid"
+            else:
+                child_status = raw_child_status
+            raw_child_receipt_sha = child_receipt.get("receipt_sha256")
+            if not _is_sha256_hex(raw_child_receipt_sha):
+                child_error = f"actions[{action['index']}].child receipt hash is missing or invalid"
+            else:
+                child_receipt_sha = raw_child_receipt_sha
+        if child_error is not None:
+            records.append(_mechanic_child_error_record(action, child, error=child_error))
+            any_child_not_passed = True
+            if stopped_after is None:
+                stopped_after = action["index"]
+                stopped_at_action = str(action["action"])
+            if not continue_on_blocked:
+                break
+            continue
+        assert child_receipt is not None
+        assert child_status is not None
+        assert child_receipt_sha is not None
         mechanic_receipt = {
             "schema_version": 1,
             "role": "mechanic",
@@ -1839,7 +1918,7 @@ def _run_mechanic_loop(
                 break
 
     scope_visible = all(isinstance(record.get("target"), dict) and isinstance(record.get("scope"), dict) for record in records)
-    receipt_bound = all(isinstance(record.get("receipt_sha256"), str) and len(str(record.get("receipt_sha256"))) == 64 for record in records)
+    receipt_bound = all(_is_sha256_hex(record.get("receipt_sha256")) for record in records)
     _check(receipt, "scope-visible", "pass" if scope_visible else "fail", f"actions={len(records)}")
     _check(receipt, "receipt-per-grip", "pass" if receipt_bound else "fail", f"actions={len(records)}")
     return {
@@ -1849,7 +1928,8 @@ def _run_mechanic_loop(
         "forbidden_effects": list(MECHANIC_FORBIDDEN_EFFECTS),
         "requested_action_count": len(actions),
         "executed_action_count": len(records),
-        "status": "blocked" if any_child_not_passed else "succeeded",
+        "status": "blocked" if any_child_not_passed else "passed",
+        "receipt_status": "blocked" if any_child_not_passed else "passed",
         "complete": not any_child_not_passed and len(records) == len(actions),
         "stopped_after": stopped_after,
         "stopped_at_index": stopped_after,
@@ -1884,6 +1964,8 @@ def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
         risk = _bound_mapping(item.get("risk"), context=f"actions[{index}]", name="risk")
         recovery_path = risk.get("recovery_path")
         irreversibility = risk.get("irreversibility")
+        if irreversibility is not None and irreversibility not in {"reversible", "irreversible"}:
+            raise GripPreflightError(f"actions[{index}].risk.irreversibility must be reversible or irreversible")
         if not isinstance(recovery_path, str) or not recovery_path.strip():
             if not isinstance(irreversibility, str) or not irreversibility.strip():
                 raise GripPreflightError(f"actions[{index}].risk requires recovery_path or irreversibility")
@@ -1942,10 +2024,13 @@ def _run_captain_preflight(
     _check(receipt, "high-impact-marked", "pass", ", ".join(action["action"] for action in actions))
     _check(receipt, "recovery-or-irreversibility", "pass", "risk records include recovery or irreversibility")
     _check(receipt, "target-change-record", "pass", "target changes are explicit or null")
+    aggregate_status = "blocked" if blocked_reasons else "passed"
     return {
         "schema_version": 1,
         "profile": "captain",
         "decision": "blocked" if blocked_reasons else "plan_only",
+        "status": aggregate_status,
+        "receipt_status": aggregate_status,
         "blocked_reasons": blocked_reasons,
         "high_impact_action_allowlist": sorted(CAPTAIN_HIGH_IMPACT_ACTIONS),
         "actions": actions,
@@ -2031,9 +2116,12 @@ def run_grip(
             )
         else:
             output = action(spec, parameters, receipt, command)
-        if spec.runner == "mechanic_loop" and isinstance(output, dict) and output.get("status") == "blocked":
-            return _finish(receipt, "blocked", "action", output)
-        return _finish(receipt, "passed", "action", output)
+        final_status = "passed"
+        if isinstance(output, dict):
+            requested_status = output.get("receipt_status")
+            if requested_status in {"passed", "blocked", "failed"}:
+                final_status = requested_status
+        return _finish(receipt, final_status, "action", output)
     except GripPreflightError as exc:
         return _finish(receipt, "blocked", "preflight", {"error": str(exc)})
     except GripActionError as exc:
