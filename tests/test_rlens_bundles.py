@@ -76,6 +76,8 @@ class RlensBundleToolTests(unittest.TestCase):
             "artifacts": [
                 {"role": "canonical_md"},
                 {"role": "output_health"},
+                {"role": "sqlite_index", "path": f"{stem}.index.sqlite"},
+                {"role": "citation_map_jsonl", "path": f"{stem}.citation_map.jsonl"},
             ],
         }), encoding="utf-8")
         (self.merges / f"{stem}_merge.bundle_health.post.json").write_text(json.dumps({
@@ -102,6 +104,8 @@ class RlensBundleToolTests(unittest.TestCase):
                 },
             },
         }), encoding="utf-8")
+        (self.merges / f"{stem}.index.sqlite").write_text("sqlite placeholder", encoding="utf-8")
+        (self.merges / f"{stem}.citation_map.jsonl").write_text("", encoding="utf-8")
         return manifest
 
     def _git_repo(self, name: str) -> tuple[Path, str]:
@@ -249,6 +253,111 @@ class RlensBundleToolTests(unittest.TestCase):
         result = mcp.rlens_context_pack("missing-repo", "basic_repo_question")
         self.assertFalse(result["available"])
         self.assertEqual(result["reason"], "no_bundle_available")
+
+    def test_query_normalizes_hits_shape_and_range_refs(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        payload = {
+            "hits": [
+                {
+                    "path": "docs/a.md",
+                    "range": "1-3",
+                    "score": 0.9,
+                    "resolved_code_snippet": "alpha snippet",
+                    "range_ref": {
+                        "artifact_role": "canonical_md",
+                        "repo_id": "demo-repo",
+                        "file_path": "demo-repo-max-260701-1200_merge.md",
+                        "start_line": 1,
+                        "end_line": 3,
+                    },
+                }
+            ],
+            "context_risk": {"missing_relevant_context_possible": True},
+        }
+
+        with patch.object(mcp, "_rlens_lenskit_json", return_value=payload):
+            result = mcp.rlens_query("demo-repo", "alpha", "demo-repo-max-260701-1200")
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["query_output_shape"], "top_level_hits")
+        self.assertEqual(result["hits"][0]["snippet"], "alpha snippet")
+        self.assertEqual(result["hits"][0]["range_ref"]["start_line"], 1)
+        self.assertIn("absence_of_relevant_context", result["does_not_establish"])
+
+    def test_query_normalizes_context_bundle_results_shape(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        payload = {
+            "context_bundle": {
+                "results": [
+                    {
+                        "file": "src/app.py",
+                        "text": "beta snippet",
+                        "range_ref": {"artifact_role": "canonical_md"},
+                    }
+                ]
+            }
+        }
+
+        with patch.object(mcp, "_rlens_lenskit_json", return_value=payload):
+            result = mcp.rlens_query("demo-repo", "beta", "demo-repo-max-260701-1200")
+
+        self.assertEqual(result["query_output_shape"], "context_bundle_results")
+        self.assertEqual(result["hits"][0]["path"], "src/app.py")
+        self.assertEqual(result["hits"][0]["snippet"], "beta snippet")
+
+    def test_context_pack_includes_query_snippets_ranges_and_template(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        manifest = self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        manifest_sha = __import__("hashlib").sha256(manifest.read_bytes()).hexdigest()
+        preflight = {
+            "status": "pass",
+            "available": True,
+            "required_reading": {"status": "pass"},
+            "answer_compliance_template": {"task_profile": "strict_review"},
+            "does_not_establish": ["actual_reading_proven"],
+        }
+        query_payload = {
+            "hits": [
+                {
+                    "path": "docs/a.md",
+                    "resolved_code_snippet": "gamma snippet",
+                    "range_ref": {"artifact_role": "canonical_md", "start_line": 4, "end_line": 5},
+                }
+            ]
+        }
+
+        with patch.object(mcp, "_rlens_agent_preflight", return_value=preflight), \
+             patch.object(mcp, "_rlens_lenskit_json", return_value=query_payload):
+            result = mcp.rlens_context_pack(
+                "demo-repo",
+                "strict_review",
+                "demo-repo-max-260701-1200",
+                query="gamma",
+            )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["context_ref"]["manifest_sha256"], manifest_sha)
+        self.assertEqual(result["context_ref"]["query"], "gamma")
+        self.assertEqual(result["context_ref"]["hit_count"], 1)
+        self.assertEqual(result["context_ref"]["range_ref_count"], 1)
+        self.assertEqual(result["snippets"][0]["snippet"], "gamma snippet")
+        self.assertEqual(result["range_refs"][0]["start_line"], 4)
+        self.assertEqual(result["preflight"]["answer_compliance_template"]["task_profile"], "strict_review")
+        self.assertIn("actual_agent_reading", result["does_not_establish"])
+
+    def test_range_get_resolves_range_ref_through_lenskit(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        range_ref = {"artifact_role": "canonical_md", "start_line": 1, "end_line": 2}
+
+        with patch.object(mcp, "_rlens_lenskit_json", return_value={"content": "range content"}):
+            result = mcp.rlens_range_get("demo-repo", range_ref, "demo-repo-max-260701-1200")
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["snippet"], "range content")
+        self.assertEqual(result["range_ref"], range_ref)
 
 
 if __name__ == "__main__":

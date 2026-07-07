@@ -48,6 +48,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `rlens_bundle_discover` | knowledge | yes | low | Discover current rLens/repoLens bundles from the immutable local merges area. |
 | `rlens_bundle_status` | knowledge | yes | low | Read bounded manifest, health and sidecar status for one rLens bundle. |
 | `rlens_freshness_check` | knowledge | yes | low | Compare one rLens bundle commit with the current local repository HEAD. |
+| `rlens_query` | knowledge | yes | low | Query an existing rLens SQLite index and return bounded normalized hits. |
+| `rlens_range_get` | knowledge | yes | low | Resolve one rLens range_ref through Lenskit without exposing raw dumps by default. |
 | `rlens_context_pack` | knowledge | yes | low | Build a bounded rLens context pack for agent handoff and Bureau receipts. |
 | `grabowski_runtime_health` | context | yes | low | Read minimal deployment, audit and kill-switch health without path inventories. |
 | `grabowski_deployment_identity` | context | yes | low | Read bounded runtime identity and integrity flags without local paths. |

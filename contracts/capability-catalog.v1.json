@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "6adf2cbd08f0913a70d0c8c3b25c6248910de95423ec10ebbcedf65093c80eba",
+  "capability_source_sha256": "413e21a8cb4bb69a2c0fcd525a672632deaeaeaec3894d7e03392fba08e5d6d1",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "7869671606789e24407e859d76ccce59144c0d9f36b38cffb888a3726e76932f",
+  "contract_sha256": "5e4ed5645d0e869a89cd36b6c7c13b5e5ba2dbb18b76b90b00e74d1c2a4b12d8",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -295,6 +295,28 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "rlens_freshness_check"
+    },
+    {
+      "category": "knowledge",
+      "description": "Query an existing rLens SQLite index and return bounded normalized hits.",
+      "effects": [],
+      "id": "rlens_query",
+      "purpose": "Query an existing rLens SQLite index and return bounded normalized hits.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_query"
+    },
+    {
+      "category": "knowledge",
+      "description": "Resolve one rLens range_ref through Lenskit without exposing raw dumps by default.",
+      "effects": [],
+      "id": "rlens_range_get",
+      "purpose": "Resolve one rLens range_ref through Lenskit without exposing raw dumps by default.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_range_get"
     },
     {
       "category": "knowledge",

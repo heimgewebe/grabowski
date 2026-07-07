@@ -170,6 +170,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "rlens_query": {
+        "category": "knowledge",
+        "purpose": "Query an existing rLens SQLite index and return bounded normalized hits.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "rlens_range_get": {
+        "category": "knowledge",
+        "purpose": "Resolve one rLens range_ref through Lenskit without exposing raw dumps by default.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "rlens_context_pack": {
         "category": "knowledge",
         "purpose": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",

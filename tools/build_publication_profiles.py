@@ -35,6 +35,8 @@ CORE_TOOLS = {
     "rlens_bundle_discover",
     "rlens_bundle_status",
     "rlens_freshness_check",
+    "rlens_query",
+    "rlens_range_get",
     "rlens_context_pack",
 }
 OPERATOR_ORIENTATION_TOOLS = {
@@ -43,6 +45,8 @@ OPERATOR_ORIENTATION_TOOLS = {
     "rlens_bundle_discover",
     "rlens_bundle_status",
     "rlens_freshness_check",
+    "rlens_query",
+    "rlens_range_get",
     "rlens_context_pack",
 }
 

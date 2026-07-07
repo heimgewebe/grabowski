@@ -3943,6 +3943,301 @@ def _rlens_file_sha256(path: Path) -> str:
     return hashlib.sha256(_ensure_regular_text_file(path, 2_000_000)).hexdigest()
 
 
+
+
+def _rlens_manifest_artifact_path(manifest_path: Path, role: str) -> Path | None:
+    doc = _rlens_json(manifest_path)
+    artifacts = doc.get("artifacts")
+    if not isinstance(artifacts, list):
+        return None
+    base = manifest_path.parent.resolve(strict=False)
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if artifact.get("role") != role or not isinstance(artifact.get("path"), str):
+            continue
+        raw = artifact["path"]
+        if not raw or "\x00" in raw or Path(raw).is_absolute():
+            return None
+        candidate = (base / raw).resolve(strict=False)
+        if candidate != base and base not in candidate.parents:
+            return None
+        return candidate
+    return None
+
+
+def _rlens_lenskit_repo() -> tuple[Path | None, dict[str, Any] | None]:
+    lenskit_repo = (HOME / "repos" / "lenskit").resolve(strict=False)
+    if not lenskit_repo.is_dir() or lenskit_repo.is_symlink():
+        return None, {
+            "status": "unknown",
+            "available": False,
+            "reason": "lenskit_repo_missing_or_invalid",
+        }
+    return lenskit_repo, None
+
+
+def _rlens_lenskit_json(command: list[str], *, timeout_seconds: int = 30) -> dict[str, Any]:
+    lenskit_repo, error = _rlens_lenskit_repo()
+    if error is not None:
+        return error
+    assert lenskit_repo is not None
+    completed = subprocess.run(
+        ["python3", "-m", "merger.lenskit.cli.main", *command],
+        cwd=lenskit_repo,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout_seconds,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    stdout = completed.stdout[:1_000_000]
+    stderr = completed.stderr[:20_000]
+    if completed.returncode not in {0, 1} or not stdout.strip():
+        return {
+            "status": "unknown",
+            "available": True,
+            "returncode": completed.returncode,
+            "stderr": _redact_sensitive_text(stderr)[0],
+            "reason": "lenskit_command_failed",
+        }
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {
+            "status": "unknown",
+            "available": True,
+            "returncode": completed.returncode,
+            "reason": "lenskit_command_invalid_json",
+        }
+    if not isinstance(value, dict):
+        return {
+            "status": "unknown",
+            "available": True,
+            "returncode": completed.returncode,
+            "reason": "lenskit_command_non_object",
+        }
+    value.setdefault("available", True)
+    value["returncode"] = completed.returncode
+    return value
+
+
+def _rlens_bounded_text(value: Any, *, max_chars: int = 2_000) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "…"
+
+
+def _rlens_normalize_query_hits(payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    candidates: list[tuple[str, Any]] = [
+        ("top_level_hits", payload.get("hits")),
+        ("top_level_results", payload.get("results")),
+    ]
+    context_bundle = payload.get("context_bundle")
+    if isinstance(context_bundle, dict):
+        candidates.extend([
+            ("context_bundle_hits", context_bundle.get("hits")),
+            ("context_bundle_results", context_bundle.get("results")),
+        ])
+    wrapper = payload.get("query_result")
+    if isinstance(wrapper, dict):
+        candidates.extend([
+            ("query_result_hits", wrapper.get("hits")),
+            ("query_result_results", wrapper.get("results")),
+        ])
+
+    for shape, value in candidates:
+        if isinstance(value, list):
+            return shape, [item for item in value if isinstance(item, dict)]
+    return "unrecognized", []
+
+
+def _rlens_normalize_hit(hit: dict[str, Any], ordinal: int) -> dict[str, Any]:
+    range_ref = hit.get("range_ref")
+    if not isinstance(range_ref, dict):
+        range_ref = None
+    path = hit.get("path") or hit.get("file") or hit.get("source_file")
+    normalized: dict[str, Any] = {
+        "ordinal": ordinal,
+        "path": path if isinstance(path, str) else None,
+        "range": hit.get("range") if isinstance(hit.get("range"), str) else None,
+        "score": hit.get("score") if isinstance(hit.get("score"), (int, float)) else None,
+        "snippet": _rlens_bounded_text(
+            hit.get("resolved_code_snippet")
+            or hit.get("snippet")
+            or hit.get("text")
+            or hit.get("content"),
+            max_chars=2_000,
+        ),
+        "surrounding_context": _rlens_bounded_text(hit.get("surrounding_context"), max_chars=2_000),
+        "range_ref": range_ref,
+    }
+    hit_identity = hit.get("hit_identity")
+    if isinstance(hit_identity, str):
+        normalized["hit_identity"] = hit_identity
+    epistemics = hit.get("epistemics")
+    if isinstance(epistemics, dict):
+        normalized["epistemics"] = epistemics
+    return normalized
+
+
+def _rlens_query_common(
+    repo: str,
+    query: str,
+    *,
+    stem: str | None = None,
+    k: int = 3,
+    context_window_lines: int = 5,
+) -> dict[str, Any]:
+    repo = _rlens_validate_repo(repo) or ""
+    if not isinstance(query, str) or not query.strip() or len(query) > 500:
+        raise ValueError("query must be a non-empty string up to 500 characters")
+    if not isinstance(k, int) or not 1 <= k <= 10:
+        raise ValueError("k must be between 1 and 10")
+    if not isinstance(context_window_lines, int) or not 0 <= context_window_lines <= 50:
+        raise ValueError("context_window_lines must be between 0 and 50")
+
+    freshness = rlens_freshness_check(repo, stem)
+    selected_stem = freshness.get("stem")
+    if not isinstance(selected_stem, str):
+        return {
+            "kind": "grabowski.rlens_query",
+            "schema_version": 1,
+            "repo": repo,
+            "query": query,
+            "available": False,
+            "freshness": freshness,
+            "reason": "no_bundle_available",
+            "hits": [],
+            "does_not_establish": [
+                "absence_of_relevant_context",
+                "repo_understood",
+                "claims_true",
+                "runtime_correctness",
+            ],
+        }
+
+    status = rlens_bundle_status(selected_stem)
+    status_repo = status.get("repo") if isinstance(status, dict) else None
+    if status.get("exists") and status_repo != repo:
+        return {
+            "kind": "grabowski.rlens_query",
+            "schema_version": 1,
+            "repo": repo,
+            "query": query,
+            "stem": selected_stem,
+            "available": False,
+            "freshness": freshness,
+            "reason": "bundle_repo_mismatch",
+            "bundle_repo": status_repo,
+            "hits": [],
+            "does_not_establish": [
+                "absence_of_relevant_context",
+                "repo_understood",
+                "claims_true",
+                "runtime_correctness",
+            ],
+        }
+
+    manifest_path = _rlens_manifest_path(selected_stem)
+    sqlite_index = _rlens_manifest_artifact_path(manifest_path, "sqlite_index")
+    if sqlite_index is None or not sqlite_index.is_file() or sqlite_index.is_symlink():
+        return {
+            "kind": "grabowski.rlens_query",
+            "schema_version": 1,
+            "repo": repo,
+            "query": query,
+            "stem": selected_stem,
+            "available": False,
+            "freshness": freshness,
+            "reason": "sqlite_index_missing_or_invalid",
+            "hits": [],
+            "does_not_establish": [
+                "absence_of_relevant_context",
+                "repo_understood",
+                "claims_true",
+                "runtime_correctness",
+            ],
+        }
+
+    command = [
+        "query",
+        "--index",
+        str(sqlite_index),
+        "--q",
+        query,
+        "--k",
+        str(k),
+        "--emit",
+        "json",
+        "--build-context-bundle",
+        "--output-profile",
+        "review_context",
+        "--context-mode",
+        "window",
+        "--context-window-lines",
+        str(context_window_lines),
+        "--range-diagnostics",
+    ]
+    citation_map = _rlens_manifest_artifact_path(manifest_path, "citation_map_jsonl")
+    if citation_map is not None and citation_map.is_file() and not citation_map.is_symlink():
+        command.extend(["--citation-map", str(citation_map)])
+    raw = _rlens_lenskit_json(command, timeout_seconds=30)
+    if raw.get("reason") in {
+        "lenskit_repo_missing_or_invalid",
+        "lenskit_command_failed",
+        "lenskit_command_invalid_json",
+        "lenskit_command_non_object",
+    }:
+        return {
+            "kind": "grabowski.rlens_query",
+            "schema_version": 1,
+            "repo": repo,
+            "query": query,
+            "stem": selected_stem,
+            "available": False,
+            "freshness": freshness,
+            "reason": raw.get("reason"),
+            "lenskit": raw,
+            "hits": [],
+            "does_not_establish": [
+                "absence_of_relevant_context",
+                "repo_understood",
+                "claims_true",
+                "runtime_correctness",
+            ],
+        }
+
+    shape, raw_hits = _rlens_normalize_query_hits(raw)
+    hits = [_rlens_normalize_hit(hit, idx + 1) for idx, hit in enumerate(raw_hits[:k])]
+    context_risk = raw.get("context_risk") if isinstance(raw.get("context_risk"), dict) else None
+    return {
+        "kind": "grabowski.rlens_query",
+        "schema_version": 1,
+        "repo": repo,
+        "query": query,
+        "stem": selected_stem,
+        "available": True,
+        "freshness": freshness,
+        "query_output_shape": shape,
+        "hit_count": len(hits),
+        "hits": hits,
+        "context_risk": context_risk,
+        "does_not_establish": [
+            "absence_of_relevant_context",
+            "answer_correct",
+            "repo_understood",
+            "all_relevant_context_used",
+            "claims_true",
+            "ranking_importance",
+            "runtime_correctness",
+        ],
+    }
+
+
 def _rlens_agent_preflight(task_profile: str, manifest_path: Path) -> dict[str, Any]:
     """Run Lenskit's own agent-consumption preflight when the local CLI is available."""
     lenskit_repo = (HOME / "repos" / "lenskit").resolve(strict=False)
@@ -4004,16 +4299,143 @@ def _rlens_agent_preflight(task_profile: str, manifest_path: Path) -> dict[str, 
     return value
 
 
+@mcp.tool(name="rlens_query", annotations=READ_ANNOTATIONS)
+def rlens_query(
+    repo: str,
+    query: str,
+    stem: str | None = None,
+    k: int = 3,
+    context_window_lines: int = 5,
+) -> dict[str, Any]:
+    """Query an existing rLens SQLite index and return bounded normalized hits."""
+    _require_capability("bundle_registry")
+    return _rlens_query_common(
+        repo,
+        query,
+        stem=stem,
+        k=k,
+        context_window_lines=context_window_lines,
+    )
+
+
+@mcp.tool(name="rlens_range_get", annotations=READ_ANNOTATIONS)
+def rlens_range_get(
+    repo: str,
+    range_ref: dict[str, Any],
+    stem: str | None = None,
+    max_chars: int = 4_000,
+) -> dict[str, Any]:
+    """Resolve one rLens range_ref through Lenskit without exposing raw dumps by default."""
+    _require_capability("bundle_registry")
+    repo = _rlens_validate_repo(repo) or ""
+    if not isinstance(range_ref, dict):
+        raise ValueError("range_ref must be a JSON object")
+    if not isinstance(max_chars, int) or not 100 <= max_chars <= 20_000:
+        raise ValueError("max_chars must be between 100 and 20000")
+    freshness = rlens_freshness_check(repo, stem)
+    selected_stem = freshness.get("stem")
+    if not isinstance(selected_stem, str):
+        return {
+            "kind": "grabowski.rlens_range_get",
+            "schema_version": 1,
+            "repo": repo,
+            "available": False,
+            "freshness": freshness,
+            "reason": "no_bundle_available",
+            "does_not_establish": ["claims_true", "runtime_correctness"],
+        }
+    status = rlens_bundle_status(selected_stem)
+    status_repo = status.get("repo") if isinstance(status, dict) else None
+    if status.get("exists") and status_repo != repo:
+        return {
+            "kind": "grabowski.rlens_range_get",
+            "schema_version": 1,
+            "repo": repo,
+            "stem": selected_stem,
+            "available": False,
+            "freshness": freshness,
+            "reason": "bundle_repo_mismatch",
+            "bundle_repo": status_repo,
+            "does_not_establish": ["claims_true", "runtime_correctness"],
+        }
+    manifest_path = _rlens_manifest_path(selected_stem)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".range_ref.json", delete=False) as tmp:
+        json.dump(range_ref, tmp, sort_keys=True)
+        tmp_path = Path(tmp.name)
+    try:
+        raw = _rlens_lenskit_json([
+            "range",
+            "get",
+            "--manifest",
+            str(manifest_path),
+            "--ref",
+            str(tmp_path),
+            "--format",
+            "json",
+        ], timeout_seconds=30)
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+    if raw.get("reason") in {
+        "lenskit_repo_missing_or_invalid",
+        "lenskit_command_failed",
+        "lenskit_command_invalid_json",
+        "lenskit_command_non_object",
+    }:
+        return {
+            "kind": "grabowski.rlens_range_get",
+            "schema_version": 1,
+            "repo": repo,
+            "stem": selected_stem,
+            "available": False,
+            "freshness": freshness,
+            "reason": raw.get("reason"),
+            "lenskit": raw,
+            "does_not_establish": ["claims_true", "runtime_correctness"],
+        }
+    content = (
+        raw.get("content")
+        or raw.get("text")
+        or raw.get("snippet")
+        or raw.get("resolved_code_snippet")
+    )
+    return {
+        "kind": "grabowski.rlens_range_get",
+        "schema_version": 1,
+        "repo": repo,
+        "stem": selected_stem,
+        "available": True,
+        "freshness": freshness,
+        "range_ref": range_ref,
+        "snippet": _rlens_bounded_text(content, max_chars=max_chars),
+        "range_result": raw,
+        "does_not_establish": [
+            "answer_correct",
+            "repo_understood",
+            "claims_true",
+            "runtime_correctness",
+        ],
+    }
+
+
 @mcp.tool(name="rlens_context_pack", annotations=READ_ANNOTATIONS)
 def rlens_context_pack(
     repo: str,
     task_profile: str = "basic_repo_question",
     stem: str | None = None,
+    query: str | None = None,
+    max_hits: int = 3,
 ) -> dict[str, Any]:
     """Build a bounded rLens context pack for agent handoff and Bureau receipts."""
     _require_capability("bundle_registry")
     repo = _rlens_validate_repo(repo) or ""
     task_profile = _rlens_validate_task_profile(task_profile)
+    if not isinstance(max_hits, int) or not 1 <= max_hits <= 10:
+        raise ValueError("max_hits must be between 1 and 10")
+    if query is not None and (not isinstance(query, str) or not query.strip() or len(query) > 500):
+        raise ValueError("query must be null or a non-empty string up to 500 characters")
     freshness = rlens_freshness_check(repo, stem)
     selected_stem = freshness.get("stem")
     if not isinstance(selected_stem, str):
@@ -4059,6 +4481,33 @@ def rlens_context_pack(
     generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     live = freshness.get("live_repo") if isinstance(freshness.get("live_repo"), dict) else {}
     bundle = freshness.get("bundle") if isinstance(freshness.get("bundle"), dict) else {}
+    query_result = (
+        _rlens_query_common(repo, query, stem=selected_stem, k=max_hits)
+        if isinstance(query, str)
+        else {
+            "available": False,
+            "reason": "query_not_requested",
+            "hits": [],
+            "does_not_establish": ["absence_of_relevant_context"],
+        }
+    )
+    query_hits = query_result.get("hits") if isinstance(query_result.get("hits"), list) else []
+    snippets = [
+        {
+            "ordinal": hit.get("ordinal"),
+            "path": hit.get("path"),
+            "range": hit.get("range"),
+            "snippet": hit.get("snippet"),
+            "surrounding_context": hit.get("surrounding_context"),
+        }
+        for hit in query_hits
+        if isinstance(hit, dict) and (hit.get("snippet") or hit.get("surrounding_context"))
+    ]
+    range_refs = [
+        hit.get("range_ref")
+        for hit in query_hits
+        if isinstance(hit, dict) and isinstance(hit.get("range_ref"), dict)
+    ]
     context_ref = {
         "schema_version": 1,
         "repo": repo,
@@ -4069,6 +4518,9 @@ def rlens_context_pack(
         "freshness_status": freshness.get("freshness", "unknown"),
         "task_profile": task_profile,
         "preflight_status": preflight_status,
+        "query": query,
+        "hit_count": len(query_hits),
+        "range_ref_count": len(range_refs),
         "source": "grabowski.rlens_context_pack",
         "generated_at": generated_at,
         "does_not_establish": [
@@ -4097,6 +4549,9 @@ def rlens_context_pack(
             "bundle_surface_validation": status.get("bundle_surface_validation"),
             "output_health": status.get("output_health"),
         },
+        "query_result": query_result,
+        "snippets": snippets,
+        "range_refs": range_refs,
         "preflight": {
             "available": preflight.get("available", False),
             "status": preflight_status,
@@ -4106,10 +4561,10 @@ def rlens_context_pack(
             "error_reason": preflight.get("reason"),
         },
         "agent_handoff": {
-            "default_surface": "context_pack_metadata_only",
+            "default_surface": "context_pack_with_bounded_snippets_when_query_supplied",
             "raw_canonical_dump_included": False,
             "requires_answer_compliance": preflight_status in {"pass", "warn"},
-            "recommended_next_step": "Use required_reading and answer_compliance_template; cite ranges from Lenskit when making content claims.",
+            "recommended_next_step": "Use snippets, range_refs, required_reading and answer_compliance_template; cite ranges from Lenskit when making content claims.",
         },
         "does_not_establish": [
             "actual_agent_reading",

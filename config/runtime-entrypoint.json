@@ -23,6 +23,8 @@
     "rlens_bundle_discover",
     "rlens_bundle_status",
     "rlens_freshness_check",
+    "rlens_query",
+    "rlens_range_get",
     "rlens_context_pack",
     "grabowski_runtime_health",
     "grabowski_deployment_identity",

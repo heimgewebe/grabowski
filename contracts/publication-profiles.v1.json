@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "7869671606789e24407e859d76ccce59144c0d9f36b38cffb888a3726e76932f"
+    "sha256": "5e4ed5645d0e869a89cd36b6c7c13b5e5ba2dbb18b76b90b00e74d1c2a4b12d8"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "63e36149c4032e68939c7f8e221315a8d40e9bf4644fd31390a2e2b073242aa2"
+    "sha256": "83b76d52ae160f52ab8807e849216c4f91da859891a0d902bedaf41bbc42a5b8"
   },
   "counts": {
-    "core": 21,
-    "full": 93,
-    "operator": 78
+    "core": 23,
+    "full": 95,
+    "operator": 80
   },
   "profiles": {
     "core": [
@@ -18,6 +18,8 @@
       "rlens_bundle_discover",
       "rlens_bundle_status",
       "rlens_freshness_check",
+      "rlens_query",
+      "rlens_range_get",
       "rlens_context_pack",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
@@ -60,6 +62,8 @@
       "rlens_bundle_discover",
       "rlens_bundle_status",
       "rlens_freshness_check",
+      "rlens_query",
+      "rlens_range_get",
       "rlens_context_pack",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
@@ -154,6 +158,8 @@
       "rlens_bundle_discover",
       "rlens_bundle_status",
       "rlens_freshness_check",
+      "rlens_query",
+      "rlens_range_get",
       "rlens_context_pack",
       "grabowski_runtime_health",
       "grabowski_contract_drift",
@@ -242,7 +248,9 @@
         "rlens_bundle_discover",
         "rlens_bundle_status",
         "rlens_context_pack",
-        "rlens_freshness_check"
+        "rlens_freshness_check",
+        "rlens_query",
+        "rlens_range_get"
       ],
       "read_only": true,
       "risk_classes": [
@@ -260,7 +268,9 @@
         "rlens_bundle_discover",
         "rlens_bundle_status",
         "rlens_context_pack",
-        "rlens_freshness_check"
+        "rlens_freshness_check",
+        "rlens_query",
+        "rlens_range_get"
       ],
       "selection": "all tools not in core plus orientation tools"
     }

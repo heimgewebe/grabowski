@@ -286,6 +286,28 @@
     },
     {
       "category": "knowledge",
+      "description": "Query an existing rLens SQLite index and return bounded normalized hits.",
+      "effects": [],
+      "id": "rlens_query",
+      "purpose": "Query an existing rLens SQLite index and return bounded normalized hits.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_query"
+    },
+    {
+      "category": "knowledge",
+      "description": "Resolve one rLens range_ref through Lenskit without exposing raw dumps by default.",
+      "effects": [],
+      "id": "rlens_range_get",
+      "purpose": "Resolve one rLens range_ref through Lenskit without exposing raw dumps by default.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_range_get"
+    },
+    {
+      "category": "knowledge",
       "description": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",
       "effects": [],
       "id": "rlens_context_pack",
@@ -1264,6 +1286,8 @@
       "rlens_bundle_discover",
       "rlens_bundle_status",
       "rlens_freshness_check",
+      "rlens_query",
+      "rlens_range_get",
       "rlens_context_pack",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
@@ -1432,7 +1456,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "6adf2cbd08f0913a70d0c8c3b25c6248910de95423ec10ebbcedf65093c80eba"
+      "sha256": "413e21a8cb4bb69a2c0fcd525a672632deaeaeaec3894d7e03392fba08e5d6d1"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1440,17 +1464,17 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "7869671606789e24407e859d76ccce59144c0d9f36b38cffb888a3726e76932f"
+      "sha256": "5e4ed5645d0e869a89cd36b6c7c13b5e5ba2dbb18b76b90b00e74d1c2a4b12d8"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "6adf2cbd08f0913a70d0c8c3b25c6248910de95423ec10ebbcedf65093c80eba",
+      "src/grabowski_capabilities.py": "413e21a8cb4bb69a2c0fcd525a672632deaeaeaec3894d7e03392fba08e5d6d1",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "f31abfd29d13f753b2e402f94e395a8ec24e87fb6b6da2046916aa5172e37862",
       "src/grabowski_friction.py": "3db9040ed9aafb44354620728ae9293c0f82d037aa5036dba2f2f76e5aac41c8",
       "src/grabowski_grips.py": "30fd00a2244a7d8d423ded2b8c927f0fb2de95daad611bbd2d075ca2bc642d94",
-      "src/grabowski_mcp.py": "86b4098842953a47b4e61fd25bd597d0c9fa7f49aff885c28769b8dd05e90d70",
+      "src/grabowski_mcp.py": "26dcf2379669c42166eedcc6e3d181fa5974959473d649cf970664005368415b",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "8349e6d82afbbd32f5b924b842568e2448a7b01b4e643df76f4f050c43c87aaa",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
