@@ -1671,6 +1671,26 @@ def _normal_action_name(item: dict[str, Any], *, index: int) -> str:
     return raw.strip()
 
 
+def _validate_mechanic_target_matches_parameters(
+    action_name: str,
+    parameters: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    index: int,
+) -> None:
+    if action_name == "branch-publish":
+        branch = parameters.get("branch")
+        if target.get("branch") != branch:
+            raise GripPreflightError(f"actions[{index}].target.branch must match parameters.branch")
+        remote = target.get("remote")
+        if remote is not None and remote != "origin":
+            raise GripPreflightError(f"actions[{index}].target.remote must be origin for branch-publish")
+    if action_name == "pr-create-or-update":
+        for key in ("base", "head", "branch"):
+            if key in target and key in parameters and target.get(key) != parameters.get(key):
+                raise GripPreflightError(f"actions[{index}].target.{key} must match parameters.{key}")
+
+
 def _mechanic_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
     value = parameters.get("actions")
     if not isinstance(value, list) or not value:
@@ -1682,12 +1702,14 @@ def _mechanic_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             raise GripPreflightError(f"actions[{index}] must be an object")
         action_name = _normal_action_name(item, index=index)
+        if action_name == "mechanic-loop" or action_name in GRIP_SURFACE_CAPTAIN_ONLY:
+            raise GripPreflightError(f"actions[{index}].action is not dispatchable by mechanic-loop: {action_name}")
         if action_name in CAPTAIN_HIGH_IMPACT_ACTIONS:
             raise GripPreflightError(f"actions[{index}].action requires Captain: {action_name}")
         if action_name not in MECHANIC_NORMAL_GRIPS:
             raise GripPreflightError(f"actions[{index}].action is not a normal mechanic action: {action_name}")
         spec = GRIP_SPECS.get(action_name)
-        if spec is None or action_name == "mechanic-loop":
+        if spec is None:
             raise GripPreflightError(f"actions[{index}].action is not dispatchable by mechanic-loop: {action_name}")
         parameters_value = item.get("parameters", {})
         if not isinstance(parameters_value, dict):
@@ -1704,6 +1726,7 @@ def _mechanic_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
         forbidden = scope.get("forbidden_effects")
         if forbidden is not None and (not isinstance(forbidden, list) or not all(isinstance(entry, str) for entry in forbidden)):
             raise GripPreflightError(f"actions[{index}].scope.forbidden_effects must be a list of strings when provided")
+        _validate_mechanic_target_matches_parameters(action_name, parameters_value, target, index=index)
         actions.append(
             {
                 "index": index,
@@ -1750,6 +1773,8 @@ def _run_mechanic_loop(
 
     records: list[dict[str, Any]] = []
     stopped_after: int | None = None
+    stopped_at_action: str | None = None
+    any_child_not_passed = False
     for action in actions:
         child = run_grip(
             str(action["grip"]),
@@ -1758,15 +1783,23 @@ def _run_mechanic_loop(
             command_runner=runner,
             github_runner=github_runner,
         )
-        child_receipt = child.get("receipt", {})
-        child_receipt_sha = child_receipt.get("receipt_sha256") if isinstance(child_receipt, dict) else None
+        raw_child_receipt = child.get("receipt") if isinstance(child, dict) else None
+        if not isinstance(raw_child_receipt, dict):
+            raise GripPreflightError(f"actions[{action['index']}].child receipt is missing or invalid")
+        child_receipt = raw_child_receipt
+        child_status = child_receipt.get("status")
+        if not isinstance(child_status, str):
+            raise GripPreflightError(f"actions[{action['index']}].child receipt status is missing or invalid")
+        child_receipt_sha = child_receipt.get("receipt_sha256")
+        if not isinstance(child_receipt_sha, str) or len(child_receipt_sha) != 64:
+            raise GripPreflightError(f"actions[{action['index']}].child receipt hash is missing or invalid")
         mechanic_receipt = {
             "schema_version": 1,
             "role": "mechanic",
             "action": action["action"],
             "target": action["target"],
             "scope": action["scope"],
-            "status": child_receipt.get("status") if isinstance(child_receipt, dict) else "missing_child_receipt",
+            "status": child_status,
             "child_receipt_sha256": child_receipt_sha,
             "receipt_path": action["receipt_path"],
             "does_not_establish": [
@@ -1789,17 +1822,21 @@ def _run_mechanic_loop(
             "receipt_path": action["receipt_path"],
             "receipt_sha256": mechanic_receipt["receipt_sha256"],
             "child_receipt_sha256": child_receipt_sha,
-            "receipt_status": child_receipt.get("status") if isinstance(child_receipt, dict) else None,
-            "receipt_phase": child_receipt.get("phase") if isinstance(child_receipt, dict) else None,
+            "receipt_status": child_status,
+            "receipt_phase": child_receipt.get("phase"),
             "envelope": action["envelope"],
             "mechanic_receipt": mechanic_receipt,
             "receipt": child_receipt,
             "output": child.get("output", {}),
         }
         records.append(record)
-        if child_receipt.get("status") != "passed" and not continue_on_blocked:
-            stopped_after = int(action["index"])
-            break
+        if child_status != "passed":
+            any_child_not_passed = True
+            if stopped_after is None:
+                stopped_after = action["index"]
+                stopped_at_action = str(action["action"])
+            if not continue_on_blocked:
+                break
 
     scope_visible = all(isinstance(record.get("target"), dict) and isinstance(record.get("scope"), dict) for record in records)
     receipt_bound = all(isinstance(record.get("receipt_sha256"), str) and len(str(record.get("receipt_sha256"))) == 64 for record in records)
@@ -1812,8 +1849,11 @@ def _run_mechanic_loop(
         "forbidden_effects": list(MECHANIC_FORBIDDEN_EFFECTS),
         "requested_action_count": len(actions),
         "executed_action_count": len(records),
-        "complete": stopped_after is None and len(records) == len(actions),
+        "status": "blocked" if any_child_not_passed else "succeeded",
+        "complete": not any_child_not_passed and len(records) == len(actions),
         "stopped_after": stopped_after,
+        "stopped_at_index": stopped_after,
+        "stopped_at_action": stopped_at_action,
         "continue_on_blocked": continue_on_blocked,
         "actions": records,
         "non_claims": [
@@ -1991,6 +2031,8 @@ def run_grip(
             )
         else:
             output = action(spec, parameters, receipt, command)
+        if spec.runner == "mechanic_loop" and isinstance(output, dict) and output.get("status") == "blocked":
+            return _finish(receipt, "blocked", "action", output)
         return _finish(receipt, "passed", "action", output)
     except GripPreflightError as exc:
         return _finish(receipt, "blocked", "preflight", {"error": str(exc)})

@@ -649,7 +649,7 @@ class GripFoundationTests(unittest.TestCase):
         )
 
         self.assertEqual("blocked", result["receipt"]["status"])
-        self.assertIn("not a normal mechanic action", result["output"]["error"])
+        self.assertIn("not dispatchable by mechanic-loop", result["output"]["error"])
 
     def test_mechanic_loop_runs_mutating_normal_grip_with_child_allow_mutation(self) -> None:
         head = "a" * 40
@@ -708,9 +708,11 @@ class GripFoundationTests(unittest.TestCase):
                 github_runner=FakeGh(),
             )
 
-        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("blocked", result["receipt"]["status"])
         self.assertFalse(result["output"]["complete"])
-        self.assertEqual(0, result["output"]["stopped_after"])
+        self.assertEqual("blocked", result["output"]["status"])
+        self.assertEqual(0, result["output"]["stopped_at_index"])
+        self.assertEqual("branch-publish", result["output"]["stopped_at_action"])
         self.assertEqual(1, result["output"]["executed_action_count"])
         self.assertEqual("blocked", result["output"]["actions"][0]["receipt_status"])
         self.assertEqual(64, len(result["output"]["actions"][0]["receipt_sha256"]))
@@ -811,6 +813,120 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("captain-only", result["output"]["error"])
+
+    def test_mechanic_loop_rejects_captain_only_child_grip(self) -> None:
+        result = grips.run_grip(
+            "mechanic-loop",
+            {
+                "actions": [
+                    {
+                        "action": "captain-preflight",
+                        "target": {"repo": "heimgewebe/grabowski"},
+                        "scope": {"operation": "preflight"},
+                        "receipt_path": "receipts/mechanic/captain-preflight.json",
+                    }
+                ]
+            },
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=FakeGh(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("not dispatchable by mechanic-loop", result["output"]["error"])
+
+    def test_mechanic_loop_rejects_target_parameter_mismatch(self) -> None:
+        head = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "mechanic-loop",
+                {
+                    "actions": [
+                        {
+                            "action": "branch-publish",
+                            "parameters": {"repo": tmp, "branch": "feat/actual", "expected_head": head},
+                            "allow_mutation": True,
+                            "target": {"remote": "origin", "branch": "feat/claimed"},
+                            "scope": {"operation": "publish expected HEAD"},
+                            "receipt_path": "receipts/mechanic/branch-publish.json",
+                        }
+                    ]
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/actual", dirty=False, head=head),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("target.branch must match parameters.branch", result["output"]["error"])
+
+    def test_mechanic_loop_blocks_child_without_valid_receipt(self) -> None:
+        original = grips.run_grip
+
+        def fake_child(*args, **kwargs):
+            if args and args[0] == "repo-orient":
+                return {"receipt": None, "output": {}}
+            return original(*args, **kwargs)
+
+        try:
+            grips.run_grip = fake_child
+            result = original(
+                "mechanic-loop",
+                {
+                    "actions": [
+                        {
+                            "action": "repo-orient",
+                            "parameters": {"repo": "."},
+                            "target": {"repo": "heimgewebe/grabowski"},
+                            "scope": {"operation": "read"},
+                            "receipt_path": "receipts/mechanic/repo-orient.json",
+                        }
+                    ]
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+        finally:
+            grips.run_grip = original
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("child receipt is missing or invalid", result["output"]["error"])
+
+    def test_mechanic_loop_continue_on_blocked_runs_remaining_but_parent_blocks(self) -> None:
+        head = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "mechanic-loop",
+                {
+                    "continue_on_blocked": True,
+                    "actions": [
+                        {
+                            "action": "branch-publish",
+                            "parameters": {"repo": tmp, "branch": "feat/work", "expected_head": head},
+                            "target": {"remote": "origin", "branch": "feat/work"},
+                            "scope": {"operation": "publish expected HEAD"},
+                            "receipt_path": "receipts/mechanic/branch-publish-blocked.json",
+                        },
+                        {
+                            "action": "repo-orient",
+                            "parameters": {"repo": tmp},
+                            "target": {"repo": "heimgewebe/grabowski", "checkout": tmp},
+                            "scope": {"operation": "read repository orientation"},
+                            "receipt_path": "receipts/mechanic/repo-after-block.json",
+                        },
+                    ],
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", dirty=False, head=head),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("blocked", result["output"]["status"])
+        self.assertFalse(result["output"]["complete"])
+        self.assertEqual(2, result["output"]["executed_action_count"])
+        self.assertEqual(["blocked", "passed"], [item["receipt_status"] for item in result["output"]["actions"]])
 
 
     def test_situation_grip_reports_core_state_and_next_safe_grip(self) -> None:
