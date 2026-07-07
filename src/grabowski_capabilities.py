@@ -23,6 +23,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grip_list": {
+        "category": "grip-surface",
+        "purpose": "List allowlisted receipt-bound Grabowski grips with profile visibility and expected receipt shape.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grip_run": {
+        "category": "grip-surface",
+        "purpose": "Dispatch one allowlisted Grabowski grip and return its receipt-bound result.",
+        "risk_class": "medium",
+        "effects": ["grip-dispatch", "command-dependent"],
+        "reversibility": "receipt-dependent",
+    },
     "grabowski_list_directory": {
         "category": "filesystem",
         "purpose": "List one allowed directory without recursive traversal.",

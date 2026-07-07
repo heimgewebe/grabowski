@@ -27,6 +27,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 |---|---|---:|---|---|
 | `grabowski_status` | context | yes | low | Read policy, deployment provenance and the current bounded operating mode. |
 | `grabowski_context` | context | yes | low | Return a task-oriented live operator context and explicit drift findings. |
+| `grip_list` | grip-surface | yes | low | List allowlisted receipt-bound Grabowski grips with profile visibility and expected receipt shape. |
+| `grip_run` | grip-surface | no | medium | Dispatch one allowlisted Grabowski grip and return its receipt-bound result. |
 | `grabowski_list_directory` | filesystem | yes | low | List one allowed directory without recursive traversal. |
 | `grabowski_stat` | filesystem | yes | low | Read metadata and a content hash for one allowed path. |
 | `grabowski_read_text` | filesystem | yes | low | Read bounded UTF-8 text and obtain a concurrency hash. |

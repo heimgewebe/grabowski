@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "f6457418e784976154e86a97f2d51aefec2b9e392f60d3ac0c526373a5849fa5",
+  "capability_source_sha256": "6adf2cbd08f0913a70d0c8c3b25c6248910de95423ec10ebbcedf65093c80eba",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "b6a33c817201f03884150f494f0a9fd77a3cfbe84862bbacfa2748098c3c8514",
+  "contract_sha256": "8d28e0163706f73e60d0831f37bb0ea603c7ca7bd912e6083884fb83956f4b5a",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -33,6 +33,31 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_context"
+    },
+    {
+      "category": "grip-surface",
+      "description": "Return the first-class allowed Grabowski grip surface.",
+      "effects": [],
+      "id": "grip_list",
+      "purpose": "List allowlisted receipt-bound Grabowski grips with profile visibility and expected receipt shape.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grip_list"
+    },
+    {
+      "category": "grip-surface",
+      "description": "Run one allowlisted Grabowski grip and return its receipt-bound result.",
+      "effects": [
+        "grip-dispatch",
+        "command-dependent"
+      ],
+      "id": "grip_run",
+      "purpose": "Dispatch one allowlisted Grabowski grip and return its receipt-bound result.",
+      "read_only": false,
+      "reversibility": "receipt-dependent",
+      "risk_class": "medium",
+      "tool": "grip_run"
     },
     {
       "category": "filesystem",
