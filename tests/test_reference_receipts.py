@@ -57,6 +57,16 @@ class ReferenceReceiptTests(unittest.TestCase):
         self.assertEqual(receipt["irreversibility"], "none")
         self.assertFalse(receipt["captain_default_enabled"])
 
+    def test_rejects_invalid_request_id(self) -> None:
+        reference = self._reference()
+        invalid = dict(reference)
+        invalid["request_id"] = "not-hex"
+        invalid["reference_sha256"] = receipts.canonical_sha256(
+            {key: value for key, value in invalid.items() if key != "reference_sha256"}
+        )
+        with self.assertRaises(ValueError):
+            receipts.build_reference_receipt(invalid, "service-restart", now=1000)
+
     def test_rejects_tampered_or_expired_reference(self) -> None:
         reference = self._reference()
         tampered = dict(reference)

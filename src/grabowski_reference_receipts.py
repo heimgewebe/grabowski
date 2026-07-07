@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from typing import Any
 
@@ -10,6 +11,7 @@ RECEIPT_SCHEMA_VERSION = 1
 MAX_REFERENCE_TTL_SECONDS = 900
 REPLAY_POLICY = "single-use-external-broker"
 EXECUTION_MODE = "unprivileged-reference-only"
+REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 RECEIPT_PROFILES: dict[str, dict[str, Any]] = {
     "runtime-deploy-check": {
@@ -87,9 +89,11 @@ def validate_reference(reference: dict[str, Any], *, now: int | None = None) -> 
         raise ValueError("reference external-agent contract is invalid")
     if reference["replay_policy"] != REPLAY_POLICY:
         raise ValueError("reference replay policy is invalid")
-    for key in ("action", "target", "justification", "request_id"):
+    for key in ("action", "target", "justification"):
         if not isinstance(reference[key], str) or not reference[key].strip():
             raise ValueError(f"reference {key} must be a non-empty string")
+    if not isinstance(reference["request_id"], str) or not REQUEST_ID.fullmatch(reference["request_id"]):
+        raise ValueError("reference request_id is invalid")
     created = reference["created_at_unix"]
     expires = reference["expires_at_unix"]
     if not isinstance(created, int) or not isinstance(expires, int):
