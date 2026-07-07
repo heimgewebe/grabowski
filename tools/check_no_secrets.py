@@ -3,8 +3,20 @@ from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
+_SECRET_KEY_PREFIX = "s" + "k-"
+_OPENAI_SECRET_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    + re.escape(_SECRET_KEY_PREFIX)
+    + r"(?:(?:proj|svcacct|admin)-[A-Za-z0-9._-]{20,}|[A-Za-z0-9]{24,})(?![A-Za-z0-9._-])"
+)
+_ANTHROPIC_SECRET_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    + re.escape(_SECRET_KEY_PREFIX)
+    + r"ant-[A-Za-z0-9._-]{20,}(?![A-Za-z0-9._-])"
+)
 patterns = [
-    ("OpenAI-style API key", re.compile(r"s" + r"k-[A-Za-z0-9_-]{20,}")),
+    ("OpenAI-style API key", _OPENAI_SECRET_PATTERN),
+    ("Anthropic-style API key", _ANTHROPIC_SECRET_PATTERN),
     ("Bearer token", re.compile(r"Bearer\s+[A-Za-z0-9._-]{20,}")),
     (
         "private key block",
