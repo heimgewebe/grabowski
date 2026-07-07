@@ -2003,6 +2003,10 @@ def _captain_target_string(target: dict[str, Any], key: str, *, index: int) -> s
 def _captain_validate_repo_slug(value: str, *, context: str) -> None:
     if _captain_wildcardish(value) or CAPTAIN_REPO_SLUG_RE.fullmatch(value) is None:
         raise GripPreflightError(f"{context} must name exactly one owner/repo")
+    owner, repo = value.split("/", 1)
+    for segment, label in ((owner, "owner"), (repo, "repo")):
+        if len(segment) > 100 or segment in {".", ".."} or set(segment) <= {"."}:
+            raise GripPreflightError(f"{context}.{label} segment is not a bounded repository slug")
 
 
 def _captain_concrete_string(target: dict[str, Any], key: str, *, index: int, action_name: str) -> str:
@@ -2014,32 +2018,40 @@ def _captain_concrete_string(target: dict[str, Any], key: str, *, index: int, ac
     return value
 
 
+def _captain_optional_string(target: dict[str, Any], key: str, *, index: int, action_name: str) -> str | None:
+    if key not in target or target.get(key) is None:
+        return None
+    return _captain_concrete_string(target, key, index=index, action_name=action_name)
+
+
+def _captain_exactly_one_target_key(target: dict[str, Any], keys: tuple[str, ...], *, index: int, action_name: str) -> tuple[str, str]:
+    present: list[tuple[str, str]] = []
+    for key in keys:
+        value = _captain_optional_string(target, key, index=index, action_name=action_name)
+        if value is not None:
+            present.append((key, value))
+    if len(present) != 1:
+        names = " or ".join(keys)
+        raise GripPreflightError(f"actions[{index}].target requires exactly one concrete {names} for {action_name}")
+    return present[0]
+
+
 def _validate_captain_target(action_name: str, target: dict[str, Any], *, index: int) -> None:
     if action_name == "pr-merge":
         repo = _captain_target_string(target, "repo", index=index)
         _captain_validate_repo_slug(repo, context=f"actions[{index}].target.repo")
         pr = target.get("pr")
-        if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
+        if type(pr) is not int or pr <= 0:
             raise GripPreflightError(f"actions[{index}].target.pr must be a positive integer")
     elif action_name == "runtime-deploy":
-        runtime_origin = None
-        for key in ("repo", "service"):
-            if isinstance(target.get(key), str) and target[key].strip():
-                runtime_origin = _captain_concrete_string(target, key, index=index, action_name="runtime-deploy")
-                if key == "repo":
-                    _captain_validate_repo_slug(runtime_origin, context=f"actions[{index}].target.repo")
-                break
-        if runtime_origin is None:
-            raise GripPreflightError(f"actions[{index}].target requires repo or service for runtime-deploy")
-        if not any(
-            isinstance(target.get(key), str)
-            and target[key].strip()
-            and not _captain_wildcardish(target[key])
-            for key in ("environment", "runtime_target")
-        ):
-            raise GripPreflightError(
-                f"actions[{index}].target requires one concrete environment or runtime_target for runtime-deploy"
-            )
+        origin_key, runtime_origin = _captain_exactly_one_target_key(
+            target, ("repo", "service"), index=index, action_name="runtime-deploy"
+        )
+        if origin_key == "repo":
+            _captain_validate_repo_slug(runtime_origin, context=f"actions[{index}].target.repo")
+        _captain_exactly_one_target_key(
+            target, ("environment", "runtime_target"), index=index, action_name="runtime-deploy"
+        )
     elif action_name == "service-restart":
         _captain_concrete_string(target, "host", index=index, action_name="service-restart")
         _captain_concrete_string(target, "unit", index=index, action_name="service-restart")
@@ -2050,12 +2062,12 @@ def _validate_captain_target(action_name: str, target: dict[str, Any], *, index:
             raise GripPreflightError(f"actions[{index}].target.operation must be an explicit operation, not a generic verb")
     elif action_name == "cleanup-apply":
         _captain_concrete_string(target, "cleanup_target", index=index, action_name="cleanup-apply")
-        if not any(isinstance(target.get(key), str) and target[key].strip() for key in ("repo", "checkout_path")):
+        repo = _captain_optional_string(target, "repo", index=index, action_name="cleanup-apply")
+        checkout_path = _captain_optional_string(target, "checkout_path", index=index, action_name="cleanup-apply")
+        if repo is None and checkout_path is None:
             raise GripPreflightError(f"actions[{index}].target requires repo or checkout_path for cleanup-apply")
-        if isinstance(target.get("repo"), str) and target["repo"].strip():
-            _captain_validate_repo_slug(target["repo"].strip(), context=f"actions[{index}].target.repo")
-        if isinstance(target.get("checkout_path"), str) and _captain_wildcardish(target["checkout_path"]):
-            raise GripPreflightError(f"actions[{index}].target.checkout_path must name one concrete cleanup target")
+        if repo is not None:
+            _captain_validate_repo_slug(repo, context=f"actions[{index}].target.repo")
 
 
 def _non_empty_string_list(value: Any) -> bool:
@@ -2083,12 +2095,16 @@ def _captain_scope_findings(scope: dict[str, Any], *, index: int) -> list[str]:
         findings.append(f"actions[{index}].scope.max_targets must be a positive integer")
     if not any(key in scope for key in CAPTAIN_SCOPE_RECOMMENDED_KEYS):
         findings.append(f"actions[{index}].scope declares none of {', '.join(CAPTAIN_SCOPE_RECOMMENDED_KEYS)}")
-    if not any(
-        (key in scope and key not in {"allowed_effects", "forbidden_effects"})
-        or _non_empty_string_list(scope.get(key))
-        for key in CAPTAIN_SCOPE_RECOMMENDED_KEYS
-    ):
-        findings.append(f"actions[{index}].scope must contain at least one concrete boundary field")
+    has_effect_boundary = _non_empty_string_list(scope.get("allowed_effects")) or _non_empty_string_list(scope.get("forbidden_effects"))
+    has_named_boundary = False
+    if isinstance(boundaries, str):
+        has_named_boundary = bool(boundaries.strip())
+    elif isinstance(boundaries, (dict, list)):
+        has_named_boundary = bool(boundaries)
+    if not (has_effect_boundary or has_named_boundary):
+        findings.append(
+            f"actions[{index}].scope must contain allowed_effects, forbidden_effects or boundaries; max_targets alone is not enough"
+        )
     return findings
 
 
@@ -2123,22 +2139,25 @@ def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
         irreversibility = risk.get("irreversibility")
         if irreversibility is not None and irreversibility not in {"reversible", "irreversible"}:
             raise GripPreflightError(f"actions[{index}].risk.irreversibility must be reversible or irreversible")
-        if not isinstance(recovery_path, str) or not recovery_path.strip():
-            if not isinstance(irreversibility, str) or not irreversibility.strip():
-                raise GripPreflightError(f"actions[{index}].risk requires recovery_path or irreversibility")
+        has_recovery_path = isinstance(recovery_path, str) and bool(recovery_path.strip())
+        if irreversibility == "reversible" and not has_recovery_path:
+            raise GripPreflightError(f"actions[{index}].risk.recovery_path is required for reversible actions")
         irreversibility_record = item.get("irreversibility_record")
         if irreversibility == "irreversible" and (not isinstance(irreversibility_record, dict) or not irreversibility_record):
             raise GripPreflightError(f"actions[{index}].irreversibility_record is required for irreversible actions")
+        if not has_recovery_path and irreversibility != "irreversible":
+            raise GripPreflightError(f"actions[{index}].risk requires recovery_path or irreversible risk record")
         target_change_required = item.get("target_change_required", False)
         if not isinstance(target_change_required, bool):
             raise GripPreflightError(f"actions[{index}].target_change_required must be a boolean when provided")
         target_change = item.get("target_change")
-        if target_change_required and not isinstance(target_change, dict):
+        if target_change is not None:
+            if not isinstance(target_change, dict):
+                raise GripPreflightError(f"actions[{index}].target_change must be an object or null")
+            if not target_change:
+                raise GripPreflightError(f"actions[{index}].target_change must be a non-empty object when provided")
+        if target_change_required and target_change is None:
             raise GripPreflightError(f"actions[{index}].target_change record is required")
-        if target_change_required and not target_change:
-            raise GripPreflightError(f"actions[{index}].target_change record must be a non-empty object")
-        if target_change is not None and not isinstance(target_change, dict):
-            raise GripPreflightError(f"actions[{index}].target_change must be an object or null")
         receipt_path = _relative_receipt_path(item.get("receipt_path"), context=f"actions[{index}]")
         actions.append(
             {
@@ -2349,7 +2368,7 @@ def _captain_human_authorization_gate(parameters: dict[str, Any]) -> dict[str, A
     )
 
 
-def _captain_action_record(action: dict[str, Any], *, decision: str, projection_info: dict[str, Any]) -> dict[str, Any]:
+def _captain_action_record(action: dict[str, Any], *, gate_decision: str, projection_info: dict[str, Any]) -> dict[str, Any]:
     captain_receipt = {
         "schema_version": 1,
         "role": "captain",
@@ -2363,7 +2382,8 @@ def _captain_action_record(action: dict[str, Any], *, decision: str, projection_
         "target_change": action["target_change"],
         "status_projection_sha256": projection_info.get("sha256"),
         "status": "blocked",
-        "decision": decision,
+        "decision": "blocked",
+        "gate_decision": gate_decision,
         "execution": "not-performed",
         "receipt_path": action["receipt_path"],
         "does_not_establish": list(CAPTAIN_DOES_NOT_ESTABLISH),
@@ -2410,7 +2430,8 @@ def _run_captain_preflight(
         else:
             blocked_reasons.append(f"{gate['id']}: {gate['reason']}")
     all_gates_pass = not blocked_reasons
-    decision = "ready_for_manual_captain_decision" if all_gates_pass else "blocked"
+    gate_decision = "ready_for_manual_captain_decision" if all_gates_pass else "blocked"
+    manual_decision_candidate = all_gates_pass
     if all_gates_pass:
         blocked_reasons = ["captain_execution_not_implemented_in_this_slice"]
     for gate in gates:
@@ -2421,14 +2442,16 @@ def _run_captain_preflight(
     return {
         "schema_version": 2,
         "profile": "captain",
-        "decision": decision,
+        "decision": "blocked",
+        "gate_decision": gate_decision,
+        "manual_decision_candidate": manual_decision_candidate,
         "status": "blocked",
         "receipt_status": "blocked",
         "blocked_reasons": blocked_reasons,
         "gates": gates,
         "status_projection": projection_info,
         "high_impact_action_allowlist": sorted(CAPTAIN_HIGH_IMPACT_ACTIONS),
-        "actions": [_captain_action_record(action, decision=decision, projection_info=projection_info) for action in actions],
+        "actions": [_captain_action_record(action, gate_decision=gate_decision, projection_info=projection_info) for action in actions],
         "why_no_mutation": CAPTAIN_NO_MUTATION_REASON,
         "does_not_establish": list(CAPTAIN_DOES_NOT_ESTABLISH),
         "non_claims": list(CAPTAIN_NON_CLAIMS),
