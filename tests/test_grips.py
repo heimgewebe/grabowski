@@ -1904,6 +1904,23 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertEqual("blocked", self.gate(result, "review-evidence-present")["status"])
 
+    def test_expected_head_is_required_for_captain_evidence_binding(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("expected_head")
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", self.gate(result, "review-evidence-present")["status"])
+        self.assertIn("expected_head_missing_or_invalid", result["output"]["blocked_reasons"])
+        self.assertEqual("blocked", result["output"]["decision"])
+
+    def test_ci_head_must_match_expected_head(self) -> None:
+        result = self.run_captain(
+            captain_parameters(ci_evidence={"state": "passed", "head_sha": "e" * 40, "source": "github-actions"})
+        )
+
+        self.assertEqual("blocked", self.gate(result, "ci-green")["status"])
+        self.assertIn("ci_evidence.head_sha does not match expected_head", result["output"]["blocked_reasons"])
+
     def test_blocks_missing_diff_binding(self) -> None:
         parameters = captain_parameters()
         parameters.pop("diff_sha256")
@@ -1947,6 +1964,10 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(captain_parameters([action]))
         self.assertIn("irreversibility_record is required", result["output"]["error"])
 
+        action["irreversibility_record"] = {}
+        empty_record = self.run_captain(captain_parameters([action]))
+        self.assertIn("irreversibility_record is required", empty_record["output"]["error"])
+
         action["irreversibility_record"] = {"reason": "merge rewrites main history context", "accepted_by": "alex"}
         recorded = self.run_captain(captain_parameters([action]))
         self.assertEqual("ready_for_manual_captain_decision", recorded["output"]["decision"])
@@ -1976,6 +1997,10 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             {"pr": 96},
             {"repo": "heimgewebe/grabowski"},
             {"repo": "grabowski", "pr": 96},
+            {"repo": "owner/repo/extra", "pr": 96},
+            {"repo": "owner/", "pr": 96},
+            {"repo": "/repo", "pr": 96},
+            {"repo": "owner//repo", "pr": 96},
             {"repo": "heimgewebe/grabowski", "pr": 0},
             {"repo": "heimgewebe/grabowski", "pr": -3},
             {"repo": "heimgewebe/grabowski", "pr": "96"},
@@ -2004,7 +2029,14 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_service_restart_requires_host_and_concrete_unit(self) -> None:
         base = {"action": "service-restart", "receipt_path": "receipts/captain/service-restart.json"}
-        for target in ({"unit": "grabowski-mcp.service"}, {"host": "heim-pc"}, {"host": "heim-pc", "unit": "*"}, {"host": "heim-pc", "unit": "all"}):
+        for target in (
+            {"unit": "grabowski-mcp.service"},
+            {"host": "heim-pc"},
+            {"host": "*", "unit": "grabowski-mcp.service"},
+            {"host": "all", "unit": "grabowski-mcp.service"},
+            {"host": "heim-pc", "unit": "*"},
+            {"host": "heim-pc", "unit": "all"},
+        ):
             result = self.run_captain(captain_parameters([captain_action(**base, target=target)]))
             self.assertEqual("blocked", result["receipt"]["status"])
             self.assertIn("target", result["output"]["error"])
@@ -2023,7 +2055,13 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_cleanup_apply_requires_cleanup_target_and_location(self) -> None:
         base = {"action": "cleanup-apply", "receipt_path": "receipts/captain/cleanup-apply.json"}
-        for target in ({"repo": "heimgewebe/grabowski"}, {"cleanup_target": "stale worktrees"}):
+        for target in (
+            {"repo": "heimgewebe/grabowski"},
+            {"cleanup_target": "stale worktrees"},
+            {"cleanup_target": "*", "repo": "heimgewebe/grabowski"},
+            {"cleanup_target": "stale worktrees", "repo": "owner/repo/extra"},
+            {"cleanup_target": "stale worktrees", "checkout_path": "*"},
+        ):
             result = self.run_captain(captain_parameters([captain_action(**base, target=target)]))
             self.assertEqual("blocked", result["receipt"]["status"])
             self.assertIn("target", result["output"]["error"])
@@ -2036,10 +2074,18 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIn("target_change record must be a non-empty object", result["output"]["error"])
 
     def test_scope_without_effect_boundaries_blocks(self) -> None:
-        result = self.run_captain(captain_parameters([captain_action(scope={"operation": "preflight only"})]))
-
-        self.assertEqual("blocked", self.gate(result, "scope-bound")["status"])
-        self.assertEqual("blocked", result["output"]["decision"])
+        for scope in (
+            {"operation": "preflight only"},
+            {"max_targets": "unbounded"},
+            {"max_targets": 0},
+            {"boundaries": "  "},
+            {"boundaries": []},
+            {"allowed_effects": []},
+            {"forbidden_effects": [""]},
+        ):
+            result = self.run_captain(captain_parameters([captain_action(scope=scope)]))
+            self.assertEqual("blocked", self.gate(result, "scope-bound")["status"])
+            self.assertEqual("blocked", result["output"]["decision"])
 
     def test_does_not_establish_lists_safety_non_claims(self) -> None:
         result = self.run_captain(captain_parameters())

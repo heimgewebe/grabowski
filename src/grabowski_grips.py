@@ -213,6 +213,7 @@ CAPTAIN_MAX_ACTIONS = 10
 CAPTAIN_SCOPE_RECOMMENDED_KEYS = ("allowed_effects", "forbidden_effects", "boundaries", "max_targets")
 CAPTAIN_WILDCARD_TOKENS = frozenset({"*", "all", "any", "every", "wildcard"})
 CAPTAIN_GENERIC_OPERATIONS = frozenset({"mutate", "change", "update", "apply", "operate", "do", "run"})
+CAPTAIN_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 CAPTAIN_GATE_IDS = (
     "high-impact-marked",
     "target-bound",
@@ -1999,47 +2000,96 @@ def _captain_target_string(target: dict[str, Any], key: str, *, index: int) -> s
     return value.strip()
 
 
+def _captain_validate_repo_slug(value: str, *, context: str) -> None:
+    if _captain_wildcardish(value) or CAPTAIN_REPO_SLUG_RE.fullmatch(value) is None:
+        raise GripPreflightError(f"{context} must name exactly one owner/repo")
+
+
+def _captain_concrete_string(target: dict[str, Any], key: str, *, index: int, action_name: str) -> str:
+    value = _captain_target_string(target, key, index=index)
+    if _captain_wildcardish(value):
+        raise GripPreflightError(
+            f"actions[{index}].target.{key} must name one concrete {action_name} target, not a wildcard"
+        )
+    return value
+
+
 def _validate_captain_target(action_name: str, target: dict[str, Any], *, index: int) -> None:
     if action_name == "pr-merge":
         repo = _captain_target_string(target, "repo", index=index)
-        if _captain_wildcardish(repo) or "/" not in repo or any(char.isspace() for char in repo):
-            raise GripPreflightError(f"actions[{index}].target.repo must name exactly one owner/repo")
+        _captain_validate_repo_slug(repo, context=f"actions[{index}].target.repo")
         pr = target.get("pr")
         if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
             raise GripPreflightError(f"actions[{index}].target.pr must be a positive integer")
     elif action_name == "runtime-deploy":
-        if not any(isinstance(target.get(key), str) and target[key].strip() for key in ("repo", "service")):
+        runtime_origin = None
+        for key in ("repo", "service"):
+            if isinstance(target.get(key), str) and target[key].strip():
+                runtime_origin = _captain_concrete_string(target, key, index=index, action_name="runtime-deploy")
+                if key == "repo":
+                    _captain_validate_repo_slug(runtime_origin, context=f"actions[{index}].target.repo")
+                break
+        if runtime_origin is None:
             raise GripPreflightError(f"actions[{index}].target requires repo or service for runtime-deploy")
-        if not any(isinstance(target.get(key), str) and target[key].strip() for key in ("environment", "runtime_target")):
-            raise GripPreflightError(f"actions[{index}].target requires environment or runtime_target for runtime-deploy")
+        if not any(
+            isinstance(target.get(key), str)
+            and target[key].strip()
+            and not _captain_wildcardish(target[key])
+            for key in ("environment", "runtime_target")
+        ):
+            raise GripPreflightError(
+                f"actions[{index}].target requires one concrete environment or runtime_target for runtime-deploy"
+            )
     elif action_name == "service-restart":
-        _captain_target_string(target, "host", index=index)
-        unit = _captain_target_string(target, "unit", index=index)
-        if _captain_wildcardish(unit):
-            raise GripPreflightError(f"actions[{index}].target.unit must name one concrete unit, not a wildcard")
+        _captain_concrete_string(target, "host", index=index, action_name="service-restart")
+        _captain_concrete_string(target, "unit", index=index, action_name="service-restart")
     elif action_name == "fleet-mutation":
-        fleet_target = _captain_target_string(target, "fleet_target", index=index)
-        if _captain_wildcardish(fleet_target):
-            raise GripPreflightError(f"actions[{index}].target.fleet_target must be concrete, not a wildcard")
-        operation = _captain_target_string(target, "operation", index=index)
-        if _captain_wildcardish(operation) or operation.strip().lower() in CAPTAIN_GENERIC_OPERATIONS:
+        _captain_concrete_string(target, "fleet_target", index=index, action_name="fleet-mutation")
+        operation = _captain_concrete_string(target, "operation", index=index, action_name="fleet-mutation")
+        if operation.strip().lower() in CAPTAIN_GENERIC_OPERATIONS:
             raise GripPreflightError(f"actions[{index}].target.operation must be an explicit operation, not a generic verb")
     elif action_name == "cleanup-apply":
-        _captain_target_string(target, "cleanup_target", index=index)
+        _captain_concrete_string(target, "cleanup_target", index=index, action_name="cleanup-apply")
         if not any(isinstance(target.get(key), str) and target[key].strip() for key in ("repo", "checkout_path")):
             raise GripPreflightError(f"actions[{index}].target requires repo or checkout_path for cleanup-apply")
+        if isinstance(target.get("repo"), str) and target["repo"].strip():
+            _captain_validate_repo_slug(target["repo"].strip(), context=f"actions[{index}].target.repo")
+        if isinstance(target.get("checkout_path"), str) and _captain_wildcardish(target["checkout_path"]):
+            raise GripPreflightError(f"actions[{index}].target.checkout_path must name one concrete cleanup target")
+
+
+def _non_empty_string_list(value: Any) -> bool:
+    return isinstance(value, list) and bool(value) and all(isinstance(entry, str) and entry.strip() for entry in value)
 
 
 def _captain_scope_findings(scope: dict[str, Any], *, index: int) -> list[str]:
+    findings: list[str] = []
     for key in ("allowed_effects", "forbidden_effects"):
         value = scope.get(key)
-        if value is not None and (not isinstance(value, list) or not all(isinstance(entry, str) for entry in value)):
-            raise GripPreflightError(f"actions[{index}].scope.{key} must be a list of strings when provided")
+        if value is not None and not _non_empty_string_list(value):
+            findings.append(f"actions[{index}].scope.{key} must be a non-empty list of non-empty strings")
+    boundaries = scope.get("boundaries")
+    if boundaries is not None:
+        if isinstance(boundaries, str):
+            if not boundaries.strip():
+                findings.append(f"actions[{index}].scope.boundaries must not be blank")
+        elif isinstance(boundaries, (dict, list)):
+            if not boundaries:
+                findings.append(f"actions[{index}].scope.boundaries must not be empty")
+        else:
+            findings.append(f"actions[{index}].scope.boundaries must be a non-empty string, object or list")
+    max_targets = scope.get("max_targets")
+    if max_targets is not None and (isinstance(max_targets, bool) or not isinstance(max_targets, int) or max_targets < 1):
+        findings.append(f"actions[{index}].scope.max_targets must be a positive integer")
     if not any(key in scope for key in CAPTAIN_SCOPE_RECOMMENDED_KEYS):
-        return [
-            f"actions[{index}].scope declares none of {', '.join(CAPTAIN_SCOPE_RECOMMENDED_KEYS)}"
-        ]
-    return []
+        findings.append(f"actions[{index}].scope declares none of {', '.join(CAPTAIN_SCOPE_RECOMMENDED_KEYS)}")
+    if not any(
+        (key in scope and key not in {"allowed_effects", "forbidden_effects"})
+        or _non_empty_string_list(scope.get(key))
+        for key in CAPTAIN_SCOPE_RECOMMENDED_KEYS
+    ):
+        findings.append(f"actions[{index}].scope must contain at least one concrete boundary field")
+    return findings
 
 
 def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2076,7 +2126,8 @@ def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(recovery_path, str) or not recovery_path.strip():
             if not isinstance(irreversibility, str) or not irreversibility.strip():
                 raise GripPreflightError(f"actions[{index}].risk requires recovery_path or irreversibility")
-        if irreversibility == "irreversible" and not isinstance(item.get("irreversibility_record"), dict):
+        irreversibility_record = item.get("irreversibility_record")
+        if irreversibility == "irreversible" and (not isinstance(irreversibility_record, dict) or not irreversibility_record):
             raise GripPreflightError(f"actions[{index}].irreversibility_record is required for irreversible actions")
         target_change_required = item.get("target_change_required", False)
         if not isinstance(target_change_required, bool):
@@ -2209,8 +2260,13 @@ def _captain_execution_authority_gate(parameters: dict[str, Any]) -> dict[str, A
 def _captain_review_evidence_gate(parameters: dict[str, Any]) -> dict[str, Any]:
     evidence = parameters.get("review_evidence")
     expected_head = parameters.get("expected_head")
-    if expected_head is not None and not _is_hex_sha(expected_head, lengths=(40,)):
-        return _captain_gate("review-evidence-present", "blocked", "expected_head must be a 40 character hex SHA when provided")
+    if not _is_hex_sha(expected_head, lengths=(40,)):
+        return _captain_gate(
+            "review-evidence-present",
+            "blocked",
+            "expected_head must be present as a 40 character hex SHA for Captain evidence binding",
+            ["expected_head_missing_or_invalid"],
+        )
     if evidence is None:
         return _captain_gate(
             "review-evidence-present",
@@ -2255,6 +2311,9 @@ def _captain_ci_gate(parameters: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(evidence.get("source"), str) or not evidence["source"].strip():
         problems.append("ci_evidence.source must be a non-empty string")
     review = parameters.get("review_evidence")
+    expected_head = parameters.get("expected_head")
+    if _is_hex_sha(expected_head, lengths=(40,)) and evidence.get("head_sha") != expected_head:
+        problems.append("ci_evidence.head_sha does not match expected_head")
     if (
         not problems
         and isinstance(review, dict)
