@@ -522,7 +522,7 @@ class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}
-        self.assertEqual({"branch-publish", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "scout", "situation", "worktree-orient"}, set(specs))
+        self.assertEqual({"branch-publish", "captain-preflight", "mechanic-loop", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "scout", "situation", "worktree-orient"}, set(specs))
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
@@ -547,6 +547,7 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("observer", surface["profile"])
         self.assertFalse(by_name["branch-publish"]["availability"]["available"])
+        self.assertFalse(by_name["captain-preflight"]["availability"]["available"])
         self.assertTrue(by_name["repo-orient"]["availability"]["available"])
         self.assertIn("does not expose generic shell execution", surface["non_claims"])
 
@@ -592,6 +593,224 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("profile observer cannot run mutating grips", result["output"]["error"])
+
+    def test_mechanic_loop_runs_normal_actions_with_visible_scope_and_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "mechanic-loop",
+                {
+                    "actions": [
+                        {
+                            "action": "repo-orient",
+                            "parameters": {"repo": tmp},
+                            "target": {"repo": "heimgewebe/grabowski", "checkout": tmp},
+                            "scope": {"operation": "read repository orientation", "forbidden_effects": ["pr-merge", "runtime-deploy"]},
+                            "receipt_path": "receipts/mechanic/repo-orient.json",
+                        },
+                        {
+                            "action": "pr-check-readiness",
+                            "parameters": {"repo": tmp},
+                            "target": {"repo": "heimgewebe/grabowski", "branch": "feat/work"},
+                            "scope": {"operation": "evaluate PR readiness", "forbidden_effects": ["pr-merge", "runtime-deploy"]},
+                            "receipt_path": "receipts/mechanic/pr-check-readiness.json",
+                        },
+                    ]
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", dirty=False),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("mechanic-loop", result["receipt"]["grip"]["name"])
+        self.assertTrue(result["output"]["complete"])
+        self.assertEqual(2, result["output"]["executed_action_count"])
+        self.assertEqual(["repo-orient", "pr-check-readiness"], [item["grip"] for item in result["output"]["actions"]])
+        for action in result["output"]["actions"]:
+            self.assertIsInstance(action["target"], dict)
+            self.assertIsInstance(action["scope"], dict)
+            self.assertTrue(action["receipt_path"].startswith("receipts/"))
+            self.assertEqual("mechanic", action["envelope"]["role"])
+            self.assertFalse(action["envelope"]["requires_captain"])
+            self.assertEqual(64, len(action["receipt_sha256"]))
+            self.assertEqual("passed", action["receipt_status"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["normal-grips-only"])
+        self.assertEqual("pass", checks["scope-visible"])
+        self.assertEqual("pass", checks["receipt-per-grip"])
+
+    def test_mechanic_loop_rejects_non_normal_or_recursive_grip(self) -> None:
+        result = grips.run_grip(
+            "mechanic-loop",
+            {"actions": [{"grip": "mechanic-loop", "parameters": {"actions": []}}]},
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=FakeGh(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("not a normal mechanic action", result["output"]["error"])
+
+    def test_mechanic_loop_runs_mutating_normal_grip_with_child_allow_mutation(self) -> None:
+        head = "a" * 40
+        fake_git = FakeGit(branch="feat/work", dirty=False, head=head)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "mechanic-loop",
+                {
+                    "actions": [
+                        {
+                            "action": "branch-publish",
+                            "parameters": {"repo": tmp, "branch": "feat/work", "expected_head": head},
+                            "allow_mutation": True,
+                            "target": {"remote": "origin", "branch": "feat/work"},
+                            "scope": {"operation": "publish expected HEAD", "forbidden_effects": ["pr-merge", "runtime-deploy"]},
+                            "receipt_path": "receipts/mechanic/branch-publish.json",
+                        }
+                    ]
+                },
+                allow_mutation=True,
+                command_runner=fake_git,
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["complete"])
+        self.assertEqual("branch-publish", result["output"]["actions"][0]["grip"])
+        self.assertEqual("mutating", result["output"]["actions"][0]["effect"])
+        self.assertIn(("push", "origin", "HEAD:feat/work"), fake_git.calls)
+
+    def test_mechanic_loop_stops_on_blocked_child_but_keeps_child_receipt(self) -> None:
+        head = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "mechanic-loop",
+                {
+                    "actions": [
+                        {
+                            "action": "branch-publish",
+                            "parameters": {"repo": tmp, "branch": "feat/work", "expected_head": head},
+                            "target": {"remote": "origin", "branch": "feat/work"},
+                            "scope": {"operation": "publish expected HEAD", "forbidden_effects": ["pr-merge", "runtime-deploy"]},
+                            "receipt_path": "receipts/mechanic/branch-publish-blocked.json",
+                        },
+                        {
+                            "action": "repo-orient",
+                            "parameters": {"repo": tmp},
+                            "target": {"repo": "heimgewebe/grabowski", "checkout": tmp},
+                            "scope": {"operation": "read repository orientation", "forbidden_effects": ["pr-merge"]},
+                            "receipt_path": "receipts/mechanic/repo-after-block.json",
+                        },
+                    ]
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", dirty=False, head=head),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertFalse(result["output"]["complete"])
+        self.assertEqual(0, result["output"]["stopped_after"])
+        self.assertEqual(1, result["output"]["executed_action_count"])
+        self.assertEqual("blocked", result["output"]["actions"][0]["receipt_status"])
+        self.assertEqual(64, len(result["output"]["actions"][0]["receipt_sha256"]))
+
+    def test_mechanic_loop_rejects_high_impact_action(self) -> None:
+        result = grips.run_grip(
+            "mechanic-loop",
+            {
+                "actions": [
+                    {
+                        "action": "runtime-deploy",
+                        "target": {"repo": "heimgewebe/grabowski"},
+                        "scope": {"operation": "deploy"},
+                        "receipt_path": "receipts/mechanic/runtime-deploy.json",
+                    }
+                ]
+            },
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=FakeGh(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("requires Captain", result["output"]["error"])
+
+    def test_mechanic_loop_rejects_missing_target_scope_or_receipt_path(self) -> None:
+        invalid_actions = [
+            {"action": "repo-orient", "parameters": {"repo": "."}, "scope": {"operation": "read"}, "receipt_path": "r.json"},
+            {"action": "repo-orient", "parameters": {"repo": "."}, "target": {"repo": "x"}, "receipt_path": "r.json"},
+            {"action": "repo-orient", "parameters": {"repo": "."}, "target": {"repo": "x"}, "scope": {"operation": "read"}},
+        ]
+        for action in invalid_actions:
+            with self.subTest(action=action):
+                result = grips.run_grip(
+                    "mechanic-loop",
+                    {"actions": [action]},
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=FakeGh(),
+                )
+                self.assertEqual("blocked", result["receipt"]["status"])
+
+    def test_captain_preflight_blocks_without_fresh_projection(self) -> None:
+        result = grips.grip_run(
+            "captain-preflight",
+            {
+                "actions": [
+                    {
+                        "action": "service-restart",
+                        "high_impact": True,
+                        "target": {"host": "heim-pc", "unit": "grabowski-mcp.service"},
+                        "scope": {"operation": "preflight only"},
+                        "risk": {"risk_level": "high", "irreversibility": "reversible", "recovery_path": "restart previous unit"},
+                        "target_change": None,
+                        "receipt_path": "receipts/captain/service-restart.json",
+                    }
+                ]
+            },
+            profile="captain",
+            command_runner=FakeGit(),
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("blocked", result["output"]["decision"])
+        self.assertIn("fresh_status_projection_unavailable", result["output"]["blocked_reasons"])
+        self.assertIn("service-restart", result["output"]["high_impact_action_allowlist"])
+
+    def test_captain_preflight_requires_target_change_record_when_declared(self) -> None:
+        result = grips.grip_run(
+            "captain-preflight",
+            {
+                "actions": [
+                    {
+                        "action": "pr-merge",
+                        "high_impact": True,
+                        "target": {"repo": "heimgewebe/grabowski", "pr": 1},
+                        "scope": {"operation": "preflight only"},
+                        "risk": {"risk_level": "high", "irreversibility": "reversible", "recovery_path": "revert merge commit"},
+                        "target_change_required": True,
+                        "receipt_path": "receipts/captain/pr-merge.json",
+                    }
+                ]
+            },
+            profile="captain",
+            command_runner=FakeGit(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("target_change record is required", result["output"]["error"])
+
+    def test_captain_preflight_is_captain_only_surface(self) -> None:
+        result = grips.grip_run(
+            "captain-preflight",
+            {"actions": []},
+            profile="operator",
+            command_runner=FakeGit(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("captain-only", result["output"]["error"])
 
 
     def test_situation_grip_reports_core_state_and_next_safe_grip(self) -> None:
