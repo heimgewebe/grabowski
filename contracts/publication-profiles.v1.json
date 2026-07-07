@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "7869671606789e24407e859d76ccce59144c0d9f36b38cffb888a3726e76932f"
+    "sha256": "d1fdf8f79b787ae02b377559342e05ee100d72b725005afb0e667127022c19ab"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "63e36149c4032e68939c7f8e221315a8d40e9bf4644fd31390a2e2b073242aa2"
+    "sha256": "c324097b212b11f143496e188cf3aec4a7a280435fadab90b89b66b500ecb202"
   },
   "counts": {
     "core": 21,
-    "full": 93,
-    "operator": 78
+    "full": 97,
+    "operator": 82
   },
   "profiles": {
     "core": [
@@ -60,6 +60,10 @@
       "rlens_bundle_discover",
       "rlens_bundle_status",
       "rlens_freshness_check",
+      "rlens_preflight",
+      "rlens_query",
+      "rlens_query_existing_index",
+      "rlens_range_get",
       "rlens_context_pack",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
@@ -154,6 +158,10 @@
       "rlens_bundle_discover",
       "rlens_bundle_status",
       "rlens_freshness_check",
+      "rlens_preflight",
+      "rlens_query",
+      "rlens_query_existing_index",
+      "rlens_range_get",
       "rlens_context_pack",
       "grabowski_runtime_health",
       "grabowski_contract_drift",
