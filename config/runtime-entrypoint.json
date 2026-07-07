@@ -178,6 +178,10 @@
     {
       "module": "grabowski_worker_process",
       "source": "src/grabowski_worker_process.py"
+    },
+    {
+      "module": "grabowski_repobrief",
+      "source": "src/grabowski_repobrief.py"
     }
   ]
 }
