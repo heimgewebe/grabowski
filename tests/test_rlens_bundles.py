@@ -250,6 +250,102 @@ class RlensBundleToolTests(unittest.TestCase):
         self.assertFalse(result["available"])
         self.assertEqual(result["reason"], "no_bundle_available")
 
+    def test_rlens_preflight_tool_returns_handoff_contract(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        preflight = {
+            "status": "pass",
+            "required_reading": {"status": "pass"},
+            "answer_compliance_template": {"task_profile": "basic_repo_question"},
+        }
+
+        with patch.object(mcp, "_rlens_agent_preflight", return_value=preflight):
+            result = mcp.rlens_preflight("demo-repo", "basic_repo_question")
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["kind"], "grabowski.rlens_preflight")
+        self.assertEqual(result["preflight"]["status"], "pass")
+        self.assertEqual(result["preflight"]["required_reading"]["status"], "pass")
+        self.assertEqual(
+            result["preflight"]["answer_compliance_template"]["task_profile"],
+            "basic_repo_question",
+        )
+        self.assertFalse(result["agent_handoff"]["raw_canonical_dump_included"])
+        self.assertIn("claims_true", result["does_not_establish"])
+
+    def test_query_existing_index_normalizes_nested_lenskit_results(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        access_result = {
+            "status": "available",
+            "query_result": {
+                "results": [
+                    {"chunk_id": "c1", "path": "README.md"},
+                ],
+            },
+            "source_citation_projection": {
+                "items": [
+                    {
+                        "chunk_id": "c1",
+                        "text_excerpt": "hello",
+                        "source_range": {"file_path": "README.md", "start_line": 1, "end_line": 1},
+                    },
+                ],
+            },
+        }
+
+        with patch.object(mcp, "_rlens_lenskit_access_call", return_value=access_result):
+            result = mcp.rlens_query_existing_index("demo-repo", "hello", k=1)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["hit_count"], 1)
+        self.assertEqual(result["hits"][0]["chunk_id"], "c1")
+        self.assertEqual(result["snippet_count"], 1)
+        self.assertEqual(result["snippets"][0]["text_excerpt"], "hello")
+        self.assertFalse(result["agent_handoff"]["raw_canonical_dump_included"])
+
+    def test_range_get_returns_bounded_range_result(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        range_ref = {"artifact_role": "canonical_md", "file_path": "demo.md"}
+        access_result = {
+            "status": "available",
+            "range": {"text": "hello", "lines": [1, 1]},
+        }
+
+        with patch.object(mcp, "_rlens_lenskit_access_call", return_value=access_result):
+            result = mcp.rlens_range_get("demo-repo", range_ref)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["range_result"]["status"], "available")
+        self.assertEqual(result["range_result"]["range"]["text"], "hello")
+        self.assertFalse(result["agent_handoff"]["raw_canonical_dump_included"])
+
+    def test_context_bridge_combines_preflight_and_query_snippets(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        preflight = {
+            "status": "pass",
+            "required_reading": {"status": "pass"},
+            "answer_compliance_template": {"task_profile": "basic_repo_question"},
+        }
+        access_result = {
+            "status": "available",
+            "query_result": {"results": [{"chunk_id": "c1"}]},
+            "source_citation_projection": {"items": [{"chunk_id": "c1", "text_excerpt": "hello"}]},
+        }
+
+        with patch.object(mcp, "_rlens_agent_preflight", return_value=preflight):
+            with patch.object(mcp, "_rlens_lenskit_access_call", return_value=access_result):
+                result = mcp.rlens_context_bridge("demo-repo", query="hello")
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["preflight"]["status"], "pass")
+        self.assertEqual(result["snippets"][0]["text_excerpt"], "hello")
+        self.assertEqual(result["hits"][0]["chunk_id"], "c1")
+        self.assertFalse(result["agent_handoff"]["raw_canonical_dump_included"])
+
+
 
 if __name__ == "__main__":
     unittest.main()

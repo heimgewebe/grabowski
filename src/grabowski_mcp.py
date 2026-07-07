@@ -4004,6 +4004,398 @@ def _rlens_agent_preflight(task_profile: str, manifest_path: Path) -> dict[str, 
     return value
 
 
+
+
+def _rlens_access_nonclaims() -> list[str]:
+    return [
+        "actual_agent_reading",
+        "answer_correct",
+        "repo_understood",
+        "claims_true",
+        "review_complete",
+        "runtime_correctness",
+    ]
+
+
+def _rlens_lenskit_repo() -> Path | None:
+    lenskit_repo = (HOME / "repos" / "lenskit").resolve(strict=False)
+    if not lenskit_repo.is_dir() or lenskit_repo.is_symlink():
+        return None
+    return lenskit_repo
+
+
+def _rlens_lenskit_access_call(
+    function_name: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    lenskit_repo = _rlens_lenskit_repo()
+    if lenskit_repo is None:
+        return {
+            "available": False,
+            "status": "unknown",
+            "reason": "lenskit_repo_missing_or_invalid",
+        }
+    if function_name not in {"range_get", "query_existing_index"}:
+        return {
+            "available": False,
+            "status": "invalid",
+            "reason": "unsupported_lenskit_access_function",
+            "function": function_name,
+        }
+    script = (
+        "import json, sys\n"
+        "from merger.lenskit.core import repobrief_access\n"
+        "p=json.load(sys.stdin); m=p['bundle_manifest']; f=p['function']\n"
+        "if f=='range_get':\n"
+        "    r=repobrief_access.range_get(m, p.get('range_ref'))\n"
+        "elif f=='query_existing_index':\n"
+        "    r=repobrief_access.query_existing_index(\n"
+        "        m, p.get('query'), k=p.get('k', 10),\n"
+        "        filters=p.get('filters') or {},\n"
+        "        resolve_evidence=p.get('resolve_evidence', False),\n"
+        "        project_sources=p.get('project_sources', False))\n"
+        "else:\n"
+        "    raise SystemExit(f'unsupported function: {f}')\n"
+        "json.dump(r, sys.stdout, sort_keys=True); sys.stdout.write('\\n')\n"
+    )
+    completed = subprocess.run(
+        ["python3", "-c", script],
+        cwd=lenskit_repo,
+        input=json.dumps({"function": function_name, **payload}),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    stdout = completed.stdout[:500_000]
+    stderr = completed.stderr[:20_000]
+    if completed.returncode != 0 or not stdout.strip():
+        return {
+            "available": False,
+            "status": "unknown",
+            "returncode": completed.returncode,
+            "stderr": _redact_sensitive_text(stderr)[0],
+            "reason": "lenskit_access_call_failed",
+            "function": function_name,
+        }
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {
+            "available": False,
+            "status": "unknown",
+            "returncode": completed.returncode,
+            "reason": "lenskit_access_invalid_json",
+            "function": function_name,
+        }
+    if not isinstance(value, dict):
+        return {
+            "available": False,
+            "status": "unknown",
+            "returncode": completed.returncode,
+            "reason": "lenskit_access_non_object",
+            "function": function_name,
+        }
+    value["available"] = value.get("status") == "available"
+    value["returncode"] = completed.returncode
+    return value
+
+
+def _rlens_select_context(
+    repo: str,
+    task_profile: str,
+    stem: str | None,
+) -> dict[str, Any]:
+    repo = _rlens_validate_repo(repo) or ""
+    task_profile = _rlens_validate_task_profile(task_profile)
+    freshness = rlens_freshness_check(repo, stem)
+    selected_stem = freshness.get("stem")
+    if not isinstance(selected_stem, str):
+        return {
+            "available": False,
+            "repo": repo,
+            "task_profile": task_profile,
+            "freshness": freshness,
+            "reason": "no_bundle_available",
+        }
+    status = rlens_bundle_status(selected_stem)
+    status_repo = status.get("repo") if isinstance(status, dict) else None
+    if status.get("exists") and status_repo != repo:
+        return {
+            "available": False,
+            "repo": repo,
+            "task_profile": task_profile,
+            "stem": selected_stem,
+            "freshness": freshness,
+            "reason": "bundle_repo_mismatch",
+            "bundle_repo": status_repo,
+        }
+    selected_manifest_path = _rlens_manifest_path(selected_stem)
+    manifest_sha = (
+        _rlens_file_sha256(selected_manifest_path)
+        if selected_manifest_path.is_file()
+        else None
+    )
+    live = freshness.get("live_repo") if isinstance(freshness.get("live_repo"), dict) else {}
+    bundle = freshness.get("bundle") if isinstance(freshness.get("bundle"), dict) else {}
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return {
+        "available": True,
+        "repo": repo,
+        "task_profile": task_profile,
+        "stem": selected_stem,
+        "manifest_path": selected_manifest_path,
+        "manifest_sha256": manifest_sha,
+        "freshness": freshness,
+        "bundle_status": status,
+        "context_ref": {
+            "schema_version": 1,
+            "repo": repo,
+            "stem": selected_stem,
+            "manifest_sha256": manifest_sha,
+            "bundle_commit": bundle.get("git_commit"),
+            "live_commit_at_claim": live.get("head"),
+            "freshness_status": freshness.get("freshness", "unknown"),
+            "task_profile": task_profile,
+            "source": "grabowski.rlens_context_pack",
+            "generated_at": generated_at,
+            "does_not_establish": _rlens_access_nonclaims(),
+        },
+    }
+
+
+def _rlens_unavailable_context_response(
+    kind: str,
+    selection: dict[str, Any],
+) -> dict[str, Any]:
+    result = {
+        "kind": kind,
+        "schema_version": 1,
+        "repo": selection.get("repo"),
+        "task_profile": selection.get("task_profile"),
+        "available": False,
+        "freshness": selection.get("freshness"),
+        "reason": selection.get("reason"),
+        "does_not_establish": [
+            "actual_agent_reading",
+            "repo_understood",
+            "claims_true",
+            "runtime_correctness",
+        ],
+    }
+    if selection.get("stem") is not None:
+        result["stem"] = selection.get("stem")
+    if selection.get("bundle_repo") is not None:
+        result["bundle_repo"] = selection.get("bundle_repo")
+    return result
+
+
+def _rlens_normalize_query_hits(query_result: Any) -> list[dict[str, Any]]:
+    if isinstance(query_result, dict):
+        raw_hits = query_result.get("results")
+        if raw_hits is None and isinstance(query_result.get("query_result"), dict):
+            raw_hits = query_result["query_result"].get("results")
+    else:
+        raw_hits = None
+    if not isinstance(raw_hits, list):
+        return []
+    return [hit for hit in raw_hits if isinstance(hit, dict)]
+
+
+def _rlens_snippet_items(query_result: dict[str, Any]) -> list[dict[str, Any]]:
+    projection = query_result.get("source_citation_projection")
+    if isinstance(projection, dict) and isinstance(projection.get("items"), list):
+        return [item for item in projection["items"] if isinstance(item, dict)]
+    return []
+
+
+@mcp.tool(name="rlens_preflight", annotations=READ_ANNOTATIONS)
+def rlens_preflight(
+    repo: str,
+    task_profile: str = "basic_repo_question",
+    stem: str | None = None,
+) -> dict[str, Any]:
+    """Run bounded rLens agent-consumption preflight for a selected bundle."""
+    _require_capability("bundle_registry")
+    selection = _rlens_select_context(repo, task_profile, stem)
+    if not selection.get("available"):
+        return _rlens_unavailable_context_response("grabowski.rlens_preflight", selection)
+    preflight = _rlens_agent_preflight(task_profile, selection["manifest_path"])
+    status = preflight.get("status") if isinstance(preflight.get("status"), str) else "unknown"
+    context_ref = dict(selection["context_ref"])
+    context_ref["preflight_status"] = status
+    return {
+        "kind": "grabowski.rlens_preflight",
+        "schema_version": 1,
+        "repo": selection["repo"],
+        "task_profile": task_profile,
+        "stem": selection["stem"],
+        "available": True,
+        "context_ref": context_ref,
+        "freshness": selection["freshness"],
+        "preflight": {
+            "available": preflight.get("available", False),
+            "status": status,
+            "required_reading": preflight.get("required_reading"),
+            "answer_compliance_template": preflight.get("answer_compliance_template"),
+            "does_not_establish": preflight.get("does_not_establish"),
+            "error_reason": preflight.get("reason"),
+        },
+        "agent_handoff": {
+            "default_surface": "preflight_metadata_only",
+            "raw_canonical_dump_included": False,
+            "requires_answer_compliance": status in {"pass", "warn"},
+        },
+        "does_not_establish": _rlens_access_nonclaims(),
+    }
+
+
+@mcp.tool(name="rlens_range_get", annotations=READ_ANNOTATIONS)
+def rlens_range_get(
+    repo: str,
+    range_ref: dict[str, Any],
+    task_profile: str = "basic_repo_question",
+    stem: str | None = None,
+) -> dict[str, Any]:
+    """Resolve one bounded rLens/RepoBrief range reference from bundle artifacts."""
+    _require_capability("bundle_registry")
+    selection = _rlens_select_context(repo, task_profile, stem)
+    if not selection.get("available"):
+        return _rlens_unavailable_context_response("grabowski.rlens_range_get", selection)
+    result = _rlens_lenskit_access_call(
+        "range_get",
+        {
+            "bundle_manifest": str(selection["manifest_path"]),
+            "range_ref": range_ref,
+        },
+    )
+    return {
+        "kind": "grabowski.rlens_range_get",
+        "schema_version": 1,
+        "repo": selection["repo"],
+        "task_profile": task_profile,
+        "stem": selection["stem"],
+        "available": result.get("status") == "available",
+        "context_ref": selection["context_ref"],
+        "freshness": selection["freshness"],
+        "range_ref": range_ref,
+        "range_result": result,
+        "agent_handoff": {
+            "default_surface": "bounded_range_result",
+            "raw_canonical_dump_included": False,
+            "requires_answer_compliance": True,
+        },
+        "does_not_establish": _rlens_access_nonclaims(),
+    }
+
+
+@mcp.tool(name="rlens_query_existing_index", annotations=READ_ANNOTATIONS)
+def rlens_query_existing_index(
+    repo: str,
+    query: str,
+    k: int = 10,
+    filters: dict[str, str | None] | None = None,
+    task_profile: str = "basic_repo_question",
+    stem: str | None = None,
+    resolve_evidence: bool = True,
+    project_sources: bool = True,
+) -> dict[str, Any]:
+    """Query a prebuilt RepoBrief index and return bounded snippets/ranges."""
+    _require_capability("bundle_registry")
+    selection = _rlens_select_context(repo, task_profile, stem)
+    if not selection.get("available"):
+        return _rlens_unavailable_context_response(
+            "grabowski.rlens_query_existing_index",
+            selection,
+        )
+    result = _rlens_lenskit_access_call(
+        "query_existing_index",
+        {
+            "bundle_manifest": str(selection["manifest_path"]),
+            "query": query,
+            "k": k,
+            "filters": filters or {},
+            "resolve_evidence": resolve_evidence,
+            "project_sources": project_sources,
+        },
+    )
+    hits = _rlens_normalize_query_hits(result)
+    snippets = _rlens_snippet_items(result)
+    return {
+        "kind": "grabowski.rlens_query_existing_index",
+        "schema_version": 1,
+        "repo": selection["repo"],
+        "task_profile": task_profile,
+        "stem": selection["stem"],
+        "available": result.get("status") == "available",
+        "context_ref": selection["context_ref"],
+        "freshness": selection["freshness"],
+        "query": query,
+        "k": k,
+        "filters": filters or {},
+        "hit_count": len(hits),
+        "hits": hits,
+        "snippet_count": len(snippets),
+        "snippets": snippets,
+        "query_result": result,
+        "agent_handoff": {
+            "default_surface": "bounded_query_snippets_and_ranges",
+            "raw_canonical_dump_included": False,
+            "requires_answer_compliance": True,
+            "recommended_next_step": "Use snippets, source ranges and citation projections; do not claim full-repo truth from search hits alone.",
+        },
+        "does_not_establish": _rlens_access_nonclaims() + ["full_recall"],
+    }
+
+
+@mcp.tool(name="rlens_context_bridge", annotations=READ_ANNOTATIONS)
+def rlens_context_bridge(
+    repo: str,
+    task_profile: str = "basic_repo_question",
+    stem: str | None = None,
+    query: str | None = None,
+    k: int = 5,
+) -> dict[str, Any]:
+    """Build a bounded rLens context pack with optional query snippets."""
+    preflight_result = rlens_preflight(repo, task_profile, stem)
+    if not preflight_result.get("available"):
+        return {
+            **preflight_result,
+            "kind": "grabowski.rlens_context_bridge",
+        }
+    query_result = None
+    if query:
+        query_result = rlens_query_existing_index(
+            repo,
+            query,
+            k=k,
+            task_profile=task_profile,
+            stem=preflight_result.get("stem"),
+        )
+    return {
+        "kind": "grabowski.rlens_context_bridge",
+        "schema_version": 1,
+        "repo": preflight_result.get("repo"),
+        "task_profile": task_profile,
+        "stem": preflight_result.get("stem"),
+        "available": True,
+        "context_ref": preflight_result.get("context_ref"),
+        "freshness": preflight_result.get("freshness"),
+        "preflight": preflight_result.get("preflight"),
+        "query": query_result,
+        "snippets": query_result.get("snippets") if isinstance(query_result, dict) else [],
+        "hits": query_result.get("hits") if isinstance(query_result, dict) else [],
+        "agent_handoff": {
+            "default_surface": "context_pack_with_optional_bounded_query",
+            "raw_canonical_dump_included": False,
+            "requires_answer_compliance": True,
+        },
+        "does_not_establish": _rlens_access_nonclaims() + ["full_recall"],
+    }
+
+
 @mcp.tool(name="rlens_context_pack", annotations=READ_ANNOTATIONS)
 def rlens_context_pack(
     repo: str,

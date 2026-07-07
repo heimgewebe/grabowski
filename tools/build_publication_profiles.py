@@ -36,6 +36,10 @@ CORE_TOOLS = {
     "rlens_bundle_status",
     "rlens_freshness_check",
     "rlens_context_pack",
+    "rlens_preflight",
+    "rlens_range_get",
+    "rlens_query_existing_index",
+    "rlens_context_bridge",
 }
 OPERATOR_ORIENTATION_TOOLS = {
     "grabowski_runtime_health",
@@ -44,6 +48,9 @@ OPERATOR_ORIENTATION_TOOLS = {
     "rlens_bundle_status",
     "rlens_freshness_check",
     "rlens_context_pack",
+    "rlens_preflight",
+    "rlens_query_existing_index",
+    "rlens_context_bridge",
 }
 
 

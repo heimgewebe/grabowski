@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "7869671606789e24407e859d76ccce59144c0d9f36b38cffb888a3726e76932f"
+    "sha256": "15abf7053b56a924b1faf1048a7ab1c5092ccda628271c155d02472a30d234eb"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "63e36149c4032e68939c7f8e221315a8d40e9bf4644fd31390a2e2b073242aa2"
+    "sha256": "b58f823112693937db66087240e2a2f273b675835eea45da9032c37dc57dec3e"
   },
   "counts": {
-    "core": 21,
-    "full": 93,
-    "operator": 78
+    "core": 25,
+    "full": 97,
+    "operator": 81
   },
   "profiles": {
     "core": [
@@ -19,6 +19,10 @@
       "rlens_bundle_status",
       "rlens_freshness_check",
       "rlens_context_pack",
+      "rlens_preflight",
+      "rlens_range_get",
+      "rlens_query_existing_index",
+      "rlens_context_bridge",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -61,6 +65,10 @@
       "rlens_bundle_status",
       "rlens_freshness_check",
       "rlens_context_pack",
+      "rlens_preflight",
+      "rlens_range_get",
+      "rlens_query_existing_index",
+      "rlens_context_bridge",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -155,6 +163,9 @@
       "rlens_bundle_status",
       "rlens_freshness_check",
       "rlens_context_pack",
+      "rlens_preflight",
+      "rlens_query_existing_index",
+      "rlens_context_bridge",
       "grabowski_runtime_health",
       "grabowski_contract_drift",
       "grabowski_runtime_deploy_schedule",
@@ -241,8 +252,12 @@
         "grabowski_verify_audit",
         "rlens_bundle_discover",
         "rlens_bundle_status",
+        "rlens_context_bridge",
         "rlens_context_pack",
-        "rlens_freshness_check"
+        "rlens_freshness_check",
+        "rlens_preflight",
+        "rlens_query_existing_index",
+        "rlens_range_get"
       ],
       "read_only": true,
       "risk_classes": [
@@ -259,8 +274,11 @@
         "grabowski_runtime_health",
         "rlens_bundle_discover",
         "rlens_bundle_status",
+        "rlens_context_bridge",
         "rlens_context_pack",
-        "rlens_freshness_check"
+        "rlens_freshness_check",
+        "rlens_preflight",
+        "rlens_query_existing_index"
       ],
       "selection": "all tools not in core plus orientation tools"
     }

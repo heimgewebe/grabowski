@@ -49,6 +49,10 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `rlens_bundle_status` | knowledge | yes | low | Read bounded manifest, health and sidecar status for one rLens bundle. |
 | `rlens_freshness_check` | knowledge | yes | low | Compare one rLens bundle commit with the current local repository HEAD. |
 | `rlens_context_pack` | knowledge | yes | low | Build a bounded rLens context pack for agent handoff and Bureau receipts. |
+| `rlens_preflight` | knowledge | yes | low | Run bounded rLens agent-consumption preflight for a selected bundle. |
+| `rlens_range_get` | knowledge | yes | low | Resolve one bounded rLens/RepoBrief range reference from bundle artifacts. |
+| `rlens_query_existing_index` | knowledge | yes | low | Query a prebuilt RepoBrief index and return bounded snippets/ranges. |
+| `rlens_context_bridge` | knowledge | yes | low | Build a bounded rLens context pack with optional query snippets. |
 | `grabowski_runtime_health` | context | yes | low | Read minimal deployment, audit and kill-switch health without path inventories. |
 | `grabowski_deployment_identity` | context | yes | low | Read bounded runtime identity and integrity flags without local paths. |
 | `grabowski_contract_drift` | context | yes | low | Read bounded runtime-contract and capability-catalog drift. |

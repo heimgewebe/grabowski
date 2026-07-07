@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "6adf2cbd08f0913a70d0c8c3b25c6248910de95423ec10ebbcedf65093c80eba",
+  "capability_source_sha256": "df3257b36e9e1e3551f31c503c198dbf342c70018635fb8983f4f1226e9b21b2",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "7869671606789e24407e859d76ccce59144c0d9f36b38cffb888a3726e76932f",
+  "contract_sha256": "15abf7053b56a924b1faf1048a7ab1c5092ccda628271c155d02472a30d234eb",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -306,6 +306,50 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "rlens_context_pack"
+    },
+    {
+      "category": "knowledge",
+      "description": "Run bounded rLens agent-consumption preflight for a selected bundle.",
+      "effects": [],
+      "id": "rlens_preflight",
+      "purpose": "Run bounded rLens agent-consumption preflight for a selected bundle.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_preflight"
+    },
+    {
+      "category": "knowledge",
+      "description": "Resolve one bounded rLens/RepoBrief range reference from bundle artifacts.",
+      "effects": [],
+      "id": "rlens_range_get",
+      "purpose": "Resolve one bounded rLens/RepoBrief range reference from bundle artifacts.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_range_get"
+    },
+    {
+      "category": "knowledge",
+      "description": "Query a prebuilt RepoBrief index and return bounded snippets/ranges.",
+      "effects": [],
+      "id": "rlens_query_existing_index",
+      "purpose": "Query a prebuilt RepoBrief index and return bounded snippets/ranges.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_query_existing_index"
+    },
+    {
+      "category": "knowledge",
+      "description": "Build a bounded rLens context pack with optional query snippets.",
+      "effects": [],
+      "id": "rlens_context_bridge",
+      "purpose": "Build a bounded rLens context pack with optional query snippets.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_context_bridge"
     },
     {
       "category": "context",
