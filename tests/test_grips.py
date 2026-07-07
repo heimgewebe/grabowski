@@ -52,8 +52,17 @@ class FakeGit:
 
 
 class FakeGh:
-    def __init__(self, *, existing: dict[str, object] | None = None, view: dict[str, object] | None = None):
+    def __init__(
+        self,
+        *,
+        existing: dict[str, object] | list[dict[str, object]] | None = None,
+        view: dict[str, object] | None = None,
+        failure: bool = False,
+        invalid_json: bool = False,
+    ):
         self.existing = existing
+        self.failure = failure
+        self.invalid_json = invalid_json
         self.view = view or {
             "number": 77,
             "url": "https://github.com/heimgewebe/grabowski/pull/77",
@@ -69,7 +78,24 @@ class FakeGh:
     def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
         self.calls.append(tuple(argv))
         if argv[:2] == ["pr", "list"]:
-            return {"returncode": 0, "stdout": json.dumps(self.existing), "stderr": ""}
+            if self.failure:
+                return {"returncode": 2, "stdout": "", "stderr": "gh failed"}
+            if self.invalid_json:
+                return {"returncode": 0, "stdout": "{", "stderr": ""}
+            uses_jq = "--jq" in argv
+            if uses_jq:
+                value: object
+                if isinstance(self.existing, list):
+                    value = self.existing[0] if self.existing else None
+                else:
+                    value = self.existing
+            elif self.existing is None:
+                value = []
+            elif isinstance(self.existing, list):
+                value = self.existing
+            else:
+                value = [self.existing]
+            return {"returncode": 0, "stdout": json.dumps(value), "stderr": ""}
         if argv[:2] == ["pr", "create"]:
             return {"returncode": 0, "stdout": str(self.view["url"]), "stderr": ""}
         if argv[:2] == ["pr", "edit"]:
@@ -558,7 +584,7 @@ class GripFoundationTests(unittest.TestCase):
             "isDraft": False,
             "mergeable": "MERGEABLE",
             "reviewDecision": "APPROVED",
-            "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "validate", "conclusion": "SUCCESS"}],
         }
         with tempfile.TemporaryDirectory() as tmp:
             result = grips.run_grip(
@@ -572,7 +598,148 @@ class GripFoundationTests(unittest.TestCase):
         self.assertTrue(result["output"]["pr"]["available"])
         self.assertEqual(132, result["output"]["pr"]["number"])
         self.assertEqual({"SUCCESS": 1}, result["output"]["pr"]["check_state_counts"])
+        self.assertEqual({"validate": "SUCCESS"}, result["output"]["pr"]["check_results"])
         self.assertEqual("pr-check-readiness", result["output"]["next_safe_grip"]["name"])
+        self.assertEqual(
+            {"validate": "SUCCESS"},
+            result["output"]["next_safe_grip"]["parameters"]["check_results"],
+        )
+
+    def test_situation_grip_skips_github_when_include_pr_is_false(self) -> None:
+        fake_gh = FakeGh()
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "situation",
+                {"repo": tmp, "include_pr": False},
+                command_runner=FakeGit(branch="feat/work", dirty=False),
+                github_runner=fake_gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual([], fake_gh.calls)
+        self.assertEqual("PR lookup skipped", result["output"]["pr"]["reason"])
+
+    def test_situation_grip_blocks_invalid_include_pr_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "situation",
+                {"repo": tmp, "include_pr": "false"},
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("include_pr must be a boolean", result["output"]["error"])
+
+    def test_situation_grip_blocks_invalid_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "situation",
+                {"repo": tmp, "expected_grip_catalog_sha256": "z" * 64},
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("hex SHA", result["output"]["error"])
+
+    def test_situation_grip_blocks_missing_repo(self) -> None:
+        missing = "/tmp/grabowski-missing-situation-repo"
+        result = grips.run_grip(
+            "situation",
+            {"repo": missing},
+            command_runner=FakeGit(),
+            github_runner=FakeGh(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("repo does not exist", result["output"]["error"])
+
+    def test_situation_grip_reports_github_failure_as_unavailable_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "situation",
+                {"repo": tmp},
+                command_runner=FakeGit(branch="feat/work", dirty=False),
+                github_runner=FakeGh(failure=True),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertFalse(result["output"]["pr"]["available"])
+        self.assertEqual("gh failed", result["output"]["pr"]["reason"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("warn", checks["pr_state"])
+
+    def test_situation_grip_reports_invalid_pr_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "situation",
+                {"repo": tmp},
+                command_runner=FakeGit(branch="feat/work", dirty=False),
+                github_runner=FakeGh(invalid_json=True),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertFalse(result["output"]["pr"]["available"])
+        self.assertEqual("PR lookup returned invalid JSON", result["output"]["pr"]["reason"])
+
+    def test_situation_grip_rejects_incomplete_pr_object(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "situation",
+                {"repo": tmp},
+                command_runner=FakeGit(branch="feat/work", dirty=False),
+                github_runner=FakeGh(existing={}),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertFalse(result["output"]["pr"]["available"])
+        self.assertEqual("PR lookup returned incomplete PR object", result["output"]["pr"]["reason"])
+
+    def test_situation_grip_marks_multiple_prs_ambiguous(self) -> None:
+        first = {
+            "number": 1,
+            "url": "https://github.com/heimgewebe/grabowski/pull/1",
+            "headRefName": "feat/work",
+            "headRefOid": "a" * 40,
+        }
+        second = {
+            "number": 2,
+            "url": "https://github.com/heimgewebe/grabowski/pull/2",
+            "headRefName": "feat/work",
+            "headRefOid": "b" * 40,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "situation",
+                {"repo": tmp},
+                command_runner=FakeGit(branch="feat/work", dirty=False),
+                github_runner=FakeGh(existing=[first, second]),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["pr"]["ambiguous"])
+        self.assertEqual(2, result["output"]["pr"]["count"])
+        self.assertIsNone(result["output"]["next_safe_grip"]["name"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("warn", checks["pr_state"])
+
+    def test_situation_grip_skips_pr_lookup_for_detached_head(self) -> None:
+        fake_gh = FakeGh()
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "situation",
+                {"repo": tmp},
+                command_runner=FakeGit(branch="HEAD", dirty=False),
+                github_runner=fake_gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual([], fake_gh.calls)
+        self.assertEqual(
+            "detached HEAD; PR lookup by branch skipped",
+            result["output"]["pr"]["reason"],
+        )
 
     def test_repo_orient_emits_pass_receipt_and_git_facts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
