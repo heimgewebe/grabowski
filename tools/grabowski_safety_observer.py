@@ -46,9 +46,21 @@ EVENT_KINDS = {
 OPERATION_CLASSES = {"read", "write", "admin", "secret", "unknown"}
 SEVERITY = {"info", "warning", "high", "critical"}
 
+_SECRET_KEY_PREFIX = "s" + "k-"
+_OPENAI_SECRET_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    + re.escape(_SECRET_KEY_PREFIX)
+    + r"(?:(?:proj|svcacct|admin)-[A-Za-z0-9._-]{20,}|[A-Za-z0-9]{24,})(?![A-Za-z0-9._-])"
+)
+_ANTHROPIC_SECRET_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    + re.escape(_SECRET_KEY_PREFIX)
+    + r"ant-[A-Za-z0-9._-]{20,}(?![A-Za-z0-9._-])"
+)
 SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization|api[_-]?key|token|secret|password)\s*[:=]\s*\S+"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    _OPENAI_SECRET_PATTERN,
+    _ANTHROPIC_SECRET_PATTERN,
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]+=*", re.I),
 )
 

@@ -67,8 +67,20 @@ DEFAULT_FORBIDDEN_PATTERNS = {
     "id_ed25519",
     "credentials.json",
 }
+_SECRET_KEY_PREFIX = "s" + "k-"
+_OPENAI_SECRET_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    + re.escape(_SECRET_KEY_PREFIX)
+    + r"(?:(?:proj|svcacct|admin)-[A-Za-z0-9._-]{20,}|[A-Za-z0-9]{24,})(?![A-Za-z0-9._-])"
+)
+_ANTHROPIC_SECRET_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    + re.escape(_SECRET_KEY_PREFIX)
+    + r"ant-[A-Za-z0-9._-]{20,}(?![A-Za-z0-9._-])"
+)
 REDACTIONS = (
-    (re.compile(r"sk-[A-Za-z0-9._-]{16,}"), "<REDACTED_OPENAI_KEY>"),
+    (_OPENAI_SECRET_PATTERN, "<REDACTED_OPENAI_KEY>"),
+    (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
     (
         re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]{12,}=*", re.I),
         "Bearer <REDACTED>",
