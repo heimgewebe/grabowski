@@ -822,6 +822,17 @@ def _reconcile_blocker(record: dict[str, Any], observation: dict[str, Any]) -> d
     return None
 
 
+def _reconcile_observe_denial(record: dict[str, Any], exc: PermissionError) -> dict[str, Any]:
+    return {
+        "task_id": record["task_id"],
+        "host": record["host"],
+        "unit": record["unit"],
+        "current_state": record["state"],
+        "resume_policy": record["resume_policy"],
+        "reason": f"observation denied: {_redact_reason(str(exc))}",
+    }
+
+
 def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
     if not isinstance(task_id, str):
         raise ValueError("task_id must be a string")
@@ -834,7 +845,11 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
     would_resume: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     for record in rows:
-        observation = _observe(record)
+        try:
+            observation = _observe(record)
+        except PermissionError as exc:
+            blocked.append(_reconcile_observe_denial(record, exc))
+            continue
         item = {
             "task_id": record["task_id"],
             "current_state": record["state"],
@@ -873,8 +888,13 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
     rows = _reconcile_candidate_rows(task_id)
     refreshed: list[dict[str, Any]] = []
     released: list[str] = []
+    denied: list[dict[str, Any]] = []
     for record in rows:
-        observation = _observe(record)
+        try:
+            observation = _observe(record)
+        except PermissionError as exc:
+            denied.append(_reconcile_observe_denial(record, exc))
+            continue
         stored = _set_state(
             record["task_id"],
             observation["state"],
@@ -891,7 +911,7 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
         "refreshed": refreshed,
         "released": released,
         "resumed": [],
-        "blocked": [],
+        "blocked": denied,
         "checked_at_unix": _now(),
     }
 
@@ -916,7 +936,11 @@ def reconcile_tasks_resume(
     resumed: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     for record in rows:
-        observation = _observe(record)
+        try:
+            observation = _observe(record)
+        except PermissionError as exc:
+            blocked.append(_reconcile_observe_denial(record, exc))
+            continue
         stored = _set_state(
             record["task_id"],
             observation["state"],
