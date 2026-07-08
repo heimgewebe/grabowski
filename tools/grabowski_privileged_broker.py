@@ -89,7 +89,10 @@ def main() -> int:
         "stderr": stderr,
         "audit": record,
     }, ensure_ascii=False, sort_keys=True))
-    return 0 if completed.returncode == 0 else 1
+    # The socket client returns non-zero for non-zero action returncodes. The
+    # broker process itself exits successfully after a structured response so a
+    # handled request failure does not leave a failed transient systemd unit.
+    return 0
 
 
 if __name__ == "__main__":
@@ -97,10 +100,10 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except subprocess.TimeoutExpired as exc:
         print(json.dumps({"error": "privileged action timed out", "timeout": exc.timeout}))
-        raise SystemExit(124)
-    except FileExistsError:
-        print(json.dumps({"error": "privileged reference was already used"}))
-        raise SystemExit(3)
+        raise SystemExit(0)
+    except (FileExistsError, PermissionError, ValueError) as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False, sort_keys=True))
+        raise SystemExit(0)
     except Exception as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False, sort_keys=True))
         raise SystemExit(2)
