@@ -604,5 +604,122 @@ class RlensContextBridgeToolTests(unittest.TestCase):
         self.assertEqual(result["mutation_boundary"]["writes"], [])
 
 
+class RlensContextPackResolvedEvidenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.merges = self.home / "repos" / "merges"
+        self.merges.mkdir(parents=True)
+        self.state = self.home / ".local" / "state" / "grabowski"
+        self.state.mkdir(parents=True)
+        self.patches = [
+            patch.object(mcp, "HOME", self.home),
+            patch.object(mcp, "MERGES_ROOT", self.merges),
+            patch.object(mcp, "BUNDLE_REGISTRY", self.state / "rlens-latest-complete-bundles.tsv"),
+            patch.object(mcp, "_require_capability", lambda _capability: None),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self) -> None:
+        for item in reversed(self.patches):
+            item.stop()
+        self.tmp.cleanup()
+
+    def _write_bundle_and_repo(self, name: str = "demo-repo") -> tuple[Path, str]:
+        repo = self.home / "repos" / name
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Grabowski Test"], cwd=repo, check=True)
+        (repo / "README.md").write_text("demo\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        stem = f"{name}-max-260701-1200"
+        manifest = self.merges / f"{stem}_merge.bundle.manifest.json"
+        manifest.write_text(json.dumps({
+            "kind": "repolens.bundle.manifest",
+            "run_id": f"{stem}-run",
+            "created_at": "2026-07-01T00:00:00Z",
+            "generator": {"runtime": {"git_commit": head, "git_dirty": False}},
+            "artifacts": [
+                {"role": "canonical_md"},
+                {"role": "sqlite_index"},
+                {"role": "citation_map_jsonl"},
+            ],
+        }), encoding="utf-8")
+        (self.merges / f"{stem}_merge.bundle_health.post.json").write_text(json.dumps({"status": "pass"}), encoding="utf-8")
+        (self.merges / f"{stem}_merge.output_health.json").write_text(json.dumps({"verdict": "pass"}), encoding="utf-8")
+        return manifest, head
+
+    def test_context_pack_consumes_resolved_evidence_hits_with_citation_and_live_address(self) -> None:
+        self._write_bundle_and_repo()
+        preflight = {
+            "status": "pass",
+            "available": True,
+            "answer_compliance_template": {"task_profile": "basic_repo_question"},
+            "does_not_establish": ["actual_agent_reading"],
+        }
+        payload = {
+            "kind": "repobrief.query_existing_index",
+            "status": "available",
+            "resolved_evidence": {
+                "hits": [{
+                    "chunk_id": "c1",
+                    "source_path": "src/app.py",
+                    "text_excerpt": "resolved evidence text",
+                    "source_range": {"file_path": "src/app.py", "start_line": 4, "end_line": 5},
+                    "line_range": {"start_line": 4, "end_line": 5, "display": "4-5"},
+                    "citation_id": "cit_0123456789abcdef",
+                    "citation_status": "resolved",
+                    "citation_verified": True,
+                    "canonical_authority": {"authority": "canonical_brief_source"},
+                    "live_repo_address": {"status": "available", "path": "src/app.py", "git_commit": "a" * 40},
+                    "live_repo_address_status": "available",
+                }]
+            },
+            "mutation_boundary": {"writes": [], "read_paths_do_not_refresh": True},
+            "evidence_resolution_used": True,
+        }
+        with patch.object(mcp, "_rlens_agent_preflight", return_value=preflight), \
+             patch.object(mcp, "_rlens_lenskit_query_existing_index", return_value=payload):
+            result = mcp.rlens_context_pack("demo-repo", query="hello", k=1)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["bounded_evidence"]["normalized_query_shape"], "resolved_evidence.hits")
+        self.assertEqual(result["bounded_evidence"]["resolved_evidence_status"], "available")
+        self.assertEqual(result["bounded_evidence"]["citation_ids"], ["cit_0123456789abcdef"])
+        self.assertEqual(result["context_ref"]["citation_count"], 1)
+        snippet = result["snippets"][0]
+        self.assertEqual(snippet["text_excerpt"], "resolved evidence text")
+        self.assertEqual(snippet["source_range"]["file_path"], "src/app.py")
+        self.assertEqual(snippet["live_repo_address_status"], "available")
+        self.assertEqual(snippet["canonical_authority"]["authority"], "canonical_brief_source")
+
+    def test_context_pack_degrades_when_resolved_evidence_unavailable(self) -> None:
+        self._write_bundle_and_repo()
+        preflight = {"status": "warn", "available": True, "answer_compliance_template": {"task_profile": "basic_repo_question"}}
+        payload = {
+            "kind": "repobrief.query_existing_index",
+            "status": "available",
+            "query_result": {"count": 0, "results": []},
+            "evidence_resolution_used": False,
+        }
+        with patch.object(mcp, "_rlens_agent_preflight", return_value=preflight), \
+             patch.object(mcp, "_rlens_lenskit_query_existing_index", return_value=payload):
+            result = mcp.rlens_context_pack("demo-repo", query="missing", k=1)
+
+        self.assertEqual(result["bounded_evidence"]["resolved_evidence_status"], "degraded")
+        self.assertEqual(
+            result["bounded_evidence"]["degradation_reason"],
+            "resolved_evidence_missing_snippets_ranges_or_citations",
+        )
+        self.assertEqual(result["bounded_evidence"]["snippets"], [])
+        self.assertEqual(result["bounded_evidence"]["ranges"], [])
+        self.assertEqual(result["context_ref"]["resolved_evidence_status"], "degraded")
+
+
 if __name__ == "__main__":
     unittest.main()
