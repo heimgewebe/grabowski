@@ -38,6 +38,8 @@ Example:
 
 Periodically run `grabowski_friction_summary`. Recurring `platform_filter` entries should become typed tools or smaller workflows. Recurring `connector_snapshot` entries require a connector refresh gate. Recurring `fail_closed_gate` entries usually mean the gate is doing its job; improve the runbook, not the permission surface.
 
+The summary also emits `next_grip_proposals`. These are proposal-only, read-only recommendations. They group repeated command-chain, blocked-gate, stale-snapshot, review-loop and missing-receipt-field patterns, link recommendations to bounded `event_id` evidence, and state what the evidence does not prove. They do not create Bureau tasks, change queue priority, execute grips, resume tasks, merge, deploy or authorize policy exceptions.
+
 ## Task failure classification loop
 
 `docs/operator-optimization-plan.md` makes failure signal quality the first optimization slice. Failed persistent tasks are not automatically friction events: a failed task can be an expected red-phase test, a superseded repair attempt, a command-shape error, an environment/tooling problem or a live actionable failure.

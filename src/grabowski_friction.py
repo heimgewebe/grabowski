@@ -105,6 +105,101 @@ ACTION_REQUIRED_FAILURE_CLASSES = frozenset({
     "actionable_failure",
     "unknown",
 })
+PROPOSAL_DOES_NOT_ESTABLISH = (
+    "bureau_queue_mutation",
+    "task_creation",
+    "priority_change",
+    "root_cause",
+    "implementation_readiness",
+    "merge_readiness",
+)
+PATTERN_EVIDENCE_THRESHOLD = 2
+FRICTION_PROPOSAL_PATTERNS: dict[str, dict[str, Any]] = {
+    "command_chains": {
+        "terms": (
+            "command chain",
+            "command-chain",
+            "shell chain",
+            "broad shell",
+            "command shape",
+            "command-shape",
+            "argv",
+            "split commands",
+        ),
+        "recommendation_type": "next_grip",
+        "title": "Extract a narrower typed command grip",
+        "rationale": (
+            "Repeated command-chain friction indicates the operator is using broad "
+            "shell sequences where a typed grip or smaller command helper would "
+            "be easier to validate and resume."
+        ),
+    },
+    "blocked_gates": {
+        "terms": (
+            "blocked gate",
+            "gate blocked",
+            "fail closed",
+            "fail-closed",
+            "policy gate",
+            "gate evidence",
+        ),
+        "recommendation_type": "next_grip",
+        "title": "Add a gate-evidence preparation grip",
+        "rationale": (
+            "Repeated gate friction should become better evidence preparation "
+            "or clearer runbook steps, not an automatic policy bypass."
+        ),
+    },
+    "stale_snapshots": {
+        "terms": (
+            "stale snapshot",
+            "snapshot stale",
+            "connector snapshot",
+            "runtime snapshot",
+            "client snapshot",
+            "contract drift",
+        ),
+        "recommendation_type": "next_grip",
+        "title": "Add a snapshot refresh or drift preflight",
+        "rationale": (
+            "Repeated stale snapshot friction means the operator should refresh "
+            "or compare observable contracts before choosing a mutation path."
+        ),
+    },
+    "review_loops": {
+        "terms": (
+            "review loop",
+            "external review",
+            "self-review",
+            "codex",
+            "claude",
+            "diff hash",
+            "review gate",
+        ),
+        "recommendation_type": "small_bureau_task",
+        "title": "Create a review-evidence workflow task",
+        "rationale": (
+            "Repeated review-loop friction should become a bounded checklist "
+            "or Bureau task for evidence collection and stale-review triage."
+        ),
+    },
+    "missing_receipt_fields": {
+        "terms": (
+            "missing receipt",
+            "receipt missing",
+            "missing field",
+            "missing fields",
+            "receipt field",
+            "receipt schema",
+        ),
+        "recommendation_type": "small_bureau_task",
+        "title": "Tighten receipt schema coverage",
+        "rationale": (
+            "Repeated missing receipt fields should become schema/test work "
+            "for the emitting grip or task adapter."
+        ),
+    },
+}
 EXPECTED_RED_PHASE_TERMS = frozenset({
     "expected red-phase",
     "expected red phase",
@@ -285,6 +380,115 @@ def _decision_event(event: dict[str, Any], failure_class: str) -> dict[str, Any]
     }
 
 
+def _event_id(event: dict[str, Any]) -> str:
+    value = _bounded_summary_text(event.get("event_id"), max_chars=80)
+    return value or "unknown"
+
+
+def _proposal_pattern_hits(event: dict[str, Any], failure_class: str) -> list[str]:
+    hits: list[str] = []
+    haystack = _event_haystack(event)
+    kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
+    if kind == "fail_closed_gate" or failure_class == "policy_gate":
+        hits.append("blocked_gates")
+    if kind == "connector_snapshot":
+        hits.append("stale_snapshots")
+    for pattern, rule in FRICTION_PROPOSAL_PATTERNS.items():
+        terms = rule.get("terms", ())
+        if isinstance(terms, tuple) and any(term in haystack for term in terms):
+            hits.append(pattern)
+    return sorted(set(hits))
+
+
+def _proposal_group(pattern: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    unresolved_events = [event for event in events if event.get("resolved") is not True]
+    failure_classes: dict[str, int] = {}
+    kinds: dict[str, int] = {}
+    surfaces: dict[str, int] = {}
+    for event in events:
+        failure_class = classify_friction_event(event)
+        failure_classes[failure_class] = failure_classes.get(failure_class, 0) + 1
+        kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
+        surface = _known_enum_value(event.get("surface"), FRICTION_SURFACES)
+        kinds[kind] = kinds.get(kind, 0) + 1
+        surfaces[surface] = surfaces.get(surface, 0) + 1
+    return {
+        "pattern": pattern,
+        "count": len(events),
+        "unresolved": len(unresolved_events),
+        "repeated": len(events) >= PATTERN_EVIDENCE_THRESHOLD,
+        "actionable_repeated": len(unresolved_events) >= PATTERN_EVIDENCE_THRESHOLD,
+        "evidence_event_ids": [_event_id(event) for event in events[:20]],
+        "evidence_event_ids_truncated": len(events) > 20,
+        "by_failure_class": dict(sorted(failure_classes.items())),
+        "by_kind": dict(sorted(kinds.items())),
+        "by_surface": dict(sorted(surfaces.items())),
+    }
+
+
+def _recommendation_for_group(group: dict[str, Any]) -> dict[str, Any] | None:
+    if group.get("actionable_repeated") is not True:
+        return None
+    pattern = str(group.get("pattern", ""))
+    rule = FRICTION_PROPOSAL_PATTERNS.get(pattern)
+    if not rule:
+        return None
+    return {
+        "pattern": pattern,
+        "recommendation_type": rule["recommendation_type"],
+        "title": rule["title"],
+        "rationale": rule["rationale"],
+        "evidence_event_ids": list(group.get("evidence_event_ids", [])),
+        "does_not_establish": list(PROPOSAL_DOES_NOT_ESTABLISH),
+    }
+
+
+def propose_next_grip_from_friction(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Group repeated friction into proposal-only next-action hints.
+
+    This is read-only evidence synthesis. It never mutates Bureau, never starts a
+    grip and never promotes a recommendation into a task.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {
+        pattern: [] for pattern in FRICTION_PROPOSAL_PATTERNS
+    }
+    for event in events:
+        failure_class = classify_friction_event(event)
+        for pattern in _proposal_pattern_hits(event, failure_class):
+            grouped.setdefault(pattern, []).append(event)
+
+    groups = [
+        _proposal_group(pattern, grouped_events)
+        for pattern, grouped_events in sorted(grouped.items())
+        if grouped_events
+    ]
+    recommendations = [
+        recommendation
+        for group in groups
+        for recommendation in [_recommendation_for_group(group)]
+        if recommendation is not None
+    ]
+    no_action = not recommendations
+    return {
+        "schema_version": 1,
+        "authority": "proposal_only",
+        "evidence_scope": "recent_valid_events",
+        "evidence_threshold": PATTERN_EVIDENCE_THRESHOLD,
+        "does_not_establish": list(PROPOSAL_DOES_NOT_ESTABLISH),
+        "groups": groups,
+        "recommendations": recommendations,
+        "recommendation_count": len(recommendations),
+        "no_action": {
+            "recommended": no_action,
+            "reason": (
+                "no repeated unresolved friction pattern met the evidence threshold"
+                if no_action
+                else "one or more repeated unresolved friction patterns met the evidence threshold"
+            ),
+        },
+    }
+
+
 def classify_failure_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     by_failure_class: dict[str, int] = {}
     unresolved_by_failure_class: dict[str, int] = {}
@@ -439,6 +643,7 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
         "by_kind": dict(sorted(by_kind.items())),
         "by_surface": dict(sorted(by_surface.items())),
         "failure_classification": classify_failure_events(events),
+        "next_grip_proposals": propose_next_grip_from_friction(events),
         "events": [_bounded_event(event) for event in events],
     }
 
