@@ -14,16 +14,27 @@ The self-review gate validates structure, exact PR file coverage, and current he
 
 Self-review is required for every PR. For every non-exempt PR, Grabowski must also start an external LLM review loop before merge by handing the user a portable review packet. The packet must contain repo, PR number, current head SHA, diff hash, exact reviewer instructions, an evidence template, and the full PR diff as a downloadable file suitable for another model. Required external review remains blocking until returned findings are triaged and supplied as external review evidence, unless the user consciously overrides that gate outside this automated policy.
 
+Create the self-review template and external review packet once per PR head/diff:
+
 ```bash
 python3 tools/pr_review_gate.py \
   --pr <PR_NUMBER> \
   --write-self-review-template evidence/pr-<PR_NUMBER>-self-review-template.json \
   --write-external-review-packet evidence/pr-<PR_NUMBER>-external \
-  --self-review evidence/self-review.json \
-  --external-review-evidence evidence/external-review.json
+  --json
 ```
 
-For high-critical PRs, include `--claude-evidence evidence/claude.json` when Claude CLI evidence is used instead of a current-head trusted Claude review object.
+Then run the repeatable gate check against completed evidence:
+
+```bash
+python3 tools/pr_review_gate.py \
+  --pr <PR_NUMBER> \
+  --self-review evidence/self-review.json \
+  --external-review-evidence evidence/external-review.json \
+  --json
+```
+
+For external-review-exempt PRs, still pass completed `--self-review` evidence and omit only `--external-review-evidence`. For high-critical PRs, include `--claude-evidence evidence/claude.json` when Claude CLI evidence is used instead of a current-head trusted Claude review object.
 
 Minimal self-review evidence object:
 

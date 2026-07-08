@@ -85,7 +85,21 @@ The live context tools compute runtime and checkout state on every call. Static 
 
 ## PR review gate
 
-Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Every PR requires current self-review evidence; non-exempt PRs also require external review evidence. Use `python3 tools/pr_review_gate.py --pr <number> --write-self-review-template <path> --write-external-review-packet <dir> --self-review <path> --external-review-evidence <path> --json` for non-exempt PRs, and omit only the external packet/evidence arguments when the gate classifies the PR as external-review-exempt. Treat a BLOCK verdict as merge-blocking. The self-review template is only a scaffold; it is not passing evidence until Grabowski has actually reviewed the diff, recorded a PASS verdict, review iterations, reviewed files, focus axes, and terminal finding triage.
+Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Every PR requires current self-review evidence; non-exempt PRs also require external review evidence. Generate self-review templates and external review packets in a separate create-only step; then run the gate against completed evidence in a repeatable check step. Treat a BLOCK verdict as merge-blocking. The self-review template is only a scaffold; it is not passing evidence until Grabowski has actually reviewed the diff, recorded a PASS verdict, review iterations, reviewed files, focus axes, and terminal finding triage.
+
+For a non-exempt PR, first generate review scaffolds:
+
+```bash
+python3 tools/pr_review_gate.py --pr <number> --write-self-review-template <path> --write-external-review-packet <dir> --json
+```
+
+Then run the repeatable gate check after evidence is completed:
+
+```bash
+python3 tools/pr_review_gate.py --pr <number> --self-review <path> --external-review-evidence <path> --json
+```
+
+For an external-review-exempt PR, still provide completed self-review evidence and omit only the external packet/evidence arguments from the relevant command.
 
 The gate requires a head-SHA- and `gh pr diff` SHA-256-bound Grabowski self-review, iterative review evidence, terminal triage for every finding at every severity, and expected green checks named `validate (3.10)` and `validate (3.12)`. External LLM review evidence is required for every PR except documentation-only changes and very small uncomplicated changes. Policy-critical documentation and build/config/CI/packaging/tooling changes are not exempt merely because they are text or small. High-critical changes additionally require at least one platform review from Codex or Claude, provided either by a current-head trusted review object or, for Claude CLI, by a valid `--claude-evidence` receipt. Codex and Claude are therefore not the default review path for ordinary PRs; external LLM review packets are.
 

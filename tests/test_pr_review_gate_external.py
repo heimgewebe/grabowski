@@ -543,6 +543,30 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
             self.assertEqual(template["review_iterations"], [])
             self.assertFalse(template["all_findings_triaged"])
 
+    def test_write_self_review_template_requires_repo_name(self) -> None:
+        state = _state("src/feature.py")
+        state.pop("repoName")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            with self.assertRaisesRegex(gate.GateInputError, "cannot write self-review template without repo name"):
+                gate.write_self_review_template(path, state)
+
+    def test_write_self_review_template_requires_complete_file_list(self) -> None:
+        state = _state("src/feature.py")
+        state["pr"]["files"] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            with self.assertRaisesRegex(gate.GateInputError, "complete current PR file list"):
+                gate.write_self_review_template(path, state)
+
+    def test_write_self_review_template_rejects_incomplete_file_list(self) -> None:
+        state = _state("src/feature.py")
+        state["pr"]["changedFiles"] = 2
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            with self.assertRaisesRegex(gate.GateInputError, "current PR file list is incomplete"):
+                gate.write_self_review_template(path, state)
+
     def test_write_self_review_template_refuses_to_overwrite_existing_file(self) -> None:
         state = _state("src/feature.py")
         with tempfile.TemporaryDirectory() as tmpdir:

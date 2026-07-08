@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +40,7 @@ class PrReviewGateCliTests(unittest.TestCase):
     def test_unavailable_review_reason_warns_but_no_cli_bypass_exists(self) -> None:
         marker = "cod" + "ex"
         state = {
+            "repoName": "heimgewebe/grabowski",
             "pr_diff_bypass": True,
             "pr_diff_bypass_reason": "legacy unit seam without live PR diff",
             "pr": {
@@ -82,6 +88,7 @@ class PrReviewGateCliTests(unittest.TestCase):
     def test_pr_comment_self_review_text_does_not_satisfy_self_review_evidence(self) -> None:
         head = "a" * 40
         state = {
+            "repoName": "heimgewebe/grabowski",
             "pr_diff_bypass": True,
             "pr_diff_bypass_reason": "legacy unit seam without live PR diff",
             "pr": {
@@ -268,6 +275,34 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         self.assertIn("self-review kind must be grabowski_self_review", result["failures"])
         self.assertFalse(result["review_sources"]["self_review_workflow_valid"])
 
+    def test_self_review_current_pr_number_is_required(self) -> None:
+        state = self._state()
+        state["pr"].pop("number")
+        result = pr_review_gate.evaluate_review_gate(state, self_review=self._review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("current PR state is missing integer PR number", result["failures"])
+
+    def test_self_review_current_pr_number_rejects_bool(self) -> None:
+        state = self._state()
+        state["pr"]["number"] = True
+        result = pr_review_gate.evaluate_review_gate(state, self_review=self._review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("current PR state is missing integer PR number", result["failures"])
+
+    def test_self_review_current_repo_name_is_required(self) -> None:
+        state = self._state()
+        state.pop("repoName")
+        result = pr_review_gate.evaluate_review_gate(state, self_review=self._review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("current gate state is missing repoName", result["failures"])
+
+    def test_self_review_file_coverage_requires_complete_pr_file_list(self) -> None:
+        state = self._state()
+        state["pr"]["changedFiles"] = 2
+        result = pr_review_gate.evaluate_review_gate(state, self_review=self._review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("current PR file list is incomplete", result["failures"])
+
     def test_self_review_schema_version_is_required(self) -> None:
         review = self._review()
         review.pop("schema_version")
@@ -291,6 +326,13 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("self-review pr number mismatch", result["failures"])
 
+    def test_self_review_file_coverage_accepts_repeated_dot_slash_prefix(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=["././docs/low_risk_note.md"]),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+
     def test_self_review_file_coverage_accepts_dot_slash_prefix(self) -> None:
         result = pr_review_gate.evaluate_review_gate(
             self._state(),
@@ -309,6 +351,38 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
             "self-review reviewed_files does not cover PR file(s): docs/low_risk_note.md",
             result["failures"],
         )
+
+    def test_self_review_file_coverage_rejects_backslashes(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=[r"docs\low_risk_note.md"]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review reviewed_files contains invalid path at index 0", result["failures"])
+
+    def test_self_review_file_coverage_rejects_double_slashes(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=["docs//low_risk_note.md"]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review reviewed_files contains invalid path at index 0", result["failures"])
+
+    def test_self_review_file_coverage_rejects_control_characters(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=["docs/low\t_risk_note.md"]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review reviewed_files contains invalid path at index 0", result["failures"])
+
+    def test_self_review_file_coverage_rejects_dot_segments(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=["docs/./low_risk_note.md"]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review reviewed_files contains invalid path at index 0", result["failures"])
 
     def test_self_review_file_coverage_rejects_parent_segments(self) -> None:
         result = pr_review_gate.evaluate_review_gate(
@@ -368,6 +442,63 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
             "self-review review_focus missing required item(s): regression_risk, security, integration",
             result["failures"],
         )
+
+    def test_self_review_gate_valid_includes_full_self_review_requirements(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(diff_reviewed=False),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(result["review_sources"]["self_review_workflow_valid"])
+        self.assertTrue(result["review_sources"]["self_review_metadata_valid"])
+        self.assertFalse(result["review_sources"]["self_review_gate_valid"])
+
+    def test_write_self_review_template_cli_emits_template_metadata(self) -> None:
+        state = self._state()
+        state["pr_diff_sha256"] = "0" * 64
+        build = ROOT / "build"
+        build.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=build) as tmpdir:
+            template_path = Path(tmpdir) / "self-review-template.json"
+            stdout = io.StringIO()
+            with mock.patch.object(pr_review_gate, "load_pr_state", return_value=state), contextlib.redirect_stdout(stdout):
+                rc = pr_review_gate.main(["--pr", "58", "--write-self-review-template", str(template_path), "--json"])
+            self.assertEqual(rc, 2)
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(result["self_review_template"]["path"], str(template_path))
+            self.assertEqual(result["self_review_template"]["diff_sha256"], "0" * 64)
+            self.assertTrue(template_path.is_file())
+
+    def test_write_self_review_template_cli_blocks_existing_file(self) -> None:
+        state = self._state()
+        state["pr_diff_sha256"] = "0" * 64
+        build = ROOT / "build"
+        build.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=build) as tmpdir:
+            template_path = Path(tmpdir) / "self-review-template.json"
+            template_path.write_text("existing", encoding="utf-8")
+            stdout = io.StringIO()
+            with mock.patch.object(pr_review_gate, "load_pr_state", return_value=state), contextlib.redirect_stdout(stdout):
+                rc = pr_review_gate.main(["--pr", "58", "--write-self-review-template", str(template_path), "--json"])
+            self.assertEqual(rc, 2)
+            result = json.loads(stdout.getvalue())
+            self.assertIn("self-review template already exists", result["failures"][0])
+            self.assertEqual(template_path.read_text(encoding="utf-8"), "existing")
+
+    def test_write_self_review_template_cli_blocks_missing_diff_hash(self) -> None:
+        state = self._state()
+        state["pr_diff_error"] = "gh pr diff failed"
+        build = ROOT / "build"
+        build.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=build) as tmpdir:
+            template_path = Path(tmpdir) / "self-review-template.json"
+            stdout = io.StringIO()
+            with mock.patch.object(pr_review_gate, "load_pr_state", return_value=state), contextlib.redirect_stdout(stdout):
+                rc = pr_review_gate.main(["--pr", "58", "--write-self-review-template", str(template_path), "--json"])
+            self.assertEqual(rc, 2)
+            result = json.loads(stdout.getvalue())
+            self.assertIn("cannot write self-review template without current PR diff SHA-256", result["failures"][0])
+            self.assertFalse(template_path.exists())
 
     def test_claude_evidence_repo_mismatch_blocks(self) -> None:
         result = pr_review_gate.evaluate_review_gate(
