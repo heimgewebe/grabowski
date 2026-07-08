@@ -105,7 +105,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_recovery_server_probe` | recovery | no | high | Produce fresh server recovery evidence. |
 | `grabowski_friction_record` | operations-observability | no | medium | Record one bounded operator-friction event for later analysis. |
 | `grabowski_friction_summary` | operations-observability | yes | low | Summarize recent bounded operator-friction events. |
-| `grabowski_operator_recall_export` | operations-observability | yes | low | Export evidence-bound operator recall items from provided receipts, PRs, Bureau tasks and friction records. |
+| `grabowski_operator_recall_export` | operations-observability | yes | low | Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth. |
 | `grabowski_resource_acquire` | resource | no | medium | Atomically acquire typed resource leases for one owner. |
 | `grabowski_resource_renew` | resource | no | medium | Renew live resource leases owned by one owner. |
 | `grabowski_resource_release` | resource | no | high | Release owner-bound resource leases with an explicit force override. |

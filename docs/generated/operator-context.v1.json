@@ -989,7 +989,7 @@
       "description": "Export evidence-bound operator recall items from provided source records.",
       "effects": [],
       "id": "grabowski_operator_recall_export",
-      "purpose": "Export evidence-bound operator recall items from provided receipts, PRs, Bureau tasks and friction records.",
+      "purpose": "Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -1496,7 +1496,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "5ab6ad0b27d2c45b465c86bb324ac1b265011de627afcbc4194a1593b23a3374"
+      "sha256": "ce9b8f113e877ecd899038a6744536ab5780aa6d1858e578c153d8d51079504b"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1508,7 +1508,7 @@
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "5ab6ad0b27d2c45b465c86bb324ac1b265011de627afcbc4194a1593b23a3374",
+      "src/grabowski_capabilities.py": "ce9b8f113e877ecd899038a6744536ab5780aa6d1858e578c153d8d51079504b",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
@@ -1519,7 +1519,7 @@
       "src/grabowski_operator.py": "df7bed5d1955f7d48adc12f114de9d877f8de9f6a12a7d160efc8aa44d5b5ddd",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
       "src/grabowski_read_surface.py": "1e8147ea845e8a9cc5ab723140dc996965f7aebb2183af74164de30d24f97928",
-      "src/grabowski_recall.py": "035f066983ca8f6cec10afbcaf3bc65c7b4c82ad43b267d40f8f143eaa0ffbf7",
+      "src/grabowski_recall.py": "c4f3039a97a05cbfab74034901404fd737275ec8f2bc21492d0acfae0d222f4a",
       "src/grabowski_recovery.py": "b0c5124271498639f6c16614ccb51f7b3b696ebfd88011ad2291d353e56d0fe6",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",

@@ -12,7 +12,17 @@ READ_ONLY = operator.READ_ONLY
 
 RECALL_KIND = "grabowski_operator_recall_item"
 MAX_RECALL_TEXT_CHARS = 500
+MAX_RECALL_LIMIT = 500
 MAX_EVIDENCE_REFS = 20
+MAX_REJECTED_SOURCES = 20
+MAX_REJECTION_DETAIL_CHARS = 160
+SOURCE_TRUST = "caller_supplied_unverified"
+EVIDENCE_BINDING = "requires_concrete_ref_but_does_not_verify_source"
+HEIMLERN_OFFLINE_LEARNING_BOUNDARY = {
+    "allowed": True,
+    "mode": "offline_proposal_only",
+    "does_not_establish": ["live_routing_change", "merge_policy_change", "task_completion"],
+}
 RECALL_DOES_NOT_ESTABLISH = (
     "free_form_chat_memory",
     "policy_oracle",
@@ -21,6 +31,10 @@ RECALL_DOES_NOT_ESTABLISH = (
     "merge_readiness",
     "live_routing_change",
     "heimlern_live_update",
+    "evidence_authenticity",
+    "source_record_authenticity",
+    "source_record_completeness",
+    "current_truth",
 )
 SUPPORTED_SOURCE_KEYS = (
     "receipts",
@@ -36,36 +50,59 @@ SUPPORTED_EVIDENCE_TYPES = {
 }
 
 
+def _has_control_character(text: str) -> bool:
+    return any(ord(char) < 32 or ord(char) == 127 for char in text)
+
+
 def _bounded_text(value: Any, *, label: str, max_chars: int = MAX_RECALL_TEXT_CHARS) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{label} must be a string")
     text = operator._redact(value).strip()
     if not text:
         raise ValueError(f"{label} must be non-empty")
-    if "\x00" in text:
-        raise ValueError(f"{label} must not contain NUL")
+    if _has_control_character(text):
+        raise ValueError(f"{label} must not contain control characters")
     if len(text) > max_chars:
         return text[: max_chars - 1] + "…"
     return text
 
 
 def _optional_bounded_text(value: Any, *, max_chars: int = MAX_RECALL_TEXT_CHARS) -> str | None:
-    if not isinstance(value, str):
+    try:
+        return _bounded_text(value, label="optional text", max_chars=max_chars)
+    except ValueError:
         return None
-    text = operator._redact(value).strip()
-    if not text:
-        return None
-    if "\x00" in text:
-        return None
-    if len(text) > max_chars:
-        return text[: max_chars - 1] + "…"
-    return text
+
+
+def _bounded_id(value: Any, *, label: str, max_chars: int = 160) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError(f"{label} must be a string or positive integer id")
+    if isinstance(value, int) and value < 1:
+        raise ValueError(f"{label} must be a positive integer id")
+    return _bounded_text(str(value), label=label, max_chars=max_chars)
+
+
+def _positive_int(value: Any, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _bounded_rejection_detail(value: Any) -> str:
+    return _bounded_text(str(value), label="rejection detail", max_chars=MAX_REJECTION_DETAIL_CHARS)
+
+
+def _unsupported_source_key(value: Any) -> str:
+    try:
+        return _bounded_text(str(value), label="unsupported source key", max_chars=120)
+    except ValueError:
+        return "<invalid-key>"
 
 
 def _evidence_ref(evidence_type: str, evidence_id: Any, **extra: Any) -> dict[str, Any]:
     if evidence_type not in SUPPORTED_EVIDENCE_TYPES:
         raise ValueError("evidence type is unsupported")
-    evidence_id_text = _bounded_text(str(evidence_id) if evidence_id is not None else "", label="evidence id", max_chars=160)
+    evidence_id_text = _bounded_id(evidence_id, label="evidence id", max_chars=160)
     ref: dict[str, Any] = {
         "type": evidence_type,
         "id": evidence_id_text,
@@ -148,9 +185,12 @@ def _receipt_recall(record: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _pr_recall(record: dict[str, Any]) -> dict[str, Any] | None:
-    number = record.get("number") or record.get("pr")
+    raw_number = record["number"] if "number" in record else record.get("pr")
+    if raw_number is None:
+        return None
+    number = _positive_int(raw_number, label="pr number")
     repo = _optional_bounded_text(record.get("repo"), max_chars=160)
-    if number is None or not repo:
+    if not repo:
         return None
     title = _optional_bounded_text(record.get("title"), max_chars=180) or f"PR {number}"
     state = _optional_bounded_text(record.get("state"), max_chars=80) or "unknown"
@@ -206,30 +246,48 @@ def _friction_record_recall(record: dict[str, Any]) -> dict[str, Any] | None:
 def export_operator_recall(sources: dict[str, Any], *, limit: int = 50) -> dict[str, Any]:
     if not isinstance(sources, dict):
         raise ValueError("sources must be an object")
-    if not isinstance(limit, int) or limit < 1 or limit > 500:
-        raise ValueError("limit must be between 1 and 500")
+    if not isinstance(limit, int) or limit < 1 or limit > MAX_RECALL_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_RECALL_LIMIT}")
     builders = {
         "receipts": _receipt_recall,
         "prs": _pr_recall,
         "bureau_tasks": _bureau_task_recall,
         "friction_records": _friction_record_recall,
     }
-    items: list[dict[str, Any]] = []
-    rejected_sources: list[dict[str, Any]] = []
+    unsupported_source_keys = sorted(
+        _unsupported_source_key(key)
+        for key in sources
+        if key not in SUPPORTED_SOURCE_KEYS
+    )
     source_counts: dict[str, int] = {}
+    normalized_sources: dict[str, list[Any]] = {}
     for key in SUPPORTED_SOURCE_KEYS:
         raw_records = sources.get(key, [])
         if raw_records is None:
             raw_records = []
         if not isinstance(raw_records, list):
             raise ValueError(f"{key} must be a list")
+        normalized_sources[key] = raw_records
         source_counts[key] = len(raw_records)
+
+    items: list[dict[str, Any]] = []
+    rejected_sources: list[dict[str, Any]] = []
+    for key in SUPPORTED_SOURCE_KEYS:
         builder = builders[key]
-        for index, record in enumerate(raw_records):
+        for index, record in enumerate(normalized_sources[key]):
             if not isinstance(record, dict):
                 rejected_sources.append({"source": key, "index": index, "reason": "not_object"})
                 continue
-            item = builder(record)
+            try:
+                item = builder(record)
+            except ValueError as exc:
+                rejected_sources.append({
+                    "source": key,
+                    "index": index,
+                    "reason": "invalid_source_record",
+                    "detail": _bounded_rejection_detail(str(exc)),
+                })
+                continue
             if item is None:
                 rejected_sources.append({"source": key, "index": index, "reason": "missing_concrete_evidence_ref"})
                 continue
@@ -242,17 +300,19 @@ def export_operator_recall(sources: dict[str, Any], *, limit: int = 50) -> dict[
         "schema_version": 1,
         "kind": "grabowski_operator_recall_export",
         "authority": "derived_evidence_records",
+        "source_trust": SOURCE_TRUST,
+        "evidence_binding": EVIDENCE_BINDING,
         "limit": limit,
         "source_counts": source_counts,
+        "unsupported_source_key_count": len(unsupported_source_keys),
+        "unsupported_source_keys": unsupported_source_keys,
         "returned": len(items),
+        "stopped_on_limit": len(items) >= limit,
         "rejected_source_count": len(rejected_sources),
-        "rejected_sources": rejected_sources[:MAX_EVIDENCE_REFS],
+        "rejected_sources": rejected_sources[:MAX_REJECTED_SOURCES],
+        "rejected_sources_truncated": len(rejected_sources) > MAX_REJECTED_SOURCES,
         "items": items,
-        "heimlern_offline_learning": {
-            "allowed": True,
-            "mode": "offline_proposal_only",
-            "does_not_establish": ["live_routing_change", "merge_policy_change", "task_completion"],
-        },
+        "heimlern_offline_learning": dict(HEIMLERN_OFFLINE_LEARNING_BOUNDARY),
         "does_not_establish": list(RECALL_DOES_NOT_ESTABLISH),
     }
 

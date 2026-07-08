@@ -73,6 +73,10 @@ class RecallTests(unittest.TestCase):
 
         self.assertEqual(export["kind"], "grabowski_operator_recall_export")
         self.assertEqual(export["authority"], "derived_evidence_records")
+        self.assertEqual(export["source_trust"], "caller_supplied_unverified")
+        self.assertEqual(export["evidence_binding"], "requires_concrete_ref_but_does_not_verify_source")
+        self.assertIn("evidence_authenticity", export["does_not_establish"])
+        self.assertIn("current_truth", export["does_not_establish"])
         self.assertEqual(export["returned"], 4)
         self.assertEqual(export["rejected_source_count"], 0)
         self.assertEqual({item["source"] for item in export["items"]}, {"receipt", "pr", "bureau_task", "friction_record"})
@@ -102,6 +106,124 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(export["returned"], 0)
         self.assertEqual(export["rejected_source_count"], 1)
         self.assertEqual(export["rejected_sources"][0]["reason"], "missing_concrete_evidence_ref")
+
+    def test_caller_supplied_refs_do_not_establish_authenticity_or_current_truth(self) -> None:
+        module = self._load_module()
+        export = module.export_operator_recall({"prs": [{"repo": "heimgewebe/grabowski", "number": 999999, "state": "MERGED"}]})
+
+        self.assertEqual(export["returned"], 1)
+        self.assertEqual(export["source_trust"], "caller_supplied_unverified")
+        self.assertEqual(export["evidence_binding"], "requires_concrete_ref_but_does_not_verify_source")
+        self.assertIn("evidence_authenticity", export["does_not_establish"])
+        self.assertIn("source_record_authenticity", export["does_not_establish"])
+        self.assertIn("current_truth", export["does_not_establish"])
+
+    def test_invalid_pr_numbers_are_rejected_per_record(self) -> None:
+        module = self._load_module()
+        export = module.export_operator_recall({
+            "prs": [
+                {"repo": "heimgewebe/grabowski", "number": True},
+                {"repo": "heimgewebe/grabowski", "number": 0},
+                {"repo": "heimgewebe/grabowski", "number": -1},
+                {"repo": "heimgewebe/grabowski", "number": "114"},
+            ]
+        })
+
+        self.assertEqual(export["returned"], 0)
+        self.assertEqual(export["rejected_source_count"], 4)
+        self.assertEqual({item["reason"] for item in export["rejected_sources"]}, {"invalid_source_record"})
+
+    def test_non_scalar_evidence_id_is_rejected_per_record(self) -> None:
+        module = self._load_module()
+        export = module.export_operator_recall({"receipts": [{"receipt_id": {"bad": "object"}, "phase": "x"}]})
+
+        self.assertEqual(export["returned"], 0)
+        self.assertEqual(export["rejected_source_count"], 1)
+        self.assertEqual(export["rejected_sources"][0]["reason"], "invalid_source_record")
+
+    def test_required_control_char_text_is_rejected(self) -> None:
+        module = self._load_module()
+        with self.assertRaisesRegex(ValueError, "control characters"):
+            module.build_recall_item(
+                topic="bad\nline",
+                situation="situation",
+                attempt="attempt",
+                result="result",
+                learned_rule="rule",
+                evidence_refs=[{"type": "receipt", "id": "r1"}],
+                source="receipt",
+            )
+
+    def test_unsupported_source_keys_are_reported(self) -> None:
+        module = self._load_module()
+        export = module.export_operator_recall({"memories": [{"text": "remember this"}]})
+
+        self.assertEqual(export["unsupported_source_keys"], ["memories"])
+        self.assertEqual(export["unsupported_source_key_count"], 1)
+        self.assertEqual(export["returned"], 0)
+
+    def test_rejected_sources_are_bounded_and_marked_truncated(self) -> None:
+        module = self._load_module()
+        export = module.export_operator_recall({"prs": [{"repo": "heimgewebe/grabowski", "number": 0} for _ in range(module.MAX_REJECTED_SOURCES + 3)]})
+
+        self.assertEqual(export["rejected_source_count"], module.MAX_REJECTED_SOURCES + 3)
+        self.assertTrue(export["rejected_sources_truncated"])
+        self.assertEqual(len(export["rejected_sources"]), module.MAX_REJECTED_SOURCES)
+
+    def test_limit_preserves_full_source_counts(self) -> None:
+        module = self._load_module()
+        export = module.export_operator_recall(
+            {
+                "receipts": [{"receipt_id": "r1"}, {"receipt_id": "r2"}],
+                "prs": [{"repo": "heimgewebe/grabowski", "number": 1}, {"repo": "heimgewebe/grabowski", "number": 2}],
+                "bureau_tasks": [{"id": "T1"}, {"id": "T2"}],
+                "friction_records": [{"event_id": "f1"}, {"event_id": "f2"}],
+            },
+            limit=1,
+        )
+
+        self.assertEqual(export["returned"], 1)
+        self.assertTrue(export["stopped_on_limit"])
+        self.assertEqual(export["source_counts"], {"receipts": 2, "prs": 2, "bureau_tasks": 2, "friction_records": 2})
+
+    def test_too_many_evidence_refs_are_rejected(self) -> None:
+        module = self._load_module()
+        with self.assertRaisesRegex(ValueError, "too many evidence references"):
+            module.build_recall_item(
+                topic="topic",
+                situation="situation",
+                attempt="attempt",
+                result="result",
+                learned_rule="rule",
+                evidence_refs=[{"type": "receipt", "id": f"r{i}"} for i in range(module.MAX_EVIDENCE_REFS + 1)],
+                source="receipt",
+            )
+
+    def test_required_long_strings_are_bounded(self) -> None:
+        module = self._load_module()
+        long_text = "x" * (module.MAX_RECALL_TEXT_CHARS + 25)
+        item = module.build_recall_item(
+            topic="topic",
+            situation=long_text,
+            attempt="attempt",
+            result="result",
+            learned_rule="rule",
+            evidence_refs=[{"type": "receipt", "id": "r1"}],
+            source="receipt",
+        )
+
+        self.assertLessEqual(len(item["situation"]), module.MAX_RECALL_TEXT_CHARS)
+        self.assertTrue(item["situation"].endswith("…"))
+
+    def test_operator_recall_doc_states_boundary(self) -> None:
+        doc = (ROOT / "docs/operator-recall.md").read_text(encoding="utf-8")
+
+        self.assertIn("caller_supplied_unverified", doc)
+        self.assertIn("free_form_chat_memory", doc)
+        self.assertIn("policy_oracle", doc)
+        self.assertIn("offline_proposal_only", doc)
+        self.assertIn("does not verify", doc)
+
 
     def test_heimlern_boundary_is_offline_proposal_only(self) -> None:
         module = self._load_module()

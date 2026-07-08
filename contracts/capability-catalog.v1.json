@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "5ab6ad0b27d2c45b465c86bb324ac1b265011de627afcbc4194a1593b23a3374",
+  "capability_source_sha256": "ce9b8f113e877ecd899038a6744536ab5780aa6d1858e578c153d8d51079504b",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "73e027b006ec8cf283a935cba8bf2669f0827afab417588c2303211e31eca4ff",
   "integrity": {
@@ -1001,7 +1001,7 @@
       "description": "Export evidence-bound operator recall items from provided source records.",
       "effects": [],
       "id": "grabowski_operator_recall_export",
-      "purpose": "Export evidence-bound operator recall items from provided receipts, PRs, Bureau tasks and friction records.",
+      "purpose": "Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
