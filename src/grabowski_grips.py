@@ -242,6 +242,8 @@ CAPTAIN_GATE_IDS = (
 )
 CAPTAIN_EXECUTABLE_ACTIONS = frozenset({"pr-merge"})
 CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY = "act_unless_irreversible_or_ambiguous"
+CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT = 4096
+CAPTAIN_POST_MERGE_VERIFY_ATTEMPTS = 3
 CAPTAIN_DOES_NOT_ESTABLISH = (
     "automatic_merge_authority",
     "automatic_deploy_authority",
@@ -563,6 +565,46 @@ def _returncode(result: dict[str, Any]) -> int:
         return int(result.get("returncode", 1))
     except (TypeError, ValueError):
         return 1
+
+
+def _bounded_command_output(value: Any, *, limit: int = CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...[truncated {len(text) - limit} chars]"
+
+
+def _command_result_info(result: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        stderr = f"command runner returned non-object result: {type(result).__name__}"
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": stderr,
+            "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "schema_warning": "result_not_mapping",
+        }
+    stdout = str(result.get("stdout", ""))
+    stderr = str(result.get("stderr", ""))
+    info: dict[str, Any] = {
+        "returncode": _returncode(result),
+        "stdout": _bounded_command_output(stdout),
+        "stderr": _bounded_command_output(stderr),
+        "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
+        "stdout_truncated": len(stdout) > CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT,
+        "stderr_truncated": len(stderr) > CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT,
+    }
+    if "returncode" not in result:
+        info["schema_warning"] = "returncode_missing"
+    elif not isinstance(result.get("returncode"), int) or isinstance(result.get("returncode"), bool):
+        info["schema_warning"] = "returncode_not_integer"
+    return info
 
 
 def _external_review_evidence_errors(evidence: Any, *, expected_head: str | None) -> list[str]:
@@ -2051,6 +2093,22 @@ def _captain_concrete_string(target: dict[str, Any], key: str, *, index: int, ac
     return value
 
 
+def _captain_base_branch(target: dict[str, Any], key: str, *, index: int) -> str:
+    value = _captain_concrete_string(target, key, index=index, action_name="pr-merge")
+    lowered = value.lower()
+    if lowered.startswith("refs/"):
+        raise GripPreflightError(f"actions[{index}].target.{key} must be a short branch name, not a ref")
+    if value.startswith("-") or ":" in value or ".." in value:
+        raise GripPreflightError(f"actions[{index}].target.{key} must be a safe short branch name")
+    if any(char.isspace() or ord(char) < 32 for char in value):
+        raise GripPreflightError(f"actions[{index}].target.{key} must not contain whitespace or control characters")
+    if any(segment in {"", ".", ".."} for segment in value.split("/")):
+        raise GripPreflightError(f"actions[{index}].target.{key} must not contain empty or relative path segments")
+    if value.endswith("/") or any(segment.endswith(".lock") for segment in value.split("/")):
+        raise GripPreflightError(f"actions[{index}].target.{key} must be a safe short branch name")
+    return value
+
+
 def _captain_optional_string(target: dict[str, Any], key: str, *, index: int, action_name: str) -> str | None:
     if key not in target or target.get(key) is None:
         return None
@@ -2076,7 +2134,7 @@ def _validate_captain_target(action_name: str, target: dict[str, Any], *, index:
         pr = target.get("pr")
         if type(pr) is not int or pr <= 0:
             raise GripPreflightError(f"actions[{index}].target.pr must be a positive integer")
-        _captain_concrete_string(target, "base", index=index, action_name="pr-merge")
+        _captain_base_branch(target, "base", index=index)
     elif action_name == "runtime-deploy":
         origin_key, runtime_origin = _captain_exactly_one_target_key(
             target, ("repo", "service"), index=index, action_name="runtime-deploy"
@@ -2391,6 +2449,7 @@ def _captain_trusted_owner_autonomy_ready(parameters: dict[str, Any], actions: l
         and parameters.get("autonomy_policy") == CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY
         and bool(actions)
         and all(action.get("irreversibility") == "reversible" for action in actions)
+        and all(action.get("action") in CAPTAIN_EXECUTABLE_ACTIONS for action in actions)
     )
 
 
@@ -2416,6 +2475,14 @@ def _captain_autonomy_policy_gate(parameters: dict[str, Any], actions: list[dict
             "blocked",
             "trusted_owner_mode requires the explicit autonomy policy",
             ["trusted_owner_autonomy_policy_missing"],
+        )
+    unsupported = [str(action.get("action")) for action in actions if action.get("action") not in CAPTAIN_EXECUTABLE_ACTIONS]
+    if unsupported:
+        return _captain_gate(
+            "autonomy-policy",
+            "blocked",
+            "trusted-owner autonomy requires an implemented Captain executor",
+            [f"captain_executor_unavailable:{name}" for name in unsupported],
         )
     irreversible = [str(action.get("action")) for action in actions if action.get("irreversibility") == "irreversible"]
     if irreversible:
@@ -2577,13 +2644,11 @@ def _captain_pr_view(
         "--json",
         "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,isDraft,mergeable,mergeStateStatus",
     ]
-    view_result = github_runner(repo_path, view_args)
-    info = {
-        "command": ["gh", *view_args],
-        "returncode": _returncode(view_result),
-        "stdout": view_result.get("stdout", ""),
-        "stderr": view_result.get("stderr", ""),
-    }
+    try:
+        view_result = github_runner(repo_path, view_args)
+    except Exception as exc:  # pragma: no cover - defensive receipt boundary
+        view_result = {"returncode": 1, "stdout": "", "stderr": f"gh pr view runner exception: {type(exc).__name__}: {exc}"}
+    info = {"command": ["gh", *view_args], **_command_result_info(view_result)}
     if info["returncode"] != 0:
         info["error"] = str(view_result.get("stderr") or view_result.get("stdout") or "gh pr view failed")
         return None, info
@@ -2600,23 +2665,71 @@ def _captain_pr_view(
 
 def _captain_pr_merge_preflight_errors(viewed: dict[str, Any], *, expected_head: str, expected_base: str) -> list[str]:
     errors: list[str] = []
+    required = ("state", "isDraft", "headRefOid", "baseRefName", "mergeable", "mergeStateStatus")
+    for key in required:
+        if key not in viewed:
+            errors.append(f"pr_view_missing_{key}")
+    if errors:
+        return errors
     if viewed.get("state") == "MERGED":
         errors.append("pr_already_merged_before_execution")
     elif viewed.get("state") != "OPEN":
         errors.append("pr_not_open_before_execution")
-    if viewed.get("isDraft") is True:
-        errors.append("pr_is_draft_before_execution")
+    if viewed.get("isDraft") is not False:
+        errors.append("pr_draft_state_not_confirmed_before_execution")
     if viewed.get("headRefOid") != expected_head:
         errors.append("pr_head_does_not_match_expected_head_before_execution")
     if viewed.get("baseRefName") != expected_base:
         errors.append("pr_base_does_not_match_expected_base_before_execution")
-    mergeable = viewed.get("mergeable")
-    if mergeable is not None and mergeable not in {"MERGEABLE", "UNKNOWN"}:
-        errors.append("pr_not_mergeable_before_execution")
-    merge_state = viewed.get("mergeStateStatus")
-    if merge_state is not None and merge_state not in {"CLEAN", "UNKNOWN"}:
+    if viewed.get("mergeable") != "MERGEABLE":
+        errors.append("pr_mergeable_not_confirmed_before_execution")
+    if viewed.get("mergeStateStatus") != "CLEAN":
         errors.append("pr_merge_state_not_clean_before_execution")
     return errors
+
+
+def _captain_pr_merge_verify_errors(viewed: dict[str, Any], *, expected_head: str, expected_base: str) -> list[str]:
+    errors: list[str] = []
+    required = ("state", "headRefOid", "baseRefName")
+    for key in required:
+        if key not in viewed:
+            errors.append(f"pr_verify_missing_{key}")
+    if errors:
+        return errors
+    if viewed.get("state") != "MERGED":
+        errors.append("pr_not_merged_after_execution")
+    if viewed.get("headRefOid") != expected_head:
+        errors.append("merged_pr_head_does_not_match_expected_head")
+    if viewed.get("baseRefName") != expected_base:
+        errors.append("merged_pr_base_does_not_match_expected_base")
+    return errors
+
+
+def _captain_pr_merge_post_view(
+    repo_path: Path,
+    github_runner: GithubRunner,
+    *,
+    repo_slug: str,
+    pr_number: str,
+    expected_head: str,
+    expected_base: str,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[str]]:
+    attempts: list[dict[str, Any]] = []
+    last_viewed: dict[str, Any] | None = None
+    last_errors: list[str] = ["post_merge_view_not_attempted"]
+    for attempt in range(1, CAPTAIN_POST_MERGE_VERIFY_ATTEMPTS + 1):
+        viewed, info = _captain_pr_view(repo_path, github_runner, repo_slug=repo_slug, pr_number=pr_number)
+        attempt_record = dict(info)
+        attempt_record["attempt"] = attempt
+        attempts.append(attempt_record)
+        if viewed is None:
+            last_errors = [str(info.get("error") or "gh pr view failed after merge")]
+            continue
+        last_viewed = viewed
+        last_errors = _captain_pr_merge_verify_errors(viewed, expected_head=expected_head, expected_base=expected_base)
+        if not last_errors:
+            return viewed, attempts, []
+    return last_viewed, attempts, last_errors
 
 
 def _run_captain_pr_merge(
@@ -2665,29 +2778,34 @@ def _run_captain_pr_merge(
         "--match-head-commit",
         expected_head,
     ]
-    merge_result = _github(repo_path, github_runner, merge_args)
-    execution_result.update(
-        {
-            "execution_attempted": True,
-            "merge_command": ["gh", *merge_args],
-            "merge_stdout": merge_result.get("stdout", ""),
-            "merge_stderr": merge_result.get("stderr", ""),
-        }
+    execution_result["execution_attempted"] = True
+    execution_result["merge_command"] = ["gh", *merge_args]
+    try:
+        merge_result = github_runner(repo_path, merge_args)
+    except Exception as exc:  # pragma: no cover - defensive receipt boundary
+        merge_result = {"returncode": 1, "stdout": "", "stderr": f"gh pr merge runner exception: {type(exc).__name__}: {exc}"}
+    merge_info = _command_result_info(merge_result)
+    execution_result["merge_result"] = merge_info
+    execution_result["merge_returncode"] = merge_info["returncode"]
+    execution_result["merge_stdout"] = merge_info["stdout"]
+    execution_result["merge_stderr"] = merge_info["stderr"]
+    viewed, view_attempts, verify_errors = _captain_pr_merge_post_view(
+        repo_path,
+        github_runner,
+        repo_slug=repo_slug,
+        pr_number=pr_number,
+        expected_head=expected_head,
+        expected_base=expected_base,
     )
-    viewed, view_info = _captain_pr_view(repo_path, github_runner, repo_slug=repo_slug, pr_number=pr_number)
-    execution_result["verify_view_result"] = view_info
-    if viewed is None:
-        execution_result["verification_error"] = str(view_info.get("error") or "gh pr view failed after merge")
-        return execution_result
+    execution_result["verify_view_attempts"] = view_attempts
     execution_result["verified_pr"] = viewed
-    if viewed.get("state") != "MERGED":
-        execution_result["verification_error"] = "PR merge command returned without a merged PR state"
+    if verify_errors:
+        execution_result["post_verify_errors"] = verify_errors
+        execution_result["verification_error"] = "; ".join(verify_errors)
         return execution_result
-    if viewed.get("headRefOid") != expected_head:
-        execution_result["verification_error"] = "merged PR head does not match expected_head"
-        return execution_result
-    if viewed.get("baseRefName") != expected_base:
-        execution_result["verification_error"] = "merged PR base does not match expected_base"
+    if merge_info["returncode"] != 0:
+        execution_result["verification_error"] = "merge_command_failed_but_merge_observed"
+        execution_result["post_verify_errors"] = ["merge_command_failed_but_merge_observed"]
         return execution_result
     execution_result["verification_passed"] = True
     return execution_result
@@ -2835,21 +2953,33 @@ def _run_captain_run(
     else:
         receipt_status = "passed"
         decision = "executed"
+    attempted_count = sum(1 for result in executions if result.get("execution_attempted") is True)
+    verified_count = sum(1 for result in executions if result.get("verification_passed") is True)
     for gate in gates:
         _check(receipt, f"captain-gate-{gate['id']}", "pass", str(gate["reason"]))
     _check(receipt, "captain-gates-pass", "pass", action_names)
     _check(receipt, "trusted-owner-autonomy", "pass" if _captain_trusted_owner_autonomy_ready(parameters, actions) else "warn", str(parameters.get("autonomy_policy") or "manual evidence mode"))
-    _check(receipt, "receipt-bound-execution", "pass", f"executions={len(executions)}")
+    _check(receipt, "receipt-bound-execution", "pass", f"execution_records={len(executions)} attempted={attempted_count} verified={verified_count}")
+    preflight_reasons = [
+        reason
+        for result in pre_execution_failures
+        for reason in result.get("preflight_errors", [str(result.get("verification_error") or "pre-execution failure")])
+    ]
     post_execution_reasons = [
         str(result.get("verification_error") or "post-execution verification failed")
         for result in verification_failures
     ]
-    if verification_failures:
-        _check(receipt, "post-execution-verification", "fail", "; ".join(post_execution_reasons))
-    elif pre_execution_failures:
+    if pre_execution_failures:
+        _check(receipt, "execution-preflight", "fail", "; ".join(preflight_reasons))
+        _check(receipt, "execution-attempted", "skip", "execution not attempted")
         _check(receipt, "post-execution-verification", "skip", "execution not attempted")
     else:
-        _check(receipt, "post-execution-verification", "pass", "all executions verified")
+        _check(receipt, "execution-preflight", "pass", "execution preflight passed")
+        _check(receipt, "execution-attempted", "pass", f"attempted={attempted_count}")
+        if verification_failures:
+            _check(receipt, "post-execution-verification", "fail", "; ".join(post_execution_reasons))
+        else:
+            _check(receipt, "post-execution-verification", "pass", "all executions verified")
     return {
         "schema_version": 1,
         "profile": "captain",
@@ -2857,11 +2987,7 @@ def _run_captain_run(
         "gate_decision": decision,
         "status": receipt_status,
         "receipt_status": receipt_status,
-        "blocked_reasons": [
-            reason
-            for result in pre_execution_failures
-            for reason in result.get("preflight_errors", [str(result.get("verification_error") or "pre-execution failure")])
-        ],
+        "blocked_reasons": preflight_reasons,
         "failed_reasons": post_execution_reasons,
         "gates": gates,
         "status_projection": projection_info,
