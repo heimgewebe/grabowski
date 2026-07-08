@@ -52,6 +52,8 @@ Der Handler akzeptiert nur kurzlebige, hashgebundene Referenzen aus `grabowski_p
 
 `grabowski_privileged_broker_status` prüft Binary, root-eigene Konfiguration, Socket und Client. Die Hostinstallation ist bewusst kein unprivilegierter Selbstumbau: Dateien müssen root-eigen unter `/usr/local` und `/etc` installiert, der Socket aktiviert und der Operator der Gruppe `grabowski` hinzugefügt werden. Bis dahin bleibt der Pfad fail-closed.
 
+Für stale systemd-Fehlzustände gibt es als enges Template `reset_failed_systemd_unit` mit `/usr/bin/systemctl reset-failed {target}`. Die Aktion bleibt in der Beispielkonfiguration deaktiviert und darf nur Zielnamen matchen, die als `.service`-Unit explizit zugelassen sind. Sie ist kein Service-Control-Pfad: kein Start, Stop, Restart, Enable, Disable und keine Unit-Bearbeitung.
+
 ## Secrets
 
 `grabowski_secret_use` ist der Standardpfad. `grabowski_secret_reveal` ist Break-Glass und verlangt zusätzlich zur Hash-Vorbedingung:

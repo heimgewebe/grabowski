@@ -98,6 +98,7 @@ PRIVILEGED_REFERENCE_ACTIONS = {
     "bind_privileged_port",
     "change_file_owner",
     "mount_filesystem",
+    "reset_failed_systemd_unit",
 }
 
 REDACTIONS = (

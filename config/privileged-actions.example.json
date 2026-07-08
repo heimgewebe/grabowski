@@ -6,6 +6,12 @@
       "target_pattern": "[A-Za-z0-9_.@:-]{1,200}",
       "argv": ["/usr/bin/systemctl", "restart", "{target}"],
       "timeout_seconds": 120
+    },
+    "reset_failed_systemd_unit": {
+      "enabled": false,
+      "target_pattern": "(?:user@[0-9]{1,10}|[A-Za-z0-9_@][A-Za-z0-9_.@:-]{0,119})\.service",
+      "argv": ["/usr/bin/systemctl", "reset-failed", "{target}"],
+      "timeout_seconds": 30
     }
   }
 }

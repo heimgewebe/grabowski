@@ -355,6 +355,59 @@ class PrivilegedBrokerTests(unittest.TestCase):
         )
         self.assertEqual(timeout, 120)
 
+    def test_reset_failed_systemd_unit_uses_fixed_template(self) -> None:
+        reference = self._reference()
+        reference["action"] = "reset_failed_systemd_unit"
+        reference["target"] = "user@111.service"
+        reference["justification"] = "Clear stale failed state for a checked GDM user manager"
+        reference.pop("reference_sha256")
+        reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 1,
+            "actions": {
+                "reset_failed_systemd_unit": {
+                    "enabled": True,
+                    "target_pattern": r"(?:user@[0-9]{1,10}|[A-Za-z0-9_@][A-Za-z0-9_.@:-]{0,119})\.service",
+                    "argv": ["/usr/bin/systemctl", "reset-failed", "{target}"],
+                    "timeout_seconds": 30,
+                }
+            },
+        }
+        argv, timeout = privileged_broker.resolve_action(config, parsed)
+        self.assertEqual(
+            argv,
+            ["/usr/bin/systemctl", "reset-failed", "user@111.service"],
+        )
+        self.assertEqual(timeout, 30)
+
+    def test_reset_failed_systemd_unit_rejects_non_service_target(self) -> None:
+        config = {
+            "schema_version": 1,
+            "actions": {
+                "reset_failed_systemd_unit": {
+                    "enabled": True,
+                    "target_pattern": r"(?:user@[0-9]{1,10}|[A-Za-z0-9_@][A-Za-z0-9_.@:-]{0,119})\.service",
+                    "argv": ["/usr/bin/systemctl", "reset-failed", "{target}"],
+                    "timeout_seconds": 30,
+                }
+            },
+        }
+        for target in ("../../etc/shadow", "--system.service", "-.service"):
+            with self.subTest(target=target):
+                reference = self._reference()
+                reference["action"] = "reset_failed_systemd_unit"
+                reference["target"] = target
+                reference.pop("reference_sha256")
+                reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+                parsed = privileged_broker.parse_reference(
+                    json.dumps(reference).encode("utf-8"), now=1000
+                )
+                with self.assertRaisesRegex(PermissionError, "target"):
+                    privileged_broker.resolve_action(config, parsed)
+
     def test_tamper_expiry_disable_and_replay_fail_closed(self) -> None:
         reference = self._reference()
         reference["target"] = "other.service"
