@@ -57,6 +57,7 @@ def _fresh_server_marker(target: str) -> dict[str, object]:
         "target": target,
         "configured_target": target,
         "target_matches_configured": True,
+        "configured_target_valid": True,
         "error": None,
     }
 
@@ -155,6 +156,37 @@ class RecoveryToolTests(unittest.TestCase):
         self.assertEqual(boundary["status"], recovery.RECOVERY_STATUS_BLOCKED_UNTIL_CONFIGURED_TARGET_PROBE_SUCCEEDS)
         self.assertIn(f"produce fresh server recovery evidence for configured target {target}", result["required_actions"])
 
+    def test_recovery_status_blocks_invalid_configured_recovery_target(self) -> None:
+        invalid_targets = (
+            "",
+            "ssh://heimserver:rest-server/grabowski-recovery-probe",
+            "[heimserver]garbage:rest-server/grabowski-recovery-probe",
+            "heimserver",
+            "heimserver:",
+            "heimserver:../probe",
+            "heimserver:rest-server/probe/extra",
+            " heimserver:rest-server/grabowski-recovery-probe",
+            "heimserver:rest-server/grabowski recovery probe",
+        )
+        for target in invalid_targets:
+            with self.subTest(target=target):
+                result = _run_ready_recovery_status(
+                    _fresh_server_marker(target),
+                    host="wg-prod-1",
+                    target=target,
+                )
+
+                self.assertFalse(result["checks"]["server_recovery_fresh"])
+                self.assertFalse(result["ready_for_user_power_worker"])
+                self.assertFalse(result["ready_for_privileged_actions"])
+                boundary = result["recovery_evidence_boundary"]
+                self.assertFalse(boundary["configured_target_valid"])
+                self.assertIsNone(boundary["configured_target_host"])
+                self.assertFalse(boundary["custom_recovery_target_configured"])
+                self.assertEqual(boundary["status"], recovery.RECOVERY_STATUS_BLOCKED_INVALID_TARGET)
+                self.assertTrue(boundary["configured_target_error"])
+                self.assertTrue(any(action.startswith("repair server recovery target configuration:") for action in result["required_actions"]))
+
     def test_recovery_status_allows_custom_target_with_matching_fresh_evidence(self) -> None:
         target = "wg-prod-1:rest-server/grabowski-recovery-probe"
         result = _run_ready_recovery_status(
@@ -170,6 +202,34 @@ class RecoveryToolTests(unittest.TestCase):
         self.assertEqual(boundary["status"], recovery.RECOVERY_STATUS_FRESH_EVIDENCE_PRESENT)
         self.assertTrue(boundary["target_matches_configured"])
         self.assertFalse(boundary["high_impact_actions_remain_blocked_until_fresh_server_evidence"])
+
+    def test_server_marker_rejects_matching_marker_when_configured_target_is_invalid(self) -> None:
+        invalid_target = "heimserver"
+        with tempfile.TemporaryDirectory() as raw:
+            marker_path = Path(raw) / "last-server-recovery.json"
+            marker_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "completed_at_unix": int(time.time()),
+                        "snapshot_id": "abc12345",
+                        "restore_probe_valid": True,
+                        "repository_check_valid": True,
+                        "target": invalid_target,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(recovery, "SERVER_RECOVERY", marker_path), patch.object(
+                recovery, "SERVER_RECOVERY_TARGET", invalid_target
+            ):
+                marker = recovery._server_marker()
+
+        self.assertFalse(marker["valid"])
+        self.assertFalse(marker["configured_target_valid"])
+        self.assertFalse(marker["target_matches_configured"])
+        self.assertEqual(marker["error"], "server recovery target must match <host>:rest-server/<probe>")
 
     def test_server_marker_rejects_fresh_evidence_for_different_configured_target(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
