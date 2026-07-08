@@ -106,8 +106,9 @@ class PrReviewGateCliTests(unittest.TestCase):
         }
         result = pr_review_gate.evaluate_review_gate(state, self_review=review)
         self.assertEqual(result["verdict"], "BLOCK")
-        self.assertIn("risk path touched", result["complexity"]["reasons"])
-        self.assertIn("Claude review is required but not observed on current head", result["failures"])
+        self.assertTrue(result["complexity"]["high_critical"])
+        self.assertIn("high-critical Grabowski operator path touched: src/grabowski_mcp.py", result["complexity"]["reasons"])
+        self.assertIn("External review evidence invalid: external review is required but evidence is missing", result["failures"])
 
 class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
     def _state(self, *, reviews=None, review_comments=None) -> dict:
@@ -178,11 +179,11 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         head = "a" * 40
         result = pr_review_gate.evaluate_review_gate(
             self._state(reviews=[], review_comments=[{"user": {"login": "chatgpt-codex-connector"}, "commit_id": head}]),
-            self_review=self._review(),
+            self_review=self._review(codex_review={"required": True, "reason": "explicit check"}),
         )
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertFalse(result["review_sources"]["codex_seen"])
-        self.assertIn("Codex review was not observed", result["failures"])
+        self.assertIn("Codex review is explicitly required but not observed on current head", result["failures"])
 
     def test_rest_pr_review_still_satisfies_codex_evidence(self) -> None:
         head = "a" * 40

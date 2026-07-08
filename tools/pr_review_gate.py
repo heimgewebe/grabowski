@@ -35,6 +35,7 @@ RISK_PATH_MARKERS = (
     "privileged",
     "audit",
     "rollback",
+    "runtime",
     "secret",
     "broker",
 )
@@ -50,6 +51,46 @@ RISK_PATH_PREFIXES = (
     "src/grabowski_operations.py",
     "src/grabowski_artifacts.py",
     "tools/pr_review_gate.py",
+)
+DOCUMENTATION_PATH_PREFIXES = ("docs/", "documentation/")
+DOCUMENTATION_FILENAMES = (
+    "agents.md",
+    "changelog.md",
+    "contributing.md",
+    "grabowski.md",
+    "license",
+    "notice",
+    "readme",
+    "readme.md",
+)
+DOCUMENTATION_EXTENSIONS = (".adoc", ".markdown", ".md", ".mdx", ".rst", ".txt")
+VERY_SMALL_CHANGE_FILE_LIMIT = 3
+VERY_SMALL_CHANGE_LINE_LIMIT = 40
+HIGH_CRITICAL_PATH_PREFIXES = (
+    ".github/actions/",
+    ".github/workflows/",
+    "deploy/",
+    "infra/",
+    "migrations/",
+    "ops/",
+    "scripts/deploy",
+    "scripts/migration",
+    "tools/pr_review_gate.py",
+)
+HIGH_CRITICAL_PATH_MARKERS = (
+    "auth",
+    "credential",
+    "database",
+    "deploy",
+    "migration",
+    "permission",
+    "privileged",
+    "recovery",
+    "rollback",
+    "runtime",
+    "secret",
+    "security",
+    "systemd",
 )
 PR_FIELDS = (
     "number",
@@ -288,24 +329,94 @@ def _is_risk_path(path: str) -> bool:
     return any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES) or any(marker in normalized for marker in RISK_PATH_MARKERS)
 
 
+def _is_documentation_path(path: str) -> bool:
+    normalized = path.lower().lstrip("./")
+    name = Path(normalized).name
+    if normalized.startswith(DOCUMENTATION_PATH_PREFIXES):
+        return True
+    if name in DOCUMENTATION_FILENAMES:
+        return True
+    return Path(normalized).suffix in DOCUMENTATION_EXTENSIONS
+
+
+def _high_critical_path_reason(path: str) -> str | None:
+    normalized = path.lower().lstrip("./")
+    if any(normalized == prefix.rstrip("/") or normalized.startswith(prefix) for prefix in HIGH_CRITICAL_PATH_PREFIXES):
+        return f"high-critical path touched: {path}"
+    if any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES):
+        return f"high-critical Grabowski operator path touched: {path}"
+    marker = next((marker for marker in HIGH_CRITICAL_PATH_MARKERS if marker in normalized), None)
+    if marker is not None:
+        return f"high-critical marker touched ({marker}): {path}"
+    return None
+
+
+def _is_very_small_uncomplicated_change(paths: list[str], changed_files: int, changed_lines: int) -> bool:
+    if changed_files <= 0 or changed_files > VERY_SMALL_CHANGE_FILE_LIMIT:
+        return False
+    if changed_lines > VERY_SMALL_CHANGE_LINE_LIMIT:
+        return False
+    return not any(_is_risk_path(path) or _high_critical_path_reason(path) for path in paths)
+
+
 def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) -> dict[str, Any]:
     changed_files = int(pr.get("changedFiles") or 0)
     changed_lines = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
-    reasons: list[str] = []
-    if changed_files > 15:
-        reasons.append("many files")
-    if changed_lines > 500:
-        reasons.append("large diff")
-    if any(_is_risk_path(path) for path in _paths(pr)):
-        reasons.append("risk path touched")
+    paths = _paths(pr)
+    docs_only = bool(paths) and all(_is_documentation_path(path) for path in paths)
+    very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
+
+    high_critical_reasons: list[str] = []
+    if not docs_only:
+        if changed_files > 15:
+            high_critical_reasons.append("many files")
+        if changed_lines > 500:
+            high_critical_reasons.append("large diff")
+        for path in paths:
+            reason = _high_critical_path_reason(path)
+            if reason is not None:
+                high_critical_reasons.append(reason)
     if isinstance(self_review, dict):
         uncertainty = self_review.get("uncertainty")
         if isinstance(uncertainty, (int, float)) and float(uncertainty) > 0.35:
-            reasons.append("high review uncertainty")
+            high_critical_reasons.append("high review uncertainty")
         material = self_review.get("material_findings_after_first_review")
         if isinstance(material, int) and material > 3:
-            reasons.append("many material findings after first review")
-    return {"complex": bool(reasons), "reasons": reasons, "changed_files": changed_files, "changed_lines": changed_lines}
+            high_critical_reasons.append("many material findings after first review")
+
+    external_review_reasons: list[str] = []
+    if high_critical_reasons:
+        external_review_reasons.extend(high_critical_reasons)
+    elif docs_only:
+        pass
+    elif very_small_uncomplicated:
+        pass
+    else:
+        external_review_reasons.append("non-trivial non-documentation change")
+
+    if high_critical_reasons:
+        review_tier = "high_critical"
+    elif external_review_reasons:
+        review_tier = "external_llm"
+    elif docs_only:
+        review_tier = "exempt_documentation"
+    elif very_small_uncomplicated:
+        review_tier = "exempt_very_small"
+    else:
+        review_tier = "external_llm"
+
+    return {
+        "complex": bool(external_review_reasons),
+        "reasons": external_review_reasons,
+        "high_critical": bool(high_critical_reasons),
+        "high_critical_reasons": high_critical_reasons,
+        "external_review_required": bool(external_review_reasons),
+        "review_tier": review_tier,
+        "docs_only": docs_only,
+        "very_small_uncomplicated": very_small_uncomplicated,
+        "changed_files": changed_files,
+        "changed_lines": changed_lines,
+    }
 
 
 def _load_json_file(path: Path | None, *, label: str) -> dict[str, Any] | None:
@@ -673,6 +784,89 @@ def _external_review_failures(
     return failures
 
 
+def build_external_review_prompt(state: dict[str, Any], diff_filename: str, diff_sha256: str) -> str:
+    pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
+    repo_name = state.get("repoName") if isinstance(state.get("repoName"), str) else "unknown"
+    pr_number = pr.get("number")
+    head_sha = pr.get("headRefOid")
+    title = pr.get("title") or ""
+    return (
+        "You are an external LLM reviewer. Review the attached PR diff and return a concise, actionable review.\n\n"
+        f"Repo: {repo_name}\n"
+        f"PR: {pr_number}\n"
+        f"Title: {title}\n"
+        f"Head SHA: {head_sha}\n"
+        f"Diff SHA-256: {diff_sha256}\n"
+        f"Diff file: {diff_filename}\n\n"
+        "Required verdict: PASS, NEEDS_CHANGE, or BLOCK.\n"
+        "Report every material issue with severity, affected file/range when possible, and the concrete fix.\n"
+        "Do not assume surrounding context not visible in the diff. Flag uncertainty explicitly.\n"
+        "Treat security, deployment, runtime, migration, privilege, recovery, and policy changes as high risk.\n"
+    )
+
+
+def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_diff: bytes) -> dict[str, Any]:
+    pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
+    pr_number = pr.get("number")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int):
+        raise GateInputError("cannot write external review packet without integer PR number")
+    head = pr.get("headRefOid")
+    if not isinstance(head, str) or not head:
+        raise GateInputError("cannot write external review packet without PR head SHA")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    diff_sha256 = _sha256_bytes(pr_diff)
+    diff_filename = f"pr-{pr_number}-{head[:12]}.diff"
+    prompt_filename = f"pr-{pr_number}-{head[:12]}-external-review-prompt.md"
+    evidence_filename = f"pr-{pr_number}-{head[:12]}-external-review-template.json"
+    manifest_filename = f"pr-{pr_number}-{head[:12]}-external-review-manifest.json"
+
+    diff_path = output_dir / diff_filename
+    prompt_path = output_dir / prompt_filename
+    evidence_path = output_dir / evidence_filename
+    manifest_path = output_dir / manifest_filename
+
+    diff_path.write_bytes(pr_diff)
+    prompt = build_external_review_prompt(state, diff_filename, diff_sha256)
+    prompt_path.write_text(prompt, encoding="utf-8")
+    prompt_sha256 = _sha256_text(prompt)
+    evidence_template = {
+        "schema_version": 1,
+        "kind": "external_review",
+        "repo": state.get("repoName"),
+        "pr": pr_number,
+        "head_sha": head,
+        "diff_sha256": diff_sha256,
+        "prompt_sha256": prompt_sha256,
+        "prompt_includes_diff": True,
+        "reviews": [
+            {
+                "source": "external-llm",
+                "review_sha256": "<sha256 of returned review text>",
+                "verdict": "PASS|NEEDS_CHANGE|BLOCK",
+                "finding_count": 0,
+            }
+        ],
+        "external_reviews_triaged": False,
+        "findings": [],
+    }
+    evidence_path.write_text(json.dumps(evidence_template, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest = {
+        "schema_version": 1,
+        "kind": "external_review_packet",
+        "repo": state.get("repoName"),
+        "pr": pr_number,
+        "head_sha": head,
+        "diff_path": str(diff_path),
+        "diff_sha256": diff_sha256,
+        "prompt_path": str(prompt_path),
+        "prompt_sha256": prompt_sha256,
+        "evidence_template_path": str(evidence_path),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {**manifest, "manifest_path": str(manifest_path)}
+
+
 def evaluate_review_gate(
     state: dict[str, Any],
     *,
@@ -711,18 +905,23 @@ def evaluate_review_gate(
     mergeable = pr.get("mergeable")
     if mergeable != "MERGEABLE":
         failures.append(f"GitHub mergeable is {mergeable}, not MERGEABLE")
+    codex = self_review.get("codex_review") if isinstance(self_review, dict) else None
+    codex_required = isinstance(codex, dict) and codex.get("required") is True
+    platform_review_required = complexity["high_critical"]
+    platform_review_seen = codex_seen or claude_seen or claude_cli_seen
+
     if codex_blocking_states:
         failures.append(f"Codex review has blocking state(s): {', '.join(codex_blocking_states)}")
     if claude_blocking_states:
         failures.append(f"Claude review has blocking state(s): {', '.join(claude_blocking_states)}")
     for failure in claude_cli_failures:
         failures.append(f"Claude CLI evidence invalid: {failure}")
-    if not codex_seen and not codex_blocking_states:
-        codex = self_review.get("codex_review") if isinstance(self_review, dict) else None
-        if isinstance(codex, dict) and codex.get("unavailable_reason"):
-            warnings.append("Codex review unavailable but explained")
-        else:
-            failures.append("Codex review was not observed")
+    if codex_required and not codex_seen and not codex_blocking_states:
+        failures.append("Codex review is explicitly required but not observed on current head")
+    elif not codex_seen and isinstance(codex, dict) and codex.get("unavailable_reason"):
+        warnings.append("Codex review unavailable but explained")
+    if platform_review_required and not platform_review_seen and not codex_blocking_states and not claude_blocking_states:
+        failures.append("High-critical platform review is required but neither Codex nor Claude was observed")
 
     if self_review is None:
         failures.append("Grabowski self-review evidence is missing")
@@ -760,12 +959,9 @@ def evaluate_review_gate(
             failures.append("material findings remain without accepted residual-risk reason")
 
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
-    claude_required = complexity["complex"] or (isinstance(claude, dict) and claude.get("required") is True)
-    claude_not_required = isinstance(claude, dict) and claude.get("required") is False and bool(claude.get("reason"))
+    claude_required = isinstance(claude, dict) and claude.get("required") is True
     if claude_required and not (claude_seen or claude_cli_seen) and not claude_blocking_states:
-        failures.append("Claude review is required but not observed on current head")
-    if not claude_required and not claude_not_required:
-        warnings.append("Claude non-requirement reason is not recorded")
+        failures.append("Claude review is explicitly required but not observed on current head")
 
     if state.get("pr_diff_bypass") is True:
         warnings.append("Self-review diff binding bypass was requested")
@@ -775,7 +971,7 @@ def evaluate_review_gate(
     if isinstance(deprecated_external_review, dict):
         warnings.append("Deprecated self_review.external_review ignored; pass --external-review-evidence instead")
 
-    external_required = complexity["complex"] or (isinstance(external_review, dict) and external_review.get("required") is True)
+    external_required = complexity["external_review_required"] or (isinstance(external_review, dict) and external_review.get("required") is True)
     for failure in _external_review_failures(state, pr, external_review, required=external_required, repo_name=repo_name):
         failures.append(f"External review evidence invalid: {failure}")
 
@@ -808,6 +1004,10 @@ def evaluate_review_gate(
             "claude_cli_seen": claude_cli_seen,
             "external_review_required": external_required,
             "external_reviews_received": _external_review_count(external_review),
+            "platform_review_required": platform_review_required,
+            "platform_review_seen": platform_review_seen,
+            "codex_required": codex_required,
+            "claude_required": claude_required,
             "self_review_diff_bound": isinstance(self_review, dict)
             and _self_review_diff_bound(state, self_review),
             "self_review_diff_bypass_used": state.get("pr_diff_bypass") is True,
@@ -838,6 +1038,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-review")
     parser.add_argument("--claude-evidence")
     parser.add_argument("--external-review-evidence")
+    parser.add_argument("--write-external-review-packet")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     repo = args.repo.resolve()
@@ -845,12 +1046,21 @@ def main(argv: list[str] | None = None) -> int:
         self_review = load_self_review(resolve_inside_repo(repo, args.self_review, label="self-review"))
         claude_evidence = load_claude_evidence(resolve_inside_repo(repo, args.claude_evidence, label="Claude evidence"))
         external_review_evidence = load_external_review_evidence(resolve_inside_repo(repo, args.external_review_evidence, label="external review evidence"))
+        state = load_pr_state(repo, args.pr)
+        packet = None
+        if args.write_external_review_packet:
+            packet_dir = resolve_inside_repo(repo, args.write_external_review_packet, label="external review packet")
+            if packet_dir is None:
+                raise GateInputError("external review packet path is required")
+            packet = write_external_review_packet(packet_dir, state, _run_bytes(repo, ["gh", "pr", "diff", str(args.pr)]))
         result = evaluate_review_gate(
-            load_pr_state(repo, args.pr),
+            state,
             self_review=self_review,
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
         )
+        if packet is not None:
+            result["external_review_packet"] = packet
     except Exception as exc:
         result = {"schema_version": 1, "verdict": "BLOCK", "failures": [str(exc)], "warnings": []}
     if args.json:

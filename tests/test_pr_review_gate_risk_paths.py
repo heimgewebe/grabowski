@@ -72,8 +72,15 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
             with self.subTest(path=path):
                 result = pr_review_gate.evaluate_review_gate(_state(path), self_review=_self_review())
                 self.assertEqual(result["verdict"], "BLOCK")
-                self.assertIn("risk path touched", result["complexity"]["reasons"])
-                self.assertIn("Claude review is required but not observed on current head", result["failures"])
+                self.assertTrue(result["complexity"]["high_critical"])
+                self.assertTrue(
+                    any("high-critical Grabowski operator path touched" in reason for reason in result["complexity"]["reasons"]),
+                    result["complexity"]["reasons"],
+                )
+                self.assertIn(
+                    "External review evidence invalid: external review is required but evidence is missing",
+                    result["failures"],
+                )
 
 
 if __name__ == "__main__":

@@ -85,9 +85,9 @@ The live context tools compute runtime and checkout state on every call. Static 
 
 ## PR review gate
 
-Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Run `python3 tools/pr_review_gate.py --pr <number> --self-review <path> --claude-evidence <path> --json` when Claude evidence is required, or omit `--claude-evidence` only when the gate should block on missing Claude evidence. Treat a BLOCK verdict as merge-blocking.
+Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Run `python3 tools/pr_review_gate.py --pr <number> --write-external-review-packet <dir> --self-review <path> --external-review-evidence <path> --json` for any non-exempt PR. Treat a BLOCK verdict as merge-blocking.
 
-The gate requires Codex review evidence from a trusted review object for the current head, or an explicit `codex_review.unavailable_reason` after a documented trigger/collection attempt; unavailable Codex is only a warning path and does not waive the rest of the gate. It also requires a head-SHA- and `gh pr diff` SHA-256-bound Grabowski self-review, iterative review evidence, terminal triage for every finding at every severity, and expected green checks named `validate (3.10)` and `validate (3.12)`. Complex or risk-sensitive changes require Claude review evidence, provided either by a current-head trusted Claude review or by a valid `--claude-evidence` receipt.
+The gate requires a head-SHA- and `gh pr diff` SHA-256-bound Grabowski self-review, iterative review evidence, terminal triage for every finding at every severity, and expected green checks named `validate (3.10)` and `validate (3.12)`. External LLM review evidence is required for every PR except documentation-only changes and very small uncomplicated changes. High-critical changes additionally require at least one platform review from Codex or Claude, provided either by a current-head trusted review object or, for Claude CLI, by a valid `--claude-evidence` receipt. Codex and Claude are therefore not the default review path for ordinary PRs; external LLM review packets are.
 
 Self-review evidence must use the same diff source as the gate:
 

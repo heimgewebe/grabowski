@@ -1,8 +1,8 @@
 # External review loop
 
-`tools/pr_review_gate.py` requires separate external review evidence when a pull request is classified as complex/risky or when the external evidence explicitly marks itself as required. Complexity is currently derived from file count, diff size, risk paths, self-review uncertainty, and material findings after the first review.
+`tools/pr_review_gate.py` requires separate external LLM review evidence for every pull request except documentation-only changes and very small uncomplicated changes. High-critical pull requests also require a platform review from Codex or Claude. High-critical classification is derived from large file/line counts, generic runtime/deploy/security/migration/privilege/recovery/policy path markers, Grabowski operator-critical paths, self-review uncertainty, and material findings after the first review.
 
-The external loop is separate from Grabowski self-review. Self-review remains internal evidence; external review evidence is passed with its own CLI argument:
+The external loop is separate from Grabowski self-review. Self-review remains internal evidence; external review evidence is passed with its own CLI argument. Use the packet writer whenever an external LLM review is needed so the diff is available as a downloadable artifact:
 
 ## Evidence, not comments
 
@@ -10,15 +10,17 @@ A GitHub PR comment that says the operator checked the PR is not review evidence
 
 Before merge, Grabowski must run its own review against the current PR head and current PR diff. That review has to inspect the diff itself, record review iterations, record material findings, and terminally triage every finding. A comment may summarize the result for visibility, but it is only a pointer to the real evidence.
 
-For complex, risky, important, security-sensitive, runtime-sensitive, deploy-sensitive, or high-uncertainty PRs, Grabowski must also start an external review loop before merge by handing the user a portable review packet. The packet must contain repo, PR number, current head SHA, diff hash when available, risk reason, exact reviewer instructions, and the full PR diff or a bounded diff artifact suitable for another model. Required external review remains blocking until returned findings are triaged and supplied as external review evidence, unless the user consciously overrides that gate outside this automated policy.
+For every non-exempt PR, Grabowski must start an external LLM review loop before merge by handing the user a portable review packet. The packet must contain repo, PR number, current head SHA, diff hash, exact reviewer instructions, an evidence template, and the full PR diff as a downloadable file suitable for another model. Required external review remains blocking until returned findings are triaged and supplied as external review evidence, unless the user consciously overrides that gate outside this automated policy.
 
 ```bash
 python3 tools/pr_review_gate.py \
   --pr <PR_NUMBER> \
+  --write-external-review-packet evidence/pr-<PR_NUMBER>-external \
   --self-review evidence/self-review.json \
-  --claude-evidence evidence/claude.json \
   --external-review-evidence evidence/external-review.json
 ```
+
+For high-critical PRs, include `--claude-evidence evidence/claude.json` when Claude CLI evidence is used instead of a current-head trusted Claude review object.
 
 Minimal external evidence object:
 
@@ -54,7 +56,7 @@ Rules:
 - `reviews` must be a list and must be non-empty when the external loop is required.
 - Each review entry must include `source`, `review_sha256`, `verdict`, and integer `finding_count >= 0`.
 - `source` is a human-readable label for traceability. It is not a trust anchor and does not prove reviewer identity.
-- `external_review.required`, when present, must be a boolean. A complex/risky PR cannot be unblocked by setting `required=false` in evidence.
+- `external_review.required`, when present, must be a boolean. A required external review cannot be disabled by setting `required=false` in evidence.
 - `external_reviews_triaged` must be true.
 - `findings` must be a list, and every finding must be terminally triaged with the same terminal status rules as Grabowski self-review findings.
 - A review with `verdict != "PASS"` or `finding_count > 0` must be covered by terminal top-level `findings[]`; `findings: []` cannot hide a documented external blocker.
@@ -62,7 +64,9 @@ Rules:
 - V1 uses count coverage rather than finding IDs: reported external findings must be no greater than terminal top-level findings, and a non-PASS review with `finding_count: 0` counts as one reported finding.
 - Count coverage is not identity-binding. It only prevents obvious under-recording; it does not bind a specific reported finding to a specific terminal finding.
 - Deprecated `self_review.external_review` is ignored. Use `--external-review-evidence` for external evidence.
-- A trivial PR with no external evidence does not block. If voluntary external evidence is passed, its findings are still validated.
+- Documentation-only PRs and very small uncomplicated PRs with no external evidence do not block. If voluntary external evidence is passed, its findings are still validated.
+- Non-trivial non-documentation PRs require external LLM evidence even when Codex or Claude is not required.
+- High-critical PRs require both external LLM evidence and at least one platform review from Codex or Claude.
 
 Threat model:
 
@@ -72,4 +76,4 @@ The hashes are audit and integrity handles, not identity guarantees. They help d
 
 A stronger model would use stable finding IDs, signed prompt/review artifacts, branch protection, externally stored attestations, or reviewer identity backed by a system outside the operator's write path. Those are outside this PR.
 
-This is not a substitute for Grabowski self-review, Codex, Claude, or CI. It is a contrast loop: different reviewer failure modes, not ritual mass.
+This is not a substitute for Grabowski self-review, high-critical platform review, or CI. It is a contrast loop: different reviewer failure modes, not ritual mass.
