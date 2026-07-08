@@ -8,7 +8,7 @@ The external loop is separate from Grabowski self-review. Self-review remains in
 
 A GitHub PR comment that says the operator checked the PR is not review evidence and must not be treated as a merge gate.
 
-Before merge, Grabowski must run its own review against the current PR head and current PR diff. That review has to inspect the diff itself, record review iterations, record material findings, and terminally triage every finding. A comment may summarize the result for visibility, but it is only a pointer to the real evidence.
+Before merge, Grabowski must run its own critical review against the current PR head and current PR diff. That review has to inspect the diff itself, challenge the approach, record review iterations, record material findings, and terminally triage every finding in structured self-review evidence. Do not write the self-review text into the pull request as a review comment; the PR may at most reference the evidence artifact path/hash/status.
 
 For every non-exempt PR, Grabowski must start an external LLM review loop before merge by handing the user a portable review packet. The packet must contain repo, PR number, current head SHA, diff hash, exact reviewer instructions, an evidence template, and the full PR diff as a downloadable file suitable for another model. Required external review remains blocking until returned findings are triaged and supplied as external review evidence, unless the user consciously overrides that gate outside this automated policy.
 

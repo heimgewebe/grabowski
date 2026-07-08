@@ -97,6 +97,6 @@ sha256sum evidence/pr-<number>.diff
 # macOS: shasum -a 256 evidence/pr-<number>.diff
 ```
 
-The self-review JSON must include `head_sha`, `diff_sha256`, `diff_reviewed: true`, `all_findings_triaged: true`, non-empty `review_iterations`, terminal `findings`, `material_findings_remaining`, and a `stop_reason`. A PR comment is not self-review evidence. Existing self-review evidence without `diff_sha256` must be regenerated against the current head and current `gh pr diff` output before merge.
+The self-review JSON must include `head_sha`, `diff_sha256`, `diff_reviewed: true`, `all_findings_triaged: true`, non-empty `review_iterations`, terminal `findings`, `material_findings_remaining`, and a `stop_reason`. The self-review must be a critical review performed by Grabowski against the actual diff; do not post the self-review text into the PR. A PR comment, review body, or inline comment is not self-review evidence. Existing self-review evidence without `diff_sha256` must be regenerated against the current head and current `gh pr diff` output before merge.
 
 Allowed terminal finding states are `fixed`, `accepted`, `false_positive`, `deferred_with_reason`, and `not_applicable`; accepted or deferred findings require reasons. Blocking findings cannot be merely accepted or deferred. Severity values `p0`, `p1`, `high`, and `critical` are treated as blocking for this purpose. Pending, cancelled, or missing checks block the gate.

@@ -70,6 +70,39 @@ class PrReviewGateCliTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertIn("Codex review unavailable but explained", result["warnings"])
 
+    def test_pr_comment_self_review_text_does_not_satisfy_self_review_evidence(self) -> None:
+        head = "a" * 40
+        state = {
+            "pr_diff_bypass": True,
+            "pr_diff_bypass_reason": "legacy unit seam without live PR diff",
+            "pr": {
+                "number": 58,
+                "state": "OPEN",
+                "isDraft": False,
+                "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "headRefOid": head,
+                "baseRefOid": "b" * 40,
+                "changedFiles": 1,
+                "additions": 1,
+                "deletions": 0,
+                "files": [{"path": "docs/low_risk_note.md"}],
+                "reviews": [],
+                "latestReviews": [],
+                "comments": [
+                    {
+                        "author": {"login": "grabowski"},
+                        "body": "Self-review: PASS. I critically reviewed the diff.",
+                    }
+                ],
+            },
+            "checks": [{"bucket": "pass", "name": "validate (3.10)"}, {"bucket": "pass", "name": "validate (3.12)"}],
+            "reviewComments": [],
+        }
+        result = pr_review_gate.evaluate_review_gate(state, self_review=None)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("Grabowski self-review evidence is missing", result["failures"])
+
     def test_core_grabowski_paths_require_independent_review(self) -> None:
         head = "a" * 40
         state = {
