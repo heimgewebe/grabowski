@@ -120,6 +120,7 @@
         "process_signal",
         "port_inspect",
         "privileged_reference",
+        "file_delete",
         "file_destroy",
         "file_move",
         "chmod",

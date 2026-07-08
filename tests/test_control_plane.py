@@ -177,6 +177,91 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(call_argv[-2:], ["prod.example", "exec hostname"])
 
 
+    def test_task_unit_observer_does_not_open_generic_systemctl_on_production(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "fleet.json"
+            _write(config, {
+                "schema_version": 1,
+                "hosts": {
+                    "prod": {
+                        "transport": "ssh",
+                        "target": "prod.example",
+                        "enabled": True,
+                        "roles": ["vps", "production"],
+                        "command_allowlist": ["hostname"],
+                        "connect_timeout_seconds": 7,
+                    }
+                },
+            })
+            completed = {
+                "returncode": 0,
+                "stdout": "LoadState=not-found\nActiveState=inactive\nResult=success\n",
+                "stderr": "",
+                "timed_out": False,
+            }
+            with (
+                patch.object(fleet, "FLEET_CONFIG", config),
+                patch.object(fleet.shutil, "which", return_value="/usr/bin/ssh"),
+                patch.object(fleet.operator, "_run", return_value=completed) as run,
+            ):
+                with self.assertRaisesRegex(fleet.FleetCommandDenied, "Executable is not allowed"):
+                    fleet.run_fleet_host(
+                        "prod",
+                        ["systemctl", "--user", "show", "demo.service"],
+                        timeout_seconds=10,
+                        max_output_bytes=1000,
+                    )
+                result = fleet.run_fleet_task_unit_show(
+                    "prod",
+                    "grabowski-task-0123456789abcdef01234567-a1.service",
+                    ("LoadState", "ActiveState", "Result"),
+                    timeout_seconds=10,
+                    max_output_bytes=1000,
+                )
+
+            self.assertEqual(result["observer"], fleet.TASK_UNIT_SHOW_OBSERVER)
+            self.assertEqual(result["transport"], "ssh")
+            call_argv = run.call_args.args[0]
+            self.assertEqual(call_argv[-2], "prod.example")
+            self.assertEqual(
+                call_argv[-1],
+                "exec systemctl --user show grabowski-task-0123456789abcdef01234567-a1.service --no-pager --property=LoadState --property=ActiveState --property=Result",
+            )
+
+    def test_task_unit_observer_rejects_unbounded_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "fleet.json"
+            _write(config, {
+                "schema_version": 1,
+                "hosts": {
+                    "local": {
+                        "transport": "local",
+                        "target": "local",
+                        "enabled": True,
+                        "roles": ["test"],
+                        "command_allowlist": ["hostname"],
+                    }
+                },
+            })
+            with patch.object(fleet, "FLEET_CONFIG", config), patch.object(
+                fleet.operator, "_run"
+            ) as run:
+                with self.assertRaisesRegex(ValueError, "task unit"):
+                    fleet.run_fleet_task_unit_show(
+                        "local", "demo.service", ["LoadState"],
+                        timeout_seconds=10, max_output_bytes=1000,
+                    )
+                with self.assertRaisesRegex(ValueError, "property"):
+                    fleet.run_fleet_task_unit_show(
+                        "local",
+                        "grabowski-task-0123456789abcdef01234567-a1.service",
+                        ["LoadState;reboot"],
+                        timeout_seconds=10,
+                        max_output_bytes=1000,
+                    )
+            run.assert_not_called()
+
+
 class OperationTests(unittest.TestCase):
     def _config(self, path: Path) -> None:
         _write(path, {

@@ -240,6 +240,62 @@ class TaskTests(unittest.TestCase):
         self.assertTrue(task["unit"].endswith("-a2.service"))
         self.assertEqual(task["last_observation"]["state"], "outcome_unknown")
 
+    def test_reconcile_observer_falls_back_to_narrow_production_probe(self) -> None:
+        probe = _launcher()
+        probe["stdout"] = (
+            "LoadState=not-found\n"
+            "ActiveState=inactive\n"
+            "SubState=dead\n"
+            "Result=success\n"
+            "ExecMainCode=0\n"
+            "ExecMainStatus=0\n"
+        )
+        observed = {
+            "host": "wg-prod-1",
+            "transport": "ssh",
+            "roles": ["vps", "production"],
+            "observer": tasks.fleet.TASK_UNIT_SHOW_OBSERVER,
+            "result": probe,
+        }
+        with patch.object(
+            tasks,
+            "_dispatch",
+            side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host wg-prod-1: systemctl"),
+        ), patch.object(
+            tasks.fleet, "run_fleet_task_unit_show", return_value=observed
+        ) as show:
+            result = tasks._observe({
+                "host": "wg-prod-1",
+                "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+            })
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["observer"]["kind"], tasks.fleet.TASK_UNIT_SHOW_OBSERVER)
+        self.assertEqual(
+            result["observer"]["fallback_from"],
+            "fleet-dispatch-permission-denied",
+        )
+        show.assert_called_once_with(
+            "wg-prod-1",
+            "grabowski-task-0123456789abcdef01234567-a1.service",
+            tasks.fleet.TASK_UNIT_SHOW_PROPERTIES,
+            timeout_seconds=30,
+            max_output_bytes=8192,
+        )
+
+    def test_reconcile_observer_propagates_narrow_probe_failure(self) -> None:
+        with patch.object(
+            tasks,
+            "_dispatch",
+            side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host wg-prod-1: systemctl"),
+        ), patch.object(
+            tasks.fleet, "run_fleet_task_unit_show", side_effect=RuntimeError("ssh failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ssh failed"):
+                tasks._observe({
+                    "host": "wg-prod-1",
+                    "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+                })
+
     def test_manual_resume_policy_fails_closed(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_dispatch", return_value=_launcher()

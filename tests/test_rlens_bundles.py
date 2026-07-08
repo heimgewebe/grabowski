@@ -145,6 +145,52 @@ class RlensBundleToolTests(unittest.TestCase):
         self.assertEqual(result["authority"], "artifact_metadata_only")
         self.assertIn("claims_true", result["does_not_establish"])
 
+    def test_latest_complete_bundles_merges_valid_legacy_with_discovery_when_cache_is_stale(self) -> None:
+        self._write_bundle("valid-repo-max-260701-1200")
+        self._write_bundle("live-repo-max-260701-1200")
+        (self.state / "rlens-latest-complete-bundles.tsv").write_text(
+            "repo\tstem\tlatest_mtime\thas_agent_reading_pack\tcanonical_md\tbundle_manifest\toutput_health\tagent_reading_pack\n"
+            "valid-repo\tvalid-repo-max-260701-1200\t2026-07-01T00:00:00Z\tno\t./merges/valid-repo-max-260701-1200_merge.md\t./merges/valid-repo-max-260701-1200_merge.bundle.manifest.json\t./merges/valid-repo-max-260701-1200_merge.output_health.json\t./merges/valid-repo-max-260701-1200_merge.agent_reading_pack.md\n"
+            "stale-repo\tstale-repo-max-260101-0000\t2026-01-01T00:00:00Z\tno\t./merges/stale.md\t./merges/stale.json\t./merges/stale-health.json\t./merges/stale-pack.md\n",
+            encoding="utf-8",
+        )
+
+        result = mcp.latest_complete_bundles()
+
+        self.assertEqual(result["authority"], "merged_legacy_live_discovery")
+        self.assertEqual(result["stale_legacy_row_count"], 1)
+        self.assertEqual(result["live_discovery_row_count"], 2)
+        self.assertEqual([row[0] for row in result["rows"]], ["valid-repo", "live-repo"])
+        self.assertNotIn("stale-repo", [row[0] for row in result["rows"]])
+        self.assertIn("bundle_freshness_against_live_repo", result["does_not_establish"])
+
+    def test_latest_complete_bundles_uses_valid_cache_without_live_discovery(self) -> None:
+        self._write_bundle("valid-repo-max-260701-1200")
+        (self.state / "rlens-latest-complete-bundles.tsv").write_text(
+            "repo\tstem\tlatest_mtime\thas_agent_reading_pack\tcanonical_md\tbundle_manifest\toutput_health\tagent_reading_pack\n"
+            "valid-repo\tvalid-repo-max-260701-1200\t2026-07-01T00:00:00Z\tno\t./merges/valid-repo-max-260701-1200_merge.md\t./merges/valid-repo-max-260701-1200_merge.bundle.manifest.json\t./merges/valid-repo-max-260701-1200_merge.output_health.json\t./merges/valid-repo-max-260701-1200_merge.agent_reading_pack.md\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(mcp, "_rlens_latest_manifest_by_repo", side_effect=AssertionError("unexpected discovery")):
+            result = mcp.latest_complete_bundles()
+
+        self.assertEqual(result["authority"], "legacy_cache")
+        self.assertEqual(result["stale_legacy_row_count"], 0)
+        self.assertEqual(result["live_discovery_row_count"], 0)
+        self.assertEqual(result["rows"][1][0], "valid-repo")
+
+    def test_registry_header_status_requires_full_header_shape(self) -> None:
+        self.assertTrue(mcp._rlens_registry_row_status(list(mcp.BUNDLE_REGISTRY_HEADER))["is_header"])
+        malformed = ["repo", "wrong", *list(mcp.BUNDLE_REGISTRY_HEADER[2:])]
+        status = mcp._rlens_registry_row_status(malformed)
+        self.assertFalse(status["is_header"])
+        self.assertFalse(status["valid"])
+        extended_header = [*list(mcp.BUNDLE_REGISTRY_HEADER), "extra"]
+        status = mcp._rlens_registry_row_status(extended_header)
+        self.assertFalse(status["is_header"])
+        self.assertFalse(status["valid"])
+
     def test_bundle_status_surfaces_output_health_dependency_degradation(self) -> None:
         stem = "demo-repo-max-260701-1200"
         self._write_bundle(stem)

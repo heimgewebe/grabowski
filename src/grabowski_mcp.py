@@ -3633,6 +3633,16 @@ _BUNDLE_MANIFEST_SUFFIX = "_merge.bundle.manifest.json"
 _BUNDLE_HEALTH_SUFFIX = "_merge.bundle_health.post.json"
 _BUNDLE_SURFACE_SUFFIX = "_merge.bundle_surface_validation.json"
 _BUNDLE_OUTPUT_HEALTH_SUFFIX = "_merge.output_health.json"
+BUNDLE_REGISTRY_HEADER = (
+    "repo",
+    "stem",
+    "latest_mtime",
+    "has_agent_reading_pack",
+    "canonical_md",
+    "bundle_manifest",
+    "output_health",
+    "agent_reading_pack",
+)
 _RLENS_STEM_RE = re.compile(r"[A-Za-z0-9_.-]{1,160}\Z")
 _RLENS_REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,120}\Z")
 
@@ -3781,6 +3791,74 @@ def _rlens_iter_manifests(repo: str | None = None) -> list[Path]:
         ]
     manifests.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
     return manifests
+
+
+def _rlens_latest_manifest_by_repo() -> dict[str, Path]:
+    latest: dict[str, Path] = {}
+    latest_key: dict[str, tuple[float, str]] = {}
+    for path in _rlens_iter_manifests(None):
+        stem = _rlens_stem_from_manifest(path)
+        repo = _rlens_repo_from_stem(stem)
+        key = (path.stat().st_mtime, path.name)
+        if repo not in latest or key > latest_key[repo]:
+            latest[repo] = path
+            latest_key[repo] = key
+    return latest
+
+
+def _rlens_manifest_registry_row(path: Path) -> list[str]:
+    summary = _rlens_manifest_summary(path)
+    stem = str(summary["stem"])
+    repo = str(summary["repo"])
+    artifact_roles = set(summary.get("artifact_roles") or [])
+    def rel(suffix: str) -> str:
+        return "./merges/" + stem + suffix
+    return [
+        repo,
+        stem,
+        datetime.fromtimestamp(int(summary["manifest_mtime_unix"]), timezone.utc).isoformat(),
+        "yes" if "agent_reading_pack" in artifact_roles else "no",
+        rel("_merge.md"),
+        rel(_BUNDLE_MANIFEST_SUFFIX),
+        rel(_BUNDLE_OUTPUT_HEALTH_SUFFIX),
+        rel("_merge.agent_reading_pack.md"),
+    ]
+
+
+def _rlens_registry_row_status(row: list[str]) -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "valid": False,
+        "header": False,
+        "is_header": False,
+        "reason": None,
+        "stem": None,
+        "repo": row[0] if row else None,
+        "manifest_exists": False,
+    }
+    if not row:
+        status["reason"] = "empty_row"
+        return status
+    if len(row) == len(BUNDLE_REGISTRY_HEADER) and tuple(row) == BUNDLE_REGISTRY_HEADER:
+        status.update({"valid": True, "header": True, "is_header": True})
+        return status
+    if len(row) < len(BUNDLE_REGISTRY_HEADER):
+        status["reason"] = "short_row"
+        return status
+    try:
+        stem = _rlens_validate_stem(row[1])
+    except ValueError:
+        status["reason"] = "invalid_stem"
+        return status
+    manifest_path = _rlens_manifest_path(stem)
+    exists = manifest_path.is_file() and not manifest_path.is_symlink()
+    status.update({
+        "valid": exists,
+        "stem": stem,
+        "repo": row[0],
+        "manifest_exists": exists,
+        "reason": None if exists else "manifest_missing",
+    })
+    return status
 
 
 def _rlens_git(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
@@ -4819,25 +4897,55 @@ def grip_run(
 def latest_complete_bundles() -> dict[str, Any]:
     """Return the curated latest-complete Lens/repoLens bundle registry."""
     _require_capability("bundle_registry")
-    if not BUNDLE_REGISTRY.is_file():
-        return {
-            "path": str(BUNDLE_REGISTRY),
-            "exists": False,
-            "rows": [],
-        }
-
-    data = _ensure_regular_text_file(BUNDLE_REGISTRY, 2_000_000)
-    rows = []
-    for line in data.decode("utf-8").splitlines():
-        if not line or line.startswith("#"):
-            continue
-        rows.append(line.split("\t"))
-
+    rows: list[list[str]] = []
+    sha256: str | None = None
+    if BUNDLE_REGISTRY.is_file():
+        data = _ensure_regular_text_file(BUNDLE_REGISTRY, 2_000_000)
+        sha256 = hashlib.sha256(data).hexdigest()
+        for line in data.decode("utf-8").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            rows.append(line.split("\t"))
+    row_status = [_rlens_registry_row_status(row) for row in rows]
+    stale_rows = [item for item in row_status if item.get("is_header") is not True and not item.get("valid")]
+    valid_legacy_rows = [
+        row for row, status in zip(rows, row_status)
+        if status.get("is_header") is not True and status.get("valid") is True
+    ]
+    discovery_needed = not rows or bool(stale_rows)
+    discovered: list[list[str]] = []
+    if discovery_needed:
+        discovered = [
+            _rlens_manifest_registry_row(path)
+            for _repo, path in sorted(_rlens_latest_manifest_by_repo().items())
+        ]
+    if not rows:
+        effective_rows = discovered
+        authority = "live_discovery"
+    elif stale_rows:
+        legacy_repos = {row[0] for row in valid_legacy_rows if row}
+        discovery_additions = [row for row in discovered if row and row[0] not in legacy_repos]
+        effective_rows = [*valid_legacy_rows, *discovery_additions]
+        authority = "merged_legacy_live_discovery" if discovered else "legacy_cache_valid_rows"
+    else:
+        effective_rows = rows
+        authority = "legacy_cache"
     return {
         "path": str(BUNDLE_REGISTRY),
-        "exists": True,
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "rows": rows,
+        "exists": BUNDLE_REGISTRY.is_file(),
+        "sha256": sha256,
+        "rows": effective_rows,
+        "legacy_rows": rows,
+        "legacy_row_status": row_status,
+        "stale_legacy_row_count": len(stale_rows),
+        "live_discovery_row_count": len(discovered),
+        "authority": authority,
+        "does_not_establish": [
+            "bundle_freshness_against_live_repo",
+            "repo_understood",
+            "claims_true",
+            "runtime_correctness",
+        ],
     }
 
 

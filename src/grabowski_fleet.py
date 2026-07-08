@@ -7,7 +7,7 @@ import re
 import shlex
 import shutil
 import stat
-from typing import Any
+from typing import Any, Sequence
 
 try:
     import grabowski_operator_core as operator
@@ -25,6 +25,19 @@ FLEET_CONFIG = Path(os.environ.get(
 HOST_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 SSH_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}\Z")
 PRODUCTION_ROLE = "production"
+TASK_UNIT_SHOW_OBSERVER = "task-systemd-user-show-v1"
+TASK_UNIT_SHOW_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "ExecMainCode",
+    "ExecMainStatus",
+)
+
+
+class FleetCommandDenied(PermissionError):
+    """Raised when a fleet host rejects an otherwise valid command shape."""
 
 
 def _load_object(path: Path) -> dict[str, Any]:
@@ -120,7 +133,7 @@ def _ensure_command_allowed(name: str, host: dict[str, Any], command: list[str])
             )
         return
     if command[0] not in allowlist and executable not in allowlist:
-        raise PermissionError(f"Executable is not allowed for fleet host {name}: {command[0]}")
+        raise FleetCommandDenied(f"Executable is not allowed for fleet host {name}: {command[0]}")
 
 
 def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
@@ -145,6 +158,55 @@ def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
         ], cwd=HOME, timeout_seconds=timeout, max_output_bytes=output_limit)
     return {"host": name, "transport": host["transport"], "roles": host["roles"],
             "remote_argv": command, "result": result}
+
+
+_TASK_UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
+_SYSTEMD_SHOW_PROPERTY = re.compile(r"[A-Za-z][A-Za-z0-9]*\Z")
+
+
+def run_fleet_task_unit_show(
+    name: str,
+    unit: str,
+    properties: Sequence[str],
+    *,
+    timeout_seconds: int,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    """Run the narrow read-only task-unit observer used by task reconcile.
+
+    This deliberately does not add generic ``systemctl`` to a production host's
+    command allowlist.  The only accepted command shape is
+    ``systemctl --user show <grabowski-task-unit>`` with bounded property names.
+    """
+    host = fleet_host(name)
+    if not isinstance(unit, str) or _TASK_UNIT.fullmatch(unit) is None:
+        raise ValueError("Invalid Grabowski task unit")
+    if not (
+        isinstance(properties, (list, tuple))
+        and 1 <= len(properties) <= 32
+        and all(isinstance(item, str) and _SYSTEMD_SHOW_PROPERTY.fullmatch(item) for item in properties)
+    ):
+        raise ValueError("Invalid systemd property list")
+    command = ["systemctl", "--user", "show", unit, "--no-pager"]
+    command.extend(f"--property={item}" for item in properties)
+    timeout = operator._timeout(timeout_seconds)
+    output_limit = operator._output_limit(max_output_bytes)
+    if host["transport"] == "local":
+        result = operator._run(command, cwd=HOME, timeout_seconds=timeout,
+                               max_output_bytes=output_limit)
+    else:
+        ssh = shutil.which("ssh")
+        if not ssh:
+            raise RuntimeError("OpenSSH client is not installed")
+        remote_command = "exec " + shlex.join(command)
+        result = operator._run([
+            ssh, "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
+            "-o", f"ConnectTimeout={host['connect_timeout_seconds']}",
+            "--", host["target"], remote_command,
+        ], cwd=HOME, timeout_seconds=timeout, max_output_bytes=output_limit)
+    return {"host": name, "transport": host["transport"], "roles": host["roles"],
+            "remote_argv": command, "observer": TASK_UNIT_SHOW_OBSERVER,
+            "result": result}
 
 
 @mcp.tool(name="grabowski_fleet_list", annotations=READ_ONLY)
