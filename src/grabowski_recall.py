@@ -18,6 +18,7 @@ MAX_REJECTED_SOURCES = 20
 MAX_REJECTION_DETAIL_CHARS = 160
 SOURCE_TRUST = "caller_supplied_unverified"
 EVIDENCE_BINDING = "requires_concrete_ref_but_does_not_verify_source"
+LEARNED_RULE_TRUST = "caller_supplied_unverified"
 HEIMLERN_OFFLINE_LEARNING_BOUNDARY = {
     "allowed": True,
     "mode": "offline_proposal_only",
@@ -35,7 +36,22 @@ RECALL_DOES_NOT_ESTABLISH = (
     "source_record_authenticity",
     "source_record_completeness",
     "current_truth",
+    "learned_rule_authority",
+    "policy_change",
+    "operator_instruction_authority",
 )
+SUPPORTED_ITEM_SOURCES = {
+    "receipt",
+    "pr",
+    "bureau_task",
+    "friction_record",
+}
+SOURCE_TO_EVIDENCE_TYPE = {
+    "receipt": "receipt",
+    "pr": "pr",
+    "bureau_task": "bureau_task",
+    "friction_record": "friction_record",
+}
 SUPPORTED_SOURCE_KEYS = (
     "receipts",
     "prs",
@@ -147,21 +163,29 @@ def build_recall_item(
     evidence_refs: list[dict[str, Any]],
     source: str,
 ) -> dict[str, Any]:
-    """Build one evidence-bound operator recall item.
+    """Build one evidence-ref-bound operator recall item.
 
     This function intentionally rejects free-form memories without concrete
     evidence refs. Recall items are derived records, not policy oracles.
     """
+    source_text = _bounded_text(source, label="source", max_chars=80)
+    if source_text not in SUPPORTED_ITEM_SOURCES:
+        raise ValueError("source is unsupported")
+    normalized_refs = _normalize_evidence_refs(evidence_refs)
+    expected_type = SOURCE_TO_EVIDENCE_TYPE[source_text]
+    if not any(ref.get("type") == expected_type for ref in normalized_refs):
+        raise ValueError("recall source requires matching evidence reference")
     return {
         "schema_version": 1,
         "kind": RECALL_KIND,
-        "source": _bounded_text(source, label="source", max_chars=80),
+        "source": source_text,
         "topic": _bounded_text(topic, label="topic", max_chars=120),
         "situation": _bounded_text(situation, label="situation"),
         "attempt": _bounded_text(attempt, label="attempt"),
         "result": _bounded_text(result, label="result"),
         "learned_rule": _bounded_text(learned_rule, label="learned_rule"),
-        "evidence_refs": _normalize_evidence_refs(evidence_refs),
+        "learned_rule_trust": LEARNED_RULE_TRUST,
+        "evidence_refs": normalized_refs,
         "does_not_establish": list(RECALL_DOES_NOT_ESTABLISH),
     }
 
@@ -189,9 +213,10 @@ def _pr_recall(record: dict[str, Any]) -> dict[str, Any] | None:
     if raw_number is None:
         return None
     number = _positive_int(raw_number, label="pr number")
-    repo = _optional_bounded_text(record.get("repo"), max_chars=160)
-    if not repo:
+    repo_raw = record.get("repo")
+    if repo_raw is None:
         return None
+    repo = _bounded_text(repo_raw, label="repo", max_chars=160)
     title = _optional_bounded_text(record.get("title"), max_chars=180) or f"PR {number}"
     state = _optional_bounded_text(record.get("state"), max_chars=80) or "unknown"
     url = record.get("url")
@@ -272,16 +297,25 @@ def export_operator_recall(sources: dict[str, Any], *, limit: int = 50) -> dict[
 
     items: list[dict[str, Any]] = []
     rejected_sources: list[dict[str, Any]] = []
+    rejected_source_count = 0
+    stopped_on_limit = False
+
+    def record_rejection(entry: dict[str, Any]) -> None:
+        nonlocal rejected_source_count
+        rejected_source_count += 1
+        if len(rejected_sources) < MAX_REJECTED_SOURCES:
+            rejected_sources.append(entry)
+
     for key in SUPPORTED_SOURCE_KEYS:
         builder = builders[key]
         for index, record in enumerate(normalized_sources[key]):
             if not isinstance(record, dict):
-                rejected_sources.append({"source": key, "index": index, "reason": "not_object"})
+                record_rejection({"source": key, "index": index, "reason": "not_object"})
                 continue
             try:
                 item = builder(record)
             except ValueError as exc:
-                rejected_sources.append({
+                record_rejection({
                     "source": key,
                     "index": index,
                     "reason": "invalid_source_record",
@@ -289,12 +323,13 @@ def export_operator_recall(sources: dict[str, Any], *, limit: int = 50) -> dict[
                 })
                 continue
             if item is None:
-                rejected_sources.append({"source": key, "index": index, "reason": "missing_concrete_evidence_ref"})
+                record_rejection({"source": key, "index": index, "reason": "missing_concrete_evidence_ref"})
                 continue
             items.append(item)
             if len(items) >= limit:
+                stopped_on_limit = True
                 break
-        if len(items) >= limit:
+        if stopped_on_limit:
             break
     return {
         "schema_version": 1,
@@ -307,10 +342,10 @@ def export_operator_recall(sources: dict[str, Any], *, limit: int = 50) -> dict[
         "unsupported_source_key_count": len(unsupported_source_keys),
         "unsupported_source_keys": unsupported_source_keys,
         "returned": len(items),
-        "stopped_on_limit": len(items) >= limit,
-        "rejected_source_count": len(rejected_sources),
-        "rejected_sources": rejected_sources[:MAX_REJECTED_SOURCES],
-        "rejected_sources_truncated": len(rejected_sources) > MAX_REJECTED_SOURCES,
+        "stopped_on_limit": stopped_on_limit,
+        "rejected_source_count": rejected_source_count,
+        "rejected_sources": rejected_sources,
+        "rejected_sources_truncated": rejected_source_count > MAX_REJECTED_SOURCES,
         "items": items,
         "heimlern_offline_learning": dict(HEIMLERN_OFFLINE_LEARNING_BOUNDARY),
         "does_not_establish": list(RECALL_DOES_NOT_ESTABLISH),
@@ -319,5 +354,5 @@ def export_operator_recall(sources: dict[str, Any], *, limit: int = 50) -> dict[
 
 @mcp.tool(name="grabowski_operator_recall_export", annotations=READ_ONLY)
 def grabowski_operator_recall_export(sources: dict[str, Any], limit: int = 50) -> dict[str, Any]:
-    """Export evidence-bound operator recall items from provided source records."""
+    """Export evidence-ref-bound recall items from caller-supplied source records."""
     return export_operator_recall(sources, limit=limit)

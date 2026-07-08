@@ -85,6 +85,8 @@ class RecallTests(unittest.TestCase):
             self.assertTrue(item["evidence_refs"])
             self.assertIn("free_form_chat_memory", item["does_not_establish"])
             self.assertIn("policy_oracle", item["does_not_establish"])
+            self.assertEqual(item["learned_rule_trust"], "caller_supplied_unverified")
+            self.assertIn("learned_rule_authority", item["does_not_establish"])
 
     def test_free_form_memory_without_evidence_is_rejected(self) -> None:
         module = self._load_module()
@@ -96,7 +98,7 @@ class RecallTests(unittest.TestCase):
                 result="stored",
                 learned_rule="always do this",
                 evidence_refs=[],
-                source="chat",
+                source="receipt",
             )
 
     def test_missing_source_evidence_is_reported_not_exported(self) -> None:
@@ -141,6 +143,46 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(export["rejected_source_count"], 1)
         self.assertEqual(export["rejected_sources"][0]["reason"], "invalid_source_record")
 
+    def test_unknown_item_source_is_rejected_even_with_valid_evidence(self) -> None:
+        module = self._load_module()
+        with self.assertRaisesRegex(ValueError, "source is unsupported"):
+            module.build_recall_item(
+                topic="topic",
+                situation="situation",
+                attempt="attempt",
+                result="result",
+                learned_rule="rule",
+                evidence_refs=[{"type": "receipt", "id": "r1"}],
+                source="chat",
+            )
+
+    def test_item_source_requires_matching_evidence_type(self) -> None:
+        module = self._load_module()
+        with self.assertRaisesRegex(ValueError, "matching evidence reference"):
+            module.build_recall_item(
+                topic="topic",
+                situation="situation",
+                attempt="attempt",
+                result="result",
+                learned_rule="rule",
+                evidence_refs=[{"type": "receipt", "id": "r1"}],
+                source="pr",
+            )
+
+    def test_invalid_required_pr_repo_is_rejected_per_record(self) -> None:
+        module = self._load_module()
+        export = module.export_operator_recall({"prs": [{"repo": "bad\nrepo", "number": 1}]})
+
+        self.assertEqual(export["returned"], 0)
+        self.assertEqual(export["rejected_source_count"], 1)
+        self.assertEqual(export["rejected_sources"][0]["reason"], "invalid_source_record")
+
+    def test_runtime_imports_recall_module(self) -> None:
+        runtime = (ROOT / "src/grabowski_runtime.py").read_text(encoding="utf-8")
+
+        self.assertIn("import grabowski_recall", runtime)
+
+
     def test_required_control_char_text_is_rejected(self) -> None:
         module = self._load_module()
         with self.assertRaisesRegex(ValueError, "control characters"):
@@ -164,9 +206,9 @@ class RecallTests(unittest.TestCase):
 
     def test_rejected_sources_are_bounded_and_marked_truncated(self) -> None:
         module = self._load_module()
-        export = module.export_operator_recall({"prs": [{"repo": "heimgewebe/grabowski", "number": 0} for _ in range(module.MAX_REJECTED_SOURCES + 3)]})
+        export = module.export_operator_recall({"prs": [{"repo": "heimgewebe/grabowski", "number": 0} for _ in range(module.MAX_REJECTED_SOURCES + 100)]})
 
-        self.assertEqual(export["rejected_source_count"], module.MAX_REJECTED_SOURCES + 3)
+        self.assertEqual(export["rejected_source_count"], module.MAX_REJECTED_SOURCES + 100)
         self.assertTrue(export["rejected_sources_truncated"])
         self.assertEqual(len(export["rejected_sources"]), module.MAX_REJECTED_SOURCES)
 
@@ -223,7 +265,7 @@ class RecallTests(unittest.TestCase):
         self.assertIn("policy_oracle", doc)
         self.assertIn("offline_proposal_only", doc)
         self.assertIn("does not verify", doc)
-
+        self.assertIn("Multiline source text must be normalized", doc)
 
     def test_heimlern_boundary_is_offline_proposal_only(self) -> None:
         module = self._load_module()

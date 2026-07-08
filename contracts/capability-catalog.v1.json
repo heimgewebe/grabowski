@@ -998,7 +998,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Export evidence-bound operator recall items from provided source records.",
+      "description": "Export evidence-ref-bound recall items from caller-supplied source records.",
       "effects": [],
       "id": "grabowski_operator_recall_export",
       "purpose": "Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth.",

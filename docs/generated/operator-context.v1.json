@@ -986,7 +986,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Export evidence-bound operator recall items from provided source records.",
+      "description": "Export evidence-ref-bound recall items from caller-supplied source records.",
       "effects": [],
       "id": "grabowski_operator_recall_export",
       "purpose": "Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth.",
@@ -1519,7 +1519,7 @@
       "src/grabowski_operator.py": "df7bed5d1955f7d48adc12f114de9d877f8de9f6a12a7d160efc8aa44d5b5ddd",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
       "src/grabowski_read_surface.py": "1e8147ea845e8a9cc5ab723140dc996965f7aebb2183af74164de30d24f97928",
-      "src/grabowski_recall.py": "c4f3039a97a05cbfab74034901404fd737275ec8f2bc21492d0acfae0d222f4a",
+      "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
       "src/grabowski_recovery.py": "b0c5124271498639f6c16614ccb51f7b3b696ebfd88011ad2291d353e56d0fe6",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
