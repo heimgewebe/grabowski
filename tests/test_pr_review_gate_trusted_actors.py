@@ -73,10 +73,15 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("GitHub mergeable is UNKNOWN, not MERGEABLE", result["failures"])
 
-    def test_untrusted_codex_substring_actor_does_not_satisfy_review(self) -> None:
-        result = pr_review_gate.evaluate_review_gate(_state(actor="friendly-codex-bot"), self_review=_self_review())
+    def test_untrusted_codex_substring_actor_does_not_satisfy_explicit_codex_requirement(self) -> None:
+        state = _state(actor="friendly-codex-bot")
+        state["pr_diff_bypass"] = True
+        state["pr_diff_bypass_reason"] = "legacy unit seam without live PR diff"
+        review = _self_review()
+        review["codex_review"] = {"required": True, "reason": "explicit check"}
+        result = pr_review_gate.evaluate_review_gate(state, self_review=review)
         self.assertEqual(result["verdict"], "BLOCK")
-        self.assertIn("Codex review was not observed", result["failures"])
+        self.assertIn("Codex review is explicitly required but not observed on current head", result["failures"])
 
 
 if __name__ == "__main__":

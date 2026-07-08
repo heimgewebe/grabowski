@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -353,6 +354,166 @@ class ExternalReviewGateTests(unittest.TestCase):
         )
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertTrue(_has_failure(result, "external_review finding 0 is not terminally triaged"), result["failures"])
+
+
+class ExternalReviewDefaultPolicyTests(unittest.TestCase):
+    def test_non_trivial_code_change_requires_external_llm_evidence(self) -> None:
+        state = _state("src/feature.py")
+        state["pr"]["additions"] = 45
+        state["pr"]["deletions"] = 0
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["high_critical"])
+        self.assertFalse(result["complexity"]["complex"])
+        self.assertEqual(result["complexity"]["review_tier"], "external_llm")
+        self.assertTrue(result["review_sources"]["external_review_required"])
+        self.assertFalse(result["review_sources"]["platform_review_required"])
+        self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
+
+    def test_docs_only_change_is_exempt_from_external_llm_evidence(self) -> None:
+        state = _state("docs/architecture.md")
+        state["pr"]["additions"] = 1200
+        state["pr"]["deletions"] = 200
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["complexity"]["review_tier"], "exempt_documentation")
+        self.assertFalse(result["review_sources"]["external_review_required"])
+        self.assertFalse(result["review_sources"]["platform_review_required"])
+
+    def test_grabowski_md_is_policy_critical_not_documentation_exempt(self) -> None:
+        state = _state("GRABOWSKI.md")
+        state["pr"]["additions"] = 200
+        state["pr"]["deletions"] = 0
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["docs_only"])
+        self.assertEqual(result["complexity"]["review_tier"], "high_critical")
+        self.assertTrue(result["review_sources"]["platform_review_required"])
+        self.assertIn("high-critical policy path touched: GRABOWSKI.md", result["complexity"]["reasons"])
+
+    def test_agents_md_is_policy_critical_not_documentation_exempt(self) -> None:
+        state = _state("AGENTS.md")
+        state["pr"]["additions"] = 80
+        state["pr"]["deletions"] = 0
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["docs_only"])
+        self.assertEqual(result["complexity"]["review_tier"], "high_critical")
+        self.assertTrue(result["review_sources"]["platform_review_required"])
+        self.assertIn("high-critical policy path touched: AGENTS.md", result["complexity"]["reasons"])
+
+    def test_external_review_loop_doc_is_policy_critical(self) -> None:
+        state = _state("docs/external-review-loop.md")
+        state["pr"]["additions"] = 20
+        state["pr"]["deletions"] = 0
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["docs_only"])
+        self.assertEqual(result["complexity"]["review_tier"], "high_critical")
+        self.assertTrue(result["review_sources"]["platform_review_required"])
+
+    def test_generated_json_under_docs_is_not_documentation_exempt(self) -> None:
+        state = _state("docs/generated/operator-context.v1.json")
+        state["pr"]["additions"] = 120
+        state["pr"]["deletions"] = 0
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["docs_only"])
+        self.assertEqual(result["complexity"]["review_tier"], "external_llm")
+        self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
+
+    def test_requirements_txt_is_not_documentation_exempt(self) -> None:
+        state = _state("requirements/deploy-tooling.lock.txt")
+        state["pr"]["additions"] = 60
+        state["pr"]["deletions"] = 0
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["docs_only"])
+        self.assertEqual(result["complexity"]["review_tier"], "high_critical")
+        self.assertTrue(result["complexity"]["high_critical"])
+        self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
+
+    def test_small_pyproject_change_is_not_trivial_exempt(self) -> None:
+        state = _state("pyproject.toml")
+        state["pr"]["additions"] = 2
+        state["pr"]["deletions"] = 1
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["very_small_uncomplicated"])
+        self.assertEqual(result["complexity"]["review_tier"], "external_llm")
+        self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
+
+    def test_small_makefile_change_is_not_trivial_exempt(self) -> None:
+        state = _state("Makefile")
+        state["pr"]["additions"] = 1
+        state["pr"]["deletions"] = 1
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["very_small_uncomplicated"])
+        self.assertEqual(result["complexity"]["review_tier"], "external_llm")
+
+    def test_zero_line_asset_change_is_not_trivial_exempt(self) -> None:
+        state = _state("assets/logo.png")
+        state["pr"]["additions"] = 0
+        state["pr"]["deletions"] = 0
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["very_small_uncomplicated"])
+        self.assertEqual(result["complexity"]["review_tier"], "external_llm")
+
+    def test_very_small_uncomplicated_code_change_is_exempt(self) -> None:
+        state = _state("src/tiny_feature.py")
+        state["pr"]["additions"] = 4
+        state["pr"]["deletions"] = 1
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["complexity"]["review_tier"], "exempt_very_small")
+        self.assertFalse(result["review_sources"]["external_review_required"])
+        self.assertFalse(result["review_sources"]["platform_review_required"])
+
+    def test_high_critical_change_requires_platform_and_external_evidence(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(result["complexity"]["high_critical"])
+        self.assertTrue(result["complexity"]["complex"])
+        self.assertEqual(result["complexity"]["review_tier"], "high_critical")
+        self.assertTrue(result["review_sources"]["external_review_required"])
+        self.assertTrue(result["review_sources"]["platform_review_required"])
+        self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
+        self.assertIn(
+            "High-critical platform review is required but neither Codex nor Claude was observed",
+            result["failures"],
+        )
+
+    def test_write_external_review_packet_creates_downloadable_diff_and_template(self) -> None:
+        state = _state("src/feature.py")
+        state["pr"]["title"] = "feat: example"
+        patch_text = "diff header\n+example\n".encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            packet = gate.write_external_review_packet(Path(tmpdir), state, patch_text)
+            diff_path = Path(packet["diff_path"])
+            prompt_path = Path(packet["prompt_path"])
+            evidence_path = Path(packet["evidence_template_path"])
+            manifest_path = Path(packet["manifest_path"])
+            self.assertEqual(diff_path.read_bytes(), patch_text)
+            self.assertTrue(prompt_path.read_text(encoding="utf-8").startswith("You are an external LLM reviewer."))
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            self.assertEqual(evidence["diff_sha256"], gate._sha256_bytes(patch_text))
+            self.assertEqual(evidence["prompt_sha256"], packet["prompt_sha256"])
+            self.assertTrue(manifest_path.is_file())
 
 
 if __name__ == "__main__":
