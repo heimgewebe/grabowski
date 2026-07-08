@@ -360,9 +360,6 @@ class RlensBundleToolTests(unittest.TestCase):
 
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class RlensContextBridgeToolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -509,6 +506,39 @@ class RlensContextBridgeToolTests(unittest.TestCase):
         self.assertEqual(result["ranges"][0], range_ref)
         self.assertIn("actual_agent_reading", result["does_not_establish"])
 
+
+    def test_query_existing_index_honors_evidence_and_projection_flags(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        captured = {}
+
+        def fake_query(_manifest, _query, *, k, filters, resolve_evidence, project_sources):
+            captured.update({
+                "k": k,
+                "filters": filters,
+                "resolve_evidence": resolve_evidence,
+                "project_sources": project_sources,
+            })
+            return {"status": "available", "query_result": {"results": []}}
+
+        with patch.object(mcp, "_rlens_lenskit_query_existing_index", side_effect=fake_query):
+            result = mcp.rlens_query_existing_index(
+                "demo-repo",
+                "hello",
+                k=2,
+                filters={"path": "README.md"},
+                resolve_evidence=False,
+                project_sources=False,
+            )
+
+        self.assertTrue(result["available"])
+        self.assertFalse(result["resolve_evidence"])
+        self.assertFalse(result["project_sources"])
+        self.assertEqual(captured["k"], 2)
+        self.assertEqual(captured["filters"], {"path": "README.md"})
+        self.assertFalse(captured["resolve_evidence"])
+        self.assertFalse(captured["project_sources"])
+
     def test_range_wrapper_returns_bounded_lenskit_range(self) -> None:
         _repo, head = self._git_repo("demo-repo")
         self._write_bundle("demo-repo-max-260701-1200", commit=head)
@@ -526,3 +556,7 @@ class RlensContextBridgeToolTests(unittest.TestCase):
         self.assertTrue(result["available"])
         self.assertEqual(result["range"]["text"], "hello")
         self.assertEqual(result["mutation_boundary"]["writes"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()
