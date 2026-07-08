@@ -96,6 +96,8 @@ Lange Befehle laufen als transiente User-systemd-Units:
 - `grabowski_job_logs`
 - `grabowski_job_cancel`
 
+Job-Metadaten sind dauerhafte Evidence, keine Erfolgsmeldung. Ein Job-Record enthält `job_id`, `owner`, `scope`, `started_at`, `expected_receipt`, `final_status` und `terminalization_evidence`. `notify_on_done` ist in diesem Slice nur Metadaten: `delivery_enabled=false`, kein Versand, kein Polling und keine verdeckte Finalisierungsannahme. Fehlende oder fehlgeschlagene Terminalisierung bleibt über `grabowski_job_status` sichtbar.
+
 ## Git und GitHub
 
 `grabowski_git` führt Git mit explizitem Repo-Pfad aus.

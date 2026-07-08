@@ -104,7 +104,7 @@ Ein Deployment, das Operator und Tunnel neu startet, darf nicht an den Lebenszyk
 
 Es akzeptiert weder einen Repositorypfad noch beliebige Befehle. Vor dem Start werden der kanonische Checkout, `main`, `HEAD`, `origin/main`, ein sauberer Arbeitsbaum und der versionierte Runner geprüft. Anschließend startet das Werkzeug einen eigenständigen dauerhaften systemd-Job und gibt dessen Unit und Logpfade zurück. Der Runner wartet zunächst, prüft den Checkout erneut, führt `make validate` und danach `make deploy` aus und verifiziert abschließend das Live-Manifest.
 
-Die Verzögerung ist Teil des Antwortvertrags: Der MCP-Request kann abgeschlossen werden, bevor Operator und Tunnel neu starten. Nach der Wiederverbindung liefern `grabowski_job_status` und `grabowski_job_logs` den dauerhaften Nachweis.
+Die Verzögerung ist Teil des Antwortvertrags: Der MCP-Request kann abgeschlossen werden, bevor Operator und Tunnel neu starten. Nach der Wiederverbindung liefern `grabowski_job_status` und `grabowski_job_logs` den dauerhaften Nachweis. Job-Status enthält eine eigene `terminalization_evidence`; optionale `notify_on_done`-Metadaten senden in diesem Slice nichts und dürfen fehlende oder fehlgeschlagene Finalisierung nicht verdecken.
 
 ## Integritätsgeprüfte Releases
 
