@@ -3838,7 +3838,7 @@ def _rlens_registry_row_status(row: list[str]) -> dict[str, Any]:
     if not row:
         status["reason"] = "empty_row"
         return status
-    if tuple(row[:len(BUNDLE_REGISTRY_HEADER)]) == BUNDLE_REGISTRY_HEADER:
+    if len(row) == len(BUNDLE_REGISTRY_HEADER) and tuple(row) == BUNDLE_REGISTRY_HEADER:
         status.update({"valid": True, "header": True, "is_header": True})
         return status
     if len(row) < len(BUNDLE_REGISTRY_HEADER):

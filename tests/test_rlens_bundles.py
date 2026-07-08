@@ -186,6 +186,10 @@ class RlensBundleToolTests(unittest.TestCase):
         status = mcp._rlens_registry_row_status(malformed)
         self.assertFalse(status["is_header"])
         self.assertFalse(status["valid"])
+        extended_header = [*list(mcp.BUNDLE_REGISTRY_HEADER), "extra"]
+        status = mcp._rlens_registry_row_status(extended_header)
+        self.assertFalse(status["is_header"])
+        self.assertFalse(status["valid"])
 
     def test_bundle_status_surfaces_output_health_dependency_degradation(self) -> None:
         stem = "demo-repo-max-260701-1200"
