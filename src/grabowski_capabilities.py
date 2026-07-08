@@ -415,6 +415,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_operator_recall_export": {
+        "category": "operations-observability",
+        "purpose": "Export evidence-bound operator recall items from provided receipts, PRs, Bureau tasks and friction records.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_task_start": {
         "category": "task",
         "purpose": "Start a persistent local or fleet task in its own systemd unit.",

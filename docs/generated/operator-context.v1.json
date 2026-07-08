@@ -985,6 +985,17 @@
       "tool": "grabowski_friction_summary"
     },
     {
+      "category": "operations-observability",
+      "description": "Export evidence-bound operator recall items from provided source records.",
+      "effects": [],
+      "id": "grabowski_operator_recall_export",
+      "purpose": "Export evidence-bound operator recall items from provided receipts, PRs, Bureau tasks and friction records.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_operator_recall_export"
+    },
+    {
       "category": "resource",
       "description": "Atomically acquire typed resource leases for one owner.",
       "effects": [
@@ -1365,6 +1376,7 @@
       "grabowski_recovery_server_probe",
       "grabowski_friction_record",
       "grabowski_friction_summary",
+      "grabowski_operator_recall_export",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",
       "grabowski_resource_release",
@@ -1447,6 +1459,10 @@
         "source": "src/grabowski_friction.py"
       },
       {
+        "module": "grabowski_recall",
+        "source": "src/grabowski_recall.py"
+      },
+      {
         "module": "grabowski_resources",
         "source": "src/grabowski_resources.py"
       },
@@ -1480,7 +1496,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "0d2ca69405d5aae979030c1c78899cae2b861b3fc496ddc879285b298b0d1891"
+      "sha256": "5ab6ad0b27d2c45b465c86bb324ac1b265011de627afcbc4194a1593b23a3374"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1488,25 +1504,26 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "d1fdf8f79b787ae02b377559342e05ee100d72b725005afb0e667127022c19ab"
+      "sha256": "73e027b006ec8cf283a935cba8bf2669f0827afab417588c2303211e31eca4ff"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "0d2ca69405d5aae979030c1c78899cae2b861b3fc496ddc879285b298b0d1891",
+      "src/grabowski_capabilities.py": "5ab6ad0b27d2c45b465c86bb324ac1b265011de627afcbc4194a1593b23a3374",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "c81842fd18772dd9a8696a7ae715b950007704f000d0d8559bc3f3b793cf38bd",
       "src/grabowski_grips.py": "86e81271fa447ee5a3145cc515963c4fa3ed1c53eced6cc8eb60f3cd3871d123",
-      "src/grabowski_mcp.py": "43c327e0516f1178fd0ecc7c93acc933c7d2c1274347474c068896520c2a7302",
+      "src/grabowski_mcp.py": "c98c87685c81b62a734c22b3111f21d95e88f59b5913da263a1abf5d46e95a37",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "df7bed5d1955f7d48adc12f114de9d877f8de9f6a12a7d160efc8aa44d5b5ddd",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
       "src/grabowski_read_surface.py": "1e8147ea845e8a9cc5ab723140dc996965f7aebb2183af74164de30d24f97928",
+      "src/grabowski_recall.py": "035f066983ca8f6cec10afbcaf3bc65c7b4c82ad43b267d40f8f143eaa0ffbf7",
       "src/grabowski_recovery.py": "b0c5124271498639f6c16614ccb51f7b3b696ebfd88011ad2291d353e56d0fe6",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
-      "src/grabowski_runtime.py": "57b9925ffbbcaa5bb51fa6ad838338ec6babba049b80f8d7bbd5c93524111a5c",
+      "src/grabowski_runtime.py": "246a3bfd7d734dd3567e38bc9de706a84f3ff3e75360d3166583d57326279eee",
       "src/grabowski_runtime_extensions.py": "3092fc1e9031cc2d3beb9e6e1e2a43ea31d68fe07cc6186055d06dacb56e87ed",
       "src/grabowski_self_deploy.py": "1c3e33310eecf259c636c6250f1f01618a0e0589ca85c2a9f8ed84cf025a9674",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
