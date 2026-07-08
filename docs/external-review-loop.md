@@ -65,6 +65,8 @@ Rules:
 - Count coverage is not identity-binding. It only prevents obvious under-recording; it does not bind a specific reported finding to a specific terminal finding.
 - Deprecated `self_review.external_review` is ignored. Use `--external-review-evidence` for external evidence.
 - Documentation-only PRs and very small uncomplicated PRs with no external evidence do not block. If voluntary external evidence is passed, its findings are still validated.
+- Policy-critical documentation such as `GRABOWSKI.md`, `AGENTS.md`, `docs/external-review-loop.md`, and operator/recovery/deploy doctrine is not documentation-exempt.
+- Very small changes are not exempt when they touch build, config, CI, packaging, controlled tool paths, structured data, lock files, or zero-line/binary-like diffs.
 - Non-trivial non-documentation PRs require external LLM evidence even when Codex or Claude is not required.
 - High-critical PRs require both external LLM evidence and at least one platform review from Codex or Claude.
 

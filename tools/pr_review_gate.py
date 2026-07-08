@@ -63,8 +63,41 @@ DOCUMENTATION_FILENAMES = (
     "readme.md",
 )
 DOCUMENTATION_EXTENSIONS = (".adoc", ".markdown", ".md", ".mdx", ".rst")
+POLICY_CRITICAL_PATHS = (
+    "agents.md",
+    "grabowski.md",
+    "docs/external-review-loop.md",
+)
+POLICY_CRITICAL_PREFIXES = (
+    "docs/autonomy/",
+    "docs/deploy/",
+    "docs/operator",
+    "docs/recovery/",
+)
 VERY_SMALL_CHANGE_FILE_LIMIT = 3
 VERY_SMALL_CHANGE_LINE_LIMIT = 40
+TRIVIAL_EXEMPT_DENY_FILENAMES = (
+    "dockerfile",
+    "makefile",
+    "pyproject.toml",
+    "setup.py",
+)
+TRIVIAL_EXEMPT_DENY_SUFFIXES = (
+    ".json",
+    ".lock",
+    ".toml",
+    ".yaml",
+    ".yml",
+)
+TRIVIAL_EXEMPT_DENY_PREFIXES = (
+    ".github/",
+    "config/",
+    "deploy/",
+    "infra/",
+    "requirements/",
+    "scripts/",
+    "tools/",
+)
 HIGH_CRITICAL_PATH_PREFIXES = (
     ".github/actions/",
     ".github/workflows/",
@@ -328,20 +361,47 @@ def _is_risk_path(path: str) -> bool:
     return any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES) or any(marker in normalized for marker in RISK_PATH_MARKERS)
 
 
+def _is_policy_critical_path(path: str) -> bool:
+    normalized = path.lower().lstrip("./")
+    if normalized in POLICY_CRITICAL_PATHS:
+        return True
+    return any(normalized.startswith(prefix) for prefix in POLICY_CRITICAL_PREFIXES)
+
+
 def _is_documentation_path(path: str) -> bool:
     normalized = path.lower().lstrip("./")
     path_obj = Path(normalized)
     name = path_obj.name
     suffix = path_obj.suffix
+    if _is_policy_critical_path(normalized):
+        return False
     if name in DOCUMENTATION_FILENAMES:
         return True
     if normalized.startswith(DOCUMENTATION_PATH_PREFIXES):
         return suffix in DOCUMENTATION_EXTENSIONS
-    return suffix in DOCUMENTATION_EXTENSIONS
+    return False
+
+
+def _trivial_exempt_deny_reason(path: str, changed_lines: int) -> str | None:
+    normalized = path.lower().lstrip("./")
+    name = Path(normalized).name
+    suffix = Path(normalized).suffix
+    if changed_lines <= 0:
+        return f"zero-line or binary-like diff is not trivial-exempt: {path}"
+    if name in TRIVIAL_EXEMPT_DENY_FILENAMES:
+        return f"trivial exemption denied for build/config file: {path}"
+    if suffix in TRIVIAL_EXEMPT_DENY_SUFFIXES:
+        return f"trivial exemption denied for structured/config suffix: {path}"
+    prefix = next((prefix for prefix in TRIVIAL_EXEMPT_DENY_PREFIXES if normalized.startswith(prefix)), None)
+    if prefix is not None:
+        return f"trivial exemption denied for controlled path: {path}"
+    return None
 
 
 def _high_critical_path_reason(path: str) -> str | None:
     normalized = path.lower().lstrip("./")
+    if _is_policy_critical_path(normalized):
+        return f"high-critical policy path touched: {path}"
     if any(normalized == prefix.rstrip("/") or normalized.startswith(prefix) for prefix in HIGH_CRITICAL_PATH_PREFIXES):
         return f"high-critical path touched: {path}"
     if any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES):
@@ -355,9 +415,14 @@ def _high_critical_path_reason(path: str) -> str | None:
 def _is_very_small_uncomplicated_change(paths: list[str], changed_files: int, changed_lines: int) -> bool:
     if changed_files <= 0 or changed_files > VERY_SMALL_CHANGE_FILE_LIMIT:
         return False
-    if changed_lines > VERY_SMALL_CHANGE_LINE_LIMIT:
+    if changed_lines <= 0 or changed_lines > VERY_SMALL_CHANGE_LINE_LIMIT:
         return False
-    return not any(_is_risk_path(path) or _high_critical_path_reason(path) for path in paths)
+    return not any(
+        _is_risk_path(path)
+        or _high_critical_path_reason(path)
+        or _trivial_exempt_deny_reason(path, changed_lines)
+        for path in paths
+    )
 
 
 def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) -> dict[str, Any]:
@@ -407,8 +472,9 @@ def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) 
         review_tier = "external_llm"
 
     return {
-        "complex": bool(external_review_reasons),
+        "complex": bool(high_critical_reasons),
         "reasons": external_review_reasons,
+        "complex_reasons": high_critical_reasons,
         "high_critical": bool(high_critical_reasons),
         "high_critical_reasons": high_critical_reasons,
         "external_review_required": bool(external_review_reasons),
