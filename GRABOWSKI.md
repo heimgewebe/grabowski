@@ -85,7 +85,21 @@ The live context tools compute runtime and checkout state on every call. Static 
 
 ## PR review gate
 
-Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Run `python3 tools/pr_review_gate.py --pr <number> --write-external-review-packet <dir> --self-review <path> --external-review-evidence <path> --json` for any non-exempt PR. Treat a BLOCK verdict as merge-blocking.
+Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Every PR requires current self-review evidence; non-exempt PRs also require external review evidence. Generate self-review templates and external review packets in a separate create-only step; then run the gate against completed evidence in a repeatable check step. Treat a BLOCK verdict as merge-blocking. The self-review template is only a scaffold; it is not passing evidence until Grabowski has actually reviewed the diff, recorded a PASS verdict, review iterations, reviewed files, focus axes, and terminal finding triage.
+
+For a non-exempt PR, first generate review scaffolds:
+
+```bash
+python3 tools/pr_review_gate.py --pr <number> --write-self-review-template <path> --write-external-review-packet <dir> --json
+```
+
+Then run the repeatable gate check after evidence is completed:
+
+```bash
+python3 tools/pr_review_gate.py --pr <number> --self-review <path> --external-review-evidence <path> --json
+```
+
+For an external-review-exempt PR, still provide completed self-review evidence and omit only the external packet/evidence arguments from the relevant command.
 
 The gate requires a head-SHA- and `gh pr diff` SHA-256-bound Grabowski self-review, iterative review evidence, terminal triage for every finding at every severity, and expected green checks named `validate (3.10)` and `validate (3.12)`. External LLM review evidence is required for every PR except documentation-only changes and very small uncomplicated changes. Policy-critical documentation and build/config/CI/packaging/tooling changes are not exempt merely because they are text or small. High-critical changes additionally require at least one platform review from Codex or Claude, provided either by a current-head trusted review object or, for Claude CLI, by a valid `--claude-evidence` receipt. Codex and Claude are therefore not the default review path for ordinary PRs; external LLM review packets are.
 
@@ -97,6 +111,8 @@ sha256sum evidence/pr-<number>.diff
 # macOS: shasum -a 256 evidence/pr-<number>.diff
 ```
 
-The self-review JSON must include `head_sha`, `diff_sha256`, `diff_reviewed: true`, `all_findings_triaged: true`, non-empty `review_iterations`, terminal `findings`, `material_findings_remaining`, and a `stop_reason`. The self-review must be a critical review performed by Grabowski against the actual diff; do not post the self-review text into the PR. A PR comment, review body, or inline comment is not self-review evidence. Existing self-review evidence without `diff_sha256` must be regenerated against the current head and current `gh pr diff` output before merge.
+The self-review JSON must include `schema_version: 1`, `kind: "grabowski_self_review"`, `review_mode: "critical_diff_review"`, `repo`, `pr`, `verdict: "PASS"`, `head_sha`, `diff_sha256`, `diff_reviewed: true`, complete `reviewed_files` coverage for the current PR files, `review_focus` covering `correctness`, `regression_risk`, `tests`, `security`, and `integration`, `all_findings_triaged: true`, non-empty `review_iterations`, terminal `findings`, `material_findings_remaining`, and a `stop_reason`. The self-review must be a critical review performed by Grabowski against the actual diff; do not post the self-review text into the PR. A PR comment, review body, or inline comment is not self-review evidence. Existing self-review evidence without the required workflow fields or without `diff_sha256` must be regenerated against the current head and current `gh pr diff` output before merge.
+
+The self-review gate checks structural compliance, exact PR file coverage, and current head/diff binding. That reduces self-deception but does not prove review quality by itself; external review evidence remains the collision-reduction layer for every non-exempt PR. `review_focus` records that every required axis was consciously considered. There is no per-axis exemption: if an axis yields no issue for a specific PR, keep the axis in `review_focus` and record concrete non-applicable findings only when useful. Template placeholders such as `PASS|NEEDS_CHANGE|BLOCK` must be replaced before the object can be passing evidence.
 
 Allowed terminal finding states are `fixed`, `accepted`, `false_positive`, `deferred_with_reason`, and `not_applicable`; accepted or deferred findings require reasons. Blocking findings cannot be merely accepted or deferred. Severity values `p0`, `p1`, `high`, and `critical` are treated as blocking for this purpose. Pending, cancelled, or missing checks block the gate.

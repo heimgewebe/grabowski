@@ -20,6 +20,16 @@ NON_BLOCKING_OPTIONAL_SKIPPED_CHECK_NAMES = {"claude"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
+SELF_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
+SELF_REVIEW_KIND = "grabowski_self_review"
+SELF_REVIEW_MODE = "critical_diff_review"
+REQUIRED_SELF_REVIEW_FOCUS = (
+    "correctness",
+    "regression_risk",
+    "tests",
+    "security",
+    "integration",
+)
 SELF_REVIEW_DIFF_BYPASS_REASON = "legacy unit seam without live PR diff"
 RISK_PATH_MARKERS = (
     "auth",
@@ -356,6 +366,20 @@ def _paths(pr: dict[str, Any]) -> list[str]:
             if isinstance(value, str):
                 paths.append(value)
     return paths
+
+
+def _current_pr_paths_failures(pr: dict[str, Any]) -> tuple[list[str], list[str]]:
+    paths = _paths(pr)
+    failures: list[str] = []
+    if not paths:
+        failures.append("current PR file list is missing or empty")
+    changed_files = pr.get("changedFiles")
+    if changed_files is not None:
+        if isinstance(changed_files, bool) or not isinstance(changed_files, int) or changed_files < 0:
+            failures.append("current PR changedFiles is missing or invalid")
+        elif changed_files != len(paths):
+            failures.append("current PR file list is incomplete")
+    return paths, failures
 
 
 def _is_risk_path(path: str) -> bool:
@@ -708,6 +732,95 @@ def _valid_iteration(item: Any) -> bool:
     return True
 
 
+def _normalized_review_path(value: str) -> str | None:
+    path = value.strip()
+    while path.startswith("./"):
+        path = path[2:]
+    if not path or path.startswith("/") or "\\" in path:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in path):
+        return None
+    segments = path.split("/")
+    if any(segment in {"", ".", ".."} for segment in segments):
+        return None
+    return path
+
+
+def _self_review_workflow_failures(
+    pr: dict[str, Any],
+    self_review: dict[str, Any],
+    *,
+    repo_name: str | None = None,
+) -> list[str]:
+    failures: list[str] = []
+    schema_version = self_review.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
+        failures.append("self-review schema_version is not integer 1")
+    if self_review.get("kind") != SELF_REVIEW_KIND:
+        failures.append(f"self-review kind must be {SELF_REVIEW_KIND}")
+    if self_review.get("review_mode") != SELF_REVIEW_MODE:
+        failures.append(f"self-review review_mode must be {SELF_REVIEW_MODE}")
+    if repo_name is None:
+        failures.append("current gate state is missing repoName")
+    elif self_review.get("repo") != repo_name:
+        failures.append("self-review repo mismatch")
+    pr_number = pr.get("number")
+    evidence_pr = self_review.get("pr")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int):
+        failures.append("current PR state is missing integer PR number")
+    elif isinstance(evidence_pr, bool) or not isinstance(evidence_pr, int) or evidence_pr != pr_number:
+        failures.append("self-review pr number mismatch")
+
+    verdict = self_review.get("verdict")
+    if verdict not in SELF_REVIEW_VERDICTS:
+        failures.append("self-review verdict is missing or invalid")
+    elif verdict != "PASS":
+        failures.append(f"self-review verdict is {verdict}, not PASS")
+
+    expected_paths, path_failures = _current_pr_paths_failures(pr)
+    failures.extend(path_failures)
+    normalized_expected: list[str] = []
+    for index, path in enumerate(expected_paths):
+        normalized = _normalized_review_path(path)
+        if normalized is None:
+            failures.append(f"current PR file list contains invalid path at index {index}")
+        else:
+            normalized_expected.append(normalized)
+
+    reviewed_files = self_review.get("reviewed_files")
+    if not isinstance(reviewed_files, list) or not reviewed_files:
+        failures.append("self-review reviewed_files must be a non-empty list")
+    else:
+        normalized_reviewed: list[str] = []
+        for index, item in enumerate(reviewed_files):
+            if not isinstance(item, str) or not item.strip():
+                failures.append("self-review reviewed_files contains empty or non-string entry")
+                continue
+            normalized = _normalized_review_path(item)
+            if normalized is None:
+                failures.append(f"self-review reviewed_files contains invalid path at index {index}")
+                continue
+            normalized_reviewed.append(normalized)
+        if normalized_expected and normalized_reviewed:
+            reviewed = set(normalized_reviewed)
+            expected = set(normalized_expected)
+            missing = sorted(expected - reviewed)
+            if missing:
+                failures.append("self-review reviewed_files does not cover PR file(s): " + ", ".join(missing))
+
+    review_focus = self_review.get("review_focus")
+    if not isinstance(review_focus, list) or not review_focus:
+        failures.append("self-review review_focus must be a non-empty list")
+    elif not all(isinstance(item, str) and item.strip() for item in review_focus):
+        failures.append("self-review review_focus contains empty or non-string entry")
+    else:
+        focus = {item.strip().lower() for item in review_focus}
+        missing_focus = [item for item in REQUIRED_SELF_REVIEW_FOCUS if item not in focus]
+        if missing_focus:
+            failures.append("self-review review_focus missing required item(s): " + ", ".join(missing_focus))
+    return failures
+
+
 def _legacy_external_finding_failures(external_review: dict[str, Any]) -> list[str]:
     findings = external_review.get("findings", [])
     if not isinstance(findings, list):
@@ -936,6 +1049,67 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
     return {**manifest, "manifest_path": str(manifest_path)}
 
 
+def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict[str, Any]:
+    repo_name = state.get("repoName")
+    if not isinstance(repo_name, str) or not repo_name.strip():
+        raise GateInputError("cannot write self-review template without repo name")
+    repo_name = repo_name.strip()
+    pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
+    pr_number = pr.get("number")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int):
+        raise GateInputError("cannot write self-review template without integer PR number")
+    head = pr.get("headRefOid")
+    if not isinstance(head, str) or not head:
+        raise GateInputError("cannot write self-review template without PR head SHA")
+    diff_sha256 = state.get("pr_diff_sha256")
+    if not _valid_sha256(diff_sha256):
+        pr_diff_error = state.get("pr_diff_error")
+        detail = f": {_brief_error(pr_diff_error)}" if isinstance(pr_diff_error, str) and pr_diff_error.strip() else ""
+        raise GateInputError(f"cannot write self-review template without current PR diff SHA-256{detail}")
+    paths, path_failures = _current_pr_paths_failures(pr)
+    if path_failures:
+        raise GateInputError("cannot write self-review template without complete current PR file list: " + "; ".join(path_failures))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    template = {
+        "schema_version": 1,
+        "kind": SELF_REVIEW_KIND,
+        "reviewer": "grabowski-self",
+        "review_mode": SELF_REVIEW_MODE,
+        "repo": repo_name,
+        "pr": pr_number,
+        "head_sha": head,
+        "diff_sha256": _normalize_sha256(diff_sha256),
+        "diff_reviewed": False,
+        "reviewed_files": paths,
+        "review_focus": list(REQUIRED_SELF_REVIEW_FOCUS),
+        "verdict": "PASS|NEEDS_CHANGE|BLOCK",
+        "review_iterations": [],
+        "all_findings_triaged": False,
+        "findings": [],
+        "material_findings_remaining": None,
+        "material_findings_after_first_review": None,
+        "stop_reason": "clean_pass|diminishing_returns|residual_only_with_reason|small_trivial_change",
+        "residual_risk": {"accepted": False, "reason": ""},
+    }
+    try:
+        with output_path.open("x", encoding="utf-8") as handle:
+            json.dump(template, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except FileExistsError as exc:
+        raise GateInputError(f"self-review template already exists: {output_path}") from exc
+    return {
+        "schema_version": 1,
+        "kind": "self_review_template",
+        "path": str(output_path),
+        "repo": repo_name,
+        "pr": pr_number,
+        "head_sha": head,
+        "diff_sha256": _normalize_sha256(diff_sha256),
+        "required_review_focus": list(REQUIRED_SELF_REVIEW_FOCUS),
+    }
+
+
 def evaluate_review_gate(
     state: dict[str, Any],
     *,
@@ -955,7 +1129,8 @@ def evaluate_review_gate(
     claude_blocking_states = _blocking_review_states(items, TRUSTED_CLAUDE_ACTORS)
     codex_seen = _has_trusted_actor(items, TRUSTED_CODEX_ACTORS)
     claude_seen = _has_trusted_actor(items, TRUSTED_CLAUDE_ACTORS)
-    repo_name = state.get("repoName") if isinstance(state.get("repoName"), str) else None
+    raw_repo_name = state.get("repoName")
+    repo_name = raw_repo_name.strip() if isinstance(raw_repo_name, str) and raw_repo_name.strip() else None
     claude_cli_failures = _claude_cli_evidence_failures(pr, claude_evidence, repo_name=repo_name)
     claude_cli_seen = claude_evidence is not None and not claude_cli_failures
     complexity = classify_complexity(pr, self_review)
@@ -992,40 +1167,45 @@ def evaluate_review_gate(
     if platform_review_required and not platform_review_seen and not codex_blocking_states and not claude_blocking_states:
         failures.append("High-critical platform review is required but neither Codex nor Claude was observed")
 
+    self_review_failures: list[str] = []
+    self_review_workflow_failures: list[str] = []
     if self_review is None:
-        failures.append("Grabowski self-review evidence is missing")
+        self_review_failures.append("Grabowski self-review evidence is missing")
     else:
         head_sha = pr.get("headRefOid")
         if not head_sha:
-            failures.append("PR headRefOid is missing")
+            self_review_failures.append("PR headRefOid is missing")
         elif self_review.get("head_sha") != head_sha:
-            failures.append("self-review head_sha mismatch")
+            self_review_failures.append("self-review head_sha mismatch")
+        self_review_workflow_failures = _self_review_workflow_failures(pr, self_review, repo_name=repo_name)
+        self_review_failures.extend(self_review_workflow_failures)
         if self_review.get("diff_reviewed") is not True:
-            failures.append("self-review does not assert diff_reviewed=true")
-        failures.extend(_self_review_diff_failures(state, self_review))
+            self_review_failures.append("self-review does not assert diff_reviewed=true")
+        self_review_failures.extend(_self_review_diff_failures(state, self_review))
         if self_review.get("all_findings_triaged") is not True:
-            failures.append("self-review does not assert all_findings_triaged=true")
+            self_review_failures.append("self-review does not assert all_findings_triaged=true")
         iterations = self_review.get("review_iterations")
         if not isinstance(iterations, list) or not iterations:
-            failures.append("self-review has no review_iterations")
+            self_review_failures.append("self-review has no review_iterations")
         else:
             for index, iteration in enumerate(iterations):
                 if not _valid_iteration(iteration):
-                    failures.append(f"review_iteration {index} lacks required evidence")
+                    self_review_failures.append(f"review_iteration {index} lacks required evidence")
         if self_review.get("stop_reason") not in STOP_REASONS:
-            failures.append("self-review stop_reason is missing or invalid")
+            self_review_failures.append("self-review stop_reason is missing or invalid")
         findings = self_review.get("findings", [])
         if not isinstance(findings, list):
-            failures.append("self-review findings is not a list")
+            self_review_failures.append("self-review findings is not a list")
         else:
             for index, finding in enumerate(findings):
                 if not isinstance(finding, dict) or not _terminal(finding):
-                    failures.append(f"finding {index} is not terminally triaged")
-        remaining = _material_findings_remaining(self_review, failures)
+                    self_review_failures.append(f"finding {index} is not terminally triaged")
+        remaining = _material_findings_remaining(self_review, self_review_failures)
         residual = self_review.get("residual_risk")
         accepted_residual = isinstance(residual, dict) and residual.get("accepted") is True and bool(residual.get("reason"))
         if remaining is not None and remaining > 0 and not accepted_residual:
-            failures.append("material findings remain without accepted residual-risk reason")
+            self_review_failures.append("material findings remain without accepted residual-risk reason")
+    failures.extend(self_review_failures)
 
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
     claude_required = isinstance(claude, dict) and claude.get("required") is True
@@ -1099,6 +1279,12 @@ def evaluate_review_gate(
             "claude_required": claude_required,
             "self_review_diff_bound": isinstance(self_review, dict)
             and _self_review_diff_bound(state, self_review),
+            "self_review_workflow_valid": isinstance(self_review, dict)
+            and not self_review_workflow_failures,
+            "self_review_metadata_valid": isinstance(self_review, dict)
+            and not self_review_workflow_failures,
+            "self_review_gate_valid": isinstance(self_review, dict)
+            and not self_review_failures,
             "self_review_diff_bypass_used": state.get("pr_diff_bypass") is True,
             "review_item_count": len(all_review_items),
             "current_head_review_item_count": len(items),
@@ -1128,6 +1314,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--claude-evidence")
     parser.add_argument("--external-review-evidence")
     parser.add_argument("--write-external-review-packet")
+    parser.add_argument("--write-self-review-template")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     repo = args.repo.resolve()
@@ -1137,6 +1324,12 @@ def main(argv: list[str] | None = None) -> int:
         external_review_evidence = load_external_review_evidence(resolve_inside_repo(repo, args.external_review_evidence, label="external review evidence"))
         state = load_pr_state(repo, args.pr)
         packet = None
+        self_review_template = None
+        if args.write_self_review_template:
+            template_path = resolve_inside_repo(repo, args.write_self_review_template, label="self-review template")
+            if template_path is None:
+                raise GateInputError("self-review template path is required")
+            self_review_template = write_self_review_template(template_path, state)
         if args.write_external_review_packet:
             packet_dir = resolve_inside_repo(repo, args.write_external_review_packet, label="external review packet")
             if packet_dir is None:
@@ -1148,6 +1341,8 @@ def main(argv: list[str] | None = None) -> int:
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
         )
+        if self_review_template is not None:
+            result["self_review_template"] = self_review_template
         if packet is not None:
             result["external_review_packet"] = packet
     except Exception as exc:

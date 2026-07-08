@@ -55,9 +55,17 @@ def _state(path: str = "README.md", *, diff_sha: str | None = DIFF_SHA) -> dict[
     return state
 
 
-def _self_review(*, diff_sha: str = DIFF_SHA) -> dict[str, object]:
+def _self_review(*, diff_sha: str = DIFF_SHA, path: str = "README.md") -> dict[str, object]:
     return {
+        "schema_version": 1,
+        "kind": "grabowski_self_review",
+        "review_mode": "critical_diff_review",
+        "verdict": "PASS",
+        "repo": "heimgewebe/grabowski",
+        "pr": 7,
         "head_sha": HEAD,
+        "reviewed_files": [path],
+        "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
         "diff_reviewed": True,
         "diff_sha256": diff_sha,
         "all_findings_triaged": True,
@@ -104,14 +112,14 @@ def _has_failure(result: dict[str, object], needle: str) -> bool:
 
 class ExternalReviewGateTests(unittest.TestCase):
     def test_complex_risk_path_without_external_evidence_blocks(self) -> None:
-        result = gate.evaluate_review_gate(_state("tools/pr_review_gate.py"), self_review=_self_review())
+        result = gate.evaluate_review_gate(_state("tools/pr_review_gate.py"), self_review=_self_review(path="tools/pr_review_gate.py"))
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
 
     def test_complex_risk_path_with_valid_external_evidence_passes(self) -> None:
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
-            self_review=_self_review(),
+            self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(),
         )
         self.assertEqual(result["verdict"], "PASS")
@@ -122,7 +130,7 @@ class ExternalReviewGateTests(unittest.TestCase):
     def test_complex_risk_path_block_verdict_without_terminal_finding_coverage_blocks(self) -> None:
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
-            self_review=_self_review(),
+            self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
                 reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "BLOCK", "finding_count": 0}],
                 external_reviews_triaged=True,
@@ -135,7 +143,7 @@ class ExternalReviewGateTests(unittest.TestCase):
     def test_complex_risk_path_needs_change_without_terminal_finding_coverage_blocks(self) -> None:
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
-            self_review=_self_review(),
+            self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
                 reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "NEEDS_CHANGE", "finding_count": 0}],
                 external_reviews_triaged=True,
@@ -148,7 +156,7 @@ class ExternalReviewGateTests(unittest.TestCase):
     def test_complex_risk_path_pass_with_reported_finding_without_terminal_finding_blocks(self) -> None:
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
-            self_review=_self_review(),
+            self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
                 reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1}],
                 external_reviews_triaged=True,
@@ -161,7 +169,7 @@ class ExternalReviewGateTests(unittest.TestCase):
     def test_complex_risk_path_reported_finding_with_matching_terminal_finding_passes(self) -> None:
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
-            self_review=_self_review(),
+            self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
                 reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1}],
                 external_reviews_triaged=True,
@@ -173,7 +181,7 @@ class ExternalReviewGateTests(unittest.TestCase):
     def test_complex_risk_path_two_reported_findings_with_one_terminal_finding_blocks(self) -> None:
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
-            self_review=_self_review(),
+            self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
                 reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 2}],
                 external_reviews_triaged=True,
@@ -186,7 +194,7 @@ class ExternalReviewGateTests(unittest.TestCase):
     def test_complex_risk_path_needs_change_requires_matching_terminal_finding_count(self) -> None:
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
-            self_review=_self_review(),
+            self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
                 reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "NEEDS_CHANGE", "finding_count": 2}],
                 external_reviews_triaged=True,
@@ -198,7 +206,7 @@ class ExternalReviewGateTests(unittest.TestCase):
 
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
-            self_review=_self_review(),
+            self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
                 reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "NEEDS_CHANGE", "finding_count": 2}],
                 external_reviews_triaged=True,
@@ -210,7 +218,7 @@ class ExternalReviewGateTests(unittest.TestCase):
     def test_complex_risk_path_block_zero_count_passes_with_one_terminal_finding(self) -> None:
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
-            self_review=_self_review(),
+            self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
                 reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "BLOCK", "finding_count": 0}],
                 external_reviews_triaged=True,
@@ -225,7 +233,7 @@ class ExternalReviewGateTests(unittest.TestCase):
         review_sha = "ef" * 32
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py", diff_sha=diff_sha),
-            self_review=_self_review(diff_sha=diff_sha),
+            self_review=_self_review(diff_sha=diff_sha, path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
                 diff_sha256=f"  {diff_sha.upper()}\n",
                 prompt_sha256=f"\t{prompt_sha.upper()}  ",
@@ -259,7 +267,7 @@ class ExternalReviewGateTests(unittest.TestCase):
 
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
-            self_review=_self_review(),
+            self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
                 reviews=reviews,
                 findings=[_terminal_external_finding(), _terminal_external_finding()],
@@ -376,7 +384,7 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         state["pr"]["additions"] = 1200
         state["pr"]["deletions"] = 200
         state["pr"]["reviews"] = []
-        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        result = gate.evaluate_review_gate(state, self_review=_self_review(path="docs/architecture.md"))
         self.assertEqual(result["verdict"], "PASS")
         self.assertEqual(result["complexity"]["review_tier"], "exempt_documentation")
         self.assertFalse(result["review_sources"]["external_review_required"])
@@ -476,7 +484,7 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         state["pr"]["additions"] = 4
         state["pr"]["deletions"] = 1
         state["pr"]["reviews"] = []
-        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        result = gate.evaluate_review_gate(state, self_review=_self_review(path="src/tiny_feature.py"))
         self.assertEqual(result["verdict"], "PASS")
         self.assertEqual(result["complexity"]["review_tier"], "exempt_very_small")
         self.assertFalse(result["review_sources"]["external_review_required"])
@@ -514,6 +522,67 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
             self.assertEqual(evidence["diff_sha256"], gate._sha256_bytes(patch_text))
             self.assertEqual(evidence["prompt_sha256"], packet["prompt_sha256"])
             self.assertTrue(manifest_path.is_file())
+
+    def test_write_self_review_template_creates_non_passing_scaffold(self) -> None:
+        state = _state("src/feature.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            result = gate.write_self_review_template(path, state)
+            template = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(result["kind"], "self_review_template")
+            self.assertEqual(template["schema_version"], 1)
+            self.assertEqual(template["kind"], "grabowski_self_review")
+            self.assertEqual(template["repo"], "heimgewebe/grabowski")
+            self.assertEqual(template["pr"], 7)
+            self.assertEqual(template["head_sha"], HEAD)
+            self.assertEqual(template["diff_sha256"], DIFF_SHA)
+            self.assertEqual(template["reviewed_files"], ["src/feature.py"])
+            self.assertEqual(template["review_focus"], ["correctness", "regression_risk", "tests", "security", "integration"])
+            self.assertFalse(template["diff_reviewed"])
+            self.assertEqual(template["verdict"], "PASS|NEEDS_CHANGE|BLOCK")
+            self.assertEqual(template["review_iterations"], [])
+            self.assertFalse(template["all_findings_triaged"])
+
+    def test_write_self_review_template_requires_repo_name(self) -> None:
+        state = _state("src/feature.py")
+        state.pop("repoName")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            with self.assertRaisesRegex(gate.GateInputError, "cannot write self-review template without repo name"):
+                gate.write_self_review_template(path, state)
+
+    def test_write_self_review_template_requires_complete_file_list(self) -> None:
+        state = _state("src/feature.py")
+        state["pr"]["files"] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            with self.assertRaisesRegex(gate.GateInputError, "complete current PR file list"):
+                gate.write_self_review_template(path, state)
+
+    def test_write_self_review_template_rejects_incomplete_file_list(self) -> None:
+        state = _state("src/feature.py")
+        state["pr"]["changedFiles"] = 2
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            with self.assertRaisesRegex(gate.GateInputError, "current PR file list is incomplete"):
+                gate.write_self_review_template(path, state)
+
+    def test_write_self_review_template_refuses_to_overwrite_existing_file(self) -> None:
+        state = _state("src/feature.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            path.write_text("existing", encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateInputError, "self-review template already exists"):
+                gate.write_self_review_template(path, state)
+            self.assertEqual(path.read_text(encoding="utf-8"), "existing")
+
+    def test_write_self_review_template_requires_current_diff_hash(self) -> None:
+        state = _state("src/feature.py", diff_sha=None)
+        state["pr_diff_error"] = "gh pr diff failed"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            with self.assertRaisesRegex(gate.GateInputError, "cannot write self-review template without current PR diff SHA-256: gh pr diff failed"):
+                gate.write_self_review_template(path, state)
 
 
 if __name__ == "__main__":

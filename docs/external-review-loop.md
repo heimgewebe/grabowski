@@ -8,19 +8,69 @@ The external loop is separate from Grabowski self-review. Self-review remains in
 
 A GitHub PR comment that says the operator checked the PR is not review evidence and must not be treated as a merge gate.
 
-Before merge, Grabowski must run its own critical review against the current PR head and current PR diff. That review has to inspect the diff itself, challenge the approach, record review iterations, record material findings, and terminally triage every finding in structured self-review evidence. Do not write the self-review text into the pull request as a review comment; the PR may at most reference the evidence artifact path/hash/status.
+Before merge, Grabowski must run its own critical review against the current PR head and current PR diff. That review has to inspect the diff itself, challenge the approach, record a `PASS|NEEDS_CHANGE|BLOCK` verdict, list every reviewed PR file, cover the focus axes `correctness`, `regression_risk`, `tests`, `security`, and `integration`, record review iterations, record material findings, and terminally triage every finding in structured self-review evidence. Do not write the self-review text into the pull request as a review comment; the PR may at most reference the evidence artifact path/hash/status.
 
-For every non-exempt PR, Grabowski must start an external LLM review loop before merge by handing the user a portable review packet. The packet must contain repo, PR number, current head SHA, diff hash, exact reviewer instructions, an evidence template, and the full PR diff as a downloadable file suitable for another model. Required external review remains blocking until returned findings are triaged and supplied as external review evidence, unless the user consciously overrides that gate outside this automated policy.
+The self-review gate validates structure, exact PR file coverage, and current head/diff binding. This is necessary evidence hygiene, not proof that the review was high quality. External review evidence remains the collision-reduction layer for every non-exempt PR. The required focus axes have no local exemption: if `security` or `integration` yields no issue for a given change, the axis still stays in `review_focus`; individual findings may use terminal `not_applicable` status when recording such a conclusion is useful.
+
+Self-review is required for every PR. For every non-exempt PR, Grabowski must also start an external LLM review loop before merge by handing the user a portable review packet. The packet must contain repo, PR number, current head SHA, diff hash, exact reviewer instructions, an evidence template, and the full PR diff as a downloadable file suitable for another model. Required external review remains blocking until returned findings are triaged and supplied as external review evidence, unless the user consciously overrides that gate outside this automated policy.
+
+Create the self-review template and external review packet once per PR head/diff:
 
 ```bash
 python3 tools/pr_review_gate.py \
   --pr <PR_NUMBER> \
+  --write-self-review-template evidence/pr-<PR_NUMBER>-self-review-template.json \
   --write-external-review-packet evidence/pr-<PR_NUMBER>-external \
-  --self-review evidence/self-review.json \
-  --external-review-evidence evidence/external-review.json
+  --json
 ```
 
-For high-critical PRs, include `--claude-evidence evidence/claude.json` when Claude CLI evidence is used instead of a current-head trusted Claude review object.
+Then run the repeatable gate check against completed evidence:
+
+```bash
+python3 tools/pr_review_gate.py \
+  --pr <PR_NUMBER> \
+  --self-review evidence/self-review.json \
+  --external-review-evidence evidence/external-review.json \
+  --json
+```
+
+For external-review-exempt PRs, still pass completed `--self-review` evidence and omit only `--external-review-evidence`. For high-critical PRs, include `--claude-evidence evidence/claude.json` when Claude CLI evidence is used instead of a current-head trusted Claude review object.
+
+Minimal self-review evidence object:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "grabowski_self_review",
+  "reviewer": "grabowski-self",
+  "review_mode": "critical_diff_review",
+  "repo": "heimgewebe/grabowski",
+  "pr": 70,
+  "head_sha": "<current PR head SHA>",
+  "diff_sha256": "<sha256 of current PR diff>",
+  "diff_reviewed": true,
+  "reviewed_files": ["<every current PR file>"],
+  "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
+  "verdict": "PASS",
+  "review_iterations": [
+    {"n": 1, "summary": "critical diff review completed", "material_findings": 0}
+  ],
+  "all_findings_triaged": true,
+  "findings": [],
+  "material_findings_remaining": 0,
+  "material_findings_after_first_review": 0,
+  "stop_reason": "clean_pass"
+}
+```
+
+Self-review rules:
+
+- `schema_version` must be integer `1`, `kind` must be `grabowski_self_review`, and `review_mode` must be `critical_diff_review`.
+- `repo`, `pr`, `head_sha`, and `diff_sha256` must match the current gate state.
+- `verdict` must be `PASS`; `NEEDS_CHANGE` or `BLOCK` blocks merge.
+- `reviewed_files` must cover every file in the current PR file list using exact, case-sensitive repository paths. A single leading `./` is tolerated; absolute paths and `..` path segments are invalid.
+- `review_focus` must include `correctness`, `regression_risk`, `tests`, `security`, and `integration`; these axes are mandatory considerations, not optional per-PR switches.
+- `--write-self-review-template` writes a scaffold bound to the current head and diff hash; it does not satisfy the gate until completed after an actual critical review and all placeholders such as `PASS|NEEDS_CHANGE|BLOCK` are replaced. Existing template files are not overwritten.
 
 Minimal external evidence object:
 
