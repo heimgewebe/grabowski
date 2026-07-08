@@ -251,5 +251,312 @@ class RlensBundleToolTests(unittest.TestCase):
         self.assertEqual(result["reason"], "no_bundle_available")
 
 
+    def test_query_existing_index_normalizes_nested_query_result_shape(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        lenskit_result = {
+            "status": "available",
+            "query_result": {
+                "results": [
+                    {
+                        "path": "README.md",
+                        "chunk_id": "chunk-1",
+                        "text": "hello world from bounded evidence",
+                        "score": 0.5,
+                        "range_ref": {
+                            "artifact_role": "canonical_md",
+                            "file_path": "demo-repo.md",
+                            "start_byte": 0,
+                            "end_byte": 11,
+                        },
+                    }
+                ]
+            },
+        }
+
+        with patch.object(mcp, "_rlens_lenskit_query_existing_index", return_value=lenskit_result):
+            result = mcp.rlens_query_existing_index("demo-repo", "hello", k=1)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["normalized_query_shape"], "query_result.results")
+        self.assertEqual(result["hit_count"], 1)
+        self.assertEqual(result["snippets"][0]["text_excerpt"], "hello world from bounded evidence")
+        self.assertEqual(result["ranges"][0]["artifact_role"], "canonical_md")
+        self.assertIn("runtime_correctness", result["does_not_establish"])
+
+    def test_query_existing_index_accepts_top_level_results_shape(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        lenskit_result = {
+            "status": "available",
+            "results": [
+                {
+                    "path": "README.md",
+                    "snippet": "top level shape",
+                    "derived_range_ref": {
+                        "artifact_role": "canonical_md",
+                        "file_path": "demo-repo.md",
+                        "start_byte": 20,
+                        "end_byte": 35,
+                    },
+                }
+            ],
+        }
+
+        with patch.object(mcp, "_rlens_lenskit_query_existing_index", return_value=lenskit_result):
+            result = mcp.rlens_query_existing_index("demo-repo", "shape", k=1)
+
+        self.assertEqual(result["normalized_query_shape"], "top_level_results")
+        self.assertEqual(result["snippets"][0]["text_excerpt"], "top level shape")
+        self.assertEqual(result["ranges"][0]["start_byte"], 20)
+
+    def test_range_get_wraps_lenskit_result(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        range_ref = {
+            "artifact_role": "canonical_md",
+            "file_path": "demo-repo.md",
+            "start_byte": 0,
+            "end_byte": 5,
+        }
+        lenskit_result = {
+            "status": "available",
+            "available": True,
+            "range": {"text": "hello", "lines": [1, 1]},
+        }
+
+        with patch.object(mcp, "_rlens_lenskit_range_get", return_value=lenskit_result):
+            result = mcp.rlens_range_get("demo-repo", range_ref)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["kind"], "grabowski.rlens_range_get")
+        self.assertEqual(result["range"]["text"], "hello")
+        self.assertEqual(result["mutation_boundary"]["writes"], [])
+
+    def test_context_pack_exposes_wrappers_and_empty_snippet_axes(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        manifest = self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        manifest_sha = __import__("hashlib").sha256(manifest.read_bytes()).hexdigest()
+        preflight = {
+            "status": "pass",
+            "answer_compliance_template": {"task_profile": "basic_repo_question"},
+        }
+
+        with patch.object(mcp, "_rlens_agent_preflight", return_value=preflight):
+            result = mcp.rlens_context_pack("demo-repo", "basic_repo_question")
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["context_ref"]["manifest_sha256"], manifest_sha)
+        self.assertEqual(result["access_wrappers"]["preflight"], "rlens_preflight")
+        self.assertEqual(result["access_wrappers"]["query"], "rlens_query_existing_index")
+        self.assertEqual(result["access_wrappers"]["range"], "rlens_range_get")
+        self.assertEqual(result["bounded_evidence"]["normalized_query_shape"], "query_not_requested")
+        self.assertEqual(result["bounded_evidence"]["snippets"], [])
+        self.assertEqual(result["bounded_evidence"]["ranges"], [])
+        self.assertEqual(
+            result["preflight"]["answer_compliance_template"]["task_profile"],
+            "basic_repo_question",
+        )
+
+
+
+class RlensContextBridgeToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.merges = self.home / "repos" / "merges"
+        self.merges.mkdir(parents=True)
+        self.state = self.home / ".local" / "state" / "grabowski"
+        self.state.mkdir(parents=True)
+        self.patches = [
+            patch.object(mcp, "HOME", self.home),
+            patch.object(mcp, "MERGES_ROOT", self.merges),
+            patch.object(mcp, "BUNDLE_REGISTRY", self.state / "rlens-latest-complete-bundles.tsv"),
+            patch.object(mcp, "_require_capability", lambda _capability: None),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self) -> None:
+        for item in reversed(self.patches):
+            item.stop()
+        self.tmp.cleanup()
+
+    def _write_bundle(self, stem: str, commit: str = "a" * 40) -> Path:
+        manifest = self.merges / f"{stem}_merge.bundle.manifest.json"
+        manifest.write_text(json.dumps({
+            "kind": "repolens.bundle.manifest",
+            "run_id": f"{stem}-run",
+            "created_at": "2026-07-01T00:00:00Z",
+            "generator": {"runtime": {"git_commit": commit, "git_dirty": False}},
+            "artifacts": [
+                {"role": "canonical_md"},
+                {"role": "sqlite_index"},
+                {"role": "citation_map_jsonl"},
+            ],
+        }), encoding="utf-8")
+        (self.merges / f"{stem}_merge.bundle_health.post.json").write_text(json.dumps({
+            "status": "pass",
+            "evidence_level": "range_strict",
+            "range_ref_resolution_status": "ok",
+        }), encoding="utf-8")
+        (self.merges / f"{stem}_merge.output_health.json").write_text(json.dumps({
+            "verdict": "pass",
+            "checks": {"range_ref_resolution_status": "ok"},
+        }), encoding="utf-8")
+        return manifest
+
+    def _git_repo(self, name: str) -> tuple[Path, str]:
+        repo = self.home / "repos" / name
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Grabowski Test"], cwd=repo, check=True)
+        (repo / "README.md").write_text("demo\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        return repo, head
+
+    def _range_ref(self) -> dict[str, object]:
+        return {
+            "artifact_role": "canonical_md",
+            "repo_id": "demo-repo",
+            "file_path": "README.md",
+            "start_byte": 0,
+            "end_byte": 5,
+            "start_line": 1,
+            "end_line": 1,
+            "content_sha256": "b" * 64,
+        }
+
+    def test_query_wrapper_normalizes_nested_lenskit_query_result(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        range_ref = self._range_ref()
+        payload = {
+            "kind": "repobrief.query_existing_index",
+            "status": "available",
+            "query_result": {
+                "count": 1,
+                "results": [{
+                    "chunk_id": "c1",
+                    "path": "README.md",
+                    "content": "hello from nested result",
+                    "range_ref": range_ref,
+                }],
+            },
+            "mutation_boundary": {"writes": [], "read_paths_do_not_refresh": True},
+            "evidence_resolution_used": True,
+        }
+
+        with patch.object(mcp, "_rlens_lenskit_query_existing_index", return_value=payload):
+            result = mcp.rlens_query("demo-repo", "hello", k=1)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["query_shape"], "query_result.results")
+        self.assertEqual(result["hit_count"], 1)
+        self.assertEqual(result["snippets"][0]["text_excerpt"], "hello from nested result")
+        self.assertEqual(result["ranges"][0], range_ref)
+        self.assertFalse(result["raw_results_included"])
+
+    def test_context_pack_includes_snippets_ranges_and_compliance_template(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        manifest = self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        manifest_sha = __import__("hashlib").sha256(manifest.read_bytes()).hexdigest()
+        range_ref = self._range_ref()
+        preflight = {
+            "status": "pass",
+            "available": True,
+            "required_reading": {"required": ["canonical_md"]},
+            "answer_compliance_template": {"task_profile": "basic_repo_question"},
+            "does_not_establish": ["actual_agent_reading"],
+        }
+        query_payload = {
+            "kind": "repobrief.query_existing_index",
+            "status": "available",
+            "query_result": {"count": 1, "results": []},
+            "source_citation_projection": {
+                "items": [{
+                    "ordinal": 0,
+                    "path": "README.md",
+                    "chunk_id": "c1",
+                    "text_excerpt": "bounded citation text",
+                    "range_status": "resolved",
+                    "citation_status": "resolved",
+                    "citation_id": "cit_0123456789abcdef",
+                    "source_range": range_ref,
+                }]
+            },
+            "mutation_boundary": {"writes": [], "read_paths_do_not_refresh": True},
+            "evidence_resolution_used": True,
+        }
+
+        with patch.object(mcp, "_rlens_agent_preflight", return_value=preflight), \
+             patch.object(mcp, "_rlens_lenskit_query_existing_index", return_value=query_payload):
+            result = mcp.rlens_context_pack("demo-repo", query="hello", k=1)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["context_ref"]["manifest_sha256"], manifest_sha)
+        self.assertEqual(result["context_ref"]["snippet_count"], 1)
+        self.assertEqual(result["context_ref"]["range_count"], 1)
+        self.assertEqual(result["preflight"]["answer_compliance_template"]["task_profile"], "basic_repo_question")
+        self.assertEqual(result["snippets"][0]["text_excerpt"], "bounded citation text")
+        self.assertEqual(result["ranges"][0], range_ref)
+        self.assertIn("actual_agent_reading", result["does_not_establish"])
+
+
+    def test_query_existing_index_honors_evidence_and_projection_flags(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        captured = {}
+
+        def fake_query(_manifest, _query, *, k, filters, resolve_evidence, project_sources):
+            captured.update({
+                "k": k,
+                "filters": filters,
+                "resolve_evidence": resolve_evidence,
+                "project_sources": project_sources,
+            })
+            return {"status": "available", "query_result": {"results": []}}
+
+        with patch.object(mcp, "_rlens_lenskit_query_existing_index", side_effect=fake_query):
+            result = mcp.rlens_query_existing_index(
+                "demo-repo",
+                "hello",
+                k=2,
+                filters={"path": "README.md"},
+                resolve_evidence=False,
+                project_sources=False,
+            )
+
+        self.assertTrue(result["available"])
+        self.assertFalse(result["resolve_evidence"])
+        self.assertFalse(result["project_sources"])
+        self.assertEqual(captured["k"], 2)
+        self.assertEqual(captured["filters"], {"path": "README.md"})
+        self.assertFalse(captured["resolve_evidence"])
+        self.assertFalse(captured["project_sources"])
+
+    def test_range_wrapper_returns_bounded_lenskit_range(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        range_ref = self._range_ref()
+        payload = {
+            "kind": "repobrief.range_get",
+            "status": "available",
+            "range": {"text": "hello", "lines": [1, 1]},
+            "mutation_boundary": {"writes": [], "read_paths_do_not_refresh": True},
+        }
+
+        with patch.object(mcp, "_rlens_lenskit_range_get", return_value=payload):
+            result = mcp.rlens_range_get("demo-repo", range_ref)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["range"]["text"], "hello")
+        self.assertEqual(result["mutation_boundary"]["writes"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

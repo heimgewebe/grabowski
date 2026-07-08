@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "6adf2cbd08f0913a70d0c8c3b25c6248910de95423ec10ebbcedf65093c80eba",
+  "capability_source_sha256": "0d2ca69405d5aae979030c1c78899cae2b861b3fc496ddc879285b298b0d1891",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "7869671606789e24407e859d76ccce59144c0d9f36b38cffb888a3726e76932f",
+  "contract_sha256": "d1fdf8f79b787ae02b377559342e05ee100d72b725005afb0e667127022c19ab",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -295,6 +295,50 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "rlens_freshness_check"
+    },
+    {
+      "category": "knowledge",
+      "description": "Return bounded rLens/RepoBrief preflight for an agent task profile.",
+      "effects": [],
+      "id": "rlens_preflight",
+      "purpose": "Run bounded rLens/RepoBrief consumption preflight for a selected bundle.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_preflight"
+    },
+    {
+      "category": "knowledge",
+      "description": "Run a bounded read-only RepoBrief query and normalize result shapes.",
+      "effects": [],
+      "id": "rlens_query",
+      "purpose": "Run a bounded read-only rLens/RepoBrief query and normalize result snippets and ranges.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_query"
+    },
+    {
+      "category": "knowledge",
+      "description": "Compatibility wrapper for querying a prebuilt RepoBrief index without refresh.",
+      "effects": [],
+      "id": "rlens_query_existing_index",
+      "purpose": "Query a prebuilt rLens/RepoBrief index and return normalized bounded snippets and ranges.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_query_existing_index"
+    },
+    {
+      "category": "knowledge",
+      "description": "Resolve one bounded RepoBrief range_ref without reading live workspace files.",
+      "effects": [],
+      "id": "rlens_range_get",
+      "purpose": "Resolve one bounded rLens/RepoBrief range reference without refreshing source artifacts.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_range_get"
     },
     {
       "category": "knowledge",

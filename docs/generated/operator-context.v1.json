@@ -286,6 +286,50 @@
     },
     {
       "category": "knowledge",
+      "description": "Return bounded rLens/RepoBrief preflight for an agent task profile.",
+      "effects": [],
+      "id": "rlens_preflight",
+      "purpose": "Run bounded rLens/RepoBrief consumption preflight for a selected bundle.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_preflight"
+    },
+    {
+      "category": "knowledge",
+      "description": "Run a bounded read-only RepoBrief query and normalize result shapes.",
+      "effects": [],
+      "id": "rlens_query",
+      "purpose": "Run a bounded read-only rLens/RepoBrief query and normalize result snippets and ranges.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_query"
+    },
+    {
+      "category": "knowledge",
+      "description": "Compatibility wrapper for querying a prebuilt RepoBrief index without refresh.",
+      "effects": [],
+      "id": "rlens_query_existing_index",
+      "purpose": "Query a prebuilt rLens/RepoBrief index and return normalized bounded snippets and ranges.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_query_existing_index"
+    },
+    {
+      "category": "knowledge",
+      "description": "Resolve one bounded RepoBrief range_ref without reading live workspace files.",
+      "effects": [],
+      "id": "rlens_range_get",
+      "purpose": "Resolve one bounded rLens/RepoBrief range reference without refreshing source artifacts.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "rlens_range_get"
+    },
+    {
+      "category": "knowledge",
       "description": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",
       "effects": [],
       "id": "rlens_context_pack",
@@ -1264,6 +1308,10 @@
       "rlens_bundle_discover",
       "rlens_bundle_status",
       "rlens_freshness_check",
+      "rlens_preflight",
+      "rlens_query",
+      "rlens_query_existing_index",
+      "rlens_range_get",
       "rlens_context_pack",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
@@ -1432,7 +1480,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "6adf2cbd08f0913a70d0c8c3b25c6248910de95423ec10ebbcedf65093c80eba"
+      "sha256": "0d2ca69405d5aae979030c1c78899cae2b861b3fc496ddc879285b298b0d1891"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1440,17 +1488,17 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "7869671606789e24407e859d76ccce59144c0d9f36b38cffb888a3726e76932f"
+      "sha256": "d1fdf8f79b787ae02b377559342e05ee100d72b725005afb0e667127022c19ab"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "6adf2cbd08f0913a70d0c8c3b25c6248910de95423ec10ebbcedf65093c80eba",
+      "src/grabowski_capabilities.py": "0d2ca69405d5aae979030c1c78899cae2b861b3fc496ddc879285b298b0d1891",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "f31abfd29d13f753b2e402f94e395a8ec24e87fb6b6da2046916aa5172e37862",
       "src/grabowski_friction.py": "3db9040ed9aafb44354620728ae9293c0f82d037aa5036dba2f2f76e5aac41c8",
       "src/grabowski_grips.py": "30fd00a2244a7d8d423ded2b8c927f0fb2de95daad611bbd2d075ca2bc642d94",
-      "src/grabowski_mcp.py": "86b4098842953a47b4e61fd25bd597d0c9fa7f49aff885c28769b8dd05e90d70",
+      "src/grabowski_mcp.py": "c29ef4033e38456165bc2ce59b5cc6d626973d6fd8db78ba534dede0e1794d91",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "8349e6d82afbbd32f5b924b842568e2448a7b01b4e643df76f4f050c43c87aaa",
       "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
