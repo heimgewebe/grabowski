@@ -260,7 +260,7 @@ class TaskTests(unittest.TestCase):
         with patch.object(
             tasks,
             "_dispatch",
-            side_effect=PermissionError("Executable is not allowed for fleet host wg-prod-1: systemctl"),
+            side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host wg-prod-1: systemctl"),
         ), patch.object(
             tasks.fleet, "run_fleet_task_unit_show", return_value=observed
         ) as show:

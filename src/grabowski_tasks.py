@@ -520,12 +520,10 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
     observer: dict[str, Any] = {"kind": "fleet-dispatch-v1"}
     try:
         result = _dispatch(record["host"], command, timeout_seconds=30)
-    except PermissionError as exc:
+    except fleet.FleetCommandDenied:
         # Production hosts intentionally do not expose generic systemctl through
         # fleet_run.  Reconcile still needs one fixed read-only observation shape
         # for Grabowski-owned task units, so fall back to the narrow fleet helper.
-        if "Executable is not allowed" not in str(exc):
-            raise
         observed = fleet.run_fleet_task_unit_show(
             record["host"],
             record["unit"],

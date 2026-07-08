@@ -204,7 +204,7 @@ class FleetTests(unittest.TestCase):
                 patch.object(fleet.shutil, "which", return_value="/usr/bin/ssh"),
                 patch.object(fleet.operator, "_run", return_value=completed) as run,
             ):
-                with self.assertRaisesRegex(PermissionError, "Executable is not allowed"):
+                with self.assertRaisesRegex(fleet.FleetCommandDenied, "Executable is not allowed"):
                     fleet.run_fleet_host(
                         "prod",
                         ["systemctl", "--user", "show", "demo.service"],

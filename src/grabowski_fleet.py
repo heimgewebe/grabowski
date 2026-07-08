@@ -27,6 +27,10 @@ SSH_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}\Z")
 PRODUCTION_ROLE = "production"
 
 
+class FleetCommandDenied(PermissionError):
+    """Raised when a fleet host rejects an otherwise valid command shape."""
+
+
 def _load_object(path: Path) -> dict[str, Any]:
     if path.is_symlink():
         raise PermissionError(f"Fleet registry may not be a symlink: {path}")
@@ -120,7 +124,7 @@ def _ensure_command_allowed(name: str, host: dict[str, Any], command: list[str])
             )
         return
     if command[0] not in allowlist and executable not in allowlist:
-        raise PermissionError(f"Executable is not allowed for fleet host {name}: {command[0]}")
+        raise FleetCommandDenied(f"Executable is not allowed for fleet host {name}: {command[0]}")
 
 
 def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
