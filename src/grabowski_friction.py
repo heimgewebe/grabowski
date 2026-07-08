@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -114,6 +115,7 @@ PROPOSAL_DOES_NOT_ESTABLISH = (
     "merge_readiness",
 )
 PATTERN_EVIDENCE_THRESHOLD = 2
+MAX_PROPOSAL_EVIDENCE_IDS = 20
 FRICTION_PROPOSAL_PATTERNS: dict[str, dict[str, Any]] = {
     "command_chains": {
         "terms": (
@@ -123,7 +125,10 @@ FRICTION_PROPOSAL_PATTERNS: dict[str, dict[str, Any]] = {
             "broad shell",
             "command shape",
             "command-shape",
-            "argv",
+            "argv shape",
+            "argv-only",
+            "command too broad",
+            "split command",
             "split commands",
         ),
         "recommendation_type": "next_grip",
@@ -171,8 +176,10 @@ FRICTION_PROPOSAL_PATTERNS: dict[str, dict[str, Any]] = {
             "review loop",
             "external review",
             "self-review",
-            "codex",
-            "claude",
+            "codex review loop",
+            "stale codex review",
+            "claude review evidence",
+            "stale claude review",
             "diff hash",
             "review gate",
         ),
@@ -381,45 +388,59 @@ def _decision_event(event: dict[str, Any], failure_class: str) -> dict[str, Any]
 
 
 def _event_id(event: dict[str, Any]) -> str:
-    value = _bounded_summary_text(event.get("event_id"), max_chars=80)
+    value = _bounded_summary_text(event.get("event_id", ""), max_chars=80)
     return value or "unknown"
 
 
+def _has_event_id(event: dict[str, Any]) -> bool:
+    return bool(_bounded_summary_text(event.get("event_id", ""), max_chars=80))
+
+
+def _proposal_event_ids(events: list[dict[str, Any]]) -> list[str]:
+    return [_event_id(event) for event in events[:MAX_PROPOSAL_EVIDENCE_IDS]]
+
+
 def _proposal_pattern_hits(event: dict[str, Any], failure_class: str) -> list[str]:
-    hits: list[str] = []
+    hits: set[str] = set()
     haystack = _event_haystack(event)
     kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
     if kind == "fail_closed_gate" or failure_class == "policy_gate":
-        hits.append("blocked_gates")
+        hits.add("blocked_gates")
     if kind == "connector_snapshot":
-        hits.append("stale_snapshots")
+        hits.add("stale_snapshots")
     for pattern, rule in FRICTION_PROPOSAL_PATTERNS.items():
+        if pattern in hits:
+            continue
         terms = rule.get("terms", ())
         if isinstance(terms, tuple) and any(term in haystack for term in terms):
-            hits.append(pattern)
-    return sorted(set(hits))
+            hits.add(pattern)
+    return [pattern for pattern in FRICTION_PROPOSAL_PATTERNS if pattern in hits]
 
 
 def _proposal_group(pattern: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     unresolved_events = [event for event in events if event.get("resolved") is not True]
-    failure_classes: dict[str, int] = {}
-    kinds: dict[str, int] = {}
-    surfaces: dict[str, int] = {}
+    failure_classes: Counter[str] = Counter()
+    kinds: Counter[str] = Counter()
+    surfaces: Counter[str] = Counter()
     for event in events:
         failure_class = classify_friction_event(event)
-        failure_classes[failure_class] = failure_classes.get(failure_class, 0) + 1
+        failure_classes[failure_class] += 1
         kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
         surface = _known_enum_value(event.get("surface"), FRICTION_SURFACES)
-        kinds[kind] = kinds.get(kind, 0) + 1
-        surfaces[surface] = surfaces.get(surface, 0) + 1
+        kinds[kind] += 1
+        surfaces[surface] += 1
     return {
         "pattern": pattern,
         "count": len(events),
         "unresolved": len(unresolved_events),
         "repeated": len(events) >= PATTERN_EVIDENCE_THRESHOLD,
         "actionable_repeated": len(unresolved_events) >= PATTERN_EVIDENCE_THRESHOLD,
-        "evidence_event_ids": [_event_id(event) for event in events[:20]],
-        "evidence_event_ids_truncated": len(events) > 20,
+        "evidence_event_ids": _proposal_event_ids(events),
+        "evidence_event_ids_truncated": len(events) > MAX_PROPOSAL_EVIDENCE_IDS,
+        "unresolved_evidence_event_ids": _proposal_event_ids(unresolved_events),
+        "unresolved_evidence_event_ids_truncated": len(unresolved_events) > MAX_PROPOSAL_EVIDENCE_IDS,
+        "missing_event_id_count": sum(1 for event in events if not _has_event_id(event)),
+        "unresolved_missing_event_id_count": sum(1 for event in unresolved_events if not _has_event_id(event)),
         "by_failure_class": dict(sorted(failure_classes.items())),
         "by_kind": dict(sorted(kinds.items())),
         "by_surface": dict(sorted(surfaces.items())),
@@ -438,8 +459,16 @@ def _recommendation_for_group(group: dict[str, Any]) -> dict[str, Any] | None:
         "recommendation_type": rule["recommendation_type"],
         "title": rule["title"],
         "rationale": rule["rationale"],
-        "evidence_event_ids": list(group.get("evidence_event_ids", [])),
-        "does_not_establish": list(PROPOSAL_DOES_NOT_ESTABLISH),
+        "count": group["count"],
+        "unresolved": group["unresolved"],
+        "evidence_threshold": PATTERN_EVIDENCE_THRESHOLD,
+        "by_failure_class": group["by_failure_class"],
+        "by_kind": group["by_kind"],
+        "by_surface": group["by_surface"],
+        "evidence_event_ids": list(group.get("unresolved_evidence_event_ids", [])),
+        "evidence_event_ids_truncated": group.get("unresolved_evidence_event_ids_truncated") is True,
+        "missing_event_id_count": group["unresolved_missing_event_id_count"],
+        "inherits_does_not_establish": True,
     }
 
 
@@ -447,26 +476,30 @@ def propose_next_grip_from_friction(events: list[dict[str, Any]]) -> dict[str, A
     """Group repeated friction into proposal-only next-action hints.
 
     This is read-only evidence synthesis. It never mutates Bureau, never starts a
-    grip and never promotes a recommendation into a task.
+    grip and never promotes a recommendation into a task. One event may support
+    multiple proposal groups; that is not evidence for multiple root causes.
     """
     grouped: dict[str, list[dict[str, Any]]] = {
         pattern: [] for pattern in FRICTION_PROPOSAL_PATTERNS
     }
+    matched_event_count = 0
     for event in events:
         failure_class = classify_friction_event(event)
-        for pattern in _proposal_pattern_hits(event, failure_class):
-            grouped.setdefault(pattern, []).append(event)
+        patterns = _proposal_pattern_hits(event, failure_class)
+        if patterns:
+            matched_event_count += 1
+        for pattern in patterns:
+            grouped[pattern].append(event)
 
     groups = [
         _proposal_group(pattern, grouped_events)
-        for pattern, grouped_events in sorted(grouped.items())
+        for pattern, grouped_events in grouped.items()
         if grouped_events
     ]
     recommendations = [
         recommendation
         for group in groups
-        for recommendation in [_recommendation_for_group(group)]
-        if recommendation is not None
+        if (recommendation := _recommendation_for_group(group)) is not None
     ]
     no_action = not recommendations
     return {
@@ -474,16 +507,20 @@ def propose_next_grip_from_friction(events: list[dict[str, Any]]) -> dict[str, A
         "authority": "proposal_only",
         "evidence_scope": "recent_valid_events",
         "evidence_threshold": PATTERN_EVIDENCE_THRESHOLD,
+        "max_evidence_event_ids": MAX_PROPOSAL_EVIDENCE_IDS,
         "does_not_establish": list(PROPOSAL_DOES_NOT_ESTABLISH),
+        "matched_event_count": matched_event_count,
+        "unmatched_event_count": len(events) - matched_event_count,
         "groups": groups,
         "recommendations": recommendations,
         "recommendation_count": len(recommendations),
+        "has_recommendations": bool(recommendations),
         "no_action": {
             "recommended": no_action,
             "reason": (
-                "no repeated unresolved friction pattern met the evidence threshold"
+                "no configured proposal pattern met the unresolved evidence threshold"
                 if no_action
-                else "one or more repeated unresolved friction patterns met the evidence threshold"
+                else "one or more configured proposal patterns met the unresolved evidence threshold"
             ),
         },
     }
