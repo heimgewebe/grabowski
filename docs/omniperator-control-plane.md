@@ -70,6 +70,8 @@ Fleet-Aufrufe bleiben argv-basiert. Benannte Operationen behalten Preflight, Act
 
 Benutzer-Power-Tasks und privilegierte Aktionen besitzen getrennte Gates. Der Root-Gate kann erst grün werden, wenn auch der Broker hostseitig installiert und geprüft ist.
 
+Runtime-Gesundheit und Recovery-Evidence sind getrennte Wahrheiten. Ein grüner Runtime-Status beweist nicht, dass Restore-Pfade frisch geprüft sind. `grabowski_recovery_status` gibt deshalb zusätzlich `recovery_evidence_boundary` aus. Bei der Standardkonfiguration meldet die Boundary `uses_default_heimserver_backend=true`; ist dieser Pfad nicht frisch und zielgleich belegt, bleiben Power-Worker und privilegierte Aktionen blockiert. Ein Custom-Recovery-Ziel meldet `custom_recovery_target_configured=true` nur bei gültiger Target-Form `<host>:rest-server/<probe>` und gilt erst als Recovery-Evidence, nachdem Backup-, Restore-Sentinel- und Repository-Check gegen exakt dieses konfigurierte Ziel bestanden haben. Ungültige Targets melden `configured_target_valid=false` und bleiben fail-closed. Details: `docs/non-heimserver-recovery-boundary.md`.
+
 ## Recovery-Server
 
 Die versionierte Compose-Datei unter `deploy/heimserver/` beschreibt einen begrenzten Restic-REST-Dienst:
