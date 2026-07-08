@@ -718,16 +718,35 @@ def _valid_iteration(item: Any) -> bool:
     return True
 
 
-def _normalized_review_path(value: str) -> str:
-    return value.strip().lower().lstrip("./")
+def _normalized_review_path(value: str) -> str | None:
+    path = value.strip()
+    if path.startswith("./"):
+        path = path[2:]
+    if not path or path.startswith("/") or ".." in path.split("/"):
+        return None
+    return path
 
 
-def _self_review_workflow_failures(pr: dict[str, Any], self_review: dict[str, Any]) -> list[str]:
+def _self_review_workflow_failures(
+    pr: dict[str, Any],
+    self_review: dict[str, Any],
+    *,
+    repo_name: str | None = None,
+) -> list[str]:
     failures: list[str] = []
+    schema_version = self_review.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
+        failures.append("self-review schema_version is not integer 1")
     if self_review.get("kind") != SELF_REVIEW_KIND:
         failures.append(f"self-review kind must be {SELF_REVIEW_KIND}")
     if self_review.get("review_mode") != SELF_REVIEW_MODE:
         failures.append(f"self-review review_mode must be {SELF_REVIEW_MODE}")
+    if repo_name is not None and self_review.get("repo") != repo_name:
+        failures.append("self-review repo mismatch")
+    pr_number = pr.get("number")
+    evidence_pr = self_review.get("pr")
+    if pr_number is not None and (isinstance(evidence_pr, bool) or not isinstance(evidence_pr, int) or evidence_pr != pr_number):
+        failures.append("self-review pr number mismatch")
 
     verdict = self_review.get("verdict")
     if verdict not in SELF_REVIEW_VERDICTS:
@@ -735,16 +754,35 @@ def _self_review_workflow_failures(pr: dict[str, Any], self_review: dict[str, An
     elif verdict != "PASS":
         failures.append(f"self-review verdict is {verdict}, not PASS")
 
+    expected_paths = _paths(pr)
+    normalized_expected: list[str] = []
+    if not expected_paths:
+        failures.append("current PR file list is missing or empty")
+    else:
+        for index, path in enumerate(expected_paths):
+            normalized = _normalized_review_path(path)
+            if normalized is None:
+                failures.append(f"current PR file list contains invalid path at index {index}")
+            else:
+                normalized_expected.append(normalized)
+
     reviewed_files = self_review.get("reviewed_files")
     if not isinstance(reviewed_files, list) or not reviewed_files:
         failures.append("self-review reviewed_files must be a non-empty list")
     else:
-        bad_entries = [index for index, item in enumerate(reviewed_files) if not isinstance(item, str) or not item.strip()]
-        if bad_entries:
-            failures.append("self-review reviewed_files contains empty or non-string entry")
-        else:
-            reviewed = {_normalized_review_path(item) for item in reviewed_files}
-            expected = {_normalized_review_path(path) for path in _paths(pr)}
+        normalized_reviewed: list[str] = []
+        for index, item in enumerate(reviewed_files):
+            if not isinstance(item, str) or not item.strip():
+                failures.append("self-review reviewed_files contains empty or non-string entry")
+                continue
+            normalized = _normalized_review_path(item)
+            if normalized is None:
+                failures.append(f"self-review reviewed_files contains invalid path at index {index}")
+                continue
+            normalized_reviewed.append(normalized)
+        if normalized_expected and normalized_reviewed:
+            reviewed = set(normalized_reviewed)
+            expected = set(normalized_expected)
             missing = sorted(expected - reviewed)
             if missing:
                 failures.append("self-review reviewed_files does not cover PR file(s): " + ", ".join(missing))
@@ -1004,6 +1042,8 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
         detail = f": {_brief_error(pr_diff_error)}" if isinstance(pr_diff_error, str) and pr_diff_error.strip() else ""
         raise GateInputError(f"cannot write self-review template without current PR diff SHA-256{detail}")
 
+    if output_path.exists() or output_path.is_symlink():
+        raise GateInputError(f"self-review template already exists: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     template = {
         "schema_version": 1,
@@ -1103,7 +1143,7 @@ def evaluate_review_gate(
             failures.append("PR headRefOid is missing")
         elif self_review.get("head_sha") != head_sha:
             failures.append("self-review head_sha mismatch")
-        failures.extend(_self_review_workflow_failures(pr, self_review))
+        failures.extend(_self_review_workflow_failures(pr, self_review, repo_name=repo_name))
         if self_review.get("diff_reviewed") is not True:
             failures.append("self-review does not assert diff_reviewed=true")
         failures.extend(_self_review_diff_failures(state, self_review))
@@ -1204,7 +1244,7 @@ def evaluate_review_gate(
             "self_review_diff_bound": isinstance(self_review, dict)
             and _self_review_diff_bound(state, self_review),
             "self_review_workflow_valid": isinstance(self_review, dict)
-            and not _self_review_workflow_failures(pr, self_review),
+            and not _self_review_workflow_failures(pr, self_review, repo_name=repo_name),
             "self_review_diff_bypass_used": state.get("pr_diff_bypass") is True,
             "review_item_count": len(all_review_items),
             "current_head_review_item_count": len(items),

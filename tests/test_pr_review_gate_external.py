@@ -57,9 +57,12 @@ def _state(path: str = "README.md", *, diff_sha: str | None = DIFF_SHA) -> dict[
 
 def _self_review(*, diff_sha: str = DIFF_SHA, path: str = "README.md") -> dict[str, object]:
     return {
+        "schema_version": 1,
         "kind": "grabowski_self_review",
         "review_mode": "critical_diff_review",
         "verdict": "PASS",
+        "repo": "heimgewebe/grabowski",
+        "pr": 7,
         "head_sha": HEAD,
         "reviewed_files": [path],
         "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
@@ -519,6 +522,43 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
             self.assertEqual(evidence["diff_sha256"], gate._sha256_bytes(patch_text))
             self.assertEqual(evidence["prompt_sha256"], packet["prompt_sha256"])
             self.assertTrue(manifest_path.is_file())
+
+    def test_write_self_review_template_creates_non_passing_scaffold(self) -> None:
+        state = _state("src/feature.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            result = gate.write_self_review_template(path, state)
+            template = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(result["kind"], "self_review_template")
+            self.assertEqual(template["schema_version"], 1)
+            self.assertEqual(template["kind"], "grabowski_self_review")
+            self.assertEqual(template["repo"], "heimgewebe/grabowski")
+            self.assertEqual(template["pr"], 7)
+            self.assertEqual(template["head_sha"], HEAD)
+            self.assertEqual(template["diff_sha256"], DIFF_SHA)
+            self.assertEqual(template["reviewed_files"], ["src/feature.py"])
+            self.assertEqual(template["review_focus"], ["correctness", "regression_risk", "tests", "security", "integration"])
+            self.assertFalse(template["diff_reviewed"])
+            self.assertEqual(template["verdict"], "PASS|NEEDS_CHANGE|BLOCK")
+            self.assertEqual(template["review_iterations"], [])
+            self.assertFalse(template["all_findings_triaged"])
+
+    def test_write_self_review_template_refuses_to_overwrite_existing_file(self) -> None:
+        state = _state("src/feature.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            path.write_text("existing", encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateInputError, "self-review template already exists"):
+                gate.write_self_review_template(path, state)
+            self.assertEqual(path.read_text(encoding="utf-8"), "existing")
+
+    def test_write_self_review_template_requires_current_diff_hash(self) -> None:
+        state = _state("src/feature.py", diff_sha=None)
+        state["pr_diff_error"] = "gh pr diff failed"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "self-review-template.json"
+            with self.assertRaisesRegex(gate.GateInputError, "cannot write self-review template without current PR diff SHA-256: gh pr diff failed"):
+                gate.write_self_review_template(path, state)
 
 
 if __name__ == "__main__":

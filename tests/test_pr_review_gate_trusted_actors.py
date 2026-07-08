@@ -28,9 +28,12 @@ pr_review_gate = _load_gate()
 
 def _self_review() -> dict:
     return {
+        "schema_version": 1,
         "kind": "grabowski_self_review",
         "review_mode": "critical_diff_review",
         "verdict": "PASS",
+        "repo": "heimgewebe/grabowski",
+        "pr": 58,
         "head_sha": HEAD,
         "reviewed_files": ["docs/low_risk_note.md"],
         "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
@@ -47,6 +50,7 @@ def _self_review() -> dict:
 
 def _state(*, actor: str = "chatgpt-codex-connector", merge_state: str = "CLEAN", mergeable: str = "MERGEABLE") -> dict:
     return {
+        "repoName": "heimgewebe/grabowski",
         "pr": {
             "number": 58,
             "state": "OPEN",

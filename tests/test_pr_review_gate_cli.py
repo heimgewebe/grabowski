@@ -57,9 +57,12 @@ class PrReviewGateCliTests(unittest.TestCase):
             "reviewComments": [],
         }
         review = {
+            "schema_version": 1,
             "kind": "grabowski_self_review",
             "review_mode": "critical_diff_review",
             "verdict": "PASS",
+            "repo": "heimgewebe/grabowski",
+            "pr": 58,
             "head_sha": "a" * 40,
             "reviewed_files": ["docs/low_risk_note.md"],
             "review_focus": REVIEW_FOCUS,
@@ -134,9 +137,12 @@ class PrReviewGateCliTests(unittest.TestCase):
             "reviewComments": [],
         }
         review = {
+            "schema_version": 1,
             "kind": "grabowski_self_review",
             "review_mode": "critical_diff_review",
             "verdict": "PASS",
+            "repo": "heimgewebe/grabowski",
+            "pr": 58,
             "head_sha": head,
             "reviewed_files": ["src/grabowski_mcp.py"],
             "review_focus": REVIEW_FOCUS,
@@ -184,9 +190,12 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
     def _review(self, **overrides) -> dict:
         head = "a" * 40
         payload = {
+            "schema_version": 1,
             "kind": "grabowski_self_review",
             "review_mode": "critical_diff_review",
             "verdict": "PASS",
+            "repo": "heimgewebe/grabowski",
+            "pr": 58,
             "head_sha": head,
             "reviewed_files": ["docs/low_risk_note.md"],
             "review_focus": REVIEW_FOCUS,
@@ -258,6 +267,77 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("self-review kind must be grabowski_self_review", result["failures"])
         self.assertFalse(result["review_sources"]["self_review_workflow_valid"])
+
+    def test_self_review_schema_version_is_required(self) -> None:
+        review = self._review()
+        review.pop("schema_version")
+        result = pr_review_gate.evaluate_review_gate(self._state(), self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review schema_version is not integer 1", result["failures"])
+
+    def test_self_review_repo_mismatch_blocks(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(repo="heimgewebe/other"),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review repo mismatch", result["failures"])
+
+    def test_self_review_pr_mismatch_blocks(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(pr=59),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review pr number mismatch", result["failures"])
+
+    def test_self_review_file_coverage_accepts_dot_slash_prefix(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=["./docs/low_risk_note.md"]),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertTrue(result["review_sources"]["self_review_workflow_valid"])
+
+    def test_self_review_file_coverage_is_case_sensitive(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=["DOCS/LOW_RISK_NOTE.MD"]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn(
+            "self-review reviewed_files does not cover PR file(s): docs/low_risk_note.md",
+            result["failures"],
+        )
+
+    def test_self_review_file_coverage_rejects_parent_segments(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=["../../docs/low_risk_note.md"]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review reviewed_files contains invalid path at index 0", result["failures"])
+
+    def test_self_review_file_coverage_rejects_absolute_paths(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=["/docs/low_risk_note.md"]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review reviewed_files contains invalid path at index 0", result["failures"])
+
+    def test_self_review_file_coverage_requires_current_pr_file_list(self) -> None:
+        state = self._state()
+        state["pr"]["files"] = []
+        result = pr_review_gate.evaluate_review_gate(state, self_review=self._review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("current PR file list is missing or empty", result["failures"])
+
+    def test_self_review_file_coverage_accepts_filename_field(self) -> None:
+        state = self._state()
+        state["pr"]["files"] = [{"filename": "docs/low_risk_note.md"}]
+        result = pr_review_gate.evaluate_review_gate(state, self_review=self._review())
+        self.assertEqual(result["verdict"], "PASS")
 
     def test_self_review_non_pass_verdict_blocks(self) -> None:
         result = pr_review_gate.evaluate_review_gate(

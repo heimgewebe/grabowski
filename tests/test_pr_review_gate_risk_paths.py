@@ -27,6 +27,7 @@ pr_review_gate = _load_gate()
 
 def _state(path: str) -> dict:
     return {
+        "repoName": "heimgewebe/grabowski",
         "pr": {
             "number": 58,
             "state": "OPEN",
@@ -50,9 +51,12 @@ def _state(path: str) -> dict:
 
 def _self_review(path: str) -> dict:
     return {
+        "schema_version": 1,
         "kind": "grabowski_self_review",
         "review_mode": "critical_diff_review",
         "verdict": "PASS",
+        "repo": "heimgewebe/grabowski",
+        "pr": 58,
         "head_sha": HEAD,
         "reviewed_files": [path],
         "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
