@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -105,6 +106,107 @@ ACTION_REQUIRED_FAILURE_CLASSES = frozenset({
     "actionable_failure",
     "unknown",
 })
+PROPOSAL_DOES_NOT_ESTABLISH = (
+    "bureau_queue_mutation",
+    "task_creation",
+    "priority_change",
+    "root_cause",
+    "implementation_readiness",
+    "merge_readiness",
+)
+PATTERN_EVIDENCE_THRESHOLD = 2
+MAX_PROPOSAL_EVIDENCE_IDS = 20
+FRICTION_PROPOSAL_PATTERNS: dict[str, dict[str, Any]] = {
+    "command_chains": {
+        "terms": (
+            "command chain",
+            "command-chain",
+            "shell chain",
+            "broad shell",
+            "command shape",
+            "command-shape",
+            "argv shape",
+            "argv-only",
+            "command too broad",
+            "split command",
+            "split commands",
+        ),
+        "recommendation_type": "next_grip",
+        "title": "Extract a narrower typed command grip",
+        "rationale": (
+            "Repeated command-chain friction indicates the operator is using broad "
+            "shell sequences where a typed grip or smaller command helper would "
+            "be easier to validate and resume."
+        ),
+    },
+    "blocked_gates": {
+        "terms": (
+            "blocked gate",
+            "gate blocked",
+            "fail closed",
+            "fail-closed",
+            "policy gate",
+            "gate evidence",
+        ),
+        "recommendation_type": "next_grip",
+        "title": "Add a gate-evidence preparation grip",
+        "rationale": (
+            "Repeated gate friction should become better evidence preparation "
+            "or clearer runbook steps, not an automatic policy bypass."
+        ),
+    },
+    "stale_snapshots": {
+        "terms": (
+            "stale snapshot",
+            "snapshot stale",
+            "connector snapshot",
+            "runtime snapshot",
+            "client snapshot",
+            "contract drift",
+        ),
+        "recommendation_type": "next_grip",
+        "title": "Add a snapshot refresh or drift preflight",
+        "rationale": (
+            "Repeated stale snapshot friction means the operator should refresh "
+            "or compare observable contracts before choosing a mutation path."
+        ),
+    },
+    "review_loops": {
+        "terms": (
+            "review loop",
+            "external review",
+            "self-review",
+            "codex review loop",
+            "stale codex review",
+            "claude review evidence",
+            "stale claude review",
+            "diff hash",
+            "review gate",
+        ),
+        "recommendation_type": "small_bureau_task",
+        "title": "Create a review-evidence workflow task",
+        "rationale": (
+            "Repeated review-loop friction should become a bounded checklist "
+            "or Bureau task for evidence collection and stale-review triage."
+        ),
+    },
+    "missing_receipt_fields": {
+        "terms": (
+            "missing receipt",
+            "receipt missing",
+            "missing field",
+            "missing fields",
+            "receipt field",
+            "receipt schema",
+        ),
+        "recommendation_type": "small_bureau_task",
+        "title": "Tighten receipt schema coverage",
+        "rationale": (
+            "Repeated missing receipt fields should become schema/test work "
+            "for the emitting grip or task adapter."
+        ),
+    },
+}
 EXPECTED_RED_PHASE_TERMS = frozenset({
     "expected red-phase",
     "expected red phase",
@@ -285,6 +387,145 @@ def _decision_event(event: dict[str, Any], failure_class: str) -> dict[str, Any]
     }
 
 
+def _event_id(event: dict[str, Any]) -> str:
+    value = _bounded_summary_text(event.get("event_id", ""), max_chars=80)
+    return value or "unknown"
+
+
+def _has_event_id(event: dict[str, Any]) -> bool:
+    return bool(_bounded_summary_text(event.get("event_id", ""), max_chars=80))
+
+
+def _proposal_event_ids(events: list[dict[str, Any]]) -> list[str]:
+    return [_event_id(event) for event in events[:MAX_PROPOSAL_EVIDENCE_IDS]]
+
+
+def _proposal_pattern_hits(event: dict[str, Any], failure_class: str) -> list[str]:
+    hits: set[str] = set()
+    haystack = _event_haystack(event)
+    kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
+    if kind == "fail_closed_gate" or failure_class == "policy_gate":
+        hits.add("blocked_gates")
+    if kind == "connector_snapshot":
+        hits.add("stale_snapshots")
+    for pattern, rule in FRICTION_PROPOSAL_PATTERNS.items():
+        if pattern in hits:
+            continue
+        terms = rule.get("terms", ())
+        if isinstance(terms, tuple) and any(term in haystack for term in terms):
+            hits.add(pattern)
+    return [pattern for pattern in FRICTION_PROPOSAL_PATTERNS if pattern in hits]
+
+
+def _proposal_group(pattern: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    unresolved_events = [event for event in events if event.get("resolved") is not True]
+    failure_classes: Counter[str] = Counter()
+    kinds: Counter[str] = Counter()
+    surfaces: Counter[str] = Counter()
+    for event in events:
+        failure_class = classify_friction_event(event)
+        failure_classes[failure_class] += 1
+        kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
+        surface = _known_enum_value(event.get("surface"), FRICTION_SURFACES)
+        kinds[kind] += 1
+        surfaces[surface] += 1
+    return {
+        "pattern": pattern,
+        "count": len(events),
+        "unresolved": len(unresolved_events),
+        "repeated": len(events) >= PATTERN_EVIDENCE_THRESHOLD,
+        "actionable_repeated": len(unresolved_events) >= PATTERN_EVIDENCE_THRESHOLD,
+        "evidence_event_ids": _proposal_event_ids(events),
+        "evidence_event_ids_truncated": len(events) > MAX_PROPOSAL_EVIDENCE_IDS,
+        "unresolved_evidence_event_ids": _proposal_event_ids(unresolved_events),
+        "unresolved_evidence_event_ids_truncated": len(unresolved_events) > MAX_PROPOSAL_EVIDENCE_IDS,
+        "missing_event_id_count": sum(1 for event in events if not _has_event_id(event)),
+        "unresolved_missing_event_id_count": sum(1 for event in unresolved_events if not _has_event_id(event)),
+        "by_failure_class": dict(sorted(failure_classes.items())),
+        "by_kind": dict(sorted(kinds.items())),
+        "by_surface": dict(sorted(surfaces.items())),
+    }
+
+
+def _recommendation_for_group(group: dict[str, Any]) -> dict[str, Any] | None:
+    if group.get("actionable_repeated") is not True:
+        return None
+    pattern = str(group.get("pattern", ""))
+    rule = FRICTION_PROPOSAL_PATTERNS.get(pattern)
+    if not rule:
+        return None
+    return {
+        "pattern": pattern,
+        "recommendation_type": rule["recommendation_type"],
+        "title": rule["title"],
+        "rationale": rule["rationale"],
+        "count": group["count"],
+        "unresolved": group["unresolved"],
+        "evidence_threshold": PATTERN_EVIDENCE_THRESHOLD,
+        "by_failure_class": group["by_failure_class"],
+        "by_kind": group["by_kind"],
+        "by_surface": group["by_surface"],
+        "evidence_event_ids": list(group.get("unresolved_evidence_event_ids", [])),
+        "evidence_event_ids_truncated": group.get("unresolved_evidence_event_ids_truncated") is True,
+        "missing_event_id_count": group["unresolved_missing_event_id_count"],
+        "inherits_does_not_establish": True,
+    }
+
+
+def propose_next_grip_from_friction(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Group repeated friction into proposal-only next-action hints.
+
+    This is read-only evidence synthesis. It never mutates Bureau, never starts a
+    grip and never promotes a recommendation into a task. One event may support
+    multiple proposal groups; that is not evidence for multiple root causes.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {
+        pattern: [] for pattern in FRICTION_PROPOSAL_PATTERNS
+    }
+    matched_event_count = 0
+    for event in events:
+        failure_class = classify_friction_event(event)
+        patterns = _proposal_pattern_hits(event, failure_class)
+        if patterns:
+            matched_event_count += 1
+        for pattern in patterns:
+            grouped[pattern].append(event)
+
+    groups = [
+        _proposal_group(pattern, grouped_events)
+        for pattern, grouped_events in grouped.items()
+        if grouped_events
+    ]
+    recommendations = [
+        recommendation
+        for group in groups
+        if (recommendation := _recommendation_for_group(group)) is not None
+    ]
+    no_action = not recommendations
+    return {
+        "schema_version": 1,
+        "authority": "proposal_only",
+        "evidence_scope": "recent_valid_events",
+        "evidence_threshold": PATTERN_EVIDENCE_THRESHOLD,
+        "max_evidence_event_ids": MAX_PROPOSAL_EVIDENCE_IDS,
+        "does_not_establish": list(PROPOSAL_DOES_NOT_ESTABLISH),
+        "matched_event_count": matched_event_count,
+        "unmatched_event_count": len(events) - matched_event_count,
+        "groups": groups,
+        "recommendations": recommendations,
+        "recommendation_count": len(recommendations),
+        "has_recommendations": bool(recommendations),
+        "no_action": {
+            "recommended": no_action,
+            "reason": (
+                "no configured proposal pattern met the unresolved evidence threshold"
+                if no_action
+                else "one or more configured proposal patterns met the unresolved evidence threshold"
+            ),
+        },
+    }
+
+
 def classify_failure_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     by_failure_class: dict[str, int] = {}
     unresolved_by_failure_class: dict[str, int] = {}
@@ -439,6 +680,7 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
         "by_kind": dict(sorted(by_kind.items())),
         "by_surface": dict(sorted(by_surface.items())),
         "failure_classification": classify_failure_events(events),
+        "next_grip_proposals": propose_next_grip_from_friction(events),
         "events": [_bounded_event(event) for event in events],
     }
 

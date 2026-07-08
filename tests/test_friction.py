@@ -215,6 +215,284 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertLessEqual(len(summary["events"][0]["symptom"]), 240)
         self.assertEqual(summary["events"][0]["notes_count"], 1)
 
+    def test_next_grip_proposals_group_repeated_friction_patterns(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "event_id": "gate-1",
+                "kind": "fail_closed_gate",
+                "surface": "github",
+                "operation": "review gate",
+                "symptom": "blocked gate missing external review evidence",
+                "resolved": False,
+            },
+            {
+                "event_id": "gate-2",
+                "kind": "fail_closed_gate",
+                "surface": "ci",
+                "operation": "review gate",
+                "symptom": "gate blocked waiting for self-review diff hash",
+                "resolved": False,
+            },
+            {
+                "event_id": "receipt-1",
+                "kind": "operator_bug",
+                "surface": "runtime",
+                "operation": "captain receipt",
+                "symptom": "missing receipt field for postflight",
+                "resolved": False,
+            },
+            {
+                "event_id": "receipt-2",
+                "kind": "operator_bug",
+                "surface": "runtime",
+                "operation": "captain receipt",
+                "symptom": "receipt missing field for rollback",
+                "resolved": False,
+            },
+        ]
+        module.FRICTION_LOG.write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+
+        self.assertEqual(proposals["authority"], "proposal_only")
+        self.assertIn("bureau_queue_mutation", proposals["does_not_establish"])
+        self.assertEqual(proposals["matched_event_count"], 4)
+        self.assertEqual(proposals["unmatched_event_count"], 0)
+        groups = {group["pattern"]: group for group in proposals["groups"]}
+        self.assertEqual(groups["blocked_gates"]["unresolved"], 2)
+        self.assertEqual(groups["missing_receipt_fields"]["unresolved"], 2)
+        recommendations = {item["pattern"]: item for item in proposals["recommendations"]}
+        self.assertEqual(recommendations["blocked_gates"]["recommendation_type"], "next_grip")
+        self.assertEqual(recommendations["blocked_gates"]["unresolved"], 2)
+        self.assertEqual(recommendations["blocked_gates"]["evidence_threshold"], 2)
+        self.assertTrue(recommendations["blocked_gates"]["inherits_does_not_establish"])
+        self.assertEqual(
+            recommendations["blocked_gates"]["evidence_event_ids"],
+            ["gate-1", "gate-2"],
+        )
+        self.assertEqual(
+            recommendations["missing_receipt_fields"]["recommendation_type"],
+            "small_bureau_task",
+        )
+        self.assertFalse(proposals["no_action"]["recommended"])
+
+    def test_next_grip_proposals_require_repeated_unresolved_evidence(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "event_id": "snapshot-1",
+            "kind": "connector_snapshot",
+            "surface": "connector",
+            "operation": "tool snapshot",
+            "symptom": "stale snapshot after runtime refresh",
+            "resolved": False,
+        }
+        module.FRICTION_LOG.write_text(json.dumps(event, sort_keys=True) + "\n", encoding="utf-8")
+
+        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+
+        self.assertEqual(proposals["recommendations"], [])
+        self.assertFalse(proposals["has_recommendations"])
+        self.assertTrue(proposals["no_action"]["recommended"])
+        groups = {group["pattern"]: group for group in proposals["groups"]}
+        self.assertFalse(groups["stale_snapshots"]["actionable_repeated"])
+        self.assertEqual(groups["stale_snapshots"]["evidence_event_ids"], ["snapshot-1"])
+
+    def test_next_grip_recommendations_use_unresolved_evidence_ids(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "event_id": "gate-1",
+                "kind": "fail_closed_gate",
+                "surface": "github",
+                "operation": "review gate",
+                "symptom": "gate blocked but already resolved",
+                "resolved": True,
+            },
+            {
+                "event_id": "gate-2",
+                "kind": "fail_closed_gate",
+                "surface": "ci",
+                "operation": "review gate",
+                "symptom": "blocked gate already triaged",
+                "resolved": True,
+            },
+            {
+                "event_id": "gate-3",
+                "kind": "fail_closed_gate",
+                "surface": "github",
+                "operation": "review gate",
+                "symptom": "blocked gate missing external review",
+                "resolved": False,
+            },
+            {
+                "event_id": "gate-4",
+                "kind": "fail_closed_gate",
+                "surface": "ci",
+                "operation": "review gate",
+                "symptom": "gate blocked missing current review",
+                "resolved": False,
+            },
+        ]
+        module.FRICTION_LOG.write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+        groups = {group["pattern"]: group for group in proposals["groups"]}
+        recommendation = {item["pattern"]: item for item in proposals["recommendations"]}["blocked_gates"]
+
+        self.assertEqual(groups["blocked_gates"]["evidence_event_ids"], ["gate-1", "gate-2", "gate-3", "gate-4"])
+        self.assertEqual(groups["blocked_gates"]["unresolved_evidence_event_ids"], ["gate-3", "gate-4"])
+        self.assertEqual(recommendation["evidence_event_ids"], ["gate-3", "gate-4"])
+
+    def test_next_grip_proposals_do_not_trigger_on_broad_tool_words_alone(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "event_id": "argv-1",
+                "kind": "operator_bug",
+                "surface": "runtime",
+                "operation": "debug output",
+                "symptom": "printed argv for diagnostics",
+                "resolved": False,
+            },
+            {
+                "event_id": "codex-1",
+                "kind": "operator_bug",
+                "surface": "github",
+                "operation": "comment scan",
+                "symptom": "codex mentioned a neutral note",
+                "resolved": False,
+            },
+        ]
+        module.FRICTION_LOG.write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+
+        self.assertEqual(proposals["recommendations"], [])
+        self.assertEqual(proposals["matched_event_count"], 0)
+        self.assertEqual(proposals["unmatched_event_count"], 2)
+        self.assertTrue(proposals["no_action"]["recommended"])
+
+    def test_next_grip_proposals_allow_multi_pattern_event_without_double_matching_event_count(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "event_id": "multi-1",
+                "kind": "fail_closed_gate",
+                "surface": "github",
+                "operation": "review gate",
+                "symptom": "review loop blocked by gate evidence",
+                "resolved": False,
+            }
+        ]
+        module.FRICTION_LOG.write_text(json.dumps(events[0], sort_keys=True) + "\n", encoding="utf-8")
+
+        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+        groups = {group["pattern"]: group for group in proposals["groups"]}
+
+        self.assertIn("blocked_gates", groups)
+        self.assertIn("review_loops", groups)
+        self.assertEqual(proposals["matched_event_count"], 1)
+        self.assertEqual(proposals["unmatched_event_count"], 0)
+        self.assertEqual(groups["blocked_gates"]["evidence_event_ids"], ["multi-1"])
+        self.assertEqual(groups["review_loops"]["evidence_event_ids"], ["multi-1"])
+
+    def test_next_grip_proposals_surface_missing_event_ids(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "kind": "operator_bug",
+                "surface": "runtime",
+                "operation": "captain receipt",
+                "symptom": "missing receipt field for rollback",
+                "resolved": False,
+            },
+            {
+                "kind": "operator_bug",
+                "surface": "runtime",
+                "operation": "captain receipt",
+                "symptom": "receipt missing field for postflight",
+                "resolved": False,
+            },
+        ]
+        module.FRICTION_LOG.write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+        group = {group["pattern"]: group for group in proposals["groups"]}["missing_receipt_fields"]
+        recommendation = {item["pattern"]: item for item in proposals["recommendations"]}["missing_receipt_fields"]
+
+        self.assertEqual(group["missing_event_id_count"], 2)
+        self.assertEqual(group["unresolved_missing_event_id_count"], 2)
+        self.assertEqual(group["unresolved_evidence_event_ids"], ["unknown", "unknown"])
+        self.assertEqual(recommendation["missing_event_id_count"], 2)
+        self.assertEqual(recommendation["evidence_event_ids"], ["unknown", "unknown"])
+
+    def test_next_grip_proposals_emit_no_action_for_empty_events(self) -> None:
+        module = self._load_module()
+
+        proposals = module.propose_next_grip_from_friction([])
+
+        self.assertEqual(proposals["groups"], [])
+        self.assertEqual(proposals["recommendations"], [])
+        self.assertEqual(proposals["matched_event_count"], 0)
+        self.assertEqual(proposals["unmatched_event_count"], 0)
+        self.assertFalse(proposals["has_recommendations"])
+        self.assertTrue(proposals["no_action"]["recommended"])
+
+
+    def test_next_grip_proposals_emit_no_action_for_resolved_repeated_noise(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "event_id": "review-1",
+                "kind": "ci_contract",
+                "surface": "github",
+                "operation": "external review loop",
+                "symptom": "external review stale diff hash",
+                "resolved": True,
+            },
+            {
+                "event_id": "review-2",
+                "kind": "ci_contract",
+                "surface": "github",
+                "operation": "self-review",
+                "symptom": "review loop resolved by new evidence",
+                "resolved": True,
+            },
+        ]
+        module.FRICTION_LOG.write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+
+        self.assertEqual(proposals["recommendation_count"], 0)
+        self.assertTrue(proposals["no_action"]["recommended"])
+        groups = {group["pattern"]: group for group in proposals["groups"]}
+        self.assertTrue(groups["review_loops"]["repeated"])
+        self.assertFalse(groups["review_loops"]["actionable_repeated"])
+
+
 
 if __name__ == "__main__":
     unittest.main()
