@@ -37,6 +37,43 @@ Autonomieklasse zugeordnet werden, zum Beispiel `repo_operator`,
 `fleet_sensitive`. Eine Klasse darf nicht still in eine riskantere Klasse
 wechseln.
 
+## Grip-orientierte Autonomiedoktrin
+
+Grabowski darf eigenständig handeln, wenn Ziel, Target, Scope, Risiko und
+Receipt klar sind. Autonomie bedeutet hier nicht unbegrenzte
+Selbstbeauftragung, sondern einen typisierten Griff mit prüfbarer Grenze. Ein
+Griff darf weitergehen, wenn seine Eingaben gebunden sind, sein Effektprofil
+bekannt ist und sein Ergebnis als Receipt nachvollziehbar bleibt.
+
+Normale Mechanic-Arbeit umfasst read-only Orientierung, Tests, Branch- und
+PR-Pflege, Review-Anfragen, Friction-Triage und Post-Merge-Sync. Diese Arbeit
+darf ohne zusätzlichen Captain-Pfad laufen, solange sie bekannte Griffe,
+begrenzte Ziele, sichtbare Scopes und Receipts verwendet.
+
+High-impact-Arbeit ist nicht pauschal verboten. Merge, Deploy,
+Service-Restart, Fleet-Mutation, Cleanup und vergleichbare Effekte sind
+Captain-Arbeit: Sie benötigen explizite High-impact-Markierung, konkrete
+Targets, Scope-Grenzen, Recovery- oder Irreversibility-Evidence, frische
+Statusprojektion, Review-/CI-/Diff-Bindung und menschliche Autorisierung, bevor
+sie überhaupt als manuelle Captain-Entscheidungskandidaten gelten. Ein
+bestandenes Preflight-Gate ist keine Ausführung.
+
+## Organe als Hilfen, nicht als universelle Gates
+
+Bureau, Cabinet, Chronik, Plexer, Lenskit und Vibe-Lab sind Hilfsorgane mit
+begrenzter Beweiskraft. Bureau kann Aufgaben, Queues, Claims und Receipts
+registrieren; es ersetzt aber nicht den Live-Zustand von GitHub, CI oder
+Runtime. Cabinet kann Übersicht und Projektionen liefern; es ist keine
+Wahrheitsquelle für Merge- oder Deploy-Sicherheit. Chronik und Plexer können
+Ereignisse und Zustellung sichtbar machen; sie sind keine Freigabeinstanzen.
+Lenskit und RepoBrief können Kontext bereitstellen; sie ersetzen keine
+aktuelle Diff-, Test- oder Review-Prüfung. Vibe-Lab kann Experimente und
+Signale liefern; es macht daraus keine Produktionsautorität.
+
+Diese Organe sollen Entscheidungen besser beobachtbar machen, aber keinen
+Taskwechsel gegen Ball-vor-Board auslösen und keine High-impact-Aktion
+automatisch freigeben.
+
 ## Terminalmodell
 
 `grabowski_terminal_run` erzeugt einen neuen nicht-interaktiven Prozess. Das
