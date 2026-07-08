@@ -381,6 +381,29 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertFalse(result["review_sources"]["external_review_required"])
         self.assertFalse(result["review_sources"]["platform_review_required"])
 
+    def test_generated_json_under_docs_is_not_documentation_exempt(self) -> None:
+        state = _state("docs/generated/operator-context.v1.json")
+        state["pr"]["additions"] = 120
+        state["pr"]["deletions"] = 0
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["docs_only"])
+        self.assertEqual(result["complexity"]["review_tier"], "external_llm")
+        self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
+
+    def test_requirements_txt_is_not_documentation_exempt(self) -> None:
+        state = _state("requirements/deploy-tooling.lock.txt")
+        state["pr"]["additions"] = 60
+        state["pr"]["deletions"] = 0
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertFalse(result["complexity"]["docs_only"])
+        self.assertEqual(result["complexity"]["review_tier"], "high_critical")
+        self.assertTrue(result["complexity"]["high_critical"])
+        self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
+
     def test_very_small_uncomplicated_code_change_is_exempt(self) -> None:
         state = _state("src/tiny_feature.py")
         state["pr"]["additions"] = 4

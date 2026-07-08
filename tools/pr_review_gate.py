@@ -35,7 +35,6 @@ RISK_PATH_MARKERS = (
     "privileged",
     "audit",
     "rollback",
-    "runtime",
     "secret",
     "broker",
 )
@@ -63,7 +62,7 @@ DOCUMENTATION_FILENAMES = (
     "readme",
     "readme.md",
 )
-DOCUMENTATION_EXTENSIONS = (".adoc", ".markdown", ".md", ".mdx", ".rst", ".txt")
+DOCUMENTATION_EXTENSIONS = (".adoc", ".markdown", ".md", ".mdx", ".rst")
 VERY_SMALL_CHANGE_FILE_LIMIT = 3
 VERY_SMALL_CHANGE_LINE_LIMIT = 40
 HIGH_CRITICAL_PATH_PREFIXES = (
@@ -331,12 +330,14 @@ def _is_risk_path(path: str) -> bool:
 
 def _is_documentation_path(path: str) -> bool:
     normalized = path.lower().lstrip("./")
-    name = Path(normalized).name
-    if normalized.startswith(DOCUMENTATION_PATH_PREFIXES):
-        return True
+    path_obj = Path(normalized)
+    name = path_obj.name
+    suffix = path_obj.suffix
     if name in DOCUMENTATION_FILENAMES:
         return True
-    return Path(normalized).suffix in DOCUMENTATION_EXTENSIONS
+    if normalized.startswith(DOCUMENTATION_PATH_PREFIXES):
+        return suffix in DOCUMENTATION_EXTENSIONS
+    return suffix in DOCUMENTATION_EXTENSIONS
 
 
 def _high_critical_path_reason(path: str) -> str | None:
