@@ -145,6 +145,23 @@ class RlensBundleToolTests(unittest.TestCase):
         self.assertEqual(result["authority"], "artifact_metadata_only")
         self.assertIn("claims_true", result["does_not_establish"])
 
+    def test_latest_complete_bundles_falls_back_to_live_discovery_when_cache_is_stale(self) -> None:
+        self._write_bundle("live-repo-max-260701-1200")
+        (self.state / "rlens-latest-complete-bundles.tsv").write_text(
+            "repo\tstem\tlatest_mtime\thas_agent_reading_pack\tcanonical_md\tbundle_manifest\toutput_health\tagent_reading_pack\n"
+            "stale-repo\tstale-repo-max-260101-0000\t2026-01-01T00:00:00Z\tno\t./merges/stale.md\t./merges/stale.json\t./merges/stale-health.json\t./merges/stale-pack.md\n",
+            encoding="utf-8",
+        )
+
+        result = mcp.latest_complete_bundles()
+
+        self.assertEqual(result["authority"], "live_discovery")
+        self.assertEqual(result["stale_legacy_row_count"], 1)
+        self.assertEqual(result["live_discovery_row_count"], 1)
+        self.assertEqual(result["rows"][0][0], "live-repo")
+        self.assertEqual(result["rows"][0][1], "live-repo-max-260701-1200")
+        self.assertIn("bundle_freshness_against_live_repo", result["does_not_establish"])
+
     def test_bundle_status_surfaces_output_health_dependency_degradation(self) -> None:
         stem = "demo-repo-max-260701-1200"
         self._write_bundle(stem)

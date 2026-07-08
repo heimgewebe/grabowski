@@ -498,24 +498,49 @@ def _set_state(
     return updated
 
 
+_TASK_OBSERVE_PROPERTIES = [
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "ExecMainCode",
+    "ExecMainStatus",
+]
+
+
 def _observe(record: dict[str, Any]) -> dict[str, Any]:
-    result = _dispatch(
-        record["host"],
-        [
-            "systemctl",
-            "--user",
-            "show",
+    command = [
+        "systemctl",
+        "--user",
+        "show",
+        record["unit"],
+        "--no-pager",
+    ]
+    command.extend(f"--property={item}" for item in _TASK_OBSERVE_PROPERTIES)
+    observer: dict[str, Any] = {"kind": "fleet-dispatch-v1"}
+    try:
+        result = _dispatch(record["host"], command, timeout_seconds=30)
+    except PermissionError as exc:
+        # Production hosts intentionally do not expose generic systemctl through
+        # fleet_run.  Reconcile still needs one fixed read-only observation shape
+        # for Grabowski-owned task units, so fall back to the narrow fleet helper.
+        if "Executable is not allowed" not in str(exc):
+            raise
+        observed = fleet.run_fleet_task_unit_show(
+            record["host"],
             record["unit"],
-            "--no-pager",
-            "--property=LoadState",
-            "--property=ActiveState",
-            "--property=SubState",
-            "--property=Result",
-            "--property=ExecMainCode",
-            "--property=ExecMainStatus",
-        ],
-        timeout_seconds=30,
-    )
+            _TASK_OBSERVE_PROPERTIES,
+            timeout_seconds=30,
+            max_output_bytes=8192,
+        )
+        result = observed["result"]
+        observer = {
+            "host": observed["host"],
+            "transport": observed["transport"],
+            "roles": observed["roles"],
+            "kind": observed["observer"],
+            "fallback_from": "fleet-dispatch-permission-denied",
+        }
     properties: dict[str, str] = {}
     for line in result.get("stdout", "").splitlines():
         if "=" in line:
@@ -526,6 +551,7 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
         "state": state,
         "properties": properties,
         "probe": result,
+        "observer": observer,
         "observed_at_unix": _now(),
     }
 

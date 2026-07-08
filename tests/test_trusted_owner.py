@@ -71,6 +71,13 @@ class TrustedOwnerTests(unittest.TestCase):
             base._validate_policy(invalid)
 
 
+    def test_trusted_owner_keeps_reversible_delete_with_destroy_authority(self) -> None:
+        capabilities = TRUSTED_POLICY["profiles"]["trusted-owner"]["capabilities"]
+        self.assertIn("file_destroy", capabilities)
+        self.assertIn("file_delete", capabilities)
+        self.assertLess(capabilities.index("file_delete"), capabilities.index("file_destroy"))
+
+
     def test_observe_profile_denies_sensitive_and_mutating_capabilities(self) -> None:
         base._validate_policy(OBSERVE_POLICY)
         with patch.object(base, "_load_policy", return_value=OBSERVE_POLICY):

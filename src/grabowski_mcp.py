@@ -3783,6 +3783,51 @@ def _rlens_iter_manifests(repo: str | None = None) -> list[Path]:
     return manifests
 
 
+def _rlens_latest_manifest_by_repo() -> dict[str, Path]:
+    latest: dict[str, Path] = {}
+    for path in _rlens_iter_manifests(None):
+        stem = _rlens_stem_from_manifest(path)
+        repo = _rlens_repo_from_stem(stem)
+        if repo not in latest:
+            latest[repo] = path
+    return latest
+
+
+def _rlens_manifest_registry_row(path: Path) -> list[str]:
+    summary = _rlens_manifest_summary(path)
+    stem = str(summary["stem"])
+    repo = str(summary["repo"])
+    artifact_roles = set(summary.get("artifact_roles") or [])
+    def rel(suffix: str) -> str:
+        return "./merges/" + stem + suffix
+    return [
+        repo,
+        stem,
+        datetime.fromtimestamp(int(summary["manifest_mtime_unix"]), timezone.utc).isoformat(),
+        "yes" if "agent_reading_pack" in artifact_roles else "no",
+        rel("_merge.md"),
+        rel(_BUNDLE_MANIFEST_SUFFIX),
+        rel(_BUNDLE_OUTPUT_HEALTH_SUFFIX),
+        rel("_merge.agent_reading_pack.md"),
+    ]
+
+
+def _rlens_registry_row_status(row: list[str]) -> dict[str, Any]:
+    if not row:
+        return {"valid": False, "reason": "empty_row"}
+    if row[0] == "repo":
+        return {"valid": True, "header": True}
+    if len(row) < 2:
+        return {"valid": False, "reason": "short_row"}
+    try:
+        stem = _rlens_validate_stem(row[1])
+    except ValueError:
+        return {"valid": False, "reason": "invalid_stem"}
+    manifest_path = _rlens_manifest_path(stem)
+    exists = manifest_path.is_file() and not manifest_path.is_symlink()
+    return {"valid": exists, "header": False, "stem": stem, "manifest_exists": exists}
+
+
 def _rlens_git(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
     completed = subprocess.run(
         ["git", "-C", str(repo_path), *args],
@@ -4819,25 +4864,40 @@ def grip_run(
 def latest_complete_bundles() -> dict[str, Any]:
     """Return the curated latest-complete Lens/repoLens bundle registry."""
     _require_capability("bundle_registry")
-    if not BUNDLE_REGISTRY.is_file():
-        return {
-            "path": str(BUNDLE_REGISTRY),
-            "exists": False,
-            "rows": [],
-        }
-
-    data = _ensure_regular_text_file(BUNDLE_REGISTRY, 2_000_000)
-    rows = []
-    for line in data.decode("utf-8").splitlines():
-        if not line or line.startswith("#"):
-            continue
-        rows.append(line.split("\t"))
-
+    rows: list[list[str]] = []
+    sha256: str | None = None
+    if BUNDLE_REGISTRY.is_file():
+        data = _ensure_regular_text_file(BUNDLE_REGISTRY, 2_000_000)
+        sha256 = hashlib.sha256(data).hexdigest()
+        for line in data.decode("utf-8").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            rows.append(line.split("\t"))
+    row_status = [_rlens_registry_row_status(row) for row in rows]
+    stale_rows = [item for item in row_status if item.get("header") is not True and not item.get("valid")]
+    discovered = [
+        _rlens_manifest_registry_row(path)
+        for _repo, path in sorted(_rlens_latest_manifest_by_repo().items())
+    ]
+    use_discovery = not rows or (bool(stale_rows) and bool(discovered))
+    effective_rows = discovered if use_discovery else rows
+    authority = "live_discovery" if use_discovery else "legacy_cache"
     return {
         "path": str(BUNDLE_REGISTRY),
-        "exists": True,
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "rows": rows,
+        "exists": BUNDLE_REGISTRY.is_file(),
+        "sha256": sha256,
+        "rows": effective_rows,
+        "legacy_rows": rows,
+        "legacy_row_status": row_status,
+        "stale_legacy_row_count": len(stale_rows),
+        "live_discovery_row_count": len(discovered),
+        "authority": authority,
+        "does_not_establish": [
+            "bundle_freshness_against_live_repo",
+            "repo_understood",
+            "claims_true",
+            "runtime_correctness",
+        ],
     }
 
 

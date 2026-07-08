@@ -147,6 +147,56 @@ def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
             "remote_argv": command, "result": result}
 
 
+_TASK_UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
+_SYSTEMD_SHOW_PROPERTY = re.compile(r"[A-Za-z][A-Za-z0-9]*\Z")
+
+
+def run_fleet_task_unit_show(
+    name: str,
+    unit: str,
+    properties: list[str],
+    *,
+    timeout_seconds: int,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    """Run the narrow read-only task-unit observer used by task reconcile.
+
+    This deliberately does not add generic ``systemctl`` to a production host's
+    command allowlist.  The only accepted command shape is
+    ``systemctl --user show <grabowski-task-unit>`` with bounded property names.
+    """
+    host = fleet_host(name)
+    if not isinstance(unit, str) or _TASK_UNIT.fullmatch(unit) is None:
+        raise ValueError("Invalid Grabowski task unit")
+    if not (
+        isinstance(properties, list)
+        and properties
+        and len(properties) <= 32
+        and all(isinstance(item, str) and _SYSTEMD_SHOW_PROPERTY.fullmatch(item) for item in properties)
+    ):
+        raise ValueError("Invalid systemd property list")
+    command = ["systemctl", "--user", "show", unit, "--no-pager"]
+    command.extend(f"--property={item}" for item in properties)
+    timeout = operator._timeout(timeout_seconds)
+    output_limit = operator._output_limit(max_output_bytes)
+    if host["transport"] == "local":
+        result = operator._run(command, cwd=HOME, timeout_seconds=timeout,
+                               max_output_bytes=output_limit)
+    else:
+        ssh = shutil.which("ssh")
+        if not ssh:
+            raise RuntimeError("OpenSSH client is not installed")
+        remote_command = "exec " + shlex.join(command)
+        result = operator._run([
+            ssh, "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
+            "-o", f"ConnectTimeout={host['connect_timeout_seconds']}",
+            "--", host["target"], remote_command,
+        ], cwd=HOME, timeout_seconds=timeout, max_output_bytes=output_limit)
+    return {"host": name, "transport": host["transport"], "roles": host["roles"],
+            "remote_argv": command, "observer": "task-systemd-user-show-v1",
+            "result": result}
+
+
 @mcp.tool(name="grabowski_fleet_list", annotations=READ_ONLY)
 def grabowski_fleet_list() -> dict[str, Any]:
     """Return the validated local and SSH host registry."""
