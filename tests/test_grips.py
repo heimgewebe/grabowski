@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import json
 import sys
 import tempfile
@@ -70,6 +71,7 @@ class FakeGh:
         view_non_mapping: bool = False,
         merge_exception: bool = False,
         view_sequence: list[dict[str, object]] | None = None,
+        view_results: list[object] | None = None,
     ):
         self.existing = existing
         self.failure = failure
@@ -96,6 +98,7 @@ class FakeGh:
         self.view_non_mapping = view_non_mapping
         self.merge_exception = merge_exception
         self.view_sequence = list(view_sequence or [])
+        self.view_results = list(view_results or [])
         self.merged = False
         self.calls: list[tuple[str, ...]] = []
 
@@ -135,6 +138,9 @@ class FakeGh:
                 self.view = merged_view
             return {"returncode": self.merge_returncode, "stdout": self.merge_stdout, "stderr": self.merge_stderr}
         if argv[:2] == ["pr", "view"]:
+            if self.view_results:
+                result = self.view_results.pop(0)
+                return result  # type: ignore[return-value]
             if self.view_non_mapping:
                 return None  # type: ignore[return-value]
             if self.view_invalid_json:
@@ -2408,6 +2414,98 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 self.assertEqual("blocked", result["receipt"]["status"])
                 self.assertIn(expected, result["output"]["executions"][0]["verification_error"])
 
+    def test_bounded_command_output_keeps_prefix_for_tiny_limit_and_hashes_bytes(self) -> None:
+        self.assertEqual("abcdefghij", grips._bounded_command_output("abcdefghijklmnop", limit=10))
+        raw_stdout = ("prefix-".encode() + b"\xff" * (grips.CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT + 20))
+        info = grips._command_result_info({"returncode": 1, "stdout": raw_stdout, "stderr": b""})
+
+        self.assertTrue(info["stdout_truncated"])
+        self.assertLessEqual(len(info["stdout"]), grips.CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT)
+        self.assertEqual(hashlib.sha256(raw_stdout).hexdigest(), info["stdout_sha256"])
+
+    def test_captain_run_retries_transient_preflight_view_failure_before_execution(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        clean_view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        gh = FakeGh(view=clean_view, view_results=[{"returncode": 0, "stdout": "{", "stderr": ""}])
+        sleeps: list[float] = []
+
+        original_sleep = grips._captain_sleep
+        try:
+            grips._captain_sleep = sleeps.append
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+        finally:
+            grips._captain_sleep = original_sleep
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual([0.5], sleeps)
+        self.assertEqual(2, result["output"]["executions"][0]["preflight_view_summary"]["attempt_count"])
+        self.assertTrue([call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_captain_run_does_not_retry_unknown_state_with_hard_preflight_blocker(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        hard_blocked_view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "release/other",
+            "headRefName": "feat/captain",
+            "headRefOid": "a" * 40,
+            "isDraft": False,
+            "mergeable": "UNKNOWN",
+            "mergeStateStatus": "UNKNOWN",
+        }
+        gh = FakeGh(view=hard_blocked_view)
+        sleeps: list[float] = []
+
+        original_sleep = grips._captain_sleep
+        try:
+            grips._captain_sleep = sleeps.append
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+        finally:
+            grips._captain_sleep = original_sleep
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertEqual(1, execution["preflight_view_summary"]["attempt_count"])
+        self.assertIn("pr_head_does_not_match_expected_head_before_execution", execution["preflight_errors"])
+        self.assertIn("pr_base_does_not_match_expected_base_before_execution", execution["preflight_errors"])
+        self.assertEqual([], sleeps)
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
     def test_captain_run_requires_post_merge_head_confirmation(self) -> None:
         for post_merge_view in ({"headRefOid": None}, {"headRefOid": "a" * 40}):
             with self.subTest(post_merge_view=post_merge_view):
@@ -2656,6 +2754,15 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertFalse(execution["execution_attempted"])
         self.assertFalse(execution["command_returned"])
         self.assertIn("runner_exception", execution)
+        self.assertEqual(
+            {
+                "invoked_count": 1,
+                "command_returned_count": 0,
+                "attempted_count": 0,
+                "verified_count": 0,
+            },
+            result["output"]["execution_counts"],
+        )
 
     def test_captain_run_requires_merge_commit_oid_after_merge(self) -> None:
         for merge_commit in (None, {"oid": "not-a-sha"}):
@@ -2812,6 +2919,9 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             {"repo": "heimgewebe/grabowski", "pr": 96, "base": "main\\evil"},
             {"repo": "heimgewebe/grabowski", "pr": 96, "base": "main[abc]"},
             {"repo": "heimgewebe/grabowski", "pr": 96, "base": "main."},
+            {"repo": "heimgewebe/grabowski", "pr": 96, "base": "main/.evil"},
+            {"repo": "heimgewebe/grabowski", "pr": 96, "base": "main/foo."},
+            {"repo": "heimgewebe/grabowski", "pr": 96, "base": "main/foo.lock"},
         ):
             result = self.run_captain(captain_parameters([captain_action(target=target)]))
             self.assertEqual("blocked", result["receipt"]["status"])

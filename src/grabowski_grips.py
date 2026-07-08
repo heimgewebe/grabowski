@@ -245,9 +245,13 @@ CAPTAIN_EXECUTABLE_ACTIONS = frozenset({"pr-merge"})
 CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY = "act_unless_irreversible_or_ambiguous"
 CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT = 4096
 CAPTAIN_POST_MERGE_VERIFY_ATTEMPTS = 3
-CAPTAIN_POST_MERGE_VERIFY_DELAYS_SECONDS = (0.0, 0.5, 1.0)
+CAPTAIN_POST_MERGE_VERIFY_DELAYS_SECONDS = (0.5, 1.0)
 CAPTAIN_PREFLIGHT_SETTLE_ATTEMPTS = 3
-CAPTAIN_PREFLIGHT_SETTLE_DELAYS_SECONDS = (0.0, 0.5, 1.0)
+CAPTAIN_PREFLIGHT_SETTLE_DELAYS_SECONDS = (0.5, 1.0)
+CAPTAIN_PREFLIGHT_TRANSIENT_ERRORS = frozenset({
+    "pr_mergeable_not_confirmed_before_execution",
+    "pr_merge_state_not_clean_before_execution",
+})
 CAPTAIN_BASE_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 CAPTAIN_DOES_NOT_ESTABLISH = (
     "automatic_merge_authority",
@@ -580,15 +584,32 @@ def _command_text(value: Any) -> str:
     return str(value)
 
 
+def _command_bytes(value: Any) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    return _command_text(value).encode("utf-8", errors="replace")
+
+
 def _bounded_command_output(value: Any, *, limit: int = CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT) -> str:
-    text = _command_text(value)
     if limit <= 0:
         return ""
+    if isinstance(value, bytes):
+        if len(value) <= limit:
+            return value.decode("utf-8", errors="replace")
+        suffix = f"...[truncated {len(value) - limit} bytes]"
+        suffix_bytes = suffix.encode("utf-8")
+        if len(suffix_bytes) >= limit:
+            return value[:limit].decode("utf-8", errors="replace")
+        prefix = value[: limit - len(suffix_bytes)].decode("utf-8", errors="replace")
+        return f"{prefix}{suffix}"
+    text = _command_text(value)
     if len(text) <= limit:
         return text
     suffix = f"...[truncated {len(text) - limit} chars]"
     if len(suffix) >= limit:
-        return suffix[:limit]
+        return text[:limit]
     return f"{text[: limit - len(suffix)]}{suffix}"
 
 
@@ -600,21 +621,23 @@ def _command_result_info(result: Any) -> dict[str, Any]:
             "stdout": "",
             "stderr": _bounded_command_output(stderr),
             "stdout_sha256": hashlib.sha256(b"").hexdigest(),
-            "stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
+            "stderr_sha256": hashlib.sha256(_command_bytes(stderr)).hexdigest(),
             "stdout_truncated": False,
             "stderr_truncated": len(stderr) > CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT,
             "schema_warning": "result_not_mapping",
         }
-    stdout = _command_text(result.get("stdout", ""))
-    stderr = _command_text(result.get("stderr", ""))
+    raw_stdout = result.get("stdout", "")
+    raw_stderr = result.get("stderr", "")
+    stdout_bytes = _command_bytes(raw_stdout)
+    stderr_bytes = _command_bytes(raw_stderr)
     info: dict[str, Any] = {
         "returncode": _returncode(result),
-        "stdout": _bounded_command_output(stdout),
-        "stderr": _bounded_command_output(stderr),
-        "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
-        "stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
-        "stdout_truncated": len(stdout) > CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT,
-        "stderr_truncated": len(stderr) > CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT,
+        "stdout": _bounded_command_output(raw_stdout),
+        "stderr": _bounded_command_output(raw_stderr),
+        "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+        "stdout_truncated": len(stdout_bytes) > CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT,
+        "stderr_truncated": len(stderr_bytes) > CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT,
     }
     if "returncode" not in result:
         info["schema_warning"] = "returncode_missing"
@@ -2124,9 +2147,12 @@ def _captain_base_branch(target: dict[str, Any], key: str, *, index: int) -> str
         raise GripPreflightError(f"actions[{index}].target.{key} must be a safe short branch name")
     if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
         raise GripPreflightError(f"actions[{index}].target.{key} must not contain whitespace or control characters")
-    if any(segment in {"", ".", ".."} for segment in value.split("/")):
+    segments = value.split("/")
+    if any(segment in {"", ".", ".."} for segment in segments):
         raise GripPreflightError(f"actions[{index}].target.{key} must not contain empty or relative path segments")
-    if value.endswith("/") or value.endswith(".") or any(segment.endswith(".lock") for segment in value.split("/")):
+    if any(segment.startswith(".") or segment.endswith(".") or segment.endswith(".lock") for segment in segments):
+        raise GripPreflightError(f"actions[{index}].target.{key} must be a safe short branch name")
+    if value.endswith("/"):
         raise GripPreflightError(f"actions[{index}].target.{key} must be a safe short branch name")
     return value
 
@@ -2672,11 +2698,8 @@ def _captain_pr_view(
         view_result = {"returncode": 1, "stdout": "", "stderr": f"gh pr view runner exception: {type(exc).__name__}: {exc}"}
     info = {"command": ["gh", *view_args], **_command_result_info(view_result)}
     if info["returncode"] != 0:
-        if isinstance(view_result, dict):
-            raw_error = view_result.get("stderr") or view_result.get("stdout")
-        else:
-            raw_error = info.get("stderr") or info.get("stdout")
-        info["error"] = _bounded_command_output(raw_error or "gh pr view failed")
+        raw_error = info.get("stderr") or info.get("stdout")
+        info["error"] = raw_error if raw_error else "gh pr view failed"
         return None, info
     try:
         viewed = _json_stdout(view_result)
@@ -2719,6 +2742,17 @@ def _captain_pr_view_is_settling(viewed: dict[str, Any]) -> bool:
     return viewed.get("mergeable") == "UNKNOWN" or viewed.get("mergeStateStatus") == "UNKNOWN"
 
 
+
+
+def _captain_retry_delay(delays: tuple[float, ...], attempt: int) -> float:
+    if attempt <= 1 or not delays:
+        return 0.0
+    return delays[min(attempt - 2, len(delays) - 1)]
+
+
+def _captain_preflight_errors_are_transient(viewed: dict[str, Any], errors: list[str]) -> bool:
+    return bool(errors) and set(errors).issubset(CAPTAIN_PREFLIGHT_TRANSIENT_ERRORS) and _captain_pr_view_is_settling(viewed)
+
 def _captain_pr_merge_preflight_view(
     repo_path: Path,
     github_runner: GithubRunner,
@@ -2733,9 +2767,8 @@ def _captain_pr_merge_preflight_view(
     last_info: dict[str, Any] = {}
     last_errors: list[str] = ["pr_pre_execution_view_not_attempted"]
     for attempt in range(1, CAPTAIN_PREFLIGHT_SETTLE_ATTEMPTS + 1):
-        delay = CAPTAIN_PREFLIGHT_SETTLE_DELAYS_SECONDS[min(attempt - 1, len(CAPTAIN_PREFLIGHT_SETTLE_DELAYS_SECONDS) - 1)]
         if attempt > 1:
-            _captain_sleep(delay)
+            _captain_sleep(_captain_retry_delay(CAPTAIN_PREFLIGHT_SETTLE_DELAYS_SECONDS, attempt))
         viewed, info = _captain_pr_view(repo_path, github_runner, repo_slug=repo_slug, pr_number=pr_number)
         attempt_record = dict(info)
         attempt_record["attempt"] = attempt
@@ -2743,6 +2776,8 @@ def _captain_pr_merge_preflight_view(
         last_info = info
         if viewed is None:
             last_errors = [str(info.get("error") or "pr_pre_execution_view_failed")]
+            if attempt < CAPTAIN_PREFLIGHT_SETTLE_ATTEMPTS:
+                continue
             break
         last_viewed = viewed
         last_errors = _captain_pr_merge_preflight_errors(viewed, expected_head=expected_head, expected_base=expected_base)
@@ -2755,7 +2790,7 @@ def _captain_pr_merge_preflight_view(
                 "error_codes_seen": [],
             }
             return viewed, summary, []
-        if not _captain_pr_view_is_settling(viewed):
+        if not _captain_preflight_errors_are_transient(viewed, last_errors):
             break
     summary = {
         "attempt_count": len(attempts),
@@ -2812,27 +2847,26 @@ def _captain_pr_merge_post_view(
     attempts: list[dict[str, Any]] = []
     last_viewed: dict[str, Any] | None = None
     last_errors: list[str] = ["post_merge_view_not_attempted"]
-    all_errors: list[str] = []
+    all_errors: set[str] = set()
     for attempt in range(1, CAPTAIN_POST_MERGE_VERIFY_ATTEMPTS + 1):
-        delay = CAPTAIN_POST_MERGE_VERIFY_DELAYS_SECONDS[min(attempt - 1, len(CAPTAIN_POST_MERGE_VERIFY_DELAYS_SECONDS) - 1)]
         if attempt > 1:
-            _captain_sleep(delay)
+            _captain_sleep(_captain_retry_delay(CAPTAIN_POST_MERGE_VERIFY_DELAYS_SECONDS, attempt))
         viewed, info = _captain_pr_view(repo_path, github_runner, repo_slug=repo_slug, pr_number=pr_number)
         attempt_record = dict(info)
         attempt_record["attempt"] = attempt
         attempts.append(attempt_record)
         if viewed is None:
             last_errors = [str(info.get("error") or "gh pr view failed after merge")]
-            all_errors.extend(last_errors)
+            all_errors.update(last_errors)
             continue
         last_viewed = viewed
         last_errors = _captain_pr_merge_verify_errors(viewed, expected_head=expected_head, expected_base=expected_base)
-        all_errors.extend(last_errors)
+        all_errors.update(last_errors)
         if not last_errors:
             summary = {
                 "attempt_count": len(attempts),
                 "last_error": None,
-                "error_codes_seen": sorted(set(all_errors)),
+                "error_codes_seen": sorted(all_errors),
                 "last_viewed": viewed,
                 "verified": True,
             }
@@ -2840,7 +2874,7 @@ def _captain_pr_merge_post_view(
     summary = {
         "attempt_count": len(attempts),
         "last_error": "; ".join(last_errors),
-        "error_codes_seen": sorted(set(all_errors or last_errors)),
+        "error_codes_seen": sorted(all_errors or set(last_errors)),
         "last_viewed": last_viewed,
         "verified": False,
     }
@@ -3090,13 +3124,15 @@ def _run_captain_run(
     else:
         receipt_status = "passed"
         decision = "executed"
-    attempted_count = sum(1 for result in executions if result.get("execution_invoked") is True)
+    invoked_count = sum(1 for result in executions if result.get("execution_invoked") is True)
+    command_returned_count = sum(1 for result in executions if result.get("command_returned") is True)
+    attempted_count = sum(1 for result in executions if result.get("execution_attempted") is True)
     verified_count = sum(1 for result in executions if result.get("verification_passed") is True)
     for gate in gates:
         _check(receipt, f"captain-gate-{gate['id']}", "pass", str(gate["reason"]))
     _check(receipt, "captain-gates-pass", "pass", action_names)
     _check(receipt, "trusted-owner-autonomy", "pass" if _captain_trusted_owner_autonomy_ready(parameters, actions) else "warn", str(parameters.get("autonomy_policy") or "manual evidence mode"))
-    _check(receipt, "receipt-bound-execution", "pass", f"execution_records={len(executions)} attempted={attempted_count} verified={verified_count}")
+    _check(receipt, "receipt-bound-execution", "pass", f"execution_records={len(executions)} invoked={invoked_count} command_returned={command_returned_count} attempted={attempted_count} verified={verified_count}")
     preflight_reasons = [
         reason
         for result in pre_execution_failures
@@ -3112,7 +3148,7 @@ def _run_captain_run(
         _check(receipt, "post-execution-verification", "skip", "execution not attempted")
     else:
         _check(receipt, "execution-preflight", "pass", "execution preflight passed")
-        _check(receipt, "execution-attempted", "pass", f"attempted={attempted_count}")
+        _check(receipt, "execution-attempted", "pass", f"invoked={invoked_count} command_returned={command_returned_count} attempted={attempted_count}")
         if verification_failures:
             _check(receipt, "post-execution-verification", "fail", "; ".join(post_execution_reasons))
         else:
@@ -3130,6 +3166,12 @@ def _run_captain_run(
         "status_projection": projection_info,
         "executable_action_allowlist": sorted(CAPTAIN_EXECUTABLE_ACTIONS),
         "actions": action_records,
+        "execution_counts": {
+            "invoked_count": invoked_count,
+            "command_returned_count": command_returned_count,
+            "attempted_count": attempted_count,
+            "verified_count": verified_count,
+        },
         "executions": executions,
         "non_claims": [
             "does not execute actions outside the explicit executable_action_allowlist",
