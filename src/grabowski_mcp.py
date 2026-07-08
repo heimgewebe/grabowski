@@ -4218,6 +4218,11 @@ def _rlens_extract_query_hits(payload: Any) -> tuple[list[dict[str, Any]], str]:
         return _rlens_list_of_dicts(payload), "bare_results_array"
     if not isinstance(payload, dict):
         return [], "non_object"
+    resolved = payload.get("resolved_evidence")
+    if isinstance(resolved, dict):
+        resolved_hits = resolved.get("hits")
+        if isinstance(resolved_hits, list):
+            return _rlens_list_of_dicts(resolved_hits), "resolved_evidence.hits"
     direct_results = payload.get("results")
     if isinstance(direct_results, list):
         return _rlens_list_of_dicts(direct_results), "top_level_results"
@@ -4263,6 +4268,10 @@ def _rlens_query_snippets(payload: Any, *, max_snippets: int = 5) -> dict[str, A
                 "range_status": item.get("range_status"),
                 "citation_status": item.get("citation_status"),
                 "citation_id": item.get("citation_id"),
+                "citation_range": item.get("citation_range") if isinstance(item.get("citation_range"), dict) else None,
+                "canonical_authority": item.get("canonical_authority") if isinstance(item.get("canonical_authority"), dict) else None,
+                "live_repo_address": item.get("live_repo_address") if isinstance(item.get("live_repo_address"), dict) else None,
+                "live_repo_address_status": item.get("live_repo_address_status"),
                 "source_range": source_range,
             }
             snippets.append(snippet)
@@ -4278,8 +4287,13 @@ def _rlens_query_snippets(payload: Any, *, max_snippets: int = 5) -> dict[str, A
     hits, shape = _rlens_extract_query_hits(payload)
     for ordinal, hit in enumerate(hits[:max_snippets]):
         range_ref = _rlens_range_identity_from_hit(hit)
+        source_range = hit.get("source_range") if isinstance(hit.get("source_range"), dict) else None
+        canonical_authority = hit.get("canonical_authority") if isinstance(hit.get("canonical_authority"), dict) else None
+        live_repo_address = hit.get("live_repo_address") if isinstance(hit.get("live_repo_address"), dict) else None
         text = _rlens_text_excerpt(
-            hit.get("text")
+            hit.get("text_excerpt")
+            if isinstance(hit.get("text_excerpt"), str)
+            else hit.get("text")
             if isinstance(hit.get("text"), str)
             else hit.get("content")
             if isinstance(hit.get("content"), str)
@@ -4287,14 +4301,24 @@ def _rlens_query_snippets(payload: Any, *, max_snippets: int = 5) -> dict[str, A
         )
         snippet = {
             "ordinal": ordinal,
-            "path": hit.get("path"),
+            "path": hit.get("source_path") or hit.get("path"),
             "chunk_id": hit.get("chunk_id"),
             "score": hit.get("score"),
             "text_excerpt": text,
             "range_ref": range_ref,
+            "source_range": source_range,
+            "line_range": hit.get("line_range") if isinstance(hit.get("line_range"), dict) else None,
+            "citation_id": hit.get("citation_id"),
+            "citation_status": hit.get("citation_status"),
+            "citation_verified": hit.get("citation_verified"),
+            "canonical_authority": canonical_authority,
+            "live_repo_address": live_repo_address,
+            "live_repo_address_status": hit.get("live_repo_address_status"),
         }
         snippets.append(snippet)
-        if range_ref is not None:
+        if source_range is not None:
+            ranges.append(source_range)
+        elif range_ref is not None:
             ranges.append(range_ref)
     return {
         "source_shape": shape,
@@ -4302,6 +4326,29 @@ def _rlens_query_snippets(payload: Any, *, max_snippets: int = 5) -> dict[str, A
         "snippets": snippets,
         "ranges": ranges,
     }
+
+
+
+
+def _rlens_context_evidence_status(query: str | None, query_context: dict[str, Any], snippets: list[dict[str, Any]], ranges: list[dict[str, Any]]) -> tuple[str, str | None]:
+    if not query:
+        return "skipped", "query_not_provided"
+    if not query_context.get("available", False):
+        reason = query_context.get("reason") or query_context.get("status") or "query_unavailable"
+        return "unavailable", str(reason)
+    citation_count = sum(1 for snippet in snippets if isinstance(snippet.get("citation_id"), str) and snippet.get("citation_id"))
+    if snippets and (ranges or citation_count):
+        return "available", None
+    return "degraded", "resolved_evidence_missing_snippets_ranges_or_citations"
+
+
+def _rlens_context_citation_ids(snippets: list[dict[str, Any]]) -> list[str]:
+    ids = []
+    for snippet in snippets:
+        citation_id = snippet.get("citation_id")
+        if isinstance(citation_id, str) and citation_id and citation_id not in ids:
+            ids.append(citation_id)
+    return ids
 
 
 def _rlens_selected_manifest_for_repo(
@@ -4769,15 +4816,24 @@ def rlens_context_pack(
         }
     snippets = _rlens_list_of_dicts(query_context.get("snippets"))
     ranges = _rlens_list_of_dicts(query_context.get("ranges"))
+    evidence_status, evidence_reason = _rlens_context_evidence_status(query, query_context, snippets, ranges)
+    citation_ids = _rlens_context_citation_ids(snippets)
     bounded_evidence = {
         "query": query,
         "k": k if query else None,
         "normalized_query_shape": query_context.get("normalized_query_shape") or query_context.get("query_shape"),
+        "resolved_evidence_status": evidence_status,
+        "degradation_reason": evidence_reason,
         "hit_count": query_context.get("hit_count", 0),
         "result_count": query_context.get("result_count"),
+        "snippet_count": len(snippets),
+        "range_count": len(ranges),
+        "citation_count": len(citation_ids),
+        "citation_ids": citation_ids,
         "snippets": snippets,
         "ranges": ranges,
         "query_status": query_context.get("status"),
+        "query_available": query_context.get("available", False),
     }
     context_ref = {
         "schema_version": 1,
@@ -4792,6 +4848,8 @@ def rlens_context_pack(
         "query_shape": bounded_evidence["normalized_query_shape"],
         "snippet_count": len(snippets),
         "range_count": len(ranges),
+        "citation_count": len(citation_ids),
+        "resolved_evidence_status": evidence_status,
         "source": "grabowski.rlens_context_pack",
         "generated_at": generated_at,
         "does_not_establish": [
