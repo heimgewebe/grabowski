@@ -51,31 +51,80 @@ SSH_BIN = os.environ.get("GRABOWSKI_SSH_BIN", "/usr/bin/ssh")
 SERVER_RECOVERY_CHECK_SUBSET = os.environ.get("GRABOWSKI_SERVER_RECOVERY_CHECK_SUBSET", "1/100")
 SERVER_RECOVERY_TIMEOUT_SECONDS = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_TIMEOUT_SECONDS", "300"))
 SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES", "4096"))
+HEIMSERVER_RECOVERY_ALIASES_ENV = "GRABOWSKI_HEIMSERVER_RECOVERY_ALIASES"
+DEFAULT_HEIMSERVER_RECOVERY_ALIASES = "heimserver"
+RECOVERY_STATUS_FRESH_EVIDENCE_PRESENT = "fresh_evidence_present"
+RECOVERY_STATUS_BLOCKED_ON_DEFAULT_HEIMSERVER = "blocked_on_default_heimserver_or_alternate_recovery_target"
+RECOVERY_STATUS_BLOCKED_UNTIL_CONFIGURED_TARGET_PROBE_SUCCEEDS = "blocked_until_configured_target_probe_succeeds"
+RECOVERY_STATUS_BLOCKED_TARGET_MISMATCH = "blocked_until_configured_target_matches_marker"
 
 
-def _requires_heimserver_recovery_backend() -> bool:
-    host = SERVER_RECOVERY_HOST.strip().lower()
+def _normalize_recovery_host(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().lower()
+    if not text or any(ord(char) < 32 for char in text):
+        return ""
+    return text
+
+
+def _configured_recovery_target_host() -> str:
     target = SERVER_RECOVERY_TARGET.strip().lower()
-    target_host = target.split(":", 1)[0]
-    return host == "heimserver" or target_host == "heimserver"
+    if not target or any(ord(char) < 32 for char in target):
+        return ""
+    if target.startswith("["):
+        closing = target.find("]")
+        if closing <= 1:
+            return ""
+        return _normalize_recovery_host(target[1:closing])
+    return _normalize_recovery_host(target.split(":", 1)[0])
 
 
-def _recovery_evidence_boundary(server_marker: dict[str, Any]) -> dict[str, Any]:
-    requires_heimserver = _requires_heimserver_recovery_backend()
-    server_fresh = bool(server_marker.get("valid"))
+def _heimserver_recovery_aliases() -> frozenset[str]:
+    raw = os.environ.get(HEIMSERVER_RECOVERY_ALIASES_ENV, DEFAULT_HEIMSERVER_RECOVERY_ALIASES)
+    aliases = {_normalize_recovery_host(part) for part in raw.split(",")}
+    aliases.discard("")
+    return frozenset(aliases or {"heimserver"})
+
+
+def _uses_default_heimserver_recovery_backend() -> bool:
+    aliases = _heimserver_recovery_aliases()
+    host = _normalize_recovery_host(SERVER_RECOVERY_HOST)
+    target_host = _configured_recovery_target_host()
+    return host in aliases or target_host in aliases
+
+
+def _server_recovery_target_matches_configured(server_marker: dict[str, Any]) -> bool:
+    return server_marker.get("target") == SERVER_RECOVERY_TARGET
+
+
+def _server_recovery_evidence_fresh(server_marker: dict[str, Any]) -> bool:
+    return bool(server_marker.get("valid")) and _server_recovery_target_matches_configured(server_marker)
+
+
+def _server_recovery_evidence_boundary(server_marker: dict[str, Any]) -> dict[str, Any]:
+    uses_default_heimserver_backend = _uses_default_heimserver_recovery_backend()
+    target_matches_configured = _server_recovery_target_matches_configured(server_marker)
+    server_fresh = _server_recovery_evidence_fresh(server_marker)
     if server_fresh:
-        status = "fresh_evidence_present"
-    elif requires_heimserver:
-        status = "blocked_on_heimserver_or_alternate_recovery_target"
+        status = RECOVERY_STATUS_FRESH_EVIDENCE_PRESENT
+    elif bool(server_marker.get("target")) and not target_matches_configured:
+        status = RECOVERY_STATUS_BLOCKED_TARGET_MISMATCH
+    elif uses_default_heimserver_backend:
+        status = RECOVERY_STATUS_BLOCKED_ON_DEFAULT_HEIMSERVER
     else:
-        status = "blocked_until_configured_target_probe_succeeds"
+        status = RECOVERY_STATUS_BLOCKED_UNTIL_CONFIGURED_TARGET_PROBE_SUCCEEDS
     return {
         "schema_version": 1,
         "kind": "ssh_tunnelled_restic_backup_restore_check",
         "server_recovery_host": SERVER_RECOVERY_HOST,
         "server_recovery_target": SERVER_RECOVERY_TARGET,
-        "requires_heimserver": requires_heimserver,
-        "non_heimserver_configured": not requires_heimserver,
+        "marker_target": server_marker.get("target"),
+        "configured_target": SERVER_RECOVERY_TARGET,
+        "target_matches_configured": target_matches_configured,
+        "heimserver_recovery_aliases": sorted(_heimserver_recovery_aliases()),
+        "uses_default_heimserver_backend": uses_default_heimserver_backend,
+        "custom_recovery_target_configured": not uses_default_heimserver_backend,
         "status": status,
         "runtime_health_is_separate": True,
         "high_impact_actions_remain_blocked_until_fresh_server_evidence": not server_fresh,
@@ -83,6 +132,7 @@ def _recovery_evidence_boundary(server_marker: dict[str, Any]) -> dict[str, Any]
             "runtime health does not prove restore readiness",
             "stale server recovery markers do not authorize privileged or power-worker actions",
             "a configured non-heimserver target is only sufficient after backup, restore and repository checks pass",
+            "server recovery evidence for one target authorizes no other configured target",
         ],
     }
 
@@ -133,7 +183,10 @@ def _server_marker() -> dict[str, Any]:
         "path": str(SERVER_RECOVERY), "exists": SERVER_RECOVERY.exists(),
         "valid": False, "timestamp_unix": None, "age_seconds": None,
         "snapshot_id": None, "restore_probe_valid": False,
-        "repository_check_valid": False, "target": None, "error": None,
+        "repository_check_valid": False, "target": None,
+        "configured_target": SERVER_RECOVERY_TARGET,
+        "target_matches_configured": False,
+        "error": None,
     }
     if not _bounded_file(SERVER_RECOVERY):
         result["error"] = "server marker is missing or invalid"
@@ -152,21 +205,28 @@ def _server_marker() -> dict[str, Any]:
         result["error"] = "server marker timestamp is invalid"
         return result
     age = max(0, int(time.time()) - stamp)
+    marker_target = value["target"]
+    target_matches_configured = marker_target == SERVER_RECOVERY_TARGET
     result.update({
         "timestamp_unix": stamp, "age_seconds": age,
         "snapshot_id": value["snapshot_id"],
         "restore_probe_valid": value["restore_probe_valid"] is True,
         "repository_check_valid": value["repository_check_valid"] is True,
-        "target": value["target"],
+        "target": marker_target,
+        "configured_target": SERVER_RECOVERY_TARGET,
+        "target_matches_configured": target_matches_configured,
     })
-    result["valid"] = all((
+    base_valid = all((
         age <= MAX_AGE_SECONDS,
         isinstance(result["snapshot_id"], str) and bool(result["snapshot_id"]),
         result["restore_probe_valid"], result["repository_check_valid"],
         isinstance(result["target"], str) and bool(result["target"]),
     ))
-    if not result["valid"]:
+    result["valid"] = base_valid and target_matches_configured
+    if not base_valid:
         result["error"] = "server recovery evidence is incomplete or stale"
+    elif not target_matches_configured:
+        result["error"] = "server recovery target does not match configured target"
     return result
 
 
@@ -471,7 +531,7 @@ def recovery_status() -> dict[str, Any]:
         "local_backup_fresh": bool(local_backup["valid"]),
         "backup_timer_enabled": bool(timer_enabled["ok"]),
         "backup_timer_active": bool(timer_active["ok"]),
-        "server_recovery_fresh": bool(server_backup["valid"]),
+        "server_recovery_fresh": _server_recovery_evidence_fresh(server_backup),
         "privileged_broker_ready": bool(broker.get("ready")),
     }
     user_gate = all(checks[name] for name in (
@@ -485,7 +545,9 @@ def recovery_status() -> dict[str, Any]:
     if not checks["backup_timer_enabled"] or not checks["backup_timer_active"]:
         actions.append(f"enable and start {BACKUP_TIMER}")
     if not checks["server_recovery_fresh"]:
-        if _requires_heimserver_recovery_backend():
+        if bool(server_backup.get("target")) and not bool(server_backup.get("target_matches_configured")):
+            actions.append(f"produce fresh server recovery evidence for configured target {SERVER_RECOVERY_TARGET}")
+        elif _uses_default_heimserver_recovery_backend():
             actions.append("configure and prove a non-heimserver recovery target, or restore fresh heimserver recovery evidence")
         else:
             actions.append(f"produce fresh server recovery evidence for configured target {SERVER_RECOVERY_TARGET}")
@@ -501,7 +563,7 @@ def recovery_status() -> dict[str, Any]:
         "local_backup": local_backup,
         "backup_timer": {"unit": BACKUP_TIMER, "enabled": timer_enabled, "active": timer_active},
         "server_recovery": server_backup,
-        "recovery_evidence_boundary": _recovery_evidence_boundary(server_backup),
+        "recovery_evidence_boundary": _server_recovery_evidence_boundary(server_backup),
         "privileged_broker": broker,
         "required_actions": actions,
     }
