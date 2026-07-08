@@ -604,10 +604,6 @@ class RlensContextBridgeToolTests(unittest.TestCase):
         self.assertEqual(result["mutation_boundary"]["writes"], [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RlensContextPackResolvedEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -723,3 +719,7 @@ class RlensContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertEqual(result["bounded_evidence"]["snippets"], [])
         self.assertEqual(result["bounded_evidence"]["ranges"], [])
         self.assertEqual(result["context_ref"]["resolved_evidence_status"], "degraded")
+
+
+if __name__ == "__main__":
+    unittest.main()
