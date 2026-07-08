@@ -59,6 +59,8 @@ class FakeGh:
         view: dict[str, object] | None = None,
         failure: bool = False,
         invalid_json: bool = False,
+        view_failure_after_merge: bool = False,
+        post_merge_view: dict[str, object] | None = None,
     ):
         self.existing = existing
         self.failure = failure
@@ -73,6 +75,9 @@ class FakeGh:
             "isDraft": False,
             "mergeable": "MERGEABLE",
         }
+        self.view_failure_after_merge = view_failure_after_merge
+        self.post_merge_view = post_merge_view or {}
+        self.merged = False
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
@@ -100,7 +105,16 @@ class FakeGh:
             return {"returncode": 0, "stdout": str(self.view["url"]), "stderr": ""}
         if argv[:2] == ["pr", "edit"]:
             return {"returncode": 0, "stdout": "", "stderr": ""}
+        if argv[:2] == ["pr", "merge"]:
+            self.merged = True
+            merged_view = dict(self.view)
+            merged_view.update({"state": "MERGED", "mergedAt": "2026-07-08T03:00:00Z", "mergeCommit": {"oid": "d" * 40}})
+            merged_view.update(self.post_merge_view)
+            self.view = merged_view
+            return {"returncode": 0, "stdout": "merged", "stderr": ""}
         if argv[:2] == ["pr", "view"]:
+            if self.view_failure_after_merge and self.merged:
+                return {"returncode": 1, "stdout": "", "stderr": "transient PR view failure"}
             return {"returncode": 0, "stdout": json.dumps(self.view), "stderr": ""}
         return {"returncode": 1, "stdout": "", "stderr": f"unexpected gh command: {argv}"}
 
@@ -522,7 +536,7 @@ class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}
-        self.assertEqual({"branch-publish", "captain-preflight", "mechanic-loop", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "scout", "situation", "worktree-orient"}, set(specs))
+        self.assertEqual({"branch-publish", "captain-preflight", "captain-run", "mechanic-loop", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "scout", "situation", "worktree-orient"}, set(specs))
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
@@ -548,6 +562,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("observer", surface["profile"])
         self.assertFalse(by_name["branch-publish"]["availability"]["available"])
         self.assertFalse(by_name["captain-preflight"]["availability"]["available"])
+        self.assertFalse(by_name["captain-run"]["availability"]["available"])
         self.assertTrue(by_name["repo-orient"]["availability"]["available"])
         self.assertIn("does not expose generic shell execution", surface["non_claims"])
 
@@ -788,7 +803,7 @@ class GripFoundationTests(unittest.TestCase):
                     {
                         "action": "pr-merge",
                         "high_impact": True,
-                        "target": {"repo": "heimgewebe/grabowski", "pr": 1},
+                        "target": {"repo": "heimgewebe/grabowski", "pr": 1, "base": "main"},
                         "scope": {"operation": "preflight only"},
                         "risk": {"risk_level": "high", "irreversibility": "reversible", "recovery_path": "revert merge commit"},
                         "target_change_required": True,
@@ -987,7 +1002,7 @@ class GripFoundationTests(unittest.TestCase):
                     {
                         "action": "pr-merge",
                         "high_impact": True,
-                        "target": {"repo": "heimgewebe/grabowski", "pr": 1},
+                        "target": {"repo": "heimgewebe/grabowski", "pr": 1, "base": "main"},
                         "scope": {"operation": "preflight only"},
                         "risk": {"risk_level": "high", "irreversibility": "maybe"},
                         "target_change": None,
@@ -1765,7 +1780,7 @@ def captain_action(**overrides) -> dict[str, object]:
         "action": "pr-merge",
         "high_impact": True,
         "role": "captain",
-        "target": {"repo": "heimgewebe/grabowski", "pr": 96},
+        "target": {"repo": "heimgewebe/grabowski", "pr": 96, "base": "main"},
         "scope": {
             "allowed_effects": ["merge pull request 96 into main"],
             "forbidden_effects": ["force-push", "branch-deletion"],
@@ -1827,7 +1842,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertTrue(output["manual_decision_candidate"])
         self.assertEqual("blocked", output["status"])
         self.assertEqual("blocked", output["receipt_status"])
-        self.assertEqual(["captain_execution_not_implemented_in_this_slice"], output["blocked_reasons"])
+        self.assertEqual(["captain_preflight_does_not_execute; use captain-run for execution"], output["blocked_reasons"])
         self.assertEqual("blocked", result["receipt"]["status"])
         action = output["actions"][0]
         self.assertEqual("not-performed", action["execution"])
@@ -1836,7 +1851,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("ready_for_manual_captain_decision", action["captain_receipt"]["gate_decision"])
         self.assertTrue(grips._is_sha256_hex(action["receipt_sha256"]))
         self.assertEqual(action["captain_receipt"]["recovery_path"], "revert the merge commit on main")
-        self.assertIn("privileged execution is not implemented", output["why_no_mutation"])
+        self.assertIn("captain-preflight is read-only", output["why_no_mutation"])
 
     def test_top_level_receipt_follows_receipt_status_when_blocked(self) -> None:
         result = self.run_captain(captain_parameters(review_evidence=None))
@@ -1957,6 +1972,291 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertIn("human_authorization_missing", result["output"]["blocked_reasons"])
 
+    def test_trusted_owner_autonomy_replaces_per_action_human_authorization_for_reversible_actions(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        result = self.run_captain(parameters)
+
+        self.assertEqual("ready_for_autonomous_captain_execution", result["output"]["gate_decision"])
+        self.assertTrue(result["output"]["autonomous_execution_candidate"])
+        self.assertFalse(result["output"]["manual_decision_candidate"])
+        self.assertNotIn("human_authorization_missing", result["output"]["blocked_reasons"])
+        self.assertEqual("pass", self.gate(result, "autonomy-policy")["status"])
+        self.assertEqual("pass", self.gate(result, "human-authorization-present")["status"])
+
+    def test_trusted_owner_autonomy_does_not_cover_irreversible_actions(self) -> None:
+        action = captain_action(
+            risk={"risk_level": "high", "irreversibility": "irreversible"},
+            irreversibility_record={"reason": "no automatic rollback"},
+        )
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", result["output"]["gate_decision"])
+        self.assertIn("irreversible_action_requires_human_authorization", result["output"]["blocked_reasons"])
+        self.assertIn("human_authorization_missing", result["output"]["blocked_reasons"])
+
+    def test_trusted_owner_autonomy_requires_explicit_reversible_record(self) -> None:
+        action = captain_action(risk={"risk_level": "high", "recovery_path": "revert the merge commit on main"})
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", result["output"]["gate_decision"])
+        self.assertIn("ambiguous_reversibility_requires_human_authorization", result["output"]["blocked_reasons"])
+        self.assertIn("human_authorization_missing", result["output"]["blocked_reasons"])
+
+    def test_captain_run_merges_pr_when_trusted_owner_gates_pass(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        gh = FakeGh(view={
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+        })
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("executed", result["output"]["decision"])
+        self.assertEqual("passed", result["output"]["actions"][0]["captain_receipt"]["status"])
+        self.assertEqual("performed", result["output"]["actions"][0]["execution"])
+        self.assertNotIn(
+            "automatic_merge_authority",
+            result["output"]["actions"][0]["captain_receipt"]["does_not_establish"],
+        )
+        merge_calls = [call for call in gh.calls if call[:2] == ("pr", "merge")]
+        self.assertEqual(1, len(merge_calls))
+        self.assertIn("--match-head-commit", merge_calls[0])
+        self.assertIn(CAPTAIN_HEAD, merge_calls[0])
+
+    def test_captain_run_preserves_execution_receipt_when_post_merge_verification_fails(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+            },
+            view_failure_after_merge=True,
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertEqual("verification_failed_after_execution", result["output"]["decision"])
+        self.assertEqual("performed", result["output"]["actions"][0]["execution"])
+        self.assertEqual("failed", result["output"]["actions"][0]["captain_receipt"]["status"])
+        self.assertFalse(result["output"]["executions"][0]["verification_passed"])
+        self.assertEqual("transient PR view failure", result["output"]["executions"][0]["verification_error"])
+        self.assertEqual("merged", result["output"]["executions"][0]["merge_stdout"])
+        verification_checks = [check for check in result["receipt"]["checks"] if check["id"] == "post-execution-verification"]
+        self.assertEqual("fail", verification_checks[-1]["status"])
+        self.assertTrue(grips._is_sha256_hex(result["output"]["actions"][0]["receipt_sha256"]))
+
+    def test_captain_run_blocks_multiple_actions_before_execution(self) -> None:
+        parameters = captain_parameters(
+            [captain_action(), captain_action(target={"repo": "heimgewebe/grabowski", "pr": 97, "base": "main"})],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        gh = FakeGh()
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("captain_run_supports_exactly_one_action_in_v1", result["output"]["blocked_reasons"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_captain_run_blocks_pr_merge_preflight_drift_before_execution(self) -> None:
+        cases = (
+            ({"baseRefName": "develop"}, "pr_base_does_not_match_expected_base_before_execution"),
+            ({"isDraft": True}, "pr_is_draft_before_execution"),
+            ({"state": "CLOSED"}, "pr_not_open_before_execution"),
+            ({"state": "MERGED"}, "pr_already_merged_before_execution"),
+            ({"headRefOid": "a" * 40}, "pr_head_does_not_match_expected_head_before_execution"),
+            ({"mergeStateStatus": "DIRTY"}, "pr_merge_state_not_clean_before_execution"),
+            ({"mergeable": "CONFLICTING"}, "pr_not_mergeable_before_execution"),
+        )
+        for view_patch, expected_reason in cases:
+            with self.subTest(expected_reason=expected_reason):
+                parameters = captain_parameters(
+                    trusted_owner_mode=True,
+                    autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+                    allow_execution=True,
+                )
+                parameters.pop("human_authorization")
+                parameters.pop("execution_authority")
+                view = {
+                    "number": 96,
+                    "state": "OPEN",
+                    "baseRefName": "main",
+                    "headRefName": "feat/captain",
+                    "headRefOid": CAPTAIN_HEAD,
+                    "isDraft": False,
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                }
+                view.update(view_patch)
+                gh = FakeGh(view=view)
+
+                result = grips.grip_run(
+                    "captain-run",
+                    parameters,
+                    profile="captain",
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=gh,
+                )
+
+                self.assertEqual("blocked", result["receipt"]["status"])
+                self.assertIn(expected_reason, result["output"]["blocked_reasons"])
+                self.assertFalse(result["output"]["executions"][0]["execution_attempted"])
+                self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_captain_run_requires_post_merge_head_confirmation(self) -> None:
+        for post_merge_view in ({"headRefOid": None}, {"headRefOid": "a" * 40}):
+            with self.subTest(post_merge_view=post_merge_view):
+                parameters = captain_parameters(
+                    trusted_owner_mode=True,
+                    autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+                    allow_execution=True,
+                )
+                parameters.pop("human_authorization")
+                parameters.pop("execution_authority")
+                gh = FakeGh(
+                    view={
+                        "number": 96,
+                        "state": "OPEN",
+                        "baseRefName": "main",
+                        "headRefName": "feat/captain",
+                        "headRefOid": CAPTAIN_HEAD,
+                        "isDraft": False,
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "CLEAN",
+                    },
+                    post_merge_view=post_merge_view,
+                )
+
+                result = grips.grip_run(
+                    "captain-run",
+                    parameters,
+                    profile="captain",
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=gh,
+                )
+
+                self.assertEqual("failed", result["receipt"]["status"])
+                self.assertEqual("verification_failed_after_execution", result["output"]["decision"])
+                self.assertEqual("merged PR head does not match expected_head", result["output"]["executions"][0]["verification_error"])
+                verification_checks = [check for check in result["receipt"]["checks"] if check["id"] == "post-execution-verification"]
+                self.assertEqual("fail", verification_checks[-1]["status"])
+
+    def test_captain_run_blocks_unimplemented_high_impact_executor(self) -> None:
+        action = captain_action(
+            action="service-restart",
+            target={"host": "heim-pc", "unit": "grabowski-mcp.service"},
+            receipt_path="receipts/captain/service-restart.json",
+        )
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=FakeGh(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("captain_action_execution_not_implemented:service-restart", result["output"]["blocked_reasons"])
+
+    def test_captain_run_requires_allow_execution_parameter(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=FakeGh(),
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("allow_execution_required", result["output"]["blocked_reasons"])
+
     def test_blocks_missing_recovery_and_irreversibility(self) -> None:
         result = self.run_captain(captain_parameters([captain_action(risk={"risk_level": "high"})]))
 
@@ -1999,22 +2299,24 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_pr_merge_requires_repo_and_positive_integer_pr(self) -> None:
         for target in (
-            {"pr": 96},
-            {"repo": "heimgewebe/grabowski"},
-            {"repo": "grabowski", "pr": 96},
-            {"repo": "owner/repo/extra", "pr": 96},
-            {"repo": "owner/", "pr": 96},
-            {"repo": "/repo", "pr": 96},
-            {"repo": "owner//repo", "pr": 96},
-            {"repo": "./repo", "pr": 96},
-            {"repo": "owner/.", "pr": 96},
-            {"repo": "../repo", "pr": 96},
-            {"repo": "owner/..", "pr": 96},
-            {"repo": "a" * 101 + "/repo", "pr": 96},
-            {"repo": "heimgewebe/grabowski", "pr": 0},
-            {"repo": "heimgewebe/grabowski", "pr": -3},
-            {"repo": "heimgewebe/grabowski", "pr": "96"},
-            {"repo": "heimgewebe/grabowski", "pr": True},
+            {"pr": 96, "base": "main"},
+            {"repo": "heimgewebe/grabowski", "base": "main"},
+            {"repo": "heimgewebe/grabowski", "pr": 96},
+            {"repo": "grabowski", "pr": 96, "base": "main"},
+            {"repo": "owner/repo/extra", "pr": 96, "base": "main"},
+            {"repo": "owner/", "pr": 96, "base": "main"},
+            {"repo": "/repo", "pr": 96, "base": "main"},
+            {"repo": "owner//repo", "pr": 96, "base": "main"},
+            {"repo": "./repo", "pr": 96, "base": "main"},
+            {"repo": "owner/.", "pr": 96, "base": "main"},
+            {"repo": "../repo", "pr": 96, "base": "main"},
+            {"repo": "owner/..", "pr": 96, "base": "main"},
+            {"repo": "a" * 101 + "/repo", "pr": 96, "base": "main"},
+            {"repo": "heimgewebe/grabowski", "pr": 0, "base": "main"},
+            {"repo": "heimgewebe/grabowski", "pr": -3, "base": "main"},
+            {"repo": "heimgewebe/grabowski", "pr": "96", "base": "main"},
+            {"repo": "heimgewebe/grabowski", "pr": True, "base": "main"},
+            {"repo": "heimgewebe/grabowski", "pr": 96, "base": "*"},
         ):
             result = self.run_captain(captain_parameters([captain_action(target=target)]))
             self.assertEqual("blocked", result["receipt"]["status"])

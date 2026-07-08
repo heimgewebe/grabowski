@@ -124,12 +124,22 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "captain-preflight": GripSpec(
         name="captain-preflight",
-        version="1.1",
+        version="1.2",
         summary="Evaluate Captain authority gates for high-impact actions without executing privileged mutations.",
         effect=READ_ONLY,
         required_parameters=("actions",),
         acceptance_ids=("high-impact-marked", "recovery-or-irreversibility", "target-change-record"),
         runner="captain_preflight",
+    ),
+    "captain-run": GripSpec(
+        name="captain-run",
+        version="1.0",
+        summary="Execute action-specific Captain operations when autonomy gates are satisfied.",
+        effect=MUTATING,
+        required_parameters=("actions",),
+        acceptance_ids=("captain-gates-pass", "trusted-owner-autonomy", "receipt-bound-execution"),
+        runner="captain_run",
+        uses_github=True,
     ),
     "branch-publish": GripSpec(
         name="branch-publish",
@@ -161,6 +171,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "scout",
         "mechanic-loop",
         "captain-preflight",
+        "captain-run",
         "pr-check-readiness",
         "post-merge-sync",
         "branch-publish",
@@ -176,6 +187,7 @@ GRIP_SURFACE_TARGETS = {
     "scout": "change-only repository, PR and runtime drift signal",
     "mechanic-loop": "bounded normal grip action sequence",
     "captain-preflight": "high-impact Captain action preflight only",
+    "captain-run": "action-specific high-impact Captain execution",
     "pr-check-readiness": "pull request readiness evidence",
     "post-merge-sync": "post-merge local checkout sync",
     "branch-publish": "git branch publication",
@@ -206,7 +218,7 @@ CAPTAIN_HIGH_IMPACT_ACTIONS = frozenset(
         "cleanup-apply",
     }
 )
-GRIP_SURFACE_CAPTAIN_ONLY = frozenset({"captain-preflight"})
+GRIP_SURFACE_CAPTAIN_ONLY = frozenset({"captain-preflight", "captain-run"})
 MECHANIC_FORBIDDEN_EFFECTS = tuple(sorted(CAPTAIN_HIGH_IMPACT_ACTIONS | {"force-push", "secret-mutation", "database-migration", "privileged-broker-mutation"}))
 MECHANIC_MAX_ACTIONS = 10
 CAPTAIN_MAX_ACTIONS = 10
@@ -225,8 +237,11 @@ CAPTAIN_GATE_IDS = (
     "review-evidence-present",
     "diff-bound",
     "ci-green",
+    "autonomy-policy",
     "human-authorization-present",
 )
+CAPTAIN_EXECUTABLE_ACTIONS = frozenset({"pr-merge"})
+CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY = "act_unless_irreversible_or_ambiguous"
 CAPTAIN_DOES_NOT_ESTABLISH = (
     "automatic_merge_authority",
     "automatic_deploy_authority",
@@ -239,18 +254,23 @@ CAPTAIN_DOES_NOT_ESTABLISH = (
     "production_safety",
     "privileged_execution",
 )
+CAPTAIN_EXECUTION_DOES_NOT_ESTABLISH = tuple(
+    "privileged_execution_outside_this_receipt" if claim == "privileged_execution" else claim
+    for claim in CAPTAIN_DOES_NOT_ESTABLISH
+    if claim != "automatic_merge_authority"
+)
 CAPTAIN_NON_CLAIMS = (
     "does not execute privileged mutations; no merge, deploy, restart, fleet mutation or cleanup happens here",
     "does not treat status projection as runtime truth; projection is evidence only",
     "does not treat CI green as production safety",
     "does not treat review approval as semantic correctness",
     "does not grant execution because allow_execution or any other parameter is set",
+    "trusted-owner autonomy requires the explicit autonomy_policy and still blocks irreversible or ambiguous actions",
     "human authorization is recorded evidence, never an automatic execution release",
 )
 CAPTAIN_NO_MUTATION_REASON = (
-    "captain-preflight is a read-only authority evaluation; privileged execution is not "
-    "implemented in this slice, so every receipt stays blocked and any real high-impact "
-    "action requires a separate, explicitly authorized path"
+    "captain-preflight is read-only authority evaluation; it never mutates. "
+    "Use captain-run for action-specific execution after the same evidence gates pass."
 )
 
 
@@ -530,6 +550,19 @@ def _is_hex_sha(value: Any, *, lengths: tuple[int, ...]) -> bool:
 
 def _is_sha256_hex(value: Any) -> bool:
     return _is_hex_sha(value, lengths=(64,))
+
+
+def _normalize_40_sha(value: Any) -> str | None:
+    if not _is_hex_sha(value, lengths=(40,)):
+        return None
+    return str(value).lower()
+
+
+def _returncode(result: dict[str, Any]) -> int:
+    try:
+        return int(result.get("returncode", 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _external_review_evidence_errors(evidence: Any, *, expected_head: str | None) -> list[str]:
@@ -2043,6 +2076,7 @@ def _validate_captain_target(action_name: str, target: dict[str, Any], *, index:
         pr = target.get("pr")
         if type(pr) is not int or pr <= 0:
             raise GripPreflightError(f"actions[{index}].target.pr must be a positive integer")
+        _captain_concrete_string(target, "base", index=index, action_name="pr-merge")
     elif action_name == "runtime-deploy":
         origin_key, runtime_origin = _captain_exactly_one_target_key(
             target, ("repo", "service"), index=index, action_name="runtime-deploy"
@@ -2253,7 +2287,13 @@ def _captain_evidence_object(parameters: dict[str, Any], name: str) -> dict[str,
     return None
 
 
-def _captain_execution_authority_gate(parameters: dict[str, Any]) -> dict[str, Any]:
+def _captain_execution_authority_gate(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, Any]:
+    if _captain_trusted_owner_autonomy_ready(parameters, actions):
+        return _captain_gate(
+            "execution-authority-present",
+            "pass",
+            "trusted-owner autonomy supplies execution authority for reversible target-bound actions",
+        )
     evidence = _captain_evidence_object(parameters, "execution_authority")
     if evidence is None:
         return _captain_gate(
@@ -2345,7 +2385,73 @@ def _captain_ci_gate(parameters: dict[str, Any]) -> dict[str, Any]:
     return _captain_gate("ci-green", "pass", "CI is green for the bound head; CI proves those jobs only, not production safety")
 
 
-def _captain_human_authorization_gate(parameters: dict[str, Any]) -> dict[str, Any]:
+def _captain_trusted_owner_autonomy_ready(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> bool:
+    return (
+        parameters.get("trusted_owner_mode") is True
+        and parameters.get("autonomy_policy") == CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY
+        and bool(actions)
+        and all(action.get("irreversibility") == "reversible" for action in actions)
+    )
+
+
+def _captain_autonomy_policy_gate(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, Any]:
+    trusted_owner_mode = _mechanic_bool(parameters, "trusted_owner_mode", False)
+    autonomy_policy = parameters.get("autonomy_policy")
+    if autonomy_policy is not None and autonomy_policy != CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY:
+        return _captain_gate(
+            "autonomy-policy",
+            "blocked",
+            "autonomy_policy is not an accepted trusted-owner policy",
+            ["autonomy_policy_invalid"],
+        )
+    if not trusted_owner_mode:
+        return _captain_gate(
+            "autonomy-policy",
+            "pass",
+            "manual evidence mode; trusted-owner autonomy is not requested",
+        )
+    if autonomy_policy != CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY:
+        return _captain_gate(
+            "autonomy-policy",
+            "blocked",
+            "trusted_owner_mode requires the explicit autonomy policy",
+            ["trusted_owner_autonomy_policy_missing"],
+        )
+    irreversible = [str(action.get("action")) for action in actions if action.get("irreversibility") == "irreversible"]
+    if irreversible:
+        return _captain_gate(
+            "autonomy-policy",
+            "blocked",
+            "trusted-owner autonomy does not cover irreversible Captain actions",
+            ["irreversible_action_requires_human_authorization"],
+        )
+    ambiguous = [
+        str(action.get("action"))
+        for action in actions
+        if action.get("irreversibility") not in {"reversible", "irreversible"}
+    ]
+    if ambiguous:
+        return _captain_gate(
+            "autonomy-policy",
+            "blocked",
+            "trusted-owner autonomy requires explicit reversible irreversibility records",
+            ["ambiguous_reversibility_requires_human_authorization"],
+        )
+    return _captain_gate(
+        "autonomy-policy",
+        "pass",
+        "trusted-owner autonomy accepted for reversible, target-bound Captain actions",
+        {"policy": CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY},
+    )
+
+
+def _captain_human_authorization_gate(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, Any]:
+    if _captain_trusted_owner_autonomy_ready(parameters, actions):
+        return _captain_gate(
+            "human-authorization-present",
+            "pass",
+            "trusted-owner autonomy supplies execution authority without a per-action human approval ritual",
+        )
     evidence = _captain_evidence_object(parameters, "human_authorization")
     if evidence is None:
         return _captain_gate(
@@ -2368,7 +2474,17 @@ def _captain_human_authorization_gate(parameters: dict[str, Any]) -> dict[str, A
     )
 
 
-def _captain_action_record(action: dict[str, Any], *, gate_decision: str, projection_info: dict[str, Any]) -> dict[str, Any]:
+def _captain_action_record(
+    action: dict[str, Any],
+    *,
+    gate_decision: str,
+    projection_info: dict[str, Any],
+    status: str = "blocked",
+    decision: str = "blocked",
+    execution: str = "not-performed",
+    execution_result: dict[str, Any] | None = None,
+    does_not_establish: tuple[str, ...] = CAPTAIN_DOES_NOT_ESTABLISH,
+) -> dict[str, Any]:
     captain_receipt = {
         "schema_version": 1,
         "role": "captain",
@@ -2381,25 +2497,26 @@ def _captain_action_record(action: dict[str, Any], *, gate_decision: str, projec
         "irreversibility": action["irreversibility"],
         "target_change": action["target_change"],
         "status_projection_sha256": projection_info.get("sha256"),
-        "status": "blocked",
-        "decision": "blocked",
+        "status": status,
+        "decision": decision,
         "gate_decision": gate_decision,
-        "execution": "not-performed",
+        "execution": execution,
         "receipt_path": action["receipt_path"],
-        "does_not_establish": list(CAPTAIN_DOES_NOT_ESTABLISH),
+        "does_not_establish": list(does_not_establish),
     }
+    if execution_result is not None:
+        captain_receipt["execution_result_sha256"] = sha256_json(execution_result)
     captain_receipt["receipt_sha256"] = _mechanic_record_sha256(captain_receipt)
-    return {**action, "captain_receipt": captain_receipt, "receipt_sha256": captain_receipt["receipt_sha256"]}
+    record = {**action, "captain_receipt": captain_receipt, "receipt_sha256": captain_receipt["receipt_sha256"], "execution": execution}
+    if execution_result is not None:
+        record["execution_result"] = execution_result
+    return record
 
 
-def _run_captain_preflight(
-    spec: GripSpec,
+def _captain_authority_gates(
     parameters: dict[str, Any],
-    receipt: Receipt,
-    runner: CommandRunner,
-) -> dict[str, Any]:
-    actions = _captain_actions(parameters)
-    _mechanic_bool(parameters, "allow_execution", False)
+    actions: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     action_names = ", ".join(action["action"] for action in actions)
     scope_findings = [finding for action in actions for finding in action["scope_findings"]]
     projection_gate, projection_info = _captain_status_projection_gate(parameters)
@@ -2414,12 +2531,17 @@ def _run_captain_preflight(
         _captain_gate("target-change-record", "pass", "target changes are explicit records or null"),
         _captain_gate("recovery-or-irreversibility", "pass", "risk records include recovery or irreversibility; a precondition, not proof of safe execution"),
         projection_gate,
-        _captain_execution_authority_gate(parameters),
+        _captain_execution_authority_gate(parameters, actions),
         _captain_review_evidence_gate(parameters),
         _captain_diff_bound_gate(parameters),
         _captain_ci_gate(parameters),
-        _captain_human_authorization_gate(parameters),
+        _captain_autonomy_policy_gate(parameters, actions),
+        _captain_human_authorization_gate(parameters, actions),
     ]
+    return gates, projection_info
+
+
+def _captain_blocked_reasons(gates: list[dict[str, Any]]) -> list[str]:
     blocked_reasons: list[str] = []
     for gate in gates:
         if gate["status"] == "pass":
@@ -2429,11 +2551,172 @@ def _run_captain_preflight(
             blocked_reasons.extend(str(entry) for entry in details)
         else:
             blocked_reasons.append(f"{gate['id']}: {gate['reason']}")
+    return blocked_reasons
+
+
+def _captain_execution_cwd(parameters: dict[str, Any]) -> Path:
+    raw = parameters.get("local_repo")
+    if isinstance(raw, str) and raw.strip():
+        return Path(raw).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def _captain_pr_view(
+    repo_path: Path,
+    github_runner: GithubRunner,
+    *,
+    repo_slug: str,
+    pr_number: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    view_args = [
+        "pr",
+        "view",
+        pr_number,
+        "--repo",
+        repo_slug,
+        "--json",
+        "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,isDraft,mergeable,mergeStateStatus",
+    ]
+    view_result = github_runner(repo_path, view_args)
+    info = {
+        "command": ["gh", *view_args],
+        "returncode": _returncode(view_result),
+        "stdout": view_result.get("stdout", ""),
+        "stderr": view_result.get("stderr", ""),
+    }
+    if info["returncode"] != 0:
+        info["error"] = str(view_result.get("stderr") or view_result.get("stdout") or "gh pr view failed")
+        return None, info
+    try:
+        viewed = _json_stdout(view_result)
+    except GripActionError as exc:
+        info["error"] = str(exc)
+        return None, info
+    if not isinstance(viewed, dict):
+        info["error"] = "unexpected PR view output"
+        return None, info
+    return viewed, info
+
+
+def _captain_pr_merge_preflight_errors(viewed: dict[str, Any], *, expected_head: str, expected_base: str) -> list[str]:
+    errors: list[str] = []
+    if viewed.get("state") == "MERGED":
+        errors.append("pr_already_merged_before_execution")
+    elif viewed.get("state") != "OPEN":
+        errors.append("pr_not_open_before_execution")
+    if viewed.get("isDraft") is True:
+        errors.append("pr_is_draft_before_execution")
+    if viewed.get("headRefOid") != expected_head:
+        errors.append("pr_head_does_not_match_expected_head_before_execution")
+    if viewed.get("baseRefName") != expected_base:
+        errors.append("pr_base_does_not_match_expected_base_before_execution")
+    mergeable = viewed.get("mergeable")
+    if mergeable is not None and mergeable not in {"MERGEABLE", "UNKNOWN"}:
+        errors.append("pr_not_mergeable_before_execution")
+    merge_state = viewed.get("mergeStateStatus")
+    if merge_state is not None and merge_state not in {"CLEAN", "UNKNOWN"}:
+        errors.append("pr_merge_state_not_clean_before_execution")
+    return errors
+
+
+def _run_captain_pr_merge(
+    repo_path: Path,
+    action: dict[str, Any],
+    parameters: dict[str, Any],
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    expected_head = _normalize_40_sha(_string_parameter(parameters, "expected_head"))
+    if expected_head is None:
+        raise GripPreflightError("expected_head must be a 40 character hex SHA for pr-merge execution")
+    target = action["target"]
+    repo_slug = str(target["repo"])
+    pr_number = str(target["pr"])
+    expected_base = str(target["base"])
+    execution_result: dict[str, Any] = {
+        "action": "pr-merge",
+        "repo": repo_slug,
+        "pr": target["pr"],
+        "expected_head": expected_head,
+        "expected_base": expected_base,
+        "execution_attempted": False,
+        "preflight_passed": False,
+        "verification_passed": False,
+    }
+    pre_view, pre_view_info = _captain_pr_view(repo_path, github_runner, repo_slug=repo_slug, pr_number=pr_number)
+    execution_result["pre_view"] = pre_view
+    execution_result["pre_view_result"] = pre_view_info
+    if pre_view is None:
+        execution_result["preflight_errors"] = [str(pre_view_info.get("error") or "pr_pre_execution_view_failed")]
+        execution_result["verification_error"] = "pre-execution PR view failed; merge not attempted"
+        return execution_result
+    preflight_errors = _captain_pr_merge_preflight_errors(pre_view, expected_head=expected_head, expected_base=expected_base)
+    if preflight_errors:
+        execution_result["preflight_errors"] = preflight_errors
+        execution_result["verification_error"] = "pre-execution PR state did not match the bound target; merge not attempted"
+        return execution_result
+    execution_result["preflight_passed"] = True
+    merge_args = [
+        "pr",
+        "merge",
+        pr_number,
+        "--repo",
+        repo_slug,
+        "--merge",
+        "--match-head-commit",
+        expected_head,
+    ]
+    merge_result = _github(repo_path, github_runner, merge_args)
+    execution_result.update(
+        {
+            "execution_attempted": True,
+            "merge_command": ["gh", *merge_args],
+            "merge_stdout": merge_result.get("stdout", ""),
+            "merge_stderr": merge_result.get("stderr", ""),
+        }
+    )
+    viewed, view_info = _captain_pr_view(repo_path, github_runner, repo_slug=repo_slug, pr_number=pr_number)
+    execution_result["verify_view_result"] = view_info
+    if viewed is None:
+        execution_result["verification_error"] = str(view_info.get("error") or "gh pr view failed after merge")
+        return execution_result
+    execution_result["verified_pr"] = viewed
+    if viewed.get("state") != "MERGED":
+        execution_result["verification_error"] = "PR merge command returned without a merged PR state"
+        return execution_result
+    if viewed.get("headRefOid") != expected_head:
+        execution_result["verification_error"] = "merged PR head does not match expected_head"
+        return execution_result
+    if viewed.get("baseRefName") != expected_base:
+        execution_result["verification_error"] = "merged PR base does not match expected_base"
+        return execution_result
+    execution_result["verification_passed"] = True
+    return execution_result
+
+
+def _run_captain_preflight(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    actions = _captain_actions(parameters)
+    _mechanic_bool(parameters, "allow_execution", False)
+    action_names = ", ".join(action["action"] for action in actions)
+    gates, projection_info = _captain_authority_gates(parameters, actions)
+    blocked_reasons = _captain_blocked_reasons(gates)
     all_gates_pass = not blocked_reasons
-    gate_decision = "ready_for_manual_captain_decision" if all_gates_pass else "blocked"
-    manual_decision_candidate = all_gates_pass
+    autonomous_ready = _captain_trusted_owner_autonomy_ready(parameters, actions)
+    gate_decision = (
+        "ready_for_autonomous_captain_execution"
+        if all_gates_pass and autonomous_ready
+        else "ready_for_manual_captain_decision"
+        if all_gates_pass
+        else "blocked"
+    )
+    manual_decision_candidate = all_gates_pass and not autonomous_ready
+    autonomous_execution_candidate = all_gates_pass and autonomous_ready
     if all_gates_pass:
-        blocked_reasons = ["captain_execution_not_implemented_in_this_slice"]
+        blocked_reasons = ["captain_preflight_does_not_execute; use captain-run for execution"]
     for gate in gates:
         _check(receipt, f"captain-gate-{gate['id']}", "pass" if gate["status"] == "pass" else "fail", str(gate["reason"]))
     _check(receipt, "high-impact-marked", "pass", action_names)
@@ -2445,6 +2728,7 @@ def _run_captain_preflight(
         "decision": "blocked",
         "gate_decision": gate_decision,
         "manual_decision_candidate": manual_decision_candidate,
+        "autonomous_execution_candidate": autonomous_execution_candidate,
         "status": "blocked",
         "receipt_status": "blocked",
         "blocked_reasons": blocked_reasons,
@@ -2458,6 +2742,140 @@ def _run_captain_preflight(
     }
 
 
+def _run_captain_run(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    actions = _captain_actions(parameters)
+    allow_execution = _mechanic_bool(parameters, "allow_execution", False)
+    action_names = ", ".join(action["action"] for action in actions)
+    gates, projection_info = _captain_authority_gates(parameters, actions)
+    blocked_reasons = _captain_blocked_reasons(gates)
+    if len(actions) != 1:
+        blocked_reasons.append("captain_run_supports_exactly_one_action_in_v1")
+    if not allow_execution:
+        blocked_reasons.append("allow_execution_required")
+    unsupported = [action["action"] for action in actions if action["action"] not in CAPTAIN_EXECUTABLE_ACTIONS]
+    if unsupported:
+        blocked_reasons.extend(f"captain_action_execution_not_implemented:{name}" for name in unsupported)
+    if blocked_reasons:
+        for gate in gates:
+            _check(receipt, f"captain-gate-{gate['id']}", "pass" if gate["status"] == "pass" else "fail", str(gate["reason"]))
+        _check(receipt, "captain-gates-pass", "fail", "; ".join(blocked_reasons))
+        _check(receipt, "receipt-bound-execution", "skip", "execution not attempted")
+        return {
+            "schema_version": 1,
+            "profile": "captain",
+            "decision": "blocked",
+            "gate_decision": "blocked",
+            "status": "blocked",
+            "receipt_status": "blocked",
+            "blocked_reasons": blocked_reasons,
+            "gates": gates,
+            "status_projection": projection_info,
+            "executable_action_allowlist": sorted(CAPTAIN_EXECUTABLE_ACTIONS),
+            "actions": [_captain_action_record(action, gate_decision="blocked", projection_info=projection_info) for action in actions],
+            "executions": [],
+            "non_claims": list(CAPTAIN_NON_CLAIMS),
+        }
+
+    repo_path = _captain_execution_cwd(parameters)
+    executions: list[dict[str, Any]] = []
+    action_records: list[dict[str, Any]] = []
+    for action in actions:
+        if action["action"] == "pr-merge":
+            execution_result = _run_captain_pr_merge(repo_path, action, parameters, github_runner)
+        else:
+            raise GripPreflightError(f"captain-run has no executor for {action['action']}")
+        executions.append(execution_result)
+        attempted = execution_result.get("execution_attempted") is True
+        verified = execution_result.get("verification_passed") is True
+        action_records.append(
+            _captain_action_record(
+                action,
+                gate_decision=(
+                    "executed"
+                    if verified
+                    else "verification_failed_after_execution"
+                    if attempted
+                    else "blocked"
+                ),
+                projection_info=projection_info,
+                status="passed" if verified else "failed" if attempted else "blocked",
+                decision=(
+                    "executed"
+                    if verified
+                    else "verification_failed_after_execution"
+                    if attempted
+                    else "blocked"
+                ),
+                execution="performed" if attempted else "not-performed",
+                execution_result=execution_result,
+                does_not_establish=CAPTAIN_EXECUTION_DOES_NOT_ESTABLISH if attempted else CAPTAIN_DOES_NOT_ESTABLISH,
+            )
+        )
+
+    pre_execution_failures = [
+        result for result in executions if result.get("execution_attempted") is not True
+    ]
+    verification_failures = [
+        result
+        for result in executions
+        if result.get("execution_attempted") is True and result.get("verification_passed") is not True
+    ]
+    if pre_execution_failures:
+        receipt_status = "blocked"
+        decision = "blocked"
+    elif verification_failures:
+        receipt_status = "failed"
+        decision = "verification_failed_after_execution"
+    else:
+        receipt_status = "passed"
+        decision = "executed"
+    for gate in gates:
+        _check(receipt, f"captain-gate-{gate['id']}", "pass", str(gate["reason"]))
+    _check(receipt, "captain-gates-pass", "pass", action_names)
+    _check(receipt, "trusted-owner-autonomy", "pass" if _captain_trusted_owner_autonomy_ready(parameters, actions) else "warn", str(parameters.get("autonomy_policy") or "manual evidence mode"))
+    _check(receipt, "receipt-bound-execution", "pass", f"executions={len(executions)}")
+    post_execution_reasons = [
+        str(result.get("verification_error") or "post-execution verification failed")
+        for result in verification_failures
+    ]
+    if verification_failures:
+        _check(receipt, "post-execution-verification", "fail", "; ".join(post_execution_reasons))
+    elif pre_execution_failures:
+        _check(receipt, "post-execution-verification", "skip", "execution not attempted")
+    else:
+        _check(receipt, "post-execution-verification", "pass", "all executions verified")
+    return {
+        "schema_version": 1,
+        "profile": "captain",
+        "decision": decision,
+        "gate_decision": decision,
+        "status": receipt_status,
+        "receipt_status": receipt_status,
+        "blocked_reasons": [
+            reason
+            for result in pre_execution_failures
+            for reason in result.get("preflight_errors", [str(result.get("verification_error") or "pre-execution failure")])
+        ],
+        "failed_reasons": post_execution_reasons,
+        "gates": gates,
+        "status_projection": projection_info,
+        "executable_action_allowlist": sorted(CAPTAIN_EXECUTABLE_ACTIONS),
+        "actions": action_records,
+        "executions": executions,
+        "non_claims": [
+            "does not execute actions outside the explicit executable_action_allowlist",
+            "does not bypass expected_head, review, diff, CI or status-projection gates",
+            "does not establish semantic correctness beyond the observed execution receipt",
+        ],
+    }
+
+
 _RUNNERS = {
     "repo_orient": _run_repo_orient,
     "pr_check_readiness": _run_pr_check_readiness,
@@ -2467,6 +2885,7 @@ _RUNNERS = {
     "scout": _run_scout,
     "mechanic_loop": _run_mechanic_loop,
     "captain_preflight": _run_captain_preflight,
+    "captain_run": _run_captain_run,
     "branch_publish": _run_branch_publish,
     "pr_create_or_update": _run_pr_create_or_update,
 }
