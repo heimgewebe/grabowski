@@ -376,6 +376,14 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("self-review reviewed_files contains invalid path at index 0", result["failures"])
 
+    def test_self_review_file_coverage_rejects_trailing_control_character_before_strip(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=["docs/low_risk_note.md\n"]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review reviewed_files contains invalid path at index 0", result["failures"])
+
     def test_self_review_file_coverage_rejects_dot_segments(self) -> None:
         result = pr_review_gate.evaluate_review_gate(
             self._state(),

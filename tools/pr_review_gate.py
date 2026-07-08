@@ -733,12 +733,12 @@ def _valid_iteration(item: Any) -> bool:
 
 
 def _normalized_review_path(value: str) -> str | None:
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return None
     path = value.strip()
     while path.startswith("./"):
         path = path[2:]
     if not path or path.startswith("/") or "\\" in path:
-        return None
-    if any(ord(char) < 32 or ord(char) == 127 for char in path):
         return None
     segments = path.split("/")
     if any(segment in {"", ".", ".."} for segment in segments):
