@@ -65,6 +65,60 @@ class RecoveryToolTests(unittest.TestCase):
 
         status.assert_not_called()
 
+    def test_recovery_status_marks_default_heimserver_boundary_fail_closed(self) -> None:
+        with patch.object(recovery.base, "_verify_audit_log", return_value={"valid": True}), patch.object(
+            recovery.base, "_deployment_metadata", return_value={"provenance_valid": True}
+        ), patch.object(recovery, "_fresh_text_marker", return_value={"valid": True}), patch.object(
+            recovery, "_server_marker", return_value={"valid": False, "target": "heimserver:rest-server/grabowski-recovery-probe"}
+        ), patch.object(recovery, "_timer_probe", return_value={"ok": True}), patch.object(
+            recovery.privileged, "grabowski_privileged_broker_status", return_value={"ready": True}
+        ), patch.object(recovery, "SERVER_RECOVERY_HOST", "heimserver"), patch.object(
+            recovery, "SERVER_RECOVERY_TARGET", "heimserver:rest-server/grabowski-recovery-probe"
+        ):
+            result = recovery.recovery_status()
+
+        self.assertFalse(result["ready_for_user_power_worker"])
+        self.assertFalse(result["ready_for_privileged_actions"])
+        boundary = result["recovery_evidence_boundary"]
+        self.assertTrue(boundary["requires_heimserver"])
+        self.assertFalse(boundary["non_heimserver_configured"])
+        self.assertEqual(boundary["status"], "blocked_on_heimserver_or_alternate_recovery_target")
+        self.assertTrue(boundary["runtime_health_is_separate"])
+        self.assertTrue(boundary["high_impact_actions_remain_blocked_until_fresh_server_evidence"])
+        self.assertIn(
+            "configure and prove a non-heimserver recovery target, or restore fresh heimserver recovery evidence",
+            result["required_actions"],
+        )
+
+    def test_non_heimserver_substring_target_is_not_heimserver_backend(self) -> None:
+        with patch.object(recovery, "SERVER_RECOVERY_HOST", "non-heimserver-backup"), patch.object(
+            recovery, "SERVER_RECOVERY_TARGET", "non-heimserver-backup:rest-server/grabowski-recovery-probe"
+        ):
+            self.assertFalse(recovery._requires_heimserver_recovery_backend())
+
+    def test_recovery_status_reports_non_heimserver_target_without_unblocking_stale_evidence(self) -> None:
+        with patch.object(recovery.base, "_verify_audit_log", return_value={"valid": True}), patch.object(
+            recovery.base, "_deployment_metadata", return_value={"provenance_valid": True}
+        ), patch.object(recovery, "_fresh_text_marker", return_value={"valid": True}), patch.object(
+            recovery, "_server_marker", return_value={"valid": False, "target": "wg-prod-1:rest-server/grabowski-recovery-probe"}
+        ), patch.object(recovery, "_timer_probe", return_value={"ok": True}), patch.object(
+            recovery.privileged, "grabowski_privileged_broker_status", return_value={"ready": True}
+        ), patch.object(recovery, "SERVER_RECOVERY_HOST", "wg-prod-1"), patch.object(
+            recovery, "SERVER_RECOVERY_TARGET", "wg-prod-1:rest-server/grabowski-recovery-probe"
+        ):
+            result = recovery.recovery_status()
+
+        self.assertFalse(result["ready_for_user_power_worker"])
+        self.assertFalse(result["ready_for_privileged_actions"])
+        boundary = result["recovery_evidence_boundary"]
+        self.assertFalse(boundary["requires_heimserver"])
+        self.assertTrue(boundary["non_heimserver_configured"])
+        self.assertEqual(boundary["status"], "blocked_until_configured_target_probe_succeeds")
+        self.assertIn(
+            "produce fresh server recovery evidence for configured target wg-prod-1:rest-server/grabowski-recovery-probe",
+            result["required_actions"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

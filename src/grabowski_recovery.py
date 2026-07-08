@@ -53,6 +53,40 @@ SERVER_RECOVERY_TIMEOUT_SECONDS = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_
 SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES", "4096"))
 
 
+def _requires_heimserver_recovery_backend() -> bool:
+    host = SERVER_RECOVERY_HOST.strip().lower()
+    target = SERVER_RECOVERY_TARGET.strip().lower()
+    target_host = target.split(":", 1)[0]
+    return host == "heimserver" or target_host == "heimserver"
+
+
+def _recovery_evidence_boundary(server_marker: dict[str, Any]) -> dict[str, Any]:
+    requires_heimserver = _requires_heimserver_recovery_backend()
+    server_fresh = bool(server_marker.get("valid"))
+    if server_fresh:
+        status = "fresh_evidence_present"
+    elif requires_heimserver:
+        status = "blocked_on_heimserver_or_alternate_recovery_target"
+    else:
+        status = "blocked_until_configured_target_probe_succeeds"
+    return {
+        "schema_version": 1,
+        "kind": "ssh_tunnelled_restic_backup_restore_check",
+        "server_recovery_host": SERVER_RECOVERY_HOST,
+        "server_recovery_target": SERVER_RECOVERY_TARGET,
+        "requires_heimserver": requires_heimserver,
+        "non_heimserver_configured": not requires_heimserver,
+        "status": status,
+        "runtime_health_is_separate": True,
+        "high_impact_actions_remain_blocked_until_fresh_server_evidence": not server_fresh,
+        "does_not_establish": [
+            "runtime health does not prove restore readiness",
+            "stale server recovery markers do not authorize privileged or power-worker actions",
+            "a configured non-heimserver target is only sufficient after backup, restore and repository checks pass",
+        ],
+    }
+
+
 def _bounded_file(path: Path) -> bool:
     return not path.is_symlink() and path.is_file() and path.stat().st_size <= 65536
 
@@ -451,7 +485,10 @@ def recovery_status() -> dict[str, Any]:
     if not checks["backup_timer_enabled"] or not checks["backup_timer_active"]:
         actions.append(f"enable and start {BACKUP_TIMER}")
     if not checks["server_recovery_fresh"]:
-        actions.append("produce fresh server recovery evidence")
+        if _requires_heimserver_recovery_backend():
+            actions.append("configure and prove a non-heimserver recovery target, or restore fresh heimserver recovery evidence")
+        else:
+            actions.append(f"produce fresh server recovery evidence for configured target {SERVER_RECOVERY_TARGET}")
     if not checks["deployment_provenance"]:
         actions.append("repair deployment provenance")
     if not checks["privileged_broker_ready"]:
@@ -463,7 +500,9 @@ def recovery_status() -> dict[str, Any]:
         "checks": checks, "audit": audit, "deployment": deployment,
         "local_backup": local_backup,
         "backup_timer": {"unit": BACKUP_TIMER, "enabled": timer_enabled, "active": timer_active},
-        "server_recovery": server_backup, "privileged_broker": broker,
+        "server_recovery": server_backup,
+        "recovery_evidence_boundary": _recovery_evidence_boundary(server_backup),
+        "privileged_broker": broker,
         "required_actions": actions,
     }
 
