@@ -457,6 +457,15 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertIn("StandardInput=socket", service_unit)
         self.assertIn("NoNewPrivileges=yes", service_unit)
         self.assertIn("ExecStart=/usr/local/libexec/grabowski-privileged-broker", service_unit)
+        self.assertNotIn("SuccessExitStatus=", service_unit)
+
+    def test_broker_script_keeps_structured_denials_out_of_systemd_failed_state(self) -> None:
+        broker = (ROOT / "tools" / "grabowski_privileged_broker.py").read_text(encoding="utf-8")
+        self.assertIn("return 0\n\n\nif __name__ ==", broker)
+        self.assertIn("except (FileExistsError, PermissionError, ValueError) as exc:", broker)
+        self.assertIn("raise SystemExit(0)", broker)
+        self.assertIn("except Exception as exc:", broker)
+        self.assertIn("raise SystemExit(2)", broker)
 
     def test_privileged_status_is_fail_closed_without_root_assets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

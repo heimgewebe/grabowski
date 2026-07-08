@@ -48,7 +48,7 @@ Details: [`docs/checkout-lifecycle.md`](checkout-lifecycle.md).
 - `tools/grabowski_privileged_request.py`: begrenzter Unix-Socket-Client,
 - `systemd/grabowski-privileged-broker.socket` und `@.service`: gruppenbegrenzte Socket-Aktivierung.
 
-Der Handler akzeptiert nur kurzlebige, hashgebundene Referenzen aus `grabowski_privileged_action_reference`, ersetzt ausschließlich das vollständige Token `{target}`, verlangt absolute Executables und markiert jede Request-ID vor der Ausführung als verbraucht. Auditdaten enthalten Ziel- und argv-Hashes, nicht Begründung oder Secretwerte.
+Der Handler akzeptiert nur kurzlebige, hashgebundene Referenzen aus `grabowski_privileged_action_reference`, ersetzt ausschließlich das vollständige Token `{target}`, verlangt absolute Executables und markiert jede Request-ID vor der Ausführung als verbraucht. Auditdaten enthalten Ziel- und argv-Hashes, nicht Begründung oder Secretwerte. Strukturierte Broker-Ablehnungen und Zielbefehlsfehler werden dem Socket-Client gemeldet; der Broker-Prozess beendet solche behandelten Request-Ergebnisse mit Exit 0, damit keine failed systemd-Instanzen entstehen. Unerwartete interne Brokerfehler bleiben Host-Service-Fehler.
 
 `grabowski_privileged_broker_status` prüft Binary, root-eigene Konfiguration, Socket und Client. Die Hostinstallation ist bewusst kein unprivilegierter Selbstumbau: Dateien müssen root-eigen unter `/usr/local` und `/etc` installiert, der Socket aktiviert und der Operator der Gruppe `grabowski` hinzugefügt werden. Bis dahin bleibt der Pfad fail-closed.
 
