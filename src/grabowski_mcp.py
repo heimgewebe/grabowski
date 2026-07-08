@@ -3633,6 +3633,16 @@ _BUNDLE_MANIFEST_SUFFIX = "_merge.bundle.manifest.json"
 _BUNDLE_HEALTH_SUFFIX = "_merge.bundle_health.post.json"
 _BUNDLE_SURFACE_SUFFIX = "_merge.bundle_surface_validation.json"
 _BUNDLE_OUTPUT_HEALTH_SUFFIX = "_merge.output_health.json"
+BUNDLE_REGISTRY_HEADER = (
+    "repo",
+    "stem",
+    "latest_mtime",
+    "has_agent_reading_pack",
+    "canonical_md",
+    "bundle_manifest",
+    "output_health",
+    "agent_reading_pack",
+)
 _RLENS_STEM_RE = re.compile(r"[A-Za-z0-9_.-]{1,160}\Z")
 _RLENS_REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,120}\Z")
 
@@ -3785,11 +3795,14 @@ def _rlens_iter_manifests(repo: str | None = None) -> list[Path]:
 
 def _rlens_latest_manifest_by_repo() -> dict[str, Path]:
     latest: dict[str, Path] = {}
+    latest_key: dict[str, tuple[float, str]] = {}
     for path in _rlens_iter_manifests(None):
         stem = _rlens_stem_from_manifest(path)
         repo = _rlens_repo_from_stem(stem)
-        if repo not in latest:
+        key = (path.stat().st_mtime, path.name)
+        if repo not in latest or key > latest_key[repo]:
             latest[repo] = path
+            latest_key[repo] = key
     return latest
 
 
@@ -3813,19 +3826,39 @@ def _rlens_manifest_registry_row(path: Path) -> list[str]:
 
 
 def _rlens_registry_row_status(row: list[str]) -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "valid": False,
+        "header": False,
+        "is_header": False,
+        "reason": None,
+        "stem": None,
+        "repo": row[0] if row else None,
+        "manifest_exists": False,
+    }
     if not row:
-        return {"valid": False, "reason": "empty_row"}
-    if row[0] == "repo":
-        return {"valid": True, "header": True}
-    if len(row) < 2:
-        return {"valid": False, "reason": "short_row"}
+        status["reason"] = "empty_row"
+        return status
+    if tuple(row[:len(BUNDLE_REGISTRY_HEADER)]) == BUNDLE_REGISTRY_HEADER:
+        status.update({"valid": True, "header": True, "is_header": True})
+        return status
+    if len(row) < len(BUNDLE_REGISTRY_HEADER):
+        status["reason"] = "short_row"
+        return status
     try:
         stem = _rlens_validate_stem(row[1])
     except ValueError:
-        return {"valid": False, "reason": "invalid_stem"}
+        status["reason"] = "invalid_stem"
+        return status
     manifest_path = _rlens_manifest_path(stem)
     exists = manifest_path.is_file() and not manifest_path.is_symlink()
-    return {"valid": exists, "header": False, "stem": stem, "manifest_exists": exists}
+    status.update({
+        "valid": exists,
+        "stem": stem,
+        "repo": row[0],
+        "manifest_exists": exists,
+        "reason": None if exists else "manifest_missing",
+    })
+    return status
 
 
 def _rlens_git(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
@@ -4874,14 +4907,29 @@ def latest_complete_bundles() -> dict[str, Any]:
                 continue
             rows.append(line.split("\t"))
     row_status = [_rlens_registry_row_status(row) for row in rows]
-    stale_rows = [item for item in row_status if item.get("header") is not True and not item.get("valid")]
-    discovered = [
-        _rlens_manifest_registry_row(path)
-        for _repo, path in sorted(_rlens_latest_manifest_by_repo().items())
+    stale_rows = [item for item in row_status if item.get("is_header") is not True and not item.get("valid")]
+    valid_legacy_rows = [
+        row for row, status in zip(rows, row_status)
+        if status.get("is_header") is not True and status.get("valid") is True
     ]
-    use_discovery = not rows or (bool(stale_rows) and bool(discovered))
-    effective_rows = discovered if use_discovery else rows
-    authority = "live_discovery" if use_discovery else "legacy_cache"
+    discovery_needed = not rows or bool(stale_rows)
+    discovered: list[list[str]] = []
+    if discovery_needed:
+        discovered = [
+            _rlens_manifest_registry_row(path)
+            for _repo, path in sorted(_rlens_latest_manifest_by_repo().items())
+        ]
+    if not rows:
+        effective_rows = discovered
+        authority = "live_discovery"
+    elif stale_rows:
+        legacy_repos = {row[0] for row in valid_legacy_rows if row}
+        discovery_additions = [row for row in discovered if row and row[0] not in legacy_repos]
+        effective_rows = [*valid_legacy_rows, *discovery_additions]
+        authority = "merged_legacy_live_discovery" if discovered else "legacy_cache_valid_rows"
+    else:
+        effective_rows = rows
+        authority = "legacy_cache"
     return {
         "path": str(BUNDLE_REGISTRY),
         "exists": BUNDLE_REGISTRY.is_file(),

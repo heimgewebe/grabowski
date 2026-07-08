@@ -214,12 +214,12 @@ class FleetTests(unittest.TestCase):
                 result = fleet.run_fleet_task_unit_show(
                     "prod",
                     "grabowski-task-0123456789abcdef01234567-a1.service",
-                    ["LoadState", "ActiveState", "Result"],
+                    ("LoadState", "ActiveState", "Result"),
                     timeout_seconds=10,
                     max_output_bytes=1000,
                 )
 
-            self.assertEqual(result["observer"], "task-systemd-user-show-v1")
+            self.assertEqual(result["observer"], fleet.TASK_UNIT_SHOW_OBSERVER)
             self.assertEqual(result["transport"], "ssh")
             call_argv = run.call_args.args[0]
             self.assertEqual(call_argv[-2], "prod.example")

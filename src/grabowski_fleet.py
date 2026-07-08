@@ -7,7 +7,7 @@ import re
 import shlex
 import shutil
 import stat
-from typing import Any
+from typing import Any, Sequence
 
 try:
     import grabowski_operator_core as operator
@@ -25,6 +25,15 @@ FLEET_CONFIG = Path(os.environ.get(
 HOST_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 SSH_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}\Z")
 PRODUCTION_ROLE = "production"
+TASK_UNIT_SHOW_OBSERVER = "task-systemd-user-show-v1"
+TASK_UNIT_SHOW_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "ExecMainCode",
+    "ExecMainStatus",
+)
 
 
 class FleetCommandDenied(PermissionError):
@@ -158,7 +167,7 @@ _SYSTEMD_SHOW_PROPERTY = re.compile(r"[A-Za-z][A-Za-z0-9]*\Z")
 def run_fleet_task_unit_show(
     name: str,
     unit: str,
-    properties: list[str],
+    properties: Sequence[str],
     *,
     timeout_seconds: int,
     max_output_bytes: int,
@@ -173,9 +182,8 @@ def run_fleet_task_unit_show(
     if not isinstance(unit, str) or _TASK_UNIT.fullmatch(unit) is None:
         raise ValueError("Invalid Grabowski task unit")
     if not (
-        isinstance(properties, list)
-        and properties
-        and len(properties) <= 32
+        isinstance(properties, (list, tuple))
+        and 1 <= len(properties) <= 32
         and all(isinstance(item, str) and _SYSTEMD_SHOW_PROPERTY.fullmatch(item) for item in properties)
     ):
         raise ValueError("Invalid systemd property list")
@@ -197,7 +205,7 @@ def run_fleet_task_unit_show(
             "--", host["target"], remote_command,
         ], cwd=HOME, timeout_seconds=timeout, max_output_bytes=output_limit)
     return {"host": name, "transport": host["transport"], "roles": host["roles"],
-            "remote_argv": command, "observer": "task-systemd-user-show-v1",
+            "remote_argv": command, "observer": TASK_UNIT_SHOW_OBSERVER,
             "result": result}
 
 

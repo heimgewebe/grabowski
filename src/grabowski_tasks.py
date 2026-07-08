@@ -498,16 +498,6 @@ def _set_state(
     return updated
 
 
-_TASK_OBSERVE_PROPERTIES = [
-    "LoadState",
-    "ActiveState",
-    "SubState",
-    "Result",
-    "ExecMainCode",
-    "ExecMainStatus",
-]
-
-
 def _observe(record: dict[str, Any]) -> dict[str, Any]:
     command = [
         "systemctl",
@@ -516,7 +506,7 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
         record["unit"],
         "--no-pager",
     ]
-    command.extend(f"--property={item}" for item in _TASK_OBSERVE_PROPERTIES)
+    command.extend(f"--property={item}" for item in fleet.TASK_UNIT_SHOW_PROPERTIES)
     observer: dict[str, Any] = {"kind": "fleet-dispatch-v1"}
     try:
         result = _dispatch(record["host"], command, timeout_seconds=30)
@@ -527,7 +517,7 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
         observed = fleet.run_fleet_task_unit_show(
             record["host"],
             record["unit"],
-            _TASK_OBSERVE_PROPERTIES,
+            fleet.TASK_UNIT_SHOW_PROPERTIES,
             timeout_seconds=30,
             max_output_bytes=8192,
         )
