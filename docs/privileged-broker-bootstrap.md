@@ -18,7 +18,9 @@ Danach wird eine Systemgruppe `grabowski` angelegt, der Operator dieser Gruppe h
 
 ## Aktivierung einer Aktion
 
-Die mitgelieferte Konfiguration enthält nur `edit_system_service` und setzt `enabled` auf `false`. Eine Aktivierung ist erst zulässig, nachdem Zielregex, absolutes argv-Template und Timeout einzeln geprüft wurden. Der Platzhalter `{target}` darf ausschließlich als vollständiges argv-Token vorkommen.
+Die mitgelieferte Konfiguration enthält nur deaktivierte Beispielaktionen. `edit_system_service` bleibt ein deaktiviertes Restart-Beispiel; `reset_failed_systemd_unit` ist ein enger Pfad für `systemctl reset-failed {target}` und ist ebenfalls standardmäßig deaktiviert. Eine Aktivierung ist erst zulässig, nachdem Zielregex, absolutes argv-Template und Timeout einzeln geprüft wurden. Der Platzhalter `{target}` darf ausschließlich als vollständiges argv-Token vorkommen.
+
+`reset_failed_systemd_unit` darf nur Failed-State-Metadaten einer explizit gematchten `.service`-Unit löschen. Der Pfad darf keine Units starten, stoppen, restarten, enablen, disablen oder editieren. Für Fälle wie einen stale `user@111.service`-Fail bleibt vor der Ausführung eine read-only Prüfung von `systemctl --failed` und `getent passwd <uid>` nötig.
 
 ## Abnahme
 

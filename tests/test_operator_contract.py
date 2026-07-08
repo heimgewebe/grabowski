@@ -394,8 +394,8 @@ class OperatorContractTests(unittest.TestCase):
             patch.object(operator.time, "time", return_value=1_700_000_000),
         ):
             payload = operator.grabowski_privileged_action_reference(
-                "edit_system_service",
-                "grabowski-watchdog.service",
+                "reset_failed_systemd_unit",
+                "user@111.service",
                 "document external approval request",
             )
 
