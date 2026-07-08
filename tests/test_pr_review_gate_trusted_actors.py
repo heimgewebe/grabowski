@@ -28,7 +28,12 @@ pr_review_gate = _load_gate()
 
 def _self_review() -> dict:
     return {
+        "kind": "grabowski_self_review",
+        "review_mode": "critical_diff_review",
+        "verdict": "PASS",
         "head_sha": HEAD,
+        "reviewed_files": ["docs/low_risk_note.md"],
+        "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
         "diff_sha256": DIFF_SHA,
         "diff_reviewed": True,
         "all_findings_triaged": True,

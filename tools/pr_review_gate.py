@@ -20,6 +20,16 @@ NON_BLOCKING_OPTIONAL_SKIPPED_CHECK_NAMES = {"claude"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
+SELF_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
+SELF_REVIEW_KIND = "grabowski_self_review"
+SELF_REVIEW_MODE = "critical_diff_review"
+REQUIRED_SELF_REVIEW_FOCUS = (
+    "correctness",
+    "regression_risk",
+    "tests",
+    "security",
+    "integration",
+)
 SELF_REVIEW_DIFF_BYPASS_REASON = "legacy unit seam without live PR diff"
 RISK_PATH_MARKERS = (
     "auth",
@@ -708,6 +718,50 @@ def _valid_iteration(item: Any) -> bool:
     return True
 
 
+def _normalized_review_path(value: str) -> str:
+    return value.strip().lower().lstrip("./")
+
+
+def _self_review_workflow_failures(pr: dict[str, Any], self_review: dict[str, Any]) -> list[str]:
+    failures: list[str] = []
+    if self_review.get("kind") != SELF_REVIEW_KIND:
+        failures.append(f"self-review kind must be {SELF_REVIEW_KIND}")
+    if self_review.get("review_mode") != SELF_REVIEW_MODE:
+        failures.append(f"self-review review_mode must be {SELF_REVIEW_MODE}")
+
+    verdict = self_review.get("verdict")
+    if verdict not in SELF_REVIEW_VERDICTS:
+        failures.append("self-review verdict is missing or invalid")
+    elif verdict != "PASS":
+        failures.append(f"self-review verdict is {verdict}, not PASS")
+
+    reviewed_files = self_review.get("reviewed_files")
+    if not isinstance(reviewed_files, list) or not reviewed_files:
+        failures.append("self-review reviewed_files must be a non-empty list")
+    else:
+        bad_entries = [index for index, item in enumerate(reviewed_files) if not isinstance(item, str) or not item.strip()]
+        if bad_entries:
+            failures.append("self-review reviewed_files contains empty or non-string entry")
+        else:
+            reviewed = {_normalized_review_path(item) for item in reviewed_files}
+            expected = {_normalized_review_path(path) for path in _paths(pr)}
+            missing = sorted(expected - reviewed)
+            if missing:
+                failures.append("self-review reviewed_files does not cover PR file(s): " + ", ".join(missing))
+
+    review_focus = self_review.get("review_focus")
+    if not isinstance(review_focus, list) or not review_focus:
+        failures.append("self-review review_focus must be a non-empty list")
+    elif not all(isinstance(item, str) and item.strip() for item in review_focus):
+        failures.append("self-review review_focus contains empty or non-string entry")
+    else:
+        focus = {item.strip().lower() for item in review_focus}
+        missing_focus = [item for item in REQUIRED_SELF_REVIEW_FOCUS if item not in focus]
+        if missing_focus:
+            failures.append("self-review review_focus missing required item(s): " + ", ".join(missing_focus))
+    return failures
+
+
 def _legacy_external_finding_failures(external_review: dict[str, Any]) -> list[str]:
     findings = external_review.get("findings", [])
     if not isinstance(findings, list):
@@ -936,6 +990,55 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
     return {**manifest, "manifest_path": str(manifest_path)}
 
 
+def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict[str, Any]:
+    pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
+    pr_number = pr.get("number")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int):
+        raise GateInputError("cannot write self-review template without integer PR number")
+    head = pr.get("headRefOid")
+    if not isinstance(head, str) or not head:
+        raise GateInputError("cannot write self-review template without PR head SHA")
+    diff_sha256 = state.get("pr_diff_sha256")
+    if not _valid_sha256(diff_sha256):
+        pr_diff_error = state.get("pr_diff_error")
+        detail = f": {_brief_error(pr_diff_error)}" if isinstance(pr_diff_error, str) and pr_diff_error.strip() else ""
+        raise GateInputError(f"cannot write self-review template without current PR diff SHA-256{detail}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    template = {
+        "schema_version": 1,
+        "kind": SELF_REVIEW_KIND,
+        "reviewer": "grabowski-self",
+        "review_mode": SELF_REVIEW_MODE,
+        "repo": state.get("repoName"),
+        "pr": pr_number,
+        "head_sha": head,
+        "diff_sha256": _normalize_sha256(diff_sha256),
+        "diff_reviewed": False,
+        "reviewed_files": _paths(pr),
+        "review_focus": list(REQUIRED_SELF_REVIEW_FOCUS),
+        "verdict": "PASS|NEEDS_CHANGE|BLOCK",
+        "review_iterations": [],
+        "all_findings_triaged": False,
+        "findings": [],
+        "material_findings_remaining": None,
+        "material_findings_after_first_review": None,
+        "stop_reason": "clean_pass|diminishing_returns|residual_only_with_reason|small_trivial_change",
+        "residual_risk": {"accepted": False, "reason": ""},
+    }
+    output_path.write_text(json.dumps(template, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "schema_version": 1,
+        "kind": "self_review_template",
+        "path": str(output_path),
+        "repo": state.get("repoName"),
+        "pr": pr_number,
+        "head_sha": head,
+        "diff_sha256": _normalize_sha256(diff_sha256),
+        "required_review_focus": list(REQUIRED_SELF_REVIEW_FOCUS),
+    }
+
+
 def evaluate_review_gate(
     state: dict[str, Any],
     *,
@@ -1000,6 +1103,7 @@ def evaluate_review_gate(
             failures.append("PR headRefOid is missing")
         elif self_review.get("head_sha") != head_sha:
             failures.append("self-review head_sha mismatch")
+        failures.extend(_self_review_workflow_failures(pr, self_review))
         if self_review.get("diff_reviewed") is not True:
             failures.append("self-review does not assert diff_reviewed=true")
         failures.extend(_self_review_diff_failures(state, self_review))
@@ -1099,6 +1203,8 @@ def evaluate_review_gate(
             "claude_required": claude_required,
             "self_review_diff_bound": isinstance(self_review, dict)
             and _self_review_diff_bound(state, self_review),
+            "self_review_workflow_valid": isinstance(self_review, dict)
+            and not _self_review_workflow_failures(pr, self_review),
             "self_review_diff_bypass_used": state.get("pr_diff_bypass") is True,
             "review_item_count": len(all_review_items),
             "current_head_review_item_count": len(items),
@@ -1128,6 +1234,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--claude-evidence")
     parser.add_argument("--external-review-evidence")
     parser.add_argument("--write-external-review-packet")
+    parser.add_argument("--write-self-review-template")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     repo = args.repo.resolve()
@@ -1137,6 +1244,12 @@ def main(argv: list[str] | None = None) -> int:
         external_review_evidence = load_external_review_evidence(resolve_inside_repo(repo, args.external_review_evidence, label="external review evidence"))
         state = load_pr_state(repo, args.pr)
         packet = None
+        self_review_template = None
+        if args.write_self_review_template:
+            template_path = resolve_inside_repo(repo, args.write_self_review_template, label="self-review template")
+            if template_path is None:
+                raise GateInputError("self-review template path is required")
+            self_review_template = write_self_review_template(template_path, state)
         if args.write_external_review_packet:
             packet_dir = resolve_inside_repo(repo, args.write_external_review_packet, label="external review packet")
             if packet_dir is None:
@@ -1148,6 +1261,8 @@ def main(argv: list[str] | None = None) -> int:
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
         )
+        if self_review_template is not None:
+            result["self_review_template"] = self_review_template
         if packet is not None:
             result["external_review_packet"] = packet
     except Exception as exc:

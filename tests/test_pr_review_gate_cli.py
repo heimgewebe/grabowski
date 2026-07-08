@@ -21,6 +21,7 @@ def _load_gate():
 
 
 pr_review_gate = _load_gate()
+REVIEW_FOCUS = ["correctness", "regression_risk", "tests", "security", "integration"]
 
 
 class PrReviewGateCliTests(unittest.TestCase):
@@ -56,7 +57,12 @@ class PrReviewGateCliTests(unittest.TestCase):
             "reviewComments": [],
         }
         review = {
+            "kind": "grabowski_self_review",
+            "review_mode": "critical_diff_review",
+            "verdict": "PASS",
             "head_sha": "a" * 40,
+            "reviewed_files": ["docs/low_risk_note.md"],
+            "review_focus": REVIEW_FOCUS,
             "diff_reviewed": True,
             "all_findings_triaged": True,
             "review_iterations": [{"n": 1, "summary": "reviewed", "material_findings": 0}],
@@ -128,7 +134,12 @@ class PrReviewGateCliTests(unittest.TestCase):
             "reviewComments": [],
         }
         review = {
+            "kind": "grabowski_self_review",
+            "review_mode": "critical_diff_review",
+            "verdict": "PASS",
             "head_sha": head,
+            "reviewed_files": ["src/grabowski_mcp.py"],
+            "review_focus": REVIEW_FOCUS,
             "diff_reviewed": True,
             "all_findings_triaged": True,
             "review_iterations": [{"n": 1, "summary": "reviewed", "material_findings": 0}],
@@ -173,7 +184,12 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
     def _review(self, **overrides) -> dict:
         head = "a" * 40
         payload = {
+            "kind": "grabowski_self_review",
+            "review_mode": "critical_diff_review",
+            "verdict": "PASS",
             "head_sha": head,
+            "reviewed_files": ["docs/low_risk_note.md"],
+            "review_focus": REVIEW_FOCUS,
             "diff_reviewed": True,
             "all_findings_triaged": True,
             "review_iterations": [{"n": 1, "summary": "reviewed", "material_findings": 0}],
@@ -233,6 +249,45 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         )
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("finding 0 is not terminally triaged", result["failures"])
+
+
+    def test_self_review_workflow_metadata_is_required(self) -> None:
+        review = self._review()
+        review.pop("kind")
+        result = pr_review_gate.evaluate_review_gate(self._state(), self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review kind must be grabowski_self_review", result["failures"])
+        self.assertFalse(result["review_sources"]["self_review_workflow_valid"])
+
+    def test_self_review_non_pass_verdict_blocks(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(verdict="NEEDS_CHANGE"),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("self-review verdict is NEEDS_CHANGE, not PASS", result["failures"])
+
+    def test_self_review_must_cover_current_pr_files(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(reviewed_files=["README.md"]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn(
+            "self-review reviewed_files does not cover PR file(s): docs/low_risk_note.md",
+            result["failures"],
+        )
+
+    def test_self_review_focus_must_cover_required_axes(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            self._state(),
+            self_review=self._review(review_focus=["correctness", "tests"]),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn(
+            "self-review review_focus missing required item(s): regression_risk, security, integration",
+            result["failures"],
+        )
 
     def test_claude_evidence_repo_mismatch_blocks(self) -> None:
         result = pr_review_gate.evaluate_review_gate(

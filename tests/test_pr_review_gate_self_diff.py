@@ -57,7 +57,12 @@ def _state(*, diff_sha: str | None = DIFF_SHA, diff_error: str | None = None) ->
 
 def _self_review(*, diff_sha: str | None = DIFF_SHA) -> dict[str, object]:
     review: dict[str, object] = {
+        "kind": "grabowski_self_review",
+        "review_mode": "critical_diff_review",
+        "verdict": "PASS",
         "head_sha": HEAD,
+        "reviewed_files": ["docs/example.md"],
+        "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
         "diff_reviewed": True,
         "all_findings_triaged": True,
         "review_iterations": [{"n": 1, "summary": "current diff reviewed", "material_findings": 0}],
