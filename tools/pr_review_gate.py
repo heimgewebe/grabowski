@@ -15,6 +15,8 @@ STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason"
 STRONG_SEVERITIES = {"p0", "p1", "high", "critical"}
 BLOCKING_REVIEW_STATES = {"CHANGES_REQUESTED", "DISMISSED", "PENDING"}
 EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
+PASS_CHECK_BUCKETS = {"pass"}
+NON_BLOCKING_OPTIONAL_SKIPPED_CHECK_NAMES = {"claude"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
@@ -1044,18 +1046,38 @@ def evaluate_review_gate(
 
     if not checks:
         failures.append("no status checks observed")
-    observed_expected_checks = {
-        check.get("name")
-        for check in checks
-        if isinstance(check, dict) and check.get("name") in EXPECTED_CHECK_NAMES
+    expected_check_buckets_by_name: dict[str, list[str | None]] = {
+        name: [] for name in EXPECTED_CHECK_NAMES
     }
-    missing_expected_checks = [name for name in EXPECTED_CHECK_NAMES if name not in observed_expected_checks]
-    if missing_expected_checks:
-        failures.append(f"expected check(s) missing: {', '.join(missing_expected_checks)}")
-    blocking_checks = [
-        check for check in checks
-        if isinstance(check, dict) and check.get("bucket") != "pass"
+    blocking_checks = []
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        name = check.get("name")
+        bucket = check.get("bucket")
+        if name in EXPECTED_CHECK_NAMES:
+            expected_check_buckets_by_name[name].append(bucket)
+            if bucket not in PASS_CHECK_BUCKETS:
+                blocking_checks.append(check)
+            continue
+        if (
+            bucket not in PASS_CHECK_BUCKETS
+            and not (
+                bucket == "skipping"
+                and name in NON_BLOCKING_OPTIONAL_SKIPPED_CHECK_NAMES
+            )
+        ):
+            blocking_checks.append(check)
+
+    missing_expected_checks = [
+        name
+        for name, buckets in expected_check_buckets_by_name.items()
+        if not buckets or not all(bucket in PASS_CHECK_BUCKETS for bucket in buckets)
     ]
+    if missing_expected_checks:
+        failures.append(
+            f"expected check(s) missing or non-green: {', '.join(missing_expected_checks)}"
+        )
     if blocking_checks:
         failures.append(f"{len(blocking_checks)} non-green check(s)")
 

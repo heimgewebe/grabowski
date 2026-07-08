@@ -8,6 +8,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 HEAD = "a" * 40
 BASE = "b" * 40
+DIFF_SHA = "c" * 64
 
 
 def _load_gate():
@@ -28,6 +29,7 @@ pr_review_gate = _load_gate()
 def _self_review() -> dict:
     return {
         "head_sha": HEAD,
+        "diff_sha256": DIFF_SHA,
         "diff_reviewed": True,
         "all_findings_triaged": True,
         "review_iterations": [{"n": 1, "summary": "reviewed", "material_findings": 0}],
@@ -58,6 +60,7 @@ def _state(*, actor: str = "chatgpt-codex-connector", merge_state: str = "CLEAN"
         },
         "checks": [{"bucket": "pass", "name": "validate (3.10)"}, {"bucket": "pass", "name": "validate (3.12)"}],
         "reviewComments": [],
+        "pr_diff_sha256": DIFF_SHA,
     }
 
 
@@ -72,6 +75,74 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         result = pr_review_gate.evaluate_review_gate(_state(mergeable="UNKNOWN"), self_review=_self_review())
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("GitHub mergeable is UNKNOWN, not MERGEABLE", result["failures"])
+
+
+    def test_optional_skipped_check_does_not_block_when_expected_checks_pass(self) -> None:
+        state = _state()
+        state["checks"].append({"bucket": "skipping", "name": "claude"})
+
+        result = pr_review_gate.evaluate_review_gate(state, self_review=_self_review())
+
+        self.assertEqual(result["verdict"], "PASS")
+
+    def test_skipped_expected_check_blocks(self) -> None:
+        state = _state()
+        state["checks"] = [
+            {"bucket": "skipping", "name": "validate (3.10)"},
+            {"bucket": "pass", "name": "validate (3.12)"},
+        ]
+
+        result = pr_review_gate.evaluate_review_gate(state, self_review=_self_review())
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn(
+            "expected check(s) missing or non-green: validate (3.10)",
+            result["failures"],
+        )
+
+    def test_optional_failed_check_still_blocks(self) -> None:
+        state = _state()
+        state["checks"].append({"bucket": "fail", "name": "claude"})
+
+        result = pr_review_gate.evaluate_review_gate(state, self_review=_self_review())
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("1 non-green check(s)", result["failures"])
+
+    def test_unknown_skipped_check_still_blocks(self) -> None:
+        state = _state()
+        state["checks"].append({"bucket": "skipping", "name": "unknown-required"})
+
+        result = pr_review_gate.evaluate_review_gate(state, self_review=_self_review())
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("1 non-green check(s)", result["failures"])
+
+    def test_non_green_duplicate_expected_check_blocks(self) -> None:
+        state = _state()
+        state["checks"].append({"bucket": "fail", "name": "validate (3.10)"})
+
+        result = pr_review_gate.evaluate_review_gate(state, self_review=_self_review())
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn(
+            "expected check(s) missing or non-green: validate (3.10)",
+            result["failures"],
+        )
+        self.assertIn("1 non-green check(s)", result["failures"])
+
+    def test_skipped_duplicate_expected_check_blocks(self) -> None:
+        state = _state()
+        state["checks"].append({"bucket": "skipping", "name": "validate (3.12)"})
+
+        result = pr_review_gate.evaluate_review_gate(state, self_review=_self_review())
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn(
+            "expected check(s) missing or non-green: validate (3.12)",
+            result["failures"],
+        )
+        self.assertIn("1 non-green check(s)", result["failures"])
 
     def test_untrusted_codex_substring_actor_does_not_satisfy_explicit_codex_requirement(self) -> None:
         state = _state(actor="friendly-codex-bot")
