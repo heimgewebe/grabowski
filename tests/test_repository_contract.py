@@ -116,7 +116,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 97)
+        self.assertEqual(len(tools), 98)
         legacy_tools = {
             "grabowski_status",
             "grabowski_context",
@@ -161,11 +161,12 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("grabowski_recovery_server_probe", tools)
         self.assertIn("grabowski_friction_record", tools)
         self.assertIn("grabowski_friction_summary", tools)
+        self.assertIn("grabowski_operator_recall_export", tools)
         supporting = {item["module"]: item["source"] for item in contract["supporting_sources"]}
         self.assertEqual(supporting["grabowski_operator_core"], "src/grabowski_operator.py")
         self.assertEqual(supporting["grabowski_read_surface"], "src/grabowski_read_surface.py")
         self.assertEqual(supporting["grabowski_self_deploy"], "src/grabowski_self_deploy.py")
-        for module in ("grabowski_mcp", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_tasks", "grabowski_recovery", "grabowski_friction"):
+        for module in ("grabowski_mcp", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_tasks", "grabowski_recovery", "grabowski_friction", "grabowski_recall"):
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
 

@@ -482,7 +482,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             for item in status["capability_requirements"]["missing_enabled_requirements"]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 97)
+        self.assertEqual(summary["registered_tool_requirements"], 98)
         self.assertEqual(missing["grabowski_remove_path"], ["file_delete"])
         self.assertEqual(missing["grabowski_restore_removed_path"], ["file_delete"])
         self.assertEqual(missing["rlens_bundle_discover"], ["bundle_registry"])

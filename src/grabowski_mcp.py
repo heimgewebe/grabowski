@@ -168,6 +168,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     'grabowski_recovery_server_probe': ('file_write', 'secret_use', 'terminal_execute'),
     'grabowski_friction_record': ('friction_record',),
     'grabowski_friction_summary': (),
+    'grabowski_operator_recall_export': (),
     'grabowski_resource_acquire': ('resource_lease',),
     'grabowski_resource_renew': ('resource_lease',),
     'grabowski_resource_release': ('resource_lease',),
