@@ -86,6 +86,166 @@ ALL_CAPABILITIES = (
     + OPERATOR_CAPABILITIES
     + RESERVED_DISABLED_CAPABILITIES
 )
+
+TOOL_CAPABILITY_REQUIREMENTS = {
+    'grabowski_status': (),
+    'grabowski_context': (),
+    'grip_list': ('file_read',),
+    'grip_run': ('terminal_execute',),
+    'grabowski_list_directory': ('file_read',),
+    'grabowski_stat': ('file_read',),
+    'grabowski_read_text': ('file_read',),
+    'grabowski_secret_inspect': ('secret_inspect',),
+    'grabowski_secret_reveal': ('secret_reveal',),
+    'grabowski_secret_use': ('secret_use',),
+    'grabowski_secret_export': ('secret_export',),
+    'grabowski_browser_profile_read': ('browser_profile_read',),
+    'grabowski_create_text': ('file_write',),
+    'grabowski_replace_text': ('file_write',),
+    'grabowski_remove_path': ('file_delete',),
+    'grabowski_restore_removed_path': ('file_delete',),
+    'grabowski_destroy_path': ('file_destroy',),
+    'grabowski_rollback_text': ('rollback_text',),
+    'grabowski_verify_audit': ('audit_verify',),
+    'latest_complete_bundles': ('bundle_registry',),
+    'rlens_bundle_discover': ('bundle_registry',),
+    'rlens_bundle_status': ('bundle_registry',),
+    'rlens_freshness_check': ('bundle_registry',),
+    'rlens_preflight': ('bundle_registry',),
+    'rlens_query': ('bundle_registry',),
+    'rlens_query_existing_index': ('bundle_registry',),
+    'rlens_range_get': ('bundle_registry',),
+    'rlens_context_pack': ('bundle_registry',),
+    'grabowski_runtime_health': (),
+    'grabowski_deployment_identity': (),
+    'grabowski_contract_drift': (),
+    'grabowski_checkout_summary': (),
+    'grabowski_git_status': (),
+    'grabowski_git_diff': (),
+    'grabowski_git_log': (),
+    'grabowski_git_show': (),
+    'grabowski_github_pr_view': ('github_cli',),
+    'grabowski_github_checks': ('github_cli',),
+    'grabowski_service_status': ('user_service_control',),
+    'grabowski_service_logs': ('user_service_control',),
+    'grabowski_runtime_deploy_schedule': ('durable_job', 'git_cli'),
+    'grabowski_terminal_run': ('terminal_execute',),
+    'grabowski_job_start': ('durable_job',),
+    'grabowski_job_status': ('durable_job',),
+    'grabowski_job_logs': ('durable_job',),
+    'grabowski_job_cancel': ('durable_job',),
+    'grabowski_git': ('git_cli',),
+    'grabowski_git_branch': ('git_cli',),
+    'grabowski_checkout_inventory': ('git_cli',),
+    'grabowski_checkout_retain': ('git_cli', 'resource_lease'),
+    'grabowski_checkout_archive': ('git_cli', 'resource_lease'),
+    'grabowski_checkout_cleanup': ('git_cli', 'resource_lease'),
+    'grabowski_github': ('github_cli',),
+    'grabowski_user_service': ('user_service_control',),
+    'grabowski_tmux_list': ('tmux_interaction',),
+    'grabowski_tmux_capture': ('tmux_interaction',),
+    'grabowski_tmux_send': ('tmux_interaction',),
+    'grabowski_process_list': ('process_inspect',),
+    'grabowski_process_signal': ('process_signal',),
+    'grabowski_ports': ('port_inspect',),
+    'grabowski_privileged_action_reference': ('privileged_reference',),
+    'grabowski_fleet_list': ('terminal_execute',),
+    'grabowski_fleet_run': ('terminal_execute',),
+    'grabowski_operation_list': ('terminal_execute',),
+    'grabowski_operation_plan': ('terminal_execute',),
+    'grabowski_operation_run': ('terminal_execute',),
+    'grabowski_privileged_broker_status': ('privileged_reference',),
+    'grabowski_task_start': ('durable_job',),
+    'grabowski_task_status': ('durable_job',),
+    'grabowski_task_logs': ('durable_job',),
+    'grabowski_task_cancel': ('durable_job',),
+    'grabowski_task_resume': ('durable_job',),
+    'grabowski_task_list': ('durable_job',),
+    'grabowski_task_reconcile_check': ('durable_job',),
+    'grabowski_task_reconcile_refresh': ('durable_job',),
+    'grabowski_task_reconcile_resume': ('durable_job',),
+    'grabowski_recovery_status': ('audit_verify',),
+    'grabowski_recovery_server_probe': ('file_write', 'secret_use', 'terminal_execute'),
+    'grabowski_friction_record': ('friction_record',),
+    'grabowski_friction_summary': (),
+    'grabowski_resource_acquire': ('resource_lease',),
+    'grabowski_resource_renew': ('resource_lease',),
+    'grabowski_resource_release': ('resource_lease',),
+    'grabowski_resource_inspect': ('resource_lease',),
+    'grabowski_resource_list': ('resource_lease',),
+    'grabowski_task_reconcile': ('durable_job',),
+    'grabowski_artifact_stat': ('artifact_transfer',),
+    'grabowski_artifact_push': ('artifact_transfer',),
+    'grabowski_artifact_pull': ('artifact_transfer',),
+    'grabowski_browser_worker_start': ('browser_worker',),
+    'grabowski_browser_worker_status': ('browser_worker',),
+    'grabowski_browser_worker_stop': ('browser_worker',),
+    'grabowski_browser_worker_list': ('browser_worker',),
+    'grabowski_gui_worker_start': ('gui_worker',),
+    'grabowski_gui_worker_status': ('gui_worker',),
+    'grabowski_gui_worker_stop': ('gui_worker',),
+    'grabowski_gui_worker_list': ('gui_worker',),
+}
+
+OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
+    'grabowski_github_pr_view',
+    'grabowski_github_checks',
+    'grabowski_service_status',
+    'grabowski_service_logs',
+    'grabowski_runtime_deploy_schedule',
+    'grabowski_terminal_run',
+    'grabowski_job_start',
+    'grabowski_job_status',
+    'grabowski_job_logs',
+    'grabowski_job_cancel',
+    'grabowski_git',
+    'grabowski_git_branch',
+    'grabowski_checkout_inventory',
+    'grabowski_checkout_retain',
+    'grabowski_checkout_archive',
+    'grabowski_checkout_cleanup',
+    'grabowski_github',
+    'grabowski_user_service',
+    'grabowski_tmux_list',
+    'grabowski_tmux_capture',
+    'grabowski_tmux_send',
+    'grabowski_process_list',
+    'grabowski_process_signal',
+    'grabowski_ports',
+    'grabowski_privileged_action_reference',
+    'grabowski_fleet_list',
+    'grabowski_fleet_run',
+    'grabowski_operation_list',
+    'grabowski_operation_plan',
+    'grabowski_operation_run',
+    'grabowski_privileged_broker_status',
+    'grabowski_task_start',
+    'grabowski_task_status',
+    'grabowski_task_logs',
+    'grabowski_task_cancel',
+    'grabowski_task_resume',
+    'grabowski_task_list',
+    'grabowski_task_reconcile_check',
+    'grabowski_task_reconcile_refresh',
+    'grabowski_task_reconcile_resume',
+    'grabowski_resource_acquire',
+    'grabowski_resource_renew',
+    'grabowski_resource_release',
+    'grabowski_resource_inspect',
+    'grabowski_resource_list',
+    'grabowski_task_reconcile',
+    'grabowski_artifact_stat',
+    'grabowski_artifact_push',
+    'grabowski_artifact_pull',
+    'grabowski_browser_worker_start',
+    'grabowski_browser_worker_status',
+    'grabowski_browser_worker_stop',
+    'grabowski_browser_worker_list',
+    'grabowski_gui_worker_start',
+    'grabowski_gui_worker_status',
+    'grabowski_gui_worker_stop',
+    'grabowski_gui_worker_list',
+}
 DEFAULT_SECRET_USE_TIMEOUT_SECONDS = 30
 DEFAULT_SECRET_USE_OUTPUT_BYTES = 250_000
 SECRET_FD_PLACEHOLDER = "{SECRET_FD_PATH}"
@@ -614,6 +774,65 @@ def _path_is_browser_profile(path: Path, policy: dict[str, Any] | None = None) -
 
 def _path_is_sensitive(path: Path, policy: dict[str, Any] | None = None) -> bool:
     return _path_is_secret(path, policy) or _path_is_browser_profile(path, policy)
+
+
+def _effective_operator_capabilities(policy: dict[str, Any]) -> set[str]:
+    forbidden = set(policy.get("forbidden_capabilities", []))
+    profiles = policy.get("profiles")
+    if isinstance(profiles, dict):
+        profile = _active_profile(policy)
+        raw = profile.get("capabilities", [])
+        capabilities = {item for item in raw if isinstance(item, str)}
+    else:
+        capabilities = set(OPERATOR_CAPABILITIES)
+    return {
+        capability
+        for capability in capabilities
+        if capability in OPERATOR_CAPABILITIES and capability not in forbidden
+    }
+
+
+def _effective_capabilities_for_tool(tool: str, policy: dict[str, Any]) -> set[str]:
+    effective = set(_effective_capabilities(policy))
+    if tool in OPERATOR_CAPABILITY_REQUIREMENT_TOOLS:
+        effective |= _effective_operator_capabilities(policy)
+    return effective
+
+
+def _capability_requirement_summary(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = _load_policy() if policy is None else policy
+    missing: list[dict[str, Any]] = []
+    guarded = {
+        tool: required
+        for tool, required in TOOL_CAPABILITY_REQUIREMENTS.items()
+        if required
+    }
+    for tool, required in sorted(guarded.items()):
+        effective = _effective_capabilities_for_tool(tool, source)
+        missing_capabilities = [capability for capability in required if capability not in effective]
+        if missing_capabilities:
+            missing.append({
+                "tool": tool,
+                "missing_capabilities": missing_capabilities,
+            })
+    return {
+        "known_tool_requirements": len(TOOL_CAPABILITY_REQUIREMENTS),
+        "registered_tool_requirements": len(TOOL_CAPABILITY_REQUIREMENTS),
+        "guarded_tool_requirements": len(guarded),
+        "operator_semantics_tool_count": len(OPERATOR_CAPABILITY_REQUIREMENT_TOOLS),
+        "unguarded_registered_tools": [
+            tool
+            for tool, required in sorted(TOOL_CAPABILITY_REQUIREMENTS.items())
+            if not required
+        ],
+        "missing_enabled_requirements": missing,
+        "missing_count": len(missing),
+        "does_not_establish": [
+            "tool_behavior_correctness",
+            "successful_execution",
+            "runtime_client_snapshot_freshness",
+        ],
+    }
 
 
 def _require_capability(capability: str) -> None:
@@ -2543,6 +2762,7 @@ def grabowski_status() -> dict[str, Any]:
         "deployment": _deployment_metadata(),
         "operating_protocol": _operator_relay_protocol(),
         "tool_contract": _runtime_tool_contract_summary(),
+        "capability_requirements": _capability_requirement_summary(policy),
         "forbidden_capabilities": policy.get("forbidden_capabilities", []),
         "kill_switch": _kill_switch_state(),
         "audit": _verify_audit_log(AUDIT_LOG),

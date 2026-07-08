@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import importlib.util
@@ -73,6 +74,69 @@ def _state_text(root: Path) -> str:
         if path.is_file():
             chunks.append(path.read_text(encoding="utf-8", errors="replace"))
     return "\n".join(chunks)
+
+
+def _static_tool_guard_requirements() -> tuple[dict[str, tuple[str, ...]], set[str]]:
+    guard_names = {
+        "_require_capability",
+        "_require_mutations_enabled",
+        "_require_operator_capability",
+        "_require_operator_mutation",
+    }
+    operator_guard_names = {
+        "_require_operator_capability",
+        "_require_operator_mutation",
+    }
+    requirements: dict[str, tuple[str, ...]] = {}
+    operator_tools: set[str] = set()
+    for path in sorted((ROOT / "src").glob("grabowski_*.py")):
+        module = ast.parse(path.read_text(encoding="utf-8"))
+        for node in module.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            tool_name = None
+            for decorator in node.decorator_list:
+                if not (
+                    isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "tool"
+                ):
+                    continue
+                for keyword in decorator.keywords:
+                    if (
+                        keyword.arg == "name"
+                        and isinstance(keyword.value, ast.Constant)
+                        and isinstance(keyword.value.value, str)
+                    ):
+                        tool_name = keyword.value.value
+            if tool_name is None:
+                continue
+            capabilities = []
+            has_operator_guard = False
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Call):
+                    continue
+                function = child.func
+                function_name = (
+                    function.id
+                    if isinstance(function, ast.Name)
+                    else function.attr
+                    if isinstance(function, ast.Attribute)
+                    else None
+                )
+                if (
+                    function_name in guard_names
+                    and child.args
+                    and isinstance(child.args[0], ast.Constant)
+                    and isinstance(child.args[0].value, str)
+                ):
+                    capabilities.append(child.args[0].value)
+                    if function_name in operator_guard_names:
+                        has_operator_guard = True
+            requirements[tool_name] = tuple(sorted(set(capabilities)))
+            if has_operator_guard:
+                operator_tools.add(tool_name)
+    return requirements, operator_tools
 
 
 class OperatorV2RuntimeTests(unittest.TestCase):
@@ -347,6 +411,84 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     grabowski_mcp.grabowski_verify_audit()["v2_records"],
                     2,
                 )
+
+    def test_tool_capability_requirements_cover_runtime_contract(self) -> None:
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        expected_tools = set(contract["expected_tools"])
+
+        self.assertEqual(set(grabowski_mcp.TOOL_CAPABILITY_REQUIREMENTS), expected_tools)
+
+    def test_tool_capability_requirements_reference_known_capabilities(self) -> None:
+        all_capabilities = set(grabowski_mcp.ALL_CAPABILITIES)
+        used_capabilities = {
+            capability
+            for required in grabowski_mcp.TOOL_CAPABILITY_REQUIREMENTS.values()
+            for capability in required
+        }
+
+        self.assertTrue(used_capabilities.issubset(all_capabilities))
+
+    def test_tool_capability_requirements_match_static_tool_guards(self) -> None:
+        requirements, operator_tools = _static_tool_guard_requirements()
+
+        self.assertEqual(grabowski_mcp.TOOL_CAPABILITY_REQUIREMENTS, requirements)
+        self.assertEqual(
+            grabowski_mcp.OPERATOR_CAPABILITY_REQUIREMENT_TOOLS,
+            operator_tools,
+        )
+
+    def test_legacy_operator_capability_semantics_are_mirrored(self) -> None:
+        policy = {
+            "version": 1,
+            "mode": "legacy-test",
+            "read_roots": [],
+            "write_roots": [],
+            "forbidden_capabilities": [],
+        }
+
+        missing = {
+            item["tool"]: item["missing_capabilities"]
+            for item in grabowski_mcp._capability_requirement_summary(policy)[
+                "missing_enabled_requirements"
+            ]
+        }
+
+        self.assertNotIn("grabowski_terminal_run", missing)
+        self.assertNotIn("grabowski_git", missing)
+        self.assertIn("grip_run", missing)
+        self.assertEqual(missing["grip_run"], ["terminal_execute"])
+
+    def test_status_reports_registered_tool_missing_required_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capabilities = [
+                "file_read",
+                "file_write",
+                "file_destroy",
+                "audit_verify",
+                "rollback_text",
+            ]
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root,
+                capabilities=capabilities,
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                status = grabowski_mcp.grabowski_status()
+
+        missing = {
+            item["tool"]: item["missing_capabilities"]
+            for item in status["capability_requirements"]["missing_enabled_requirements"]
+        }
+        summary = status["capability_requirements"]
+        self.assertEqual(summary["registered_tool_requirements"], 97)
+        self.assertEqual(missing["grabowski_remove_path"], ["file_delete"])
+        self.assertEqual(missing["grabowski_restore_removed_path"], ["file_delete"])
+        self.assertEqual(missing["rlens_bundle_discover"], ["bundle_registry"])
+        self.assertEqual(missing["grip_run"], ["terminal_execute"])
+        self.assertNotIn("grabowski_destroy_path", missing)
+        self.assertNotIn("grabowski_friction_summary", missing)
 
     def test_reversible_remove_quarantines_and_restores_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
