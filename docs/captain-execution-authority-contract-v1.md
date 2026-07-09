@@ -2,6 +2,8 @@
 
 This contract separates Captain authority terms that were previously easy to blur in receipts and operator discussion.
 
+Runtime source of truth: `src/grabowski_grips.py::_captain_authority_contract`. The generated output also exposes `required_gates` from `CAPTAIN_GATE_IDS` and `executable_action_allowlist` from `CAPTAIN_EXECUTABLE_ACTIONS` to reduce drift.
+
 ## Terms
 
 - **Evaluation authority** means permission to evaluate Captain evidence gates and emit a receipt. `captain-preflight` has only this authority and never mutates.

@@ -1932,7 +1932,13 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("execution_authority", execution["evidence_field"])
         self.assertEqual("execution-authority-present", execution["gate"])
         self.assertIn("allow_execution=true", execution["required_with"])
+        self.assertEqual(list(grips.CAPTAIN_GATE_IDS), contract["required_gates"])
+        self.assertEqual(sorted(grips.CAPTAIN_EXECUTABLE_ACTIONS), contract["executable_action_allowlist"])
         self.assertIn("allow_execution alone is never sufficient", contract["non_claims"])
+
+    def test_captain_authority_contract_rejects_unknown_surface(self) -> None:
+        with self.assertRaises(ValueError):
+            grips._captain_authority_contract("captain-rnu")
 
     def test_captain_preflight_exposes_action_and_target_digests(self) -> None:
         result = self.run_captain(captain_parameters())
@@ -2018,6 +2024,23 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(captain_parameters(status_projection_source="  "))
 
         self.assertIn("status_projection_source_missing", result["output"]["blocked_reasons"])
+
+    def test_captain_run_without_allow_mutation_exposes_authority_contract(self) -> None:
+        result = grips.grip_run(
+            "captain-run",
+            captain_parameters(),
+            profile="captain",
+            command_runner=FakeGit(),
+            github_runner=FakeGh(),
+        )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("mutating grip requires allow_mutation=true", result["output"]["error"])
+        self.assertEqual("blocked", result["output"]["decision"])
+        self.assertIn("mutation_permission_missing", result["output"]["blocked_reasons"])
+        self.assertTrue(result["output"]["requires_allow_mutation"])
+        contract = result["output"]["authority_contract"]
+        self.assertEqual("captain-run", contract["surface"])
+        self.assertIn("execution_authority evidence alone is never sufficient", contract["non_claims"])
 
     def test_captain_run_exposes_execution_authority_contract_when_blocked(self) -> None:
         parameters = captain_parameters()

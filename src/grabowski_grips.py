@@ -257,6 +257,7 @@ CAPTAIN_GATE_IDS = (
 CAPTAIN_EXECUTABLE_ACTIONS = frozenset({"pr-merge"})
 CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY = "act_unless_irreversible_or_ambiguous"
 CAPTAIN_AUTHORITY_CONTRACT_VERSION = 1
+CAPTAIN_AUTHORITY_CONTRACT_SURFACES = frozenset({"captain-preflight", "captain-run"})
 CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT = 4096
 CAPTAIN_POST_MERGE_VERIFY_ATTEMPTS = 3
 CAPTAIN_POST_MERGE_VERIFY_DELAYS_SECONDS = (0.5, 1.0)
@@ -301,9 +302,13 @@ CAPTAIN_NO_MUTATION_REASON = (
 
 
 def _captain_authority_contract(surface: str) -> dict[str, Any]:
+    if surface not in CAPTAIN_AUTHORITY_CONTRACT_SURFACES:
+        raise ValueError(f"unknown Captain authority contract surface: {surface}")
     return {
         "schema_version": CAPTAIN_AUTHORITY_CONTRACT_VERSION,
         "surface": surface,
+        "required_gates": list(CAPTAIN_GATE_IDS),
+        "executable_action_allowlist": sorted(CAPTAIN_EXECUTABLE_ACTIONS),
         "terms": {
             "evaluation_authority": {
                 "meaning": "permission to evaluate Captain evidence gates and emit a read-only receipt",
@@ -3178,12 +3183,15 @@ def run_grip(
         _check(receipt, "required_parameters", "pass", ", ".join(spec.required_parameters))
         if spec.effect == MUTATING and not allow_mutation:
             _check(receipt, "mutation_allowed", "fail", "allow_mutation is false")
-            return _finish(
-                receipt,
-                "blocked",
-                "preflight",
-                {"error": "mutating grip requires allow_mutation=true"},
-            )
+            output: dict[str, Any] = {
+                "error": "mutating grip requires allow_mutation=true",
+                "decision": "blocked",
+                "blocked_reasons": ["mutation_permission_missing"],
+                "requires_allow_mutation": True,
+            }
+            if spec.name == "captain-run":
+                output["authority_contract"] = _captain_authority_contract("captain-run")
+            return _finish(receipt, "blocked", "preflight", output)
         _check(receipt, "mutation_allowed", "pass", f"effect={spec.effect}")
         action = _RUNNERS[spec.runner]
         command = command_runner or _default_command_runner
