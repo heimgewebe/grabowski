@@ -113,7 +113,17 @@
         "bundle_registry",
         "process_inspect",
         "port_inspect"
-      ]
+      ],
+      "allowed_grips": [
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync"
+      ],
+      "max_risk_level": "low",
+      "forbidden_hosts": []
     },
     "maintain": {
       "description": "Conservative maintenance profile. Until tool-level read/write capability splits exist, it remains read-mostly and does not grant durable_job, resource_lease or git_cli.",
@@ -150,7 +160,17 @@
         "bundle_registry",
         "process_inspect",
         "port_inspect"
-      ]
+      ],
+      "allowed_grips": [
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync"
+      ],
+      "max_risk_level": "low",
+      "forbidden_hosts": []
     },
     "mutate": {
       "description": "Bounded mutation profile for repository and operator state changes with audit and preconditions. It excludes terminal, secrets, tmux, process signals and irreversible destroy.",
@@ -199,7 +219,20 @@
         "gui_worker",
         "process_inspect",
         "port_inspect"
-      ]
+      ],
+      "allowed_grips": [
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync",
+        "mechanic-loop",
+        "branch-publish",
+        "pr-create-or-update"
+      ],
+      "max_risk_level": "medium",
+      "forbidden_hosts": []
     },
     "break-glass": {
       "description": "Explicit high-risk profile for terminal execution, secret reveal/use/export, browser profiles, tmux, process signals and destructive file operations.",
@@ -265,7 +298,17 @@
         "file_move",
         "chmod",
         "chown"
-      ]
+      ],
+      "allowed_grips": [
+        "*"
+      ],
+      "max_risk_level": "high",
+      "forbidden_hosts": []
     }
-  }
+  },
+  "allowed_grips": [
+    "*"
+  ],
+  "forbidden_hosts": [],
+  "max_risk_level": "high"
 }

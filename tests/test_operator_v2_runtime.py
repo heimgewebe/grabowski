@@ -16,6 +16,9 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 
 class _FakeFastMCP:
@@ -191,6 +194,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     "forbidden_components": [".git"],
                     "forbidden_file_patterns": [".env", "*.key"],
                     "forbidden_capabilities": [],
+                    "allowed_grips": ["*"],
+                    "forbidden_hosts": [],
+                    "max_risk_level": "high",
                     "profiles": {
                         "test": {
                             "description": "isolated test profile",
@@ -206,6 +212,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                             "max_secret_use_output_bytes": 250_000,
                             "max_secret_use_seconds": 30,
                             "capabilities": caps,
+                            "allowed_grips": ["*"],
+                            "forbidden_hosts": [],
+                            "max_risk_level": "high",
                         }
                     },
                 },
@@ -305,6 +314,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         "browser_profile_roots": [],
                         "secret_export_roots": [],
                         "capabilities": ["file_read"],
+                        "allowed_grips": ["repo-orient"],
+                        "forbidden_hosts": [],
+                        "max_risk_level": "low",
                     }
                 },
                 "active_profile": "strict",
@@ -322,6 +334,18 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 ({"max_read_bytes": 0}, "Invalid access policy limit"),
                 ({"active_profile": "missing"}, "Active access profile is not defined"),
                 (
+                    {"profiles": {"strict": {**strict["profiles"]["strict"], "allowed_grips": ["not-a-grip"]}}},
+                    "Unknown allowed grips",
+                ),
+                (
+                    {"profiles": {"strict": {**strict["profiles"]["strict"], "forbidden_hosts": ["bad/host"]}}},
+                    "bare hostnames",
+                ),
+                (
+                    {"profiles": {"strict": {**strict["profiles"]["strict"], "max_risk_level": "root"}}},
+                    "max_risk_level",
+                ),
+                (
                     {"profiles": {"strict": {**strict["profiles"]["strict"], "forbid_symlinks": False}}},
                     "Unknown access profile fields",
                 ),
@@ -337,6 +361,110 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             with patch.object(grabowski_mcp, "POLICY_PATH", policy):
                 with self.assertRaisesRegex(RuntimeError, "require version 2"):
                     grabowski_mcp._load_policy()
+
+    def test_session_profile_contract_and_grip_policy_are_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root,
+                capabilities=["file_read", "terminal_execute"],
+            )
+            policy = json.loads((root / "access.json").read_text(encoding="utf-8"))
+            profile = policy["profiles"]["test"]
+            profile["allowed_grips"] = ["repo-orient"]
+            profile["max_risk_level"] = "low"
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
+                grabowski_mcp, "_load_policy", return_value=policy
+            ):
+                contract = grabowski_mcp._session_profile_contract()
+                self.assertEqual(contract["read_roots"], [str(work)])
+                self.assertEqual(contract["write_roots"], [str(work)])
+                self.assertEqual(contract["allowed_grips"], ["repo-orient"])
+                self.assertEqual(contract["forbidden_hosts"], [])
+                self.assertEqual(contract["max_risk_level"], "low")
+
+                allowed = grabowski_mcp._session_grip_policy_decision(
+                    "repo-orient",
+                    {"repo": str(work)},
+                )
+                self.assertTrue(allowed["allowed"])
+                self.assertEqual(allowed["risk"], "low")
+
+                blocked_name = grabowski_mcp.grip_run(
+                    "branch-publish",
+                    {"repo": str(work), "branch": "x", "expected_head": "0" * 40},
+                    profile="operator",
+                    allow_mutation=True,
+                )
+                self.assertEqual(blocked_name["receipt"]["status"], "blocked")
+                self.assertIn("session profile blocks grip", blocked_name["output"]["error"])
+
+                blocked_high = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {"actions": []},
+                )
+                self.assertFalse(blocked_high["allowed_by_risk"])
+                self.assertFalse(blocked_high["escalation_valid"])
+
+    def test_high_risk_grip_requires_explicit_session_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root,
+                capabilities=["file_read", "terminal_execute"],
+            )
+            policy = json.loads((root / "access.json").read_text(encoding="utf-8"))
+            policy["profiles"]["test"]["allowed_grips"] = ["captain-run"]
+            policy["profiles"]["test"]["max_risk_level"] = "high"
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
+                grabowski_mcp, "_load_policy", return_value=policy
+            ):
+                missing = grabowski_mcp._session_grip_policy_decision("captain-run", {"actions": []})
+                self.assertFalse(missing["allowed"])
+                self.assertIn("session_escalation", missing["escalation_error"])
+
+                valid = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {
+                        "actions": [],
+                        "session_escalation": {
+                            "target": {"repo": "heimgewebe/grabowski"},
+                            "reason": "bounded test",
+                            "expires_at_unix": int(__import__("time").time()) + 60,
+                            "recovery": {"plan": "no mutation in this unit test"},
+                        },
+                    },
+                )
+                self.assertTrue(valid["allowed"])
+
+    def test_session_forbidden_hosts_block_operator_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root,
+                capabilities=["terminal_execute"],
+            )
+            policy = json.loads((root / "access.json").read_text(encoding="utf-8"))
+            policy["profiles"]["test"]["forbidden_hosts"] = ["prod.example"]
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
+                grabowski_mcp, "_load_policy", return_value=policy
+            ):
+                with self.assertRaisesRegex(PermissionError, "Forbidden host"):
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "prod.example", "hostname"])
+                with self.assertRaisesRegex(PermissionError, "Forbidden host"):
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(["curl", "https://prod.example/status"])
+
+    def test_write_outside_profile_scope_remains_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root,
+                capabilities=["file_read", "file_write", "audit_verify"],
+            )
+            outside = root / "outside.txt"
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                with self.assertRaisesRegex(PermissionError, "outside configured write roots"):
+                    grabowski_mcp.grabowski_create_text(str(outside), "blocked\n")
 
     def test_audit_chain_rejects_unhashed_record_after_v2_transition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -98,6 +98,11 @@ Lange Befehle laufen als transiente User-systemd-Units:
 
 Job-Metadaten sind dauerhafte Evidence, keine Erfolgsmeldung. Ein Job-Record enthält `job_id`, `owner`, `scope`, `started_at`, `expected_receipt`, `final_status` und `terminalization_evidence`. Vor erfolgreichem `systemd-run` gilt nur `launch_prepared`; nach angenommenem Launch gilt `launch_submitted`; Launch-Fehler bleiben als `launch_failed` sichtbar. `expected_receipt` beschreibt Nachweispfade und beweist weder Receipt-Existenz noch Job-Erfolg. `notify_on_done` ist in diesem Slice nur Metadaten: `delivery_enabled=false`, kein Versand, kein Polling und keine verdeckte Finalisierungsannahme. Fehlende oder fehlgeschlagene Terminalisierung bleibt über `grabowski_job_status` sichtbar.
 
+
+### Session capability profiles
+
+Access profiles attenuate a session beyond coarse capabilities. A profile declares `read_roots`, `write_roots`, `allowed_grips`, `forbidden_hosts` and `max_risk_level`. `grip_run` checks the active session profile before dispatch: low-risk read-only grips can be allowed while medium mutating grips or high-risk Captain grips remain blocked. High-risk grip execution additionally requires `session_escalation` with target, reason, expiry and recovery or irreversibility metadata. Operator argv validation rejects configured `forbidden_hosts` in command targets before execution. These checks do not establish host reachability, action safety or successful execution; they are preconditions.
+
 ## Git und GitHub
 
 `grabowski_git` führt Git mit explizitem Repo-Pfad aus.

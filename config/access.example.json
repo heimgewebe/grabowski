@@ -118,7 +118,12 @@
       ],
       "write_roots": [
         "${HOME}"
-      ]
+      ],
+      "allowed_grips": [
+        "*"
+      ],
+      "max_risk_level": "high",
+      "forbidden_hosts": []
     },
     "maintain": {
       "browser_profile_roots": [],
@@ -146,7 +151,17 @@
       "write_excluded_roots": [
         "${HOME}/repos/merges"
       ],
-      "write_roots": []
+      "write_roots": [],
+      "allowed_grips": [
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync"
+      ],
+      "max_risk_level": "low",
+      "forbidden_hosts": []
     },
     "mutate": {
       "browser_profile_roots": [],
@@ -187,7 +202,20 @@
       "write_roots": [
         "${HOME}/repos",
         "${HOME}/grabowski-workspace"
-      ]
+      ],
+      "allowed_grips": [
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync",
+        "mechanic-loop",
+        "branch-publish",
+        "pr-create-or-update"
+      ],
+      "max_risk_level": "medium",
+      "forbidden_hosts": []
     },
     "observe": {
       "browser_profile_roots": [],
@@ -215,7 +243,17 @@
       "write_excluded_roots": [
         "${HOME}/repos/merges"
       ],
-      "write_roots": []
+      "write_roots": [],
+      "allowed_grips": [
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync"
+      ],
+      "max_risk_level": "low",
+      "forbidden_hosts": []
     }
   },
   "read_roots": [
@@ -229,5 +267,10 @@
   "write_excluded_roots": [
     "${HOME}/repos/merges"
   ],
-  "write_roots": []
+  "write_roots": [],
+  "allowed_grips": [
+    "*"
+  ],
+  "forbidden_hosts": [],
+  "max_risk_level": "high"
 }

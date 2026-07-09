@@ -181,7 +181,10 @@
           "secret_roots",
           "browser_profile_roots",
           "secret_export_roots",
-          "capabilities"
+          "capabilities",
+          "allowed_grips",
+          "forbidden_hosts",
+          "max_risk_level"
         ],
         "properties": {
           "description": {
@@ -298,12 +301,60 @@
           },
           "trusted_owner": {
             "type": "boolean"
+          },
+          "allowed_grips": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "forbidden_hosts": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "max_risk_level": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
           }
         }
       }
     },
     "trusted_owner": {
       "type": "boolean"
+    },
+    "allowed_grips": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "forbidden_hosts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "max_risk_level": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
     }
   }
 }

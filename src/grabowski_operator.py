@@ -365,6 +365,10 @@ def _validate_argv(argv: list[str], *, cwd: Path | None = None) -> list[str]:
             f"{executable}"
         )
 
+    host_guard = getattr(base, "_reject_forbidden_hosts_in_argv", None)
+    if callable(host_guard):
+        host_guard(argv)
+
     working_directory = HOME if cwd is None else cwd
     if not trusted_owner:
         for item in argv:

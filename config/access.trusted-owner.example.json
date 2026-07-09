@@ -128,8 +128,18 @@
         "chmod",
         "chown"
       ],
-      "trusted_owner": true
+      "trusted_owner": true,
+      "allowed_grips": [
+        "*"
+      ],
+      "max_risk_level": "high",
+      "forbidden_hosts": []
     }
   },
-  "trusted_owner": true
+  "trusted_owner": true,
+  "allowed_grips": [
+    "*"
+  ],
+  "forbidden_hosts": [],
+  "max_risk_level": "high"
 }

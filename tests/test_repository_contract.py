@@ -224,10 +224,20 @@ class RepositoryContractTests(unittest.TestCase):
             set(policy["profiles"]),
             {"observe", "maintain", "mutate", "break-glass"},
         )
+        for profile in policy["profiles"].values():
+            self.assertIn("allowed_grips", profile)
+            self.assertIn("forbidden_hosts", profile)
+            self.assertIn("max_risk_level", profile)
+            self.assertIn(profile["max_risk_level"], {"low", "medium", "high"})
         observe_caps = set(policy["profiles"]["observe"]["capabilities"])
         maintain_caps = set(policy["profiles"]["maintain"]["capabilities"])
         mutate_caps = set(policy["profiles"]["mutate"]["capabilities"])
         break_glass_caps = set(policy["profiles"]["break-glass"]["capabilities"])
+        self.assertEqual(policy["profiles"]["observe"]["max_risk_level"], "low")
+        self.assertEqual(policy["profiles"]["mutate"]["max_risk_level"], "medium")
+        self.assertEqual(policy["profiles"]["break-glass"]["max_risk_level"], "high")
+        self.assertIn("repo-orient", policy["profiles"]["observe"]["allowed_grips"])
+        self.assertNotIn("captain-run", policy["profiles"]["mutate"]["allowed_grips"])
         for capability in ("file_read", "audit_verify", "bundle_registry"):
             self.assertIn(capability, observe_caps)
             self.assertIn(capability, maintain_caps)
@@ -314,6 +324,8 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("privileged_reference", policy["capability_definitions"])
         self.assertIn("secret_use", policy["capability_definitions"])
         self.assertIn("browser_profile_read", policy["capability_definitions"])
+        self.assertEqual(policy["profiles"]["break-glass"]["allowed_grips"], ["*"])
+        self.assertEqual(policy["profiles"]["break-glass"]["max_risk_level"], "high")
         self.assertEqual(policy["forbidden_components"], [".git"])
 
     def test_home_wide_profiles_with_home_roots_keep_typed_roots(self) -> None:
@@ -356,6 +368,9 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(v2["properties"]["version"]["const"], 2)
         self.assertNotIn("secret_roots", v1["properties"])
         self.assertIn("secret_roots", v2["properties"])
+        self.assertIn("allowed_grips", v2["properties"]["profiles"]["additionalProperties"]["required"])
+        self.assertIn("forbidden_hosts", v2["properties"]["profiles"]["additionalProperties"]["required"])
+        self.assertIn("max_risk_level", v2["properties"]["profiles"]["additionalProperties"]["required"])
 
     def test_privileged_reference_contract_exists(self) -> None:
         contract = json.loads(
