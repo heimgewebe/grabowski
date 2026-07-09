@@ -2207,6 +2207,11 @@ def _captain_attach_action_digests(actions: list[dict[str, Any]]) -> list[dict[s
         action["envelope"]["actions_sha256"] = actions_sha256
     return actions
 
+
+def _captain_mapping_or_empty(item: dict[str, Any], key: str) -> dict[str, Any]:
+    value = item.get(key)
+    return value if isinstance(value, dict) else {}
+
 def _captain_actions(parameters: dict[str, Any], *, gate_native_validation: bool = False) -> list[dict[str, Any]]:
     value = parameters.get("actions")
     if not isinstance(value, list) or not value:
@@ -2239,7 +2244,7 @@ def _captain_actions(parameters: dict[str, Any], *, gate_native_validation: bool
         except GripPreflightError as exc:
             if not gate_native_validation:
                 raise
-            target = item.get("target") if isinstance(item.get("target"), dict) else {}
+            target = _captain_mapping_or_empty(item, "target")
             target_findings.append(str(exc))
         try:
             scope = _bound_mapping(item.get("scope"), context=f"actions[{index}]", name="scope")
@@ -2247,14 +2252,14 @@ def _captain_actions(parameters: dict[str, Any], *, gate_native_validation: bool
         except GripPreflightError as exc:
             if not gate_native_validation:
                 raise
-            scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
-            scope_findings = [str(exc)]
+            scope = _captain_mapping_or_empty(item, "scope")
+            scope_findings.append(str(exc))
         try:
             risk = _bound_mapping(item.get("risk"), context=f"actions[{index}]", name="risk")
         except GripPreflightError as exc:
             if not gate_native_validation:
                 raise
-            risk = item.get("risk") if isinstance(item.get("risk"), dict) else {}
+            risk = _captain_mapping_or_empty(item, "risk")
             risk_findings.append(str(exc))
         recovery_path = risk.get("recovery_path")
         irreversibility = risk.get("irreversibility")
@@ -2702,7 +2707,7 @@ def _captain_authority_gates(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     action_names = ", ".join(action["action"] for action in actions)
     target_findings = [finding for action in actions for finding in action.get("target_findings", [])]
-    scope_findings = [finding for action in actions for finding in action["scope_findings"]]
+    scope_findings = [finding for action in actions for finding in action.get("scope_findings", [])]
     risk_findings = [finding for action in actions for finding in action.get("risk_findings", [])]
     target_change_findings = [finding for action in actions for finding in action.get("target_change_findings", [])]
     projection_gate, projection_info = _captain_status_projection_gate(parameters, actions)
