@@ -240,15 +240,18 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         payload.update(overrides)
         return payload
 
-    def test_inline_review_comment_does_not_satisfy_codex_evidence(self) -> None:
+    def test_inline_review_comment_does_not_satisfy_codex_seen_diagnostic(self) -> None:
         head = "a" * 40
         result = pr_review_gate.evaluate_review_gate(
             self._state(reviews=[], review_comments=[{"user": {"login": "chatgpt-codex-connector"}, "commit_id": head}]),
-            self_review=self._review(codex_review={"required": True, "reason": "explicit check"}),
+            self_review=self._review(codex_review={"required": True, "reason": "legacy explicit check"}),
         )
-        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["verdict"], "PASS")
         self.assertFalse(result["review_sources"]["codex_seen"])
-        self.assertIn("Codex review is explicitly required but not observed on current head", result["failures"])
+        self.assertIn(
+            "Deprecated self_review.codex_review.required ignored; use diff-bound external review evidence",
+            result["warnings"],
+        )
 
     def test_rest_pr_review_still_satisfies_codex_evidence(self) -> None:
         head = "a" * 40
@@ -508,14 +511,18 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
             self.assertIn("cannot write self-review template without current PR diff SHA-256", result["failures"][0])
             self.assertFalse(template_path.exists())
 
-    def test_claude_evidence_repo_mismatch_blocks(self) -> None:
+    def test_legacy_claude_evidence_repo_mismatch_warns(self) -> None:
         result = pr_review_gate.evaluate_review_gate(
             self._state(reviews=[{"author": {"login": "chatgpt-codex-connector"}, "commit_id": "a" * 40}]),
-            self_review=self._review(claude_review={"required": True, "reason": "risk"}),
+            self_review=self._review(claude_review={"required": True, "reason": "legacy risk"}),
             claude_evidence=self._claude_evidence(repo="heimgewebe/other"),
         )
-        self.assertEqual(result["verdict"], "BLOCK")
-        self.assertIn("Claude CLI evidence invalid: repo mismatch", result["failures"])
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertIn("Legacy Claude CLI evidence invalid and ignored: repo mismatch", result["warnings"])
+        self.assertIn(
+            "Deprecated self_review.claude_review.required ignored; use diff-bound external review evidence",
+            result["warnings"],
+        )
 
     def test_claude_command_accepts_equals_timeout(self) -> None:
         result = pr_review_gate.evaluate_review_gate(
@@ -526,20 +533,26 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["review_sources"]["claude_cli_seen"])
 
-    def test_claude_command_rejects_unknown_extra_flag(self) -> None:
+    def test_legacy_claude_command_unknown_extra_flag_warns(self) -> None:
         result = pr_review_gate.evaluate_review_gate(
             self._state(),
-            self_review=self._review(claude_review={"required": True, "reason": "risk"}),
+            self_review=self._review(claude_review={"required": True, "reason": "legacy risk"}),
             claude_evidence=self._claude_evidence(command=["claude", "ultrareview", "58", "--json", "--timeout", "30", "--extra"]),
         )
-        self.assertEqual(result["verdict"], "BLOCK")
-        self.assertIn("Claude CLI evidence invalid: command is not claude ultrareview for this PR", result["failures"])
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertIn(
+            "Legacy Claude CLI evidence invalid and ignored: command is not claude ultrareview for this PR",
+            result["warnings"],
+        )
 
-    def test_claude_command_rejects_wrong_pr_number(self) -> None:
+    def test_legacy_claude_command_wrong_pr_number_warns(self) -> None:
         result = pr_review_gate.evaluate_review_gate(
             self._state(),
-            self_review=self._review(claude_review={"required": True, "reason": "risk"}),
+            self_review=self._review(claude_review={"required": True, "reason": "legacy risk"}),
             claude_evidence=self._claude_evidence(command=["claude", "ultrareview", "59", "--json", "--timeout", "30"]),
         )
-        self.assertEqual(result["verdict"], "BLOCK")
-        self.assertIn("Claude CLI evidence invalid: command is not claude ultrareview for this PR", result["failures"])
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertIn(
+            "Legacy Claude CLI evidence invalid and ignored: command is not claude ultrareview for this PR",
+            result["warnings"],
+        )
