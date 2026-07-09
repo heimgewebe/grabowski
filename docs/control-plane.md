@@ -41,18 +41,18 @@ Details: [`docs/checkout-lifecycle.md`](checkout-lifecycle.md).
 
 ## Privilegierter Broker
 
-`config/privileged-actions.example.json` definiert root-eigene argv-Vorlagen. Alle Beispielaktionen sind deaktiviert. Der Broker besteht aus:
+`config/privileged-actions.example.json` definiert root-eigene argv-Vorlagen und einen optionalen Power-Worker-Modus. Alle Beispielaktionen sind deaktiviert. Der Broker besteht aus:
 
-- `src/grabowski_privileged_broker.py`: Referenz-, TTL-, Template- und Replay-Prüfung,
-- `tools/grabowski_privileged_broker.py`: root-seitiger Handler ohne Shell,
+- `src/grabowski_privileged_broker.py`: Referenz-, TTL-, Template-, Power-argv- und Replay-Prüfung,
+- `tools/grabowski_privileged_broker.py`: root-seitiger Handler ohne implizite Shell,
 - `tools/grabowski_privileged_request.py`: begrenzter Unix-Socket-Client,
 - `systemd/grabowski-privileged-broker.socket` und `@.service`: gruppenbegrenzte Socket-Aktivierung.
 
-Der Handler akzeptiert nur kurzlebige, hashgebundene Referenzen aus `grabowski_privileged_action_reference`, ersetzt ausschließlich das vollständige Token `{target}`, verlangt absolute Executables und markiert jede Request-ID vor der Ausführung als verbraucht. Auditdaten enthalten Ziel- und argv-Hashes, nicht Begründung oder Secretwerte. Strukturierte Broker-Ablehnungen und Zielbefehlsfehler werden dem Socket-Client gemeldet; der Broker-Prozess beendet solche behandelten Request-Ergebnisse mit Exit 0, damit keine failed systemd-Instanzen entstehen. Unerwartete interne Brokerfehler bleiben Host-Service-Fehler.
+Der Handler akzeptiert nur kurzlebige, hashgebundene Referenzen. Template-Aktionen ersetzen ausschließlich das vollständige Token `{target}`. Power-Aktionen verwenden `mode=argv-json`: `target` ist ein JSON-Objekt mit `argv` und `cwd`. Der Broker verlangt absolute Executables, prüft `cwd_pattern`, `max_argv`, `allow_shell` und markiert jede Request-ID vor der Ausführung als verbraucht. Auditdaten enthalten Ziel-, cwd- und argv-Hashes, nicht Begründung oder Secretwerte. Strukturierte Broker-Ablehnungen und Zielbefehlsfehler werden dem Socket-Client gemeldet; der Broker-Prozess beendet solche behandelten Request-Ergebnisse mit Exit 0, damit keine failed systemd-Instanzen entstehen. Unerwartete interne Brokerfehler bleiben Host-Service-Fehler.
 
-`grabowski_privileged_broker_status` prüft Binary, root-eigene Konfiguration, Socket und Client. Die Hostinstallation ist bewusst kein unprivilegierter Selbstumbau: Dateien müssen root-eigen unter `/usr/local` und `/etc` installiert, der Socket aktiviert und der Operator der Gruppe `grabowski` hinzugefügt werden. Bis dahin bleibt der Pfad fail-closed.
+`grabowski_privileged_broker_status` prüft Binary, root-eigene Konfiguration, Socket und Client. `grabowski_power_run` ist der maximale Operatorpfad: Es erzeugt eine kurzlebige `operator_power_argv`-Referenz, verlangt gültige Audit-Chain, Kill-Switch-freiheit, Broker-Bereitschaft und `grabowski_recovery_status.ready_for_user_power_worker=true` sowie `ready_for_privileged_actions=true`, bevor es den Root-Broker aufruft. Die Hostinstallation ist bewusst kein unprivilegierter Selbstumbau: Dateien müssen root-eigen unter `/usr/local` und `/etc` installiert, der Socket aktiviert und der Operator der Gruppe `grabowski` hinzugefügt werden. Bis dahin bleibt der Pfad fail-closed.
 
-Für stale systemd-Fehlzustände gibt es als enges Template `reset_failed_systemd_unit` mit `/usr/bin/systemctl reset-failed {target}`. Die Aktion bleibt in der Beispielkonfiguration deaktiviert und darf nur Zielnamen matchen, die als `.service`-Unit explizit zugelassen sind. Sie ist kein Service-Control-Pfad: kein Start, Stop, Restart, Enable, Disable und keine Unit-Bearbeitung.
+Für stale systemd-Fehlzustände gibt es als enges Template `reset_failed_systemd_unit` mit `/usr/bin/systemctl reset-failed {target}`. Die Aktion bleibt in der Beispielkonfiguration deaktiviert und darf nur Zielnamen matchen, die als `.service`-Unit explizit zugelassen sind. `operator_power_argv` bleibt ebenfalls deaktiviert, bis der Host bewusst maximale Operator-Handlungsfähigkeit erlauben soll. Mit `allow_shell=false` werden nur direkte bekannte Shell-Executables wie `/bin/sh`, `/bin/bash` und `/usr/bin/env` blockiert. Das ist keine Sandbox: Ein aktiviertes `operator_power_argv` bleibt beliebige Root-Ausführung über absolute argv. Die root-eigene `gate`-Konfiguration muss deshalb Kill-Switch und frische Recovery-Marker zusätzlich im Broker prüfen; mit `allow_shell=true` wird auch die direkte Shell-Form bewusst zugelassen.
 
 ## Secrets
 

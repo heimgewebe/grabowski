@@ -138,6 +138,19 @@ lehnt secret-artige Ziel- oder Begründungstexte ab. Referenzen enthalten eine
 kurze Ablaufzeit und deklarieren eine Single-Use-Replay-Policy für den späteren
 externen Broker.
 
+`grabowski_power_run` ist die maximale Operator-Schiene. Standard ist
+autonome Ausführung, Grenze ist nicht Zustimmung, sondern Auditierbarkeit,
+Recovery und Kill-Switch. Das Tool führt kein lokales `sudo` im MCP-Prozess aus,
+sondern sendet eine kurzlebige `operator_power_argv`-Referenz an den
+root-eigenen Broker. Vor jedem Aufruf müssen Audit-Chain, Kill-Switch,
+Broker-Status und Recovery-Gate grün sein. Der Befehl ist argv-basiert,
+verlangt ein absolutes Executable, bounded Timeout, bounded Output und eine
+nichtleere Begründung; der Broker auditiert Ziel-, cwd- und argv-Hashes. Die
+root-eigene Konfiguration erzwingt zusätzlich eine Broker-seitige Gate-Prüfung
+und entscheidet, ob direkte bekannte Shell-Executables erlaubt sind. Das ist
+keine Sandbox: Ein aktiviertes `operator_power_argv` bedeutet bewusst
+beliebige Root-Ausführung über absolute argv.
+
 
 ## Kollisionskontrolle und spezialisierte Worker
 

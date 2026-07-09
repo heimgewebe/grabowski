@@ -1,17 +1,40 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "actions": {
     "edit_system_service": {
       "enabled": false,
       "target_pattern": "[A-Za-z0-9_.@:-]{1,200}",
-      "argv": ["/usr/bin/systemctl", "restart", "{target}"],
+      "argv": [
+        "/usr/bin/systemctl",
+        "restart",
+        "{target}"
+      ],
       "timeout_seconds": 120
     },
     "reset_failed_systemd_unit": {
       "enabled": false,
-      "target_pattern": "(?:user@[0-9]{1,10}|[A-Za-z0-9_@][A-Za-z0-9_.@:-]{0,119})\.service",
-      "argv": ["/usr/bin/systemctl", "reset-failed", "{target}"],
+      "target_pattern": "(?:user@[0-9]{1,10}|[A-Za-z0-9_@][A-Za-z0-9_.@:-]{0,119})\\.service",
+      "argv": [
+        "/usr/bin/systemctl",
+        "reset-failed",
+        "{target}"
+      ],
       "timeout_seconds": 30
+    },
+    "operator_power_argv": {
+      "enabled": false,
+      "mode": "argv-json",
+      "target_pattern": "\\{.{1,49152}\\}",
+      "cwd_pattern": "/[A-Za-z0-9._/@:+-]{0,999}",
+      "timeout_seconds": 600,
+      "max_argv": 128,
+      "allow_shell": false,
+      "gate": {
+        "kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+        "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
+        "max_recovery_age_seconds": 86400,
+        "require_root_owned_gate_files": true
+      }
     }
   }
 }

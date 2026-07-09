@@ -102,6 +102,7 @@ OPERATOR_CAPABILITIES = (
     "process_signal",
     "port_inspect",
     "privileged_reference",
+    "power_execute",
     "resource_lease",
     "artifact_transfer",
     "browser_worker",
@@ -114,6 +115,7 @@ PRIVILEGED_REFERENCE_ACTIONS = {
     "change_file_owner",
     "mount_filesystem",
     "reset_failed_systemd_unit",
+    "operator_power_argv",
 }
 
 REDACTIONS = (

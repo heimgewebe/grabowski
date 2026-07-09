@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -17,13 +18,18 @@ from grabowski_privileged_broker import (
     claim_once,
     load_root_config,
     parse_reference,
-    resolve_action,
+    resolve_execution,
 )
 
 CONFIG = Path("/etc/grabowski/privileged-actions.json")
 STATE = Path("/var/lib/grabowski/privileged-broker")
 AUDIT = STATE / "audit.jsonl"
 MAX_OUTPUT_BYTES = 250_000
+SAFE_ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+}
 
 
 def append_audit(record: dict[str, object]) -> None:
@@ -41,50 +47,83 @@ def append_audit(record: dict[str, object]) -> None:
         os.close(descriptor)
 
 
+def _base_audit_record(
+    reference: dict[str, object],
+    execution: dict[str, object],
+    started: float,
+) -> dict[str, object]:
+    argv = execution["argv"]
+    cwd = execution.get("cwd")
+    record = {
+        "schema_version": 1,
+        "timestamp_unix": int(time.time()),
+        "request_id": str(reference["request_id"]),
+        "reference_sha256": str(reference["reference_sha256"]),
+        "action": str(reference["action"]),
+        "mode": str(execution.get("mode", "template")),
+        "target_sha256": hashlib.sha256(str(reference["target"]).encode("utf-8")).hexdigest(),
+        "argv_sha256": hashlib.sha256(
+            json.dumps(argv, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "cwd_sha256": hashlib.sha256(str(cwd or "").encode("utf-8")).hexdigest(),
+        "duration_seconds": round(time.monotonic() - started, 3),
+    }
+    gate = execution.get("gate")
+    if isinstance(gate, dict):
+        record["gate_recovery_marker_sha256"] = gate.get("recovery_marker_sha256")
+        record["gate_recovery_marker_timestamp_unix"] = gate.get("recovery_marker_timestamp_unix")
+    return record
+
+
 def main() -> int:
     if os.geteuid() != 0:
         raise PermissionError("privileged broker must run as root")
     data = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
     reference = parse_reference(data)
     config = load_root_config(CONFIG)
-    argv, timeout = resolve_action(config, reference)
-    claim_once(STATE / "used", reference["request_id"])
+    execution = resolve_execution(config, reference)
+    argv = execution["argv"]
+    timeout = execution["timeout_seconds"]
+    cwd = execution.get("cwd")
+    if cwd is not None and not Path(str(cwd)).is_dir():
+        raise ValueError("privileged cwd is not an existing directory")
+    claim_once(STATE / "used", str(reference["request_id"]))
     started = time.monotonic()
-    completed = subprocess.run(
+    process = subprocess.Popen(
         argv,
+        cwd=str(cwd) if cwd is not None else None,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-        env={
-            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
-            "LANG": "C.UTF-8",
-            "LC_ALL": "C.UTF-8",
-        },
+        env=SAFE_ENV,
+        start_new_session=True,
     )
-    stdout = completed.stdout[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
-    stderr = completed.stderr[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+    timed_out = False
+    try:
+        stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout_bytes, stderr_bytes = process.communicate()
+    stdout = stdout_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+    stderr = stderr_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
     record = {
-        "schema_version": 1,
-        "timestamp_unix": int(time.time()),
-        "request_id": reference["request_id"],
-        "reference_sha256": reference["reference_sha256"],
-        "action": reference["action"],
-        "target_sha256": hashlib.sha256(reference["target"].encode("utf-8")).hexdigest(),
-        "argv_sha256": hashlib.sha256(
-            json.dumps(argv, separators=(",", ":")).encode("utf-8")
-        ).hexdigest(),
-        "returncode": completed.returncode,
-        "duration_seconds": round(time.monotonic() - started, 3),
-        "stdout_truncated": len(completed.stdout) > MAX_OUTPUT_BYTES,
-        "stderr_truncated": len(completed.stderr) > MAX_OUTPUT_BYTES,
+        **_base_audit_record(reference, execution, started),
+        "returncode": None if timed_out else process.returncode,
+        "timed_out": timed_out,
+        "stdout_truncated": len(stdout_bytes) > MAX_OUTPUT_BYTES,
+        "stderr_truncated": len(stderr_bytes) > MAX_OUTPUT_BYTES,
     }
     append_audit(record)
     print(json.dumps({
         "request_id": reference["request_id"],
         "action": reference["action"],
-        "returncode": completed.returncode,
+        "mode": execution.get("mode", "template"),
+        "returncode": None if timed_out else process.returncode,
+        "timed_out": timed_out,
         "stdout": stdout,
         "stderr": stderr,
         "audit": record,
@@ -98,9 +137,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except subprocess.TimeoutExpired as exc:
-        print(json.dumps({"error": "privileged action timed out", "timeout": exc.timeout}))
-        raise SystemExit(0)
     except (FileExistsError, PermissionError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False, sort_keys=True))
         raise SystemExit(0)

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -315,6 +316,10 @@ class OperationTests(unittest.TestCase):
 
 
 class PrivilegedBrokerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
     def _reference(self, now: int = 1000) -> dict[str, object]:
         value: dict[str, object] = {
             "schema_version": 1,
@@ -408,6 +413,200 @@ class PrivilegedBrokerTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "target"):
                     privileged_broker.resolve_action(config, parsed)
 
+    def _power_gate(self, directory: str | Path) -> dict[str, object]:
+        root = Path(directory)
+        marker = root / "recovery-gate.json"
+        marker.write_text(json.dumps({
+            "timestamp_unix": int(time.time()),
+            "restore_probe_valid": True,
+            "repository_check_valid": True,
+            "configured_target_valid": True,
+            "target_matches_configured": True,
+        }), encoding="utf-8")
+        marker.chmod(0o600)
+        return {
+            "kill_switch_path": str(root / "operator-kill-switch"),
+            "recovery_marker_path": str(marker),
+            "max_recovery_age_seconds": 86400,
+            "require_root_owned_gate_files": False,
+        }
+
+    def _power_reference(self, payload: dict[str, object], now: int = 1000) -> dict[str, object]:
+        value = self._reference(now=now)
+        value["action"] = "operator_power_argv"
+        value["target"] = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        value["justification"] = "Run one recovery-gated operator power command"
+        value.pop("reference_sha256")
+        value["reference_sha256"] = privileged_broker.canonical_sha256(value)
+        return value
+
+    def test_power_argv_json_action_resolves_without_shell(self) -> None:
+        reference = self._power_reference({"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_power_argv": {
+                    "enabled": True,
+                    "mode": "argv-json",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 600,
+                    "max_argv": 128,
+                    "allow_shell": False,
+                    "gate": self._power_gate(self.tmp.name),
+                }
+            },
+        }
+        execution = privileged_broker.resolve_execution(config, parsed)
+        self.assertEqual(execution["mode"], "argv-json")
+        self.assertEqual(execution["argv"], ["/usr/bin/id", "-u"])
+        self.assertEqual(execution["cwd"], "/")
+        argv, timeout = privileged_broker.resolve_action(config, parsed)
+        self.assertEqual(argv, ["/usr/bin/id", "-u"])
+        self.assertEqual(timeout, 30)
+
+    def test_power_gate_opens_marker_with_file_descriptor_checks(self) -> None:
+        source = (ROOT / "src" / "grabowski_privileged_broker.py").read_text(encoding="utf-8")
+        self.assertIn("os.open(marker, flags)", source)
+        self.assertIn('getattr(os, "O_NOFOLLOW", 0)', source)
+        self.assertIn("metadata = os.fstat(descriptor)", source)
+        self.assertIn("raw = os.read(descriptor, metadata.st_size)", source)
+        self.assertNotIn("raw = marker.read_bytes()", source)
+
+    def test_power_argv_json_missing_recovery_marker_is_handled_denial(self) -> None:
+        reference = self._power_reference({"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        gate = self._power_gate(self.tmp.name)
+        Path(gate["recovery_marker_path"]).unlink()
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_power_argv": {
+                    "enabled": True,
+                    "mode": "argv-json",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 600,
+                    "max_argv": 128,
+                    "allow_shell": False,
+                    "gate": gate,
+                }
+            },
+        }
+        with self.assertRaisesRegex(PermissionError, "recovery marker does not exist"):
+            privileged_broker.resolve_execution(config, parsed)
+
+    def test_power_argv_json_requires_fresh_root_side_gate(self) -> None:
+        reference = self._power_reference({"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        gate = self._power_gate(self.tmp.name)
+        Path(gate["kill_switch_path"]).write_text("stop", encoding="utf-8")
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_power_argv": {
+                    "enabled": True,
+                    "mode": "argv-json",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 600,
+                    "max_argv": 128,
+                    "allow_shell": False,
+                    "gate": gate,
+                }
+            },
+        }
+        with self.assertRaisesRegex(PermissionError, "kill-switch"):
+            privileged_broker.resolve_execution(config, parsed)
+
+    def test_power_argv_json_rejects_shell_when_disabled(self) -> None:
+        reference = self._power_reference({"argv": ["/bin/bash", "-lc", "id"], "cwd": "/", "timeout_seconds": 30})
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_power_argv": {
+                    "enabled": True,
+                    "mode": "argv-json",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 600,
+                    "max_argv": 128,
+                    "allow_shell": False,
+                    "gate": self._power_gate(self.tmp.name),
+                }
+            },
+        }
+        with self.assertRaisesRegex(PermissionError, "shell"):
+            privileged_broker.resolve_execution(config, parsed)
+
+    def test_power_run_tool_builds_reference_and_requires_recovery(self) -> None:
+        class Completed:
+            returncode = 0
+            stdout = json.dumps({
+                "returncode": 0,
+                "stdout": "uid=0(root)\n",
+                "stderr": "",
+                "audit": {"request_id": "x" * 32},
+            }).encode("utf-8")
+            stderr = b""
+
+        with tempfile.TemporaryDirectory() as directory:
+            reference_dir = Path(directory)
+            captured: dict[str, object] = {}
+
+            def fake_run(argv: list[str], **kwargs: object) -> Completed:
+                captured["argv"] = argv
+                reference_path = Path(argv[1])
+                captured["reference"] = json.loads(reference_path.read_text(encoding="utf-8"))
+                return Completed()
+
+            with patch.object(privileged, "POWER_REFERENCE_DIR", reference_dir), patch.object(
+                privileged.operator, "_require_operator_mutation"
+            ), patch.object(
+                privileged, "grabowski_privileged_broker_status",
+                return_value={"ready": True, "request_client": "/usr/local/bin/grabowski-privileged-request"},
+            ), patch.object(
+                privileged, "_power_recovery_status",
+                return_value={
+                    "ready_for_user_power_worker": True,
+                    "ready_for_privileged_actions": True,
+                    "checked_at_unix": 1000,
+                },
+            ), patch.object(privileged.subprocess, "run", side_effect=fake_run), patch.object(
+                privileged.operator.base, "_append_audit"
+            ) as append_audit:
+                result = privileged.grabowski_power_run(
+                    ["/usr/bin/id", "-u"],
+                    cwd="/",
+                    timeout_seconds=30,
+                    justification="Check root identity for operator maintenance",
+                )
+
+            self.assertTrue(result["success"])
+            self.assertEqual(captured["argv"][0], "/usr/local/bin/grabowski-privileged-request")
+            reference = captured["reference"]
+            self.assertEqual(reference["action"], "operator_power_argv")
+            self.assertEqual(reference["execution"], "unprivileged-reference-only")
+            target = json.loads(reference["target"])
+            self.assertEqual(target, {"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})
+            append_audit.assert_called_once()
+            self.assertEqual(list(reference_dir.glob("*.json")), [])
+
     def test_tamper_expiry_disable_and_replay_fail_closed(self) -> None:
         reference = self._reference()
         reference["target"] = "other.service"
@@ -458,6 +657,12 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertIn("NoNewPrivileges=yes", service_unit)
         self.assertIn("ExecStart=/usr/local/libexec/grabowski-privileged-broker", service_unit)
         self.assertNotIn("SuccessExitStatus=", service_unit)
+
+    def test_broker_script_uses_utf8_audit_hash_and_process_group_timeout(self) -> None:
+        broker = (ROOT / "tools" / "grabowski_privileged_broker.py").read_text(encoding="utf-8")
+        self.assertIn('json.dumps(argv, ensure_ascii=False, separators=(",", ":"))', broker)
+        self.assertIn("start_new_session=True", broker)
+        self.assertIn("os.killpg(process.pid, signal.SIGKILL)", broker)
 
     def test_broker_script_keeps_structured_denials_out_of_systemd_failed_state(self) -> None:
         broker = (ROOT / "tools" / "grabowski_privileged_broker.py").read_text(encoding="utf-8")
