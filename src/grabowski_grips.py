@@ -256,6 +256,8 @@ CAPTAIN_GATE_IDS = (
 )
 CAPTAIN_EXECUTABLE_ACTIONS = frozenset({"pr-merge"})
 CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY = "act_unless_irreversible_or_ambiguous"
+CAPTAIN_AUTHORITY_CONTRACT_VERSION = 1
+CAPTAIN_AUTHORITY_CONTRACT_SURFACES = frozenset({"captain-preflight", "captain-run"})
 CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT = 4096
 CAPTAIN_POST_MERGE_VERIFY_ATTEMPTS = 3
 CAPTAIN_POST_MERGE_VERIFY_DELAYS_SECONDS = (0.5, 1.0)
@@ -288,7 +290,7 @@ CAPTAIN_NON_CLAIMS = (
     "does not treat status projection as runtime truth; projection is evidence only",
     "does not treat CI green as production safety",
     "does not treat review approval as semantic correctness",
-    "does not grant execution because allow_execution or any other parameter is set",
+    "does not grant execution because allow_execution, execution_authority or any other single parameter is set",
     "trusted-owner autonomy requires the explicit autonomy_policy and still blocks irreversible or ambiguous actions",
     "human authorization is recorded evidence, never an automatic execution release",
 )
@@ -297,6 +299,54 @@ CAPTAIN_NO_MUTATION_REASON = (
     "Use captain-run for action-specific execution after the same evidence gates pass."
 )
 
+
+
+def _captain_authority_contract(surface: str) -> dict[str, Any]:
+    if surface not in CAPTAIN_AUTHORITY_CONTRACT_SURFACES:
+        raise ValueError(f"unknown Captain authority contract surface: {surface}")
+    return {
+        "schema_version": CAPTAIN_AUTHORITY_CONTRACT_VERSION,
+        "surface": surface,
+        "required_gates": list(CAPTAIN_GATE_IDS),
+        "executable_action_allowlist": sorted(CAPTAIN_EXECUTABLE_ACTIONS),
+        "terms": {
+            "evaluation_authority": {
+                "meaning": "permission to evaluate Captain evidence gates and emit a read-only receipt",
+                "surfaces": ["captain-preflight", "captain-run"],
+                "effects": ["read-only gate evaluation", "receipt construction"],
+                "does_not_grant": ["merge", "deploy", "service_restart", "fleet_mutation", "cleanup"],
+            },
+            "execution_authority": {
+                "meaning": "one explicit prerequisite for an implemented captain-run executor",
+                "evidence_field": "execution_authority",
+                "gate": "execution-authority-present",
+                "required_with": [
+                    "allow_execution=true",
+                    "all Captain gates pass",
+                    "exactly one action",
+                    "implemented executor",
+                    "expected_head and target binding",
+                    "post-execution verification",
+                ],
+                "does_not_grant_by_itself": ["execution", "mutation", "merge", "deploy", "service_restart", "fleet_mutation", "cleanup"],
+            },
+        },
+        "release_conditions": {
+            "captain_preflight": ["never executes", "top-level status remains blocked by design"],
+            "captain_run": [
+                "allow_execution must be true",
+                "same evidence gates must pass",
+                "action must be in executable_action_allowlist",
+                "executor must verify the target before and after mutation",
+            ],
+        },
+        "non_claims": [
+            "allow_execution alone is never sufficient",
+            "execution_authority evidence alone is never sufficient",
+            "trusted-owner autonomy is limited to reversible, target-bound implemented executors",
+            "unsupported high-impact actions remain blocked",
+        ],
+    }
 
 class GripPreflightError(ValueError):
     pass
@@ -2469,7 +2519,7 @@ def _captain_execution_authority_gate(parameters: dict[str, Any], actions: list[
         return _captain_gate(
             "execution-authority-present",
             "blocked",
-            "execution_authority evidence object is missing; allow_execution alone never grants authority",
+            "execution_authority evidence object is missing; allow_execution alone never grants execution authority",
             ["execution_authority_missing"],
         )
     problems = []
@@ -2483,7 +2533,7 @@ def _captain_execution_authority_gate(parameters: dict[str, Any], actions: list[
     return _captain_gate(
         "execution-authority-present",
         "pass",
-        "execution authority evidence recorded; it authorizes evaluation, not execution",
+        "execution authority evidence recorded as one execution prerequisite; it never grants execution by itself",
     )
 
 
@@ -3133,12 +3183,15 @@ def run_grip(
         _check(receipt, "required_parameters", "pass", ", ".join(spec.required_parameters))
         if spec.effect == MUTATING and not allow_mutation:
             _check(receipt, "mutation_allowed", "fail", "allow_mutation is false")
-            return _finish(
-                receipt,
-                "blocked",
-                "preflight",
-                {"error": "mutating grip requires allow_mutation=true"},
-            )
+            output: dict[str, Any] = {
+                "error": "mutating grip requires allow_mutation=true",
+                "decision": "blocked",
+                "blocked_reasons": ["mutation_permission_missing"],
+                "requires_allow_mutation": True,
+            }
+            if spec.name == "captain-run":
+                output["authority_contract"] = _captain_authority_contract("captain-run")
+            return _finish(receipt, "blocked", "preflight", output)
         _check(receipt, "mutation_allowed", "pass", f"effect={spec.effect}")
         action = _RUNNERS[spec.runner]
         command = command_runner or _default_command_runner
