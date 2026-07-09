@@ -263,6 +263,11 @@ SECRET_USE_ENV_ALLOWLIST = {
     "TERM",
     "TZ",
 }
+SESSION_RISK_LEVELS = ("low", "medium", "high")
+SESSION_RISK_ORDER = {name: index for index, name in enumerate(SESSION_RISK_LEVELS)}
+SESSION_ESCALATION_MAX_SECONDS = 7 * 24 * 60 * 60
+
+
 SENSITIVE_ENV_PARTS = (
     "TOKEN",
     "SECRET",
@@ -293,6 +298,9 @@ TOP_LEVEL_POLICY_FIELDS = {
     "forbidden_components",
     "forbidden_file_patterns",
     "forbidden_capabilities",
+    "forbidden_hosts",
+    "allowed_grips",
+    "max_risk_level",
     "capability_definitions",
     "profiles",
     "trusted_owner",
@@ -311,6 +319,9 @@ PROFILE_POLICY_FIELDS = {
     "max_secret_use_output_bytes",
     "max_secret_use_seconds",
     "capabilities",
+    "allowed_grips",
+    "forbidden_hosts",
+    "max_risk_level",
     "trusted_owner",
 }
 ROOT_LIST_FIELDS = {
@@ -487,6 +498,30 @@ def _validate_capability_list(value: Any, *, label: str) -> None:
         raise RuntimeError(f"Unknown access capabilities in {label}: {unknown}")
 
 
+def _validate_allowed_grips(value: Any, *, label: str) -> None:
+    grips = _validate_string_list(value, label=label)
+    allowed = set(grabowski_grips.GRIP_SURFACE_ALLOWLIST) | {"*"}
+    unknown = sorted(set(grips) - allowed)
+    if unknown:
+        raise RuntimeError(f"Unknown allowed grips in {label}: {unknown}")
+    if "*" in grips and len(grips) != 1:
+        raise RuntimeError(f"Access policy {label} may use '*' only by itself")
+
+
+def _validate_forbidden_hosts(value: Any, *, label: str) -> None:
+    hosts = _validate_string_list(value, label=label)
+    for host in hosts:
+        if any(ord(char) < 33 or ord(char) == 127 for char in host):
+            raise RuntimeError(f"Access policy {label} contains an invalid host")
+        if any(char in host for char in "/:@"):
+            raise RuntimeError(f"Access policy {label} hosts must be bare hostnames")
+
+
+def _validate_risk_level(value: Any, *, label: str) -> None:
+    if value not in SESSION_RISK_ORDER:
+        raise RuntimeError(f"Access policy {label} must be one of {list(SESSION_RISK_LEVELS)}")
+
+
 def _validate_policy(policy: Any) -> None:
     if not isinstance(policy, dict):
         raise RuntimeError("Access policy must be an object")
@@ -547,6 +582,12 @@ def _validate_policy(policy: Any) -> None:
             policy["forbidden_capabilities"],
             label="forbidden_capabilities",
         )
+    if "allowed_grips" in policy:
+        _validate_allowed_grips(policy["allowed_grips"], label="allowed_grips")
+    if "forbidden_hosts" in policy:
+        _validate_forbidden_hosts(policy["forbidden_hosts"], label="forbidden_hosts")
+    if "max_risk_level" in policy:
+        _validate_risk_level(policy["max_risk_level"], label="max_risk_level")
 
     definitions = policy.get("capability_definitions", {})
     if definitions is not None:
@@ -639,6 +680,12 @@ def _validate_policy(policy: Any) -> None:
                     f"Access profile {name} enables browser_profile_read without "
                     "browser_profile_roots"
                 )
+        if "allowed_grips" in profile:
+            _validate_allowed_grips(profile["allowed_grips"], label=f"profile {name} allowed_grips")
+        if "forbidden_hosts" in profile:
+            _validate_forbidden_hosts(profile["forbidden_hosts"], label=f"profile {name} forbidden_hosts")
+        if "max_risk_level" in profile:
+            _validate_risk_level(profile["max_risk_level"], label=f"profile {name} max_risk_level")
 
 
 def _profile_root_values(
@@ -678,6 +725,9 @@ def _legacy_profile(policy: dict[str, Any]) -> dict[str, Any]:
             for capability in BASE_CAPABILITIES
             if capability not in forbidden
         ],
+        "allowed_grips": policy.get("allowed_grips", ["*"]),
+        "forbidden_hosts": policy.get("forbidden_hosts", []),
+        "max_risk_level": policy.get("max_risk_level", "high"),
         "trusted_owner": bool(policy.get("trusted_owner", False)),
     }
 
@@ -707,6 +757,143 @@ def _profile_values(policy: dict[str, Any], key: str) -> Any:
     if key in profile:
         return profile[key]
     return policy.get(key)
+
+
+def _profile_string_list(policy: dict[str, Any], key: str, default: list[str]) -> list[str]:
+    value = _profile_values(policy, key)
+    if value is None:
+        return list(default)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise RuntimeError(f"Access policy {key} must be a list of strings")
+    return value
+
+
+def _profile_risk_level(policy: dict[str, Any]) -> str:
+    value = _profile_values(policy, "max_risk_level") or "high"
+    if value not in SESSION_RISK_ORDER:
+        raise RuntimeError("Access policy max_risk_level is invalid")
+    return value
+
+
+def _session_profile_contract(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = _load_policy() if policy is None else policy
+    profile = _active_profile(source)
+    allowed_grips = _profile_string_list(source, "allowed_grips", ["*"])
+    forbidden_hosts = _profile_string_list(source, "forbidden_hosts", [])
+    max_risk_level = _profile_risk_level(source)
+    return {
+        "profile": profile["name"],
+        "read_roots": _profile_values(source, "read_roots") or [],
+        "write_roots": _profile_values(source, "write_roots") or [],
+        "allowed_grips": allowed_grips,
+        "forbidden_hosts": forbidden_hosts,
+        "max_risk_level": max_risk_level,
+        "does_not_establish": [
+            "automatic_high_impact_authority",
+            "host_reachability",
+            "grip_execution_success",
+        ],
+    }
+
+
+def _risk_allowed(risk: str, max_risk_level: str) -> bool:
+    return SESSION_RISK_ORDER[risk] <= SESSION_RISK_ORDER[max_risk_level]
+
+
+def _session_grip_policy_decision(
+    name: str,
+    parameters: dict[str, Any] | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source = _load_policy() if policy is None else policy
+    contract = _session_profile_contract(source)
+    allowed_grips = set(contract["allowed_grips"])
+    risk = grabowski_grips.grip_risk_level(name)
+    allowed_by_name = "*" in allowed_grips or name in allowed_grips
+    allowed_by_risk = _risk_allowed(risk, contract["max_risk_level"])
+    escalation_required = risk == "high"
+    escalation_valid = True
+    escalation_error = None
+    if escalation_required:
+        try:
+            _validate_session_escalation((parameters or {}).get("session_escalation"))
+        except RuntimeError as exc:
+            escalation_valid = False
+            escalation_error = str(exc)
+    return {
+        "allowed": allowed_by_name and allowed_by_risk and escalation_valid,
+        "grip": name,
+        "risk": risk,
+        "allowed_by_name": allowed_by_name,
+        "allowed_by_risk": allowed_by_risk,
+        "escalation_required": escalation_required,
+        "escalation_valid": escalation_valid,
+        "escalation_error": escalation_error,
+        "session_profile": contract,
+    }
+
+
+def _validate_session_escalation(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise RuntimeError("session_escalation is required for high-risk grip execution")
+    required = {"target", "reason", "expires_at_unix"}
+    missing = sorted(required - set(value))
+    if missing:
+        raise RuntimeError(f"session_escalation missing fields: {missing}")
+    if not isinstance(value.get("target"), (str, dict)) or not value.get("target"):
+        raise RuntimeError("session_escalation.target must be non-empty")
+    if not isinstance(value.get("reason"), str) or not value.get("reason").strip():
+        raise RuntimeError("session_escalation.reason must be non-empty")
+    expires = value.get("expires_at_unix")
+    if not isinstance(expires, int) or isinstance(expires, bool):
+        raise RuntimeError("session_escalation.expires_at_unix must be an integer")
+    now = int(time.time())
+    if expires <= now:
+        raise RuntimeError("session_escalation.expires_at_unix is expired")
+    if expires > now + SESSION_ESCALATION_MAX_SECONDS:
+        raise RuntimeError("session_escalation.expires_at_unix is too far in the future")
+    has_recovery = isinstance(value.get("recovery"), dict) and bool(value["recovery"])
+    has_irreversibility = isinstance(value.get("irreversibility"), dict) and bool(value["irreversibility"])
+    if not (has_recovery or has_irreversibility):
+        raise RuntimeError("session_escalation requires recovery or irreversibility metadata")
+
+
+def _host_candidates_from_token(token: str) -> set[str]:
+    candidates: set[str] = set()
+    parsed = urllib.parse.urlparse(token)
+    if parsed.hostname:
+        candidates.add(parsed.hostname.lower())
+    if ":" in token and "/" not in token.split(":", 1)[0]:
+        left = token.split(":", 1)[0]
+        if "@" in left:
+            left = left.rsplit("@", 1)[1]
+        if left and not left.startswith("-"):
+            candidates.add(left.lower())
+    if "@" in token and "/" not in token:
+        candidates.add(token.rsplit("@", 1)[1].lower())
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", token) and "." in token:
+        candidates.add(token.lower())
+    return candidates
+
+
+def _token_matches_forbidden_host(token: str, forbidden: set[str]) -> str | None:
+    normalized = token.lower()
+    if normalized in forbidden:
+        return normalized
+    candidates = _host_candidates_from_token(token)
+    blocked = sorted(candidates & forbidden)
+    return blocked[0] if blocked else None
+
+
+def _reject_forbidden_hosts_in_argv(argv: list[str], *, policy: dict[str, Any] | None = None) -> None:
+    source_policy = policy or _load_policy()
+    forbidden = {host.lower() for host in _profile_string_list(source_policy, "forbidden_hosts", [])}
+    if not forbidden:
+        return
+    for token in argv:
+        blocked = _token_matches_forbidden_host(token, forbidden)
+        if blocked:
+            raise PermissionError(f"Forbidden host in command arguments: {blocked}")
 
 
 def _policy_limit(policy: dict[str, Any], key: str) -> int:
@@ -5229,7 +5416,9 @@ def rlens_context_pack(
 def grip_list(profile: str = "operator") -> dict[str, Any]:
     """Return the first-class allowed Grabowski grip surface."""
     _require_capability("file_read")
-    return grabowski_grips.grip_list(profile)
+    result = grabowski_grips.grip_list(profile)
+    result["session_profile"] = _session_profile_contract()
+    return result
 
 
 @mcp.tool(name="grip_run", annotations=CREATE_ANNOTATIONS)
@@ -5243,9 +5432,19 @@ def grip_run(
     _require_capability("terminal_execute")
     if allow_mutation:
         _require_mutations_enabled("terminal_execute")
+    raw_parameters = parameters or {}
+    decision = _session_grip_policy_decision(name, raw_parameters)
+    if not decision["allowed"]:
+        return grabowski_grips._blocked_surface_receipt(
+            name,
+            raw_parameters,
+            f"session profile blocks grip: {decision}",
+        )
+    dispatch_parameters = dict(raw_parameters)
+    dispatch_parameters.pop("session_escalation", None)
     return grabowski_grips.grip_run(
         name,
-        parameters or {},
+        dispatch_parameters,
         profile=profile,
         allow_mutation=allow_mutation,
     )

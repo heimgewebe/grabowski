@@ -244,11 +244,11 @@ def _operator_capabilities() -> set[str]:
     }
 
 
-def _trusted_owner_mode() -> bool:
+def _trusted_owner_mode(policy: dict[str, Any] | None = None) -> bool:
     predicate = getattr(base, "_trusted_owner_enabled", None)
     if predicate is None:
         return False
-    return bool(predicate(base._load_policy()))
+    return bool(predicate(policy or base._load_policy()))
 
 
 def _require_operator_capability(capability: str) -> None:
@@ -357,13 +357,16 @@ def _validate_argv(argv: list[str], *, cwd: Path | None = None) -> list[str]:
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise ValueError("argv must be a non-empty list of non-empty strings")
 
-    trusted_owner = _trusted_owner_mode()
+    policy = base._load_policy()
+    trusted_owner = _trusted_owner_mode(policy)
     executable = Path(argv[0]).name
     if executable in PRIVILEGE_ESCALATORS and not trusted_owner:
         raise PermissionError(
             f"Privilege escalation is not available through Grabowski: "
             f"{executable}"
         )
+
+    base._reject_forbidden_hosts_in_argv(argv, policy=policy)
 
     working_directory = HOME if cwd is None else cwd
     if not trusted_owner:

@@ -221,6 +221,16 @@ CAPTAIN_HIGH_IMPACT_ACTIONS = frozenset(
 )
 GRIP_SURFACE_CAPTAIN_ONLY = frozenset({"captain-preflight", "captain-run"})
 MECHANIC_FORBIDDEN_EFFECTS = tuple(sorted(CAPTAIN_HIGH_IMPACT_ACTIONS | {"force-push", "secret-mutation", "database-migration", "privileged-broker-mutation"}))
+GRIP_RISK_LEVELS = {
+    name: (
+        "high"
+        if name in GRIP_SURFACE_CAPTAIN_ONLY
+        else "medium"
+        if spec.effect == MUTATING
+        else "low"
+    )
+    for name, spec in GRIP_SPECS.items()
+}
 MECHANIC_MAX_ACTIONS = 10
 CAPTAIN_MAX_ACTIONS = 10
 CAPTAIN_SCOPE_RECOMMENDED_KEYS = ("allowed_effects", "forbidden_effects", "boundaries", "max_targets")
@@ -3296,7 +3306,7 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
         "scope": "observation only" if spec.effect == READ_ONLY else "bounded write through a named grip runner",
         "effect": spec.effect,
         "effect_class": "read-only" if spec.effect == READ_ONLY else "mutating",
-        "risk": "low" if spec.effect == READ_ONLY else "medium",
+        "risk": GRIP_RISK_LEVELS.get(spec.name, "medium"),
         "recovery_path": GRIP_SURFACE_RECOVERY_PATHS[spec.effect],
         "preconditions": [
             f"required parameters: {required}",
@@ -3324,6 +3334,10 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
             "mutating_receipt_contract": "mutating grips must return a blocked, failed or passed receipt; they may not bypass run_grip",
         },
     }
+
+
+def grip_risk_level(name: str) -> str:
+    return GRIP_RISK_LEVELS.get(name, "medium")
 
 
 def _validate_surface_profile(profile: str) -> str:

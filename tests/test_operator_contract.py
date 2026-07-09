@@ -69,6 +69,7 @@ def _load_operator_module():
     fake_base._active_profile = active_profile
     fake_base._kill_switch_state = lambda: {"engaged": False}
     fake_base._require_valid_audit_chain = lambda: None
+    fake_base._reject_forbidden_hosts_in_argv = lambda argv, *, policy=None: None
 
     module_name = "grabowski_operator_contract_test"
     spec = importlib.util.spec_from_file_location(
@@ -837,6 +838,25 @@ class OperatorContractTests(unittest.TestCase):
         self.assertNotIn(secret, result["stderr"])
         self.assertIn("<REDACTED>", result["stdout"])
         self.assertIn("<REDACTED>", result["stderr"])
+
+    def test_validate_argv_uses_forbidden_host_guard_fail_closed(self) -> None:
+        operator = _load_operator_module()
+        observed: list[list[str]] = []
+
+        def reject(argv: list[str], *, policy=None) -> None:
+            observed.append([*argv, f"policy={policy['active_profile']}"])
+            if "blocked.example" in argv:
+                raise PermissionError("Forbidden host in command arguments: blocked.example")
+
+        operator.base._reject_forbidden_hosts_in_argv = reject
+        self.assertEqual(operator._validate_argv(["echo", "ok"]), ["echo", "ok"])
+        self.assertEqual(observed, [["echo", "ok", "policy=operator"]])
+        with self.assertRaisesRegex(PermissionError, "blocked.example"):
+            operator._validate_argv(["ssh", "blocked.example"])
+
+        delattr(operator.base, "_reject_forbidden_hosts_in_argv")
+        with self.assertRaises(AttributeError):
+            operator._validate_argv(["echo", "unguarded"])
 
     def test_relative_command_arguments_may_not_target_merges(self) -> None:
         operator = _load_operator_module()
