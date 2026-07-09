@@ -2081,6 +2081,46 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertIn("status_projection_healthy_invalid", result["output"]["blocked_reasons"])
 
+    def test_blocks_unhealthy_status_projection(self) -> None:
+        projection = {
+            "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
+            "source": "bureau status-projection",
+            "healthy": False,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "run_id": "unhealthy-run",
+        }
+        result = self.run_captain(captain_parameters(status_projection=projection, status_projection_sha256=grips.sha256_json(projection)))
+
+        self.assertIn("status_projection_unhealthy", result["output"]["blocked_reasons"])
+        self.assertEqual("blocked", self.gate(result, "status-projection-fresh")["status"])
+
+    def test_blocks_naive_generated_at_status_projection(self) -> None:
+        projection = {
+            "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
+            "source": "bureau status-projection",
+            "healthy": True,
+            "generated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            "run_id": "naive-run",
+        }
+        result = self.run_captain(captain_parameters(status_projection=projection, status_projection_sha256=grips.sha256_json(projection)))
+
+        self.assertIn("status_projection_generated_at_invalid", result["output"]["blocked_reasons"])
+
+    def test_blocks_status_projection_generated_too_far_in_future(self) -> None:
+        generated_at = datetime.now(timezone.utc) + timedelta(
+            seconds=grips.CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS + 1
+        )
+        projection = {
+            "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
+            "source": "bureau status-projection",
+            "healthy": True,
+            "generated_at": generated_at.isoformat(),
+            "run_id": "future-run",
+        }
+        result = self.run_captain(captain_parameters(status_projection=projection, status_projection_sha256=grips.sha256_json(projection)))
+
+        self.assertIn("status_projection_generated_at_in_future", result["output"]["blocked_reasons"])
+
     def test_blocks_stale_generated_at_status_projection(self) -> None:
         projection = {
             "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,

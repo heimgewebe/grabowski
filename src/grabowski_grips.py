@@ -2397,6 +2397,10 @@ def _captain_gate(gate_id: str, status: str, reason: str, details: Any = None) -
     return gate
 
 
+def _captain_now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _parse_captain_projection_generated_at(value: Any) -> datetime | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
@@ -2413,7 +2417,7 @@ def _parse_captain_projection_generated_at(value: Any) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        return None
     return parsed.astimezone(timezone.utc)
 
 
@@ -2469,13 +2473,15 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
             problems.append("status_projection_healthy_missing")
         elif not isinstance(healthy, bool):
             problems.append("status_projection_healthy_invalid")
+        elif healthy is not True:
+            problems.append("status_projection_unhealthy")
         generated_at = projection.get("generated_at")
         parsed_generated_at = _parse_captain_projection_generated_at(generated_at)
         if parsed_generated_at is None:
             problems.append("status_projection_generated_at_invalid")
         else:
             info["generated_at"] = parsed_generated_at.isoformat().replace("+00:00", "Z")
-            age_seconds = (datetime.now(timezone.utc) - parsed_generated_at).total_seconds()
+            age_seconds = (_captain_now_utc() - parsed_generated_at).total_seconds()
             info["age_seconds"] = int(age_seconds)
             if age_seconds < -CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS:
                 problems.append("status_projection_generated_at_in_future")
@@ -2502,7 +2508,7 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
             _captain_gate(
                 "status-projection-fresh",
                 "blocked",
-                "status projection is missing, stale, untrusted, replayable or not hash-bound; projection is required evidence",
+                "status projection is missing, stale, unhealthy, not from an allowlisted source label, missing replay reference metadata or not hash-bound; projection is required evidence",
                 problems,
             ),
             info,
@@ -2511,7 +2517,7 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
         _captain_gate(
             "status-projection-fresh",
             "pass",
-            "fresh trusted status projection with schema, source, replay reference and matching sha256; evidence only, not runtime truth",
+            "fresh status projection with allowlisted source label, schema, replay reference metadata and matching sha256; evidence only, not runtime truth",
         ),
         info,
     )
