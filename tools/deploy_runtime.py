@@ -776,6 +776,45 @@ def write_snapshot_inputs(snapshot: Snapshot, release_path: Path) -> dict[str, A
     return result
 
 
+def active_virtualenv_prefix() -> Path | None:
+    prefix = Path(sys.prefix).resolve(strict=False)
+    base_prefix = Path(sys.base_prefix).resolve(strict=False)
+    if prefix == base_prefix:
+        return None
+    return prefix
+
+
+def runtime_venv_builder_python() -> Path:
+    candidates = [
+        Path(value)
+        for value in (
+            getattr(sys, "_base_executable", ""),
+            sys.executable,
+        )
+        if isinstance(value, str) and value
+    ]
+    active_prefix = active_virtualenv_prefix()
+    rejected: list[str] = []
+    for candidate in candidates:
+        if not candidate.is_absolute():
+            rejected.append(str(candidate))
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            rejected.append(str(candidate))
+            continue
+        if active_prefix is not None and path_is_within(resolved, active_prefix):
+            rejected.append(str(resolved))
+            continue
+        return resolved
+    fail(
+        "Kein sicherer Basis-Python für Runtime-Venv-Erzeugung gefunden.",
+        phase="venv-builder-python",
+        details={"rejected_candidates": rejected},
+    )
+
+
 def pip_env() -> dict[str, str]:
     env = os.environ.copy()
     for key in (
@@ -1168,7 +1207,7 @@ def build_release(
         phase = "venv"
         venv = release_path / ".venv"
         run(
-            [sys.executable, "-m", "venv", str(venv)],
+            [str(runtime_venv_builder_python()), "-m", "venv", str(venv)],
             timeout=TIMEOUTS["python"],
             env=pip_env(),
         )

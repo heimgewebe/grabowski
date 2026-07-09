@@ -336,21 +336,72 @@ class DeployRuntimeTests(unittest.TestCase):
                     proc_root=proc,
                 )
 
+    def test_runtime_venv_builder_uses_base_python_outside_active_venv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = root / "deploy-tooling" / ".venv"
+            active_python = active / "bin" / "python"
+            base_python = root / "system-python"
+            active_python.parent.mkdir(parents=True)
+            active_python.write_text("", encoding="utf-8")
+            base_python.write_text("", encoding="utf-8")
+
+            with (
+                patch.object(deploy_runtime.sys, "prefix", str(active)),
+                patch.object(deploy_runtime.sys, "base_prefix", str(root / "base-prefix")),
+                patch.object(deploy_runtime.sys, "executable", str(active_python)),
+                patch.object(deploy_runtime.sys, "_base_executable", str(base_python), create=True),
+            ):
+                self.assertEqual(
+                    deploy_runtime.runtime_venv_builder_python(),
+                    base_python.resolve(),
+                )
+
+    def test_runtime_venv_builder_rejects_only_active_venv_python(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = root / "deploy-tooling" / ".venv"
+            active_python = active / "bin" / "python"
+            active_python.parent.mkdir(parents=True)
+            active_python.write_text("", encoding="utf-8")
+
+            with (
+                patch.object(deploy_runtime.sys, "prefix", str(active)),
+                patch.object(deploy_runtime.sys, "base_prefix", str(root / "base-prefix")),
+                patch.object(deploy_runtime.sys, "executable", str(active_python)),
+                patch.object(deploy_runtime.sys, "_base_executable", "", create=True),
+            ):
+                with self.assertRaisesRegex(deploy_runtime.DeployError, "Basis-Python"):
+                    deploy_runtime.runtime_venv_builder_python()
+
     def test_build_release_creates_venv_at_final_release_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             snapshot = self._snapshot()
+            active = root / "deploy-tooling" / ".venv"
+            active_python = active / "bin" / "python"
+            base_python = root / "system-python"
+            active_python.parent.mkdir(parents=True)
+            active_python.write_text("", encoding="utf-8")
+            base_python.write_text("", encoding="utf-8")
             created_venv: list[Path] = []
+            venv_argv: list[list[str]] = []
 
             def fake_run(argv, **kwargs):
-                if argv[:3] == [sys.executable, "-m", "venv"]:
-                    venv = Path(argv[3])
-                    created_venv.append(venv)
-                    (venv / "bin").mkdir(parents=True)
-                    (venv / "bin/python").write_text("", encoding="utf-8")
+                if argv[1:3] == ["-m", "venv"]:
+                    venv_argv.append(list(argv))
+                    if argv[0] == str(base_python.resolve()):
+                        venv = Path(argv[3])
+                        created_venv.append(venv)
+                        (venv / "bin").mkdir(parents=True)
+                        (venv / "bin/python").write_text("", encoding="utf-8")
                 return self._completed(argv)
 
             with (
+                patch.object(deploy_runtime.sys, "prefix", str(active)),
+                patch.object(deploy_runtime.sys, "base_prefix", str(root / "base-prefix")),
+                patch.object(deploy_runtime.sys, "executable", str(active_python)),
+                patch.object(deploy_runtime.sys, "_base_executable", str(base_python), create=True),
                 patch.object(deploy_runtime, "run", side_effect=fake_run),
                 patch.object(deploy_runtime, "site_packages_path", side_effect=lambda python: python.parents[1] / "lib/python3.10/site-packages"),
                 patch.object(deploy_runtime, "verify_installed_distributions"),
@@ -364,6 +415,7 @@ class DeployRuntimeTests(unittest.TestCase):
                     root / "grabowski-mcp",
                 )
 
+            self.assertEqual(venv_argv, [[str(base_python.resolve()), "-m", "venv", str(result.release_path / ".venv")]])
             self.assertEqual(created_venv, [result.release_path / ".venv"])
             self.assertTrue((result.release_path / "inputs/runtime.lock.txt").is_file())
             self.assertTrue((result.release_path / deploy_runtime.MANIFEST_NAME).is_file())
