@@ -634,9 +634,6 @@ def _validate_policy(policy: Any) -> None:
                 "browser_profile_roots",
                 "secret_export_roots",
                 "capabilities",
-                "allowed_grips",
-                "forbidden_hosts",
-                "max_risk_level",
             }
             missing_profile = sorted(profile_required.difference(profile))
             if missing_profile:
@@ -5435,16 +5432,19 @@ def grip_run(
     _require_capability("terminal_execute")
     if allow_mutation:
         _require_mutations_enabled("terminal_execute")
-    decision = _session_grip_policy_decision(name, parameters or {})
+    raw_parameters = parameters or {}
+    decision = _session_grip_policy_decision(name, raw_parameters)
     if not decision["allowed"]:
         return grabowski_grips._blocked_surface_receipt(
             name,
-            parameters or {},
+            raw_parameters,
             f"session profile blocks grip: {decision}",
         )
+    dispatch_parameters = dict(raw_parameters)
+    dispatch_parameters.pop("session_escalation", None)
     return grabowski_grips.grip_run(
         name,
-        parameters or {},
+        dispatch_parameters,
         profile=profile,
         allow_mutation=allow_mutation,
     )

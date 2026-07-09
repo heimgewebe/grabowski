@@ -1515,7 +1515,7 @@
     },
     "policy_example": {
       "path": "config/access.example.json",
-      "sha256": "04d8f27ee24e42b749c4cc812957eb497190ca7cae4fe38c5170c48622bd09f5"
+      "sha256": "e65dfd1b9020474eba03793e694c47c17de9e92e2a90deb05976c24c4b3dd1c7"
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
@@ -1528,10 +1528,10 @@
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "0dc76988a3a6b9afd44ea05c458e496ad6735c4404cf306afcc862c863c6c8a2",
-      "src/grabowski_grips.py": "86e81271fa447ee5a3145cc515963c4fa3ed1c53eced6cc8eb60f3cd3871d123",
-      "src/grabowski_mcp.py": "b07714a90c6ac33bee500f732ac2b295adbffd8486880d8d71f0f9c754070656",
+      "src/grabowski_grips.py": "f306729e418af7fbd49736c178d5499ee22b71862b0f5c1df082aec072e3ce32",
+      "src/grabowski_mcp.py": "ec4f2704aa051cb51a8a3d97b00f9a11a404f83773f5d4f60573114b5b14715e",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
-      "src/grabowski_operator.py": "813263e87aa26b8b2e3d322bd9723d00bb03e503f8049674dbcc160e99ab3423",
+      "src/grabowski_operator.py": "f78eeccc70a44a9209dcf02823f71b14002c07cc047a7b6f6effd4c542df6669",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",
       "src/grabowski_read_surface.py": "1e8147ea845e8a9cc5ab723140dc996965f7aebb2183af74164de30d24f97928",
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",

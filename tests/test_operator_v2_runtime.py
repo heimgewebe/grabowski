@@ -362,6 +362,56 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "require version 2"):
                     grabowski_mcp._load_policy()
 
+    def test_pre_t006_v2_profiles_project_session_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "work"
+            work.mkdir()
+            policy = root / "access.json"
+            pre_t006 = {
+                "version": 2,
+                "mode": "test",
+                "active_profile": "test",
+                "read_roots": [str(work)],
+                "write_roots": [str(work)],
+                "write_excluded_roots": [],
+                "secret_roots": [],
+                "browser_profile_roots": [],
+                "secret_export_roots": [],
+                "max_read_bytes": 1000,
+                "max_write_bytes": 1000,
+                "max_list_entries": 50,
+                "max_secret_use_output_bytes": 1000,
+                "max_secret_use_seconds": 1,
+                "forbid_symlinks": True,
+                "forbidden_components": [".git"],
+                "forbidden_file_patterns": [".env"],
+                "forbidden_capabilities": [],
+                "profiles": {
+                    "test": {
+                        "description": "pre-T006 profile",
+                        "read_roots": [str(work)],
+                        "write_roots": [str(work)],
+                        "write_excluded_roots": [],
+                        "secret_roots": [],
+                        "browser_profile_roots": [],
+                        "secret_export_roots": [],
+                        "capabilities": ["file_read"],
+                    }
+                },
+            }
+            policy.write_text(json.dumps(pre_t006) + "\n", encoding="utf-8")
+            with patch.object(grabowski_mcp, "POLICY_PATH", policy):
+                loaded = grabowski_mcp._load_policy()
+                contract = grabowski_mcp._session_profile_contract(loaded)
+
+            self.assertEqual(contract["profile"], "test")
+            self.assertEqual(contract["read_roots"], [str(work)])
+            self.assertEqual(contract["write_roots"], [str(work)])
+            self.assertEqual(contract["allowed_grips"], ["*"])
+            self.assertEqual(contract["forbidden_hosts"], [])
+            self.assertEqual(contract["max_risk_level"], "high")
+
     def test_session_profile_contract_and_grip_policy_are_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -444,19 +494,28 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertFalse(missing["allowed"])
                 self.assertIn("session_escalation", missing["escalation_error"])
 
+                valid_parameters = {
+                    "actions": [],
+                    "session_escalation": {
+                        "target": {"repo": "heimgewebe/grabowski"},
+                        "reason": "bounded test",
+                        "expires_at_unix": int(__import__("time").time()) + 60,
+                        "recovery": {"plan": "no mutation in this unit test"},
+                    },
+                }
                 valid = grabowski_mcp._session_grip_policy_decision(
                     "captain-run",
-                    {
-                        "actions": [],
-                        "session_escalation": {
-                            "target": {"repo": "heimgewebe/grabowski"},
-                            "reason": "bounded test",
-                            "expires_at_unix": int(__import__("time").time()) + 60,
-                            "recovery": {"plan": "no mutation in this unit test"},
-                        },
-                    },
+                    valid_parameters,
                 )
                 self.assertTrue(valid["allowed"])
+
+                with patch.object(grabowski_mcp.grabowski_grips, "grip_run", return_value={"ok": True}) as run:
+                    result = grabowski_mcp.grip_run("captain-run", valid_parameters)
+
+                self.assertEqual(result, {"ok": True})
+                dispatched = run.call_args.args[1]
+                self.assertNotIn("session_escalation", dispatched)
+                self.assertEqual(dispatched, {"actions": []})
 
     def test_session_forbidden_hosts_block_operator_argv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
