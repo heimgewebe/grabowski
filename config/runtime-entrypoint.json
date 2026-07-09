@@ -118,6 +118,10 @@
       "source": "src/grabowski_grips.py"
     },
     {
+      "module": "grabowski_grip_orchestration",
+      "source": "src/grabowski_grip_orchestration.py"
+    },
+    {
       "module": "grabowski_capabilities",
       "source": "src/grabowski_capabilities.py"
     },

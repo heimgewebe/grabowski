@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import inspect
 import json
 import sys
 import tempfile
@@ -10,6 +11,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import grabowski_grips as grips
+import grabowski_grip_orchestration as grip_orchestration
 
 
 class FakeGit:
@@ -571,6 +573,22 @@ class WorktreeOrientCleanupTests(unittest.TestCase):
 
 
 class GripFoundationTests(unittest.TestCase):
+    def test_orchestration_runners_live_outside_core_grip_surface(self) -> None:
+        core_source = inspect.getsource(grips)
+        orchestration_source = inspect.getsource(grip_orchestration)
+
+        for name in ("run_mechanic_loop", "run_captain_preflight", "run_captain_run"):
+            self.assertIn(f"def {name}", orchestration_source)
+        for name in ("_run_mechanic_loop", "_run_captain_preflight", "_run_captain_run"):
+            wrapper_source = inspect.getsource(getattr(grips, name))
+            self.assertIn("grabowski_grip_orchestration.", wrapper_source)
+            self.assertNotIn("for action in actions", wrapper_source)
+            self.assertNotIn("executions: list", wrapper_source)
+        self.assertIn("for action in actions", orchestration_source)
+        self.assertIn("core.run_grip", orchestration_source)
+        self.assertIn("core._run_captain_pr_merge", orchestration_source)
+        self.assertIn("grabowski_grip_orchestration", core_source)
+
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}
