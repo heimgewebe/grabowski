@@ -12,6 +12,7 @@ Each line follows `contracts/operator-friction-event.v1.schema.json`.
 
 - `platform_filter`: ChatGPT/OpenAI refused or blocked a tool call before the host executed it.
 - `connector_snapshot`: Local runtime and the ChatGPT tool snapshot disagreed.
+- `connector_transport`: ChatGPT-to-Grabowski connector transport failed, for example 502 upstream errors, MCP stream exceptions or connector-side timeouts.
 - `fail_closed_gate`: A Grabowski safety gate intentionally stopped execution.
 - `execution_context`: Different shell, agent, SSH or environment context changed behavior.
 - `ci_contract`: CI or repository contract rejected a change.
@@ -36,9 +37,29 @@ Example:
 
 ## Review loop
 
-Periodically run `grabowski_friction_summary`. Recurring `platform_filter` entries should become typed tools or smaller workflows. Recurring `connector_snapshot` entries require a connector refresh gate. Recurring `fail_closed_gate` entries usually mean the gate is doing its job; improve the runbook, not the permission surface.
+Periodically run `grabowski_friction_summary`. Recurring `platform_filter` entries should become typed tools or smaller workflows. Recurring `connector_snapshot` entries require a connector refresh gate. Recurring `connector_transport` entries require bounded transport diagnostics and narrower call shapes, not blind retry loops. Recurring `fail_closed_gate` entries usually mean the gate is doing its job; improve the runbook, not the permission surface.
 
 The summary also emits `next_grip_proposals`. These are proposal-only, read-only recommendations. They group repeated command-chain, blocked-gate, stale-snapshot, review-loop and missing-receipt-field patterns, link recommendations to bounded unresolved `event_id` evidence, and state what the evidence does not prove. Matching is heuristic: one event can support multiple proposal groups, unmatched events do not prove the absence of friction, and recommendations do not prove root cause or implementation readiness. They do not create Bureau tasks, change queue priority, execute grips, resume tasks, merge, deploy or authorize policy exceptions.
+
+## Connector transport failures
+
+Treat 502 upstream errors, `streamable_http` exceptions, `Received exception from stream`, MCP `POST /mcp` stream failures and connector-side timeouts as `connector_transport`, not as command return codes and not as policy-gate results.
+
+Minimum bounded probe after a connector transport failure:
+
+1. Read `grabowski_status` to check runtime contract and client snapshot visibility.
+2. Read `grabowski_service_status` for `grabowski-operator.service` and `tunnel-client-grabowski.service`.
+3. Inspect only bounded, recent, redacted journal lines for `streamable_http`, `Received exception from stream`, `POST /mcp`, `timeout` and `502`.
+4. Run one adjacent small typed read-only call to see whether the transport path is still failing.
+
+Retry policy:
+
+- Read-only work may be retried once, but only as smaller typed or single-purpose calls.
+- Mutating work must not be retried after a transport failure until the target state is re-read.
+- A successful retry does not prove the first failure was harmless. Keep or record the friction event when it changed the operator path.
+- Do not loop on the same broad command. Split, narrow, or stop and document.
+
+`grabowski_friction_summary` includes `connector_transport_diagnostics`. This is diagnostic guidance only. It does not prove root cause, command success, safe mutation retry, connector vendor repair or transport reliability.
 
 ## Task failure classification loop
 

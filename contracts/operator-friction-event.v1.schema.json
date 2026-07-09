@@ -26,6 +26,7 @@
       "enum": [
         "platform_filter",
         "connector_snapshot",
+        "connector_transport",
         "fail_closed_gate",
         "execution_context",
         "ci_contract",
