@@ -34,6 +34,27 @@ python3 tools/pr_review_gate.py \
   --json
 ```
 
+## Optional agy/Gemini provider
+
+`tools/external_review_agy.py` can produce `--external-review-evidence` from a packet written by `tools/pr_review_gate.py`. It is a convenience provider, not a privileged trust anchor. The tool reads the packet manifest, verifies that the prompt and diff files are inside the packet directory, checks their SHA-256 values against the manifest, builds one inline prompt containing the full diff, invokes `gemini`/`agy` in print mode, stores the raw model response, and writes evidence shaped for the review gate.
+
+```bash
+python3 tools/external_review_agy.py \
+  --manifest evidence/pr-<PR_NUMBER>-external/pr-<PR_NUMBER>-<head>-external-review-manifest.json \
+  --output evidence/pr-<PR_NUMBER>-external/agy-external-review-evidence.json \
+  --model 'Gemini 3.1 Pro (Low)'
+```
+
+The provider intentionally uses the known-good `agy` invocation shape:
+
+```bash
+gemini --print-timeout=<seconds>s --model '<model>' --print '<prompt with full diff>'
+```
+
+Do not pipe the prompt through stdin for this provider; `agy --print` requires the prompt as an argument. Put `--print-timeout` before `--print`, otherwise `agy` can treat timeout flags as prompt text. Because argv transport can expose the prompt briefly to local process observers, use this provider only for review packets that are already acceptable to send to an external model. If the prompt would exceed the configured argv-size budget, the provider fails closed instead of silently dropping or truncating the diff.
+
+Passing provider evidence is created only for `PASS` reviews with `finding_count: 0`. Any `NEEDS_CHANGE`, `BLOCK`, or positive finding count is stored as raw review output and raw findings, but `external_reviews_triaged` remains false so the normal gate blocks until Grabowski records terminal triage in top-level `findings[]`. Upstream failures, timeouts, empty output, invalid JSON, missing packet files, or manifest hash drift also fail closed and must not be treated as evidence.
+
 For external-review-exempt PRs, still pass completed `--self-review` evidence and omit only `--external-review-evidence`. `--claude-evidence` remains accepted as legacy diagnostic input, but it is not required for high-critical PRs and does not replace `--external-review-evidence`.
 
 Minimal self-review evidence object:
