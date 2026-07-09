@@ -1426,6 +1426,10 @@
         "source": "src/grabowski_grips.py"
       },
       {
+        "module": "grabowski_grip_orchestration",
+        "source": "src/grabowski_grip_orchestration.py"
+      },
+      {
         "module": "grabowski_capabilities",
         "source": "src/grabowski_capabilities.py"
       },
@@ -1519,7 +1523,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "9e61fcb5058ae0d355c586e1318802343b141ddc454cb0a8c0a6a90d574246c7"
+      "sha256": "a3fdd357e5a7cafb82ab78b90e9a32866b5eb9cbdae02aa2b4b3b1e82ce13e37"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
@@ -1528,7 +1532,8 @@
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "0dc76988a3a6b9afd44ea05c458e496ad6735c4404cf306afcc862c863c6c8a2",
-      "src/grabowski_grips.py": "f306729e418af7fbd49736c178d5499ee22b71862b0f5c1df082aec072e3ce32",
+      "src/grabowski_grip_orchestration.py": "5d3994e2b4ce45c745035ff7a970f93f78fe8a434673c25803cfb3e18bd1c03a",
+      "src/grabowski_grips.py": "f144cbb437692e7344f7d0400593cd2b38987d47ce02ddd702ef44abaaf44a4a",
       "src/grabowski_mcp.py": "89037697453b60a447eee4390d1bdf88c26415ac2a00107fe7d5a5b900142c69",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "abc216ce3e6febaa486fe6703bc040d6b517f0d775512573c42ea7e3ec1f68a9",
