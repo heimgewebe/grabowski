@@ -879,15 +879,24 @@ def _host_candidates_from_token(token: str) -> set[str]:
     return candidates
 
 
+def _token_matches_forbidden_host(token: str, forbidden: set[str]) -> str | None:
+    normalized = token.lower()
+    if normalized in forbidden:
+        return normalized
+    candidates = _host_candidates_from_token(token)
+    blocked = sorted(candidates & forbidden)
+    return blocked[0] if blocked else None
+
+
 def _reject_forbidden_hosts_in_argv(argv: list[str]) -> None:
     policy = _load_policy()
     forbidden = {host.lower() for host in _profile_string_list(policy, "forbidden_hosts", [])}
     if not forbidden:
         return
-    candidates = {candidate for token in argv for candidate in _host_candidates_from_token(token)}
-    blocked = sorted(candidates & forbidden)
-    if blocked:
-        raise PermissionError(f"Forbidden host in command arguments: {blocked[0]}")
+    for token in argv:
+        blocked = _token_matches_forbidden_host(token, forbidden)
+        if blocked:
+            raise PermissionError(f"Forbidden host in command arguments: {blocked}")
 
 
 def _policy_limit(policy: dict[str, Any], key: str) -> int:
@@ -5423,6 +5432,9 @@ def grip_run(
     allow_mutation: bool = False,
 ) -> dict[str, Any]:
     """Run one allowlisted Grabowski grip and return its receipt-bound result."""
+    _require_capability("terminal_execute")
+    if allow_mutation:
+        _require_mutations_enabled("terminal_execute")
     decision = _session_grip_policy_decision(name, parameters or {})
     if not decision["allowed"]:
         return grabowski_grips._blocked_surface_receipt(
@@ -5430,9 +5442,6 @@ def grip_run(
             parameters or {},
             f"session profile blocks grip: {decision}",
         )
-    _require_capability("terminal_execute")
-    if allow_mutation:
-        _require_mutations_enabled("terminal_execute")
     return grabowski_grips.grip_run(
         name,
         parameters or {},

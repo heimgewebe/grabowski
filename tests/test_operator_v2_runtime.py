@@ -406,6 +406,27 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertFalse(blocked_high["allowed_by_risk"])
                 self.assertFalse(blocked_high["escalation_valid"])
 
+    def test_grip_run_checks_capability_before_session_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root,
+                capabilities=["file_read"],
+            )
+            policy = json.loads((root / "access.json").read_text(encoding="utf-8"))
+            policy["profiles"]["test"]["allowed_grips"] = ["repo-orient"]
+            policy["profiles"]["test"]["max_risk_level"] = "low"
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
+                grabowski_mcp, "_load_policy", return_value=policy
+            ):
+                with self.assertRaisesRegex(PermissionError, "terminal_execute"):
+                    grabowski_mcp.grip_run(
+                        "branch-publish",
+                        {"repo": str(work), "branch": "x", "expected_head": "0" * 40},
+                        profile="operator",
+                        allow_mutation=True,
+                    )
+
     def test_high_risk_grip_requires_explicit_session_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -453,6 +474,15 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "prod.example", "hostname"])
                 with self.assertRaisesRegex(PermissionError, "Forbidden host"):
                     grabowski_mcp._reject_forbidden_hosts_in_argv(["curl", "https://prod.example/status"])
+
+                policy["profiles"]["test"]["forbidden_hosts"] = ["wg-prod-1", "heim-pc", "heimserver"]
+                with self.assertRaisesRegex(PermissionError, "wg-prod-1"):
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "wg-prod-1", "hostname"])
+                with self.assertRaisesRegex(PermissionError, "heim-pc"):
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heim-pc", "hostname"])
+                with self.assertRaisesRegex(PermissionError, "heimserver"):
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heimserver", "hostname"])
+                grabowski_mcp._reject_forbidden_hosts_in_argv(["echo", "heim", "pc", "hostname"])
 
     def test_write_outside_profile_scope_remains_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
