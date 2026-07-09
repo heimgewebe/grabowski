@@ -885,9 +885,9 @@ def _token_matches_forbidden_host(token: str, forbidden: set[str]) -> str | None
     return blocked[0] if blocked else None
 
 
-def _reject_forbidden_hosts_in_argv(argv: list[str]) -> None:
-    policy = _load_policy()
-    forbidden = {host.lower() for host in _profile_string_list(policy, "forbidden_hosts", [])}
+def _reject_forbidden_hosts_in_argv(argv: list[str], *, policy: dict[str, Any] | None = None) -> None:
+    source_policy = policy or _load_policy()
+    forbidden = {host.lower() for host in _profile_string_list(source_policy, "forbidden_hosts", [])}
     if not forbidden:
         return
     for token in argv:

@@ -530,19 +530,19 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 grabowski_mcp, "_load_policy", return_value=policy
             ):
                 with self.assertRaisesRegex(PermissionError, "Forbidden host"):
-                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "prod.example", "hostname"])
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "prod.example", "hostname"], policy=policy)
                 with self.assertRaisesRegex(PermissionError, "Forbidden host"):
-                    grabowski_mcp._reject_forbidden_hosts_in_argv(["curl", "https://prod.example/status"])
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(["curl", "https://prod.example/status"], policy=policy)
 
                 policy["profiles"]["test"]["forbidden_hosts"] = ["wg-prod-1", "heim-pc", "heimserver"]
                 with self.assertRaisesRegex(PermissionError, "wg-prod-1"):
-                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "wg-prod-1", "hostname"])
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "wg-prod-1", "hostname"], policy=policy)
                 with self.assertRaisesRegex(PermissionError, "heim-pc"):
-                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heim-pc", "hostname"])
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heim-pc", "hostname"], policy=policy)
                 with self.assertRaisesRegex(PermissionError, "heimserver"):
-                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heimserver", "hostname"])
-                grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heimberry", "hostname"])
-                grabowski_mcp._reject_forbidden_hosts_in_argv(["echo", "heim", "pc", "hostname"])
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heimserver", "hostname"], policy=policy)
+                grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heimberry", "hostname"], policy=policy)
+                grabowski_mcp._reject_forbidden_hosts_in_argv(["echo", "heim", "pc", "hostname"], policy=policy)
 
     def test_write_outside_profile_scope_remains_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
