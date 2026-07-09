@@ -53,6 +53,7 @@ known_capabilities = {
     "process_signal",
     "port_inspect",
     "privileged_reference",
+    "power_execute",
     "resource_lease",
     "artifact_transfer",
     "browser_worker",

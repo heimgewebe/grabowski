@@ -345,6 +345,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_power_run": {
+        "category": "privileged-execution",
+        "purpose": "Run one audited root command through the recovery-gated power broker.",
+        "risk_class": "critical",
+        "effects": ["root-command-dependent", "host-state-change"],
+        "reversibility": "command-dependent-with-recovery-evidence",
+    },
     "grabowski_fleet_list": {
         "category": "fleet",
         "purpose": "Return the validated local and SSH host registry.",

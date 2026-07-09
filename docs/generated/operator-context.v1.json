@@ -746,6 +746,20 @@
       "tool": "grabowski_privileged_action_reference"
     },
     {
+      "category": "privileged-execution",
+      "description": "Run one audited root command through the recovery-gated power broker.",
+      "effects": [
+        "root-command-dependent",
+        "host-state-change"
+      ],
+      "id": "grabowski_power_run",
+      "purpose": "Run one audited root command through the recovery-gated power broker.",
+      "read_only": false,
+      "reversibility": "command-dependent-with-recovery-evidence",
+      "risk_class": "critical",
+      "tool": "grabowski_power_run"
+    },
+    {
       "category": "fleet",
       "description": "Return the validated local and SSH host registry.",
       "effects": [],
@@ -1357,6 +1371,7 @@
       "grabowski_process_signal",
       "grabowski_ports",
       "grabowski_privileged_action_reference",
+      "grabowski_power_run",
       "grabowski_fleet_list",
       "grabowski_fleet_run",
       "grabowski_operation_list",
@@ -1496,28 +1511,28 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "ce9b8f113e877ecd899038a6744536ab5780aa6d1858e578c153d8d51079504b"
+      "sha256": "da9643676ebf42ec4a978e16b33f9952edd70deafbfef955c516dbd5169ecfde"
     },
     "policy_example": {
       "path": "config/access.example.json",
-      "sha256": "39423d62e1a69b3d1d6f7c37281884b0cf7ab9756e9bf80c2b9ea41a1f2ad6df"
+      "sha256": "04d8f27ee24e42b749c4cc812957eb497190ca7cae4fe38c5170c48622bd09f5"
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "73e027b006ec8cf283a935cba8bf2669f0827afab417588c2303211e31eca4ff"
+      "sha256": "9e61fcb5058ae0d355c586e1318802343b141ddc454cb0a8c0a6a90d574246c7"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "ce9b8f113e877ecd899038a6744536ab5780aa6d1858e578c153d8d51079504b",
+      "src/grabowski_capabilities.py": "da9643676ebf42ec4a978e16b33f9952edd70deafbfef955c516dbd5169ecfde",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "c81842fd18772dd9a8696a7ae715b950007704f000d0d8559bc3f3b793cf38bd",
       "src/grabowski_grips.py": "86e81271fa447ee5a3145cc515963c4fa3ed1c53eced6cc8eb60f3cd3871d123",
-      "src/grabowski_mcp.py": "c98c87685c81b62a734c22b3111f21d95e88f59b5913da263a1abf5d46e95a37",
+      "src/grabowski_mcp.py": "e02e5a59075109c93351f267aa4758575704e0b982dc1b9b9552a13eb1f20794",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
-      "src/grabowski_operator.py": "d54b32135b33282d8efd1c18b932f7710b7e85f8aae771f7c600711b0b639914",
-      "src/grabowski_privileged.py": "532da0df30daa4c10dd94a9cebb773765ce03fec778ae6bebe367a28a2904519",
+      "src/grabowski_operator.py": "813263e87aa26b8b2e3d322bd9723d00bb03e503f8049674dbcc160e99ab3423",
+      "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",
       "src/grabowski_read_surface.py": "1e8147ea845e8a9cc5ab723140dc996965f7aebb2183af74164de30d24f97928",
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
       "src/grabowski_recovery.py": "b0c5124271498639f6c16614ccb51f7b3b696ebfd88011ad2291d353e56d0fe6",

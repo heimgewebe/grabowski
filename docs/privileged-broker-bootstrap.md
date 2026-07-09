@@ -20,6 +20,8 @@ Danach wird eine Systemgruppe `grabowski` angelegt, der Operator dieser Gruppe h
 
 Die mitgelieferte Konfiguration enthält nur deaktivierte Beispielaktionen. `edit_system_service` bleibt ein deaktiviertes Restart-Beispiel; `reset_failed_systemd_unit` ist ein enger Pfad für `systemctl reset-failed {target}` und ist ebenfalls standardmäßig deaktiviert. Eine Aktivierung ist erst zulässig, nachdem Zielregex, absolutes argv-Template und Timeout einzeln geprüft wurden. Der Platzhalter `{target}` darf ausschließlich als vollständiges argv-Token vorkommen.
 
+`operator_power_argv` ist der maximale Operatorpfad. Er nutzt `mode=argv-json`; `target` enthält ein JSON-Objekt mit `argv` und `cwd`. Der Broker verlangt absolute Executables, bounded argv-Länge, `cwd_pattern`, Timeout und eine explizite `allow_shell`-Entscheidung. Mit `allow_shell=false` sind nur direkte bekannte Shell-Executables blockiert; das ist keine Sandbox und verhindert keine Interpreter wie Python, awk oder busybox. Mit `allow_shell=true` wird auch die direkte Shell-Form bewusst zugelassen. In beiden Fällen darf die Aktion nur mit root-seitiger `gate`-Prüfung für Kill-Switch und frische Recovery-Marker aktiviert werden.
+
 `reset_failed_systemd_unit` darf nur Failed-State-Metadaten einer explizit gematchten `.service`-Unit löschen. Der Pfad darf keine Units starten, stoppen, restarten, enablen, disablen oder editieren. Für Fälle wie einen stale `user@111.service`-Fail bleibt vor der Ausführung eine read-only Prüfung von `systemctl --failed` und `getent passwd <uid>` nötig.
 
 ## Abnahme
@@ -30,4 +32,4 @@ Die mitgelieferte Konfiguration enthält nur deaktivierte Beispielaktionen. `edi
 4. Ein freigegebener Testdienst kann neu gestartet werden; Audit enthält nur Hashes und Status.
 5. Nach Deaktivierung der Aktion wird derselbe Auftrag wieder abgelehnt.
 
-Die Root-Stufe ist kein generischer Shellzugang. Neue Aktionsklassen benötigen jeweils ein neues festes Template und eigene Tests.
+Die Root-Stufe ist standardmäßig kein generischer Shellzugang. Generische Root-Handlungsfähigkeit existiert nur über `operator_power_argv`, bleibt in der Beispielkonfiguration deaktiviert und benötigt eigene Tests, Recovery-Gate und Audit-Evidence.

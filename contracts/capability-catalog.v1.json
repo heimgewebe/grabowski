@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "ce9b8f113e877ecd899038a6744536ab5780aa6d1858e578c153d8d51079504b",
+  "capability_source_sha256": "da9643676ebf42ec4a978e16b33f9952edd70deafbfef955c516dbd5169ecfde",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "73e027b006ec8cf283a935cba8bf2669f0827afab417588c2303211e31eca4ff",
+  "contract_sha256": "9e61fcb5058ae0d355c586e1318802343b141ddc454cb0a8c0a6a90d574246c7",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -756,6 +756,20 @@
       "reversibility": "not-applicable",
       "risk_class": "medium",
       "tool": "grabowski_privileged_action_reference"
+    },
+    {
+      "category": "privileged-execution",
+      "description": "Run one audited root command through the recovery-gated power broker.",
+      "effects": [
+        "root-command-dependent",
+        "host-state-change"
+      ],
+      "id": "grabowski_power_run",
+      "purpose": "Run one audited root command through the recovery-gated power broker.",
+      "read_only": false,
+      "reversibility": "command-dependent-with-recovery-evidence",
+      "risk_class": "critical",
+      "tool": "grabowski_power_run"
     },
     {
       "category": "fleet",
