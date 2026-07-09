@@ -872,7 +872,9 @@ class GripFoundationTests(unittest.TestCase):
         )
 
         self.assertEqual("blocked", result["receipt"]["status"])
-        self.assertIn("target_change record is required", result["output"]["error"])
+        target_change_gate = next(gate for gate in result["output"]["gates"] if gate["id"] == "target-change-record")
+        self.assertEqual("blocked", target_change_gate["status"])
+        self.assertTrue(any("target_change record is required" in reason for reason in result["output"]["blocked_reasons"]))
 
     def test_captain_preflight_is_captain_only_surface(self) -> None:
         result = grips.grip_run(
@@ -1071,7 +1073,9 @@ class GripFoundationTests(unittest.TestCase):
         )
 
         self.assertEqual("blocked", result["receipt"]["status"])
-        self.assertIn("irreversibility must be reversible or irreversible", result["output"]["error"])
+        recovery_gate = next(gate for gate in result["output"]["gates"] if gate["id"] == "recovery-or-irreversibility")
+        self.assertEqual("blocked", recovery_gate["status"])
+        self.assertTrue(any("irreversibility must be reversible or irreversible" in reason for reason in result["output"]["blocked_reasons"]))
 
     def test_mechanic_allowlists_do_not_overlap_captain_surfaces(self) -> None:
         self.assertLessEqual(grips.MECHANIC_NORMAL_GRIPS, grips.GRIP_SPECS.keys())
@@ -1886,6 +1890,14 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def gate(self, result: dict[str, object], gate_id: str) -> dict[str, object]:
         return next(item for item in result["output"]["gates"] if item["id"] == gate_id)
+
+    def assert_blocked_gate_reason(self, result: dict[str, object], gate_id: str, fragment: str) -> None:
+        gate = self.gate(result, gate_id)
+        self.assertEqual("blocked", gate["status"])
+        self.assertTrue(
+            any(fragment in str(reason) for reason in result["output"]["blocked_reasons"]),
+            result["output"]["blocked_reasons"],
+        )
 
     def test_all_gates_pass_yields_only_manual_decision_and_no_execution(self) -> None:
         result = self.run_captain(captain_parameters())
@@ -2912,16 +2924,16 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(captain_parameters([captain_action(risk={"risk_level": "high"})]))
 
         self.assertEqual("blocked", result["receipt"]["status"])
-        self.assertIn("risk requires recovery_path or irreversible risk record", result["output"]["error"])
+        self.assert_blocked_gate_reason(result, "recovery-or-irreversibility", "risk requires recovery_path or irreversible risk record")
 
     def test_irreversible_requires_irreversibility_record(self) -> None:
         action = captain_action(risk={"risk_level": "high", "irreversibility": "irreversible"})
         result = self.run_captain(captain_parameters([action]))
-        self.assertIn("irreversibility_record is required", result["output"]["error"])
+        self.assert_blocked_gate_reason(result, "recovery-or-irreversibility", "irreversibility_record is required")
 
         action["irreversibility_record"] = {}
         empty_record = self.run_captain(captain_parameters([action]))
-        self.assertIn("irreversibility_record is required", empty_record["output"]["error"])
+        self.assert_blocked_gate_reason(empty_record, "recovery-or-irreversibility", "irreversibility_record is required")
 
         action["irreversibility_record"] = {"reason": "merge rewrites main history context", "accepted_by": "alex"}
         recorded = self.run_captain(captain_parameters([action]))
@@ -2986,7 +2998,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         ):
             result = self.run_captain(captain_parameters([captain_action(target=target)]))
             self.assertEqual("blocked", result["receipt"]["status"])
-            self.assertIn("target", result["output"]["error"])
+            self.assert_blocked_gate_reason(result, "target-bound", "target")
 
     def test_runtime_deploy_requires_runtime_target(self) -> None:
         action = captain_action(
@@ -2995,7 +3007,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             receipt_path="receipts/captain/runtime-deploy.json",
         )
         result = self.run_captain(captain_parameters([action]))
-        self.assertIn("environment or runtime_target", result["output"]["error"])
+        self.assert_blocked_gate_reason(result, "target-bound", "environment or runtime_target")
 
         for target in (
             {"repo": "heimgewebe/grabowski", "service": "grabowski-mcp", "environment": "heim-pc"},
@@ -3004,7 +3016,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         ):
             bad = captain_action(action="runtime-deploy", target=target, receipt_path="receipts/captain/runtime-deploy.json")
             blocked = self.run_captain(captain_parameters([bad]))
-            self.assertIn("target", blocked["output"]["error"])
+            self.assert_blocked_gate_reason(blocked, "target-bound", "target")
 
         action["target"] = {"service": "grabowski-mcp", "environment": "heim-pc"}
         parameters = captain_parameters([action])
@@ -3026,7 +3038,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         ):
             result = self.run_captain(captain_parameters([captain_action(**base, target=target)]))
             self.assertEqual("blocked", result["receipt"]["status"])
-            self.assertIn("target", result["output"]["error"])
+            self.assert_blocked_gate_reason(result, "target-bound", "target")
 
     def test_fleet_mutation_requires_concrete_target_and_explicit_operation(self) -> None:
         base = {"action": "fleet-mutation", "receipt_path": "receipts/captain/fleet-mutation.json"}
@@ -3038,7 +3050,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         ):
             result = self.run_captain(captain_parameters([captain_action(**base, target=target)]))
             self.assertEqual("blocked", result["receipt"]["status"])
-            self.assertIn("target", result["output"]["error"])
+            self.assert_blocked_gate_reason(result, "target-bound", "target")
 
     def test_cleanup_apply_requires_cleanup_target_and_location(self) -> None:
         base = {"action": "cleanup-apply", "receipt_path": "receipts/captain/cleanup-apply.json"}
@@ -3052,14 +3064,14 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         ):
             result = self.run_captain(captain_parameters([captain_action(**base, target=target)]))
             self.assertEqual("blocked", result["receipt"]["status"])
-            self.assertIn("target", result["output"]["error"])
+            self.assert_blocked_gate_reason(result, "target-bound", "target")
 
     def test_target_change_must_be_non_empty_when_required_or_provided(self) -> None:
         result = self.run_captain(captain_parameters([captain_action(target_change_required=True, target_change={})]))
-        self.assertIn("target_change must be a non-empty object", result["output"]["error"])
+        self.assert_blocked_gate_reason(result, "target-change-record", "target_change must be a non-empty object")
 
         provided = self.run_captain(captain_parameters([captain_action(target_change={})]))
-        self.assertIn("target_change must be a non-empty object", provided["output"]["error"])
+        self.assert_blocked_gate_reason(provided, "target-change-record", "target_change must be a non-empty object")
 
         valid = self.run_captain(captain_parameters([captain_action(target_change={"from": "head-a", "to": "head-b"})]))
         self.assertEqual("ready_for_manual_captain_decision", valid["output"]["gate_decision"])
@@ -3090,7 +3102,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_reversible_action_requires_recovery_path(self) -> None:
         result = self.run_captain(captain_parameters([captain_action(risk={"risk_level": "high", "irreversibility": "reversible"})]))
-        self.assertIn("recovery_path is required for reversible actions", result["output"]["error"])
+        self.assert_blocked_gate_reason(result, "recovery-or-irreversibility", "recovery_path is required for reversible actions")
 
     def test_valid_non_pr_merge_action_envelopes_reach_gate_evaluation(self) -> None:
         actions = [

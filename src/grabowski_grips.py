@@ -2207,7 +2207,7 @@ def _captain_attach_action_digests(actions: list[dict[str, Any]]) -> list[dict[s
         action["envelope"]["actions_sha256"] = actions_sha256
     return actions
 
-def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
+def _captain_actions(parameters: dict[str, Any], *, gate_native_validation: bool = False) -> list[dict[str, Any]]:
     value = parameters.get("actions")
     if not isinstance(value, list) or not value:
         raise GripPreflightError("actions must be a non-empty list")
@@ -2229,34 +2229,62 @@ def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
         role = item.get("role")
         if role is not None and role != "captain":
             raise GripPreflightError(f"actions[{index}].role must be captain when provided")
-        target = _bound_mapping(item.get("target"), context=f"actions[{index}]", name="target")
-        _validate_captain_target(action_name, target, index=index)
-        scope = _bound_mapping(item.get("scope"), context=f"actions[{index}]", name="scope")
-        scope_findings = _captain_scope_findings(scope, index=index)
-        risk = _bound_mapping(item.get("risk"), context=f"actions[{index}]", name="risk")
+        target_findings: list[str] = []
+        scope_findings: list[str] = []
+        risk_findings: list[str] = []
+        target_change_findings: list[str] = []
+        try:
+            target = _bound_mapping(item.get("target"), context=f"actions[{index}]", name="target")
+            _validate_captain_target(action_name, target, index=index)
+        except GripPreflightError as exc:
+            if not gate_native_validation:
+                raise
+            target = item.get("target") if isinstance(item.get("target"), dict) else {}
+            target_findings.append(str(exc))
+        try:
+            scope = _bound_mapping(item.get("scope"), context=f"actions[{index}]", name="scope")
+            scope_findings = _captain_scope_findings(scope, index=index)
+        except GripPreflightError as exc:
+            if not gate_native_validation:
+                raise
+            scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
+            scope_findings = [str(exc)]
+        try:
+            risk = _bound_mapping(item.get("risk"), context=f"actions[{index}]", name="risk")
+        except GripPreflightError as exc:
+            if not gate_native_validation:
+                raise
+            risk = item.get("risk") if isinstance(item.get("risk"), dict) else {}
+            risk_findings.append(str(exc))
         recovery_path = risk.get("recovery_path")
         irreversibility = risk.get("irreversibility")
         if irreversibility is not None and irreversibility not in {"reversible", "irreversible"}:
-            raise GripPreflightError(f"actions[{index}].risk.irreversibility must be reversible or irreversible")
+            risk_findings.append(f"actions[{index}].risk.irreversibility must be reversible or irreversible")
         has_recovery_path = isinstance(recovery_path, str) and bool(recovery_path.strip())
         if irreversibility == "reversible" and not has_recovery_path:
-            raise GripPreflightError(f"actions[{index}].risk.recovery_path is required for reversible actions")
+            risk_findings.append(f"actions[{index}].risk.recovery_path is required for reversible actions")
         irreversibility_record = item.get("irreversibility_record")
         if irreversibility == "irreversible" and (not isinstance(irreversibility_record, dict) or not irreversibility_record):
-            raise GripPreflightError(f"actions[{index}].irreversibility_record is required for irreversible actions")
+            risk_findings.append(f"actions[{index}].irreversibility_record is required for irreversible actions")
         if not has_recovery_path and irreversibility != "irreversible":
-            raise GripPreflightError(f"actions[{index}].risk requires recovery_path or irreversible risk record")
+            risk_findings.append(f"actions[{index}].risk requires recovery_path or irreversible risk record")
+        if risk_findings and not gate_native_validation:
+            raise GripPreflightError(risk_findings[0])
         target_change_required = item.get("target_change_required", False)
         if not isinstance(target_change_required, bool):
-            raise GripPreflightError(f"actions[{index}].target_change_required must be a boolean when provided")
+            target_change_findings.append(f"actions[{index}].target_change_required must be a boolean when provided")
+            target_change_required = False
         target_change = item.get("target_change")
         if target_change is not None:
             if not isinstance(target_change, dict):
-                raise GripPreflightError(f"actions[{index}].target_change must be an object or null")
-            if not target_change:
-                raise GripPreflightError(f"actions[{index}].target_change must be a non-empty object when provided")
+                target_change_findings.append(f"actions[{index}].target_change must be an object or null")
+                target_change = None
+            elif not target_change:
+                target_change_findings.append(f"actions[{index}].target_change must be a non-empty object when provided")
         if target_change_required and target_change is None:
-            raise GripPreflightError(f"actions[{index}].target_change record is required")
+            target_change_findings.append(f"actions[{index}].target_change record is required")
+        if target_change_findings and not gate_native_validation:
+            raise GripPreflightError(target_change_findings[0])
         receipt_path = _relative_receipt_path(item.get("receipt_path"), context=f"actions[{index}]")
         actions.append(
             {
@@ -2266,7 +2294,10 @@ def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
                 "role": "captain",
                 "target": target,
                 "scope": scope,
+                "target_findings": target_findings,
                 "scope_findings": scope_findings,
+                "risk_findings": risk_findings,
+                "target_change_findings": target_change_findings,
                 "risk": risk,
                 "recovery_path": risk.get("recovery_path"),
                 "irreversibility": risk.get("irreversibility"),
@@ -2670,18 +2701,33 @@ def _captain_authority_gates(
     actions: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     action_names = ", ".join(action["action"] for action in actions)
+    target_findings = [finding for action in actions for finding in action.get("target_findings", [])]
     scope_findings = [finding for action in actions for finding in action["scope_findings"]]
+    risk_findings = [finding for action in actions for finding in action.get("risk_findings", [])]
+    target_change_findings = [finding for action in actions for finding in action.get("target_change_findings", [])]
     projection_gate, projection_info = _captain_status_projection_gate(parameters, actions)
     gates = [
         _captain_gate("high-impact-marked", "pass", f"all requested actions are marked high-impact: {action_names}"),
-        _captain_gate("target-bound", "pass", "every action carries a concrete, action-specific target"),
+        (
+            _captain_gate("target-bound", "blocked", "target must be a concrete, action-specific record", target_findings)
+            if target_findings
+            else _captain_gate("target-bound", "pass", "every action carries a concrete, action-specific target")
+        ),
         (
             _captain_gate("scope-bound", "blocked", "scope must declare visible effect boundaries", scope_findings)
             if scope_findings
             else _captain_gate("scope-bound", "pass", "every action declares a visible scope with effect boundaries")
         ),
-        _captain_gate("target-change-record", "pass", "target changes are explicit records or null"),
-        _captain_gate("recovery-or-irreversibility", "pass", "risk records include recovery or irreversibility; a precondition, not proof of safe execution"),
+        (
+            _captain_gate("target-change-record", "blocked", "target change records must be explicit objects or null", target_change_findings)
+            if target_change_findings
+            else _captain_gate("target-change-record", "pass", "target changes are explicit records or null")
+        ),
+        (
+            _captain_gate("recovery-or-irreversibility", "blocked", "risk records must include recovery or irreversibility evidence", risk_findings)
+            if risk_findings
+            else _captain_gate("recovery-or-irreversibility", "pass", "risk records include recovery or irreversibility; a precondition, not proof of safe execution")
+        ),
         projection_gate,
         _captain_evidence_digest_gate(parameters, actions),
         _captain_execution_authority_gate(parameters, actions),
