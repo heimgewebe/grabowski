@@ -246,6 +246,7 @@ CAPTAIN_GATE_IDS = (
     "target-change-record",
     "recovery-or-irreversibility",
     "status-projection-fresh",
+    "evidence-digest-bound",
     "execution-authority-present",
     "review-evidence-present",
     "diff-bound",
@@ -2145,6 +2146,67 @@ def _captain_scope_findings(scope: dict[str, Any], *, index: int) -> list[str]:
     return findings
 
 
+def _captain_action_index(action: dict[str, Any]) -> int:
+    index = action.get("index")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        envelope = action.get("envelope")
+        if isinstance(envelope, dict):
+            envelope_index = envelope.get("index")
+            if not isinstance(envelope_index, bool) and isinstance(envelope_index, int) and envelope_index >= 0:
+                return envelope_index
+        raise GripPreflightError("Captain action record is missing a non-negative integer index")
+    return index
+
+
+def _captain_action_digest_material(action: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "index": _captain_action_index(action),
+        "role": "captain",
+        "action": action["action"],
+        "high_impact": True,
+        "target": action["target"],
+        "scope": action["scope"],
+        "target_change_required": action["target_change_required"],
+        "target_change": action["target_change"],
+        "risk": action["risk"],
+        "irreversibility_record": action["irreversibility_record"],
+        "receipt_path": action["receipt_path"],
+    }
+
+
+def _captain_action_sha256(action: dict[str, Any]) -> str:
+    return sha256_json(_captain_action_digest_material(action))
+
+
+def _captain_target_sha256(target: dict[str, Any]) -> str:
+    return sha256_json(target)
+
+
+def _captain_actions_sha256(actions: list[dict[str, Any]]) -> str:
+    return sha256_json([
+        {
+            "index": _captain_action_index(action),
+            "action": action["action"],
+            "action_sha256": action["action_sha256"],
+            "target_sha256": action["target_sha256"],
+        }
+        for action in actions
+    ])
+
+
+def _captain_attach_action_digests(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for action in actions:
+        action["target_sha256"] = _captain_target_sha256(action["target"])
+        action["action_sha256"] = _captain_action_sha256(action)
+        action["envelope"]["target_sha256"] = action["target_sha256"]
+        action["envelope"]["action_sha256"] = action["action_sha256"]
+    actions_sha256 = _captain_actions_sha256(actions)
+    for action in actions:
+        action["actions_sha256"] = actions_sha256
+        action["envelope"]["actions_sha256"] = actions_sha256
+    return actions
+
 def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
     value = parameters.get("actions")
     if not isinstance(value, list) or not value:
@@ -2209,24 +2271,29 @@ def _captain_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
                 "recovery_path": risk.get("recovery_path"),
                 "irreversibility": risk.get("irreversibility"),
                 "requires_status_projection": True,
+                "target_change_required": target_change_required,
                 "target_change": target_change,
+                "irreversibility_record": irreversibility_record,
                 "receipt_path": receipt_path,
                 "execution": "not-performed",
                 "envelope": {
                     "schema_version": 1,
+                    "index": index,
                     "role": "captain",
                     "action": action_name,
                     "high_impact": True,
                     "target": target,
                     "scope": scope,
+                    "target_change_required": target_change_required,
                     "target_change": target_change,
                     "risk": risk,
+                    "irreversibility_record": irreversibility_record,
                     "receipt_path": receipt_path,
                     "created_at": utc_now(),
                 },
             }
         )
-    return actions
+    return _captain_attach_action_digests(actions)
 
 
 def _captain_gate(gate_id: str, status: str, reason: str, details: Any = None) -> dict[str, Any]:
@@ -2236,7 +2303,7 @@ def _captain_gate(gate_id: str, status: str, reason: str, details: Any = None) -
     return gate
 
 
-def _captain_status_projection_gate(parameters: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
     fresh = _mechanic_bool(parameters, "status_projection_fresh", False)
     projection = parameters.get("status_projection")
     source = parameters.get("status_projection_source")
@@ -2261,6 +2328,7 @@ def _captain_status_projection_gate(parameters: dict[str, Any]) -> tuple[dict[st
             problems.append("status_projection_sha256_mismatch")
         else:
             info["sha256"] = declared_sha
+        problems.extend(_captain_evidence_digest_binding_errors(projection, evidence_name="status_projection", actions=actions))
         if not fresh:
             problems.append("fresh_status_projection_unavailable")
     if problems:
@@ -2282,6 +2350,69 @@ def _captain_status_projection_gate(parameters: dict[str, Any]) -> tuple[dict[st
         info,
     )
 
+
+def _captain_evidence_digest_binding_errors(
+    evidence: dict[str, Any],
+    *,
+    evidence_name: str,
+    actions: list[dict[str, Any]],
+) -> list[str]:
+    errors: list[str] = []
+    expected_actions_sha256 = _captain_actions_sha256(actions)
+    valid_action_sha256s = {str(action["action_sha256"]) for action in actions}
+    valid_target_sha256s = {str(action["target_sha256"]) for action in actions}
+    declared_actions = evidence.get("actions_sha256")
+    if declared_actions is not None:
+        if not _is_sha256_hex(declared_actions):
+            errors.append(f"{evidence_name}.actions_sha256 must be a SHA-256 hex digest")
+        elif declared_actions != expected_actions_sha256:
+            errors.append(f"{evidence_name}.actions_sha256 mismatch")
+    declared_action = evidence.get("action_sha256")
+    if declared_action is not None:
+        if not _is_sha256_hex(declared_action):
+            errors.append(f"{evidence_name}.action_sha256 must be a SHA-256 hex digest")
+        elif declared_action not in valid_action_sha256s:
+            errors.append(f"{evidence_name}.action_sha256 mismatch")
+    declared_target = evidence.get("target_sha256")
+    if declared_target is not None:
+        if not _is_sha256_hex(declared_target):
+            errors.append(f"{evidence_name}.target_sha256 must be a SHA-256 hex digest")
+        elif declared_target not in valid_target_sha256s:
+            errors.append(f"{evidence_name}.target_sha256 mismatch")
+    return errors
+
+
+def _captain_evidence_digest_gate(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, Any]:
+    problems: list[str] = []
+    projection = parameters.get("status_projection")
+    if isinstance(projection, dict):
+        problems.extend(_captain_evidence_digest_binding_errors(projection, evidence_name="status_projection", actions=actions))
+    for name in ("execution_authority", "review_evidence", "ci_evidence", "human_authorization"):
+        evidence = parameters.get(name)
+        if isinstance(evidence, dict):
+            problems.extend(_captain_evidence_digest_binding_errors(evidence, evidence_name=name, actions=actions))
+    if problems:
+        return _captain_gate(
+            "evidence-digest-bound",
+            "blocked",
+            "Captain evidence digest binding does not match the requested action envelope",
+            problems,
+        )
+    bound_sources = []
+    for name in ("status_projection", "execution_authority", "review_evidence", "ci_evidence", "human_authorization"):
+        evidence = parameters.get(name)
+        if isinstance(evidence, dict) and any(key in evidence for key in ("actions_sha256", "action_sha256", "target_sha256")):
+            bound_sources.append(name)
+    return _captain_gate(
+        "evidence-digest-bound",
+        "pass",
+        "Captain evidence action/target digest bindings are absent or match the requested envelope",
+        {
+            "actions_sha256": _captain_actions_sha256(actions),
+            "bound_sources": sorted(bound_sources),
+            "target_sha256s": [action["target_sha256"] for action in actions],
+        },
+    )
 
 def _captain_evidence_object(parameters: dict[str, Any], name: str) -> dict[str, Any] | None:
     value = parameters.get(name)
@@ -2310,8 +2441,9 @@ def _captain_execution_authority_gate(parameters: dict[str, Any], actions: list[
         problems.append("execution_authority.granted_by must be a non-empty string")
     if not isinstance(evidence.get("reference"), str) or not evidence["reference"].strip():
         problems.append("execution_authority.reference must be a non-empty string")
+    problems.extend(_captain_evidence_digest_binding_errors(evidence, evidence_name="execution_authority", actions=actions))
     if problems:
-        return _captain_gate("execution-authority-present", "blocked", "execution_authority evidence is incomplete", problems)
+        return _captain_gate("execution-authority-present", "blocked", "execution_authority evidence is incomplete or digest-bound to another action", problems)
     return _captain_gate(
         "execution-authority-present",
         "pass",
@@ -2319,7 +2451,7 @@ def _captain_execution_authority_gate(parameters: dict[str, Any], actions: list[
     )
 
 
-def _captain_review_evidence_gate(parameters: dict[str, Any]) -> dict[str, Any]:
+def _captain_review_evidence_gate(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, Any]:
     evidence = parameters.get("review_evidence")
     expected_head = parameters.get("expected_head")
     if not _is_hex_sha(expected_head, lengths=(40,)):
@@ -2337,8 +2469,9 @@ def _captain_review_evidence_gate(parameters: dict[str, Any]) -> dict[str, Any]:
             ["review_evidence_missing"],
         )
     errors = _external_review_evidence_errors(evidence, expected_head=expected_head if isinstance(expected_head, str) else None)
+    errors.extend(_captain_evidence_digest_binding_errors(evidence, evidence_name="review_evidence", actions=actions))
     if errors:
-        return _captain_gate("review-evidence-present", "blocked", "review_evidence is invalid", errors)
+        return _captain_gate("review-evidence-present", "blocked", "review_evidence is invalid or digest-bound to another action", errors)
     return _captain_gate(
         "review-evidence-present",
         "pass",
@@ -2361,7 +2494,7 @@ def _captain_diff_bound_gate(parameters: dict[str, Any]) -> dict[str, Any]:
     return _captain_gate("diff-bound", "pass", "decision is bound to one reviewed diff hash")
 
 
-def _captain_ci_gate(parameters: dict[str, Any]) -> dict[str, Any]:
+def _captain_ci_gate(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, Any]:
     evidence = _captain_evidence_object(parameters, "ci_evidence")
     if evidence is None:
         return _captain_gate("ci-green", "blocked", "ci_evidence is missing", ["ci_evidence_missing"])
@@ -2383,6 +2516,7 @@ def _captain_ci_gate(parameters: dict[str, Any]) -> dict[str, Any]:
         and review["head_sha"] != evidence.get("head_sha")
     ):
         problems.append("ci_evidence.head_sha does not match review_evidence.head_sha")
+    problems.extend(_captain_evidence_digest_binding_errors(evidence, evidence_name="ci_evidence", actions=actions))
     if problems:
         return _captain_gate("ci-green", "blocked", "CI evidence is missing or not green for the bound head", problems)
     return _captain_gate("ci-green", "pass", "CI is green for the bound head; CI proves those jobs only, not production safety")
@@ -2477,8 +2611,9 @@ def _captain_human_authorization_gate(parameters: dict[str, Any], actions: list[
         problems.append("human_authorization.authorized_by must be a non-empty string")
     if not any(isinstance(evidence.get(key), str) and evidence[key].strip() for key in ("statement", "reference")):
         problems.append("human_authorization requires statement or reference")
+    problems.extend(_captain_evidence_digest_binding_errors(evidence, evidence_name="human_authorization", actions=actions))
     if problems:
-        return _captain_gate("human-authorization-present", "blocked", "human_authorization evidence is incomplete", problems)
+        return _captain_gate("human-authorization-present", "blocked", "human_authorization evidence is incomplete or digest-bound to another action", problems)
     return _captain_gate(
         "human-authorization-present",
         "pass",
@@ -2503,10 +2638,15 @@ def _captain_action_record(
         "action": action["action"],
         "high_impact": True,
         "target": action["target"],
+        "target_sha256": action["target_sha256"],
+        "action_sha256": action["action_sha256"],
+        "actions_sha256": action["actions_sha256"],
         "scope": action["scope"],
         "risk": action["risk"],
         "recovery_path": action["recovery_path"],
         "irreversibility": action["irreversibility"],
+        "irreversibility_record": action["irreversibility_record"],
+        "target_change_required": action["target_change_required"],
         "target_change": action["target_change"],
         "status_projection_sha256": projection_info.get("sha256"),
         "status": status,
@@ -2531,7 +2671,7 @@ def _captain_authority_gates(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     action_names = ", ".join(action["action"] for action in actions)
     scope_findings = [finding for action in actions for finding in action["scope_findings"]]
-    projection_gate, projection_info = _captain_status_projection_gate(parameters)
+    projection_gate, projection_info = _captain_status_projection_gate(parameters, actions)
     gates = [
         _captain_gate("high-impact-marked", "pass", f"all requested actions are marked high-impact: {action_names}"),
         _captain_gate("target-bound", "pass", "every action carries a concrete, action-specific target"),
@@ -2543,10 +2683,11 @@ def _captain_authority_gates(
         _captain_gate("target-change-record", "pass", "target changes are explicit records or null"),
         _captain_gate("recovery-or-irreversibility", "pass", "risk records include recovery or irreversibility; a precondition, not proof of safe execution"),
         projection_gate,
+        _captain_evidence_digest_gate(parameters, actions),
         _captain_execution_authority_gate(parameters, actions),
-        _captain_review_evidence_gate(parameters),
+        _captain_review_evidence_gate(parameters, actions),
         _captain_diff_bound_gate(parameters),
-        _captain_ci_gate(parameters),
+        _captain_ci_gate(parameters, actions),
         _captain_autonomy_policy_gate(parameters, actions),
         _captain_human_authorization_gate(parameters, actions),
     ]
