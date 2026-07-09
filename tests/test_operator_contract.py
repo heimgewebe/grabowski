@@ -243,11 +243,15 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(job["scope"]["cwd"], str(cwd.resolve()))
             self.assertEqual(job["scope"]["runtime_seconds"], 60)
             self.assertIn("started_at", job)
+            self.assertTrue(job["started_at"].endswith("Z"))
             self.assertEqual(job["started_at_unix"], job["created_at_unix"])
             self.assertEqual(job["expected_receipt"]["status_tool"], "grabowski_job_status")
             self.assertEqual(job["expected_receipt"]["logs_tool"], "grabowski_job_logs")
-            self.assertEqual(job["final_status"], "started")
-            self.assertEqual(job["terminalization_evidence"]["final_status"], "started")
+            self.assertEqual(job["final_status"], "launch_prepared")
+            self.assertEqual(job["terminalization_evidence"]["final_status"], "launch_prepared")
+            self.assertEqual(job["terminalization_evidence"]["source"], "prelaunch-metadata")
+            self.assertIn("receipt_exists", job["expected_receipt"]["does_not_establish"])
+            self.assertIn("job_success", job["expected_receipt"]["does_not_establish"])
             self.assertFalse(job["notify_on_done"]["requested"])
             self.assertFalse(job["notify_on_done"]["delivery_enabled"])
             self.assertEqual(job["notify_on_done"]["delivery_mode"], "metadata_only")
@@ -256,7 +260,6 @@ class OperatorContractTests(unittest.TestCase):
             self.assertIn("systemd-run", invoked)
             self.assertNotIn("mail", invoked)
             self.assertNotIn("notify-send", invoked)
-
 
     def test_job_final_status_classification_is_explicit(self) -> None:
         operator = _load_operator_module()
@@ -274,6 +277,100 @@ class OperatorContractTests(unittest.TestCase):
             operator._job_final_status(True, {"ActiveState": "inactive", "Result": "exit-code", "ExecMainStatus": "1"}),
             "failed",
         )
+        self.assertEqual(
+            operator._job_final_status(True, {"ActiveState": "inactive", "Result": "", "ExecMainStatus": ""}),
+            "terminated_unclear",
+        )
+
+    def test_launch_failure_persists_failed_evidence_not_started(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            cwd = root / "cwd"
+            cwd.mkdir(parents=True)
+            fake_uuid = types.SimpleNamespace(hex="badlaunch0000ffff")
+            launcher = {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "systemd refused launch",
+                "argv": [],
+                "argv_sha256": "0" * 64,
+                "command": "systemd-run",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
+                operator, "_run", return_value=launcher
+            ):
+                with self.assertRaisesRegex(RuntimeError, "systemd refused launch"):
+                    operator.grabowski_job_start(["python3", "-c", "print(1)"], cwd=str(cwd))
+
+            metadata_path = jobs / "grabowski-job-badlaunch000" / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["final_status"], "launch_failed")
+            self.assertEqual(metadata["terminalization_evidence"]["source"], "systemd-run-launch")
+            self.assertEqual(metadata["terminalization_evidence"]["final_status"], "launch_failed")
+            self.assertFalse(metadata["terminalization_evidence"]["systemd_visible"])
+            self.assertEqual(metadata["launcher_evidence"]["returncode"], 1)
+            self.assertNotEqual(metadata["final_status"], "started")
+
+    def test_malformed_systemd_show_is_missing_finalization_evidence(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            cwd = root / "cwd"
+            cwd.mkdir(parents=True)
+            fake_uuid = types.SimpleNamespace(hex="emptyshow0000ffff")
+            launcher = {
+                "returncode": 0,
+                "stdout": "started",
+                "stderr": "",
+                "argv": [],
+                "argv_sha256": "0" * 64,
+                "command": "systemd-run",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
+                operator, "_run", return_value=launcher
+            ):
+                job = operator.grabowski_job_start(["python3", "-c", "print(1)"], cwd=str(cwd))
+
+            systemctl = {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "argv": [],
+                "argv_sha256": "1" * 64,
+                "command": "systemctl show",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator, "_run", return_value=systemctl):
+                status = operator.grabowski_job_status(job["unit"])
+
+            self.assertFalse(status["systemd_visible"])
+            self.assertEqual(status["final_status"], "missing_finalization_evidence")
+            self.assertFalse(status["terminalization_evidence"]["query_valid"])
 
     def test_notify_on_done_metadata_does_not_hide_failed_finalization(self) -> None:
         operator = _load_operator_module()
@@ -339,12 +436,111 @@ class OperatorContractTests(unittest.TestCase):
     def test_notify_on_done_metadata_is_strict_and_bounded(self) -> None:
         operator = _load_operator_module()
         self.assertEqual(operator._normalize_notify_on_done(None)["requested"], False)
+        self.assertEqual(operator._normalize_notify_on_done({})["requested"], False)
+        self.assertEqual(operator._normalize_notify_on_done({"requested": True})["requested"], True)
         with self.assertRaisesRegex(ValueError, "Unknown notify_on_done"):
             operator._normalize_notify_on_done({"requested": True, "send": True})
         with self.assertRaisesRegex(ValueError, "must be a boolean"):
             operator._normalize_notify_on_done({"requested": "yes"})
         with self.assertRaisesRegex(ValueError, "control characters"):
             operator._normalize_notify_on_done({"requested": True, "channels": ["bad\nchannel"]})
+        with self.assertRaisesRegex(ValueError, "control characters"):
+            operator._normalize_notify_on_done({"requested": True, "note": "done\n"})
+
+    def test_legacy_metadata_is_projected_for_status_and_logs(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            unit = "grabowski-job-legacy000001"
+            directory = jobs / unit
+            directory.mkdir(parents=True)
+            stdout_path = directory / "stdout.log"
+            stderr_path = directory / "stderr.log"
+            stdout_path.write_text("", encoding="utf-8")
+            stderr_path.write_text("", encoding="utf-8")
+            metadata = {
+                "schema_version": 1,
+                "unit": unit,
+                "argv": ["python3"],
+                "argv_sha256": "a" * 64,
+                "command": "python3",
+                "cwd": str(root),
+                "runtime_seconds": 60,
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+            }
+            (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            systemctl = {
+                "returncode": 0,
+                "stdout": "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainCode=0\nExecMainStatus=0\n",
+                "stderr": "",
+                "argv": [],
+                "argv_sha256": "1" * 64,
+                "command": "systemctl show",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator, "_run", return_value=systemctl):
+                status = operator.grabowski_job_status(unit)
+            with patch.object(operator, "STATE_DIR", state), patch.object(operator, "JOBS_DIR", jobs):
+                logs = operator.grabowski_job_logs(unit, max_lines=5)
+
+            self.assertEqual(status["job_record"]["job_id"], "legacy000001")
+            self.assertTrue(status["job_record"]["owner"].startswith("uid:"))
+            self.assertEqual(status["job_record"]["scope"]["argv_sha256"], "a" * 64)
+            self.assertEqual(status["job_record"]["expected_receipt"]["status_tool"], "grabowski_job_status")
+            self.assertFalse(status["job_record"]["notify_on_done"]["requested"])
+            self.assertTrue(status["job_record"]["metadata_projection"]["legacy_fields_projected"])
+            self.assertEqual(logs["job_identity"]["job_id"], "legacy000001")
+            self.assertEqual(logs["expected_receipt"]["logs_tool"], "grabowski_job_logs")
+            self.assertFalse(logs["notify_on_done"]["requested"])
+
+    def test_invalid_stored_notify_metadata_degrades_without_delivery(self) -> None:
+        operator = _load_operator_module()
+        metadata = {
+            "schema_version": 1,
+            "unit": "grabowski-job-invalidnotify",
+            "notify_on_done": {"requested": "yes"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            directory = jobs / metadata["unit"]
+            directory.mkdir(parents=True)
+            (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            (directory / "stdout.log").write_text("", encoding="utf-8")
+            (directory / "stderr.log").write_text("", encoding="utf-8")
+            systemctl = {
+                "returncode": 0,
+                "stdout": "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainCode=0\nExecMainStatus=0\n",
+                "stderr": "",
+                "argv": [],
+                "argv_sha256": "1" * 64,
+                "command": "systemctl show",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator, "_run", return_value=systemctl):
+                status = operator.grabowski_job_status(metadata["unit"])
+
+            notify = status["job_record"]["notify_on_done"]
+            self.assertFalse(notify["requested"])
+            self.assertTrue(notify["metadata_invalid"])
+            self.assertFalse(status["notification_evidence"]["delivery_enabled"])
+            self.assertEqual(status["notification_evidence"]["delivery_state"], "not_sent")
 
     def test_job_logs_expose_identity_receipt_and_notify_metadata(self) -> None:
         operator = _load_operator_module()
