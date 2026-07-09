@@ -2487,11 +2487,22 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
                 problems.append("status_projection_generated_at_in_future")
             elif age_seconds > CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS:
                 problems.append("status_projection_stale_by_generated_at")
-        replay_reference = projection.get("run_id") or projection.get("nonce") or projection.get("receipt_ref")
-        if not isinstance(replay_reference, str) or not replay_reference.strip():
+        replay_reference = next(
+            (
+                value.strip()
+                for value in (
+                    projection.get("run_id"),
+                    projection.get("nonce"),
+                    projection.get("receipt_ref"),
+                )
+                if isinstance(value, str) and value.strip()
+            ),
+            None,
+        )
+        if replay_reference is None:
             problems.append("status_projection_replay_reference_missing")
         else:
-            info["replay_reference"] = replay_reference.strip()
+            info["replay_reference"] = replay_reference
         if declared_sha is None:
             problems.append("status_projection_sha256_missing")
         elif not _is_sha256_hex(declared_sha):

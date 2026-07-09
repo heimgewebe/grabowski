@@ -2144,6 +2144,37 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertIn("status_projection_replay_reference_missing", result["output"]["blocked_reasons"])
 
+    def test_accepts_nonce_when_status_projection_run_id_is_blank(self) -> None:
+        projection = {
+            "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
+            "source": "bureau status-projection",
+            "healthy": True,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "run_id": "   ",
+            "nonce": "nonce-ok",
+        }
+        result = self.run_captain(captain_parameters(status_projection=projection, status_projection_sha256=grips.sha256_json(projection)))
+
+        self.assertNotIn("status_projection_replay_reference_missing", result["output"]["blocked_reasons"])
+        self.assertEqual("nonce-ok", result["output"]["status_projection"]["replay_reference"])
+        self.assertEqual("pass", self.gate(result, "status-projection-fresh")["status"])
+
+    def test_accepts_receipt_ref_when_status_projection_run_id_and_nonce_are_blank(self) -> None:
+        projection = {
+            "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
+            "source": "bureau status-projection",
+            "healthy": True,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "run_id": "   ",
+            "nonce": "   ",
+            "receipt_ref": "receipt-ok",
+        }
+        result = self.run_captain(captain_parameters(status_projection=projection, status_projection_sha256=grips.sha256_json(projection)))
+
+        self.assertNotIn("status_projection_replay_reference_missing", result["output"]["blocked_reasons"])
+        self.assertEqual("receipt-ok", result["output"]["status_projection"]["replay_reference"])
+        self.assertEqual("pass", self.gate(result, "status-projection-fresh")["status"])
+
     def test_captain_run_without_allow_mutation_exposes_authority_contract(self) -> None:
         result = grips.grip_run(
             "captain-run",
