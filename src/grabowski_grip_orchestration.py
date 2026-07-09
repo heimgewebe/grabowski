@@ -173,6 +173,7 @@ def run_captain_preflight(core: CoreModule, spec: Any, parameters: dict[str, Any
         "gates": gates,
         "status_projection": projection_info,
         "actions_sha256": core._captain_actions_sha256(actions),
+        "authority_contract": core._captain_authority_contract("captain-preflight"),
         "high_impact_action_allowlist": sorted(core.CAPTAIN_HIGH_IMPACT_ACTIONS),
         "actions": [core._captain_action_record(action, gate_decision=gate_decision, projection_info=projection_info) for action in actions],
         "why_no_mutation": core.CAPTAIN_NO_MUTATION_REASON,
@@ -210,6 +211,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
             "gates": gates,
             "status_projection": projection_info,
             "actions_sha256": core._captain_actions_sha256(actions),
+            "authority_contract": core._captain_authority_contract("captain-run"),
             "executable_action_allowlist": sorted(core.CAPTAIN_EXECUTABLE_ACTIONS),
             "actions": [core._captain_action_record(action, gate_decision="blocked", projection_info=projection_info) for action in actions],
             "executions": [],
@@ -313,6 +315,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         "gates": gates,
         "status_projection": projection_info,
         "actions_sha256": core._captain_actions_sha256(actions),
+        "authority_contract": core._captain_authority_contract("captain-run"),
         "executable_action_allowlist": sorted(core.CAPTAIN_EXECUTABLE_ACTIONS),
         "actions": action_records,
         "execution_counts": {

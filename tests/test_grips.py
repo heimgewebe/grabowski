@@ -1921,6 +1921,19 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(action["captain_receipt"]["recovery_path"], "revert the merge commit on main")
         self.assertIn("captain-preflight is read-only", output["why_no_mutation"])
 
+    def test_captain_preflight_exposes_authority_contract(self) -> None:
+        result = self.run_captain(captain_parameters())
+        contract = result["output"]["authority_contract"]
+        self.assertEqual(grips.CAPTAIN_AUTHORITY_CONTRACT_VERSION, contract["schema_version"])
+        self.assertEqual("captain-preflight", contract["surface"])
+        self.assertIn("evaluation_authority", contract["terms"])
+        self.assertIn("execution_authority", contract["terms"])
+        execution = contract["terms"]["execution_authority"]
+        self.assertEqual("execution_authority", execution["evidence_field"])
+        self.assertEqual("execution-authority-present", execution["gate"])
+        self.assertIn("allow_execution=true", execution["required_with"])
+        self.assertIn("allow_execution alone is never sufficient", contract["non_claims"])
+
     def test_captain_preflight_exposes_action_and_target_digests(self) -> None:
         result = self.run_captain(captain_parameters())
 
@@ -2005,6 +2018,22 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(captain_parameters(status_projection_source="  "))
 
         self.assertIn("status_projection_source_missing", result["output"]["blocked_reasons"])
+
+    def test_captain_run_exposes_execution_authority_contract_when_blocked(self) -> None:
+        parameters = captain_parameters()
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=FakeGh(),
+        )
+        contract = result["output"]["authority_contract"]
+        self.assertEqual("captain-run", contract["surface"])
+        self.assertIn("allow_execution must be true", contract["release_conditions"]["captain_run"])
+        self.assertIn("execution_authority evidence alone is never sufficient", contract["non_claims"])
+        self.assertIn("allow_execution_required", result["output"]["blocked_reasons"])
 
     def test_allow_execution_alone_never_grants_authority(self) -> None:
         parameters = captain_parameters(allow_execution=True)

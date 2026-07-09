@@ -1,0 +1,23 @@
+# Captain execution authority contract v1
+
+This contract separates Captain authority terms that were previously easy to blur in receipts and operator discussion.
+
+## Terms
+
+- **Evaluation authority** means permission to evaluate Captain evidence gates and emit a receipt. `captain-preflight` has only this authority and never mutates.
+- **Execution authority** is one explicit prerequisite for an implemented `captain-run` executor. In the v1 JSON contract the evidence field is still named `execution_authority`, but that field is never sufficient by itself.
+
+## Release conditions
+
+`captain-run` may invoke an implemented executor only when all of the following are true:
+
+1. `allow_execution=true` is present.
+2. The same Captain evidence gates pass.
+3. Exactly one action is requested.
+4. The action is present in `executable_action_allowlist`.
+5. Target, expected head, reviewed diff, CI, review evidence, status projection and authorization evidence remain bound.
+6. The executor performs target-specific preflight and post-execution verification.
+
+## Non-claims
+
+This contract does not add new executable actions. It does not make merge, deploy, restart, fleet mutation or cleanup default. It does not allow `allow_execution` or `execution_authority` evidence to bypass gates. Trusted-owner autonomy remains limited to reversible, target-bound actions with implemented executors and still fails closed for ambiguous or irreversible actions.
