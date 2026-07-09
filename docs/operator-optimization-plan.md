@@ -148,6 +148,7 @@ Includes:
 - clarify which watchdogs are intentionally inactive, timer-driven or deprecated,
 - document tunnel/operator health expectations,
 - define connector snapshot refresh criteria,
+- distinguish connector snapshot drift from connector transport 502/stream/timeout failures,
 - keep deployment identity and runtime lock validation as hard preflight inputs.
 
 Primary risk: treating observability as permission.

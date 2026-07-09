@@ -27,6 +27,7 @@ FRICTION_LOG = Path(os.environ.get(
 FRICTION_KINDS = {
     "platform_filter",
     "connector_snapshot",
+    "connector_transport",
     "fail_closed_gate",
     "execution_context",
     "ci_contract",
@@ -49,6 +50,7 @@ FRICTION_SURFACES = {
     "unknown",
 }
 FAILURE_CLASSES = frozenset({
+    "connector_transport",
     "contract_error",
     "expected_red_phase",
     "superseded",
@@ -59,6 +61,12 @@ FAILURE_CLASSES = frozenset({
     "unknown",
 })
 FAILURE_CLASS_DECISIONS = {
+    "connector_transport": (
+        "Capture bounded operator and tunnel service state, recent MCP stream "
+        "errors, and adjacent successful calls; retry read-only work at most once "
+        "as smaller typed calls, and never treat the retry as proof that the "
+        "first failure was harmless."
+    ),
     "contract_error": (
         "Inspect contract drift and decide whether producer or consumer must change."
     ),
@@ -99,6 +107,7 @@ CLASSIFICATION_DOES_NOT_ESTABLISH = (
     "raw_log_safety",
 )
 ACTION_REQUIRED_FAILURE_CLASSES = frozenset({
+    "connector_transport",
     "contract_error",
     "environment_tooling",
     "platform_filter",
@@ -117,6 +126,28 @@ PROPOSAL_DOES_NOT_ESTABLISH = (
 PATTERN_EVIDENCE_THRESHOLD = 2
 MAX_PROPOSAL_EVIDENCE_IDS = 20
 FRICTION_PROPOSAL_PATTERNS: dict[str, dict[str, Any]] = {
+    "connector_transport": {
+        "terms": (
+            "502",
+            "upstream or external service",
+            "upstream/external service",
+            "external service error",
+            "streamable_http",
+            "received exception from stream",
+            "mcp stream",
+            "post /mcp",
+            "connector timeout",
+            "connector timed out",
+            "transport timeout",
+        ),
+        "recommendation_type": "next_grip",
+        "title": "Add connector transport diagnostics",
+        "rationale": (
+            "Repeated connector transport failures should become bounded "
+            "diagnostics and split/retry policy, not broad terminal retries or "
+            "false-green conclusions after a successful retry."
+        ),
+    },
     "command_chains": {
         "terms": (
             "command chain",
@@ -226,6 +257,27 @@ SUPERSEDED_TERMS = frozenset({
 })
 MAX_TEXT_BYTES = 2000
 MAX_NOTE_COUNT = 20
+CONNECTOR_TRANSPORT_TERMS = frozenset({
+    "502",
+    "upstream or external service",
+    "upstream/external service",
+    "external service error",
+    "streamable_http",
+    "received exception from stream",
+    "mcp stream",
+    "post /mcp",
+    "connector timeout",
+    "connector timed out",
+    "transport timeout",
+})
+CONNECTOR_TRANSPORT_DOES_NOT_ESTABLISH = (
+    "root_cause_proof",
+    "connector_vendor_fix",
+    "runtime_policy_change",
+    "command_success_or_failure",
+    "safe_mutation_retry",
+    "transport_reliability_proof",
+)
 
 
 def _clean_text(
@@ -347,6 +399,47 @@ def _bounded_event(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _looks_like_connector_transport(event: dict[str, Any], haystack: str) -> bool:
+    kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
+    surface = _known_enum_value(event.get("surface"), FRICTION_SURFACES)
+    if kind == "connector_transport":
+        return True
+    if not any(term in haystack for term in CONNECTOR_TRANSPORT_TERMS):
+        return False
+    return surface == "connector" or "streamable_http" in haystack or "post /mcp" in haystack
+
+
+def connector_transport_diagnostics(events: list[dict[str, Any]]) -> dict[str, Any]:
+    transport_events = [
+        event
+        for event in events
+        if classify_friction_event(event) == "connector_transport"
+    ]
+    unresolved_events = [event for event in transport_events if event.get("resolved") is not True]
+    return {
+        "schema_version": 1,
+        "authority": "read_only_diagnostic_guidance",
+        "event_count": len(transport_events),
+        "unresolved_event_count": len(unresolved_events),
+        "recent_event_ids": _proposal_event_ids(transport_events),
+        "recent_event_ids_truncated": len(transport_events) > MAX_PROPOSAL_EVIDENCE_IDS,
+        "recommended_bounded_probe": [
+            "grabowski_status for runtime contract and client snapshot visibility",
+            "grabowski_service_status for grabowski-operator.service and tunnel-client-grabowski.service",
+            "bounded recent journal search for streamable_http, Received exception from stream, POST /mcp, timeout and 502",
+            "one adjacent small typed read-only call to determine whether the transport failure is still active",
+        ],
+        "split_retry_policy": {
+            "read_only_retry_limit": 1,
+            "retry_shape": "split broad terminal calls into smaller typed or single-purpose read-only calls",
+            "mutation_rule": "do not retry mutating work after a transport failure until target state is re-read",
+            "record_rule": "record friction when a connector transport failure changes the operator path",
+            "false_green_warning": "a successful retry does not prove the first failure was harmless",
+        },
+        "does_not_establish": list(CONNECTOR_TRANSPORT_DOES_NOT_ESTABLISH),
+    }
+
+
 def classify_friction_event(event: dict[str, Any]) -> str:
     """Classify one friction event as read-only failure evidence.
 
@@ -360,6 +453,8 @@ def classify_friction_event(event: dict[str, Any]) -> str:
         return "superseded"
     if any(term in haystack for term in EXPECTED_RED_PHASE_TERMS):
         return "expected_red_phase"
+    if _looks_like_connector_transport(event, haystack):
+        return "connector_transport"
 
     kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
     if kind == "platform_filter":
@@ -404,6 +499,8 @@ def _proposal_pattern_hits(event: dict[str, Any], failure_class: str) -> list[st
     hits: set[str] = set()
     haystack = _event_haystack(event)
     kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
+    if failure_class == "connector_transport":
+        hits.add("connector_transport")
     if kind == "fail_closed_gate" or failure_class == "policy_gate":
         hits.add("blocked_gates")
     if kind == "connector_snapshot":
@@ -680,6 +777,7 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
         "by_kind": dict(sorted(by_kind.items())),
         "by_surface": dict(sorted(by_surface.items())),
         "failure_classification": classify_failure_events(events),
+        "connector_transport_diagnostics": connector_transport_diagnostics(events),
         "next_grip_proposals": propose_next_grip_from_friction(events),
         "events": [_bounded_event(event) for event in events],
     }

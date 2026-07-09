@@ -16,6 +16,7 @@ class FrictionLedgerContractTests(unittest.TestCase):
         self.assertLessEqual(schema["properties"]["notes"]["maxItems"], 20)
         self.assertIn("platform_filter", schema["properties"]["kind"]["enum"])
         self.assertIn("connector_snapshot", schema["properties"]["kind"]["enum"])
+        self.assertIn("connector_transport", schema["properties"]["kind"]["enum"])
         self.assertIn("chat_tool", schema["properties"]["surface"]["enum"])
 
     def test_source_registers_record_and_summary_tools(self) -> None:
@@ -26,6 +27,8 @@ class FrictionLedgerContractTests(unittest.TestCase):
         self.assertIn('MAX_NOTE_COUNT = 20', source)
         self.assertIn('FAILURE_CLASSES = frozenset({', source)
         self.assertIn('def classify_friction_event', source)
+        self.assertIn('def connector_transport_diagnostics', source)
+        self.assertIn('connector_transport_diagnostics', source)
         self.assertIn('invalid_lines', source)
         self.assertIn('def _bounded_event', source)
         self.assertIn('operator._redact(text)', source)
@@ -105,6 +108,26 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(
             module.classify_friction_event({"kind": "platform_filter", "symptom": "rejected"}),
             "platform_filter",
+        )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "execution_context",
+                    "surface": "connector",
+                    "symptom": "Server returned 502: upstream or external service error",
+                }
+            ),
+            "connector_transport",
+        )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "operator_bug",
+                    "surface": "recovery",
+                    "symptom": "grabowski_recovery_status timed out",
+                }
+            ),
+            "actionable_failure",
         )
 
         module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +237,61 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(summary["by_surface"]["unknown"], 1)
         self.assertLessEqual(len(summary["events"][0]["symptom"]), 240)
         self.assertEqual(summary["events"][0]["notes_count"], 1)
+
+
+    def test_connector_transport_diagnostics_and_retry_policy_are_explicit(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "event_id": "transport-1",
+                "kind": "execution_context",
+                "surface": "connector",
+                "operation": "broad terminal run",
+                "symptom": "ChatGPT connector returned 502 upstream/external service error",
+                "resolved": False,
+            },
+            {
+                "event_id": "transport-2",
+                "kind": "connector_transport",
+                "surface": "connector",
+                "operation": "recovery status",
+                "symptom": "streamable_http Received exception from stream after POST /mcp",
+                "resolved": False,
+            },
+            {
+                "event_id": "recovery-timeout",
+                "kind": "operator_bug",
+                "surface": "recovery",
+                "operation": "recovery status",
+                "symptom": "grabowski_recovery_status timed out once",
+                "resolved": False,
+            },
+        ]
+        module.FRICTION_LOG.write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+        summary = module.friction_summary(limit=10)
+        classification = summary["failure_classification"]
+        diagnostics = summary["connector_transport_diagnostics"]
+        proposals = summary["next_grip_proposals"]
+
+        self.assertEqual(classification["by_failure_class"]["connector_transport"], 2)
+        self.assertEqual(classification["by_failure_class"]["actionable_failure"], 1)
+        self.assertEqual(diagnostics["authority"], "read_only_diagnostic_guidance")
+        self.assertEqual(diagnostics["event_count"], 2)
+        self.assertEqual(diagnostics["unresolved_event_count"], 2)
+        self.assertEqual(diagnostics["recent_event_ids"], ["transport-1", "transport-2"])
+        self.assertEqual(diagnostics["split_retry_policy"]["read_only_retry_limit"], 1)
+        self.assertIn("safe_mutation_retry", diagnostics["does_not_establish"])
+        self.assertIn("bounded recent journal search", " ".join(diagnostics["recommended_bounded_probe"]))
+        groups = {group["pattern"]: group for group in proposals["groups"]}
+        self.assertTrue(groups["connector_transport"]["actionable_repeated"])
+        recommendation = {item["pattern"]: item for item in proposals["recommendations"]}["connector_transport"]
+        self.assertEqual(recommendation["title"], "Add connector transport diagnostics")
+        self.assertEqual(recommendation["evidence_event_ids"], ["transport-1", "transport-2"])
 
     def test_next_grip_proposals_group_repeated_friction_patterns(self) -> None:
         module = self._load_module()
