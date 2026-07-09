@@ -125,7 +125,7 @@ def run_mechanic_loop(core: CoreModule, spec: Any, parameters: dict[str, Any], r
 
 
 def run_captain_preflight(core: CoreModule, spec: Any, parameters: dict[str, Any], receipt: dict[str, Any], runner: Any) -> dict[str, Any]:
-    actions = core._captain_actions(parameters)
+    actions = core._captain_actions(parameters, gate_native_validation=True)
     core._mechanic_bool(parameters, "allow_execution", False)
     action_names = ", ".join(action["action"] for action in actions)
     gates, projection_info = core._captain_authority_gates(parameters, actions)
@@ -145,9 +145,21 @@ def run_captain_preflight(core: CoreModule, spec: Any, parameters: dict[str, Any
         blocked_reasons = ["captain_preflight_does_not_execute; use captain-run for execution"]
     for gate in gates:
         core._check(receipt, f"captain-gate-{gate['id']}", "pass" if gate["status"] == "pass" else "fail", str(gate["reason"]))
+    gate_status = {str(gate["id"]): str(gate["status"]) for gate in gates}
+    gate_reason = {str(gate["id"]): str(gate["reason"]) for gate in gates}
     core._check(receipt, "high-impact-marked", "pass", action_names)
-    core._check(receipt, "recovery-or-irreversibility", "pass", "risk records include recovery or irreversibility")
-    core._check(receipt, "target-change-record", "pass", "target changes are explicit or null")
+    core._check(
+        receipt,
+        "recovery-or-irreversibility",
+        "pass" if gate_status.get("recovery-or-irreversibility") == "pass" else "fail",
+        gate_reason.get("recovery-or-irreversibility", "risk gate missing"),
+    )
+    core._check(
+        receipt,
+        "target-change-record",
+        "pass" if gate_status.get("target-change-record") == "pass" else "fail",
+        gate_reason.get("target-change-record", "target-change gate missing"),
+    )
     return {
         "schema_version": 2,
         "profile": "captain",
