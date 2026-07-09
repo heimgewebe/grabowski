@@ -268,11 +268,12 @@ CAPTAIN_PREFLIGHT_TRANSIENT_ERRORS = frozenset({
     "pr_merge_state_not_clean_before_execution",
 })
 CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION = 1
-CAPTAIN_STATUS_PROJECTION_TRUSTED_SOURCES = frozenset({
+CAPTAIN_STATUS_PROJECTION_ALLOWLISTED_SOURCES = frozenset({
     "bureau status-projection",
     "grabowski status-projection",
     "captain status-projection",
 })
+CAPTAIN_STATUS_PROJECTION_TRUSTED_SOURCES = CAPTAIN_STATUS_PROJECTION_ALLOWLISTED_SOURCES
 CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS = 3600
 CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS = 300
 CAPTAIN_BASE_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -2430,7 +2431,9 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
         "used": False,
         "fresh": fresh,
         "source": None,
+        "source_allowlisted": False,
         "source_trusted": False,
+        "allowlisted_sources": sorted(CAPTAIN_STATUS_PROJECTION_ALLOWLISTED_SOURCES),
         "sha256": None,
         "schema_version": None,
         "generated_at": None,
@@ -2439,6 +2442,7 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
         "age_seconds": None,
         "projection_source": None,
         "replay_reference": None,
+        "replay_reference_kind": None,
     }
     problems: list[str] = []
     if projection is None:
@@ -2452,9 +2456,10 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
         else:
             source_name = source.strip()
             info["source"] = source_name
-            if source_name not in CAPTAIN_STATUS_PROJECTION_TRUSTED_SOURCES:
+            if source_name not in CAPTAIN_STATUS_PROJECTION_ALLOWLISTED_SOURCES:
                 problems.append("status_projection_source_untrusted")
             else:
+                info["source_allowlisted"] = True
                 info["source_trusted"] = True
         schema_version = projection.get("schema_version")
         info["schema_version"] = schema_version
@@ -2487,11 +2492,19 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
                 problems.append("status_projection_generated_at_in_future")
             elif age_seconds > CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS:
                 problems.append("status_projection_stale_by_generated_at")
-        replay_reference = projection.get("run_id") or projection.get("nonce") or projection.get("receipt_ref")
-        if not isinstance(replay_reference, str) or not replay_reference.strip():
+        replay_reference_kind = None
+        replay_reference = None
+        for key in ("receipt_ref", "run_id", "nonce"):
+            value = projection.get(key)
+            if isinstance(value, str) and value.strip():
+                replay_reference_kind = key
+                replay_reference = value.strip()
+                break
+        if replay_reference is None:
             problems.append("status_projection_replay_reference_missing")
         else:
-            info["replay_reference"] = replay_reference.strip()
+            info["replay_reference"] = replay_reference
+            info["replay_reference_kind"] = replay_reference_kind
         if declared_sha is None:
             problems.append("status_projection_sha256_missing")
         elif not _is_sha256_hex(declared_sha):
