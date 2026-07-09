@@ -3964,6 +3964,67 @@ def _rlens_output_health_status(path: Path) -> dict[str, Any]:
     return result
 
 
+def _rlens_manifest_snapshot_provenance(doc: dict[str, Any], repo: str) -> dict[str, Any]:
+    """Return explicit source-repository provenance from a RepoBrief manifest.
+
+    ``generator.runtime.git_commit`` describes the Lenskit/rLens code that
+    produced the bundle.  It is not the commit of the scanned repository.  The
+    freshness check may only compare a commit to the live repository when the
+    manifest exposes explicit snapshot/source provenance for that repository.
+    """
+    provenance = doc.get("snapshotProvenance")
+    if not isinstance(provenance, dict):
+        provenance = doc.get("snapshot_provenance")
+    if not isinstance(provenance, dict):
+        return {"available": False, "reason": "snapshot_provenance_absent"}
+
+    repositories = provenance.get("repositories")
+    if not isinstance(repositories, list):
+        return {"available": False, "reason": "snapshot_repositories_absent"}
+
+    fallback: dict[str, Any] | None = None
+    for item in repositories:
+        if not isinstance(item, dict):
+            continue
+        if fallback is None:
+            fallback = item
+        names = [
+            item.get("repo"),
+            item.get("repository"),
+            item.get("repo_id"),
+            item.get("name"),
+        ]
+        if repo in {value for value in names if isinstance(value, str)}:
+            fallback = item
+            break
+    if fallback is None:
+        return {"available": False, "reason": "snapshot_repository_entry_absent"}
+
+    commit = fallback.get("git_commit") or fallback.get("commit") or fallback.get("head")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+        return {
+            "available": False,
+            "reason": "snapshot_repository_commit_absent",
+            "repository": {
+                key: fallback.get(key)
+                for key in ("repo", "repository", "repo_id", "name", "ref", "remote_ref")
+                if key in fallback
+            },
+        }
+    result: dict[str, Any] = {
+        "available": True,
+        "git_commit": commit.lower(),
+        "repository": {
+            key: fallback.get(key)
+            for key in ("repo", "repository", "repo_id", "name", "ref", "remote_ref")
+            if key in fallback
+        },
+    }
+    if isinstance(fallback.get("git_dirty"), bool):
+        result["git_dirty"] = fallback.get("git_dirty")
+    return result
+
+
 def _rlens_manifest_summary(path: Path) -> dict[str, Any]:
     stem = _rlens_stem_from_manifest(path)
     repo = _rlens_repo_from_stem(stem)
@@ -3976,6 +4037,9 @@ def _rlens_manifest_summary(path: Path) -> dict[str, Any]:
     runtime = (doc.get("generator") or {}).get("runtime")
     if not isinstance(runtime, dict):
         runtime = {}
+    snapshot = _rlens_manifest_snapshot_provenance(doc, repo)
+    source_commit = snapshot.get("git_commit") if snapshot.get("available") else None
+    source_dirty = snapshot.get("git_dirty") if snapshot.get("available") else None
     stat = path.stat()
     health_path = _rlens_sidecar_path(stem, _BUNDLE_HEALTH_SUFFIX)
     health = _rlens_sidecar_status(
@@ -3991,8 +4055,15 @@ def _rlens_manifest_summary(path: Path) -> dict[str, Any]:
         "created_at": doc.get("created_at"),
         "artifact_count": len(artifacts),
         "artifact_roles": roles,
-        "git_commit": runtime.get("git_commit"),
-        "git_dirty": runtime.get("git_dirty"),
+        "git_commit": source_commit,
+        "git_dirty": source_dirty,
+        "source_provenance": snapshot,
+        "generator_runtime": {
+            "git_commit": runtime.get("git_commit"),
+            "git_dirty": runtime.get("git_dirty"),
+            "module": runtime.get("module"),
+            "package_root": runtime.get("package_root"),
+        },
         "post_emit_health": health,
         "output_health": _rlens_output_health_status(
             _rlens_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX)
@@ -4196,9 +4267,12 @@ def rlens_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
             "dirty": bool(dirty_out) if dirty_rc == 0 else None,
             "error": head_err or dirty_err or None,
         })
-        if head_rc != 0 or dirty_rc != 0 or not isinstance(bundle_commit, str):
+        if head_rc != 0 or dirty_rc != 0:
             freshness = "unknown"
-            reason = "git_or_bundle_commit_unavailable"
+            reason = "git_unavailable"
+        elif not isinstance(bundle_commit, str):
+            freshness = "unknown"
+            reason = "bundle_source_commit_unavailable"
         elif bundle_commit != head:
             freshness = "stale_head"
             reason = "bundle_commit_differs_from_live_head"
@@ -4217,6 +4291,8 @@ def rlens_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
             "exists": status.get("exists", False),
             "git_commit": bundle_commit,
             "git_dirty": bundle_dirty,
+            "source_provenance": status.get("source_provenance"),
+            "generator_runtime": status.get("generator_runtime"),
             "post_emit_health": status.get("post_emit_health"),
         },
         "live_repo": live,

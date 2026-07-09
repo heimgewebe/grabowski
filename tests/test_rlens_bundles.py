@@ -66,18 +66,38 @@ class RlensBundleToolTests(unittest.TestCase):
             item.stop()
         self.tmp.cleanup()
 
-    def _write_bundle(self, stem: str, commit: str = "a" * 40) -> Path:
+    def _write_bundle(
+        self,
+        stem: str,
+        commit: str = "a" * 40,
+        *,
+        include_snapshot_provenance: bool = True,
+        generator_commit: str | None = None,
+    ) -> Path:
         manifest = self.merges / f"{stem}_merge.bundle.manifest.json"
-        manifest.write_text(json.dumps({
+        repo = stem.rsplit("-max-", 1)[0]
+        doc = {
             "kind": "repolens.bundle.manifest",
             "run_id": f"{stem}-run",
             "created_at": "2026-07-01T00:00:00Z",
-            "generator": {"runtime": {"git_commit": commit, "git_dirty": False}},
+            "generator": {
+                "runtime": {
+                    "git_commit": generator_commit or "f" * 40,
+                    "git_dirty": False,
+                }
+            },
             "artifacts": [
                 {"role": "canonical_md"},
                 {"role": "output_health"},
             ],
-        }), encoding="utf-8")
+        }
+        if include_snapshot_provenance:
+            doc["snapshotProvenance"] = {
+                "repositories": [
+                    {"repo": repo, "git_commit": commit, "git_dirty": False}
+                ]
+            }
+        manifest.write_text(json.dumps(doc), encoding="utf-8")
         (self.merges / f"{stem}_merge.bundle_health.post.json").write_text(json.dumps({
             "status": "pass",
             "evidence_level": "range_strict",
@@ -126,6 +146,9 @@ class RlensBundleToolTests(unittest.TestCase):
         candidate = result["candidates"][0]
         self.assertEqual(candidate["repo"], "demo-repo")
         self.assertEqual(candidate["post_emit_health"]["status"], "pass")
+        self.assertEqual(candidate["git_commit"], "a" * 40)
+        self.assertEqual(candidate["source_provenance"]["git_commit"], "a" * 40)
+        self.assertEqual(candidate["generator_runtime"]["git_commit"], "f" * 40)
         self.assertEqual(candidate["output_health"]["range_ref_resolution_status"], "ok")
         self.assertTrue(candidate["output_health"]["dependencies"]["jsonschema"]["available"])
         self.assertIn("canonical_md", candidate["artifact_roles"])
@@ -252,6 +275,26 @@ class RlensBundleToolTests(unittest.TestCase):
 
         self.assertEqual(result["freshness"], "stale_head")
         self.assertEqual(result["reason"], "bundle_commit_differs_from_live_head")
+
+    def test_freshness_check_does_not_compare_generator_commit_to_live_head(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle(
+            "demo-repo-max-260701-1200",
+            commit=head,
+            include_snapshot_provenance=False,
+            generator_commit="b" * 40,
+        )
+
+        result = mcp.rlens_freshness_check("demo-repo", "demo-repo-max-260701-1200")
+
+        self.assertEqual(result["freshness"], "unknown")
+        self.assertEqual(result["reason"], "bundle_source_commit_unavailable")
+        self.assertIsNone(result["bundle"]["git_commit"])
+        self.assertEqual(
+            result["bundle"]["source_provenance"]["reason"],
+            "snapshot_provenance_absent",
+        )
+        self.assertEqual(result["bundle"]["generator_runtime"]["git_commit"], "b" * 40)
 
     def test_invalid_repo_name_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
