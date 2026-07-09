@@ -660,14 +660,23 @@ def _job_terminalization_evidence(
     }
 
 
+def _safe_notify_metadata_error(message: str) -> dict[str, Any]:
+    fallback = _normalize_notify_on_done(None)
+    text = _redact(message)
+    text = "".join(
+        char if ord(char) >= 32 and ord(char) != 127 else "�"
+        for char in text
+    ).strip()
+    fallback["metadata_invalid"] = True
+    fallback["metadata_error"] = text[:MAX_NOTIFY_ON_DONE_TEXT] or "invalid notify_on_done metadata"
+    return fallback
+
+
 def _safe_normalize_stored_notify_on_done(value: Any) -> dict[str, Any]:
     if value is None:
         return _normalize_notify_on_done(None)
     if not isinstance(value, dict):
-        fallback = _normalize_notify_on_done(None)
-        fallback["metadata_invalid"] = True
-        fallback["metadata_error"] = "notify_on_done must be an object when provided"
-        return fallback
+        return _safe_notify_metadata_error("notify_on_done must be an object when provided")
     allowed_stored = {
         "requested",
         "channels",
@@ -678,18 +687,24 @@ def _safe_normalize_stored_notify_on_done(value: Any) -> dict[str, Any]:
     }
     unknown = sorted(set(value) - allowed_stored)
     if unknown:
-        fallback = _normalize_notify_on_done(None)
-        fallback["metadata_invalid"] = True
-        fallback["metadata_error"] = f"Unknown notify_on_done field(s): {', '.join(unknown)}"
-        return fallback
+        return _safe_notify_metadata_error(f"Unknown notify_on_done field(s): {', '.join(unknown)}")
+    if value.get("delivery_enabled") is not None and value.get("delivery_enabled") is not False:
+        return _safe_notify_metadata_error("notify_on_done.delivery_enabled must be false")
+    if value.get("delivery_mode") is not None and value.get("delivery_mode") != "metadata_only":
+        return _safe_notify_metadata_error("notify_on_done.delivery_mode must be metadata_only")
+    if "does_not_establish" in value:
+        raw_non_claims = value["does_not_establish"]
+        if (
+            not isinstance(raw_non_claims, list)
+            or not all(isinstance(item, str) for item in raw_non_claims)
+            or not set(NOTIFICATION_NON_CLAIMS).issubset(set(raw_non_claims))
+        ):
+            return _safe_notify_metadata_error("notify_on_done.does_not_establish is invalid")
     try:
         source = {key: value[key] for key in ("requested", "channels", "note") if key in value}
         return _normalize_notify_on_done(source)
     except ValueError as exc:
-        fallback = _normalize_notify_on_done(None)
-        fallback["metadata_invalid"] = True
-        fallback["metadata_error"] = _bounded_job_text(str(exc), label="notify_on_done metadata error")
-        return fallback
+        return _safe_notify_metadata_error(str(exc))
 
 
 def _job_notification_evidence(notify_on_done: dict[str, Any], terminalization: dict[str, Any]) -> dict[str, Any]:
@@ -719,7 +734,15 @@ def _job_paths_for_unit(unit: str) -> dict[str, Path]:
 
 def _project_job_metadata(unit: str, metadata: dict[str, Any]) -> dict[str, Any]:
     paths = _job_paths_for_unit(unit)
-    identity = _job_identity(unit, owner=metadata.get("owner") if isinstance(metadata.get("owner"), str) else None)
+    stored_job_id = metadata.get("job_id")
+    job_id = unit.removeprefix(JOB_PREFIX)
+    stored_job_id_mismatch = isinstance(stored_job_id, str) and stored_job_id != job_id
+    job_id_projected = not isinstance(stored_job_id, str) or stored_job_id_mismatch
+    stored_unit_mismatch = metadata.get("unit") != unit
+    identity = _job_identity(
+        unit,
+        owner=metadata.get("owner") if isinstance(metadata.get("owner"), str) else None,
+    )
     scope_projected = not isinstance(metadata.get("scope"), dict)
     scope = metadata.get("scope") if isinstance(metadata.get("scope"), dict) else {
         "cwd": metadata.get("cwd"),
@@ -745,12 +768,21 @@ def _project_job_metadata(unit: str, metadata: dict[str, Any]) -> dict[str, Any]
         "expected_receipt": expected_receipt,
         "notify_on_done": notify_on_done,
     }
-    if scope_projected or expected_receipt_projected or started_at_projected:
+    if (
+        scope_projected
+        or expected_receipt_projected
+        or started_at_projected
+        or job_id_projected
+        or stored_unit_mismatch
+    ):
         projected["metadata_projection"] = {
             "legacy_fields_projected": True,
             "scope_projected": scope_projected,
             "expected_receipt_projected": expected_receipt_projected,
             "started_at_projected": started_at_projected,
+            "job_id_projected": job_id_projected,
+            "stored_job_id_mismatch": stored_job_id_mismatch,
+            "stored_unit_mismatch": stored_unit_mismatch,
             "does_not_establish": ["original_started_at", "receipt_integrity", "job_success"],
         }
     return projected
@@ -838,12 +870,21 @@ def _write_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    _fsync_directory(directory)
     return path
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _replace_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
     path = directory / "metadata.json"
-    temp_path = directory / "metadata.json.tmp"
+    temp_path = directory / f"metadata.json.{uuid.uuid4().hex}.tmp"
     data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     descriptor = os.open(
         temp_path,
@@ -851,11 +892,19 @@ def _replace_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
         0o600,
     )
     try:
-        os.write(descriptor, data)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(temp_path, path)
+        try:
+            os.write(descriptor, data)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temp_path, path)
+        _fsync_directory(directory)
+    except BaseException:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     return path
 
 
@@ -1090,8 +1139,8 @@ def grabowski_job_start(
         timeout_seconds=60,
         max_output_bytes=DEFAULT_OUTPUT_BYTES,
     )
+    launcher_evidence = _job_launcher_evidence(result)
     if result["returncode"] != 0:
-        launcher_evidence = _job_launcher_evidence(result)
         metadata = {
             **metadata,
             "final_status": "launch_failed",
@@ -1115,6 +1164,27 @@ def grabowski_job_start(
         _replace_job_metadata(directory, metadata)
         raise RuntimeError(result["stderr"] or result["stdout"])
 
+    metadata = {
+        **metadata,
+        "final_status": "launch_submitted",
+        "terminalization_evidence": {
+            "source": "systemd-run-launch",
+            "query_valid": False,
+            "final_status": "launch_submitted",
+            "systemd_visible": False,
+            "does_not_establish": list(JOB_FINAL_STATUS_NON_CLAIMS),
+        },
+        "launcher_evidence": launcher_evidence,
+        "notification_evidence": {
+            "requested": bool(notify_metadata.get("requested")),
+            "delivery_enabled": False,
+            "delivery_state": "not_sent",
+            "reason": "notify_on_done is metadata-only in this slice",
+            "final_status_preserved": "launch_submitted",
+            "does_not_establish": list(NOTIFICATION_NON_CLAIMS),
+        },
+    }
+    metadata_path = _replace_job_metadata(directory, metadata)
     return {
         **metadata,
         "metadata_path": str(metadata_path),

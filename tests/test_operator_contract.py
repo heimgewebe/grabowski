@@ -247,15 +247,20 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(job["started_at_unix"], job["created_at_unix"])
             self.assertEqual(job["expected_receipt"]["status_tool"], "grabowski_job_status")
             self.assertEqual(job["expected_receipt"]["logs_tool"], "grabowski_job_logs")
-            self.assertEqual(job["final_status"], "launch_prepared")
-            self.assertEqual(job["terminalization_evidence"]["final_status"], "launch_prepared")
-            self.assertEqual(job["terminalization_evidence"]["source"], "prelaunch-metadata")
+            self.assertEqual(job["final_status"], "launch_submitted")
+            self.assertEqual(job["terminalization_evidence"]["final_status"], "launch_submitted")
+            self.assertEqual(job["terminalization_evidence"]["source"], "systemd-run-launch")
+            self.assertEqual(job["launcher_evidence"]["returncode"], 0)
+            self.assertEqual(job["notification_evidence"]["final_status_preserved"], "launch_submitted")
             self.assertIn("receipt_exists", job["expected_receipt"]["does_not_establish"])
             self.assertIn("job_success", job["expected_receipt"]["does_not_establish"])
             self.assertFalse(job["notify_on_done"]["requested"])
             self.assertFalse(job["notify_on_done"]["delivery_enabled"])
             self.assertEqual(job["notify_on_done"]["delivery_mode"], "metadata_only")
             self.assertEqual(job["notification_evidence"]["delivery_state"], "not_sent")
+            persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(persisted["final_status"], "launch_submitted")
+            self.assertEqual(persisted["terminalization_evidence"]["source"], "systemd-run-launch")
             invoked = run.call_args_list[0].args[0]
             self.assertIn("systemd-run", invoked)
             self.assertNotIn("mail", invoked)
@@ -589,6 +594,92 @@ class OperatorContractTests(unittest.TestCase):
             self.assertTrue(notify["metadata_invalid"])
             self.assertIn("Unknown notify_on_done field", notify["metadata_error"])
             self.assertFalse(status["notification_evidence"]["delivery_enabled"])
+
+            for invalid_notify, expected_error in (
+                ({"requested": True, "delivery_enabled": True}, "delivery_enabled must be false"),
+                ({"requested": True, "delivery_mode": "real_delivery"}, "delivery_mode must be metadata_only"),
+                ({"requested": True, "does_not_establish": ["job_success"]}, "does_not_establish is invalid"),
+            ):
+                metadata["notify_on_done"] = invalid_notify
+                (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+                with patch.object(operator, "STATE_DIR", state), patch.object(
+                    operator, "JOBS_DIR", jobs
+                ), patch.object(operator, "_run", return_value=systemctl):
+                    status = operator.grabowski_job_status(metadata["unit"])
+
+                notify = status["job_record"]["notify_on_done"]
+                self.assertFalse(notify["requested"])
+                self.assertTrue(notify["metadata_invalid"])
+                self.assertIn(expected_error, notify["metadata_error"])
+                self.assertFalse(status["notification_evidence"]["delivery_enabled"])
+
+            metadata["notify_on_done"] = {"requested": True, "send\nnow": True}
+            (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator, "_run", return_value=systemctl):
+                status = operator.grabowski_job_status(metadata["unit"])
+            self.assertIn("�", status["job_record"]["notify_on_done"]["metadata_error"])
+
+    def test_job_metadata_projection_marks_identity_mismatch(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            unit = "grabowski-job-realjobid001"
+            directory = jobs / unit
+            directory.mkdir(parents=True)
+            (directory / "stdout.log").write_text("", encoding="utf-8")
+            (directory / "stderr.log").write_text("", encoding="utf-8")
+            metadata = {
+                "schema_version": 1,
+                "unit": unit,
+                "job_id": "wrongjobid",
+                "stdout_path": str(directory / "stdout.log"),
+                "stderr_path": str(directory / "stderr.log"),
+            }
+            (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            systemctl = {
+                "returncode": 0,
+                "stdout": "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainCode=0\nExecMainStatus=0\n",
+                "stderr": "",
+                "argv": [],
+                "argv_sha256": "1" * 64,
+                "command": "systemctl show",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator, "_run", return_value=systemctl):
+                status = operator.grabowski_job_status(unit)
+
+            self.assertEqual(status["job_record"]["job_id"], "realjobid001")
+            projection = status["job_record"]["metadata_projection"]
+            self.assertTrue(projection["job_id_projected"])
+            self.assertTrue(projection["stored_job_id_mismatch"])
+
+    def test_replace_job_metadata_uses_unique_temp_and_cleans_failed_write(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first = {"unit": "grabowski-job-temp000000", "n": 1}
+            second = {"unit": "grabowski-job-temp000000", "n": 2}
+            broken = {"unit": "grabowski-job-temp000000", "n": 3}
+            operator._replace_job_metadata(directory, first)
+            operator._replace_job_metadata(directory, second)
+            self.assertEqual(json.loads((directory / "metadata.json").read_text(encoding="utf-8"))["n"], 2)
+            self.assertEqual(list(directory.glob("metadata.json.*.tmp")), [])
+
+            with patch.object(operator.os, "write", side_effect=RuntimeError("write failed")):
+                with self.assertRaisesRegex(RuntimeError, "write failed"):
+                    operator._replace_job_metadata(directory, broken)
+            self.assertEqual(json.loads((directory / "metadata.json").read_text(encoding="utf-8"))["n"], 2)
+            self.assertEqual(list(directory.glob("metadata.json.*.tmp")), [])
 
     def test_job_logs_expose_identity_receipt_and_notify_metadata(self) -> None:
         operator = _load_operator_module()
