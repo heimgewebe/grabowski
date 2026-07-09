@@ -267,6 +267,13 @@ CAPTAIN_PREFLIGHT_TRANSIENT_ERRORS = frozenset({
     "pr_mergeable_not_confirmed_before_execution",
     "pr_merge_state_not_clean_before_execution",
 })
+CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION = 1
+CAPTAIN_STATUS_PROJECTION_TRUSTED_SOURCES = frozenset({
+    "bureau status-projection",
+    "grabowski status-projection",
+    "captain status-projection",
+})
+CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS = 3600
 CAPTAIN_BASE_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 CAPTAIN_DOES_NOT_ESTABLISH = (
     "automatic_merge_authority",
@@ -2389,12 +2396,43 @@ def _captain_gate(gate_id: str, status: str, reason: str, details: Any = None) -
     return gate
 
 
+def _parse_captain_projection_generated_at(value: Any) -> datetime | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
     fresh = _mechanic_bool(parameters, "status_projection_fresh", False)
     projection = parameters.get("status_projection")
     source = parameters.get("status_projection_source")
     declared_sha = parameters.get("status_projection_sha256")
-    info: dict[str, Any] = {"used": False, "fresh": fresh, "source": None, "sha256": None}
+    info: dict[str, Any] = {
+        "used": False,
+        "fresh": fresh,
+        "source": None,
+        "source_trusted": False,
+        "sha256": None,
+        "schema_version": None,
+        "generated_at": None,
+        "max_age_seconds": CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS,
+        "age_seconds": None,
+        "replay_reference": None,
+    }
     problems: list[str] = []
     if projection is None:
         problems.append("fresh_status_projection_unavailable")
@@ -2405,7 +2443,35 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
         if not isinstance(source, str) or not source.strip():
             problems.append("status_projection_source_missing")
         else:
-            info["source"] = source.strip()
+            source_name = source.strip()
+            info["source"] = source_name
+            if source_name not in CAPTAIN_STATUS_PROJECTION_TRUSTED_SOURCES:
+                problems.append("status_projection_source_untrusted")
+            else:
+                info["source_trusted"] = True
+        schema_version = projection.get("schema_version")
+        info["schema_version"] = schema_version
+        if schema_version != CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION:
+            problems.append("status_projection_schema_version_invalid")
+        if "healthy" not in projection:
+            problems.append("status_projection_healthy_missing")
+        generated_at = projection.get("generated_at")
+        parsed_generated_at = _parse_captain_projection_generated_at(generated_at)
+        if parsed_generated_at is None:
+            problems.append("status_projection_generated_at_invalid")
+        else:
+            info["generated_at"] = parsed_generated_at.isoformat().replace("+00:00", "Z")
+            age_seconds = (datetime.now(timezone.utc) - parsed_generated_at).total_seconds()
+            info["age_seconds"] = int(age_seconds)
+            if age_seconds < 0:
+                problems.append("status_projection_generated_at_in_future")
+            elif age_seconds > CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS:
+                problems.append("status_projection_stale_by_generated_at")
+        replay_reference = projection.get("run_id") or projection.get("nonce") or projection.get("receipt_ref")
+        if not isinstance(replay_reference, str) or not replay_reference.strip():
+            problems.append("status_projection_replay_reference_missing")
+        else:
+            info["replay_reference"] = replay_reference.strip()
         if declared_sha is None:
             problems.append("status_projection_sha256_missing")
         elif not _is_sha256_hex(declared_sha):
@@ -2422,7 +2488,7 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
             _captain_gate(
                 "status-projection-fresh",
                 "blocked",
-                "status projection is missing, stale or not hash-bound; projection is required evidence",
+                "status projection is missing, stale, untrusted, replayable or not hash-bound; projection is required evidence",
                 problems,
             ),
             info,
@@ -2431,7 +2497,7 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
         _captain_gate(
             "status-projection-fresh",
             "pass",
-            "fresh status projection with source and matching sha256; evidence only, not runtime truth",
+            "fresh trusted status projection with schema, source, replay reference and matching sha256; evidence only, not runtime truth",
         ),
         info,
     )
