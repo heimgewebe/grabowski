@@ -1909,6 +1909,49 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(action["captain_receipt"]["recovery_path"], "revert the merge commit on main")
         self.assertIn("captain-preflight is read-only", output["why_no_mutation"])
 
+    def test_captain_preflight_exposes_action_and_target_digests(self) -> None:
+        result = self.run_captain(captain_parameters())
+
+        output = result["output"]
+        self.assertTrue(grips._is_sha256_hex(output["actions_sha256"]))
+        binding_gate = self.gate(result, "evidence-digest-bound")
+        self.assertEqual("pass", binding_gate["status"])
+        self.assertEqual(output["actions_sha256"], binding_gate["details"]["actions_sha256"])
+        action = output["actions"][0]
+        self.assertTrue(grips._is_sha256_hex(action["target_sha256"]))
+        self.assertTrue(grips._is_sha256_hex(action["action_sha256"]))
+        self.assertEqual(output["actions_sha256"], action["actions_sha256"])
+        self.assertEqual(0, action["index"])
+        self.assertEqual(action["index"], action["envelope"]["index"])
+        self.assertEqual(action["target_sha256"], action["envelope"]["target_sha256"])
+        self.assertEqual(action["action_sha256"], action["envelope"]["action_sha256"])
+        self.assertEqual(output["actions_sha256"], action["envelope"]["actions_sha256"])
+        self.assertEqual(action["target_sha256"], action["captain_receipt"]["target_sha256"])
+        self.assertEqual(action["action_sha256"], action["captain_receipt"]["action_sha256"])
+        self.assertEqual(output["actions_sha256"], action["captain_receipt"]["actions_sha256"])
+
+    def test_captain_evidence_digest_mismatches_fail_closed(self) -> None:
+        cases = (
+            ("status_projection", "actions_sha256", "status_projection.actions_sha256 mismatch", "status-projection-fresh"),
+            ("execution_authority", "target_sha256", "execution_authority.target_sha256 mismatch", "execution-authority-present"),
+            ("review_evidence", "actions_sha256", "review_evidence.actions_sha256 mismatch", "review-evidence-present"),
+            ("ci_evidence", "action_sha256", "ci_evidence.action_sha256 mismatch", "ci-green"),
+            ("human_authorization", "target_sha256", "human_authorization.target_sha256 mismatch", "human-authorization-present"),
+        )
+        for evidence_name, digest_field, expected_reason, specific_gate in cases:
+            with self.subTest(evidence_name=evidence_name, digest_field=digest_field):
+                parameters = captain_parameters()
+                assert isinstance(parameters[evidence_name], dict)
+                parameters[evidence_name][digest_field] = "f" * 64
+                if evidence_name == "status_projection":
+                    parameters["status_projection_sha256"] = grips.sha256_json(parameters["status_projection"])
+                result = self.run_captain(parameters)
+
+                self.assertEqual("blocked", result["output"]["decision"])
+                self.assertIn(expected_reason, result["output"]["blocked_reasons"])
+                self.assertEqual("blocked", self.gate(result, "evidence-digest-bound")["status"])
+                self.assertEqual("blocked", self.gate(result, specific_gate)["status"])
+
     def test_top_level_receipt_follows_receipt_status_when_blocked(self) -> None:
         result = self.run_captain(captain_parameters(review_evidence=None))
 

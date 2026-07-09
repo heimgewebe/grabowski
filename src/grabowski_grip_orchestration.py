@@ -160,6 +160,7 @@ def run_captain_preflight(core: CoreModule, spec: Any, parameters: dict[str, Any
         "blocked_reasons": blocked_reasons,
         "gates": gates,
         "status_projection": projection_info,
+        "actions_sha256": core._captain_actions_sha256(actions),
         "high_impact_action_allowlist": sorted(core.CAPTAIN_HIGH_IMPACT_ACTIONS),
         "actions": [core._captain_action_record(action, gate_decision=gate_decision, projection_info=projection_info) for action in actions],
         "why_no_mutation": core.CAPTAIN_NO_MUTATION_REASON,
@@ -196,6 +197,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
             "blocked_reasons": blocked_reasons,
             "gates": gates,
             "status_projection": projection_info,
+            "actions_sha256": core._captain_actions_sha256(actions),
             "executable_action_allowlist": sorted(core.CAPTAIN_EXECUTABLE_ACTIONS),
             "actions": [core._captain_action_record(action, gate_decision="blocked", projection_info=projection_info) for action in actions],
             "executions": [],
@@ -298,6 +300,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         "failed_reasons": post_execution_reasons,
         "gates": gates,
         "status_projection": projection_info,
+        "actions_sha256": core._captain_actions_sha256(actions),
         "executable_action_allowlist": sorted(core.CAPTAIN_EXECUTABLE_ACTIONS),
         "actions": action_records,
         "execution_counts": {
