@@ -482,6 +482,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heim-pc", "hostname"])
                 with self.assertRaisesRegex(PermissionError, "heimserver"):
                     grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heimserver", "hostname"])
+                grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heimberry", "hostname"])
                 grabowski_mcp._reject_forbidden_hosts_in_argv(["echo", "heim", "pc", "hostname"])
 
     def test_write_outside_profile_scope_remains_blocked(self) -> None:
