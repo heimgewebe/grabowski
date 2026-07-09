@@ -29,6 +29,18 @@
       "timeout_seconds": 600,
       "max_argv": 128,
       "allow_shell": false,
+      "allowed_argv_prefixes": [
+        ["/usr/bin/systemctl", "is-active"],
+        ["/usr/bin/systemctl", "status"],
+        ["/usr/bin/systemctl", "reset-failed"],
+        ["/usr/bin/apt-get", "update"],
+        ["/usr/bin/apt-get", "install", "-y"],
+        ["/usr/bin/docker", "compose"],
+        ["/usr/bin/chown"],
+        ["/usr/bin/chmod"],
+        ["/usr/bin/mount"],
+        ["/usr/bin/umount"]
+      ],
       "gate": {
         "kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
         "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",

@@ -554,6 +554,82 @@ class PrivilegedBrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "shell"):
             privileged_broker.resolve_execution(config, parsed)
 
+    def test_power_argv_json_allows_cataloged_admin_prefix(self) -> None:
+        reference = self._power_reference({"argv": ["/usr/bin/systemctl", "is-active", "grabowski-privileged-broker.socket"], "cwd": "/", "timeout_seconds": 30})
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_power_argv": {
+                    "enabled": True,
+                    "mode": "argv-json",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 600,
+                    "max_argv": 128,
+                    "allow_shell": False,
+                    "allowed_argv_prefixes": [
+                        ["/usr/bin/systemctl", "is-active"],
+                        ["/usr/bin/systemctl", "status"],
+                    ],
+                    "gate": self._power_gate(self.tmp.name),
+                }
+            },
+        }
+        execution = privileged_broker.resolve_execution(config, parsed)
+
+        self.assertEqual(execution["argv"], ["/usr/bin/systemctl", "is-active", "grabowski-privileged-broker.socket"])
+
+    def test_power_argv_json_rejects_uncataloged_admin_command(self) -> None:
+        reference = self._power_reference({"argv": ["/usr/bin/systemctl", "restart", "grabowski-mcp.service"], "cwd": "/", "timeout_seconds": 30})
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_power_argv": {
+                    "enabled": True,
+                    "mode": "argv-json",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 600,
+                    "max_argv": 128,
+                    "allow_shell": False,
+                    "allowed_argv_prefixes": [["/usr/bin/systemctl", "is-active"]],
+                    "gate": self._power_gate(self.tmp.name),
+                }
+            },
+        }
+        with self.assertRaisesRegex(PermissionError, "configured catalog"):
+            privileged_broker.resolve_execution(config, parsed)
+
+    def test_power_argv_json_rejects_shell_prefix_in_catalog_when_shell_disabled(self) -> None:
+        reference = self._power_reference({"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_power_argv": {
+                    "enabled": True,
+                    "mode": "argv-json",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 600,
+                    "max_argv": 128,
+                    "allow_shell": False,
+                    "allowed_argv_prefixes": [["/bin/bash", "-lc"]],
+                    "gate": self._power_gate(self.tmp.name),
+                }
+            },
+        }
+        with self.assertRaisesRegex(PermissionError, "shell"):
+            privileged_broker.resolve_execution(config, parsed)
+
     def test_power_run_tool_builds_reference_and_requires_recovery(self) -> None:
         class Completed:
             returncode = 0

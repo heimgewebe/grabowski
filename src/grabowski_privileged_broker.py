@@ -150,6 +150,28 @@ def _validate_power_argv(value: Any, *, max_argv: int, allow_shell: bool) -> lis
     return argv
 
 
+def _validate_power_argv_prefixes(value: Any, *, allow_shell: bool) -> list[list[str]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not value:
+        raise ValueError("power allowed_argv_prefixes must be a non-empty list when supplied")
+    if len(value) > 256:
+        raise ValueError("power allowed_argv_prefixes exceeds item limit")
+    prefixes: list[list[str]] = []
+    for prefix in value:
+        normalized = _validate_power_argv(
+            prefix,
+            max_argv=MAX_ARGV_ITEMS,
+            allow_shell=allow_shell,
+        )
+        prefixes.append(normalized)
+    return prefixes
+
+
+def _power_argv_matches_prefix(argv: list[str], prefix: list[str]) -> bool:
+    return len(argv) >= len(prefix) and argv[: len(prefix)] == prefix
+
+
 def _validate_power_cwd(value: Any, *, pattern: str) -> str:
     if value is None:
         value = "/"
@@ -259,7 +281,9 @@ def _resolve_power_argv_action(
         "enabled", "mode", "target_pattern", "timeout_seconds",
         "cwd_pattern", "max_argv", "allow_shell", "gate",
     }
-    if set(candidate) != required or candidate["enabled"] is not True:
+    optional = {"allowed_argv_prefixes"}
+    candidate_keys = set(candidate)
+    if not required.issubset(candidate_keys) or candidate_keys - required - optional or candidate["enabled"] is not True:
         raise PermissionError("privileged action is disabled or malformed")
     if candidate["mode"] != "argv-json":
         raise PermissionError("privileged action is disabled or malformed")
@@ -277,6 +301,10 @@ def _resolve_power_argv_action(
     allow_shell = candidate["allow_shell"]
     if not isinstance(allow_shell, bool):
         raise ValueError("power allow_shell is invalid")
+    allowed_argv_prefixes = _validate_power_argv_prefixes(
+        candidate.get("allowed_argv_prefixes"),
+        allow_shell=allow_shell,
+    )
     cwd_pattern = candidate["cwd_pattern"]
     if not isinstance(cwd_pattern, str):
         raise ValueError("power cwd_pattern is invalid")
@@ -292,6 +320,11 @@ def _resolve_power_argv_action(
         max_argv=max_argv,
         allow_shell=allow_shell,
     )
+    if allowed_argv_prefixes and not any(
+        _power_argv_matches_prefix(argv, prefix)
+        for prefix in allowed_argv_prefixes
+    ):
+        raise PermissionError("power argv is not allowed by configured catalog")
     cwd = _validate_power_cwd(payload["cwd"], pattern=cwd_pattern)
     requested_timeout = _validate_power_timeout(
         payload["timeout_seconds"],
