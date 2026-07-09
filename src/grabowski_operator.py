@@ -598,13 +598,20 @@ def _job_expected_receipt(
     }
 
 
-def _systemd_job_query_visible(result: dict[str, Any], properties: dict[str, str]) -> bool:
+def _systemd_job_query_valid(result: dict[str, Any], properties: dict[str, str]) -> bool:
     load_state = properties.get("LoadState")
     active_state = properties.get("ActiveState")
     return (
         result.get("returncode") == 0
-        and load_state not in {None, "", "not-found"}
+        and load_state not in {None, ""}
         and active_state not in {None, ""}
+    )
+
+
+def _systemd_job_query_visible(result: dict[str, Any], properties: dict[str, str]) -> bool:
+    return (
+        _systemd_job_query_valid(result, properties)
+        and properties.get("LoadState") != "not-found"
     )
 
 
@@ -629,8 +636,14 @@ def _job_final_status(systemd_visible: bool, properties: dict[str, str]) -> str:
     return "unknown"
 
 
-def _job_terminalization_evidence(systemd_visible: bool, properties: dict[str, str]) -> dict[str, Any]:
-    query_valid = systemd_visible
+def _job_terminalization_evidence(
+    systemd_visible: bool,
+    properties: dict[str, str],
+    *,
+    query_valid: bool | None = None,
+) -> dict[str, Any]:
+    if query_valid is None:
+        query_valid = systemd_visible
     final_status = _job_final_status(systemd_visible, properties)
     return {
         "source": "systemd-show",
@@ -654,6 +667,20 @@ def _safe_normalize_stored_notify_on_done(value: Any) -> dict[str, Any]:
         fallback = _normalize_notify_on_done(None)
         fallback["metadata_invalid"] = True
         fallback["metadata_error"] = "notify_on_done must be an object when provided"
+        return fallback
+    allowed_stored = {
+        "requested",
+        "channels",
+        "note",
+        "delivery_mode",
+        "delivery_enabled",
+        "does_not_establish",
+    }
+    unknown = sorted(set(value) - allowed_stored)
+    if unknown:
+        fallback = _normalize_notify_on_done(None)
+        fallback["metadata_invalid"] = True
+        fallback["metadata_error"] = f"Unknown notify_on_done field(s): {', '.join(unknown)}"
         return fallback
     try:
         source = {key: value[key] for key in ("requested", "channels", "note") if key in value}
@@ -729,8 +756,39 @@ def _project_job_metadata(unit: str, metadata: dict[str, Any]) -> dict[str, Any]
     return projected
 
 
-def _job_status_record(unit: str, metadata: dict[str, Any], *, systemd_visible: bool, properties: dict[str, str]) -> dict[str, Any]:
-    terminalization = _job_terminalization_evidence(systemd_visible, properties)
+def _metadata_launch_failure_evidence(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    evidence = metadata.get("terminalization_evidence")
+    if not isinstance(evidence, dict):
+        return None
+    if metadata.get("final_status") != "launch_failed":
+        return None
+    if evidence.get("final_status") != "launch_failed":
+        return None
+    return {
+        **evidence,
+        "query_valid": False,
+        "systemd_visible": False,
+        "final_status": "launch_failed",
+    }
+
+
+def _job_status_record(
+    unit: str,
+    metadata: dict[str, Any],
+    *,
+    systemd_visible: bool,
+    query_valid: bool,
+    properties: dict[str, str],
+) -> dict[str, Any]:
+    terminalization = _job_terminalization_evidence(
+        systemd_visible,
+        properties,
+        query_valid=query_valid,
+    )
+    if not systemd_visible:
+        metadata_terminalization = _metadata_launch_failure_evidence(metadata)
+        if metadata_terminalization is not None:
+            terminalization = metadata_terminalization
     projected = _project_job_metadata(unit, metadata)
     notify_on_done = projected["notify_on_done"]
     return {
@@ -1090,11 +1148,13 @@ def grabowski_job_status(unit: str) -> dict[str, Any]:
         max_output_bytes=DEFAULT_OUTPUT_BYTES,
     )
     properties = _parse_show(result["stdout"])
+    query_valid = _systemd_job_query_valid(result, properties)
     systemd_visible = _systemd_job_query_visible(result, properties)
     job_record = _job_status_record(
         name,
         metadata,
         systemd_visible=systemd_visible,
+        query_valid=query_valid,
         properties=properties,
     )
     return {

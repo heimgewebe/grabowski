@@ -321,6 +321,41 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(metadata["launcher_evidence"]["returncode"], 1)
             self.assertNotEqual(metadata["final_status"], "started")
 
+            systemctl = {
+                "returncode": 0,
+                "stdout": "LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=\nExecMainCode=\nExecMainStatus=\n",
+                "stderr": "",
+                "argv": [],
+                "argv_sha256": "1" * 64,
+                "command": "systemctl show",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator, "_run", return_value=systemctl):
+                status = operator.grabowski_job_status("grabowski-job-badlaunch000")
+
+            self.assertFalse(status["systemd_visible"])
+            self.assertEqual(status["final_status"], "launch_failed")
+            self.assertEqual(status["terminalization_evidence"]["source"], "systemd-run-launch")
+            self.assertEqual(status["notification_evidence"]["final_status_preserved"], "launch_failed")
+
+    def test_not_found_systemd_unit_has_valid_query_but_missing_finalization(self) -> None:
+        operator = _load_operator_module()
+        result = {"returncode": 0}
+        properties = {"LoadState": "not-found", "ActiveState": "inactive"}
+
+        self.assertTrue(operator._systemd_job_query_valid(result, properties))
+        self.assertFalse(operator._systemd_job_query_visible(result, properties))
+        evidence = operator._job_terminalization_evidence(False, properties, query_valid=True)
+        self.assertTrue(evidence["query_valid"])
+        self.assertFalse(evidence["systemd_visible"])
+        self.assertEqual(evidence["final_status"], "missing_finalization_evidence")
+
     def test_malformed_systemd_show_is_missing_finalization_evidence(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -541,6 +576,19 @@ class OperatorContractTests(unittest.TestCase):
             self.assertTrue(notify["metadata_invalid"])
             self.assertFalse(status["notification_evidence"]["delivery_enabled"])
             self.assertEqual(status["notification_evidence"]["delivery_state"], "not_sent")
+
+            metadata["notify_on_done"] = {"requested": True, "send": True}
+            (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator, "_run", return_value=systemctl):
+                status = operator.grabowski_job_status(metadata["unit"])
+
+            notify = status["job_record"]["notify_on_done"]
+            self.assertFalse(notify["requested"])
+            self.assertTrue(notify["metadata_invalid"])
+            self.assertIn("Unknown notify_on_done field", notify["metadata_error"])
+            self.assertFalse(status["notification_evidence"]["delivery_enabled"])
 
     def test_job_logs_expose_identity_receipt_and_notify_metadata(self) -> None:
         operator = _load_operator_module()
