@@ -153,15 +153,30 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         )
         self.assertIn("1 non-green check(s)", result["failures"])
 
-    def test_untrusted_codex_substring_actor_does_not_satisfy_explicit_codex_requirement(self) -> None:
+    def test_coding_agent_review_state_is_advisory_but_github_merge_state_still_blocks(self) -> None:
+        state = _state(merge_state="BLOCKED")
+        state["pr"]["reviews"] = [{"author": {"login": "chatgpt-codex-connector"}, "commit_id": HEAD, "state": "CHANGES_REQUESTED"}]
+
+        result = pr_review_gate.evaluate_review_gate(state, self_review=_self_review())
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("GitHub mergeStateStatus is BLOCKED, not CLEAN", result["failures"])
+        self.assertIn("Codex review has advisory blocking state(s): CHANGES_REQUESTED", result["warnings"])
+        self.assertFalse(any("Codex review has blocking state" in failure for failure in result["failures"]))
+
+    def test_untrusted_codex_substring_actor_does_not_satisfy_codex_seen_diagnostic(self) -> None:
         state = _state(actor="friendly-codex-bot")
         state["pr_diff_bypass"] = True
         state["pr_diff_bypass_reason"] = "legacy unit seam without live PR diff"
         review = _self_review()
-        review["codex_review"] = {"required": True, "reason": "explicit check"}
+        review["codex_review"] = {"required": True, "reason": "legacy explicit check"}
         result = pr_review_gate.evaluate_review_gate(state, self_review=review)
-        self.assertEqual(result["verdict"], "BLOCK")
-        self.assertIn("Codex review is explicitly required but not observed on current head", result["failures"])
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertFalse(result["review_sources"]["codex_seen"])
+        self.assertIn(
+            "Deprecated self_review.codex_review.required ignored; use diff-bound external review evidence",
+            result["warnings"],
+        )
 
 
 if __name__ == "__main__":

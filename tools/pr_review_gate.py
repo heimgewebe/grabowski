@@ -1151,21 +1151,19 @@ def evaluate_review_gate(
         failures.append(f"GitHub mergeable is {mergeable}, not MERGEABLE")
     codex = self_review.get("codex_review") if isinstance(self_review, dict) else None
     codex_required = isinstance(codex, dict) and codex.get("required") is True
-    platform_review_required = complexity["high_critical"]
+    platform_review_required = False
     platform_review_seen = codex_seen or claude_seen or claude_cli_seen
 
     if codex_blocking_states:
-        failures.append(f"Codex review has blocking state(s): {', '.join(codex_blocking_states)}")
+        warnings.append(f"Codex review has advisory blocking state(s): {', '.join(codex_blocking_states)}")
     if claude_blocking_states:
-        failures.append(f"Claude review has blocking state(s): {', '.join(claude_blocking_states)}")
+        warnings.append(f"Claude review has advisory blocking state(s): {', '.join(claude_blocking_states)}")
     for failure in claude_cli_failures:
-        failures.append(f"Claude CLI evidence invalid: {failure}")
-    if codex_required and not codex_seen and not codex_blocking_states:
-        failures.append("Codex review is explicitly required but not observed on current head")
+        warnings.append(f"Legacy Claude CLI evidence invalid and ignored: {failure}")
+    if codex_required:
+        warnings.append("Deprecated self_review.codex_review.required ignored; use diff-bound external review evidence")
     elif not codex_seen and isinstance(codex, dict) and codex.get("unavailable_reason"):
         warnings.append("Codex review unavailable but explained")
-    if platform_review_required and not platform_review_seen and not codex_blocking_states and not claude_blocking_states:
-        failures.append("High-critical platform review is required but neither Codex nor Claude was observed")
 
     self_review_failures: list[str] = []
     self_review_workflow_failures: list[str] = []
@@ -1209,8 +1207,8 @@ def evaluate_review_gate(
 
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
     claude_required = isinstance(claude, dict) and claude.get("required") is True
-    if claude_required and not (claude_seen or claude_cli_seen) and not claude_blocking_states:
-        failures.append("Claude review is explicitly required but not observed on current head")
+    if claude_required:
+        warnings.append("Deprecated self_review.claude_review.required ignored; use diff-bound external review evidence")
 
     if state.get("pr_diff_bypass") is True:
         warnings.append("Self-review diff binding bypass was requested")

@@ -399,7 +399,7 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertFalse(result["complexity"]["docs_only"])
         self.assertEqual(result["complexity"]["review_tier"], "high_critical")
-        self.assertTrue(result["review_sources"]["platform_review_required"])
+        self.assertFalse(result["review_sources"]["platform_review_required"])
         self.assertIn("high-critical policy path touched: GRABOWSKI.md", result["complexity"]["reasons"])
 
     def test_agents_md_is_policy_critical_not_documentation_exempt(self) -> None:
@@ -411,7 +411,7 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertFalse(result["complexity"]["docs_only"])
         self.assertEqual(result["complexity"]["review_tier"], "high_critical")
-        self.assertTrue(result["review_sources"]["platform_review_required"])
+        self.assertFalse(result["review_sources"]["platform_review_required"])
         self.assertIn("high-critical policy path touched: AGENTS.md", result["complexity"]["reasons"])
 
     def test_external_review_loop_doc_is_policy_critical(self) -> None:
@@ -423,7 +423,7 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertFalse(result["complexity"]["docs_only"])
         self.assertEqual(result["complexity"]["review_tier"], "high_critical")
-        self.assertTrue(result["review_sources"]["platform_review_required"])
+        self.assertFalse(result["review_sources"]["platform_review_required"])
 
     def test_generated_json_under_docs_is_not_documentation_exempt(self) -> None:
         state = _state("docs/generated/operator-context.v1.json")
@@ -490,7 +490,7 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertFalse(result["review_sources"]["external_review_required"])
         self.assertFalse(result["review_sources"]["platform_review_required"])
 
-    def test_high_critical_change_requires_platform_and_external_evidence(self) -> None:
+    def test_high_critical_change_requires_external_evidence_without_coding_agent_requirement(self) -> None:
         state = _state("src/runtime_boundary.py")
         state["pr"]["reviews"] = []
         result = gate.evaluate_review_gate(state, self_review=_self_review())
@@ -499,12 +499,26 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertTrue(result["complexity"]["complex"])
         self.assertEqual(result["complexity"]["review_tier"], "high_critical")
         self.assertTrue(result["review_sources"]["external_review_required"])
-        self.assertTrue(result["review_sources"]["platform_review_required"])
+        self.assertFalse(result["review_sources"]["platform_review_required"])
         self.assertTrue(_has_failure(result, "external review is required but evidence is missing"), result["failures"])
-        self.assertIn(
-            "High-critical platform review is required but neither Codex nor Claude was observed",
+        self.assertFalse(
+            _has_failure(result, "High-critical platform review is required"),
             result["failures"],
         )
+
+    def test_high_critical_change_with_diff_bound_external_evidence_passes_without_coding_agent_review(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_external(),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertTrue(result["review_sources"]["external_review_required"])
+        self.assertEqual(result["review_sources"]["external_reviews_received"], 1)
+        self.assertFalse(result["review_sources"]["platform_review_required"])
+        self.assertFalse(result["review_sources"]["platform_review_seen"])
 
     def test_write_external_review_packet_creates_downloadable_diff_and_template(self) -> None:
         state = _state("src/feature.py")

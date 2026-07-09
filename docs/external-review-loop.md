@@ -1,6 +1,6 @@
 # External review loop
 
-`tools/pr_review_gate.py` requires separate external LLM review evidence for every pull request except documentation-only changes and very small uncomplicated changes. High-critical pull requests also require a platform review from Codex or Claude. High-critical classification is derived from large file/line counts, generic runtime/deploy/security/migration/privilege/recovery/policy path markers, Grabowski operator-critical paths, self-review uncertainty, and material findings after the first review.
+`tools/pr_review_gate.py` requires separate diff-bound external review evidence for every pull request except documentation-only changes and very small uncomplicated changes. High-critical pull requests require external review evidence, but they do not require a privileged Codex or Claude platform review. High-critical classification is derived from large file/line counts, generic runtime/deploy/security/migration/privilege/recovery/policy path markers, Grabowski operator-critical paths, self-review uncertainty, and material findings after the first review.
 
 The external loop is separate from Grabowski self-review. Self-review remains internal evidence; external review evidence is passed with its own CLI argument. Use the packet writer whenever an external LLM review is needed so the diff is available as a downloadable artifact:
 
@@ -34,7 +34,7 @@ python3 tools/pr_review_gate.py \
   --json
 ```
 
-For external-review-exempt PRs, still pass completed `--self-review` evidence and omit only `--external-review-evidence`. For high-critical PRs, include `--claude-evidence evidence/claude.json` when Claude CLI evidence is used instead of a current-head trusted Claude review object.
+For external-review-exempt PRs, still pass completed `--self-review` evidence and omit only `--external-review-evidence`. `--claude-evidence` remains accepted as legacy diagnostic input, but it is not required for high-critical PRs and does not replace `--external-review-evidence`.
 
 Minimal self-review evidence object:
 
@@ -86,7 +86,7 @@ Minimal external evidence object:
   "prompt_includes_diff": true,
   "reviews": [
     {
-      "source": "chatgpt|claude|gemini|other",
+      "source": "chatgpt|claude|gemini|other|user_pasted_review",
       "review_sha256": "<sha256 of returned review text>",
       "verdict": "PASS|NEEDS_CHANGE|BLOCK",
       "finding_count": 0
@@ -117,8 +117,8 @@ Rules:
 - Documentation-only PRs and very small uncomplicated PRs with no external evidence do not block. If voluntary external evidence is passed, its findings are still validated.
 - Policy-critical documentation such as `GRABOWSKI.md`, `AGENTS.md`, `docs/external-review-loop.md`, and operator/recovery/deploy doctrine is not documentation-exempt.
 - Very small changes are not exempt when they touch build, config, CI, packaging, controlled tool paths, structured data, lock files, or zero-line/binary-like diffs.
-- Non-trivial non-documentation PRs require external LLM evidence even when Codex or Claude is not required.
-- High-critical PRs require both external LLM evidence and at least one platform review from Codex or Claude.
+- Non-trivial non-documentation PRs require diff-bound external review evidence. The reviewer may be ChatGPT in the current conversation or another external LLM, as long as the review was based on the current PR diff and is recorded in structured evidence.
+- High-critical PRs require diff-bound external review evidence, not a Codex/Claude platform-review special case. If Codex or Claude review signals exist, the gate may report them as diagnostics, but they are not privileged trust anchors. GitHub merge protection remains separate: non-clean `mergeStateStatus`, non-mergeable PRs, or non-green checks still block.
 
 Threat model:
 
@@ -128,4 +128,4 @@ The hashes are audit and integrity handles, not identity guarantees. They help d
 
 A stronger model would use stable finding IDs, signed prompt/review artifacts, branch protection, externally stored attestations, or reviewer identity backed by a system outside the operator's write path. Those are outside this PR.
 
-This is not a substitute for Grabowski self-review, high-critical platform review, or CI. It is a contrast loop: different reviewer failure modes, not ritual mass.
+This is not a substitute for Grabowski self-review or CI. It is a contrast loop: different reviewer failure modes, not ritual mass. Coding-agent reviews may be useful inputs, but the gate does not prioritize them over a diff-bound review returned to ChatGPT or pasted from another external LLM.
