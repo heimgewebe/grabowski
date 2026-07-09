@@ -274,6 +274,7 @@ CAPTAIN_STATUS_PROJECTION_TRUSTED_SOURCES = frozenset({
     "captain status-projection",
 })
 CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS = 3600
+CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS = 300
 CAPTAIN_BASE_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 CAPTAIN_DOES_NOT_ESTABLISH = (
     "automatic_merge_authority",
@@ -2430,7 +2431,9 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
         "schema_version": None,
         "generated_at": None,
         "max_age_seconds": CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS,
+        "clock_skew_tolerance_seconds": CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS,
         "age_seconds": None,
+        "projection_source": None,
         "replay_reference": None,
     }
     problems: list[str] = []
@@ -2453,8 +2456,19 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
         info["schema_version"] = schema_version
         if schema_version != CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION:
             problems.append("status_projection_schema_version_invalid")
+        projection_source = projection.get("source")
+        if not isinstance(projection_source, str) or not projection_source.strip():
+            problems.append("status_projection_source_missing_in_projection")
+        else:
+            projection_source_name = projection_source.strip()
+            info["projection_source"] = projection_source_name
+            if info["source"] is not None and projection_source_name != info["source"]:
+                problems.append("status_projection_source_mismatch")
+        healthy = projection.get("healthy")
         if "healthy" not in projection:
             problems.append("status_projection_healthy_missing")
+        elif not isinstance(healthy, bool):
+            problems.append("status_projection_healthy_invalid")
         generated_at = projection.get("generated_at")
         parsed_generated_at = _parse_captain_projection_generated_at(generated_at)
         if parsed_generated_at is None:
@@ -2463,7 +2477,7 @@ def _captain_status_projection_gate(parameters: dict[str, Any], actions: list[di
             info["generated_at"] = parsed_generated_at.isoformat().replace("+00:00", "Z")
             age_seconds = (datetime.now(timezone.utc) - parsed_generated_at).total_seconds()
             info["age_seconds"] = int(age_seconds)
-            if age_seconds < 0:
+            if age_seconds < -CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS:
                 problems.append("status_projection_generated_at_in_future")
             elif age_seconds > CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS:
                 problems.append("status_projection_stale_by_generated_at")
