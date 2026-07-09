@@ -2037,7 +2037,9 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(captain_parameters(status_projection_source="caller supplied flag"))
 
         self.assertIn("status_projection_source_untrusted", result["output"]["blocked_reasons"])
+        self.assertFalse(result["output"]["status_projection"]["source_allowlisted"])
         self.assertFalse(result["output"]["status_projection"]["source_trusted"])
+        self.assertIn("bureau status-projection", result["output"]["status_projection"]["allowlisted_sources"])
 
     def test_blocks_status_projection_source_swap_after_hash(self) -> None:
         parameters = captain_parameters(status_projection_source="caller supplied flag")
@@ -2108,7 +2110,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_blocks_status_projection_generated_too_far_in_future(self) -> None:
         generated_at = datetime.now(timezone.utc) + timedelta(
-            seconds=grips.CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS + 1
+            seconds=grips.CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS + 30
         )
         projection = {
             "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
@@ -2157,6 +2159,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertNotIn("status_projection_replay_reference_missing", result["output"]["blocked_reasons"])
         self.assertEqual("nonce-ok", result["output"]["status_projection"]["replay_reference"])
+        self.assertEqual("nonce", result["output"]["status_projection"]["replay_reference_kind"])
         self.assertEqual("pass", self.gate(result, "status-projection-fresh")["status"])
 
     def test_accepts_receipt_ref_when_status_projection_run_id_and_nonce_are_blank(self) -> None:
@@ -2173,6 +2176,24 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertNotIn("status_projection_replay_reference_missing", result["output"]["blocked_reasons"])
         self.assertEqual("receipt-ok", result["output"]["status_projection"]["replay_reference"])
+        self.assertEqual("receipt_ref", result["output"]["status_projection"]["replay_reference_kind"])
+        self.assertEqual("pass", self.gate(result, "status-projection-fresh")["status"])
+
+    def test_prefers_receipt_ref_status_projection_replay_reference(self) -> None:
+        projection = {
+            "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
+            "source": "bureau status-projection",
+            "healthy": True,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "run_id": "run-ok",
+            "nonce": "nonce-ok",
+            "receipt_ref": "receipt-ok",
+        }
+        result = self.run_captain(captain_parameters(status_projection=projection, status_projection_sha256=grips.sha256_json(projection)))
+
+        self.assertNotIn("status_projection_replay_reference_missing", result["output"]["blocked_reasons"])
+        self.assertEqual("receipt-ok", result["output"]["status_projection"]["replay_reference"])
+        self.assertEqual("receipt_ref", result["output"]["status_projection"]["replay_reference_kind"])
         self.assertEqual("pass", self.gate(result, "status-projection-fresh")["status"])
 
     def test_captain_run_without_allow_mutation_exposes_authority_contract(self) -> None:
