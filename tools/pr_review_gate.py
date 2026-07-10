@@ -1124,6 +1124,48 @@ def _workflow_text_at_head(repo: Path, head_sha: str) -> str | None:
     return None
 
 
+def _direct_child_indent(lines: list[str], parent_indent: int) -> int | None:
+    indents = [
+        len(line) - len(line.lstrip())
+        for line in lines
+        if line.strip()
+        and not line.lstrip().startswith("#")
+        and len(line) - len(line.lstrip()) > parent_indent
+    ]
+    return min(indents) if indents else None
+
+
+def _mapping_child_block(
+    lines: list[str], *, key: str, parent_indent: int
+) -> tuple[list[str], str] | None:
+    child_indent = _direct_child_indent(lines, parent_indent)
+    if child_indent is None:
+        return None
+    key_pattern = re.compile(
+        rf"^\s*{re.escape(key)}\s*:\s*(?P<inline>.*)$"
+    )
+    for index, line in enumerate(lines):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent != child_indent:
+            continue
+        match = key_pattern.match(line)
+        if match is None:
+            continue
+        block: list[str] = []
+        for candidate in lines[index + 1 :]:
+            if not candidate.strip() or candidate.lstrip().startswith("#"):
+                block.append(candidate)
+                continue
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate_indent <= child_indent:
+                break
+            block.append(candidate)
+        return block, match.group("inline").strip()
+    return None
+
+
 def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
     lines = text.splitlines()
     jobs_index = next(
@@ -1137,63 +1179,88 @@ def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
     )
     if jobs_index is None:
         return ()
+    jobs_lines = lines[jobs_index + 1 :]
+    job_indent = _direct_child_indent(jobs_lines, 0)
+    if job_indent is None:
+        return ()
     validate_index: int | None = None
-    validate_indent: int | None = None
-    for index in range(jobs_index + 1, len(lines)):
-        line = lines[index]
+    for index, line in enumerate(jobs_lines):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         indent = len(line) - len(line.lstrip())
         if indent == 0:
             break
-        if re.fullmatch(r"validate\s*:\s*(?:#.*)?", line.strip()):
+        if indent == job_indent and re.fullmatch(
+            r"validate\s*:\s*(?:#.*)?", line.strip()
+        ):
             validate_index = index
-            validate_indent = indent
             break
-    if validate_index is None or validate_indent is None:
+    if validate_index is None:
         return ()
 
-    block: list[str] = []
-    for line in lines[validate_index + 1 :]:
+    validate_block: list[str] = []
+    for line in jobs_lines[validate_index + 1 :]:
         if not line.strip() or line.lstrip().startswith("#"):
-            block.append(line)
+            validate_block.append(line)
             continue
         indent = len(line) - len(line.lstrip())
-        if indent <= validate_indent:
+        if indent <= job_indent:
             break
-        if indent == validate_indent + 2 and re.match(r"^\s*name\s*:", line):
-            raise GateInputError("target validate job uses a custom name")
-        block.append(line)
+        validate_block.append(line)
 
-    for index, line in enumerate(block):
-        match = re.match(r"^(?P<indent>\s*)python-version\s*:\s*(?P<inline>.*)$", line)
-        if match is None:
+    name_entry = _mapping_child_block(
+        validate_block, key="name", parent_indent=job_indent
+    )
+    if name_entry is not None:
+        raise GateInputError("target validate job uses a custom name")
+    strategy_entry = _mapping_child_block(
+        validate_block, key="strategy", parent_indent=job_indent
+    )
+    if strategy_entry is None or strategy_entry[1]:
+        return ()
+    strategy_block, _ = strategy_entry
+    strategy_indent = _direct_child_indent(strategy_block, job_indent)
+    if strategy_indent is None:
+        return ()
+    matrix_entry = _mapping_child_block(
+        strategy_block, key="matrix", parent_indent=strategy_indent - 1
+    )
+    if matrix_entry is None or matrix_entry[1]:
+        return ()
+    matrix_block, _ = matrix_entry
+    matrix_indent = _direct_child_indent(matrix_block, strategy_indent)
+    if matrix_indent is None:
+        return ()
+    versions_entry = _mapping_child_block(
+        matrix_block, key="python-version", parent_indent=matrix_indent - 1
+    )
+    if versions_entry is None:
+        return ()
+    version_block, inline = versions_entry
+    if inline.startswith("[") and inline.endswith("]"):
+        return tuple(
+            value.strip().strip("\"'")
+            for value in inline[1:-1].split(",")
+            if value.strip().strip("\"'")
+        )
+    version_indent = _direct_child_indent(version_block, matrix_indent)
+    if version_indent is None:
+        return ()
+    values: list[str] = []
+    for line in version_block:
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        inline = match.group("inline").strip()
-        if inline.startswith("[") and inline.endswith("]"):
-            values = [
-                value.strip().strip("\"'")
-                for value in inline[1:-1].split(",")
-                if value.strip().strip("\"'")
-            ]
-            return tuple(values)
-        indentation = len(match.group("indent"))
-        values: list[str] = []
-        for candidate in block[index + 1 :]:
-            if not candidate.strip() or candidate.lstrip().startswith("#"):
-                continue
-            candidate_indent = len(candidate) - len(candidate.lstrip())
-            if candidate_indent <= indentation:
-                break
-            item = re.match(
-                r"^\s*-\s*[\"']?(?P<version>[^\"'#\s]+)[\"']?\s*(?:#.*)?$",
-                candidate,
-            )
-            if item is None:
-                break
-            values.append(item.group("version"))
-        return tuple(values)
-    return ()
+        indent = len(line) - len(line.lstrip())
+        if indent != version_indent:
+            continue
+        item = re.match(
+            r"^\s*-\s*[\"']?(?P<version>[^\"'#\s]+)[\"']?\s*(?:#.*)?$",
+            line,
+        )
+        if item is None:
+            return ()
+        values.append(item.group("version"))
+    return tuple(values)
 
 
 def expected_check_names_for_repo(

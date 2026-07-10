@@ -45,6 +45,27 @@ jobs:
             ("3.11", "3.12"),
         )
 
+    def test_ignores_nested_validate_and_step_python_version(self) -> None:
+        text = """jobs:
+  docs:
+    steps:
+      - with:
+          validate:
+            python-version: ["3.9"]
+  validate:
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "${{ matrix.python-version }}"
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+"""
+        self.assertEqual(
+            pr_review_gate._python_versions_from_validate_workflow(text),
+            ("3.11", "3.12"),
+        )
+
     def test_reads_inline_python_matrix_from_validate_job(self) -> None:
         text = """jobs:
   validate:
