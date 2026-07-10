@@ -158,6 +158,13 @@ def git_environment() -> dict[str, str]:
     return environment
 
 
+def child_environment() -> dict[str, str]:
+    environment = git_environment()
+    for name in FINALIZATION_ENV.values():
+        environment.pop(name, None)
+    return environment
+
+
 def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
@@ -276,7 +283,7 @@ def verify_repository(repo: Path, expected_head: str) -> None:
 
 def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str) -> None:
     emit(f"{phase}-start", argv=argv)
-    process = subprocess.Popen(argv, cwd=cwd, env=git_environment(), stdin=subprocess.DEVNULL, stdout=None, stderr=None, start_new_session=True)
+    process = subprocess.Popen(argv, cwd=cwd, env=child_environment(), stdin=subprocess.DEVNULL, stdout=None, stderr=None, start_new_session=True)
     try:
         returncode = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:

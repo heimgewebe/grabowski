@@ -136,6 +136,32 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 cwd=Path("/tmp"),
             )
 
+    def test_child_environment_strips_job_finalization_bindings(self) -> None:
+        bindings = {name: f"value-{index}" for index, name in enumerate(RUNNER.FINALIZATION_ENV.values())}
+        with patch.dict(os.environ, {**bindings, "GRABOWSKI_UNRELATED": "preserved"}, clear=False):
+            environment = RUNNER.child_environment()
+        for name in bindings:
+            self.assertNotIn(name, environment)
+        self.assertEqual(environment["GRABOWSKI_UNRELATED"], "preserved")
+        self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_run_streamed_uses_sanitized_child_environment(self) -> None:
+        process = Mock()
+        process.wait.return_value = 0
+        bindings = {name: "secret-binding" for name in RUNNER.FINALIZATION_ENV.values()}
+        with patch.dict(os.environ, bindings, clear=False), patch.object(
+            RUNNER.subprocess, "Popen", return_value=process
+        ) as popen:
+            RUNNER.run_streamed(
+                ["make", "validate"],
+                cwd=Path("/tmp"),
+                timeout_seconds=30,
+                phase="validate",
+            )
+        environment = popen.call_args.kwargs["env"]
+        for name in bindings:
+            self.assertNotIn(name, environment)
+
     def test_verify_repository_rejects_non_main(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
@@ -147,7 +173,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
     def test_main_validates_before_deploying(self) -> None:
         repo = Path("/tmp/repository")
         expected = "f" * 40
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "run_streamed") as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}):
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "run_streamed") as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}):
             self.assertEqual(RUNNER.main(), 0)
         self.assertEqual(verify.call_count, 2)
         self.assertEqual(streamed.call_args_list[0].args[0], ["make", "validate"])
