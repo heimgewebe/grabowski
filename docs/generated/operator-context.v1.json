@@ -1000,6 +1000,17 @@
     },
     {
       "category": "operations-observability",
+      "description": "Run bounded read-only diagnostics for connector transport failures.",
+      "effects": [],
+      "id": "grabowski_connector_transport_diagnostics",
+      "purpose": "Run bounded read-only diagnostics for connector transport failures.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_connector_transport_diagnostics"
+    },
+    {
+      "category": "operations-observability",
       "description": "Export evidence-ref-bound recall items from caller-supplied source records.",
       "effects": [],
       "id": "grabowski_operator_recall_export",
@@ -1391,6 +1402,7 @@
       "grabowski_recovery_server_probe",
       "grabowski_friction_record",
       "grabowski_friction_summary",
+      "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",
@@ -1515,7 +1527,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "da9643676ebf42ec4a978e16b33f9952edd70deafbfef955c516dbd5169ecfde"
+      "sha256": "440cdae8ca27671b1e8b53f08d22e9e6931fc75211dc696917f883c6da8aaefe"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1523,18 +1535,18 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "a3fdd357e5a7cafb82ab78b90e9a32866b5eb9cbdae02aa2b4b3b1e82ce13e37"
+      "sha256": "4a07e2be0b8ad85d434df201d94f405acfb1263b3124f3353d55cfd55fd62887"
     },
     "runtime_sources": {
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "da9643676ebf42ec4a978e16b33f9952edd70deafbfef955c516dbd5169ecfde",
+      "src/grabowski_capabilities.py": "440cdae8ca27671b1e8b53f08d22e9e6931fc75211dc696917f883c6da8aaefe",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
-      "src/grabowski_friction.py": "0dc76988a3a6b9afd44ea05c458e496ad6735c4404cf306afcc862c863c6c8a2",
+      "src/grabowski_friction.py": "b8aff6dc08cd52fd3fe754ad4a26e348e6794dca624346497c70e2807b45e6e3",
       "src/grabowski_grip_orchestration.py": "93d6134b740fec19f878c0be3113e5ec8935fb55c0cac754a6b3ae043f5ecfbb",
       "src/grabowski_grips.py": "8428a8ffa2f87ebb6862b016fedecbb73f8942bf4289e5972aacf789a5765100",
-      "src/grabowski_mcp.py": "89037697453b60a447eee4390d1bdf88c26415ac2a00107fe7d5a5b900142c69",
+      "src/grabowski_mcp.py": "c5c80f20e04c5d8631c56a190ca48eb170675cff7467475b3d1d7ef9cce7f3f3",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "abc216ce3e6febaa486fe6703bc040d6b517f0d775512573c42ea7e3ec1f68a9",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",

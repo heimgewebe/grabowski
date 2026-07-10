@@ -4,6 +4,7 @@ from collections import Counter
 import json
 import os
 from pathlib import Path
+import subprocess
 import time
 import uuid
 from typing import Any
@@ -257,6 +258,25 @@ SUPERSEDED_TERMS = frozenset({
 })
 MAX_TEXT_BYTES = 2000
 MAX_NOTE_COUNT = 20
+MAX_CONNECTOR_DIAGNOSTIC_LOG_LINES = 500
+CONNECTOR_DIAGNOSTIC_SAMPLE_LIMIT = 10
+CONNECTOR_DIAGNOSTIC_UNITS = (
+    "grabowski-operator.service",
+    "tunnel-client-grabowski.service",
+)
+CONNECTOR_TRANSPORT_LOG_MARKERS = (
+    ("502", "502"),
+    ("upstream_or_external_service", "upstream or external service"),
+    ("upstream_external_service", "upstream/external service"),
+    ("external_service_error", "external service error"),
+    ("streamable_http", "streamable_http"),
+    ("received_exception_from_stream", "received exception from stream"),
+    ("mcp_stream", "mcp stream"),
+    ("post_mcp", "post /mcp"),
+    ("connector_timeout", "connector timeout"),
+    ("transport_timeout", "transport timeout"),
+    ("timeout", "timeout"),
+)
 CONNECTOR_TRANSPORT_TERMS = frozenset({
     "502",
     "upstream or external service",
@@ -436,6 +456,243 @@ def connector_transport_diagnostics(events: list[dict[str, Any]]) -> dict[str, A
             "record_rule": "record friction when a connector transport failure changes the operator path",
             "false_green_warning": "a successful retry does not prove the first failure was harmless",
         },
+        "does_not_establish": list(CONNECTOR_TRANSPORT_DOES_NOT_ESTABLISH),
+    }
+
+
+
+def _diagnostic_environment() -> dict[str, str]:
+    environment = operator._safe_environment()
+    for key in (
+        "PAGER",
+        "LESS",
+        "SYSTEMD_PAGER",
+        "SYSTEMD_LESS",
+    ):
+        environment.pop(key, None)
+    environment.update({"PAGER": "cat", "SYSTEMD_PAGER": "cat", "NO_COLOR": "1"})
+    return environment
+
+
+def _run_diagnostic_command(
+    argv: list[str],
+    *,
+    timeout_seconds: int = 30,
+    max_output_bytes: int = 131_072,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    process = subprocess.Popen(
+        argv,
+        cwd=operator.HOME,
+        env=_diagnostic_environment(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    (
+        stdout_raw,
+        stderr_raw,
+        timed_out,
+        stdout_pipe_truncated,
+        stderr_pipe_truncated,
+    ) = base._read_limited_process_pipes(
+        process,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=max_output_bytes,
+    )
+    stdout = operator._redact(stdout_raw.decode("utf-8", errors="replace"))
+    stderr = operator._redact(stderr_raw.decode("utf-8", errors="replace"))
+    stdout, stdout_late_truncated = operator._limit(stdout, max_output_bytes)
+    stderr, stderr_late_truncated = operator._limit(stderr, max_output_bytes)
+    return {
+        "argv": operator._redact_argv(argv),
+        "argv_sha256": operator._argv_hash(argv),
+        "command": operator._redacted_command(argv),
+        "cwd": str(operator.HOME),
+        "returncode": process.returncode,
+        "timed_out": timed_out,
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": stdout_pipe_truncated or stdout_late_truncated,
+        "stderr_truncated": stderr_pipe_truncated or stderr_late_truncated,
+    }
+
+
+def _service_status_probe(unit: str) -> dict[str, Any]:
+    name = operator._validate_unit(unit)
+    result = _run_diagnostic_command(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            name,
+            "--no-pager",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=UnitFileState",
+            "--property=Result",
+            "--property=ExecMainCode",
+            "--property=ExecMainStatus",
+            "--property=NRestarts",
+        ],
+        timeout_seconds=30,
+        max_output_bytes=32_768,
+    )
+    return {
+        "unit": name,
+        "returncode": result["returncode"],
+        "timed_out": result["timed_out"],
+        "stdout_truncated": result["stdout_truncated"],
+        "stderr_truncated": result["stderr_truncated"],
+        "stderr_preview": _bounded_summary_text(result.get("stderr"), max_chars=240),
+        "properties": operator._parse_show(result.get("stdout", "")),
+    }
+
+
+def _journal_marker_probe(unit: str, max_lines: int) -> dict[str, Any]:
+    name = operator._validate_unit(unit)
+    result = _run_diagnostic_command(
+        [
+            "journalctl",
+            "--user",
+            "--unit",
+            name,
+            "--no-pager",
+            "--output=short-iso",
+            "--lines",
+            str(max_lines),
+        ],
+        timeout_seconds=30,
+        max_output_bytes=131_072,
+    )
+    marker_counts = {marker_id: 0 for marker_id, _ in CONNECTOR_TRANSPORT_LOG_MARKERS}
+    samples: list[dict[str, Any]] = []
+    match_count = 0
+    for index, line in enumerate(str(result.get("stdout", "")).splitlines(), start=1):
+        lowered = line.lower()
+        markers = [
+            marker_id
+            for marker_id, marker_text in CONNECTOR_TRANSPORT_LOG_MARKERS
+            if marker_text in lowered
+        ]
+        if not markers:
+            continue
+        match_count += 1
+        for marker in markers:
+            marker_counts[marker] += 1
+        if len(samples) < CONNECTOR_DIAGNOSTIC_SAMPLE_LIMIT:
+            parts = line.split(maxsplit=2)
+            samples.append({
+                "line_index": index,
+                "timestamp": parts[0] if parts else "",
+                "markers": markers,
+            })
+    return {
+        "unit": name,
+        "max_lines": max_lines,
+        "returncode": result["returncode"],
+        "timed_out": result["timed_out"],
+        "stdout_truncated": result["stdout_truncated"],
+        "stderr_truncated": result["stderr_truncated"],
+        "marker_counts": marker_counts,
+        "match_count": match_count,
+        "matched_line_samples": samples,
+        "matched_line_samples_truncated": match_count > len(samples),
+        "stderr_preview": _bounded_summary_text(result.get("stderr"), max_chars=240),
+    }
+
+
+def _runtime_status_probe() -> dict[str, Any]:
+    status_func = getattr(base, "grabowski_status", None)
+    if not callable(status_func):
+        return {"available": False, "reason": "grabowski_status_unavailable"}
+    try:
+        status = status_func()
+    except Exception as exc:  # pragma: no cover - defensive runtime receipt path
+        return {
+            "available": False,
+            "reason": "grabowski_status_failed",
+            "error_type": exc.__class__.__name__,
+        }
+    deployment = status.get("deployment") if isinstance(status, dict) else {}
+    tool_contract = status.get("tool_contract") if isinstance(status, dict) else {}
+    kill_switch = status.get("kill_switch") if isinstance(status, dict) else {}
+    if not isinstance(deployment, dict):
+        deployment = {}
+    if not isinstance(tool_contract, dict):
+        tool_contract = {}
+    if not isinstance(kill_switch, dict):
+        kill_switch = {}
+    return {
+        "available": True,
+        "deployment": {
+            "completion_status": deployment.get("completion_status"),
+            "repo_head": deployment.get("repo_head"),
+            "source_identity_valid": deployment.get("source_identity_valid"),
+            "runtime_binding_valid": deployment.get("runtime_binding_valid"),
+            "environment_compatibility_valid": deployment.get("environment_compatibility_valid"),
+            "provenance_valid": deployment.get("provenance_valid"),
+        },
+        "tool_contract": {
+            "registered_tool_count": tool_contract.get("registered_tool_count"),
+            "expected_tool_count": tool_contract.get("expected_tool_count"),
+            "runtime_matches_deployment_contract": tool_contract.get("runtime_matches_deployment_contract"),
+            "client_snapshot_observable": tool_contract.get("client_snapshot_observable"),
+        },
+        "kill_switch_engaged": kill_switch.get("engaged"),
+    }
+
+
+def connector_transport_live_diagnostics(
+    *,
+    limit: int = 50,
+    max_log_lines: int = 120,
+) -> dict[str, Any]:
+    if not isinstance(limit, int) or limit < 1 or limit > 500:
+        raise ValueError("limit must be between 1 and 500")
+    if not isinstance(max_log_lines, int) or max_log_lines < 1 or max_log_lines > MAX_CONNECTOR_DIAGNOSTIC_LOG_LINES:
+        raise ValueError(
+            f"max_log_lines must be between 1 and {MAX_CONNECTOR_DIAGNOSTIC_LOG_LINES}"
+        )
+    operator._require_operator_capability("user_service_control")
+    records = _load_event_records(limit)
+    events = list(records["events"])
+    history = connector_transport_diagnostics(events)
+    service_statuses = {
+        unit: _service_status_probe(unit)
+        for unit in CONNECTOR_DIAGNOSTIC_UNITS
+    }
+    journal_probes = {
+        unit: _journal_marker_probe(unit, max_log_lines)
+        for unit in CONNECTOR_DIAGNOSTIC_UNITS
+    }
+    marker_match_count = sum(
+        probe["match_count"] for probe in journal_probes.values()
+    )
+    return {
+        "schema_version": 1,
+        "authority": "read_only_transport_diagnostic_receipt",
+        "source": "friction-log-and-local-user-systemd",
+        "limit": limit,
+        "max_log_lines": max_log_lines,
+        "friction_log": {
+            "path": str(FRICTION_LOG),
+            "exists": FRICTION_LOG.exists(),
+            "scanned_lines": records["scanned_lines"],
+            "invalid_lines": records["invalid_lines"],
+            "non_event_lines": records["non_event_lines"],
+            "returned": len(events),
+            "connector_transport_diagnostics": history,
+        },
+        "runtime_status": _runtime_status_probe(),
+        "service_statuses": service_statuses,
+        "journal_marker_probes": journal_probes,
+        "live_transport_markers_observed": marker_match_count > 0,
+        "marker_match_count": marker_match_count,
+        "recommended_next_policy": history["split_retry_policy"],
         "does_not_establish": list(CONNECTOR_TRANSPORT_DOES_NOT_ESTABLISH),
     }
 
@@ -812,3 +1069,16 @@ def grabowski_friction_record(
 def grabowski_friction_summary(limit: int = 50) -> dict[str, Any]:
     """Summarize recent bounded operator-friction events."""
     return friction_summary(limit=limit)
+
+
+@mcp.tool(name="grabowski_connector_transport_diagnostics", annotations=READ_ONLY)
+def grabowski_connector_transport_diagnostics(
+    limit: int = 50,
+    max_log_lines: int = 120,
+) -> dict[str, Any]:
+    """Run bounded read-only diagnostics for connector transport failures."""
+    operator._require_operator_capability("user_service_control")
+    return connector_transport_live_diagnostics(
+        limit=limit,
+        max_log_lines=max_log_lines,
+    )
