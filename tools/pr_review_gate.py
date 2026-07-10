@@ -1111,25 +1111,61 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
     }
 
 
-def _workflow_python_versions(repo: Path) -> tuple[str, ...]:
-    workflow = next(
+def _workflow_text_at_head(repo: Path, head_sha: str) -> str | None:
+    if re.fullmatch(r"[0-9a-fA-F]{40}", head_sha) is None:
+        raise GateInputError("PR head SHA is invalid for workflow inspection")
+    for path in (
+        ".github/workflows/validate.yml",
+        ".github/workflows/validate.yaml",
+    ):
+        text = _run_text(repo, ["git", "show", f"{head_sha}:{path}"], allow_nonzero=True)
+        if text:
+            return text
+    return None
+
+
+def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
+    lines = text.splitlines()
+    jobs_index = next(
         (
-            candidate
-            for candidate in (
-                repo / ".github" / "workflows" / "validate.yml",
-                repo / ".github" / "workflows" / "validate.yaml",
-            )
-            if candidate.is_file() and not candidate.is_symlink()
+            index
+            for index, line in enumerate(lines)
+            if re.fullmatch(r"jobs\s*:\s*(?:#.*)?", line.strip())
+            and len(line) == len(line.lstrip())
         ),
         None,
     )
-    if workflow is None:
+    if jobs_index is None:
         return ()
-    try:
-        lines = workflow.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
+    validate_index: int | None = None
+    validate_indent: int | None = None
+    for index in range(jobs_index + 1, len(lines)):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            break
+        if re.fullmatch(r"validate\s*:\s*(?:#.*)?", line.strip()):
+            validate_index = index
+            validate_indent = indent
+            break
+    if validate_index is None or validate_indent is None:
         return ()
-    for index, line in enumerate(lines):
+
+    block: list[str] = []
+    for line in lines[validate_index + 1 :]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            block.append(line)
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= validate_indent:
+            break
+        if indent == validate_indent + 2 and re.match(r"^\s*name\s*:", line):
+            raise GateInputError("target validate job uses a custom name")
+        block.append(line)
+
+    for index, line in enumerate(block):
         match = re.match(r"^(?P<indent>\s*)python-version\s*:\s*(?P<inline>.*)$", line)
         if match is None:
             continue
@@ -1143,13 +1179,16 @@ def _workflow_python_versions(repo: Path) -> tuple[str, ...]:
             return tuple(values)
         indentation = len(match.group("indent"))
         values: list[str] = []
-        for candidate in lines[index + 1 :]:
+        for candidate in block[index + 1 :]:
             if not candidate.strip() or candidate.lstrip().startswith("#"):
                 continue
             candidate_indent = len(candidate) - len(candidate.lstrip())
             if candidate_indent <= indentation:
                 break
-            item = re.match(r"^\s*-\s*[\"']?(?P<version>[^\"'#\s]+)[\"']?\s*(?:#.*)?$", candidate)
+            item = re.match(
+                r"^\s*-\s*[\"']?(?P<version>[^\"'#\s]+)[\"']?\s*(?:#.*)?$",
+                candidate,
+            )
             if item is None:
                 break
             values.append(item.group("version"))
@@ -1158,9 +1197,10 @@ def _workflow_python_versions(repo: Path) -> tuple[str, ...]:
 
 
 def expected_check_names_for_repo(
-    repo: Path, *, repo_name: str | None = None
+    repo: Path, *, repo_name: str | None = None, head_sha: str | None = None
 ) -> tuple[str, ...]:
-    versions = _workflow_python_versions(repo)
+    workflow = _workflow_text_at_head(repo, head_sha) if head_sha is not None else None
+    versions = _python_versions_from_validate_workflow(workflow) if workflow else ()
     if versions:
         if len(versions) != len(set(versions)) or not all(
             re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version)
@@ -1170,7 +1210,7 @@ def expected_check_names_for_repo(
         return tuple(f"validate ({version})" for version in versions)
     if repo_name == "heimgewebe/grabowski":
         return DEFAULT_EXPECTED_CHECK_NAMES
-    raise GateInputError("cannot derive expected checks from target validate workflow")
+    raise GateInputError("cannot derive expected checks from target validate workflow at PR head")
 
 
 def evaluate_review_gate(
@@ -1404,7 +1444,9 @@ def main(argv: list[str] | None = None) -> int:
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
             expected_check_names=expected_check_names_for_repo(
-                repo, repo_name=state.get("repoName")
+                repo,
+                repo_name=state.get("repoName"),
+                head_sha=state.get("pr", {}).get("headRefOid"),
             ),
         )
         if self_review_template is not None:

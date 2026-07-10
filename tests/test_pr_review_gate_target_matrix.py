@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,41 +26,49 @@ pr_review_gate = _load_gate()
 
 
 class PrReviewGateTargetMatrixTests(unittest.TestCase):
-    def test_reads_block_python_matrix_from_target_repo(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            repo = Path(raw)
-            workflow = repo / ".github" / "workflows" / "validate.yml"
-            workflow.parent.mkdir(parents=True)
-            workflow.write_text(
-                """name: validate
+    def test_reads_block_python_matrix_from_validate_job(self) -> None:
+        text = """name: validate
 jobs:
+  docs:
+    strategy:
+      matrix:
+        python-version: ["3.9"]
   validate:
     strategy:
       matrix:
         python-version:
-          - \"3.11\"
-          - \"3.12\"
-""",
-                encoding="utf-8",
-            )
-            self.assertEqual(
-                pr_review_gate.expected_check_names_for_repo(repo),
-                ("validate (3.11)", "validate (3.12)"),
-            )
+          - "3.11"
+          - "3.12"
+"""
+        self.assertEqual(
+            pr_review_gate._python_versions_from_validate_workflow(text),
+            ("3.11", "3.12"),
+        )
 
-    def test_reads_inline_python_matrix_from_target_repo(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            repo = Path(raw)
-            workflow = repo / ".github" / "workflows" / "validate.yaml"
-            workflow.parent.mkdir(parents=True)
-            workflow.write_text(
-                "python-version: [\"3.11\", \"3.13\"]\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(
-                pr_review_gate.expected_check_names_for_repo(repo),
-                ("validate (3.11)", "validate (3.13)"),
-            )
+    def test_reads_inline_python_matrix_from_validate_job(self) -> None:
+        text = """jobs:
+  validate:
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+"""
+        self.assertEqual(
+            pr_review_gate._python_versions_from_validate_workflow(text),
+            ("3.11", "3.13"),
+        )
+
+    def test_custom_validate_job_name_fails_closed(self) -> None:
+        text = """jobs:
+  validate:
+    name: Tests (${{ matrix.python-version }})
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+"""
+        with self.assertRaisesRegex(
+            pr_review_gate.GateInputError, "custom name"
+        ):
+            pr_review_gate._python_versions_from_validate_workflow(text)
 
     def test_falls_back_only_for_grabowski_when_matrix_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -82,18 +91,55 @@ jobs:
     def test_invalid_or_duplicate_matrix_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw)
-            workflow = repo / ".github" / "workflows" / "validate.yml"
-            workflow.parent.mkdir(parents=True)
-            workflow.write_text(
-                'python-version: ["3.11", "${{ matrix.python }}"]\n',
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(
-                pr_review_gate.GateInputError, "invalid Python matrix"
+            with mock.patch.object(
+                pr_review_gate,
+                "_workflow_text_at_head",
+                return_value='''jobs:
+  validate:
+    strategy:
+      matrix:
+        python-version: ["3.11", "${{ matrix.python }}"]
+''',
             ):
-                pr_review_gate.expected_check_names_for_repo(
-                    repo, repo_name="heimgewebe/schauwerk"
+                with self.assertRaisesRegex(
+                    pr_review_gate.GateInputError, "invalid Python matrix"
+                ):
+                    pr_review_gate.expected_check_names_for_repo(
+                        repo,
+                        repo_name="heimgewebe/schauwerk",
+                        head_sha="a" * 40,
+                    )
+
+    def test_workflow_is_read_from_exact_pr_head(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            with mock.patch.object(
+                pr_review_gate,
+                "_run_text",
+                side_effect=[
+                    '''jobs:
+  validate:
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+''',
+                ],
+            ) as run:
+                result = pr_review_gate.expected_check_names_for_repo(
+                    repo,
+                    repo_name="heimgewebe/schauwerk",
+                    head_sha="a" * 40,
                 )
+            self.assertEqual(result, ("validate (3.11)", "validate (3.12)"))
+            run.assert_called_once_with(
+                repo,
+                [
+                    "git",
+                    "show",
+                    f"{'a' * 40}:.github/workflows/validate.yml",
+                ],
+                allow_nonzero=True,
+            )
 
     def test_evaluation_uses_supplied_target_check_names(self) -> None:
         state = {
