@@ -731,6 +731,7 @@ class RuntimeContractTests(unittest.TestCase):
             "grabowski_checkouts",
             "grabowski_artifacts",
             "grabowski_workers",
+            "grabowski_agent_workspace",
         ):
             self.assertIn(f"import {module}", source)
         contract = json.loads(
@@ -763,6 +764,11 @@ class RuntimeContractTests(unittest.TestCase):
             "grabowski_checkout_retain",
             "grabowski_checkout_archive",
             "grabowski_checkout_cleanup",
+            "grabowski_agent_workspace_create",
+            "grabowski_agent_workspace_status",
+            "grabowski_agent_workspace_attach",
+            "grabowski_agent_workspace_collect",
+            "grabowski_agent_workspace_close",
         ):
             self.assertIn(tool, expected)
 

@@ -1245,6 +1245,78 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_gui_worker_list"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Create one four-role tmux workspace with one isolated durable writer task.",
+      "effects": [
+        "worktree-create",
+        "branch-create",
+        "task-start",
+        "tmux-session-create",
+        "lease-create"
+      ],
+      "id": "grabowski_agent_workspace_create",
+      "purpose": "Create one task-bound four-pane tmux workspace with one isolated writer worktree.",
+      "read_only": false,
+      "reversibility": "close-and-preserved-worktree",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_create"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Derive live workspace status from Grabowski tasks, Git and tmux without trusting pane state.",
+      "effects": [
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_status",
+      "purpose": "Derive workspace state from Grabowski tasks, Git and tmux without treating pane state as success.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_workspace_status"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Return the exact attach command for an existing workspace tmux session.",
+      "effects": [],
+      "id": "grabowski_agent_workspace_attach",
+      "purpose": "Return the exact attach command for an existing non-authoritative tmux workspace UI.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_workspace_attach"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Freeze writer evidence, start/read read-only checks, and write one head/diff-bound receipt.",
+      "effects": [
+        "task-start",
+        "receipt-create",
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_collect",
+      "purpose": "Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt.",
+      "read_only": false,
+      "reversibility": "preserved-worktree-and-receipts",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_collect"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Close one collected workspace without deleting its writer worktree or branch.",
+      "effects": [
+        "possible-task-stop",
+        "tmux-session-remove",
+        "lease-release",
+        "receipt-create"
+      ],
+      "id": "grabowski_agent_workspace_close",
+      "purpose": "Close one collected workspace while preserving its branch and writer worktree.",
+      "read_only": false,
+      "reversibility": "preserved-worktree-and-branch",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_close"
     }
   ],
   "integrity": {
@@ -1420,7 +1492,12 @@
       "grabowski_gui_worker_start",
       "grabowski_gui_worker_status",
       "grabowski_gui_worker_stop",
-      "grabowski_gui_worker_list"
+      "grabowski_gui_worker_list",
+      "grabowski_agent_workspace_create",
+      "grabowski_agent_workspace_status",
+      "grabowski_agent_workspace_attach",
+      "grabowski_agent_workspace_collect",
+      "grabowski_agent_workspace_close"
     ],
     "module": "grabowski_operator",
     "source": "src/grabowski_runtime.py",
@@ -1516,6 +1593,22 @@
       {
         "module": "grabowski_repobrief",
         "source": "src/grabowski_repobrief.py"
+      },
+      {
+        "module": "grabowski_agent_workspace",
+        "source": "src/grabowski_agent_workspace.py"
+      },
+      {
+        "module": "grabowski_agent_role",
+        "source": "src/grabowski_agent_role.py"
+      },
+      {
+        "module": "grabowski_agent_sandbox",
+        "source": "src/grabowski_agent_sandbox.py"
+      },
+      {
+        "module": "grabowski_agent_writer",
+        "source": "src/grabowski_agent_writer.py"
       }
     ]
   },
@@ -1527,7 +1620,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "440cdae8ca27671b1e8b53f08d22e9e6931fc75211dc696917f883c6da8aaefe"
+      "sha256": "a5eff9a9bc726f05181ffc25aa9bf636897f1799c94775953e18bb6712df9265"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1535,18 +1628,22 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "4a07e2be0b8ad85d434df201d94f405acfb1263b3124f3353d55cfd55fd62887"
+      "sha256": "08ec0af8bdec035e54c80487640ff6471604bdcce424b06616a1719fc907fc36"
     },
     "runtime_sources": {
+      "src/grabowski_agent_role.py": "496ce69903653725be8cffbb23b0e0b6a62b336dfc15bb8f82ff1e44e8acc1f9",
+      "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
+      "src/grabowski_agent_workspace.py": "8d6111a214274ee0b605ec51d7ecc655fd2987317560c30cfe939f18fa17ac53",
+      "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "440cdae8ca27671b1e8b53f08d22e9e6931fc75211dc696917f883c6da8aaefe",
+      "src/grabowski_capabilities.py": "a5eff9a9bc726f05181ffc25aa9bf636897f1799c94775953e18bb6712df9265",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "b8aff6dc08cd52fd3fe754ad4a26e348e6794dca624346497c70e2807b45e6e3",
       "src/grabowski_grip_orchestration.py": "2c1d594433f92edbae23adc43a303b212bfff89d298121c516974d790259051d",
       "src/grabowski_grips.py": "e2d67d45b3c5d04ef48a31ccd73cae47720cb3eb3e081ddf7484216dbac4f2a9",
-      "src/grabowski_mcp.py": "c5c80f20e04c5d8631c56a190ca48eb170675cff7467475b3d1d7ef9cce7f3f3",
+      "src/grabowski_mcp.py": "8726faa9253042effe437f505fad11941debaa537a1e9635d9ef3b669feb04b3",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "2968cd5ac1bbdd5779e0fc1a90550dc9015ad3de55096b87eabd2066258e2012",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",
@@ -1555,7 +1652,7 @@
       "src/grabowski_recovery.py": "b0c5124271498639f6c16614ccb51f7b3b696ebfd88011ad2291d353e56d0fe6",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
-      "src/grabowski_runtime.py": "246a3bfd7d734dd3567e38bc9de706a84f3ff3e75360d3166583d57326279eee",
+      "src/grabowski_runtime.py": "0cea86d3e646f19478f6777ef722925980f3046d24ff25fc9c3f4080c9439ed7",
       "src/grabowski_runtime_extensions.py": "3092fc1e9031cc2d3beb9e6e1e2a43ea31d68fe07cc6186055d06dacb56e87ed",
       "src/grabowski_self_deploy.py": "22ac57c765f58c8abcc486d17c5a5b1a19185320f82f4244c0f5b50845ea055a",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",

@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "4a07e2be0b8ad85d434df201d94f405acfb1263b3124f3353d55cfd55fd62887"
+    "sha256": "08ec0af8bdec035e54c80487640ff6471604bdcce424b06616a1719fc907fc36"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "1c9bb5ac0c53845125ccbb15c06311309cf1713a38c6d5c454603a89517814a1"
+    "sha256": "8fa4a7b80734c87af39cd39a3a8e7b3749dbd91f5e16ca8be1506d30d01fb4e8"
   },
   "counts": {
     "core": 21,
-    "full": 100,
-    "operator": 85
+    "full": 105,
+    "operator": 90
   },
   "profiles": {
     "core": [
@@ -136,7 +136,12 @@
       "grabowski_gui_worker_start",
       "grabowski_gui_worker_status",
       "grabowski_gui_worker_stop",
-      "grabowski_gui_worker_list"
+      "grabowski_gui_worker_list",
+      "grabowski_agent_workspace_create",
+      "grabowski_agent_workspace_status",
+      "grabowski_agent_workspace_attach",
+      "grabowski_agent_workspace_collect",
+      "grabowski_agent_workspace_close"
     ],
     "operator": [
       "grabowski_status",
@@ -223,7 +228,12 @@
       "grabowski_gui_worker_start",
       "grabowski_gui_worker_status",
       "grabowski_gui_worker_stop",
-      "grabowski_gui_worker_list"
+      "grabowski_gui_worker_list",
+      "grabowski_agent_workspace_create",
+      "grabowski_agent_workspace_status",
+      "grabowski_agent_workspace_attach",
+      "grabowski_agent_workspace_collect",
+      "grabowski_agent_workspace_close"
     ]
   },
   "registration": {

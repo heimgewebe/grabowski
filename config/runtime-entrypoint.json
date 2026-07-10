@@ -99,7 +99,12 @@
     "grabowski_gui_worker_start",
     "grabowski_gui_worker_status",
     "grabowski_gui_worker_stop",
-    "grabowski_gui_worker_list"
+    "grabowski_gui_worker_list",
+    "grabowski_agent_workspace_create",
+    "grabowski_agent_workspace_status",
+    "grabowski_agent_workspace_attach",
+    "grabowski_agent_workspace_collect",
+    "grabowski_agent_workspace_close"
   ],
   "mode": "module",
   "module": "grabowski_operator",
@@ -197,6 +202,22 @@
     {
       "module": "grabowski_repobrief",
       "source": "src/grabowski_repobrief.py"
+    },
+    {
+      "module": "grabowski_agent_workspace",
+      "source": "src/grabowski_agent_workspace.py"
+    },
+    {
+      "module": "grabowski_agent_role",
+      "source": "src/grabowski_agent_role.py"
+    },
+    {
+      "module": "grabowski_agent_sandbox",
+      "source": "src/grabowski_agent_sandbox.py"
+    },
+    {
+      "module": "grabowski_agent_writer",
+      "source": "src/grabowski_agent_writer.py"
     }
   ]
 }
