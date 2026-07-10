@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,134 @@ from typing import Any
 OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
 MAX_CAPTURE_BYTES = 65_536
 MAX_MANIFEST_BYTES = 2_000_000
+MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
+FINALIZATION_KIND = "grabowski_runtime_deploy_finalization"
+FINALIZATION_ENV = {
+    "job_id": "GRABOWSKI_JOB_ID",
+    "unit": "GRABOWSKI_JOB_UNIT",
+    "argv_sha256": "GRABOWSKI_JOB_ARGV_SHA256",
+    "expected_head": "GRABOWSKI_JOB_EXPECTED_HEAD",
+    "metadata": "GRABOWSKI_JOB_METADATA_PATH",
+    "stdout": "GRABOWSKI_JOB_STDOUT_PATH",
+    "stderr": "GRABOWSKI_JOB_STDERR_PATH",
+    "finalization": "GRABOWSKI_JOB_FINALIZATION_PATH",
+}
+
+
+def canonical_json_sha256(payload: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def load_finalization_binding() -> dict[str, Any] | None:
+    values = {key: os.environ.get(name) for key, name in FINALIZATION_ENV.items()}
+    present = {key for key, value in values.items() if value is not None}
+    if not present:
+        return None
+    if present != set(values):
+        raise RuntimeError("incomplete job finalization binding")
+    assert all(isinstance(value, str) for value in values.values())
+    job_id = values["job_id"]
+    unit = values["unit"]
+    argv_sha256 = values["argv_sha256"]
+    expected_head = values["expected_head"]
+    if not re.fullmatch(r"[0-9a-f]{12}", job_id or ""):
+        raise RuntimeError("invalid job finalization job_id")
+    if unit != f"grabowski-job-{job_id}":
+        raise RuntimeError("invalid job finalization unit binding")
+    if not re.fullmatch(r"[0-9a-f]{64}", argv_sha256 or ""):
+        raise RuntimeError("invalid job finalization argv_sha256")
+    if not OBJECT_ID_RE.fullmatch(expected_head or ""):
+        raise RuntimeError("invalid job finalization expected_head")
+    receipt_paths = {key: values[key] for key in ("metadata", "stdout", "stderr", "finalization")}
+    finalization = Path(receipt_paths["finalization"])
+    if not finalization.is_absolute() or finalization.name != "finalization.json":
+        raise RuntimeError("invalid job finalization receipt path")
+    parent = finalization.parent
+    if parent.is_symlink() or not parent.is_dir() or parent.resolve(strict=True) != parent:
+        raise RuntimeError("invalid job finalization receipt directory")
+    expected_paths = {
+        "metadata": str(parent / "metadata.json"),
+        "stdout": str(parent / "stdout.log"),
+        "stderr": str(parent / "stderr.log"),
+        "finalization": str(parent / "finalization.json"),
+    }
+    if receipt_paths != expected_paths:
+        raise RuntimeError("job finalization receipt paths do not share one job directory")
+    return {
+        "schema_version": 1,
+        "kind": FINALIZATION_KIND,
+        "job_id": job_id,
+        "unit": unit,
+        "argv_sha256": argv_sha256,
+        "expected_head": expected_head,
+        "receipt_paths": receipt_paths,
+    }
+
+
+def write_finalization_receipt(
+    binding: dict[str, Any],
+    *,
+    final_status: str,
+    repo_head: str | None,
+    release_id: str | None,
+    failure_type: str | None,
+) -> Path:
+    if final_status not in {"completed", "failed"}:
+        raise ValueError("invalid finalization status")
+    material = {
+        **binding,
+        "final_status": final_status,
+        "completion_status": "complete" if final_status == "completed" else "failed",
+        "repo_head": repo_head,
+        "release_id": release_id,
+        "failure_type": failure_type,
+        "timestamp_unix": int(time.time()),
+    }
+    payload = {**material, "payload_sha256": canonical_json_sha256(material)}
+    data = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    if len(data) > MAX_FINALIZATION_RECEIPT_BYTES:
+        raise RuntimeError("job finalization receipt exceeds size bound")
+    path = Path(binding["receipt_paths"]["finalization"])
+    temp = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    published = False
+    try:
+        try:
+            os.write(descriptor, data)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.link(temp, path, follow_symlinks=False)
+        published = True
+        directory_descriptor = os.open(
+            path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except BaseException:
+        if published:
+            try:
+                path.unlink()
+                directory_descriptor = os.open(
+                    path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+                )
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+    return path
 
 
 def emit(phase: str, **fields: Any) -> None:
@@ -170,7 +299,18 @@ def verify_live_manifest(expected_head: str) -> dict[str, Any]:
         raise RuntimeError("live deployment manifest does not match expected head")
     if payload.get("completion_status") != "complete":
         raise RuntimeError("live deployment is not complete")
-    return {"release_id": payload.get("release_id"), "repo_head": payload.get("repo_head"), "completion_status": payload.get("completion_status")}
+    release_id = payload.get("release_id")
+    if (
+        not isinstance(release_id, str)
+        or not release_id
+        or len(release_id.encode("utf-8")) > 512
+    ):
+        raise RuntimeError("live deployment release_id is invalid")
+    return {
+        "release_id": release_id,
+        "repo_head": payload.get("repo_head"),
+        "completion_status": payload.get("completion_status"),
+    }
 
 
 def main() -> int:
@@ -182,7 +322,11 @@ def main() -> int:
     repo = args.repo
     if not 5 <= args.delay_seconds <= 60:
         raise ValueError("delay_seconds must be between 5 and 60")
+    binding: dict[str, Any] | None = None
     try:
+        binding = load_finalization_binding()
+        if binding is not None and binding["expected_head"] != args.expected_head:
+            raise RuntimeError("job finalization expected_head does not match runner arguments")
         emit("scheduled", repo=str(repo), expected_head=args.expected_head, delay_seconds=args.delay_seconds)
         time.sleep(args.delay_seconds)
         verify_repository(repo, args.expected_head)
@@ -192,8 +336,27 @@ def main() -> int:
         run_streamed(["make", "deploy-apply"], cwd=repo, timeout_seconds=1_800, phase="deploy")
         live = verify_live_manifest(args.expected_head)
         emit("complete", **live)
+        if binding is not None:
+            write_finalization_receipt(
+                binding,
+                final_status="completed",
+                repo_head=live["repo_head"],
+                release_id=live["release_id"],
+                failure_type=None,
+            )
         return 0
     except Exception as exc:
+        if binding is not None:
+            try:
+                write_finalization_receipt(
+                    binding,
+                    final_status="failed",
+                    repo_head=None,
+                    release_id=None,
+                    failure_type=type(exc).__name__,
+                )
+            except Exception as receipt_exc:
+                emit("finalization-receipt-failed", error_type=type(receipt_exc).__name__)
         emit("failed", error_type=type(exc).__name__, error=str(exc))
         return 1
 

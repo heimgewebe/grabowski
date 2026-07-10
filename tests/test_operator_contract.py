@@ -956,5 +956,296 @@ class OperatorContractTests(unittest.TestCase):
         self.assertEqual(payload["reference_sha256"], expected)
 
 
+class DurableJobFinalizationReceiptTests(unittest.TestCase):
+    def _systemd_not_found(self, root: Path) -> dict[str, object]:
+        return {
+            "returncode": 0,
+            "stdout": (
+                "LoadState=not-found\n"
+                "ActiveState=inactive\n"
+                "SubState=dead\n"
+                "Result=success\n"
+                "ExecMainCode=0\n"
+                "ExecMainStatus=0\n"
+            ),
+            "stderr": "",
+            "argv": [],
+            "argv_sha256": "1" * 64,
+            "command": "systemctl show",
+            "cwd": str(root),
+            "timed_out": False,
+            "duration_seconds": 0.01,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+    def _systemd_visible_success(self, root: Path) -> dict[str, object]:
+        result = self._systemd_not_found(root)
+        result["stdout"] = (
+            "LoadState=loaded\n"
+            "ActiveState=inactive\n"
+            "SubState=dead\n"
+            "Result=success\n"
+            "ExecMainCode=0\n"
+            "ExecMainStatus=0\n"
+        )
+        return result
+
+    def _fixture(
+        self,
+        operator,
+        root: Path,
+        *,
+        final_status: str = "completed",
+        write_receipt: bool = True,
+        raw_receipt: bytes | None = None,
+        mutate_payload=None,
+    ) -> tuple[Path, Path, str, str]:
+        state = root / "state"
+        jobs = state / "jobs"
+        unit = "grabowski-job-deadbeefcafe"
+        directory = jobs / unit
+        directory.mkdir(parents=True)
+        expected_head = "a" * 40
+        argv = [
+            "/usr/bin/python3",
+            "/repo/tools/run_scheduled_deploy.py",
+            "--repo",
+            "/repo",
+            "--expected-head",
+            expected_head,
+            "--delay-seconds",
+            "8",
+        ]
+        argv_sha256 = operator._argv_hash(argv)
+        stdout_path = directory / "stdout.log"
+        stderr_path = directory / "stderr.log"
+        stdout_path.write_text("runner output\n", encoding="utf-8")
+        stderr_path.write_text("", encoding="utf-8")
+        contract = operator._job_finalization_contract(
+            unit=unit,
+            directory=directory,
+            argv_sha256=argv_sha256,
+            expected_head=expected_head,
+        )
+        metadata = {
+            "schema_version": 1,
+            "unit": unit,
+            "job_id": "deadbeefcafe",
+            "owner": "uid:1000",
+            "argv": argv,
+            "argv_sha256": argv_sha256,
+            "command": " ".join(argv),
+            "cwd": str(root),
+            "runtime_seconds": 3600,
+            "created_at_unix": 1000,
+            "started_at": "1970-01-01T00:16:40Z",
+            "started_at_unix": 1000,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "scope": {
+                "cwd": str(root),
+                "argv_sha256": argv_sha256,
+                "runtime_seconds": 3600,
+            },
+            "finalization_contract": contract,
+            "final_status": "launch_submitted",
+            "notify_on_done": {
+                "requested": False,
+                "channels": [],
+                "delivery_mode": "metadata_only",
+                "delivery_enabled": False,
+                "does_not_establish": [
+                    "notification_sent",
+                    "notification_delivery",
+                    "job_success",
+                ],
+            },
+        }
+        (directory / "metadata.json").write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+        if write_receipt:
+            finalization_path = directory / "finalization.json"
+            if raw_receipt is not None:
+                finalization_path.write_bytes(raw_receipt)
+            else:
+                material = {
+                    "schema_version": 1,
+                    "kind": operator.RUNTIME_DEPLOY_FINALIZATION_KIND,
+                    "unit": unit,
+                    "job_id": "deadbeefcafe",
+                    "argv_sha256": argv_sha256,
+                    "expected_head": expected_head,
+                    "receipt_paths": operator._job_receipt_paths(directory),
+                    "final_status": final_status,
+                    "completion_status": (
+                        "complete" if final_status == "completed" else "failed"
+                    ),
+                    "repo_head": expected_head if final_status == "completed" else None,
+                    "release_id": "release-test" if final_status == "completed" else None,
+                    "failure_type": None if final_status == "completed" else "RuntimeError",
+                    "timestamp_unix": 1001,
+                }
+                if mutate_payload is not None:
+                    mutate_payload(material)
+                payload = {
+                    **material,
+                    "payload_sha256": operator._json_sha256(material),
+                }
+                finalization_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+        return state, jobs, unit, expected_head
+
+    def _status(self, operator, state: Path, jobs: Path, unit: str, result: dict[str, object]):
+        with patch.object(operator, "STATE_DIR", state), patch.object(
+            operator, "JOBS_DIR", jobs
+        ), patch.object(operator, "_run", return_value=result):
+            return operator.grabowski_job_status(unit)
+
+    def test_collected_unit_with_valid_bound_complete_receipt_is_completed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit, expected_head = self._fixture(operator, root)
+            status = self._status(
+                operator, state, jobs, unit, self._systemd_not_found(root)
+            )
+        self.assertEqual(status["final_status"], "completed")
+        self.assertEqual(
+            status["terminalization_evidence"]["source"],
+            "persisted-runner-receipt",
+        )
+        self.assertTrue(status["terminalization_evidence"]["fallback_used"])
+        self.assertEqual(
+            status["terminalization_evidence"]["expected_head"], expected_head
+        )
+        self.assertTrue(status["finalization_receipt"]["valid"])
+
+    def test_collected_unit_without_receipt_stays_missing_finalization_evidence(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit, _ = self._fixture(
+                operator, root, write_receipt=False
+            )
+            status = self._status(
+                operator, state, jobs, unit, self._systemd_not_found(root)
+            )
+        self.assertEqual(status["final_status"], "missing_finalization_evidence")
+        self.assertEqual(status["finalization_receipt"]["state"], "missing_receipt")
+        self.assertFalse(status["terminalization_evidence"]["fallback_used"])
+
+    def test_wrong_expected_head_is_rejected_fail_closed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def mutate(material):
+                material["expected_head"] = "c" * 40
+                material["repo_head"] = "c" * 40
+            state, jobs, unit, _ = self._fixture(
+                operator, root, mutate_payload=mutate
+            )
+            status = self._status(
+                operator, state, jobs, unit, self._systemd_not_found(root)
+            )
+        self.assertEqual(status["final_status"], "missing_finalization_evidence")
+        self.assertEqual(
+            status["finalization_receipt"]["reason"],
+            "receipt_binding_mismatch:expected_head",
+        )
+
+    def test_wrong_argv_sha256_or_job_id_is_rejected_fail_closed(self) -> None:
+        operator = _load_operator_module()
+        for key, wrong in (("argv_sha256", "d" * 64), ("job_id", "feedfacecafe")):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                def mutate(material, key=key, wrong=wrong):
+                    material[key] = wrong
+                state, jobs, unit, _ = self._fixture(
+                    operator, root, mutate_payload=mutate
+                )
+                status = self._status(
+                    operator, state, jobs, unit, self._systemd_not_found(root)
+                )
+                self.assertEqual(
+                    status["final_status"], "missing_finalization_evidence"
+                )
+                self.assertEqual(
+                    status["finalization_receipt"]["reason"],
+                    f"receipt_binding_mismatch:{key}",
+                )
+
+    def test_failed_receipt_maps_to_failed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit, _ = self._fixture(
+                operator, root, final_status="failed"
+            )
+            status = self._status(
+                operator, state, jobs, unit, self._systemd_not_found(root)
+            )
+        self.assertEqual(status["final_status"], "failed")
+        self.assertEqual(
+            status["terminalization_evidence"]["source"],
+            "persisted-runner-receipt",
+        )
+        self.assertTrue(status["finalization_receipt"]["valid"])
+
+    def test_truncated_or_invalid_json_receipt_is_rejected_fail_closed(self) -> None:
+        operator = _load_operator_module()
+        for raw in (b'{"truncated":', b'not-json'):
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state, jobs, unit, _ = self._fixture(
+                    operator, root, raw_receipt=raw
+                )
+                status = self._status(
+                    operator, state, jobs, unit, self._systemd_not_found(root)
+                )
+                self.assertEqual(
+                    status["final_status"], "missing_finalization_evidence"
+                )
+                self.assertEqual(
+                    status["finalization_receipt"]["reason"],
+                    "receipt_json_invalid",
+                )
+
+    def test_symlinked_receipt_is_rejected_fail_closed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit, _ = self._fixture(operator, root)
+            receipt = jobs / unit / "finalization.json"
+            target = root / "outside-receipt.json"
+            target.write_bytes(receipt.read_bytes())
+            receipt.unlink()
+            receipt.symlink_to(target)
+            status = self._status(
+                operator, state, jobs, unit, self._systemd_not_found(root)
+            )
+        self.assertEqual(status["final_status"], "missing_finalization_evidence")
+        self.assertEqual(status["finalization_receipt"]["reason"], "receipt_symlink")
+
+    def test_visible_systemd_status_remains_primary_over_valid_receipt(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit, _ = self._fixture(
+                operator, root, final_status="failed"
+            )
+            status = self._status(
+                operator, state, jobs, unit, self._systemd_visible_success(root)
+            )
+        self.assertEqual(status["final_status"], "succeeded")
+        self.assertEqual(
+            status["terminalization_evidence"]["source"], "systemd-show"
+        )
+        self.assertTrue(status["systemd_visible"])
+        self.assertTrue(status["finalization_receipt"]["valid"])
+
+
 if __name__ == "__main__":
     unittest.main()
