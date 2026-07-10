@@ -84,6 +84,85 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(get_args(SELF_DEPLOY.DelaySeconds)[1]["ge"], 5)
         self.assertEqual(get_args(SELF_DEPLOY.DelaySeconds)[1]["le"], 60)
 
+    def test_deploy_index_round_trip_is_private_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            unit = "grabowski-job-abcdef012345"
+            written = SELF_DEPLOY._write_deploy_index(
+                jobs,
+                units=[unit],
+                pending_unit=None,
+            )
+            loaded = SELF_DEPLOY._read_deploy_index(jobs)
+            self.assertEqual(loaded, written)
+            self.assertEqual(
+                (jobs / SELF_DEPLOY.DEPLOY_INDEX_FILENAME).stat().st_mode & 0o777,
+                0o600,
+            )
+
+    def test_deploy_index_rejects_hardlinks_and_non_private_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            SELF_DEPLOY._write_deploy_index(jobs, units=[], pending_unit=None)
+            (root / "index-hardlink").hardlink_to(
+                jobs / SELF_DEPLOY.DEPLOY_INDEX_FILENAME
+            )
+            with self.assertRaisesRegex(RuntimeError, "one private owner-controlled"):
+                SELF_DEPLOY._read_deploy_index(jobs)
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            jobs.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "private and owner-controlled"):
+                SELF_DEPLOY._read_deploy_index(jobs)
+
+    def test_index_bootstrap_excludes_terminal_self_deploy_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            repository = root / "repo"
+            runner = repository / SELF_DEPLOY.RUNNER_RELATIVE_PATH
+            terminal = "grabowski-job-111111111111"
+            running = "grabowski-job-222222222222"
+            (jobs / terminal).mkdir(mode=0o700)
+            (jobs / running).mkdir(mode=0o700)
+            metadata = {
+                terminal: {
+                    "argv": ["/usr/bin/python3", str(runner)],
+                    "final_status": "completed",
+                },
+                running: {
+                    "argv": ["/usr/bin/python3", str(runner)],
+                    "final_status": "running",
+                },
+            }
+            with patch.object(
+                SELF_DEPLOY.operator,
+                "_read_job_metadata",
+                side_effect=lambda unit: metadata[unit],
+            ):
+                index = SELF_DEPLOY._bootstrap_deploy_index(jobs, repository)
+            self.assertEqual(index["units"], [running])
+
+    def test_pending_deploy_index_unit_is_recovered_from_exact_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            unit = "grabowski-job-abcdef012345"
+            (jobs / unit).mkdir(mode=0o700)
+            SELF_DEPLOY._write_deploy_index(
+                jobs,
+                units=[],
+                pending_unit=unit,
+            )
+            index = SELF_DEPLOY._deploy_index(jobs, Path(temporary))
+            self.assertEqual(index["units"], [unit])
+            self.assertIsNone(index["pending_unit"])
+
     def test_preflight_requires_clean_synchronized_main(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
@@ -132,16 +211,26 @@ class SelfDeployToolTests(unittest.TestCase):
         SELF_DEPLOY.operator._start_job.reset_mock()
         SELF_DEPLOY.base._append_audit.reset_mock()
         SELF_DEPLOY.operator._start_job.return_value = job
+        fixed_uuid = Mock(hex="abcdef012345ffffffffffffffffffff")
         with patch.object(SELF_DEPLOY, "_canonical_preflight", return_value=(repo, runner)), patch.object(
             SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
-        ), patch.object(SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None):
+        ), patch.object(SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None), patch.object(
+            SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_index", return_value={"units": [], "pending_unit": None}
+        ), patch.object(SELF_DEPLOY, "_write_deploy_index") as write_index, patch.object(
+            SELF_DEPLOY.uuid, "uuid4", return_value=fixed_uuid
+        ):
             result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 9)
         SELF_DEPLOY.operator._start_job.assert_called_once_with(
             ["/usr/bin/python3", str(runner), "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "9"],
             cwd=str(repo),
             runtime_seconds=3600,
             finalization_expected_head=expected,
+            reserved_unit=unit,
+            allow_reserved_runtime_deploy=True,
         )
+        self.assertEqual(write_index.call_count, 2)
         self.assertTrue(result["scheduled"])
         self.assertFalse(result["already_scheduled"])
         self.assertEqual(9, result["requested_delay_seconds"])
@@ -759,42 +848,50 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         self.assertIn("deploy-apply: context-check deploy-tooling", makefile)
         self.assertIn("tools/deploy_runtime_dual.py --apply", makefile)
-        self.assertIn('deploy: context-check\n>$(PYTHON) tools/schedule_runtime_deploy.py --repo "$(CURDIR)" --delay-seconds 8', makefile)
+        self.assertIn(
+            'GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python',
+            makefile,
+        )
+        self.assertIn(
+            'deploy: context-check\n>test -x "$(GRABOWSKI_RUNTIME_PYTHON)"\n>set -eu; expected_head="$$(git rev-parse --verify HEAD)"; "$(GRABOWSKI_RUNTIME_PYTHON)" tools/schedule_runtime_deploy.py --expected-head "$$expected_head" --delay-seconds 8',
+            makefile,
+        )
+        self.assertIn(
+            'runtime-retention-apply: context-check\n>test -x "$(GRABOWSKI_RUNTIME_PYTHON)"',
+            makefile,
+        )
 
 
 class RuntimeDeploySchedulerTests(unittest.TestCase):
-    def test_build_systemd_run_argv_uses_fixed_runner_and_expected_head(self) -> None:
-        repo = Path("/home/alex/repos/grabowski")
-        runner = repo / "tools/run_scheduled_deploy.py"
+    def test_schedule_delegates_to_shared_scheduler(self) -> None:
         head = "a" * 40
-        argv = SCHEDULER.build_systemd_run_argv(repo, runner, head, 9, now=123)
-        self.assertEqual(argv[:2], ["systemd-run", "--user"])
-        self.assertIn("grabowski-scheduled-deploy-aaaaaaaaaaaa-123", argv)
-        self.assertIn("/usr/bin/python3", argv)
-        self.assertIn(str(runner), argv)
-        self.assertEqual(argv[argv.index("--expected-head") + 1], head)
-        self.assertEqual(argv[argv.index("--delay-seconds") + 1], "9")
+        receipt = {
+            "scheduled": True,
+            "already_scheduled": False,
+            "expected_head": head,
+            "unit": "grabowski-job-abcdef012345",
+        }
+        shared = Mock(return_value=receipt)
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            result = SCHEDULER.schedule(head, 9)
+        shared.assert_called_once_with(head, 9)
+        self.assertEqual(result, receipt)
 
-    def test_schedule_verifies_repository_before_systemd_run(self) -> None:
-        repo = Path("/home/alex/repos/grabowski")
-        runner = repo / "tools/run_scheduled_deploy.py"
+    def test_schedule_rejects_unbound_shared_receipt(self) -> None:
         head = "b" * 40
-        with patch.object(SCHEDULER, "verify_repository", return_value=(repo, head, runner)) as verify, \
-            patch.object(SCHEDULER.time, "time", return_value=456), \
-            patch.object(SCHEDULER, "run_systemd_run", return_value={"returncode": 0, "stdout": "started", "stderr": ""}) as run:
-            result = SCHEDULER.schedule(repo, 8)
-        verify.assert_called_once_with(repo)
-        self.assertEqual(result["expected_head"], head)
-        self.assertEqual(result["unit"], "grabowski-scheduled-deploy-bbbbbbbbbbbb-456")
-        self.assertTrue(result["expected_connector_disconnect"])
-        self.assertIn("run_scheduled_deploy.py", result["runner"])
-        self.assertEqual(run.call_args.kwargs["cwd"], repo)
+        shared = Mock(return_value={"scheduled": True, "expected_head": "c" * 40})
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            with self.assertRaisesRegex(RuntimeError, "unbound receipt"):
+                SCHEDULER.schedule(head, 8)
 
-    def test_schedule_bounds_delay_seconds(self) -> None:
+    def test_schedule_bounds_head_and_delay_seconds(self) -> None:
         with self.assertRaises(ValueError):
-            SCHEDULER.schedule(Path("/home/alex/repos/grabowski"), 4)
+            SCHEDULER.schedule("not-a-head", 8)
         with self.assertRaises(ValueError):
-            SCHEDULER.schedule(Path("/home/alex/repos/grabowski"), 61)
+            SCHEDULER.schedule("d" * 40, 4)
+        with self.assertRaises(ValueError):
+            SCHEDULER.schedule("d" * 40, 61)
+
 
 
 if __name__ == "__main__":

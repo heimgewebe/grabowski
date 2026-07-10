@@ -86,9 +86,15 @@ make deploy
 ```
 
 `make deploy` ist der normale Operatorpfad. Er startet keinen synchronen
-Runtime-Umbau im aufrufenden Terminal mehr, sondern plant einen eigenständigen
-user-systemd-Job über `tools/schedule_runtime_deploy.py`. Der Scheduler prüft
-vor dem Start:
+Runtime-Umbau im aufrufenden Terminal mehr. Die CLI
+`tools/schedule_runtime_deploy.py` ist nur noch ein dünner Einstieg in denselben
+typisierten Scheduler wie `grabowski_runtime_deploy_schedule`. Make verwendet
+dafür ausdrücklich den aktiven Grabowski-Runtime-Interpreter unter
+`~/.local/share/grabowski-mcp/.venv/bin/python`; System-Python genügt nicht,
+weil der Scheduler die MCP-Laufzeitabhängigkeiten lädt. Damit teilen
+Make-, MCP- und Captain-Pfad dieselbe Sperre, Deduplizierungswahrheit,
+Head-Bindung, Jobregistrierung und Receipt-Struktur. Der Scheduler prüft vor
+dem Start:
 
 - absoluter, nicht über Symlink erreichter Repositorypfad,
 - `main`,
@@ -134,6 +140,68 @@ Ein Deployment, das Operator und Tunnel neu startet, darf nicht an den Lebenszyk
 Es akzeptiert weder einen Repositorypfad noch beliebige Befehle. Vor dem Start werden der kanonische Checkout, `main`, `HEAD`, `origin/main`, ein sauberer Arbeitsbaum und der versionierte Runner geprüft. Anschließend startet das Werkzeug einen eigenständigen dauerhaften systemd-Job und gibt dessen Unit und Logpfade zurück. Der Runner wartet zunächst, prüft den Checkout erneut, führt `make validate` und danach `make deploy-apply` aus und verifiziert abschließend das Live-Manifest.
 
 Die Verzögerung ist Teil des Antwortvertrags: Der MCP-Request kann abgeschlossen werden, bevor Operator und Tunnel neu starten. Nach der Wiederverbindung liefern `grabowski_job_status` und `grabowski_job_logs` den dauerhaften Nachweis. Job-Status enthält eine eigene `terminalization_evidence`; akzeptierte Starts werden als `launch_submitted` markiert, und ungültige oder fehlende `systemctl show`-Daten ergeben `missing_finalization_evidence`. Optionale `notify_on_done`-Metadaten senden in diesem Slice nichts und dürfen fehlende oder fehlgeschlagene Finalisierung nicht verdecken.
+
+Der Scheduler hält zusätzlich `runtime-deploy-index.json` in der Job-Registry.
+Beim ersten Einsatz wird dieser Index einmalig aus höchstens 2.000 vorhandenen
+Jobs aufgebaut. Danach werden nur noch Self-Deploy-Jobs geprüft. Vor dem
+Jobstart wird eine konkrete Unit im Index als ausstehend reserviert; nach einem
+Abbruch wird genau diese Unit wieder eingelesen. So entsteht zwischen
+Startabsicht und Jobregistrierung weder ein ungebundener Wiederholungsversuch
+noch ein Vollscan der allgemeinen Job-Registry. Der generische Durable-Job-Pfad
+darf den versionierten Self-Deploy-Runner nicht direkt starten.
+
+## Runtime-Namensmodell
+
+`grabowski-mcp` bezeichnet den logischen Runtime- und Deploy-Vertrag, nicht
+eine systemd-Unit. Die konkreten Prozesse sind:
+
+- Operator: `grabowski-operator.service`
+- Tunnel: `tunnel-client-grabowski.service`
+- Runtime-Ziel: `heim-pc`
+- Deployment-Instanz: die jeweilige `release_id`
+
+`grabowski_runtime_health` und `grabowski_context` geben diese Ebenen getrennt
+als `service_model` aus. Das bisherige Feld `service: grabowski-mcp` bleibt aus
+Kompatibilitätsgründen erhalten.
+
+## Job- und Failed-Unit-Retention
+
+Die Retention ist zweistufig und hashgebunden. Vorschau und Apply laufen mit
+dem aktiven Grabowski-Runtime-Interpreter, damit dieselben MCP-, Policy- und
+Auditabhängigkeiten wie in der laufenden Runtime gelten:
+
+```bash
+make runtime-retention-check
+make runtime-retention-apply RETENTION_PLAN_SHA256=<sha256-aus-der-vorschau>
+```
+
+Die Vorschau liest bounded höchstens 2.000 Jobverzeichnisse, die aktuellen
+Failed-Units, den zugehörigen systemd-Zustand, die Job-Metadaten und die
+Task-Datenbank. Ein Job gilt nur dann als terminal, wenn systemd einen
+terminalen Zustand belegt oder seine registrierte maximale Laufzeit zuzüglich
+Nachlauf sicher verstrichen ist. Aktive, junge oder sonst uneindeutige Jobs
+bleiben sichtbar und unangetastet.
+
+Nur eindeutig terminale Grabowski-Jobs und -Tasks werden für ein gezieltes
+`systemctl --user reset-failed <unit>` vorgesehen. Alle terminalen Jobs, die
+älter als `RETENTION_MIN_AGE_SECONDS` sind (Standard: 86.400 Sekunden), werden
+nicht gelöscht, sondern mit Datei-Hashes und Archivmanifest nach
+`~/.local/state/grabowski/job-archive/` verschoben. Pro Lauf werden höchstens
+`RETENTION_MAX_ARCHIVE_JOBS` Jobs archiviert (Standard: 128); weitere
+Kandidaten erscheinen als `archive_deferred_count` und werden durch spätere
+hashgebundene Läufe abgearbeitet. Ein alter fehlgeschlagener Job behält seinen
+Failed-Zustand, solange seine Archivierung durch diese Batchgrenze noch
+aufgeschoben ist.
+
+Ein Apply wird nur ausgeführt, wenn die erneut berechnete Vorschau exakt zum
+angegebenen Plan-Hash passt. Vor der ersten Zustandsmutation wird ein
+Intent-Audit geschrieben. Direkt vor der Archivierung werden systemd-Zustand,
+Metadaten und Dateihashes erneut geprüft. Nach dem atomaren Move werden beide
+Elternverzeichnisse fsync-gesichert und die Zieldateien erneut gehasht. Erst
+danach folgen gezieltes `reset-failed`, create-only Receipt und
+Completion-Audit. Unbekannte Unit-Klassen, unklare Task-Zustände und
+nichtterminale Jobs bleiben unangetastet und werden im Receipt als blockiert
+beziehungsweise geschützt geführt.
 
 ## Integritätsgeprüfte Releases
 

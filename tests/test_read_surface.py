@@ -52,6 +52,15 @@ def _load_read_surface():
     capabilities = types.ModuleType("grabowski_capabilities")
     capabilities.classify_contract = lambda expected: {}
     runtime_extensions = types.ModuleType("grabowski_runtime_extensions")
+    runtime_extensions.LOGICAL_RUNTIME_SERVICE = "grabowski-mcp"
+    runtime_extensions.runtime_service_model = lambda deployment: {
+        "logical_runtime_service": "grabowski-mcp",
+        "runtime_target": "heim-pc",
+        "operator_unit": "grabowski-operator.service",
+        "tunnel_unit": "tunnel-client-grabowski.service",
+        "deployment_release": deployment.get("release_id"),
+        "repo_head": deployment.get("repo_head"),
+    }
     runtime_extensions._runtime_contract_snapshot = lambda: {"source": "test", "contract": {"expected_tools": []}}
     runtime_extensions._worktree_context = lambda head: {"worktrees": []}
     module_name = "grabowski_read_surface_test"
@@ -186,6 +195,20 @@ class ReadSurfaceTests(unittest.TestCase):
                 read_surface.grabowski_service_logs("demo.service", 0)
             with self.assertRaises(ValueError):
                 read_surface.grabowski_service_logs("demo.service", 2001)
+
+    def test_runtime_health_distinguishes_logical_service_and_units(self) -> None:
+        deployment = {
+            "completion_status": "complete",
+            "release_id": "release-1",
+            "repo_head": "a" * 40,
+        }
+        deployment.update({key: True for key in read_surface.DEPLOYMENT_INTEGRITY_FIELDS})
+        with patch.object(read_surface.base, "_deployment_metadata", return_value=deployment):
+            health = read_surface.grabowski_runtime_health()
+        self.assertEqual(health["service"], "grabowski-mcp")
+        self.assertEqual(health["service_model"]["operator_unit"], "grabowski-operator.service")
+        self.assertEqual(health["service_model"]["tunnel_unit"], "tunnel-client-grabowski.service")
+        self.assertEqual(health["service_model"]["deployment_release"], "release-1")
 
     def test_github_fields_exclude_body_and_comments(self) -> None:
         fields = set(read_surface.GITHUB_PR_FIELDS)
