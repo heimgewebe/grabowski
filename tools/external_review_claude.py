@@ -4,13 +4,49 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
+import re
 import subprocess
 import sys
+import time
 from typing import Any
 
 VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
+SEVERITIES = {"critical", "high", "medium", "low"}
 DEFAULT_TIMEOUT_MINUTES = 30
+DEFAULT_MODEL = "opus"
+DEFAULT_EFFORT = "high"
+DEFAULT_MAX_BUDGET_USD = 2.0
+DEFAULT_MAX_PROMPT_BYTES = 750_000
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": sorted(VERDICTS)},
+        "summary": {"type": "string", "minLength": 1},
+        "finding_count": {"type": "integer", "minimum": 0},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string", "enum": sorted(SEVERITIES)},
+                    "title": {"type": "string", "minLength": 1},
+                    "description": {"type": "string", "minLength": 1},
+                    "recommendation": {"type": "string", "minLength": 1},
+                    "file": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+                    "line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+                },
+                "required": ["severity", "title", "description", "recommendation", "file", "line"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["verdict", "summary", "finding_count", "findings"],
+    "additionalProperties": False,
+}
 
 
 class ClaudeReviewError(RuntimeError):
@@ -19,6 +55,14 @@ class ClaudeReviewError(RuntimeError):
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def sha256_text(value: str) -> str:
+    return sha256_bytes(value.encode("utf-8"))
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and SHA256_RE.fullmatch(value.strip().lower()) is not None
 
 
 def load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -64,12 +108,21 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         raise ClaudeReviewError("manifest schema_version is not 1")
     if manifest.get("kind") != "external_review_packet":
         raise ClaudeReviewError("manifest kind is not external_review_packet")
-    for key in ("repo", "head_sha", "diff_sha256", "prompt_sha256", "diff_path", "prompt_path"):
-        if not manifest.get(key):
-            raise ClaudeReviewError(f"manifest {key} is missing")
+    repo = manifest.get("repo")
+    if not isinstance(repo, str) or REPO_RE.fullmatch(repo) is None:
+        raise ClaudeReviewError("manifest repo is missing or invalid")
     pr = manifest.get("pr")
     if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
         raise ClaudeReviewError("manifest pr is not a positive integer")
+    head_sha = manifest.get("head_sha")
+    if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", head_sha) is None:
+        raise ClaudeReviewError("manifest head_sha is missing or invalid")
+    for key in ("diff_sha256", "prompt_sha256"):
+        if not _is_sha256(manifest.get(key)):
+            raise ClaudeReviewError(f"manifest {key} is missing or invalid")
+    for key in ("diff_path", "prompt_path"):
+        if not isinstance(manifest.get(key), str) or not manifest.get(key, "").strip():
+            raise ClaudeReviewError(f"manifest {key} is missing")
 
 
 def run_checked(argv: list[str], *, cwd: Path, timeout_seconds: int, text: bool = True) -> subprocess.CompletedProcess[Any]:
@@ -123,42 +176,115 @@ def current_pr_diff_sha256(repo: Path, pr: int) -> str:
     return sha256_bytes(completed.stdout)
 
 
-def parse_review_json(stdout: str) -> tuple[str, list[Any]]:
+def build_review_prompt(packet_prompt: str, diff_text: str) -> str:
+    return (
+        packet_prompt
+        + "\n\nReturn only the structured review object required by the supplied JSON schema. "
+        + "Use PASS only when finding_count is zero. NEEDS_CHANGE or BLOCK must contain at least one concrete finding. "
+        + "Do not report generic risk reminders as findings.\n\n"
+        + "--- BEGIN EXACT PR DIFF ---\n"
+        + diff_text
+        + "\n--- END EXACT PR DIFF ---\n"
+    )
+
+
+def build_command(*, claude_bin: str, model: str, effort: str, max_budget_usd: float) -> list[str]:
+    if claude_bin != "claude":
+        raise ClaudeReviewError("Claude packet review requires the exact claude executable name")
+    if model != DEFAULT_MODEL:
+        raise ClaudeReviewError(f"Claude packet review requires model {DEFAULT_MODEL}")
+    if effort != DEFAULT_EFFORT:
+        raise ClaudeReviewError(f"Claude packet review requires effort {DEFAULT_EFFORT}")
+    if not math.isfinite(max_budget_usd) or max_budget_usd <= 0:
+        raise ClaudeReviewError("Claude packet review budget must be a positive finite number")
+    schema = json.dumps(REVIEW_SCHEMA, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return [
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
+        "--json-schema",
+        schema,
+        "--tools=",
+        "--permission-mode",
+        "plan",
+        "--no-session-persistence",
+        "--safe-mode",
+        "--model",
+        DEFAULT_MODEL,
+        "--effort",
+        DEFAULT_EFFORT,
+        "--max-budget-usd",
+        format(max_budget_usd, "g"),
+    ]
+
+
+def _non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_finding(finding: Any, index: int) -> None:
+    required = {"severity", "title", "description", "recommendation", "file", "line"}
+    if not isinstance(finding, dict):
+        raise ClaudeReviewError(f"Claude review finding {index} is not an object")
+    if set(finding) != required:
+        raise ClaudeReviewError(f"Claude review finding {index} has an invalid shape")
+    if finding.get("severity") not in SEVERITIES:
+        raise ClaudeReviewError(f"Claude review finding {index} severity is invalid")
+    for key in ("title", "description", "recommendation"):
+        if not _non_empty_string(finding.get(key)):
+            raise ClaudeReviewError(f"Claude review finding {index} {key} is missing")
+    file_value = finding.get("file")
+    if file_value is not None and not _non_empty_string(file_value):
+        raise ClaudeReviewError(f"Claude review finding {index} file is invalid")
+    line = finding.get("line")
+    if line is not None and (isinstance(line, bool) or not isinstance(line, int) or line <= 0):
+        raise ClaudeReviewError(f"Claude review finding {index} line is invalid")
+
+
+def parse_review_json(stdout: str) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
-        payload = json.loads(stdout)
+        envelope = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise ClaudeReviewError(f"Claude ultrareview output is not valid JSON: {exc}") from exc
-
-    explicit_verdict: str | None = None
-    if isinstance(payload, list):
-        findings = payload
-    elif isinstance(payload, dict):
-        raw_verdict = payload.get("verdict")
-        if raw_verdict is not None:
-            if raw_verdict not in VERDICTS:
-                raise ClaudeReviewError("Claude ultrareview verdict is invalid")
-            explicit_verdict = raw_verdict
-        findings = None
-        for key in ("bugs", "findings", "issues"):
-            candidate = payload.get(key)
-            if isinstance(candidate, list):
-                findings = candidate
-                break
-        if findings is None:
-            count = payload.get("finding_count")
-            if count == 0 and explicit_verdict == "PASS":
-                findings = []
-            else:
-                raise ClaudeReviewError("Claude ultrareview JSON has no recognized findings list")
-    else:
-        raise ClaudeReviewError("Claude ultrareview JSON is neither an object nor a list")
-
-    verdict = explicit_verdict or ("PASS" if not findings else "NEEDS_CHANGE")
-    if findings and verdict == "PASS":
-        raise ClaudeReviewError("Claude ultrareview reports findings with PASS verdict")
-    if not findings and verdict in {"NEEDS_CHANGE", "BLOCK"}:
-        raise ClaudeReviewError("Claude ultrareview reports a blocking verdict without findings")
-    return verdict, findings
+        raise ClaudeReviewError(f"Claude CLI output is not valid JSON: {exc}") from exc
+    if not isinstance(envelope, dict):
+        raise ClaudeReviewError("Claude CLI output is not a JSON object")
+    if envelope.get("type") != "result" or envelope.get("subtype") != "success" or envelope.get("is_error") is not False:
+        raise ClaudeReviewError("Claude CLI result envelope is not successful")
+    review = envelope.get("structured_output")
+    if not isinstance(review, dict):
+        raise ClaudeReviewError("Claude CLI result has no structured_output object")
+    required = {"verdict", "summary", "finding_count", "findings"}
+    if set(review) != required:
+        raise ClaudeReviewError("Claude structured_output has an invalid shape")
+    verdict = review.get("verdict")
+    if verdict not in VERDICTS:
+        raise ClaudeReviewError("Claude review verdict is missing or invalid")
+    if not _non_empty_string(review.get("summary")):
+        raise ClaudeReviewError("Claude review summary is missing")
+    finding_count = review.get("finding_count")
+    if isinstance(finding_count, bool) or not isinstance(finding_count, int) or finding_count < 0:
+        raise ClaudeReviewError("Claude review finding_count is not an integer >= 0")
+    findings = review.get("findings")
+    if not isinstance(findings, list):
+        raise ClaudeReviewError("Claude review findings is not a list")
+    for index, finding in enumerate(findings):
+        _validate_finding(finding, index)
+    if finding_count != len(findings):
+        raise ClaudeReviewError("Claude review finding_count does not match findings length")
+    if verdict == "PASS" and findings:
+        raise ClaudeReviewError("Claude review reports findings with PASS verdict")
+    if verdict in {"NEEDS_CHANGE", "BLOCK"} and not findings:
+        raise ClaudeReviewError("Claude review reports a blocking verdict without findings")
+    total_cost = envelope.get("total_cost_usd")
+    if total_cost is not None and (
+        isinstance(total_cost, bool)
+        or not isinstance(total_cost, (int, float))
+        or not math.isfinite(float(total_cost))
+        or float(total_cost) < 0
+    ):
+        raise ClaudeReviewError("Claude CLI total_cost_usd is invalid")
+    return envelope, review
 
 
 def run_from_manifest(
@@ -170,95 +296,155 @@ def run_from_manifest(
     raw_stderr_path: Path | None,
     claude_bin: str,
     timeout_minutes: int,
+    model: str = DEFAULT_MODEL,
+    effort: str = DEFAULT_EFFORT,
+    max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
+    max_prompt_bytes: int = DEFAULT_MAX_PROMPT_BYTES,
 ) -> dict[str, Any]:
     manifest_path = manifest_path.resolve(strict=True)
     repo = repo.resolve(strict=True)
     if not repo.is_dir():
         raise ClaudeReviewError("repo is not a directory")
+    if isinstance(timeout_minutes, bool) or not isinstance(timeout_minutes, int) or timeout_minutes <= 0:
+        raise ClaudeReviewError("timeout_minutes must be a positive integer")
+    if isinstance(max_prompt_bytes, bool) or not isinstance(max_prompt_bytes, int) or max_prompt_bytes <= 0:
+        raise ClaudeReviewError("max_prompt_bytes must be a positive integer")
 
     manifest = load_json(manifest_path, label="external review manifest")
     validate_manifest(manifest)
     diff_path = resolve_packet_file(manifest_path, manifest["diff_path"], label="diff_path")
     prompt_path = resolve_packet_file(manifest_path, manifest["prompt_path"], label="prompt_path")
-    if sha256_bytes(diff_path.read_bytes()) != manifest["diff_sha256"]:
+
+    diff_bytes = diff_path.read_bytes()
+    if sha256_bytes(diff_bytes) != manifest["diff_sha256"].lower():
         raise ClaudeReviewError("packet diff sha256 does not match manifest")
-    if sha256_bytes(prompt_path.read_bytes()) != manifest["prompt_sha256"]:
+    prompt_bytes = prompt_path.read_bytes()
+    if sha256_bytes(prompt_bytes) != manifest["prompt_sha256"].lower():
         raise ClaudeReviewError("packet prompt sha256 does not match manifest")
+    try:
+        packet_prompt = prompt_bytes.decode("utf-8")
+        diff_text = diff_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ClaudeReviewError("packet prompt and diff must be valid UTF-8") from exc
+
+    transmitted_prompt = build_review_prompt(packet_prompt, diff_text)
+    transmitted_prompt_bytes = transmitted_prompt.encode("utf-8")
+    if len(transmitted_prompt_bytes) > max_prompt_bytes:
+        raise ClaudeReviewError(
+            f"Claude review prompt is too large: {len(transmitted_prompt_bytes)} bytes > {max_prompt_bytes}"
+        )
+    transmitted_prompt_sha256 = sha256_bytes(transmitted_prompt_bytes)
 
     pr = manifest["pr"]
-    expected_head = manifest["head_sha"]
-    if current_repo_name(repo) != manifest["repo"]:
-        raise ClaudeReviewError("repository name does not match manifest")
-    if current_pr_head(repo, pr) != expected_head:
+    expected_repo = manifest["repo"].lower()
+    expected_head = manifest["head_sha"].lower()
+    expected_diff_sha256 = manifest["diff_sha256"].lower()
+    if current_repo_name(repo).strip().lower() != expected_repo:
+        raise ClaudeReviewError("repository name does not match manifest before review")
+    if current_pr_head(repo, pr).lower() != expected_head:
         raise ClaudeReviewError("current PR head does not match manifest before review")
-    if current_pr_diff_sha256(repo, pr) != manifest["diff_sha256"]:
+    if current_pr_diff_sha256(repo, pr) != expected_diff_sha256:
         raise ClaudeReviewError("current PR diff does not match manifest before review")
 
-    version = run_checked([claude_bin, "--version"], cwd=repo, timeout_seconds=60).stdout.strip()
+    version = run_checked(["claude", "--version"], cwd=repo, timeout_seconds=60).stdout.strip()
     if not version:
         raise ClaudeReviewError("Claude CLI version output is empty")
-    command = [claude_bin, "ultrareview", str(pr), "--json", "--timeout", str(timeout_minutes)]
+    command = build_command(
+        claude_bin=claude_bin,
+        model=model,
+        effort=effort,
+        max_budget_usd=max_budget_usd,
+    )
+    started = time.monotonic()
     completed = subprocess.run(
         command,
         cwd=repo,
         check=False,
         capture_output=True,
-        text=True,
-        timeout=timeout_minutes * 60 + 60,
+        input=transmitted_prompt_bytes,
+        timeout=timeout_minutes * 60,
     )
-    raw_stdout = completed.stdout or ""
-    raw_stderr = completed.stderr or ""
+    runtime_seconds = time.monotonic() - started
+    raw_stdout_bytes = completed.stdout or b""
+    raw_stderr_bytes = completed.stderr or b""
+    raw_stdout = raw_stdout_bytes.decode("utf-8", errors="strict")
+    raw_stderr = raw_stderr_bytes.decode("utf-8", errors="replace")
     if completed.returncode != 0:
         detail = (raw_stderr or raw_stdout).strip()
-        raise ClaudeReviewError(f"Claude ultrareview exited with {completed.returncode}: {detail}")
+        raise ClaudeReviewError(f"Claude packet review exited with {completed.returncode}: {detail}")
     if not raw_stdout.strip():
-        raise ClaudeReviewError("Claude ultrareview returned empty stdout")
+        raise ClaudeReviewError("Claude packet review returned empty stdout")
+    envelope, review = parse_review_json(raw_stdout)
 
-    verdict, findings = parse_review_json(raw_stdout)
-    if current_pr_head(repo, pr) != expected_head:
+    if current_repo_name(repo).strip().lower() != expected_repo:
+        raise ClaudeReviewError("repository name changed during review")
+    if current_pr_head(repo, pr).lower() != expected_head:
         raise ClaudeReviewError("current PR head changed during review")
-    if current_pr_diff_sha256(repo, pr) != manifest["diff_sha256"]:
+    if current_pr_diff_sha256(repo, pr) != expected_diff_sha256:
         raise ClaudeReviewError("current PR diff changed during review")
 
     stdout_path = raw_stdout_path or output_path.with_suffix(".review.json")
     stderr_path = raw_stderr_path or output_path.with_suffix(".stderr.txt")
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
-    stdout_path.write_text(raw_stdout, encoding="utf-8")
-    stderr_path.write_text(raw_stderr, encoding="utf-8")
+    stdout_path.write_bytes(raw_stdout_bytes)
+    stderr_path.write_bytes(raw_stderr_bytes)
 
+    verdict = review["verdict"]
+    findings = review["findings"]
     pass_without_findings = verdict == "PASS" and not findings
+    model_usage = envelope.get("modelUsage")
+    usage = envelope.get("usage")
+    review_entry: dict[str, Any] = {
+        "source": "claude-cli:packet-review",
+        "tool": "claude-code",
+        "tool_version": version,
+        "command": command,
+        "stdin_sha256": transmitted_prompt_sha256,
+        "model": DEFAULT_MODEL,
+        "effort": DEFAULT_EFFORT,
+        "exit_code": completed.returncode,
+        "json_ok": True,
+        "review_sha256": sha256_bytes(raw_stdout_bytes),
+        "stderr_sha256": sha256_bytes(raw_stderr_bytes),
+        "verdict": verdict,
+        "finding_count": len(findings),
+        "summary": review["summary"],
+        "runtime_seconds": round(runtime_seconds, 6),
+    }
+    if isinstance(model_usage, dict):
+        review_entry["model_usage"] = model_usage
+        review_entry["actual_models"] = sorted(str(key) for key in model_usage)
+    if isinstance(usage, dict):
+        review_entry["usage"] = usage
+    if envelope.get("total_cost_usd") is not None:
+        review_entry["total_cost_usd"] = envelope["total_cost_usd"]
+    for key in ("duration_ms", "duration_api_ms", "num_turns"):
+        value = envelope.get(key)
+        if value is not None:
+            review_entry[key] = value
+
     evidence = {
         "schema_version": 1,
         "kind": "external_review",
-        "repo": manifest["repo"],
+        "repo": expected_repo,
         "pr": pr,
         "head_sha": expected_head,
-        "diff_sha256": manifest["diff_sha256"],
-        "prompt_sha256": manifest["prompt_sha256"],
-        "prompt_includes_diff": False,
-        "prompt_transmitted": False,
+        "diff_sha256": expected_diff_sha256,
+        "prompt_sha256": transmitted_prompt_sha256,
+        "prompt_includes_diff": True,
+        "prompt_transmitted": True,
         "review_input": {
-            "mode": "claude_ultrareview_pr",
-            "repo": manifest["repo"],
+            "mode": "claude_packet_prompt",
+            "repo": expected_repo,
             "pr": pr,
             "head_sha": expected_head,
-            "diff_sha256": manifest["diff_sha256"],
+            "diff_sha256": expected_diff_sha256,
+            "packet_prompt_sha256": manifest["prompt_sha256"].lower(),
+            "prompt_sha256": transmitted_prompt_sha256,
+            "transport": "stdin",
         },
-        "reviews": [
-            {
-                "source": "claude-cli:ultrareview",
-                "tool": "claude-code",
-                "tool_version": version,
-                "command": command,
-                "exit_code": completed.returncode,
-                "json_ok": True,
-                "review_sha256": sha256_bytes(raw_stdout.encode("utf-8")),
-                "stderr_sha256": sha256_bytes(raw_stderr.encode("utf-8")),
-                "verdict": verdict,
-                "finding_count": len(findings),
-            }
-        ],
+        "reviews": [review_entry],
         "external_reviews_triaged": pass_without_findings,
         "findings": [],
         "raw_review_path": str(stdout_path),
@@ -280,15 +466,29 @@ def positive_int(raw: str) -> int:
     return value
 
 
+def positive_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run Claude CLI ultrareview for a pr_review_gate packet.")
+    parser = argparse.ArgumentParser(description="Run a packet-bound Claude CLI review for pr_review_gate.")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--raw-stdout")
     parser.add_argument("--raw-stderr")
-    parser.add_argument("--claude-bin", default="claude")
+    parser.add_argument("--claude-bin", choices=("claude",), default="claude")
     parser.add_argument("--timeout-minutes", type=positive_int, default=DEFAULT_TIMEOUT_MINUTES)
+    parser.add_argument("--model", choices=(DEFAULT_MODEL,), default=DEFAULT_MODEL)
+    parser.add_argument("--effort", choices=(DEFAULT_EFFORT,), default=DEFAULT_EFFORT)
+    parser.add_argument("--max-budget-usd", type=positive_float, default=DEFAULT_MAX_BUDGET_USD)
+    parser.add_argument("--max-prompt-bytes", type=positive_int, default=DEFAULT_MAX_PROMPT_BYTES)
     args = parser.parse_args(argv)
     try:
         evidence = run_from_manifest(
@@ -299,8 +499,12 @@ def main(argv: list[str] | None = None) -> int:
             raw_stderr_path=Path(args.raw_stderr) if args.raw_stderr else None,
             claude_bin=args.claude_bin,
             timeout_minutes=args.timeout_minutes,
+            model=args.model,
+            effort=args.effort,
+            max_budget_usd=args.max_budget_usd,
+            max_prompt_bytes=args.max_prompt_bytes,
         )
-    except (ClaudeReviewError, OSError, subprocess.TimeoutExpired) as exc:
+    except (ClaudeReviewError, OSError, UnicodeDecodeError, subprocess.TimeoutExpired) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, sort_keys=True), file=sys.stderr)
         return 2
     print(json.dumps({"ok": True, "evidence": str(Path(args.output)), "verdict": evidence["reviews"][0]["verdict"]}, sort_keys=True))

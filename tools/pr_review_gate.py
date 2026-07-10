@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -22,8 +23,34 @@ TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
 SELF_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
-CLAUDE_CLI_REVIEW_SOURCE = "claude-cli:ultrareview"
-CLAUDE_CLI_REVIEW_INPUT_MODE = "claude_ultrareview_pr"
+CLAUDE_CLI_REVIEW_SOURCE = "claude-cli:packet-review"
+CLAUDE_CLI_REVIEW_INPUT_MODE = "claude_packet_prompt"
+CLAUDE_PACKET_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["BLOCK", "NEEDS_CHANGE", "PASS"]},
+        "summary": {"type": "string", "minLength": 1},
+        "finding_count": {"type": "integer", "minimum": 0},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string", "enum": ["critical", "high", "low", "medium"]},
+                    "title": {"type": "string", "minLength": 1},
+                    "description": {"type": "string", "minLength": 1},
+                    "recommendation": {"type": "string", "minLength": 1},
+                    "file": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+                    "line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+                },
+                "required": ["severity", "title", "description", "recommendation", "file", "line"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["verdict", "summary", "finding_count", "findings"],
+    "additionalProperties": False,
+}
 IMPORTANT_REPOS = {"heimgewebe/weltgewebe"}
 SELF_REVIEW_KIND = "grabowski_self_review"
 SELF_REVIEW_MODE = "critical_diff_review"
@@ -386,6 +413,22 @@ def _current_pr_paths_failures(pr: dict[str, Any]) -> tuple[list[str], list[str]
     return paths, failures
 
 
+def _canonical_repo_slug(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:"):
+        if normalized.lower().startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    if normalized.lower().endswith(".git"):
+        normalized = normalized[:-4]
+    parts = normalized.split("/")
+    if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts):
+        return None
+    return "/".join(parts).lower()
+
+
 def _is_risk_path(path: str) -> bool:
     normalized = path.lower().lstrip("./")
     return any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES) or any(marker in normalized for marker in RISK_PATH_MARKERS)
@@ -466,7 +509,7 @@ def classify_complexity(
     paths = _paths(pr)
     docs_only = bool(paths) and all(_is_documentation_path(path) for path in paths)
     very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
-    normalized_repo = repo_name.strip().lower() if isinstance(repo_name, str) and repo_name.strip() else None
+    normalized_repo = _canonical_repo_slug(repo_name)
     important_repo = normalized_repo in IMPORTANT_REPOS
     repo_claude_required = bool(important_repo and not docs_only)
 
@@ -576,6 +619,34 @@ def _valid_sha256(value: Any) -> bool:
     return _normalize_sha256(value) is not None
 
 
+def _claude_packet_review_command_matches(command: Any) -> bool:
+    if not isinstance(command, list) or len(command) != 17:
+        return False
+    if not all(isinstance(item, str) for item in command):
+        return False
+    if command[:5] != ["claude", "-p", "--output-format", "json", "--json-schema"]:
+        return False
+    if command[6:16] != [
+        "--tools=",
+        "--permission-mode",
+        "plan",
+        "--no-session-persistence",
+        "--safe-mode",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+        "--max-budget-usd",
+    ]:
+        return False
+    try:
+        schema = json.loads(command[5])
+        budget = float(command[16])
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return schema == CLAUDE_PACKET_REVIEW_SCHEMA and math.isfinite(budget) and budget > 0
+
+
 def _claude_ultrareview_command_matches(command: Any, pr_number: Any) -> bool:
     if not isinstance(command, list) or len(command) < 3:
         return False
@@ -636,7 +707,7 @@ def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any, *, repo_nam
         failures.append("schema_version is not integer 1")
     if evidence.get("kind") != "claude_ultrareview":
         failures.append("kind is not claude_ultrareview")
-    if repo_name is not None and evidence.get("repo") != repo_name:
+    if repo_name is not None and _canonical_repo_slug(evidence.get("repo")) != repo_name:
         failures.append("repo mismatch")
     evidence_pr = evidence.get("pr")
     if pr_number is not None and (isinstance(evidence_pr, bool) or not isinstance(evidence_pr, int) or evidence_pr != pr_number):
@@ -782,7 +853,7 @@ def _self_review_workflow_failures(
         failures.append(f"self-review review_mode must be {SELF_REVIEW_MODE}")
     if repo_name is None:
         failures.append("current gate state is missing repoName")
-    elif self_review.get("repo") != repo_name:
+    elif _canonical_repo_slug(self_review.get("repo")) != repo_name:
         failures.append("self-review repo mismatch")
     pr_number = pr.get("number")
     evidence_pr = self_review.get("pr")
@@ -869,7 +940,7 @@ def _reported_external_finding_count(verdict: Any, finding_count: int) -> int:
     return 0
 
 
-def _claude_cli_external_review_failures(review: dict[str, Any], pr_number: Any) -> list[str]:
+def _claude_cli_external_review_failures(review: dict[str, Any], prompt_sha256: Any) -> list[str]:
     failures: list[str] = []
     if review.get("source") != CLAUDE_CLI_REVIEW_SOURCE:
         failures.append(f"source is not {CLAUDE_CLI_REVIEW_SOURCE}")
@@ -877,12 +948,28 @@ def _claude_cli_external_review_failures(review: dict[str, Any], pr_number: Any)
         failures.append("tool is not claude-code")
     if not isinstance(review.get("tool_version"), str) or not review.get("tool_version").strip():
         failures.append("tool_version is missing")
-    if not _claude_ultrareview_command_matches(review.get("command"), pr_number):
-        failures.append("command is not claude ultrareview for this PR")
+    if not _claude_packet_review_command_matches(review.get("command")):
+        failures.append("command is not the allowed Claude packet-review command")
+    if review.get("model") != "opus":
+        failures.append("model is not opus")
+    if review.get("effort") != "high":
+        failures.append("effort is not high")
+    stdin_sha256 = review.get("stdin_sha256")
+    if not _valid_sha256(stdin_sha256):
+        failures.append("stdin_sha256 is missing or invalid")
+    elif not _valid_sha256(prompt_sha256) or _normalize_sha256(stdin_sha256) != _normalize_sha256(prompt_sha256):
+        failures.append("stdin_sha256 does not match prompt_sha256")
     if review.get("exit_code") != 0:
         failures.append(f"exit_code is {review.get('exit_code')}, not 0")
     if review.get("json_ok") is not True:
         failures.append("json_ok is not true")
+    verdict = review.get("verdict")
+    finding_count = review.get("finding_count")
+    valid_count = isinstance(finding_count, int) and not isinstance(finding_count, bool) and finding_count >= 0
+    if verdict == "PASS" and valid_count and finding_count != 0:
+        failures.append("PASS Claude review must have finding_count 0")
+    if verdict in {"NEEDS_CHANGE", "BLOCK"} and valid_count and finding_count == 0:
+        failures.append(f"{verdict} Claude review must report at least one finding")
     return failures
 
 
@@ -900,7 +987,7 @@ def _claude_cli_review_input_failures(
         return ["review_input is missing or not a JSON object"]
     if review_input.get("mode") != CLAUDE_CLI_REVIEW_INPUT_MODE:
         failures.append(f"review_input.mode is not {CLAUDE_CLI_REVIEW_INPUT_MODE}")
-    if repo_name is not None and review_input.get("repo") != repo_name:
+    if repo_name is not None and _canonical_repo_slug(review_input.get("repo")) != repo_name:
         failures.append("review_input.repo mismatch")
     input_pr = review_input.get("pr")
     if pr_number is not None and (isinstance(input_pr, bool) or not isinstance(input_pr, int) or input_pr != pr_number):
@@ -912,10 +999,21 @@ def _claude_cli_review_input_failures(
         failures.append("review_input.diff_sha256 is missing or invalid")
     elif _normalize_sha256(input_diff_sha256) != _normalize_sha256(diff_sha256):
         failures.append("review_input.diff_sha256 mismatch")
-    if external_review.get("prompt_transmitted") is not False:
-        failures.append("prompt_transmitted must be false for Claude ultrareview PR input")
-    if external_review.get("prompt_includes_diff") is not False:
-        failures.append("prompt_includes_diff must be false for Claude ultrareview PR input")
+    packet_prompt_sha256 = review_input.get("packet_prompt_sha256")
+    if not _valid_sha256(packet_prompt_sha256):
+        failures.append("review_input.packet_prompt_sha256 is missing or invalid")
+    prompt_sha256 = external_review.get("prompt_sha256")
+    input_prompt_sha256 = review_input.get("prompt_sha256")
+    if not _valid_sha256(input_prompt_sha256):
+        failures.append("review_input.prompt_sha256 is missing or invalid")
+    elif not _valid_sha256(prompt_sha256) or _normalize_sha256(input_prompt_sha256) != _normalize_sha256(prompt_sha256):
+        failures.append("review_input.prompt_sha256 mismatch")
+    if review_input.get("transport") != "stdin":
+        failures.append("review_input.transport is not stdin")
+    if external_review.get("prompt_transmitted") is not True:
+        failures.append("prompt_transmitted must be true for Claude packet review")
+    if external_review.get("prompt_includes_diff") is not True:
+        failures.append("prompt_includes_diff must be true for Claude packet review")
     return failures
 
 
@@ -948,7 +1046,7 @@ def _external_review_failures(
         failures.append("schema_version is not integer 1")
     if external_review.get("kind") != "external_review":
         failures.append("kind is not external_review")
-    if repo_name is not None and external_review.get("repo") != repo_name:
+    if repo_name is not None and _canonical_repo_slug(external_review.get("repo")) != repo_name:
         failures.append("repo mismatch")
     evidence_pr = external_review.get("pr")
     if pr_number is not None and (isinstance(evidence_pr, bool) or not isinstance(evidence_pr, int) or evidence_pr != pr_number):
@@ -1004,7 +1102,7 @@ def _external_review_failures(
             if not isinstance(source, str) or not source.strip():
                 failures.append(f"review {index} source is missing")
             elif source == CLAUDE_CLI_REVIEW_SOURCE:
-                claude_failures = _claude_cli_external_review_failures(review, pr_number)
+                claude_failures = _claude_cli_external_review_failures(review, external_review.get("prompt_sha256"))
                 if claude_failures:
                     failures.extend(f"review {index} Claude CLI evidence invalid: {failure}" for failure in claude_failures)
                 else:
@@ -1021,7 +1119,7 @@ def _external_review_failures(
                 reported_external_findings += _reported_external_finding_count(verdict, finding_count)
 
     if (claude_cli_required or claude_cli_input_mode) and valid_claude_cli_reviews == 0:
-        failures.append("Claude CLI ultrareview is required but no valid review entry was provided")
+        failures.append("Claude CLI packet review is required but no valid review entry was provided")
 
     if external_review.get("external_reviews_triaged") is not True:
         failures.append("external_reviews_triaged is not true")
@@ -1061,7 +1159,7 @@ def _external_review_failures(
 
 def build_external_review_prompt(state: dict[str, Any], diff_filename: str, diff_sha256: str) -> str:
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
-    repo_name = state.get("repoName") if isinstance(state.get("repoName"), str) else "unknown"
+    repo_name = _canonical_repo_slug(state.get("repoName")) or "unknown"
     pr_number = pr.get("number")
     head_sha = pr.get("headRefOid")
     title = pr.get("title") or ""
@@ -1108,7 +1206,7 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
     evidence_template = {
         "schema_version": 1,
         "kind": "external_review",
-        "repo": state.get("repoName"),
+        "repo": _canonical_repo_slug(state.get("repoName")),
         "pr": pr_number,
         "head_sha": head,
         "diff_sha256": diff_sha256,
@@ -1129,7 +1227,7 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
     manifest = {
         "schema_version": 1,
         "kind": "external_review_packet",
-        "repo": state.get("repoName"),
+        "repo": _canonical_repo_slug(state.get("repoName")),
         "pr": pr_number,
         "head_sha": head,
         "diff_path": str(diff_path),
@@ -1143,10 +1241,9 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
 
 
 def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict[str, Any]:
-    repo_name = state.get("repoName")
-    if not isinstance(repo_name, str) or not repo_name.strip():
+    repo_name = _canonical_repo_slug(state.get("repoName"))
+    if repo_name is None:
         raise GateInputError("cannot write self-review template without repo name")
-    repo_name = repo_name.strip()
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     pr_number = pr.get("number")
     if isinstance(pr_number, bool) or not isinstance(pr_number, int):
@@ -1393,7 +1490,7 @@ def evaluate_review_gate(
     codex_seen = _has_trusted_actor(items, TRUSTED_CODEX_ACTORS)
     claude_seen = _has_trusted_actor(items, TRUSTED_CLAUDE_ACTORS)
     raw_repo_name = state.get("repoName")
-    repo_name = raw_repo_name.strip() if isinstance(raw_repo_name, str) and raw_repo_name.strip() else None
+    repo_name = _canonical_repo_slug(raw_repo_name)
     claude_cli_failures = _claude_cli_evidence_failures(pr, claude_evidence, repo_name=repo_name)
     claude_cli_seen = claude_evidence is not None and not claude_cli_failures
     complexity = classify_complexity(pr, self_review, repo_name=repo_name)

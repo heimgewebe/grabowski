@@ -11,6 +11,7 @@ HEAD = "a" * 40
 DIFF_SHA = "0" * 64
 PROMPT_SHA = "1" * 64
 REVIEW_SHA = "2" * 64
+PACKET_PROMPT_SHA = "3" * 64
 
 
 def _load_gate():
@@ -79,12 +80,38 @@ def _self_review(*, diff_sha: str = DIFF_SHA, path: str = "README.md") -> dict[s
     }
 
 
+def _packet_command() -> list[str]:
+    schema = json.dumps(gate.CLAUDE_PACKET_REVIEW_SCHEMA, separators=(",", ":"), sort_keys=True)
+    return [
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
+        "--json-schema",
+        schema,
+        "--tools=",
+        "--permission-mode",
+        "plan",
+        "--no-session-persistence",
+        "--safe-mode",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+        "--max-budget-usd",
+        "2",
+    ]
+
+
 def _claude_review(**overrides: object) -> dict[str, object]:
     review: dict[str, object] = {
         "source": gate.CLAUDE_CLI_REVIEW_SOURCE,
         "tool": "claude-code",
         "tool_version": "2.1.206",
-        "command": ["claude", "ultrareview", "7", "--json", "--timeout", "30"],
+        "command": _packet_command(),
+        "stdin_sha256": PROMPT_SHA,
+        "model": "opus",
+        "effort": "high",
         "exit_code": 0,
         "json_ok": True,
         "review_sha256": REVIEW_SHA,
@@ -100,6 +127,7 @@ def _external(**overrides: object) -> dict[str, object]:
     pr = overrides.get("pr", 7)
     head_sha = overrides.get("head_sha", HEAD)
     diff_sha256 = overrides.get("diff_sha256", DIFF_SHA)
+    prompt_sha256 = overrides.get("prompt_sha256", PROMPT_SHA)
     data: dict[str, object] = {
         "schema_version": 1,
         "kind": "external_review",
@@ -107,17 +135,20 @@ def _external(**overrides: object) -> dict[str, object]:
         "pr": pr,
         "head_sha": head_sha,
         "diff_sha256": diff_sha256,
-        "prompt_sha256": PROMPT_SHA,
-        "prompt_includes_diff": False,
-        "prompt_transmitted": False,
+        "prompt_sha256": prompt_sha256,
+        "prompt_includes_diff": True,
+        "prompt_transmitted": True,
         "review_input": {
             "mode": gate.CLAUDE_CLI_REVIEW_INPUT_MODE,
             "repo": repo,
             "pr": pr,
             "head_sha": head_sha,
             "diff_sha256": diff_sha256,
+            "packet_prompt_sha256": PACKET_PROMPT_SHA,
+            "prompt_sha256": prompt_sha256,
+            "transport": "stdin",
         },
-        "reviews": [_claude_review()],
+        "reviews": [_claude_review(stdin_sha256=prompt_sha256)],
         "external_reviews_triaged": True,
         "findings": [],
     }
@@ -275,7 +306,7 @@ class ExternalReviewGateTests(unittest.TestCase):
                 diff_sha256=f"  {diff_sha.upper()}\n",
                 prompt_sha256=f"\t{prompt_sha.upper()}  ",
                 reviews=[
-                    _claude_review(review_sha256=f"  {review_sha.upper()}\t"),
+                    _claude_review(review_sha256=f"  {review_sha.upper()}\t", stdin_sha256=f"\t{prompt_sha.upper()}  "),
                 ],
             ),
         )
@@ -593,7 +624,7 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         )
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertTrue(result["review_sources"]["claude_cli_required"])
-        self.assertTrue(_has_failure(result, "Claude CLI ultrareview is required"), result["failures"])
+        self.assertTrue(_has_failure(result, "Claude CLI packet review is required"), result["failures"])
 
     def test_high_critical_claude_review_without_pr_bound_input_blocks(self) -> None:
         state = _state("src/runtime_boundary.py")
@@ -638,6 +669,171 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["review_sources"]["claude_cli_required"])
         self.assertEqual(result["review_sources"]["external_reviews_received"], 1)
+
+    def test_claude_packet_command_with_unknown_flag_blocks(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external()
+        review = dict(evidence["reviews"][0])
+        review["command"] = [*_packet_command(), "--extra"]
+        evidence["reviews"] = [review]
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "allowed Claude packet-review command"), result["failures"])
+
+    def test_claude_packet_command_requires_exact_schema(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external()
+        review = dict(evidence["reviews"][0])
+        command = _packet_command()
+        command[5] = json.dumps({"type": "object"})
+        review["command"] = command
+        evidence["reviews"] = [review]
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "allowed Claude packet-review command"), result["failures"])
+
+    def test_claude_packet_review_requires_opus_and_high_effort(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external(reviews=[_claude_review(model="sonnet", effort="medium")])
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "model is not opus"), result["failures"])
+        self.assertTrue(_has_failure(result, "effort is not high"), result["failures"])
+
+    def test_claude_packet_review_requires_tools_disabled_and_safe_mode(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        unsafe_command = _packet_command()
+        unsafe_command[6] = "--tools=Bash"
+        unsafe_command.remove("--safe-mode")
+        evidence = _external(reviews=[_claude_review(command=unsafe_command)])
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "allowed Claude packet-review command"), result["failures"])
+
+    def test_claude_packet_review_requires_stdin_hash_binding(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external(reviews=[_claude_review(stdin_sha256="f" * 64)])
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "stdin_sha256 does not match"), result["failures"])
+
+    def test_claude_packet_review_requires_prompt_and_transport_binding(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external()
+        evidence["review_input"] = {
+            **evidence["review_input"],
+            "packet_prompt_sha256": "not-a-sha",
+            "prompt_sha256": "f" * 64,
+            "transport": "argv",
+        }
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "packet_prompt_sha256"), result["failures"])
+        self.assertTrue(_has_failure(result, "review_input.prompt_sha256 mismatch"), result["failures"])
+        self.assertTrue(_has_failure(result, "transport is not stdin"), result["failures"])
+
+    def test_claude_packet_review_requires_transmitted_diff_prompt(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external(prompt_transmitted=False, prompt_includes_diff=False)
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "prompt_transmitted must be true"), result["failures"])
+        self.assertTrue(_has_failure(result, "prompt_includes_diff must be true"), result["failures"])
+
+    def test_claude_pass_with_findings_blocks_forged_evidence(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external(reviews=[_claude_review(verdict="PASS", finding_count=1)])
+        evidence["findings"] = [_terminal_external_finding()]
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "PASS Claude review must have finding_count 0"), result["failures"])
+
+    def test_chatgpt_alone_does_not_satisfy_weltgewebe_lane(self) -> None:
+        state = _state("src/tiny_feature.py")
+        state["repoName"] = "heimgewebe/weltgewebe"
+        self_review = _self_review(path="src/tiny_feature.py")
+        self_review["repo"] = "heimgewebe/weltgewebe"
+        evidence = _external(
+            repo="heimgewebe/weltgewebe",
+            reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 0}],
+        )
+        result = gate.evaluate_review_gate(state, self_review=self_review, external_review_evidence=evidence)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "Claude CLI packet review is required"), result["failures"])
+
+    def test_legacy_claude_evidence_cannot_bypass_packet_requirement(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        legacy = {
+            "schema_version": 1,
+            "kind": "claude_ultrareview",
+            "repo": "heimgewebe/grabowski",
+            "pr": 7,
+            "head_sha": HEAD,
+            "expected_head_sha": HEAD,
+            "tool": "claude-code",
+            "tool_version": "2.1.206",
+            "command": ["claude", "ultrareview", "7", "--json", "--timeout", "30"],
+            "exit_code": 0,
+            "json_ok": True,
+            "verdict": "PASS",
+            "finding_count": 0,
+            "findings_triaged": True,
+            "stdout_sha256": REVIEW_SHA,
+            "stderr_sha256": REVIEW_SHA,
+        }
+        evidence = _external(
+            reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 0}]
+        )
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            claude_evidence=legacy,
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "Claude CLI packet review is required"), result["failures"])
+
+    def test_weltgewebe_policy_survives_canonical_repo_forms(self) -> None:
+        state = _state("src/tiny_feature.py")
+        state["repoName"] = "HTTPS://GITHUB.COM/Heimgewebe/Weltgewebe.git"
+        self_review = _self_review(path="src/tiny_feature.py")
+        self_review["repo"] = "heimgewebe/weltgewebe"
+        result = gate.evaluate_review_gate(state, self_review=self_review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(result["complexity"]["important_repo"])
+        self.assertTrue(result["review_sources"]["claude_cli_required"])
 
     def test_write_external_review_packet_creates_downloadable_diff_and_template(self) -> None:
         state = _state("src/feature.py")
