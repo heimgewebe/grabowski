@@ -38,6 +38,10 @@ Recovery and irreversibility records are preconditions for any later mutation. R
 - `branch-publish`
 - `pr-create-or-update`
 
+## Action evidence schemas
+
+Each Captain action record carries an `evidence_schema` with schema version, concrete target binding, required evidence objects and digest-binding fields. The schema for `pr-merge` binds repo, PR, base, expected head, diff, CI, review and authorization evidence. Runtime deploy, service restart, fleet mutation and cleanup schemas bind their action-specific targets to projection, rollback/recovery, restart-budget or dry-run evidence as appropriate. See `docs/captain-action-evidence-schemas-v1.md`. The schema is a contract and non-claim, not proof of safety or execution authority.
+
 ## Current high-impact actions
 
 - `pr-merge`
