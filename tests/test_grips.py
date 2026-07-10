@@ -3370,6 +3370,173 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(captain_parameters([captain_action(risk={"risk_level": "high", "irreversibility": "reversible"})]))
         self.assert_blocked_gate_reason(result, "recovery-or-irreversibility", "recovery_path is required for reversible actions")
 
+    def test_pr_merge_action_evidence_schema_binds_head_diff_ci_review_and_authorization(self) -> None:
+        result = self.run_captain(captain_parameters())
+        schema = result["output"]["actions"][0]["evidence_schema"]
+        evidence_names = {item["name"] for item in schema["required_evidence"]}
+
+        self.assertEqual(schema["schema_version"], grips.CAPTAIN_ACTION_EVIDENCE_SCHEMA_VERSION)
+        self.assertEqual(schema["action"], "pr-merge")
+        self.assertEqual(schema["target_binding"], {"repo": "heimgewebe/grabowski", "pr": 96, "base": "main"})
+        self.assertEqual(schema["head_binding"], {"parameter": "expected_head", "required": True})
+        self.assertEqual(schema["diff_binding"], {"parameter": "diff_sha256", "required": True})
+        self.assertLessEqual({"status_projection", "review_evidence", "ci_evidence", "human_authorization"}, evidence_names)
+        review_evidence = next(item for item in schema["required_evidence"] if item["name"] == "review_evidence")
+        ci_evidence = next(item for item in schema["required_evidence"] if item["name"] == "ci_evidence")
+        self.assertIn("diff_sha256", review_evidence["required_fields"])
+        self.assertIn("expected_head", review_evidence["binds"])
+        self.assertIn("state", ci_evidence["required_fields"])
+        self.assertEqual(ci_evidence["required_values"], {"state": "passed"})
+        self.assertIn("expected_head", ci_evidence["binds"])
+        status_projection = next(
+            item for item in schema["required_evidence"] if item["name"] == "status_projection"
+        )
+        authorization = next(
+            item for item in schema["required_evidence"] if item["name"] == "human_authorization"
+        )
+        self.assertIn("healthy", status_projection["required_fields"])
+        self.assertNotIn("replay_reference", status_projection["required_fields"])
+        self.assertNotIn("sha256", status_projection["required_fields"])
+        self.assertEqual(status_projection["required_values"], {"healthy": True})
+        self.assertEqual(
+            status_projection["required_one_of"],
+            [["receipt_ref"], ["run_id"], ["nonce"]],
+        )
+        self.assertEqual(status_projection["required_parameters"], ["status_projection_sha256"])
+        self.assertEqual(
+            status_projection["parameter_bindings"],
+            {"status_projection_sha256": {"algorithm": "sha256", "covers": "status_projection"}},
+        )
+        self.assertIn("status_projection_sha256", status_projection["binds"])
+        self.assertEqual(authorization["required_fields"], ["authorized_by"])
+        self.assertEqual(authorization["required_one_of"], [["statement"], ["reference"]])
+        self.assertEqual(authorization["required_when"], "trusted_owner_autonomy_does_not_apply")
+
+    def test_captain_receipt_carries_action_evidence_schema(self) -> None:
+        result = self.run_captain(captain_parameters())
+        action_record = result["output"]["actions"][0]
+        self.assertEqual(action_record["captain_receipt"]["evidence_schema"], action_record["evidence_schema"])
+
+    def test_action_evidence_schema_uses_concrete_alternate_keys_when_json_nulls_are_present(self) -> None:
+        runtime_action = captain_action(
+            action="runtime-deploy",
+            target={
+                "repo": None,
+                "service": "grabowski-mcp",
+                "environment": None,
+                "runtime_target": "heim-pc",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        runtime_result = self.run_captain(captain_parameters([runtime_action]))
+        runtime_schema = runtime_result["output"]["actions"][0]["evidence_schema"]
+        deployment_boundary = next(
+            item for item in runtime_schema["required_evidence"] if item["name"] == "deployment_boundary"
+        )
+        self.assertEqual(runtime_schema["target_binding"], {"service": "grabowski-mcp", "runtime_target": "heim-pc"})
+        self.assertIn("service", deployment_boundary["required_fields"])
+        self.assertIn("runtime_target", deployment_boundary["required_fields"])
+        self.assertNotIn("repo", deployment_boundary["required_fields"])
+        self.assertNotIn("environment", deployment_boundary["required_fields"])
+
+        cleanup_action = captain_action(
+            action="cleanup-apply",
+            target={
+                "cleanup_target": "stale-worktrees",
+                "repo": None,
+                "checkout_path": "worktrees/grabowski-stale",
+            },
+            receipt_path="receipts/captain/cleanup-apply.json",
+        )
+        cleanup_result = self.run_captain(captain_parameters([cleanup_action]))
+        cleanup_schema = cleanup_result["output"]["actions"][0]["evidence_schema"]
+        dry_run = next(item for item in cleanup_schema["required_evidence"] if item["name"] == "dry_run_or_projection")
+        self.assertEqual(
+            cleanup_schema["target_binding"],
+            {"cleanup_target": "stale-worktrees", "checkout_path": "worktrees/grabowski-stale"},
+        )
+        self.assertIn("checkout_path", dry_run["required_fields"])
+        self.assertNotIn("repo", dry_run["required_fields"])
+
+    def test_cleanup_evidence_schema_binds_all_supplied_concrete_locations(self) -> None:
+        action = captain_action(
+            action="cleanup-apply",
+            target={
+                "cleanup_target": "stale-worktrees",
+                "repo": "heimgewebe/grabowski",
+                "checkout_path": "worktrees/grabowski-stale",
+            },
+            receipt_path="receipts/captain/cleanup-apply.json",
+        )
+        result = self.run_captain(captain_parameters([action]))
+        schema = result["output"]["actions"][0]["evidence_schema"]
+        dry_run = next(item for item in schema["required_evidence"] if item["name"] == "dry_run_or_projection")
+        recovery = next(
+            item for item in schema["required_evidence"] if item["name"] == "recovery_or_irreversibility"
+        )
+        self.assertEqual(
+            schema["target_binding"],
+            {
+                "cleanup_target": "stale-worktrees",
+                "repo": "heimgewebe/grabowski",
+                "checkout_path": "worktrees/grabowski-stale",
+            },
+        )
+        self.assertIn("repo", dry_run["required_fields"])
+        self.assertIn("checkout_path", dry_run["required_fields"])
+        self.assertEqual(
+            recovery["required_one_of"],
+            [["recovery_path"], ["irreversibility_record"]],
+        )
+        self.assertEqual(recovery["required_fields"], [])
+
+    def test_non_pr_captain_action_evidence_schemas_bind_specific_evidence(self) -> None:
+        actions = [
+            (
+                captain_action(
+                    action="runtime-deploy",
+                    target={"service": "grabowski-mcp", "environment": "heim-pc"},
+                    receipt_path="receipts/captain/runtime-deploy.json",
+                ),
+                {"deployment_boundary", "rollback_plan"},
+                {"service": "grabowski-mcp", "environment": "heim-pc"},
+            ),
+            (
+                captain_action(
+                    action="service-restart",
+                    target={"host": "heim-pc", "unit": "grabowski-mcp.service"},
+                    receipt_path="receipts/captain/service-restart.json",
+                ),
+                {"restart_budget", "recovery_path"},
+                {"host": "heim-pc", "unit": "grabowski-mcp.service"},
+            ),
+            (
+                captain_action(
+                    action="fleet-mutation",
+                    target={"fleet_target": "browser-workers", "operation": "rotate-worker-tokens"},
+                    receipt_path="receipts/captain/fleet-mutation.json",
+                ),
+                {"dry_run_or_projection", "recovery_or_irreversibility"},
+                {"fleet_target": "browser-workers", "operation": "rotate-worker-tokens"},
+            ),
+            (
+                captain_action(
+                    action="cleanup-apply",
+                    target={"cleanup_target": "stale-worktrees", "repo": "heimgewebe/grabowski"},
+                    receipt_path="receipts/captain/cleanup-apply.json",
+                ),
+                {"dry_run_or_projection", "recovery_or_irreversibility"},
+                {"cleanup_target": "stale-worktrees", "repo": "heimgewebe/grabowski"},
+            ),
+        ]
+        for action, expected_evidence, expected_target_binding in actions:
+            result = self.run_captain(captain_parameters([action]))
+            schema = result["output"]["actions"][0]["evidence_schema"]
+            evidence_names = {item["name"] for item in schema["required_evidence"]}
+            self.assertLessEqual({"status_projection", *expected_evidence}, evidence_names)
+            self.assertEqual(schema["target_binding"], expected_target_binding)
+            self.assertIn("target_sha256", schema["digest_bindings"])
+
     def test_valid_non_pr_merge_action_envelopes_reach_gate_evaluation(self) -> None:
         actions = [
             captain_action(

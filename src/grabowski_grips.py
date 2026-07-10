@@ -257,6 +257,7 @@ CAPTAIN_GATE_IDS = (
 CAPTAIN_EXECUTABLE_ACTIONS = frozenset({"pr-merge"})
 CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY = "act_unless_irreversible_or_ambiguous"
 CAPTAIN_AUTHORITY_CONTRACT_VERSION = 1
+CAPTAIN_ACTION_EVIDENCE_SCHEMA_VERSION = 1
 CAPTAIN_AUTHORITY_CONTRACT_SURFACES = frozenset({"captain-preflight", "captain-run"})
 CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT = 4096
 CAPTAIN_POST_MERGE_VERIFY_ATTEMPTS = 3
@@ -2168,6 +2169,186 @@ def _validate_captain_target(action_name: str, target: dict[str, Any], *, index:
             _captain_validate_repo_slug(repo, context=f"actions[{index}].target.repo")
 
 
+def _captain_action_evidence_item(
+    name: str,
+    *,
+    required_fields: tuple[str, ...],
+    binds: tuple[str, ...],
+    purpose: str,
+    required_values: dict[str, Any] | None = None,
+    required_one_of: tuple[tuple[str, ...], ...] = (),
+    required_parameters: tuple[str, ...] = (),
+    parameter_bindings: dict[str, Any] | None = None,
+    required_when: str | None = None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "name": name,
+        "required_fields": list(required_fields),
+        "binds": list(binds),
+        "purpose": purpose,
+    }
+    if required_values:
+        item["required_values"] = dict(required_values)
+    if required_one_of:
+        item["required_one_of"] = [list(group) for group in required_one_of]
+    if required_parameters:
+        item["required_parameters"] = list(required_parameters)
+    if parameter_bindings:
+        item["parameter_bindings"] = dict(parameter_bindings)
+    if required_when is not None:
+        item["required_when"] = required_when
+    return item
+
+
+def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], risk: dict[str, Any]) -> dict[str, Any]:
+    common_bindings = ("actions_sha256", "action_sha256", "target_sha256")
+    common_evidence = [
+        _captain_action_evidence_item(
+            "status_projection",
+            required_fields=("schema_version", "source", "healthy", "generated_at"),
+            required_values={"healthy": True},
+            required_one_of=(("receipt_ref",), ("run_id",), ("nonce",)),
+            required_parameters=("status_projection_sha256",),
+            parameter_bindings={
+                "status_projection_sha256": {
+                    "algorithm": "sha256",
+                    "covers": "status_projection",
+                },
+            },
+            binds=("status_projection_sha256", *common_bindings),
+            purpose="observed-state projection evidence with replay metadata and a top-level hash binding; not runtime truth",
+        ),
+    ]
+    schema: dict[str, Any] = {
+        "schema_version": CAPTAIN_ACTION_EVIDENCE_SCHEMA_VERSION,
+        "action": action_name,
+        "target_binding": {},
+        "required_evidence": common_evidence,
+        "digest_bindings": list(common_bindings),
+        "risk_binding": {
+            "irreversibility": risk.get("irreversibility"),
+            "requires_recovery_path": risk.get("irreversibility") == "reversible",
+            "requires_irreversibility_record": risk.get("irreversibility") == "irreversible",
+        },
+        "does_not_establish": [
+            "execution_authority",
+            "deployment_safety",
+            "service_restart_safety",
+            "fleet_mutation_safety",
+            "cleanup_safety",
+        ],
+    }
+    if action_name == "pr-merge":
+        schema["target_binding"] = {"repo": target.get("repo"), "pr": target.get("pr"), "base": target.get("base")}
+        schema["head_binding"] = {"parameter": "expected_head", "required": True}
+        schema["diff_binding"] = {"parameter": "diff_sha256", "required": True}
+        schema["required_evidence"].extend([
+            _captain_action_evidence_item(
+                "review_evidence",
+                required_fields=("head_sha", "diff_sha256", "reviews", "external_reviews_triaged"),
+                binds=("expected_head", "diff_sha256", *common_bindings),
+                purpose="diff-bound review evidence for the exact PR head",
+            ),
+            _captain_action_evidence_item(
+                "ci_evidence",
+                required_fields=("state", "head_sha", "source"),
+                required_values={"state": "passed"},
+                binds=("expected_head", *common_bindings),
+                purpose="green CI evidence for the exact PR head",
+            ),
+            _captain_action_evidence_item(
+                "human_authorization",
+                required_fields=("authorized_by",),
+                required_one_of=(("statement",), ("reference",)),
+                binds=common_bindings,
+                purpose="explicit human authorization evidence when trusted-owner autonomy does not apply",
+                required_when="trusted_owner_autonomy_does_not_apply",
+            ),
+        ])
+    elif action_name == "runtime-deploy":
+        origin_key = "repo" if isinstance(target.get("repo"), str) and target.get("repo", "").strip() else "service"
+        runtime_key = (
+            "environment"
+            if isinstance(target.get("environment"), str) and target.get("environment", "").strip()
+            else "runtime_target"
+        )
+        schema["target_binding"] = {origin_key: target.get(origin_key), runtime_key: target.get(runtime_key)}
+        schema["required_evidence"].extend([
+            _captain_action_evidence_item(
+                "deployment_boundary",
+                required_fields=(origin_key, runtime_key, "deployment_scope"),
+                binds=("target_sha256", "action_sha256"),
+                purpose="bounded deployment target and environment evidence",
+            ),
+            _captain_action_evidence_item(
+                "rollback_plan",
+                required_fields=("strategy", "operator_or_receipt_ref"),
+                binds=("target_sha256", "action_sha256"),
+                purpose="rollback or recovery evidence before runtime mutation",
+            ),
+        ])
+    elif action_name == "service-restart":
+        schema["target_binding"] = {"host": target.get("host"), "unit": target.get("unit")}
+        schema["required_evidence"].extend([
+            _captain_action_evidence_item(
+                "restart_budget",
+                required_fields=("max_attempts", "window", "stop_condition"),
+                binds=("target_sha256", "action_sha256"),
+                purpose="bounded restart attempt budget",
+            ),
+            _captain_action_evidence_item(
+                "recovery_path",
+                required_fields=("recovery_path",),
+                binds=("target_sha256", "action_sha256"),
+                purpose="operator recovery path for the host/unit",
+                required_when="risk.irreversibility == reversible",
+            ),
+        ])
+    elif action_name == "fleet-mutation":
+        schema["target_binding"] = {"fleet_target": target.get("fleet_target"), "operation": target.get("operation")}
+        schema["required_evidence"].extend([
+            _captain_action_evidence_item(
+                "dry_run_or_projection",
+                required_fields=("operation", "expected_delta", "affected_targets"),
+                binds=("target_sha256", "action_sha256"),
+                purpose="bounded projected fleet mutation evidence before effect",
+            ),
+            _captain_action_evidence_item(
+                "recovery_or_irreversibility",
+                required_fields=(),
+                required_one_of=(("recovery_path",), ("irreversibility_record",)),
+                binds=("target_sha256", "action_sha256"),
+                purpose="explicit recovery or irreversible-risk evidence",
+            ),
+        ])
+    elif action_name == "cleanup-apply":
+        location_keys = tuple(
+            key
+            for key in ("repo", "checkout_path")
+            if isinstance(target.get(key), str) and target.get(key, "").strip()
+        )
+        schema["target_binding"] = {
+            "cleanup_target": target.get("cleanup_target"),
+            **{key: target.get(key) for key in location_keys},
+        }
+        schema["required_evidence"].extend([
+            _captain_action_evidence_item(
+                "dry_run_or_projection",
+                required_fields=("cleanup_target", "expected_deletions_or_changes", *location_keys),
+                binds=("target_sha256", "action_sha256"),
+                purpose="bounded cleanup projection before destructive apply",
+            ),
+            _captain_action_evidence_item(
+                "recovery_or_irreversibility",
+                required_fields=(),
+                required_one_of=(("recovery_path",), ("irreversibility_record",)),
+                binds=("target_sha256", "action_sha256"),
+                purpose="explicit recovery or irreversible-risk evidence",
+            ),
+        ])
+    return schema
+
+
 def _non_empty_string_list(value: Any) -> bool:
     return isinstance(value, list) and bool(value) and all(isinstance(entry, str) and entry.strip() for entry in value)
 
@@ -2370,6 +2551,7 @@ def _captain_actions(parameters: dict[str, Any], *, gate_native_validation: bool
                 "target_change_required": target_change_required,
                 "target_change": target_change,
                 "irreversibility_record": irreversibility_record,
+                "evidence_schema": _captain_action_evidence_schema(action_name, target, risk),
                 "receipt_path": receipt_path,
                 "execution": "not-performed",
                 "envelope": {
@@ -2834,6 +3016,7 @@ def _captain_action_record(
         "irreversibility_record": action["irreversibility_record"],
         "target_change_required": action["target_change_required"],
         "target_change": action["target_change"],
+        "evidence_schema": action["evidence_schema"],
         "status_projection_sha256": projection_info.get("sha256"),
         "status": status,
         "decision": decision,
