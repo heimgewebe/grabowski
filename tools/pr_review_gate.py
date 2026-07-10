@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from typing import Any
@@ -14,7 +15,7 @@ TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reaso
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
 STRONG_SEVERITIES = {"p0", "p1", "high", "critical"}
 BLOCKING_REVIEW_STATES = {"CHANGES_REQUESTED", "DISMISSED", "PENDING"}
-EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
+DEFAULT_EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 PASS_CHECK_BUCKETS = {"pass"}
 NON_BLOCKING_OPTIONAL_SKIPPED_CHECK_NAMES = {"claude"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
@@ -1110,12 +1111,182 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
     }
 
 
+def _workflow_text_at_head(repo: Path, head_sha: str) -> str | None:
+    if re.fullmatch(r"[0-9a-fA-F]{40}", head_sha) is None:
+        raise GateInputError("PR head SHA is invalid for workflow inspection")
+    for path in (
+        ".github/workflows/validate.yml",
+        ".github/workflows/validate.yaml",
+    ):
+        text = _run_text(repo, ["git", "show", f"{head_sha}:{path}"], allow_nonzero=True)
+        if text:
+            return text
+    return None
+
+
+def _direct_child_indent(lines: list[str], parent_indent: int) -> int | None:
+    indents = [
+        len(line) - len(line.lstrip())
+        for line in lines
+        if line.strip()
+        and not line.lstrip().startswith("#")
+        and len(line) - len(line.lstrip()) > parent_indent
+    ]
+    return min(indents) if indents else None
+
+
+def _mapping_child_block(
+    lines: list[str], *, key: str, parent_indent: int
+) -> tuple[list[str], str] | None:
+    child_indent = _direct_child_indent(lines, parent_indent)
+    if child_indent is None:
+        return None
+    key_pattern = re.compile(
+        rf"^\s*{re.escape(key)}\s*:\s*(?P<inline>.*)$"
+    )
+    for index, line in enumerate(lines):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent != child_indent:
+            continue
+        match = key_pattern.match(line)
+        if match is None:
+            continue
+        block: list[str] = []
+        for candidate in lines[index + 1 :]:
+            if not candidate.strip() or candidate.lstrip().startswith("#"):
+                block.append(candidate)
+                continue
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate_indent <= child_indent:
+                break
+            block.append(candidate)
+        return block, match.group("inline").strip()
+    return None
+
+
+def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
+    lines = text.splitlines()
+    jobs_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.fullmatch(r"jobs\s*:\s*(?:#.*)?", line.strip())
+            and len(line) == len(line.lstrip())
+        ),
+        None,
+    )
+    if jobs_index is None:
+        return ()
+    jobs_lines = lines[jobs_index + 1 :]
+    job_indent = _direct_child_indent(jobs_lines, 0)
+    if job_indent is None:
+        return ()
+    validate_index: int | None = None
+    for index, line in enumerate(jobs_lines):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            break
+        if indent == job_indent and re.fullmatch(
+            r"validate\s*:\s*(?:#.*)?", line.strip()
+        ):
+            validate_index = index
+            break
+    if validate_index is None:
+        return ()
+
+    validate_block: list[str] = []
+    for line in jobs_lines[validate_index + 1 :]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            validate_block.append(line)
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= job_indent:
+            break
+        validate_block.append(line)
+
+    name_entry = _mapping_child_block(
+        validate_block, key="name", parent_indent=job_indent
+    )
+    if name_entry is not None:
+        raise GateInputError("target validate job uses a custom name")
+    strategy_entry = _mapping_child_block(
+        validate_block, key="strategy", parent_indent=job_indent
+    )
+    if strategy_entry is None or strategy_entry[1]:
+        return ()
+    strategy_block, _ = strategy_entry
+    strategy_indent = _direct_child_indent(strategy_block, job_indent)
+    if strategy_indent is None:
+        return ()
+    matrix_entry = _mapping_child_block(
+        strategy_block, key="matrix", parent_indent=strategy_indent - 1
+    )
+    if matrix_entry is None or matrix_entry[1]:
+        return ()
+    matrix_block, _ = matrix_entry
+    matrix_indent = _direct_child_indent(matrix_block, strategy_indent)
+    if matrix_indent is None:
+        return ()
+    versions_entry = _mapping_child_block(
+        matrix_block, key="python-version", parent_indent=matrix_indent - 1
+    )
+    if versions_entry is None:
+        return ()
+    version_block, inline = versions_entry
+    if inline.startswith("[") and inline.endswith("]"):
+        return tuple(
+            value.strip().strip("\"'")
+            for value in inline[1:-1].split(",")
+            if value.strip().strip("\"'")
+        )
+    version_indent = _direct_child_indent(version_block, matrix_indent)
+    if version_indent is None:
+        return ()
+    values: list[str] = []
+    for line in version_block:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent != version_indent:
+            continue
+        item = re.match(
+            r"^\s*-\s*[\"']?(?P<version>[^\"'#\s]+)[\"']?\s*(?:#.*)?$",
+            line,
+        )
+        if item is None:
+            return ()
+        values.append(item.group("version"))
+    return tuple(values)
+
+
+def expected_check_names_for_repo(
+    repo: Path, *, repo_name: str | None = None, head_sha: str | None = None
+) -> tuple[str, ...]:
+    workflow = _workflow_text_at_head(repo, head_sha) if head_sha is not None else None
+    versions = _python_versions_from_validate_workflow(workflow) if workflow else ()
+    if versions:
+        if len(versions) != len(set(versions)) or not all(
+            re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version)
+            for version in versions
+        ):
+            raise GateInputError("target validate workflow has an invalid Python matrix")
+        return tuple(f"validate ({version})" for version in versions)
+    if repo_name == "heimgewebe/grabowski":
+        return DEFAULT_EXPECTED_CHECK_NAMES
+    raise GateInputError("cannot derive expected checks from target validate workflow at PR head")
+
+
 def evaluate_review_gate(
     state: dict[str, Any],
     *,
     self_review: dict[str, Any] | None = None,
     claude_evidence: dict[str, Any] | None = None,
     external_review_evidence: dict[str, Any] | None = None,
+    expected_check_names: tuple[str, ...] = DEFAULT_EXPECTED_CHECK_NAMES,
 ) -> dict[str, Any]:
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     if isinstance(pr, dict):
@@ -1225,7 +1396,7 @@ def evaluate_review_gate(
     if not checks:
         failures.append("no status checks observed")
     expected_check_buckets_by_name: dict[str, list[str | None]] = {
-        name: [] for name in EXPECTED_CHECK_NAMES
+        name: [] for name in expected_check_names
     }
     blocking_checks = []
     for check in checks:
@@ -1233,7 +1404,7 @@ def evaluate_review_gate(
             continue
         name = check.get("name")
         bucket = check.get("bucket")
-        if name in EXPECTED_CHECK_NAMES:
+        if name in expected_check_names:
             expected_check_buckets_by_name[name].append(bucket)
             if bucket not in PASS_CHECK_BUCKETS:
                 blocking_checks.append(check)
@@ -1288,6 +1459,7 @@ def evaluate_review_gate(
             "current_head_review_item_count": len(items),
         },
         "complexity": complexity,
+        "check_policy": {"expected_check_names": list(expected_check_names)},
     }
 
 
@@ -1338,6 +1510,11 @@ def main(argv: list[str] | None = None) -> int:
             self_review=self_review,
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
+            expected_check_names=expected_check_names_for_repo(
+                repo,
+                repo_name=state.get("repoName"),
+                head_sha=state.get("pr", {}).get("headRefOid"),
+            ),
         )
         if self_review_template is not None:
             result["self_review_template"] = self_review_template

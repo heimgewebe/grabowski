@@ -140,6 +140,7 @@ Rules:
 - Very small changes are not exempt when they touch build, config, CI, packaging, controlled tool paths, structured data, lock files, or zero-line/binary-like diffs.
 - Non-trivial non-documentation PRs require diff-bound external review evidence. The reviewer may be ChatGPT in the current conversation or another external LLM, as long as the review was based on the current PR diff and is recorded in structured evidence.
 - High-critical PRs require diff-bound external review evidence, not a Codex/Claude platform-review special case. If Codex or Claude review signals exist, the gate may report them as diagnostics, but they are not privileged trust anchors. GitHub merge protection remains separate: non-clean `mergeStateStatus`, non-mergeable PRs, or non-green checks still block.
+- Required Python matrix checks are derived from the target repository's regular `.github/workflows/validate.yml` or `.yaml`. Grabowski's own fallback remains `validate (3.10)` plus `validate (3.12)`. A foreign repository with a missing, unreadable, duplicate, or non-literal Python matrix fails closed instead of inheriting Grabowski's versions.
 
 Threat model:
 
