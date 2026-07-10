@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "a3fdd357e5a7cafb82ab78b90e9a32866b5eb9cbdae02aa2b4b3b1e82ce13e37"
+    "sha256": "4a07e2be0b8ad85d434df201d94f405acfb1263b3124f3353d55cfd55fd62887"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "909c3abc526b81c5adff01bb0b3dd19a9a278c85551c982156adee9bed6f2ac7"
+    "sha256": "681f82dbbbebfacf1e7296daa596b8e2b26ff1086fee6727f0617d39ab0e6643"
   },
   "counts": {
     "core": 21,
-    "full": 99,
-    "operator": 84
+    "full": 100,
+    "operator": 85
   },
   "profiles": {
     "core": [
@@ -118,6 +118,7 @@
       "grabowski_recovery_server_probe",
       "grabowski_friction_record",
       "grabowski_friction_summary",
+      "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",
@@ -204,6 +205,7 @@
       "grabowski_recovery_server_probe",
       "grabowski_friction_record",
       "grabowski_friction_summary",
+      "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",

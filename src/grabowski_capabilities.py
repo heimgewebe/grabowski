@@ -422,6 +422,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_connector_transport_diagnostics": {
+        "category": "operations-observability",
+        "purpose": "Run bounded read-only diagnostics for connector transport failures.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_operator_recall_export": {
         "category": "operations-observability",
         "purpose": "Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth.",

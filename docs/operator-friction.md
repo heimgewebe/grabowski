@@ -61,6 +61,8 @@ Retry policy:
 
 `grabowski_friction_summary` includes `connector_transport_diagnostics`. This is diagnostic guidance only. It does not prove root cause, command success, safe mutation retry, connector vendor repair or transport reliability.
 
+`grabowski_connector_transport_diagnostics` turns the same guidance into a bounded read-only diagnostic receipt: it reads recent friction events, `grabowski_status`, fixed user-service status for `grabowski-operator.service` and `tunnel-client-grabowski.service`, and marker counts from bounded recent journal samples. It returns marker counts and timestamp/marker samples, not raw log lines. It is still diagnostic evidence only and does not authorize retry, mutation, merge, deploy or policy exceptions.
+
 ## Task failure classification loop
 
 `docs/operator-optimization-plan.md` makes failure signal quality the first optimization slice. Failed persistent tasks are not automatically friction events: a failed task can be an expected red-phase test, a superseded repair attempt, a command-shape error, an environment/tooling problem or a live actionable failure.

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "da9643676ebf42ec4a978e16b33f9952edd70deafbfef955c516dbd5169ecfde",
+  "capability_source_sha256": "440cdae8ca27671b1e8b53f08d22e9e6931fc75211dc696917f883c6da8aaefe",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "a3fdd357e5a7cafb82ab78b90e9a32866b5eb9cbdae02aa2b4b3b1e82ce13e37",
+  "contract_sha256": "4a07e2be0b8ad85d434df201d94f405acfb1263b3124f3353d55cfd55fd62887",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1009,6 +1009,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_friction_summary"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Run bounded read-only diagnostics for connector transport failures.",
+      "effects": [],
+      "id": "grabowski_connector_transport_diagnostics",
+      "purpose": "Run bounded read-only diagnostics for connector transport failures.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_connector_transport_diagnostics"
     },
     {
       "category": "operations-observability",

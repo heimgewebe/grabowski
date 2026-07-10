@@ -23,12 +23,15 @@ class FrictionLedgerContractTests(unittest.TestCase):
         source = (ROOT / "src/grabowski_friction.py").read_text(encoding="utf-8")
         self.assertIn('name="grabowski_friction_record"', source)
         self.assertIn('name="grabowski_friction_summary"', source)
+        self.assertIn('name="grabowski_connector_transport_diagnostics"', source)
         self.assertIn('MAX_TEXT_BYTES = 2000', source)
         self.assertIn('MAX_NOTE_COUNT = 20', source)
         self.assertIn('FAILURE_CLASSES = frozenset({', source)
         self.assertIn('def classify_friction_event', source)
         self.assertIn('def connector_transport_diagnostics', source)
+        self.assertIn('def connector_transport_live_diagnostics', source)
         self.assertIn('connector_transport_diagnostics', source)
+        self.assertIn('journal_marker_probes', source)
         self.assertIn('invalid_lines', source)
         self.assertIn('def _bounded_event', source)
         self.assertIn('operator._redact(text)', source)
@@ -51,6 +54,23 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         fake_base = types_mod.ModuleType("grabowski_mcp")
         fake_base._append_audit = lambda payload: None
         fake_base._require_mutations_enabled = lambda capability: None
+        fake_base.grabowski_status = lambda: {
+            "deployment": {
+                "completion_status": "complete",
+                "repo_head": "abc",
+                "source_identity_valid": True,
+                "runtime_binding_valid": True,
+                "environment_compatibility_valid": True,
+                "provenance_valid": True,
+            },
+            "tool_contract": {
+                "registered_tool_count": 99,
+                "expected_tool_count": 99,
+                "runtime_matches_deployment_contract": True,
+                "client_snapshot_observable": False,
+            },
+            "kill_switch": {"engaged": False},
+        }
 
         class FakeMCP:
             def tool(self, *args, **kwargs):
@@ -61,7 +81,18 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         fake_operator.READ_ONLY = {}
         fake_operator.MUTATING = {}
         fake_operator.STATE_DIR = root / "state"
+        fake_operator.HOME = root
         fake_operator._redact = lambda value: value
+        fake_operator._require_operator_capability = lambda capability: None
+        fake_operator._validate_unit = lambda unit: unit
+        fake_operator._safe_environment = lambda: {}
+        fake_operator._redact_argv = lambda argv: argv
+        fake_operator._argv_hash = lambda argv: "argv-hash"
+        fake_operator._redacted_command = lambda argv: " ".join(argv)
+        fake_operator._limit = lambda text, max_bytes: (text, False)
+        fake_operator._parse_show = lambda text: dict(
+            line.split("=", 1) for line in text.splitlines() if "=" in line
+        )
 
         old_base = sys_mod.modules.get("grabowski_mcp")
         old_core = sys_mod.modules.get("grabowski_operator_core")
@@ -292,6 +323,85 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         recommendation = {item["pattern"]: item for item in proposals["recommendations"]}["connector_transport"]
         self.assertEqual(recommendation["title"], "Add connector transport diagnostics")
         self.assertEqual(recommendation["evidence_event_ids"], ["transport-1", "transport-2"])
+
+    def test_connector_transport_live_diagnostics_captures_bounded_runtime_receipt(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "event_id": "transport-1",
+                "kind": "connector_transport",
+                "surface": "connector",
+                "operation": "broad terminal run",
+                "symptom": "502 upstream/external service error after POST /mcp",
+                "resolved": False,
+            },
+            {
+                "event_id": "transport-2",
+                "kind": "connector_transport",
+                "surface": "connector",
+                "operation": "status poll",
+                "symptom": "streamable_http Received exception from stream",
+                "resolved": False,
+            },
+        ]
+        module.FRICTION_LOG.write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+        def fake_run(argv, *, timeout_seconds=30, max_output_bytes=131_072):
+            if argv[0] == "systemctl":
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+            if argv[0] == "journalctl":
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": (
+                        "2026-07-10T00:00:01+0200 host python[1]: POST /mcp 200 OK\n"
+                        "2026-07-10T00:00:02+0200 host python[1]: Received exception from stream: 502 upstream/external service error\n"
+                    ),
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+            raise AssertionError(argv)
+
+        module._run_diagnostic_command = fake_run
+
+        diagnostics = module.connector_transport_live_diagnostics(limit=10, max_log_lines=25)
+
+        self.assertEqual(diagnostics["authority"], "read_only_transport_diagnostic_receipt")
+        self.assertEqual(diagnostics["friction_log"]["connector_transport_diagnostics"]["event_count"], 2)
+        self.assertTrue(diagnostics["runtime_status"]["available"])
+        self.assertEqual(
+            diagnostics["service_statuses"]["grabowski-operator.service"]["properties"]["ActiveState"],
+            "active",
+        )
+        self.assertTrue(diagnostics["live_transport_markers_observed"])
+        self.assertEqual(diagnostics["journal_marker_probes"]["grabowski-operator.service"]["max_lines"], 25)
+        self.assertGreaterEqual(
+            diagnostics["journal_marker_probes"]["grabowski-operator.service"]["marker_counts"]["post_mcp"],
+            1,
+        )
+        self.assertIn("command_success_or_failure", diagnostics["does_not_establish"])
+        self.assertIn("target state is re-read", diagnostics["recommended_next_policy"]["mutation_rule"])
+        rendered = json.dumps(diagnostics, sort_keys=True)
+        self.assertNotIn("host python[1]", rendered)
+
+    def test_connector_transport_live_diagnostics_bounds_log_lines(self) -> None:
+        module = self._load_module()
+        with self.assertRaises(ValueError):
+            module.connector_transport_live_diagnostics(max_log_lines=0)
+        with self.assertRaises(ValueError):
+            module.connector_transport_live_diagnostics(max_log_lines=501)
 
     def test_next_grip_proposals_group_repeated_friction_patterns(self) -> None:
         module = self._load_module()
