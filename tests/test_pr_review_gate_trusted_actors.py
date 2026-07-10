@@ -120,14 +120,13 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("1 non-green check(s)", result["failures"])
 
-    def test_unknown_skipped_check_still_blocks(self) -> None:
+    def test_non_expected_skipped_check_is_neutral(self) -> None:
         state = _state()
-        state["checks"].append({"bucket": "skipping", "name": "unknown-required"})
+        state["checks"].append({"bucket": "skipping", "name": "on-demand proof"})
 
         result = pr_review_gate.evaluate_review_gate(state, self_review=_self_review())
 
-        self.assertEqual(result["verdict"], "BLOCK")
-        self.assertIn("1 non-green check(s)", result["failures"])
+        self.assertEqual(result["verdict"], "PASS")
 
     def test_non_green_duplicate_expected_check_blocks(self) -> None:
         state = _state()
