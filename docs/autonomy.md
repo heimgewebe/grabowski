@@ -152,9 +152,11 @@ Broker-Status und Recovery-Gate grün sein. Der Befehl ist argv-basiert,
 verlangt ein absolutes Executable, bounded Timeout, bounded Output und eine
 nichtleere Begründung; der Broker auditiert Ziel-, cwd- und argv-Hashes. Die
 root-eigene Konfiguration erzwingt zusätzlich eine Broker-seitige Gate-Prüfung
-und entscheidet, ob direkte bekannte Shell-Executables erlaubt sind. Das ist
-keine Sandbox: Ein aktiviertes `operator_power_argv` bedeutet bewusst
-beliebige Root-Ausführung über absolute argv.
+und entscheidet, ob direkte bekannte Shell-Executables erlaubt sind.
+`allowed_argv_prefixes` kann diese Schiene in einen expliziten Admin-Katalog
+verwandeln; ohne diese Liste bleibt sie generisch. Trotzdem ist sie keine
+Sandbox: Ein aktiviertes `operator_power_argv` bedeutet bewusst beliebige
+Root-Ausführung über absolute argv.
 
 
 ## Kollisionskontrolle und spezialisierte Worker
