@@ -224,6 +224,8 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
     for action in actions:
         if action["action"] == "pr-merge":
             execution_result = core._run_captain_pr_merge(repo_path, action, parameters, github_runner)
+        elif action["action"] == "runtime-deploy":
+            execution_result = core._run_captain_runtime_deploy(action, parameters)
         else:
             raise core.GripPreflightError(f"captain-run has no executor for {action['action']}")
         executions.append(execution_result)
@@ -231,12 +233,26 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         invoked = execution_result.get("execution_invoked") is True
         command_returned = execution_result.get("command_returned") is True
         verified = execution_result.get("verification_passed") is True
-        execution_label = "performed" if command_returned else "attempt-failed" if invoked else "not-performed"
+        asynchronously_scheduled = (
+            verified
+            and execution_result.get("deployment_scheduled") is True
+            and execution_result.get("deployment_completion_verified") is False
+        )
+        successful_decision = "scheduled" if asynchronously_scheduled else "executed"
+        execution_label = (
+            "scheduled"
+            if asynchronously_scheduled
+            else "performed"
+            if command_returned
+            else "attempt-failed"
+            if invoked
+            else "not-performed"
+        )
         action_records.append(
             core._captain_action_record(
                 action,
                 gate_decision=(
-                    "executed"
+                    successful_decision
                     if verified
                     else "verification_failed_after_execution"
                     if invoked
@@ -245,7 +261,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
                 projection_info=projection_info,
                 status="passed" if verified else "failed" if invoked else "blocked",
                 decision=(
-                    "executed"
+                    successful_decision
                     if verified
                     else "verification_failed_after_execution"
                     if invoked
@@ -273,7 +289,15 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         decision = "verification_failed_after_execution"
     else:
         receipt_status = "passed"
-        decision = "executed"
+        decision = (
+            "scheduled"
+            if any(
+                result.get("deployment_scheduled") is True
+                and result.get("deployment_completion_verified") is False
+                for result in executions
+            )
+            else "executed"
+        )
     invoked_count = sum(1 for result in executions if result.get("execution_invoked") is True)
     command_returned_count = sum(1 for result in executions if result.get("command_returned") is True)
     attempted_count = sum(1 for result in executions if result.get("execution_attempted") is True)
@@ -302,7 +326,12 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         if verification_failures:
             core._check(receipt, "post-execution-verification", "fail", "; ".join(post_execution_reasons))
         else:
-            core._check(receipt, "post-execution-verification", "pass", "all executions verified")
+            core._check(
+                receipt,
+                "post-execution-verification",
+                "pass",
+                "all execution receipts verified within their declared verification scope",
+            )
     return {
         "schema_version": 1,
         "profile": "captain",

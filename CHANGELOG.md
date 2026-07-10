@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a read-only `runtime-deploy-check` grip and a Captain-gated `runtime-deploy` executor for the registered `grabowski-self` adapter. Self-deployment is scheduled through the existing independent delayed job and reports `scheduled`, never completed, until job and runtime identity are observed separately. Identical in-flight schedules are now serialized and reused, conflicting or ambiguous jobs fail closed, and receipts distinguish local job registration from later runtime mutation.
 - Fixed checkout coordination so a process or task in a parent directory no
   longer blocks every descendant worktree; only working directories equal to
   or below an actual coordination root count as blockers.

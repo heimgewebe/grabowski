@@ -115,6 +115,15 @@ GRIP_SPECS: dict[str, GripSpec] = {
         runner="scout",
         uses_github=True,
     ),
+    "runtime-deploy-check": GripSpec(
+        name="runtime-deploy-check",
+        version="1.0",
+        summary="Check whether one registered runtime deployment adapter is ready without scheduling a deployment.",
+        effect=READ_ONLY,
+        required_parameters=("adapter", "expected_head"),
+        acceptance_ids=("registered-adapter", "expected-head-bound", "deploy-preflight-readonly"),
+        runner="runtime_deploy_check",
+    ),
     "mechanic-loop": GripSpec(
         name="mechanic-loop",
         version="1.0",
@@ -172,6 +181,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "worktree-orient",
         "situation",
         "scout",
+        "runtime-deploy-check",
         "mechanic-loop",
         "captain-preflight",
         "captain-run",
@@ -188,6 +198,7 @@ GRIP_SURFACE_TARGETS = {
     "worktree-orient": "repository worktree inventory",
     "situation": "repository and PR situation snapshot",
     "scout": "change-only repository, PR and runtime drift signal",
+    "runtime-deploy-check": "registered runtime deployment adapter readiness",
     "mechanic-loop": "bounded normal grip action sequence",
     "captain-preflight": "high-impact Captain action preflight only",
     "captain-run": "action-specific high-impact Captain execution",
@@ -206,6 +217,7 @@ MECHANIC_NORMAL_GRIPS = frozenset(
         "worktree-orient",
         "situation",
         "scout",
+        "runtime-deploy-check",
         "pr-check-readiness",
         "post-merge-sync",
         "branch-publish",
@@ -254,7 +266,7 @@ CAPTAIN_GATE_IDS = (
     "autonomy-policy",
     "human-authorization-present",
 )
-CAPTAIN_EXECUTABLE_ACTIONS = frozenset({"pr-merge"})
+CAPTAIN_EXECUTABLE_ACTIONS = frozenset({"pr-merge", "runtime-deploy"})
 CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY = "act_unless_irreversible_or_ambiguous"
 CAPTAIN_AUTHORITY_CONTRACT_VERSION = 1
 CAPTAIN_ACTION_EVIDENCE_SCHEMA_VERSION = 1
@@ -262,6 +274,14 @@ CAPTAIN_AUTHORITY_CONTRACT_SURFACES = frozenset({"captain-preflight", "captain-r
 CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT = 4096
 CAPTAIN_POST_MERGE_VERIFY_ATTEMPTS = 3
 CAPTAIN_POST_MERGE_VERIFY_DELAYS_SECONDS = (0.5, 1.0)
+RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF = "grabowski-self"
+RUNTIME_DEPLOY_ADAPTERS = frozenset({RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF})
+RUNTIME_DEPLOY_GRABOWSKI_SERVICE = "grabowski-mcp"
+RUNTIME_DEPLOY_GRABOWSKI_REPO = "heimgewebe/grabowski"
+RUNTIME_DEPLOY_GRABOWSKI_TARGET = "heim-pc"
+RUNTIME_DEPLOY_DEFAULT_DELAY_SECONDS = 8
+RUNTIME_DEPLOY_MIN_DELAY_SECONDS = 5
+RUNTIME_DEPLOY_MAX_DELAY_SECONDS = 60
 CAPTAIN_PREFLIGHT_SETTLE_ATTEMPTS = 3
 CAPTAIN_PREFLIGHT_SETTLE_DELAYS_SECONDS = (0.5, 1.0)
 CAPTAIN_PREFLIGHT_TRANSIENT_ERRORS = frozenset({
@@ -297,7 +317,7 @@ CAPTAIN_EXECUTION_DOES_NOT_ESTABLISH = tuple(
     if claim != "automatic_merge_authority"
 )
 CAPTAIN_NON_CLAIMS = (
-    "does not execute privileged mutations; no merge, deploy, restart, fleet mutation or cleanup happens here",
+    "captain-preflight never mutates; captain-run executes only actions in the explicit executable allowlist",
     "does not treat status projection as runtime truth; projection is evidence only",
     "does not treat CI green as production safety",
     "does not treat review approval as semantic correctness",
@@ -1521,6 +1541,117 @@ def _sha_parameter(parameters: dict[str, Any], name: str) -> str:
     return value
 
 
+def _runtime_deploy_expected_head(parameters: dict[str, Any]) -> str:
+    value = _sha_parameter(parameters, "expected_head")
+    if len(value) != 40:
+        raise GripPreflightError("expected_head parameter must be a 40 character Git commit SHA")
+    return value.lower()
+
+
+def _runtime_deploy_adapter(parameters: dict[str, Any]) -> str:
+    adapter = _string_parameter(parameters, "adapter")
+    if adapter not in RUNTIME_DEPLOY_ADAPTERS:
+        raise GripPreflightError(
+            f"adapter is not registered: {adapter}; expected one of {sorted(RUNTIME_DEPLOY_ADAPTERS)}"
+        )
+    return adapter
+
+
+def _runtime_deploy_delay_seconds(parameters: dict[str, Any]) -> int:
+    value = parameters.get("delay_seconds", RUNTIME_DEPLOY_DEFAULT_DELAY_SECONDS)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise GripPreflightError("delay_seconds must be an integer when provided")
+    if not RUNTIME_DEPLOY_MIN_DELAY_SECONDS <= value <= RUNTIME_DEPLOY_MAX_DELAY_SECONDS:
+        raise GripPreflightError(
+            f"delay_seconds must be between {RUNTIME_DEPLOY_MIN_DELAY_SECONDS} and {RUNTIME_DEPLOY_MAX_DELAY_SECONDS}"
+        )
+    return value
+
+
+def _runtime_deploy_self_preflight(expected_head: str) -> dict[str, Any]:
+    import grabowski_self_deploy
+
+    repository, runner = grabowski_self_deploy._canonical_preflight(expected_head)
+    return {
+        "adapter": RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF,
+        "repository": str(repository),
+        "runner": str(runner),
+        "job_root": str(grabowski_self_deploy.DEPLOY_JOB_ROOT),
+        "job_prefix": grabowski_self_deploy.DEPLOY_JOB_PREFIX,
+        "expected_head": expected_head,
+        "target": {
+            "service": RUNTIME_DEPLOY_GRABOWSKI_SERVICE,
+            "runtime_target": RUNTIME_DEPLOY_GRABOWSKI_TARGET,
+        },
+        "ready": True,
+    }
+
+
+def _runtime_deploy_self_schedule(expected_head: str, delay_seconds: int) -> dict[str, Any]:
+    import grabowski_self_deploy
+
+    return grabowski_self_deploy.grabowski_runtime_deploy_schedule(expected_head, delay_seconds)
+
+
+def _runtime_deploy_self_expected_argv_sha256(
+    preflight: dict[str, Any],
+    expected_head: str,
+    delay_seconds: int,
+) -> str:
+    import grabowski_self_deploy
+
+    command = grabowski_self_deploy._deploy_command(
+        Path(str(preflight["repository"])),
+        Path(str(preflight["runner"])),
+        expected_head,
+        delay_seconds,
+    )
+    return grabowski_self_deploy._deploy_command_sha256(command)
+
+
+def _run_runtime_deploy_check(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    adapter = _runtime_deploy_adapter(parameters)
+    expected_head = _runtime_deploy_expected_head(parameters)
+    _check(receipt, "registered-adapter", "pass", adapter)
+    _check(receipt, "expected-head-bound", "pass", expected_head)
+    try:
+        if adapter == RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF:
+            preflight = _runtime_deploy_self_preflight(expected_head)
+        else:  # pragma: no cover - guarded by the adapter registry
+            raise GripPreflightError(f"no runtime deploy preflight implementation for adapter: {adapter}")
+    except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
+        _check(receipt, "deploy-preflight-readonly", "fail", str(exc))
+        return {
+            "adapter": adapter,
+            "expected_head": expected_head,
+            "ready": False,
+            "receipt_status": "blocked",
+            "blocking_reasons": [str(exc)],
+            "mutation_attempted": False,
+            "non_claims": [
+                "does not schedule or execute a deployment",
+                "does not establish CI, review or production correctness",
+            ],
+        }
+    _check(receipt, "deploy-preflight-readonly", "pass", "registered adapter preflight passed without mutation")
+    return {
+        **preflight,
+        "receipt_status": "passed",
+        "blocking_reasons": [],
+        "mutation_attempted": False,
+        "non_claims": [
+            "does not schedule or execute a deployment",
+            "does not establish CI, review or production correctness",
+        ],
+    }
+
+
 def _short_branch_name(parameters: dict[str, Any], name: str) -> str:
     branch = _string_parameter(parameters, name)
     if branch.startswith("refs/"):
@@ -1938,6 +2069,53 @@ def _validate_mechanic_target_matches_parameters(
         for key in ("base", "head", "branch"):
             if key in target and key in parameters and target.get(key) != parameters.get(key):
                 raise GripPreflightError(f"actions[{index}].target.{key} must match parameters.{key}")
+    if action_name == "runtime-deploy-check":
+        adapter = _runtime_deploy_adapter(parameters)
+        expected_head = _runtime_deploy_expected_head(parameters)
+        if target.get("adapter") != adapter:
+            raise GripPreflightError(f"actions[{index}].target.adapter must match parameters.adapter")
+        if target.get("expected_head") != expected_head:
+            raise GripPreflightError(f"actions[{index}].target.expected_head must match parameters.expected_head")
+
+        def one_concrete_alias(keys: tuple[str, ...], label: str) -> tuple[str, str]:
+            selected: list[tuple[str, str]] = []
+            for key in keys:
+                value = target.get(key)
+                if value is None:
+                    continue
+                if not isinstance(value, str) or not value.strip():
+                    raise GripPreflightError(
+                        f"actions[{index}].target.{key} must be a non-empty string when provided"
+                    )
+                selected.append((key, value.strip()))
+            if len(selected) != 1:
+                names = " or ".join(keys)
+                raise GripPreflightError(
+                    f"actions[{index}].target requires exactly one concrete {names} for {label}"
+                )
+            return selected[0]
+
+        origin_key, origin_value = one_concrete_alias(("repo", "service"), "runtime-deploy-check")
+        runtime_key, runtime_value = one_concrete_alias(
+            ("environment", "runtime_target"), "runtime-deploy-check"
+        )
+        expected_origin = (
+            RUNTIME_DEPLOY_GRABOWSKI_REPO
+            if origin_key == "repo"
+            else RUNTIME_DEPLOY_GRABOWSKI_SERVICE
+        )
+        if origin_value != expected_origin:
+            raise GripPreflightError(
+                f"actions[{index}].target.{origin_key} does not match the registered {adapter} adapter"
+            )
+        if runtime_value != RUNTIME_DEPLOY_GRABOWSKI_TARGET:
+            raise GripPreflightError(
+                f"actions[{index}].target.{runtime_key} does not match the registered {adapter} adapter"
+            )
+        for key in ("repo", "service", "environment", "runtime_target"):
+            parameter_value = parameters.get(key)
+            if parameter_value is not None and target.get(key) != parameter_value:
+                raise GripPreflightError(f"actions[{index}].target.{key} must match parameters.{key}")
 
 
 def _mechanic_actions(parameters: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2151,6 +2329,11 @@ def _validate_captain_target(action_name: str, target: dict[str, Any], *, index:
         _captain_exactly_one_target_key(
             target, ("environment", "runtime_target"), index=index, action_name="runtime-deploy"
         )
+        adapter = _captain_concrete_string(target, "adapter", index=index, action_name="runtime-deploy")
+        if adapter not in RUNTIME_DEPLOY_ADAPTERS:
+            raise GripPreflightError(
+                f"actions[{index}].target.adapter is not registered; expected one of {sorted(RUNTIME_DEPLOY_ADAPTERS)}"
+            )
     elif action_name == "service-restart":
         _captain_concrete_string(target, "host", index=index, action_name="service-restart")
         _captain_concrete_string(target, "unit", index=index, action_name="service-restart")
@@ -3401,6 +3584,187 @@ def _run_captain_pr_merge(
     return execution_result
 
 
+def _captain_runtime_deploy_target_errors(action: dict[str, Any]) -> list[str]:
+    target = action["target"]
+    errors: list[str] = []
+    adapter = target.get("adapter")
+    if adapter != RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF:
+        errors.append("runtime_deploy_adapter_must_be_grabowski_self")
+    origin_key = "repo" if isinstance(target.get("repo"), str) and target.get("repo") else "service"
+    origin_value = target.get(origin_key)
+    if origin_key == "repo":
+        if origin_value != RUNTIME_DEPLOY_GRABOWSKI_REPO:
+            errors.append("runtime_deploy_repo_does_not_match_grabowski_self_adapter")
+    elif origin_value != RUNTIME_DEPLOY_GRABOWSKI_SERVICE:
+        errors.append("runtime_deploy_service_does_not_match_grabowski_self_adapter")
+    runtime_key = (
+        "environment"
+        if isinstance(target.get("environment"), str) and target.get("environment")
+        else "runtime_target"
+    )
+    if target.get(runtime_key) != RUNTIME_DEPLOY_GRABOWSKI_TARGET:
+        errors.append("runtime_deploy_target_does_not_match_local_grabowski_runtime")
+    return errors
+
+
+def _runtime_deploy_schedule_errors(
+    schedule: Any,
+    *,
+    expected_head: str,
+    expected_delay_seconds: int,
+    expected_argv_sha256: str,
+    expected_job_root: str,
+    expected_job_prefix: str,
+) -> list[str]:
+    if not isinstance(schedule, dict):
+        return ["runtime_deploy_scheduler_returned_non_object"]
+    errors: list[str] = []
+    if schedule.get("scheduled") is not True:
+        errors.append("runtime_deploy_not_scheduled")
+    if schedule.get("expected_head") != expected_head:
+        errors.append("runtime_deploy_schedule_head_mismatch")
+    already_scheduled = schedule.get("already_scheduled")
+    if not isinstance(already_scheduled, bool):
+        errors.append("runtime_deploy_schedule_reuse_state_missing")
+    if schedule.get("requested_delay_seconds") != expected_delay_seconds:
+        errors.append("runtime_deploy_schedule_requested_delay_mismatch")
+    effective_delay_seconds = schedule.get("delay_seconds")
+    if isinstance(effective_delay_seconds, bool) or not isinstance(effective_delay_seconds, int):
+        errors.append("runtime_deploy_schedule_effective_delay_invalid")
+    elif not RUNTIME_DEPLOY_MIN_DELAY_SECONDS <= effective_delay_seconds <= RUNTIME_DEPLOY_MAX_DELAY_SECONDS:
+        errors.append("runtime_deploy_schedule_effective_delay_invalid")
+    elif already_scheduled is False and effective_delay_seconds != expected_delay_seconds:
+        errors.append("runtime_deploy_schedule_delay_mismatch")
+    unit = schedule.get("unit")
+    unit_pattern = rf"{re.escape(expected_job_prefix)}[0-9a-f]{{12}}"
+    if not isinstance(unit, str) or re.fullmatch(unit_pattern, unit) is None:
+        errors.append("runtime_deploy_schedule_unit_missing_or_unbound")
+    argv_sha256 = schedule.get("argv_sha256")
+    if not isinstance(argv_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", argv_sha256) is None:
+        errors.append("runtime_deploy_schedule_argv_hash_missing_or_invalid")
+    elif argv_sha256 != expected_argv_sha256:
+        errors.append("runtime_deploy_schedule_argv_hash_mismatch")
+    if schedule.get("expected_connector_disconnect") is not True:
+        errors.append("runtime_deploy_disconnect_contract_missing")
+    if schedule.get("status_tool") != "grabowski_job_status":
+        errors.append("runtime_deploy_status_tool_missing")
+    if schedule.get("logs_tool") != "grabowski_job_logs":
+        errors.append("runtime_deploy_logs_tool_missing")
+    path_values: dict[str, Path] = {}
+    for key in ("metadata_path", "stdout_path", "stderr_path"):
+        value = schedule.get(key)
+        if not isinstance(value, str) or not value.startswith("/"):
+            errors.append(f"runtime_deploy_{key}_missing_or_unbound")
+            continue
+        path_values[key] = Path(value)
+    if isinstance(unit, str) and len(path_values) == 3:
+        expected_names = {
+            "metadata_path": "metadata.json",
+            "stdout_path": "stdout.log",
+            "stderr_path": "stderr.log",
+        }
+        parents = {path.parent for path in path_values.values()}
+        expected_parent = Path(expected_job_root) / unit
+        if len(parents) != 1 or next(iter(parents)) != expected_parent:
+            errors.append("runtime_deploy_schedule_paths_not_bound_to_unit")
+        for key, expected_name in expected_names.items():
+            if path_values[key].name != expected_name:
+                errors.append(f"runtime_deploy_{key}_filename_invalid")
+    return errors
+
+
+def _run_captain_runtime_deploy(
+    action: dict[str, Any],
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
+    expected_head = _runtime_deploy_expected_head(parameters)
+    delay_seconds = _runtime_deploy_delay_seconds(parameters)
+    target = action["target"]
+    execution_result: dict[str, Any] = {
+        "action": "runtime-deploy",
+        "adapter": target.get("adapter"),
+        "target": target,
+        "expected_head": expected_head,
+        "delay_seconds": delay_seconds,
+        "execution_attempted": False,
+        "execution_invoked": False,
+        "command_returned": False,
+        "remote_mutation_observed": False,
+        "local_mutation_observed": False,
+        "preflight_passed": False,
+        "verification_passed": False,
+        "verification_scope": "schedule-registration",
+        "deployment_completion_verified": False,
+    }
+    target_errors = _captain_runtime_deploy_target_errors(action)
+    if target_errors:
+        execution_result["preflight_errors"] = target_errors
+        execution_result["verification_error"] = "; ".join(target_errors)
+        return execution_result
+    try:
+        preflight = _runtime_deploy_self_preflight(expected_head)
+    except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
+        execution_result["preflight_errors"] = [str(exc)]
+        execution_result["verification_error"] = f"runtime deploy preflight failed; deployment not scheduled: {exc}"
+        return execution_result
+    execution_result["preflight"] = preflight
+    execution_result["preflight_passed"] = True
+    execution_result["execution_invoked"] = True
+    execution_result["execution_attempted"] = True
+    try:
+        schedule = _runtime_deploy_self_schedule(expected_head, delay_seconds)
+        execution_result["command_returned"] = True
+    except Exception as exc:  # pragma: no cover - defensive receipt boundary
+        execution_result["runner_exception"] = (
+            f"{type(exc).__name__}: {_bounded_command_output(str(exc), limit=512)}"
+        )
+        execution_result["mutation_outcome_unknown"] = True
+        execution_result["local_mutation_outcome_unknown"] = True
+        execution_result["verification_error"] = (
+            "runtime deploy scheduling raised an exception; a job may already have been registered"
+        )
+        return execution_result
+    execution_result["schedule"] = schedule
+    effective_delay = schedule.get("delay_seconds") if isinstance(schedule, dict) else None
+    expected_schedule_hash = (
+        _runtime_deploy_self_expected_argv_sha256(preflight, expected_head, effective_delay)
+        if isinstance(effective_delay, int) and not isinstance(effective_delay, bool)
+        else ""
+    )
+    schedule_errors = _runtime_deploy_schedule_errors(
+        schedule,
+        expected_head=expected_head,
+        expected_delay_seconds=delay_seconds,
+        expected_argv_sha256=expected_schedule_hash,
+        expected_job_root=str(preflight["job_root"]),
+        expected_job_prefix=str(preflight["job_prefix"]),
+    )
+    if schedule_errors:
+        execution_result["post_verify_errors"] = schedule_errors
+        execution_result["mutation_outcome_unknown"] = True
+        execution_result["local_mutation_outcome_unknown"] = True
+        execution_result["verification_error"] = "; ".join(schedule_errors)
+        return execution_result
+    execution_result["deployment_scheduled"] = True
+    execution_result["scheduled_unit"] = schedule["unit"]
+    execution_result["already_scheduled"] = schedule["already_scheduled"]
+    execution_result["new_job_registered"] = not schedule["already_scheduled"]
+    execution_result["local_mutation_observed"] = not schedule["already_scheduled"]
+    execution_result["verification_passed"] = True
+    execution_result["next_verification"] = {
+        "status_tool": schedule["status_tool"],
+        "logs_tool": schedule["logs_tool"],
+        "unit": schedule["unit"],
+        "expected_head": expected_head,
+    }
+    execution_result["non_claims"] = [
+        "schedule verification does not claim that the delayed deployment has completed",
+        "remote_mutation_observed refers to deployment completion, not local durable-job registration",
+        "runtime identity must be checked after the connector reconnects",
+    ]
+    return execution_result
+
+
 def _run_captain_preflight(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -3427,6 +3791,7 @@ _RUNNERS = {
     "post_merge_sync": _run_post_merge_sync,
     "situation": _run_situation,
     "scout": _run_scout,
+    "runtime_deploy_check": _run_runtime_deploy_check,
     "mechanic_loop": _run_mechanic_loop,
     "captain_preflight": _run_captain_preflight,
     "captain_run": _run_captain_run,

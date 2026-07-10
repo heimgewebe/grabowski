@@ -477,7 +477,7 @@
     },
     {
       "category": "deployment",
-      "description": "Schedule a validated self-deployment in an independent delayed systemd job.",
+      "description": "Schedule one validated self-deployment, reusing an identical in-flight job.",
       "effects": [
         "background-job-start",
         "runtime-deploy",
@@ -1544,8 +1544,8 @@
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "b8aff6dc08cd52fd3fe754ad4a26e348e6794dca624346497c70e2807b45e6e3",
-      "src/grabowski_grip_orchestration.py": "93d6134b740fec19f878c0be3113e5ec8935fb55c0cac754a6b3ae043f5ecfbb",
-      "src/grabowski_grips.py": "8573c1f8c9463bee015d149e9940c0b43b1bfa5d5482d3509b27a82c4199c971",
+      "src/grabowski_grip_orchestration.py": "2c1d594433f92edbae23adc43a303b212bfff89d298121c516974d790259051d",
+      "src/grabowski_grips.py": "223c3ea14fb953ae7d23e5010db9be4a5cf89c20447a079dd8facd33eb23a0b8",
       "src/grabowski_mcp.py": "c5c80f20e04c5d8631c56a190ca48eb170675cff7467475b3d1d7ef9cce7f3f3",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "2968cd5ac1bbdd5779e0fc1a90550dc9015ad3de55096b87eabd2066258e2012",
@@ -1557,7 +1557,7 @@
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
       "src/grabowski_runtime.py": "246a3bfd7d734dd3567e38bc9de706a84f3ff3e75360d3166583d57326279eee",
       "src/grabowski_runtime_extensions.py": "3092fc1e9031cc2d3beb9e6e1e2a43ea31d68fe07cc6186055d06dacb56e87ed",
-      "src/grabowski_self_deploy.py": "c789d181f00a7cdd29a01e3340f1581f5d3adcf9731ee4b9d015e279de8c9539",
+      "src/grabowski_self_deploy.py": "461f32767b1c5275f1758a6137a3c9b42bcf21847cc83803b70f6f6c1c08e5e2",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
       "src/grabowski_tasks.py": "0feabf9a5be5be6684a9223911b01ea46f3d6f7596c7c459706bd82e41819137",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
