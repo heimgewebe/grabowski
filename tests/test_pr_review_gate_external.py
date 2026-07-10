@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import importlib.util
 import json
 import os
@@ -10,10 +11,12 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 HEAD = "a" * 40
-DIFF_SHA = "0" * 64
+DIFF_TEXT = "diff --git a/src/example.py b/src/example.py\n+VALUE = 1\n"
+DIFF_SHA = hashlib.sha256(DIFF_TEXT.encode("utf-8")).hexdigest()
 PROMPT_SHA = "1" * 64
 REVIEW_SHA = "2" * 64
 PACKET_PROMPT_SHA = "3" * 64
+PROMPT_NONCE = "4" * 32
 
 
 def _load_gate():
@@ -55,6 +58,7 @@ def _state(path: str = "README.md", *, diff_sha: str | None = DIFF_SHA) -> dict[
     }
     if diff_sha is not None:
         state["pr_diff_sha256"] = diff_sha
+        state["pr_diff_text"] = DIFF_TEXT
     return state
 
 
@@ -111,7 +115,6 @@ def _claude_review(**overrides: object) -> dict[str, object]:
         "tool": "claude-code",
         "tool_version": "2.1.206",
         "command": _packet_command(),
-        "stdin_sha256": PROMPT_SHA,
         "model": "opus",
         "effort": "high",
         "exit_code": 0,
@@ -129,7 +132,6 @@ def _external(**overrides: object) -> dict[str, object]:
     pr = overrides.get("pr", 7)
     head_sha = overrides.get("head_sha", HEAD)
     diff_sha256 = overrides.get("diff_sha256", DIFF_SHA)
-    prompt_sha256 = overrides.get("prompt_sha256", PROMPT_SHA)
     packet_prompt = gate.build_external_review_prompt(
         {
             "repoName": repo,
@@ -139,6 +141,21 @@ def _external(**overrides: object) -> dict[str, object]:
         str(diff_sha256).strip().lower(),
     )
     packet_prompt_sha256 = gate._sha256_text(packet_prompt)
+    reconstructed_prompt_sha256 = gate._sha256_text(
+        gate.build_claude_review_prompt(packet_prompt, DIFF_TEXT, PROMPT_NONCE)
+    )
+    prompt_sha256 = overrides.get("prompt_sha256", reconstructed_prompt_sha256)
+    supplied_reviews = overrides.get("reviews")
+    if supplied_reviews is None:
+        reviews: object = [_claude_review(stdin_sha256=prompt_sha256)]
+    elif isinstance(supplied_reviews, list):
+        normalized_reviews = [dict(item) for item in supplied_reviews]
+        for review in normalized_reviews:
+            if review.get("source") == gate.CLAUDE_CLI_REVIEW_SOURCE and "stdin_sha256" not in review:
+                review["stdin_sha256"] = prompt_sha256
+        reviews = normalized_reviews
+    else:
+        reviews = supplied_reviews
     data: dict[str, object] = {
         "schema_version": 1,
         "kind": "external_review",
@@ -156,14 +173,15 @@ def _external(**overrides: object) -> dict[str, object]:
             "head_sha": head_sha,
             "diff_sha256": diff_sha256,
             "packet_prompt_sha256": packet_prompt_sha256,
+            "prompt_nonce": PROMPT_NONCE,
             "prompt_sha256": prompt_sha256,
             "transport": "stdin",
         },
-        "reviews": [_claude_review(stdin_sha256=prompt_sha256)],
+        "reviews": reviews,
         "external_reviews_triaged": True,
         "findings": [],
     }
-    data.update(overrides)
+    data.update({key: value for key, value in overrides.items() if key != "reviews"})
     return data
 
 
@@ -343,14 +361,13 @@ class ExternalReviewGateTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
 
     def test_sha256_normalization_accepts_uppercase_and_whitespace(self) -> None:
-        diff_sha = "ab" * 32
-        prompt_sha = "cd" * 32
+        prompt_sha = str(_external()["prompt_sha256"])
         review_sha = "ef" * 32
         result = gate.evaluate_review_gate(
-            _state("tools/pr_review_gate.py", diff_sha=diff_sha),
-            self_review=_self_review(diff_sha=diff_sha, path="tools/pr_review_gate.py"),
+            _state("tools/pr_review_gate.py", diff_sha=DIFF_SHA),
+            self_review=_self_review(diff_sha=DIFF_SHA, path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
-                diff_sha256=f"  {diff_sha.upper()}\n",
+                diff_sha256=f"  {DIFF_SHA.upper()}\n",
                 prompt_sha256=f"\t{prompt_sha.upper()}  ",
                 reviews=[
                     _claude_review(review_sha256=f"  {review_sha.upper()}\t", stdin_sha256=f"\t{prompt_sha.upper()}  "),
@@ -759,11 +776,23 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertTrue(_has_failure(result, "model is not opus"), result["failures"])
         self.assertTrue(_has_failure(result, "effort is not high"), result["failures"])
 
-    def test_claude_packet_review_requires_tools_disabled_and_safe_mode(self) -> None:
+    def test_claude_packet_review_requires_tools_disabled(self) -> None:
         state = _state("src/runtime_boundary.py")
         unsafe_command = _packet_command()
         unsafe_command[6] = "--tools=Bash"
-        unsafe_command.remove("--safe-mode")
+        evidence = _external(reviews=[_claude_review(command=unsafe_command)])
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "allowed Claude packet-review command"), result["failures"])
+
+    def test_claude_packet_review_requires_safe_mode(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        unsafe_command = _packet_command()
+        unsafe_command[10] = "--verbose"
         evidence = _external(reviews=[_claude_review(command=unsafe_command)])
         result = gate.evaluate_review_gate(
             state,
@@ -986,6 +1015,34 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
             self.assertTrue(Path(manifest["prompt_path"]).is_absolute())
             self.assertTrue(Path(manifest["diff_path"]).is_file())
             self.assertTrue(Path(manifest["prompt_path"]).is_file())
+
+    def test_transmitted_prompt_hash_is_independently_recomputed_by_gate(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external()
+        evidence["prompt_sha256"] = "f" * 64
+        evidence["review_input"] = {**evidence["review_input"], "prompt_sha256": "f" * 64}
+        evidence["reviews"] = [_claude_review(stdin_sha256="f" * 64)]
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(
+            _has_failure(result, "independently reconstructed stdin"),
+            result["failures"],
+        )
+
+    def test_packet_prompt_hash_does_not_depend_on_mutable_pr_title(self) -> None:
+        first = _state("src/runtime_boundary.py")
+        second = _state("src/runtime_boundary.py")
+        first["pr"]["title"] = "first title"
+        second["pr"]["title"] = "second title"
+        filename = f"pr-7-{HEAD[:12]}.diff"
+        self.assertEqual(
+            gate.build_external_review_prompt(first, filename, DIFF_SHA),
+            gate.build_external_review_prompt(second, filename, DIFF_SHA),
+        )
 
     def test_packet_prompt_hash_is_recomputed_by_gate(self) -> None:
         state = _state("src/runtime_boundary.py")

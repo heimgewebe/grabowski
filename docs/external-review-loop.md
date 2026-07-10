@@ -21,7 +21,7 @@ No control substitutes for another. A GitHub comment, review body, or model summ
 
 Policy-critical documentation is not ordinary documentation. `GRABOWSKI.md`, `AGENTS.md`, `docs/external-review-loop.md`, operator/recovery/deploy doctrine, generated structured data, build/config/CI/packaging files, lock files, and binary-like zero-line diffs do not receive the ordinary documentation or tiny-change exemption.
 
-Repository identity is canonicalized only from a valid GitHub owner/repository slug or the equivalent GitHub URL/SSH form. Invalid repository identity blocks the gate; it cannot silently remove Weltgewebe from the special lane.
+Repository identity is taken from the canonical target repository encoded in the live pull-request URL, while the local checkout identity is recorded separately. Invalid or PR-mismatched target URLs block the gate; a fork checkout therefore cannot silently remove Weltgewebe from the special lane.
 
 ## Create head- and diff-bound scaffolds
 
@@ -81,13 +81,16 @@ The adapter:
 
 1. verifies packet paths and packet hashes;
 2. verifies repository identity, PR head, and live `gh pr diff` hash;
-3. builds one prompt from the packet instructions plus the exact packet diff;
-4. hashes the exact UTF-8 bytes that will be sent;
-5. sends those bytes only through stdin;
-6. runs Claude non-interactively with no tools, Plan permission mode, no persistent session, Safe Mode, model `opus`, effort `high`, and a finite budget;
-7. accepts only the CLI `structured_output` object validated against the required JSON schema;
-8. verifies repository identity, PR head, and live diff again after the review;
-9. stores raw output and structured evidence only after all post-checks pass.
+3. generates a random per-invocation nonce and fences the exact packet diff as untrusted data;
+4. places the authoritative review instructions after that nonce-bound diff;
+5. hashes the exact UTF-8 bytes that will be sent;
+6. sends those bytes only through stdin;
+7. resolves one Claude executable and uses it for both the version probe and the review process;
+8. runs Claude non-interactively with no tools, Plan permission mode, no persistent session, Safe Mode, model `opus`, effort `high`, and a finite budget;
+9. accepts only the CLI `structured_output` object validated against the required JSON schema;
+10. retains raw stdout/stderr for audit even when the command, parsing, or post-review drift checks fail;
+11. verifies repository identity, PR head, and live diff again after the review;
+12. writes consumable structured evidence only after all post-checks pass.
 
 Run it with the packet manifest:
 
@@ -99,6 +102,8 @@ python3 tools/external_review_claude.py \
   --timeout-minutes 30 \
   --max-budget-usd 2
 ```
+
+The default transmitted-prompt ceiling is 750,000 UTF-8 bytes. Exceeding it blocks before Claude is invoked. `--max-prompt-bytes` is an explicit operator availability override, not a security proof or truncation mechanism: the exact full diff is either reviewed or the lane remains closed. The separate finite dollar budget still limits provider spend.
 
 The accepted command shape is exact apart from the positive finite budget value:
 
@@ -145,6 +150,7 @@ A required Claude entry uses:
     "head_sha": "<current-head>",
     "diff_sha256": "<current-diff-sha256>",
     "packet_prompt_sha256": "<packet-instructions-sha256>",
+    "prompt_nonce": "<32-lowercase-hex-random-nonce>",
     "prompt_sha256": "<sha256-of-actual-stdin-bytes>",
     "transport": "stdin"
   },
@@ -169,7 +175,7 @@ A required Claude entry uses:
 }
 ```
 
-The top-level prompt hash, `review_input.prompt_sha256`, and review `stdin_sha256` must match. The gate independently rebuilds the deterministic packet instructions from the current repository, PR, head, diff filename, diff hash, and PR metadata, then compares that SHA-256 with `review_input.packet_prompt_sha256`. This makes the packet-instruction hash load-bearing instead of a descriptive audit field and prevents combining another packet prompt with the current diff.
+The top-level prompt hash, `review_input.prompt_sha256`, and review `stdin_sha256` must match. The gate independently rebuilds the deterministic packet instructions from the current repository, PR number, head, diff filename, and diff hash. It then rebuilds the complete transmitted prompt from those instructions, the exact current UTF-8 `gh pr diff`, and the recorded random nonce. Both hashes are compared with the evidence. The mutable PR title is deliberately excluded from the packet identity. This makes both the packet-instruction hash and the actual stdin hash load-bearing and prevents combining another packet, diff, or delimiter context with the current evidence.
 
 ## Optional providers and optional Ultrareview
 
@@ -201,9 +207,15 @@ The waiver JSON must contain exactly these fields:
 }
 ```
 
-The gate rejects missing or unknown fields, invalid authority or scope, repo/PR/head/diff mismatch, timestamps without timezone, future-dated issuance beyond five minutes of clock skew, expiry, and lifetimes longer than 24 hours. The complete waiver and its validation outcome are echoed in gate JSON. This is an auditable emergency path, not a normal alternate provider and not permission to claim Claude reviewed the PR.
+The gate rejects missing or unknown fields, invalid authority or scope, repo/PR/head/diff mismatch, timestamps without timezone, future-dated issuance beyond five minutes of clock skew, expiry, and lifetimes longer than 24 hours. The complete waiver and its validation outcome are echoed in gate JSON. `authority: trusted-owner` is an explicit operator authority assertion inside the same local trust boundary as the other evidence files; it is not a detached signature or cryptographic identity proof. This is an auditable emergency path, not a normal alternate provider and not permission to claim Claude reviewed the PR.
 
-A successful adapter invocation is the capability proof for the installed Claude CLI and records its actual version. If an upstream CLI flag or result-envelope contract changes, the run fails closed with the CLI error; repair can proceed only through the explicit waiver plus a qualifying independent external review.
+A successful adapter invocation is the capability proof for the installed Claude CLI and records its actual version and resolved executable path. If an upstream CLI flag or result-envelope contract changes, the run fails closed with the CLI error; repair can proceed only through the explicit waiver plus a qualifying independent external review. A live invocation is intentionally not part of ordinary offline unit tests because it consumes network service and budget; every real required review is itself the integration proof for its exact CLI version and command contract.
+
+## Other enforced rules
+
+- Required Python checks are derived from the target repository's ordinary `.github/workflows/validate.yml` or `.yaml` matrix. A foreign repository with a missing, unreadable, duplicate, or non-literal matrix fails closed.
+- Deprecated embedded `self_review.external_review` data is ignored; current external evidence must be supplied through `--external-review-evidence`.
+- Self-review content remains evidence, not a PR review comment. A pull request may reference the artifact path, hash, and status, but must not duplicate the full self-review as an authoritative comment.
 
 ## External finding triage
 
