@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -26,6 +27,84 @@ pr_review_gate = _load_gate()
 
 
 class PrReviewGateTargetMatrixTests(unittest.TestCase):
+    def test_base_catalog_governs_current_pr_and_head_catalog_is_only_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            head_catalog = '{"schema_version":1,"required_checks":["weak"]}'
+            base_catalog = '{"schema_version":1,"required_checks":["ci","Web E2E"]}'
+            with mock.patch.object(
+                pr_review_gate,
+                "_required_check_catalog_text_at_revision",
+                side_effect=[head_catalog, base_catalog],
+            ) as read_catalog:
+                result = pr_review_gate.expected_check_names_for_repo(
+                    repo,
+                    repo_name="heimgewebe/weltgewebe",
+                    head_sha="a" * 40,
+                    base_sha="b" * 40,
+                )
+            self.assertEqual(result, ("ci", "Web E2E"))
+            self.assertEqual(
+                read_catalog.call_args_list,
+                [mock.call(repo, "a" * 40), mock.call(repo, "b" * 40)],
+            )
+
+    def test_invalid_head_catalog_blocks_even_when_base_policy_is_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            with mock.patch.object(
+                pr_review_gate,
+                "_required_check_catalog_text_at_revision",
+                side_effect=["not-json", '{"schema_version":1,"required_checks":["ci"]}'],
+            ) as read_catalog:
+                with self.assertRaisesRegex(
+                    pr_review_gate.GateInputError, "not valid JSON"
+                ):
+                    pr_review_gate.expected_check_names_for_repo(
+                        repo,
+                        repo_name="heimgewebe/weltgewebe",
+                        head_sha="a" * 40,
+                        base_sha="b" * 40,
+                    )
+            self.assertEqual(read_catalog.call_count, 1)
+
+    def test_weltgewebe_bootstrap_applies_when_base_has_no_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            with mock.patch.object(
+                pr_review_gate,
+                "_required_check_catalog_text_at_revision",
+                return_value=None,
+            ) as read_catalog:
+                result = pr_review_gate.expected_check_names_for_repo(
+                    repo,
+                    repo_name="heimgewebe/weltgewebe",
+                    head_sha="a" * 40,
+                    base_sha="b" * 40,
+                )
+            self.assertEqual(result, ("Detect docs updates", "Core Guard Tests"))
+            self.assertEqual(read_catalog.call_count, 2)
+
+    def test_required_check_catalog_rejects_invalid_duplicate_and_oversized_entries(self) -> None:
+        too_many = {
+            "schema_version": 1,
+            "required_checks": [f"check-{index}" for index in range(65)],
+        }
+        invalid = (
+            '{}',
+            '{"schema_version":2,"required_checks":["ci"]}',
+            '{"schema_version":1,"required_checks":[]}',
+            '{"schema_version":1,"required_checks":["ci"," ci "]}',
+            '{"schema_version":1,"required_checks":[1]}',
+            '{"schema_version":1,"required_checks":["ci"],"typo":true}',
+            json.dumps(too_many),
+            json.dumps({"schema_version": 1, "required_checks": ["x" * 201]}),
+        )
+        for text in invalid:
+            with self.subTest(text=text[:80]):
+                with self.assertRaises(pr_review_gate.GateInputError):
+                    pr_review_gate._required_check_names_from_catalog(text)
+
     def test_reads_block_python_matrix_from_validate_job(self) -> None:
         text = """name: validate
 jobs:
@@ -114,7 +193,11 @@ jobs:
             repo = Path(raw)
             with mock.patch.object(
                 pr_review_gate,
-                "_workflow_text_at_head",
+                "_required_check_catalog_text_at_revision",
+                return_value=None,
+            ), mock.patch.object(
+                pr_review_gate,
+                "_workflow_text_at_revision",
                 return_value='''jobs:
   validate:
     strategy:
@@ -131,36 +214,55 @@ jobs:
                         head_sha="a" * 40,
                     )
 
-    def test_workflow_is_read_from_exact_pr_head(self) -> None:
+    def test_workflow_is_read_from_exact_policy_revision(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw)
-            with mock.patch.object(
-                pr_review_gate,
-                "_run_text",
-                side_effect=[
-                    '''jobs:
+            workflow = '''jobs:
   validate:
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
-''',
-                ],
-            ) as run:
+'''
+            with mock.patch.object(
+                pr_review_gate,
+                "_required_check_catalog_text_at_revision",
+                return_value=None,
+            ) as read_catalog, mock.patch.object(
+                pr_review_gate,
+                "_workflow_text_at_revision",
+                return_value=workflow,
+            ) as read_workflow:
                 result = pr_review_gate.expected_check_names_for_repo(
                     repo,
                     repo_name="heimgewebe/schauwerk",
                     head_sha="a" * 40,
+                    base_sha="b" * 40,
                 )
             self.assertEqual(result, ("validate (3.11)", "validate (3.12)"))
-            run.assert_called_once_with(
-                repo,
-                [
-                    "git",
-                    "show",
-                    f"{'a' * 40}:.github/workflows/validate.yml",
-                ],
-                allow_nonzero=True,
+            self.assertEqual(
+                read_catalog.call_args_list,
+                [mock.call(repo, "a" * 40), mock.call(repo, "b" * 40)],
             )
+            read_workflow.assert_called_once_with(repo, "b" * 40)
+
+    def test_tracked_text_distinguishes_missing_file_from_read_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            with mock.patch.object(pr_review_gate, "_run_bytes", return_value=b""):
+                self.assertIsNone(
+                    pr_review_gate._tracked_text_at_revision(
+                        repo, "a" * 40, ".github/example.json"
+                    )
+                )
+            with mock.patch.object(
+                pr_review_gate, "_run_bytes", return_value=b"100644 blob deadbeef\t.github/example.json\0"
+            ), mock.patch.object(
+                pr_review_gate, "_run_text", side_effect=RuntimeError("git read failed")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "git read failed"):
+                    pr_review_gate._tracked_text_at_revision(
+                        repo, "a" * 40, ".github/example.json"
+                    )
 
     def test_evaluation_uses_supplied_target_check_names(self) -> None:
         state = {

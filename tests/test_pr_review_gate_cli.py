@@ -521,8 +521,22 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=build) as tmpdir:
             template_path = Path(tmpdir) / "self-review-template.json"
             stdout = io.StringIO()
-            with mock.patch.object(pr_review_gate, "load_pr_state", return_value=state), contextlib.redirect_stdout(stdout):
-                rc = pr_review_gate.main(["--pr", "58", "--write-self-review-template", str(template_path), "--json"])
+            with mock.patch.object(
+                pr_review_gate, "load_pr_state", return_value=state
+            ), mock.patch.object(
+                pr_review_gate,
+                "expected_check_names_for_repo",
+                return_value=pr_review_gate.DEFAULT_EXPECTED_CHECK_NAMES,
+            ), contextlib.redirect_stdout(stdout):
+                rc = pr_review_gate.main(
+                    [
+                        "--pr",
+                        "58",
+                        "--write-self-review-template",
+                        str(template_path),
+                        "--json",
+                    ]
+                )
             self.assertEqual(rc, 2)
             result = json.loads(stdout.getvalue())
             self.assertEqual(result["self_review_template"]["path"], str(template_path))

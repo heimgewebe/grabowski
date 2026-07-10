@@ -18,8 +18,13 @@ STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason"
 STRONG_SEVERITIES = {"p0", "p1", "high", "critical"}
 BLOCKING_REVIEW_STATES = {"CHANGES_REQUESTED", "DISMISSED", "PENDING"}
 DEFAULT_EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
+# Bootstrap policies are sticky code-owned defaults until a base-side catalog exists.
+BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
+    "heimgewebe/weltgewebe": ("Detect docs updates", "Core Guard Tests"),
+}
+MAX_REQUIRED_CHECK_NAMES = 64
+MAX_REQUIRED_CHECK_NAME_LENGTH = 200
 PASS_CHECK_BUCKETS = {"pass"}
-NON_BLOCKING_OPTIONAL_SKIPPED_CHECK_NAMES = {"claude"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
@@ -1585,15 +1590,73 @@ def write_self_review_audit(
     return {**audit, "path": str(output_path)}
 
 
-def _workflow_text_at_head(repo: Path, head_sha: str) -> str | None:
-    if re.fullmatch(r"[0-9a-fA-F]{40}", head_sha) is None:
-        raise GateInputError("PR head SHA is invalid for workflow inspection")
+REQUIRED_CHECK_CATALOG_PATH = ".github/grabowski-required-checks.json"
+REQUIRED_CHECK_CATALOG_FIELDS = {"schema_version", "required_checks"}
+
+
+def _tracked_text_at_revision(repo: Path, revision: str, path: str) -> str | None:
+    if re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
+        raise GateInputError("revision SHA is invalid for tracked-file inspection")
+    listing = _run_bytes(repo, ["git", "ls-tree", "-z", revision, "--", path])
+    if not listing:
+        return None
+    return _run_text(repo, ["git", "show", f"{revision}:{path}"])
+
+
+def _required_check_catalog_text_at_revision(repo: Path, revision: str) -> str | None:
+    return _tracked_text_at_revision(repo, revision, REQUIRED_CHECK_CATALOG_PATH)
+
+
+def _required_check_names_from_catalog(text: str) -> tuple[str, ...]:
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise GateInputError("target required-check catalog is not valid JSON") from exc
+    if not isinstance(raw, dict):
+        raise GateInputError("target required-check catalog must be a JSON object")
+    unknown = sorted(set(raw) - REQUIRED_CHECK_CATALOG_FIELDS)
+    if unknown:
+        raise GateInputError(
+            "target required-check catalog contains unknown field(s): " + ", ".join(unknown)
+        )
+    if raw.get("schema_version") != 1:
+        raise GateInputError("target required-check catalog schema_version must be 1")
+    checks = raw.get("required_checks")
+    if not isinstance(checks, list) or not checks:
+        raise GateInputError("target required-check catalog required_checks must be non-empty")
+    if len(checks) > MAX_REQUIRED_CHECK_NAMES:
+        raise GateInputError(
+            f"target required-check catalog exceeds {MAX_REQUIRED_CHECK_NAMES} entries"
+        )
+    normalized: list[str] = []
+    for index, value in enumerate(checks):
+        if not isinstance(value, str):
+            raise GateInputError(
+                f"target required-check catalog entry {index} must be a string"
+            )
+        name = " ".join(value.split())
+        if not name or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise GateInputError(
+                f"target required-check catalog entry {index} is empty or contains controls"
+            )
+        if len(name) > MAX_REQUIRED_CHECK_NAME_LENGTH:
+            raise GateInputError(
+                f"target required-check catalog entry {index} exceeds "
+                f"{MAX_REQUIRED_CHECK_NAME_LENGTH} characters"
+            )
+        normalized.append(name)
+    if len(normalized) != len(set(normalized)):
+        raise GateInputError("target required-check catalog contains duplicate check names")
+    return tuple(normalized)
+
+
+def _workflow_text_at_revision(repo: Path, revision: str) -> str | None:
     for path in (
         ".github/workflows/validate.yml",
         ".github/workflows/validate.yaml",
     ):
-        text = _run_text(repo, ["git", "show", f"{head_sha}:{path}"], allow_nonzero=True)
-        if text:
+        text = _tracked_text_at_revision(repo, revision, path)
+        if text is not None:
             return text
     return None
 
@@ -1738,9 +1801,32 @@ def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
 
 
 def expected_check_names_for_repo(
-    repo: Path, *, repo_name: str | None = None, head_sha: str | None = None
+    repo: Path,
+    *,
+    repo_name: str | None = None,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
 ) -> tuple[str, ...]:
-    workflow = _workflow_text_at_head(repo, head_sha) if head_sha is not None else None
+    policy_sha = base_sha or head_sha
+    head_catalog = (
+        _required_check_catalog_text_at_revision(repo, head_sha)
+        if head_sha is not None
+        else None
+    )
+    if head_catalog is not None:
+        # Validate proposed policy now, but do not let a PR authorize itself.
+        _required_check_names_from_catalog(head_catalog)
+    policy_catalog = (
+        _required_check_catalog_text_at_revision(repo, policy_sha)
+        if policy_sha is not None and policy_sha != head_sha
+        else head_catalog
+    )
+    if policy_catalog is not None:
+        return _required_check_names_from_catalog(policy_catalog)
+    bootstrap = BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO.get(repo_name or "")
+    if bootstrap is not None:
+        return bootstrap
+    workflow = _workflow_text_at_revision(repo, policy_sha) if policy_sha is not None else None
     versions = _python_versions_from_validate_workflow(workflow) if workflow else ()
     if versions:
         if len(versions) != len(set(versions)) or not all(
@@ -1751,7 +1837,7 @@ def expected_check_names_for_repo(
         return tuple(f"validate ({version})" for version in versions)
     if repo_name == "heimgewebe/grabowski":
         return DEFAULT_EXPECTED_CHECK_NAMES
-    raise GateInputError("cannot derive expected checks from target validate workflow at PR head")
+    raise GateInputError("cannot derive expected checks from base required-check catalog, bootstrap policy, or validate workflow")
 
 
 def evaluate_review_gate(
@@ -1955,13 +2041,7 @@ def evaluate_review_gate(
             if bucket not in PASS_CHECK_BUCKETS:
                 blocking_checks.append(check)
             continue
-        if (
-            bucket not in PASS_CHECK_BUCKETS
-            and not (
-                bucket == "skipping"
-                and name in NON_BLOCKING_OPTIONAL_SKIPPED_CHECK_NAMES
-            )
-        ):
+        if bucket not in PASS_CHECK_BUCKETS and bucket != "skipping":
             blocking_checks.append(check)
 
     missing_expected_checks = [
@@ -2073,6 +2153,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo,
                 repo_name=state.get("repoName"),
                 head_sha=state.get("pr", {}).get("headRefOid"),
+                base_sha=state.get("pr", {}).get("baseRefOid"),
             ),
         )
         if self_review_template is not None:
