@@ -189,7 +189,7 @@ def main() -> int:
         emit("repository-preflight-complete", expected_head=args.expected_head)
         run_streamed(["make", "validate"], cwd=repo, timeout_seconds=1_200, phase="validate")
         verify_repository(repo, args.expected_head)
-        run_streamed(["make", "deploy"], cwd=repo, timeout_seconds=1_800, phase="deploy")
+        run_streamed(["make", "deploy-apply"], cwd=repo, timeout_seconds=1_800, phase="deploy")
         live = verify_live_manifest(args.expected_head)
         emit("complete", **live)
         return 0

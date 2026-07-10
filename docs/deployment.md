@@ -85,7 +85,36 @@ danach nur diese Snapshots. Er:
 make deploy
 ```
 
-Das produktive Deployment verlangt:
+`make deploy` ist der normale Operatorpfad. Er startet keinen synchronen
+Runtime-Umbau im aufrufenden Terminal mehr, sondern plant einen eigenständigen
+user-systemd-Job über `tools/schedule_runtime_deploy.py`. Der Scheduler prüft
+vor dem Start:
+
+- absoluter, nicht über Symlink erreichter Repositorypfad,
+- `main`,
+- sauberer Git-Arbeitsbaum,
+- `HEAD == origin/main`,
+- vorhandener versionierter Runner `tools/run_scheduled_deploy.py`,
+- Verzögerung zwischen 5 und 60 Sekunden.
+
+Der gestartete Job wartet kurz, prüft den Checkout erneut, führt `make validate`
+aus und ruft danach den direkten Apply-Zielpfad `make deploy-apply` auf. Damit
+ist ein Operator-/Tunnel-Neustart nicht mehr an den Lebenszyklus des
+aufrufenden Connector-Requests gebunden.
+
+Der direkte Apply bleibt absichtlich als eigenes Ziel erhalten:
+
+```bash
+make deploy-apply
+```
+
+`make deploy-apply` ist für den verzögerten Runner und bewusst manuelle lokale
+Wartung vorgesehen. Es sollte nicht über eine synchrone Connector-Session als
+Standardpfad genutzt werden. `make deploy-direct` ist nur ein Alias für
+`deploy-apply` und dient als explizite, schwerer versehentlich zu treffende
+Direktmutation.
+
+Der direkte Apply verlangt:
 
 - sauberen Git-Arbeitsbaum,
 - fixierten Git-HEAD,
@@ -102,7 +131,7 @@ nur aus den Release-Snapshots abgeleitet.
 
 Ein Deployment, das Operator und Tunnel neu startet, darf nicht an den Lebenszyklus des aufrufenden MCP-Requests gebunden sein. Dafür existiert das typisierte Werkzeug `grabowski_runtime_deploy_schedule(expected_head, delay_seconds=8)`.
 
-Es akzeptiert weder einen Repositorypfad noch beliebige Befehle. Vor dem Start werden der kanonische Checkout, `main`, `HEAD`, `origin/main`, ein sauberer Arbeitsbaum und der versionierte Runner geprüft. Anschließend startet das Werkzeug einen eigenständigen dauerhaften systemd-Job und gibt dessen Unit und Logpfade zurück. Der Runner wartet zunächst, prüft den Checkout erneut, führt `make validate` und danach `make deploy` aus und verifiziert abschließend das Live-Manifest.
+Es akzeptiert weder einen Repositorypfad noch beliebige Befehle. Vor dem Start werden der kanonische Checkout, `main`, `HEAD`, `origin/main`, ein sauberer Arbeitsbaum und der versionierte Runner geprüft. Anschließend startet das Werkzeug einen eigenständigen dauerhaften systemd-Job und gibt dessen Unit und Logpfade zurück. Der Runner wartet zunächst, prüft den Checkout erneut, führt `make validate` und danach `make deploy-apply` aus und verifiziert abschließend das Live-Manifest.
 
 Die Verzögerung ist Teil des Antwortvertrags: Der MCP-Request kann abgeschlossen werden, bevor Operator und Tunnel neu starten. Nach der Wiederverbindung liefern `grabowski_job_status` und `grabowski_job_logs` den dauerhaften Nachweis. Job-Status enthält eine eigene `terminalization_evidence`; akzeptierte Starts werden als `launch_submitted` markiert, und ungültige oder fehlende `systemctl show`-Daten ergeben `missing_finalization_evidence`. Optionale `notify_on_done`-Metadaten senden in diesem Slice nichts und dürfen fehlende oder fehlgeschlagene Finalisierung nicht verdecken.
 
