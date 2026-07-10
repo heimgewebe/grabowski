@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 from datetime import datetime, timezone
 
 import hashlib
@@ -12,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import time
 from typing import Any
@@ -39,6 +41,10 @@ MAX_OUTPUT_BYTES = 2_000_000
 TRUSTED_MAX_OUTPUT_BYTES = 33_554_432
 MAX_NOTIFY_ON_DONE_CHANNELS = 5
 MAX_NOTIFY_ON_DONE_TEXT = 200
+MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
+FINALIZATION_RECEIPT_NAME = "finalization.json"
+RUNTIME_DEPLOY_FINALIZATION_KIND = "grabowski_runtime_deploy_finalization"
+JOB_EXPECTED_HEAD_RE = re.compile(r"[0-9a-f]{40,64}")
 JOB_FINAL_STATUS_NON_CLAIMS = (
     "notification_delivery",
     "hidden_finalization_failure",
@@ -174,13 +180,18 @@ def _redact(text: str, extra_secrets: list[str] | None = None) -> str:
     return result
 
 
-def _argv_hash(argv: list[str]) -> str:
+def _json_sha256(payload: Any) -> str:
     encoded = json.dumps(
-        argv,
+        payload,
         ensure_ascii=False,
         separators=(",", ":"),
+        sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _argv_hash(argv: list[str]) -> str:
+    return _json_sha256(argv)
 
 
 def _redact_argv(argv: list[str]) -> list[str]:
@@ -584,14 +595,24 @@ def _job_identity(unit: str, *, owner: str | None = None) -> dict[str, Any]:
     }
 
 
+def _job_receipt_paths(directory: Path) -> dict[str, str]:
+    return {
+        "metadata": str(directory / "metadata.json"),
+        "stdout": str(directory / "stdout.log"),
+        "stderr": str(directory / "stderr.log"),
+        "finalization": str(directory / FINALIZATION_RECEIPT_NAME),
+    }
+
+
 def _job_expected_receipt(
     *,
     unit: str,
     metadata_path: Path,
     stdout_path: Path,
     stderr_path: Path,
+    finalization_path: Path | None = None,
 ) -> dict[str, Any]:
-    return {
+    receipt = {
         "kind": "grabowski_job_receipt",
         "unit": unit,
         "metadata_path": str(metadata_path),
@@ -600,6 +621,395 @@ def _job_expected_receipt(
         "status_tool": "grabowski_job_status",
         "logs_tool": "grabowski_job_logs",
         "does_not_establish": list(EXPECTED_RECEIPT_NON_CLAIMS),
+    }
+    if finalization_path is not None:
+        receipt["finalization_path"] = str(finalization_path)
+    return receipt
+
+
+def _runtime_deploy_expected_head(metadata: dict[str, Any]) -> str | None:
+    argv = metadata.get("argv")
+    argv_sha256 = metadata.get("argv_sha256")
+    if (
+        not isinstance(argv, list)
+        or not all(isinstance(item, str) for item in argv)
+        or not isinstance(argv_sha256, str)
+        or _argv_hash(argv) != argv_sha256
+    ):
+        return None
+    positions = [index for index, item in enumerate(argv) if item == "--expected-head"]
+    if len(positions) != 1 or positions[0] + 1 >= len(argv):
+        return None
+    expected_head = argv[positions[0] + 1]
+    if not JOB_EXPECTED_HEAD_RE.fullmatch(expected_head):
+        return None
+    return expected_head
+
+
+def _job_finalization_contract(
+    *,
+    unit: str,
+    directory: Path,
+    argv_sha256: str,
+    expected_head: str,
+) -> dict[str, Any]:
+    if not JOB_EXPECTED_HEAD_RE.fullmatch(expected_head):
+        raise ValueError("finalization expected_head must be a lowercase Git object ID")
+    material = {
+        "schema_version": 1,
+        "kind": RUNTIME_DEPLOY_FINALIZATION_KIND,
+        "unit": unit,
+        "job_id": unit.removeprefix(JOB_PREFIX),
+        "argv_sha256": argv_sha256,
+        "expected_head": expected_head,
+        "receipt_paths": _job_receipt_paths(directory),
+    }
+    return {**material, "contract_sha256": _json_sha256(material)}
+
+
+def _read_finalization_receipt_file(path: Path) -> dict[str, Any]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return {"ok": False, "state": "missing_receipt", "path": str(path)}
+    except OSError as exc:
+        reason = "receipt_symlink" if exc.errno == errno.ELOOP else "receipt_open_failed"
+        return {
+            "ok": False,
+            "state": "invalid_receipt",
+            "reason": reason,
+            "path": str(path),
+        }
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            return {
+                "ok": False,
+                "state": "invalid_receipt",
+                "reason": "receipt_not_regular_file",
+                "path": str(path),
+            }
+        size = status.st_size
+        if size <= 0 or size > MAX_FINALIZATION_RECEIPT_BYTES:
+            return {
+                "ok": False,
+                "state": "invalid_receipt",
+                "reason": "receipt_size_invalid",
+                "path": str(path),
+                "bytes": size,
+            }
+        raw = bytearray()
+        while len(raw) <= MAX_FINALIZATION_RECEIPT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(8192, MAX_FINALIZATION_RECEIPT_BYTES + 1 - len(raw)),
+            )
+            if not chunk:
+                break
+            raw.extend(chunk)
+        final_status = os.fstat(descriptor)
+        if (
+            len(raw) != size
+            or len(raw) > MAX_FINALIZATION_RECEIPT_BYTES
+            or final_status.st_dev != status.st_dev
+            or final_status.st_ino != status.st_ino
+            or final_status.st_size != status.st_size
+            or final_status.st_mtime_ns != status.st_mtime_ns
+        ):
+            return {
+                "ok": False,
+                "state": "invalid_receipt",
+                "reason": "receipt_changed_while_reading",
+                "path": str(path),
+                "bytes": len(raw),
+            }
+        return {
+            "ok": True,
+            "path": str(path),
+            "bytes": size,
+            "raw": bytes(raw),
+        }
+    finally:
+        os.close(descriptor)
+
+
+def _finalization_receipt_result(
+    unit: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    contract = metadata.get("finalization_contract")
+    if contract is None:
+        return {
+            "configured": False,
+            "valid": False,
+            "state": "not_configured",
+            "does_not_establish": ["job_success"],
+        }
+    if not isinstance(contract, dict):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "contract_not_object",
+            "does_not_establish": ["job_success"],
+        }
+
+    directory = _job_directory(unit)
+    expected_paths = _job_receipt_paths(directory)
+    expected_material = {
+        "schema_version": 1,
+        "kind": RUNTIME_DEPLOY_FINALIZATION_KIND,
+        "unit": unit,
+        "job_id": unit.removeprefix(JOB_PREFIX),
+        "argv_sha256": metadata.get("argv_sha256"),
+        "expected_head": contract.get("expected_head"),
+        "receipt_paths": expected_paths,
+    }
+    allowed_contract_keys = set(expected_material) | {"contract_sha256"}
+    if set(contract) != allowed_contract_keys:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "contract_shape_mismatch",
+            "does_not_establish": ["job_success"],
+        }
+    if not isinstance(expected_material["argv_sha256"], str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_material["argv_sha256"]
+    ):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "metadata_argv_sha256_invalid",
+            "does_not_establish": ["job_success"],
+        }
+    if not isinstance(expected_material["expected_head"], str) or not JOB_EXPECTED_HEAD_RE.fullmatch(
+        expected_material["expected_head"]
+    ):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "expected_head_invalid",
+            "does_not_establish": ["job_success"],
+        }
+    argv_expected_head = _runtime_deploy_expected_head(metadata)
+    if argv_expected_head is None:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "metadata_argv_binding_invalid",
+            "does_not_establish": ["job_success"],
+        }
+    if expected_material["expected_head"] != argv_expected_head:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "contract_binding_mismatch:expected_head_argv",
+            "does_not_establish": ["job_success"],
+        }
+    for key, expected in expected_material.items():
+        if contract.get(key) != expected:
+            return {
+                "configured": True,
+                "valid": False,
+                "state": "invalid_contract",
+                "reason": f"contract_binding_mismatch:{key}",
+                "does_not_establish": ["job_success"],
+            }
+    if contract.get("contract_sha256") != _json_sha256(expected_material):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "contract_sha256_mismatch",
+            "does_not_establish": ["job_success"],
+        }
+
+    path = directory / FINALIZATION_RECEIPT_NAME
+    file_result = _read_finalization_receipt_file(path)
+    if file_result.get("ok") is not True:
+        return {
+            "configured": True,
+            "valid": False,
+            **file_result,
+            "does_not_establish": ["job_success"],
+        }
+    raw = file_result["raw"]
+    size = file_result["bytes"]
+    receipt_sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "receipt_json_invalid",
+            "path": str(path),
+            "bytes": size,
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+    if not isinstance(payload, dict):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "receipt_not_object",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+
+    allowed_payload_keys = {
+        "schema_version",
+        "kind",
+        "unit",
+        "job_id",
+        "argv_sha256",
+        "expected_head",
+        "receipt_paths",
+        "final_status",
+        "completion_status",
+        "repo_head",
+        "release_id",
+        "failure_type",
+        "timestamp_unix",
+        "payload_sha256",
+    }
+    if set(payload) != allowed_payload_keys:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "receipt_shape_mismatch",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+    payload_material = {key: value for key, value in payload.items() if key != "payload_sha256"}
+    if payload.get("payload_sha256") != _json_sha256(payload_material):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "payload_sha256_mismatch",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+    bindings = {
+        "schema_version": 1,
+        "kind": RUNTIME_DEPLOY_FINALIZATION_KIND,
+        "unit": unit,
+        "job_id": unit.removeprefix(JOB_PREFIX),
+        "argv_sha256": metadata.get("argv_sha256"),
+        "expected_head": contract["expected_head"],
+        "receipt_paths": expected_paths,
+    }
+    for key, expected in bindings.items():
+        if payload.get(key) != expected:
+            return {
+                "configured": True,
+                "valid": False,
+                "state": "invalid_receipt",
+                "reason": f"receipt_binding_mismatch:{key}",
+                "path": str(path),
+                "receipt_sha256": receipt_sha256,
+                "does_not_establish": ["job_success"],
+            }
+    timestamp = payload.get("timestamp_unix")
+    created_at = metadata.get("created_at_unix")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "timestamp_invalid",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+    if isinstance(created_at, int) and not isinstance(created_at, bool) and timestamp < created_at:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "timestamp_precedes_job",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+
+    final_status = payload.get("final_status")
+    if final_status == "completed":
+        release_id = payload.get("release_id")
+        if (
+            payload.get("completion_status") != "complete"
+            or payload.get("repo_head") != contract["expected_head"]
+            or not isinstance(release_id, str)
+            or not release_id
+            or len(release_id.encode("utf-8")) > 512
+            or payload.get("failure_type") is not None
+        ):
+            return {
+                "configured": True,
+                "valid": False,
+                "state": "invalid_receipt",
+                "reason": "completed_receipt_semantics_invalid",
+                "path": str(path),
+                "receipt_sha256": receipt_sha256,
+                "does_not_establish": ["job_success"],
+            }
+    elif final_status == "failed":
+        failure_type = payload.get("failure_type")
+        if (
+            payload.get("completion_status") != "failed"
+            or payload.get("repo_head") is not None
+            or payload.get("release_id") is not None
+            or not isinstance(failure_type, str)
+            or not failure_type
+            or len(failure_type.encode("utf-8")) > 200
+        ):
+            return {
+                "configured": True,
+                "valid": False,
+                "state": "invalid_receipt",
+                "reason": "failed_receipt_semantics_invalid",
+                "path": str(path),
+                "receipt_sha256": receipt_sha256,
+                "does_not_establish": ["job_success"],
+            }
+    else:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "final_status_invalid",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+
+    return {
+        "configured": True,
+        "valid": True,
+        "state": "valid",
+        "path": str(path),
+        "bytes": size,
+        "receipt_sha256": receipt_sha256,
+        "payload_sha256": payload["payload_sha256"],
+        "final_status": final_status,
+        "expected_head": contract["expected_head"],
+        "timestamp_unix": timestamp,
+        "does_not_establish": ["notification_delivery", "root_cause"],
     }
 
 
@@ -757,11 +1167,15 @@ def _project_job_metadata(unit: str, metadata: dict[str, Any]) -> dict[str, Any]
     expected_receipt_projected = not isinstance(metadata.get("expected_receipt"), dict)
     expected_receipt = metadata.get("expected_receipt")
     if expected_receipt_projected:
+        finalization_path = None
+        if isinstance(metadata.get("finalization_contract"), dict):
+            finalization_path = paths["directory"] / FINALIZATION_RECEIPT_NAME
         expected_receipt = _job_expected_receipt(
             unit=unit,
             metadata_path=paths["metadata_path"],
             stdout_path=paths["stdout_path"],
             stderr_path=paths["stderr_path"],
+            finalization_path=finalization_path,
         )
     notify_on_done = _safe_normalize_stored_notify_on_done(metadata.get("notify_on_done"))
     started_at_projected = "started_at" not in metadata
@@ -822,16 +1236,39 @@ def _job_status_record(
         properties,
         query_valid=query_valid,
     )
+    finalization_receipt = _finalization_receipt_result(unit, metadata)
     if not systemd_visible:
         metadata_terminalization = _metadata_launch_failure_evidence(metadata)
         if metadata_terminalization is not None:
             terminalization = metadata_terminalization
+        elif finalization_receipt.get("valid") is True:
+            terminalization = {
+                "source": "persisted-runner-receipt",
+                "query_valid": query_valid,
+                "systemd_visible": False,
+                "fallback_used": True,
+                "final_status": finalization_receipt["final_status"],
+                "receipt_valid": True,
+                "receipt_sha256": finalization_receipt["receipt_sha256"],
+                "payload_sha256": finalization_receipt["payload_sha256"],
+                "expected_head": finalization_receipt["expected_head"],
+                "timestamp_unix": finalization_receipt["timestamp_unix"],
+                "does_not_establish": ["notification_delivery", "root_cause", "live_process_status"],
+            }
+        else:
+            terminalization = {
+                **terminalization,
+                "fallback_used": False,
+                "receipt_state": finalization_receipt.get("state"),
+                "receipt_reason": finalization_receipt.get("reason"),
+            }
     projected = _project_job_metadata(unit, metadata)
     notify_on_done = projected["notify_on_done"]
     return {
         **projected,
         "final_status": terminalization["final_status"],
         "terminalization_evidence": terminalization,
+        "finalization_receipt": finalization_receipt,
         "notification_evidence": _job_notification_evidence(notify_on_done, terminalization),
     }
 
@@ -1052,15 +1489,15 @@ def grabowski_terminal_run(
     )
 
 
-@mcp.tool(name="grabowski_job_start", annotations=MUTATING)
-def grabowski_job_start(
+def _start_job(
     argv: list[str],
     cwd: str | None = None,
     runtime_seconds: int = DEFAULT_JOB_RUNTIME,
     notify_on_done: dict[str, Any] | None = None,
+    *,
+    finalization_expected_head: str | None = None,
 ) -> dict[str, Any]:
-    """Start a durable background command as a transient user systemd unit."""
-    _require_operator_mutation("durable_job")
+    """Start an already-authorized durable job."""
     working_directory = _resolve_cwd(cwd)
     command = _validate_argv(argv, cwd=working_directory)
     runtime = _job_runtime(runtime_seconds)
@@ -1080,16 +1517,25 @@ def grabowski_job_start(
     now_unix, now_iso = _job_timestamp()
     metadata_path = directory / "metadata.json"
     identity = _job_identity(unit)
+    argv_sha256 = _argv_hash(command)
+    finalization_contract = None
+    if finalization_expected_head is not None:
+        finalization_contract = _job_finalization_contract(
+            unit=unit,
+            directory=directory,
+            argv_sha256=argv_sha256,
+            expected_head=finalization_expected_head,
+        )
     metadata = {
         "schema_version": 1,
         **identity,
         "scope": {
             "cwd": str(working_directory),
-            "argv_sha256": _argv_hash(command),
+            "argv_sha256": argv_sha256,
             "runtime_seconds": runtime,
         },
         "argv": _redact_argv(command),
-        "argv_sha256": _argv_hash(command),
+        "argv_sha256": argv_sha256,
         "command": _redacted_command(command),
         "cwd": str(working_directory),
         "runtime_seconds": runtime,
@@ -1103,7 +1549,9 @@ def grabowski_job_start(
             metadata_path=metadata_path,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
+            finalization_path=(directory / FINALIZATION_RECEIPT_NAME) if finalization_contract else None,
         ),
+        **({"finalization_contract": finalization_contract} if finalization_contract else {}),
         "final_status": "launch_prepared",
         "terminalization_evidence": {
             "source": "prelaunch-metadata",
@@ -1123,23 +1571,35 @@ def grabowski_job_start(
     }
     metadata_path = _write_job_metadata(directory, metadata)
 
+    systemd_argv = [
+        "systemd-run",
+        "--user",
+        f"--description={_systemd_safe_description('job', unit, metadata['argv_sha256'])}",
+        "--unit",
+        unit,
+        "--property=Type=exec",
+        "--property=KillMode=control-group",
+        "--property=TimeoutStopSec=10s",
+        f"--property=RuntimeMaxSec={runtime}s",
+        f"--property=WorkingDirectory={working_directory}",
+        f"--property=StandardOutput=append:{stdout_path}",
+        f"--property=StandardError=append:{stderr_path}",
+    ]
+    if finalization_contract is not None:
+        environment = {
+            "GRABOWSKI_JOB_ID": finalization_contract["job_id"],
+            "GRABOWSKI_JOB_UNIT": finalization_contract["unit"],
+            "GRABOWSKI_JOB_ARGV_SHA256": finalization_contract["argv_sha256"],
+            "GRABOWSKI_JOB_EXPECTED_HEAD": finalization_contract["expected_head"],
+            "GRABOWSKI_JOB_METADATA_PATH": finalization_contract["receipt_paths"]["metadata"],
+            "GRABOWSKI_JOB_STDOUT_PATH": finalization_contract["receipt_paths"]["stdout"],
+            "GRABOWSKI_JOB_STDERR_PATH": finalization_contract["receipt_paths"]["stderr"],
+            "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
+        }
+        systemd_argv.extend(f"--setenv={key}={value}" for key, value in environment.items())
+    systemd_argv.extend(["--", *command])
     result = _run(
-        [
-            "systemd-run",
-            "--user",
-            f"--description={_systemd_safe_description('job', unit, metadata['argv_sha256'])}",
-            "--unit",
-            unit,
-            "--property=Type=exec",
-            "--property=KillMode=control-group",
-            "--property=TimeoutStopSec=10s",
-            f"--property=RuntimeMaxSec={runtime}s",
-            f"--property=WorkingDirectory={working_directory}",
-            f"--property=StandardOutput=append:{stdout_path}",
-            f"--property=StandardError=append:{stderr_path}",
-            "--",
-            *command,
-        ],
+        systemd_argv,
         cwd=HOME,
         timeout_seconds=60,
         max_output_bytes=DEFAULT_OUTPUT_BYTES,
@@ -1197,6 +1657,23 @@ def grabowski_job_start(
     }
 
 
+@mcp.tool(name="grabowski_job_start", annotations=MUTATING)
+def grabowski_job_start(
+    argv: list[str],
+    cwd: str | None = None,
+    runtime_seconds: int = DEFAULT_JOB_RUNTIME,
+    notify_on_done: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Start a durable background command as a transient user systemd unit."""
+    _require_operator_mutation("durable_job")
+    return _start_job(
+        argv,
+        cwd=cwd,
+        runtime_seconds=runtime_seconds,
+        notify_on_done=notify_on_done,
+    )
+
+
 @mcp.tool(name="grabowski_job_status", annotations=READ_ONLY)
 def grabowski_job_status(unit: str) -> dict[str, Any]:
     """Return durable metadata and current systemd status for one job."""
@@ -1238,6 +1715,7 @@ def grabowski_job_status(unit: str) -> dict[str, Any]:
         "job_record": job_record,
         "final_status": job_record["final_status"],
         "terminalization_evidence": job_record["terminalization_evidence"],
+        "finalization_receipt": job_record["finalization_receipt"],
         "notification_evidence": job_record["notification_evidence"],
         "systemd_visible": systemd_visible,
         "returncode": result["returncode"],
@@ -1276,6 +1754,7 @@ def grabowski_job_logs(
             "scope": projected.get("scope"),
         },
         "expected_receipt": projected.get("expected_receipt"),
+        "finalization_receipt": _finalization_receipt_result(name, metadata),
         "notify_on_done": projected.get("notify_on_done"),
         "stdout": _read_job_log(expected["stdout_path"], max_lines),
         "stderr": _read_job_log(expected["stderr_path"], max_lines),

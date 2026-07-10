@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -31,6 +33,7 @@ def _load_self_deploy():
     operator._require_operator_mutation = Mock()
     operator._require_operator_capability = Mock()
     operator.grabowski_job_start = Mock()
+    operator._start_job = Mock()
     base = types.ModuleType("grabowski_mcp")
     base._append_audit = Mock()
     read_surface = types.ModuleType("grabowski_read_surface")
@@ -107,15 +110,16 @@ class SelfDeployToolTests(unittest.TestCase):
         runner = repo / "tools/run_scheduled_deploy.py"
         expected = "c" * 40
         job = {"unit": "grabowski-job-test", "argv_sha256": "d" * 64, "metadata_path": "/state/meta", "stdout_path": "/state/out", "stderr_path": "/state/err"}
-        SELF_DEPLOY.operator.grabowski_job_start.reset_mock()
+        SELF_DEPLOY.operator._start_job.reset_mock()
         SELF_DEPLOY.base._append_audit.reset_mock()
-        SELF_DEPLOY.operator.grabowski_job_start.return_value = job
+        SELF_DEPLOY.operator._start_job.return_value = job
         with patch.object(SELF_DEPLOY, "_canonical_preflight", return_value=(repo, runner)):
             result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 9)
-        SELF_DEPLOY.operator.grabowski_job_start.assert_called_once_with(
+        SELF_DEPLOY.operator._start_job.assert_called_once_with(
             ["/usr/bin/python3", str(runner), "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "9"],
             cwd=str(repo),
             runtime_seconds=3600,
+            finalization_expected_head=expected,
         )
         self.assertTrue(result["scheduled"])
         self.assertTrue(result["expected_connector_disconnect"])
@@ -148,6 +152,128 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         self.assertEqual(verify.call_count, 2)
         self.assertEqual(streamed.call_args_list[0].args[0], ["make", "validate"])
         self.assertEqual(streamed.call_args_list[1].args[0], ["make", "deploy-apply"])
+
+    def test_finalization_binding_and_atomic_receipt_are_hash_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            expected = "a" * 40
+            argv_sha256 = "b" * 64
+            env = {
+                "GRABOWSKI_JOB_ID": "deadbeefcafe",
+                "GRABOWSKI_JOB_UNIT": "grabowski-job-deadbeefcafe",
+                "GRABOWSKI_JOB_ARGV_SHA256": argv_sha256,
+                "GRABOWSKI_JOB_EXPECTED_HEAD": expected,
+                "GRABOWSKI_JOB_METADATA_PATH": str(directory / "metadata.json"),
+                "GRABOWSKI_JOB_STDOUT_PATH": str(directory / "stdout.log"),
+                "GRABOWSKI_JOB_STDERR_PATH": str(directory / "stderr.log"),
+                "GRABOWSKI_JOB_FINALIZATION_PATH": str(directory / "finalization.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                binding = RUNNER.load_finalization_binding()
+            self.assertIsNotNone(binding)
+            with patch.object(RUNNER.time, "time", return_value=1001):
+                receipt_path = RUNNER.write_finalization_receipt(
+                    binding,
+                    final_status="completed",
+                    repo_head=expected,
+                    release_id="release-test",
+                    failure_type=None,
+                )
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            material = {key: value for key, value in payload.items() if key != "payload_sha256"}
+            self.assertEqual(payload["payload_sha256"], RUNNER.canonical_json_sha256(material))
+            self.assertEqual(payload["job_id"], "deadbeefcafe")
+            self.assertEqual(payload["argv_sha256"], argv_sha256)
+            self.assertEqual(payload["expected_head"], expected)
+            self.assertEqual(payload["final_status"], "completed")
+            with self.assertRaises(FileExistsError):
+                RUNNER.write_finalization_receipt(
+                    binding,
+                    final_status="failed",
+                    repo_head=None,
+                    release_id=None,
+                    failure_type="RuntimeError",
+                )
+
+    def test_receipt_publish_failure_removes_visible_partial_finalization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            binding = {
+                "schema_version": 1,
+                "kind": RUNNER.FINALIZATION_KIND,
+                "job_id": "deadbeefcafe",
+                "unit": "grabowski-job-deadbeefcafe",
+                "argv_sha256": "b" * 64,
+                "expected_head": "a" * 40,
+                "receipt_paths": {
+                    "metadata": str(directory / "metadata.json"),
+                    "stdout": str(directory / "stdout.log"),
+                    "stderr": str(directory / "stderr.log"),
+                    "finalization": str(directory / "finalization.json"),
+                },
+            }
+            with patch.object(
+                RUNNER.os,
+                "fsync",
+                side_effect=[None, OSError("directory fsync failed"), None],
+            ):
+                with self.assertRaisesRegex(OSError, "directory fsync failed"):
+                    RUNNER.write_finalization_receipt(
+                        binding,
+                        final_status="completed",
+                        repo_head="a" * 40,
+                        release_id="release-test",
+                        failure_type=None,
+                    )
+            self.assertFalse((directory / "finalization.json").exists())
+            self.assertEqual(list(directory.glob(".finalization.json.*.tmp")), [])
+
+    def test_verify_live_manifest_rejects_missing_release_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            manifest = home / ".local/share/grabowski-mcp/deployment-manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "repo_head": "a" * 40,
+                        "completion_status": "complete",
+                        "release_id": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(RUNNER.Path, "home", return_value=home):
+                with self.assertRaisesRegex(RuntimeError, "release_id is invalid"):
+                    RUNNER.verify_live_manifest("a" * 40)
+
+    def test_main_writes_completed_receipt_after_live_manifest_verification(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        binding = {"expected_head": expected}
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "run_streamed"), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "write_finalization_receipt") as write:
+            self.assertEqual(RUNNER.main(), 0)
+        write.assert_called_once_with(
+            binding,
+            final_status="completed",
+            repo_head=expected,
+            release_id="release",
+            failure_type=None,
+        )
+
+    def test_main_writes_failed_receipt_for_runner_failure(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        binding = {"expected_head": expected}
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository", side_effect=RuntimeError("preflight failed")), patch.object(RUNNER, "write_finalization_receipt") as write:
+            self.assertEqual(RUNNER.main(), 1)
+        write.assert_called_once_with(
+            binding,
+            final_status="failed",
+            repo_head=None,
+            release_id=None,
+            failure_type="RuntimeError",
+        )
 
     def test_make_deploy_schedules_not_direct_apply(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")

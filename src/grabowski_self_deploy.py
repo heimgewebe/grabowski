@@ -128,7 +128,7 @@ def grabowski_runtime_deploy_schedule(
     }
     base._append_audit(intent)
 
-    job = operator.grabowski_job_start(
+    job = operator._start_job(
         [
             "/usr/bin/python3",
             str(runner),
@@ -141,6 +141,7 @@ def grabowski_runtime_deploy_schedule(
         ],
         cwd=str(repository),
         runtime_seconds=3_600,
+        finalization_expected_head=expected_head,
     )
     scheduled = {
         "timestamp_unix": int(time.time()),
