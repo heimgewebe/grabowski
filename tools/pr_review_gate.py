@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from typing import Any
@@ -14,7 +15,7 @@ TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reaso
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
 STRONG_SEVERITIES = {"p0", "p1", "high", "critical"}
 BLOCKING_REVIEW_STATES = {"CHANGES_REQUESTED", "DISMISSED", "PENDING"}
-EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
+DEFAULT_EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 PASS_CHECK_BUCKETS = {"pass"}
 NON_BLOCKING_OPTIONAL_SKIPPED_CHECK_NAMES = {"claude"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
@@ -1110,12 +1111,75 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
     }
 
 
+def _workflow_python_versions(repo: Path) -> tuple[str, ...]:
+    workflow = next(
+        (
+            candidate
+            for candidate in (
+                repo / ".github" / "workflows" / "validate.yml",
+                repo / ".github" / "workflows" / "validate.yaml",
+            )
+            if candidate.is_file() and not candidate.is_symlink()
+        ),
+        None,
+    )
+    if workflow is None:
+        return ()
+    try:
+        lines = workflow.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return ()
+    for index, line in enumerate(lines):
+        match = re.match(r"^(?P<indent>\s*)python-version\s*:\s*(?P<inline>.*)$", line)
+        if match is None:
+            continue
+        inline = match.group("inline").strip()
+        if inline.startswith("[") and inline.endswith("]"):
+            values = [
+                value.strip().strip("\"'")
+                for value in inline[1:-1].split(",")
+                if value.strip().strip("\"'")
+            ]
+            return tuple(values)
+        indentation = len(match.group("indent"))
+        values: list[str] = []
+        for candidate in lines[index + 1 :]:
+            if not candidate.strip() or candidate.lstrip().startswith("#"):
+                continue
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate_indent <= indentation:
+                break
+            item = re.match(r"^\s*-\s*[\"']?(?P<version>[^\"'#\s]+)[\"']?\s*(?:#.*)?$", candidate)
+            if item is None:
+                break
+            values.append(item.group("version"))
+        return tuple(values)
+    return ()
+
+
+def expected_check_names_for_repo(
+    repo: Path, *, repo_name: str | None = None
+) -> tuple[str, ...]:
+    versions = _workflow_python_versions(repo)
+    if versions:
+        if len(versions) != len(set(versions)) or not all(
+            re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version)
+            for version in versions
+        ):
+            raise GateInputError("target validate workflow has an invalid Python matrix")
+        return tuple(f"validate ({version})" for version in versions)
+    if repo_name == "heimgewebe/grabowski":
+        return DEFAULT_EXPECTED_CHECK_NAMES
+    raise GateInputError("cannot derive expected checks from target validate workflow")
+
+
 def evaluate_review_gate(
     state: dict[str, Any],
     *,
     self_review: dict[str, Any] | None = None,
     claude_evidence: dict[str, Any] | None = None,
     external_review_evidence: dict[str, Any] | None = None,
+    expected_check_names: tuple[str, ...] = DEFAULT_EXPECTED_CHECK_NAMES,
 ) -> dict[str, Any]:
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     if isinstance(pr, dict):
@@ -1225,7 +1289,7 @@ def evaluate_review_gate(
     if not checks:
         failures.append("no status checks observed")
     expected_check_buckets_by_name: dict[str, list[str | None]] = {
-        name: [] for name in EXPECTED_CHECK_NAMES
+        name: [] for name in expected_check_names
     }
     blocking_checks = []
     for check in checks:
@@ -1233,7 +1297,7 @@ def evaluate_review_gate(
             continue
         name = check.get("name")
         bucket = check.get("bucket")
-        if name in EXPECTED_CHECK_NAMES:
+        if name in expected_check_names:
             expected_check_buckets_by_name[name].append(bucket)
             if bucket not in PASS_CHECK_BUCKETS:
                 blocking_checks.append(check)
@@ -1288,6 +1352,7 @@ def evaluate_review_gate(
             "current_head_review_item_count": len(items),
         },
         "complexity": complexity,
+        "check_policy": {"expected_check_names": list(expected_check_names)},
     }
 
 
@@ -1338,6 +1403,9 @@ def main(argv: list[str] | None = None) -> int:
             self_review=self_review,
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
+            expected_check_names=expected_check_names_for_repo(
+                repo, repo_name=state.get("repoName")
+            ),
         )
         if self_review_template is not None:
             result["self_review_template"] = self_review_template
