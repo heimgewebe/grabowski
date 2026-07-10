@@ -95,9 +95,11 @@ class ExternalReviewClaudeTests(unittest.TestCase):
         root: Path,
         stdout: str,
         *,
+        head_before: str = HEAD,
         head_after: str = HEAD,
         diff_before: str | None = None,
         diff_after: str | None = None,
+        repo_before: str = "heimgewebe/grabowski",
         repo_after: str = "heimgewebe/grabowski",
         returncode: int = 0,
         model: str = "opus",
@@ -125,9 +127,9 @@ class ExternalReviewClaudeTests(unittest.TestCase):
             mock.patch.object(
                 claude_review,
                 "current_repo_name",
-                side_effect=["heimgewebe/grabowski", repo_after],
+                side_effect=[repo_before, repo_after],
             ),
-            mock.patch.object(claude_review, "current_pr_head", side_effect=[HEAD, head_after]),
+            mock.patch.object(claude_review, "current_pr_head", side_effect=[head_before, head_after]),
             mock.patch.object(
                 claude_review,
                 "current_pr_diff_sha256",
@@ -236,6 +238,40 @@ class ExternalReviewClaudeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(claude_review.ClaudeReviewError, "not valid JSON"):
                 self._run(Path(directory), "not-json")
+
+    def test_empty_stdout_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(claude_review.ClaudeReviewError, "returned empty stdout"):
+                self._run(Path(directory), "")
+
+    def test_error_result_envelope_fails_closed_even_with_zero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "terminal_reason": "api_error",
+                    "structured_output": {
+                        "verdict": "PASS",
+                        "summary": "Not trustworthy.",
+                        "finding_count": 0,
+                        "findings": [],
+                    },
+                }
+            )
+            with self.assertRaisesRegex(claude_review.ClaudeReviewError, "result envelope is not successful"):
+                self._run(Path(directory), payload)
+
+    def test_wrong_live_head_before_review_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(claude_review.ClaudeReviewError, "head does not match manifest before"):
+                self._run(Path(directory), _envelope(), head_before=OTHER_HEAD)
+
+    def test_wrong_repo_before_review_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(claude_review.ClaudeReviewError, "repository name does not match manifest before"):
+                self._run(Path(directory), _envelope(), repo_before="heimgewebe/other")
 
     def test_head_drift_during_review_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
