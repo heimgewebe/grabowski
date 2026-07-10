@@ -145,16 +145,30 @@ def run_checked(argv: list[str], *, cwd: Path, timeout_seconds: int, text: bool 
     return completed
 
 
-def current_repo_name(repo: Path) -> str:
+def target_repo_from_pr_url(value: str, *, expected_pr: int) -> str:
+    match = re.fullmatch(
+        r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/(?P<pr>[0-9]+)/?",
+        value.strip(),
+        flags=re.IGNORECASE,
+    )
+    if match is None or int(match.group("pr")) != expected_pr:
+        raise ClaudeReviewError("cannot determine PR target repository from GitHub URL")
+    result = f"{match.group('owner')}/{match.group('repo')}".lower()
+    if REPO_RE.fullmatch(result) is None:
+        raise ClaudeReviewError("PR target repository is invalid")
+    return result
+
+
+def current_pr_repo_name(repo: Path, pr: int) -> str:
     completed = run_checked(
-        ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+        ["gh", "pr", "view", str(pr), "--json", "url", "--jq", ".url"],
         cwd=repo,
         timeout_seconds=60,
     )
     value = completed.stdout.strip()
     if not value:
-        raise ClaudeReviewError("cannot determine repository name")
-    return value
+        raise ClaudeReviewError("cannot determine current PR URL")
+    return target_repo_from_pr_url(value, expected_pr=pr)
 
 
 def current_pr_head(repo: Path, pr: int) -> str:
@@ -355,7 +369,7 @@ def run_from_manifest(
     expected_repo = manifest["repo"].lower()
     expected_head = manifest["head_sha"].lower()
     expected_diff_sha256 = manifest["diff_sha256"].lower()
-    if current_repo_name(repo).strip().lower() != expected_repo:
+    if current_pr_repo_name(repo, pr) != expected_repo:
         raise ClaudeReviewError("repository name does not match manifest before review")
     if current_pr_head(repo, pr).lower() != expected_head:
         raise ClaudeReviewError("current PR head does not match manifest before review")
@@ -403,7 +417,7 @@ def run_from_manifest(
         raise ClaudeReviewError("Claude packet review returned empty stdout")
     envelope, review = parse_review_json(raw_stdout)
 
-    if current_repo_name(repo).strip().lower() != expected_repo:
+    if current_pr_repo_name(repo, pr) != expected_repo:
         raise ClaudeReviewError("repository name changed during review")
     if current_pr_head(repo, pr).lower() != expected_head:
         raise ClaudeReviewError("current PR head changed during review")
