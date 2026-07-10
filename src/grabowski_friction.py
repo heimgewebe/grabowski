@@ -4,6 +4,7 @@ from collections import Counter
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 import uuid
@@ -264,19 +265,27 @@ CONNECTOR_DIAGNOSTIC_UNITS = (
     "grabowski-operator.service",
     "tunnel-client-grabowski.service",
 )
-CONNECTOR_TRANSPORT_LOG_MARKERS = (
-    ("502", "502"),
-    ("upstream_or_external_service", "upstream or external service"),
-    ("upstream_external_service", "upstream/external service"),
-    ("external_service_error", "external service error"),
-    ("streamable_http", "streamable_http"),
-    ("received_exception_from_stream", "received exception from stream"),
-    ("mcp_stream", "mcp stream"),
-    ("post_mcp", "post /mcp"),
-    ("connector_timeout", "connector timeout"),
-    ("transport_timeout", "transport timeout"),
-    ("timeout", "timeout"),
+CONNECTOR_HTTP_STATUS_KEYS = (
+    "status",
+    "status_code",
+    "http_status",
+    "http_status_code",
+    "response_status",
+    "response_code",
 )
+CONNECTOR_ACTIVITY_MESSAGES = {
+    "dispatcher forwarded command to MCP server": "forwarded_to_mcp",
+    "dispatcher acknowledged notification with control plane": "control_plane_ack",
+}
+CONNECTOR_ERROR_MESSAGE_TERMS = {
+    "received exception from stream": "stream_exception",
+    "streamable_http": "stream_exception",
+    "upstream or external service": "upstream_error",
+    "upstream/external service": "upstream_error",
+    "external service error": "upstream_error",
+}
+CONNECTOR_STRONG_TIMEOUT_TERMS = ("timed out", "deadline exceeded")
+
 CONNECTOR_TRANSPORT_TERMS = frozenset({
     "502",
     "upstream or external service",
@@ -552,7 +561,107 @@ def _service_status_probe(unit: str) -> dict[str, Any]:
     }
 
 
-def _journal_marker_probe(unit: str, max_lines: int) -> dict[str, Any]:
+def _journal_record_payload(record: dict[str, Any]) -> dict[str, Any]:
+    message = record.get("MESSAGE")
+    if isinstance(message, str):
+        try:
+            nested = json.loads(message)
+        except json.JSONDecodeError:
+            nested = None
+        if isinstance(nested, dict):
+            payload = dict(nested)
+        else:
+            payload = {"msg": message}
+        payload["_journal_priority"] = record.get("PRIORITY")
+        return payload
+    return {}
+
+
+def _coerce_http_status(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        status = value
+    elif isinstance(value, str) and value.isdigit():
+        status = int(value)
+    else:
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def _explicit_http_statuses(payload: dict[str, Any]) -> list[int]:
+    statuses: set[int] = set()
+    candidates = [payload]
+    for key in ("error", "response", "http"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for candidate in candidates:
+        for key in CONNECTOR_HTTP_STATUS_KEYS:
+            status = _coerce_http_status(candidate.get(key))
+            if status is not None:
+                statuses.add(status)
+    message = payload.get("msg")
+    if isinstance(message, str):
+        explicit_patterns = (
+            r"(?:status|status_code|http_status|response_status|response_code|code)\s*[=:]\s*(\d{3})(?!\d)",
+            r"HTTP/\d(?:\.\d)?\s+(\d{3})(?!\d)",
+            r"received exception from stream\s*:\s*([45]\d{2})(?=\s+(?:upstream|external|http|bad gateway|service error))",
+            r"(?:upstream(?: or|/)external service|external service error)[^0-9]{0,32}([45]\d{2})(?!\d)",
+        )
+        for pattern in explicit_patterns:
+            for match in re.finditer(pattern, message, flags=re.IGNORECASE):
+                status = _coerce_http_status(match.group(1))
+                if status is not None:
+                    statuses.add(status)
+    return sorted(statuses)
+
+
+def _journal_transport_event(record: dict[str, Any]) -> dict[str, Any]:
+    payload = _journal_record_payload(record)
+    message = payload.get("msg") if isinstance(payload.get("msg"), str) else ""
+    lowered = message.lower()
+    level = str(payload.get("level", "")).upper()
+    if not level:
+        priority = str(payload.get("_journal_priority", ""))
+        if priority in {"0", "1", "2", "3"}:
+            level = "ERROR"
+        elif priority == "4":
+            level = "WARNING"
+    statuses = _explicit_http_statuses(payload)
+    domains: set[str] = set()
+    for status in statuses:
+        if status >= 500:
+            domains.add("upstream_http")
+        elif status >= 400:
+            domains.add("client_http")
+    error_level = level in {"ERROR", "WARN", "WARNING", "CRITICAL"}
+    if (
+        any(term in lowered for term in CONNECTOR_STRONG_TIMEOUT_TERMS)
+        or (error_level and "timeout" in lowered)
+    ):
+        domains.add("timeout")
+    if error_level:
+        for term, domain in CONNECTOR_ERROR_MESSAGE_TERMS.items():
+            if term in lowered:
+                domains.add(domain)
+    error_value = payload.get("error")
+    if isinstance(error_value, str) and error_value.strip():
+        domains.add("reported_error")
+    elif isinstance(error_value, dict) and error_value:
+        domains.add("reported_error")
+    activity = CONNECTOR_ACTIVITY_MESSAGES.get(message)
+    return {
+        "timestamp": str(payload.get("time") or record.get("__REALTIME_TIMESTAMP") or "")[:80],
+        "level": level[:16],
+        "component": str(payload.get("component", ""))[:80],
+        "http_statuses": statuses,
+        "error_domains": sorted(domains),
+        "activity": activity,
+    }
+
+
+def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
     name = operator._validate_unit(unit)
     result = _run_diagnostic_command(
         [
@@ -561,34 +670,47 @@ def _journal_marker_probe(unit: str, max_lines: int) -> dict[str, Any]:
             "--unit",
             name,
             "--no-pager",
-            "--output=short-iso",
+            "--output=json",
             "--lines",
             str(max_lines),
         ],
         timeout_seconds=30,
         max_output_bytes=131_072,
     )
-    marker_counts = {marker_id: 0 for marker_id, _ in CONNECTOR_TRANSPORT_LOG_MARKERS}
+    error_domains: Counter[str] = Counter()
+    http_statuses: Counter[str] = Counter()
+    activity_counts: Counter[str] = Counter()
     samples: list[dict[str, Any]] = []
-    match_count = 0
-    for index, line in enumerate(str(result.get("stdout", "")).splitlines(), start=1):
-        lowered = line.lower()
-        markers = [
-            marker_id
-            for marker_id, marker_text in CONNECTOR_TRANSPORT_LOG_MARKERS
-            if marker_text in lowered
-        ]
-        if not markers:
+    parsed_records = 0
+    invalid_json_records = 0
+    transport_error_count = 0
+    for line in str(result.get("stdout", "")).splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            invalid_json_records += 1
             continue
-        match_count += 1
-        for marker in markers:
-            marker_counts[marker] += 1
+        if not isinstance(record, dict):
+            invalid_json_records += 1
+            continue
+        parsed_records += 1
+        event = _journal_transport_event(record)
+        if event["activity"]:
+            activity_counts[event["activity"]] += 1
+        for status in event["http_statuses"]:
+            http_statuses[str(status)] += 1
+        if not event["error_domains"]:
+            continue
+        transport_error_count += 1
+        for domain in event["error_domains"]:
+            error_domains[domain] += 1
         if len(samples) < CONNECTOR_DIAGNOSTIC_SAMPLE_LIMIT:
-            parts = line.split(maxsplit=2)
             samples.append({
-                "line_index": index,
-                "timestamp": parts[0] if parts else "",
-                "markers": markers,
+                "timestamp": event["timestamp"],
+                "level": event["level"],
+                "component": event["component"],
+                "http_statuses": event["http_statuses"],
+                "error_domains": event["error_domains"],
             })
     return {
         "unit": name,
@@ -597,10 +719,14 @@ def _journal_marker_probe(unit: str, max_lines: int) -> dict[str, Any]:
         "timed_out": result["timed_out"],
         "stdout_truncated": result["stdout_truncated"],
         "stderr_truncated": result["stderr_truncated"],
-        "marker_counts": marker_counts,
-        "match_count": match_count,
-        "matched_line_samples": samples,
-        "matched_line_samples_truncated": match_count > len(samples),
+        "parsed_records": parsed_records,
+        "invalid_json_records": invalid_json_records,
+        "transport_error_count": transport_error_count,
+        "error_domain_counts": dict(sorted(error_domains.items())),
+        "http_status_counts": dict(sorted(http_statuses.items())),
+        "activity_counts": dict(sorted(activity_counts.items())),
+        "error_samples": samples,
+        "error_samples_truncated": transport_error_count > len(samples),
         "stderr_preview": _bounded_summary_text(result.get("stderr"), max_chars=240),
     }
 
@@ -666,14 +792,14 @@ def connector_transport_live_diagnostics(
         for unit in CONNECTOR_DIAGNOSTIC_UNITS
     }
     journal_probes = {
-        unit: _journal_marker_probe(unit, max_log_lines)
+        unit: _journal_transport_probe(unit, max_log_lines)
         for unit in CONNECTOR_DIAGNOSTIC_UNITS
     }
-    marker_match_count = sum(
-        probe["match_count"] for probe in journal_probes.values()
+    transport_error_count = sum(
+        probe["transport_error_count"] for probe in journal_probes.values()
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "authority": "read_only_transport_diagnostic_receipt",
         "source": "friction-log-and-local-user-systemd",
         "limit": limit,
@@ -689,9 +815,9 @@ def connector_transport_live_diagnostics(
         },
         "runtime_status": _runtime_status_probe(),
         "service_statuses": service_statuses,
-        "journal_marker_probes": journal_probes,
-        "live_transport_markers_observed": marker_match_count > 0,
-        "marker_match_count": marker_match_count,
+        "journal_transport_probes": journal_probes,
+        "live_transport_errors_observed": transport_error_count > 0,
+        "transport_error_count": transport_error_count,
         "recommended_next_policy": history["split_retry_policy"],
         "does_not_establish": list(CONNECTOR_TRANSPORT_DOES_NOT_ESTABLISH),
     }

@@ -49,7 +49,7 @@ Minimum bounded probe after a connector transport failure:
 
 1. Read `grabowski_status` to check runtime contract and client snapshot visibility.
 2. Read `grabowski_service_status` for `grabowski-operator.service` and `tunnel-client-grabowski.service`.
-3. Inspect only bounded, recent, redacted journal lines for `streamable_http`, `Received exception from stream`, `POST /mcp`, `timeout` and `502`.
+3. Parse only bounded recent journal records as JSON. Count explicit HTTP status fields, structured error objects and warning/error domains; record ordinary MCP forwarding separately as activity. A bare digit sequence such as `.502` inside a timestamp is not an HTTP status.
 4. Run one adjacent small typed read-only call to see whether the transport path is still failing.
 
 Retry policy:
@@ -61,7 +61,7 @@ Retry policy:
 
 `grabowski_friction_summary` includes `connector_transport_diagnostics`. This is diagnostic guidance only. It does not prove root cause, command success, safe mutation retry, connector vendor repair or transport reliability.
 
-`grabowski_connector_transport_diagnostics` turns the same guidance into a bounded read-only diagnostic receipt: it reads recent friction events, `grabowski_status`, fixed user-service status for `grabowski-operator.service` and `tunnel-client-grabowski.service`, and marker counts from bounded recent journal samples. It returns marker counts and timestamp/marker samples, not raw log lines. It is still diagnostic evidence only and does not authorize retry, mutation, merge, deploy or policy exceptions.
+`grabowski_connector_transport_diagnostics` turns the same guidance into a bounded read-only diagnostic receipt. It reads recent friction events, `grabowski_status`, fixed user-service status for `grabowski-operator.service` and `tunnel-client-grabowski.service`, and JSON journal records from bounded recent samples. Schema version 2 separates `activity_counts` from `transport_error_count`, groups errors by domain and accepts HTTP codes only from explicit structured fields or explicit status syntax. Samples contain only bounded timestamp, level, component, status and error-domain fields; raw log messages are not returned. This remains diagnostic evidence only and does not authorize retry, mutation, merge, deploy or policy exceptions.
 
 ## Task failure classification loop
 

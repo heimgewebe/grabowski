@@ -17,6 +17,22 @@ PROTECTED_BRANCHES = operator.PROTECTED_BRANCHES
 READ_ONLY = operator.READ_ONLY
 MUTATING = operator.MUTATING
 MAX_OUTPUT_BYTES = operator.MAX_OUTPUT_BYTES
+LOGICAL_RUNTIME_SERVICE = "grabowski-mcp"
+OPERATOR_UNIT = "grabowski-operator.service"
+TUNNEL_UNIT = "tunnel-client-grabowski.service"
+RUNTIME_TARGET = "heim-pc"
+
+
+def runtime_service_model(deployment: dict[str, Any] | None = None) -> dict[str, Any]:
+    metadata = deployment if isinstance(deployment, dict) else {}
+    return {
+        "logical_runtime_service": LOGICAL_RUNTIME_SERVICE,
+        "runtime_target": RUNTIME_TARGET,
+        "operator_unit": OPERATOR_UNIT,
+        "tunnel_unit": TUNNEL_UNIT,
+        "deployment_release": metadata.get("release_id"),
+        "repo_head": metadata.get("repo_head"),
+    }
 
 
 def _runtime_contract_snapshot() -> dict[str, Any]:
@@ -146,7 +162,8 @@ def grabowski_context(profile: str = "concise") -> dict[str, Any]:
         "profile": profile,
         "generated_at_unix": int(time.time()),
         "runtime": {
-            "service": "grabowski-mcp",
+            "service": LOGICAL_RUNTIME_SERVICE,
+            "service_model": runtime_service_model(deployment),
             "contract_source": snapshot["source"],
             "expected_tools": expected_tools,
             "deployment": deployment,

@@ -44,6 +44,7 @@ MAX_NOTIFY_ON_DONE_TEXT = 200
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
 FINALIZATION_RECEIPT_NAME = "finalization.json"
 RUNTIME_DEPLOY_FINALIZATION_KIND = "grabowski_runtime_deploy_finalization"
+RESERVED_RUNTIME_DEPLOY_RUNNER = (HOME / "repos" / "grabowski" / "tools" / "run_scheduled_deploy.py").resolve()
 JOB_EXPECTED_HEAD_RE = re.compile(r"[0-9a-f]{40,64}")
 JOB_FINAL_STATUS_NON_CLAIMS = (
     "notification_delivery",
@@ -1489,6 +1490,26 @@ def grabowski_terminal_run(
     )
 
 
+def _reserved_runtime_deploy_command(
+    command: list[str],
+    working_directory: Path,
+) -> bool:
+    for argument in command[1:]:
+        for candidate in _argument_path_candidates(argument):
+            if not _path_like_argument(candidate):
+                continue
+            path = Path(_expand_home_references(candidate)).expanduser()
+            if not path.is_absolute():
+                path = working_directory / path
+            try:
+                resolved = path.resolve(strict=False)
+            except OSError:
+                resolved = path.absolute()
+            if resolved == RESERVED_RUNTIME_DEPLOY_RUNNER:
+                return True
+    return False
+
+
 def _start_job(
     argv: list[str],
     cwd: str | None = None,
@@ -1496,13 +1517,26 @@ def _start_job(
     notify_on_done: dict[str, Any] | None = None,
     *,
     finalization_expected_head: str | None = None,
+    reserved_unit: str | None = None,
+    allow_reserved_runtime_deploy: bool = False,
 ) -> dict[str, Any]:
     """Start an already-authorized durable job."""
     working_directory = _resolve_cwd(cwd)
     command = _validate_argv(argv, cwd=working_directory)
+    if (
+        _reserved_runtime_deploy_command(command, working_directory)
+        and not allow_reserved_runtime_deploy
+    ):
+        raise PermissionError(
+            "runtime deploy runner is reserved for the typed self-deploy scheduler"
+        )
     runtime = _job_runtime(runtime_seconds)
     notify_metadata = _normalize_notify_on_done(notify_on_done)
-    unit = JOB_PREFIX + uuid.uuid4().hex[:12]
+    unit = (
+        _validate_unit(reserved_unit, job_only=True)
+        if reserved_unit is not None
+        else JOB_PREFIX + uuid.uuid4().hex[:12]
+    )
     directory = _job_directory(unit, create=True)
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"

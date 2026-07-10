@@ -103,6 +103,28 @@ class OperatorContractTests(unittest.TestCase):
         )
         self.assertIsInstance(tree, ast.Module)
 
+    def test_runtime_deploy_runner_is_reserved_for_typed_scheduler(self) -> None:
+        operator = _load_operator_module()
+        repo = operator.HOME / "repos" / "grabowski"
+        runner = "tools/run_scheduled_deploy.py"
+        commands = [
+            ["/usr/bin/python3", runner, "--expected-head", "a" * 40],
+            ["python3", runner],
+            ["/usr/bin/env", "python3", runner],
+            ["bash", "-c", f"python3 {runner} --expected-head {'a' * 40}"],
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(
+                    operator._reserved_runtime_deploy_command(command, repo)
+                )
+        self.assertFalse(
+            operator._reserved_runtime_deploy_command(
+                ["python3", "-c", "print(1)"],
+                repo,
+            )
+        )
+
     def test_expected_tools_are_declared(self) -> None:
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
         declared = set()

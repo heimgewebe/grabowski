@@ -5,8 +5,11 @@ UV ?= uv
 UV_RUNTIME_LOCK_VERSION := 0.9.18
 DEPLOY_TOOLING_VENV ?= build/deploy-tooling/.venv
 DEPLOY_TOOL_PYTHON := $(DEPLOY_TOOLING_VENV)/bin/python
+GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python
+RETENTION_MIN_AGE_SECONDS ?= 86400
+RETENTION_MAX_ARCHIVE_JOBS ?= 128
 
-.PHONY: validate syntax test policy context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy
+.PHONY: validate syntax test policy context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply
 
 validate: syntax test policy context-check profiles-check runtime-lock deploy-tooling-check secrets
 
@@ -67,4 +70,14 @@ deploy-apply: context-check deploy-tooling
 deploy-direct: deploy-apply
 
 deploy: context-check
->$(PYTHON) tools/schedule_runtime_deploy.py --repo "$(CURDIR)" --delay-seconds 8
+>test -x "$(GRABOWSKI_RUNTIME_PYTHON)"
+>set -eu; expected_head="$$(git rev-parse --verify HEAD)"; "$(GRABOWSKI_RUNTIME_PYTHON)" tools/schedule_runtime_deploy.py --expected-head "$$expected_head" --delay-seconds 8
+
+runtime-retention-check: context-check
+>test -x "$(GRABOWSKI_RUNTIME_PYTHON)"
+>"$(GRABOWSKI_RUNTIME_PYTHON)" tools/maintain_runtime_state.py --minimum-job-age-seconds "$(RETENTION_MIN_AGE_SECONDS)" --max-archive-jobs "$(RETENTION_MAX_ARCHIVE_JOBS)"
+
+runtime-retention-apply: context-check
+>test -x "$(GRABOWSKI_RUNTIME_PYTHON)"
+>test -n "$(RETENTION_PLAN_SHA256)"
+>"$(GRABOWSKI_RUNTIME_PYTHON)" tools/maintain_runtime_state.py --minimum-job-age-seconds "$(RETENTION_MIN_AGE_SECONDS)" --max-archive-jobs "$(RETENTION_MAX_ARCHIVE_JOBS)" --apply --expected-plan-sha256 "$(RETENTION_PLAN_SHA256)"

@@ -31,7 +31,7 @@ class FrictionLedgerContractTests(unittest.TestCase):
         self.assertIn('def connector_transport_diagnostics', source)
         self.assertIn('def connector_transport_live_diagnostics', source)
         self.assertIn('connector_transport_diagnostics', source)
-        self.assertIn('journal_marker_probes', source)
+        self.assertIn('journal_transport_probes', source)
         self.assertIn('invalid_lines', source)
         self.assertIn('def _bounded_event', source)
         self.assertIn('operator._redact(text)', source)
@@ -361,13 +361,30 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
                     "stderr_truncated": False,
                 }
             if argv[0] == "journalctl":
+                records = [
+                    {
+                        "__REALTIME_TIMESTAMP": "1783717201502676",
+                        "MESSAGE": json.dumps({
+                            "time": "2026-07-10T00:00:01.502676+02:00",
+                            "level": "INFO",
+                            "component": "dispatcher",
+                            "msg": "dispatcher forwarded command to MCP server",
+                        }),
+                    },
+                    {
+                        "__REALTIME_TIMESTAMP": "1783717202000000",
+                        "MESSAGE": json.dumps({
+                            "time": "2026-07-10T00:00:02+02:00",
+                            "level": "ERROR",
+                            "component": "dispatcher",
+                            "msg": "Received exception from stream: 502 upstream/external service error",
+                        }),
+                    },
+                ]
                 return {
                     "returncode": 0,
                     "timed_out": False,
-                    "stdout": (
-                        "2026-07-10T00:00:01+0200 host python[1]: POST /mcp 200 OK\n"
-                        "2026-07-10T00:00:02+0200 host python[1]: Received exception from stream: 502 upstream/external service error\n"
-                    ),
+                    "stdout": "".join(json.dumps(record) + "\n" for record in records),
                     "stderr": "",
                     "stdout_truncated": False,
                     "stderr_truncated": False,
@@ -385,16 +402,104 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             diagnostics["service_statuses"]["grabowski-operator.service"]["properties"]["ActiveState"],
             "active",
         )
-        self.assertTrue(diagnostics["live_transport_markers_observed"])
-        self.assertEqual(diagnostics["journal_marker_probes"]["grabowski-operator.service"]["max_lines"], 25)
-        self.assertGreaterEqual(
-            diagnostics["journal_marker_probes"]["grabowski-operator.service"]["marker_counts"]["post_mcp"],
-            1,
-        )
+        self.assertEqual(diagnostics["schema_version"], 2)
+        self.assertTrue(diagnostics["live_transport_errors_observed"])
+        probe = diagnostics["journal_transport_probes"]["grabowski-operator.service"]
+        self.assertEqual(probe["max_lines"], 25)
+        self.assertEqual(probe["transport_error_count"], 1)
+        self.assertEqual(probe["http_status_counts"], {"502": 1})
+        self.assertEqual(probe["activity_counts"], {"forwarded_to_mcp": 1})
         self.assertIn("command_success_or_failure", diagnostics["does_not_establish"])
         self.assertIn("target state is re-read", diagnostics["recommended_next_policy"]["mutation_rule"])
         rendered = json.dumps(diagnostics, sort_keys=True)
         self.assertNotIn("host python[1]", rendered)
+
+    def test_connector_transport_probe_uses_journal_priority_for_plain_errors(self) -> None:
+        module = self._load_module()
+        record = {
+            "__REALTIME_TIMESTAMP": "1783718211000000",
+            "PRIORITY": "3",
+            "MESSAGE": "Received exception from stream: 503 upstream/external service error",
+        }
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": json.dumps(record) + "\n",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["transport_error_count"], 1)
+        self.assertEqual(probe["http_status_counts"], {"503": 1})
+        self.assertIn("stream_exception", probe["error_domain_counts"])
+
+    def test_connector_transport_probe_does_not_treat_latency_as_http_status(self) -> None:
+        module = self._load_module()
+        records = [
+            {
+                "PRIORITY": "6",
+                "MESSAGE": json.dumps({
+                    "time": "2026-07-10T23:16:50+02:00",
+                    "level": "INFO",
+                    "component": "dispatcher",
+                    "msg": "Received exception from stream after 502 ms during recovered probe",
+                }),
+            },
+            {
+                "PRIORITY": "6",
+                "MESSAGE": json.dumps({
+                    "time": "2026-07-10T23:16:51+02:00",
+                    "level": "INFO",
+                    "component": "dispatcher",
+                    "msg": "configured timeout=30 for connector diagnostics",
+                }),
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe(
+            "tunnel-client-grabowski.service",
+            25,
+        )
+
+        self.assertEqual(probe["transport_error_count"], 0)
+        self.assertEqual(probe["http_status_counts"], {})
+
+    def test_connector_transport_probe_does_not_treat_fractional_timestamp_as_502(self) -> None:
+        module = self._load_module()
+        record = {
+            "__REALTIME_TIMESTAMP": "1783718210502676",
+            "MESSAGE": json.dumps({
+                "time": "2026-07-10T23:16:50.50267652+02:00",
+                "level": "INFO",
+                "component": "dispatcher",
+                "msg": "dispatcher forwarded command to MCP server",
+            }),
+        }
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": json.dumps(record) + "\n",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["transport_error_count"], 0)
+        self.assertEqual(probe["http_status_counts"], {})
+        self.assertEqual(probe["activity_counts"], {"forwarded_to_mcp": 1})
 
     def test_connector_transport_live_diagnostics_bounds_log_lines(self) -> None:
         module = self._load_module()

@@ -330,7 +330,8 @@ def grabowski_runtime_health() -> dict[str, Any]:
         for key in DEPLOYMENT_INTEGRITY_FIELDS
     }
     return {
-        "service": "grabowski-mcp",
+        "service": runtime_extensions.LOGICAL_RUNTIME_SERVICE,
+        "service_model": runtime_extensions.runtime_service_model(deployment),
         "healthy": (
             deployment.get("completion_status") == "complete"
             and all(integrity.values())
