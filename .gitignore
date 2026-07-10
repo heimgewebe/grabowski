@@ -27,3 +27,6 @@ core.*
 dist/
 build/
 *.egg-info/
+
+# Local, diff-bound self-review evidence; never PR content.
+.review-audits/

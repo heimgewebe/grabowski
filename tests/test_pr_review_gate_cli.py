@@ -48,10 +48,6 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
                 return []
             if argv[:3] == ["gh", "repo", "view"]:
                 return {"nameWithOwner": "contributor/weltgewebe"}
-            if argv[:3] == ["gh", "api", "repos/heimgewebe/weltgewebe/pulls/7/comments"]:
-                return []
-            if argv[:3] == ["gh", "api", "repos/heimgewebe/weltgewebe/pulls/7/reviews"]:
-                return []
             raise AssertionError(argv)
 
         with (
@@ -62,10 +58,7 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
 
         self.assertEqual(state["repoName"], "heimgewebe/weltgewebe")
         self.assertEqual(state["checkoutRepoName"], "contributor/weltgewebe")
-        self.assertIn(
-            ["gh", "api", "repos/heimgewebe/weltgewebe/pulls/7/comments", "--paginate", "--slurp"],
-            calls,
-        )
+        self.assertFalse(any(call[:2] == ["gh", "api"] for call in calls), calls)
 
     def test_malformed_or_mismatched_pr_url_has_no_target_identity(self) -> None:
         self.assertIsNone(pr_review_gate._target_repo_from_pr_url("https://github.com/a/b/pull/8", expected_pr=7))
@@ -73,14 +66,13 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
 
 
 class PrReviewGateCliTests(unittest.TestCase):
-    def test_missing_external_review_cannot_be_disabled(self) -> None:
-        source = (ROOT / "tools" / "pr_review_gate.py").read_text(encoding="utf-8")
-        marker = "cod" + "ex"
-        self.assertNotIn("--allow-missing-" + marker, source)
-        self.assertNotIn("require_" + marker, source)
-        self.assertIn("--claude-evidence", source)
+    def test_live_pr_query_excludes_review_comments_approvals_and_decisions(self) -> None:
+        self.assertNotIn("reviews", pr_review_gate.PR_FIELDS)
+        self.assertNotIn("latestReviews", pr_review_gate.PR_FIELDS)
+        self.assertNotIn("comments", pr_review_gate.PR_FIELDS)
+        self.assertNotIn("reviewDecision", pr_review_gate.PR_FIELDS)
 
-    def test_unavailable_review_reason_warns_but_no_cli_bypass_exists(self) -> None:
+    def test_optional_codex_unavailability_is_advisory(self) -> None:
         marker = "cod" + "ex"
         state = {
             "repoName": "heimgewebe/grabowski",
@@ -117,10 +109,15 @@ class PrReviewGateCliTests(unittest.TestCase):
             "review_focus": REVIEW_FOCUS,
             "diff_reviewed": True,
             "all_findings_triaged": True,
-            "review_iterations": [{"n": 1, "summary": "reviewed", "material_findings": 0}],
+            "review_iterations": [
+                {"n": n, "summary": f"review pass {n}", "material_findings": 0}
+                for n in range(1, 5)
+            ],
             "stop_reason": "clean_pass",
             "findings": [],
             "material_findings_remaining": 0,
+            "material_findings_after_first_review": 0,
+            "uncertainty": 0.1,
             "claude_review": {"required": False, "reason": "small low-risk diff"},
             marker + "_review": {"unavailable_reason": "service unavailable"},
         }
@@ -162,9 +159,10 @@ class PrReviewGateCliTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("Grabowski self-review evidence is missing", result["failures"])
 
-    def test_core_grabowski_paths_require_independent_review(self) -> None:
+    def test_core_grabowski_paths_require_deep_self_review(self) -> None:
         head = "a" * 40
         state = {
+            "repoName": "heimgewebe/grabowski",
             "pr_diff_bypass": True,
             "pr_diff_bypass_reason": "legacy unit seam without live PR diff",
             "pr": {
@@ -198,17 +196,23 @@ class PrReviewGateCliTests(unittest.TestCase):
             "review_focus": REVIEW_FOCUS,
             "diff_reviewed": True,
             "all_findings_triaged": True,
-            "review_iterations": [{"n": 1, "summary": "reviewed", "material_findings": 0}],
+            "review_iterations": [
+                {"n": n, "summary": f"review pass {n}", "material_findings": 0}
+                for n in range(1, 5)
+            ],
             "stop_reason": "clean_pass",
             "findings": [],
             "material_findings_remaining": 0,
+            "material_findings_after_first_review": 0,
+            "uncertainty": 0.1,
             "claude_review": {"required": False, "reason": "claimed small"},
         }
         result = pr_review_gate.evaluate_review_gate(state, self_review=review)
-        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["complexity"]["high_critical"])
+        self.assertEqual(result["complexity"]["minimum_self_review_iterations"], 4)
         self.assertIn("high-critical Grabowski operator path touched: src/grabowski_mcp.py", result["complexity"]["reasons"])
-        self.assertIn("External review evidence invalid: external review is required but evidence is missing", result["failures"])
+        self.assertFalse(result["review_sources"]["external_review_required"])
 
 class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
     def _state(self, *, reviews=None, review_comments=None) -> dict:
@@ -255,6 +259,8 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
             "stop_reason": "clean_pass",
             "findings": [],
             "material_findings_remaining": 0,
+            "material_findings_after_first_review": 0,
+            "uncertainty": 0.1,
             "claude_review": {"required": False, "reason": "small low-risk diff"},
         }
         payload.update(overrides)
@@ -292,7 +298,7 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertFalse(result["review_sources"]["codex_seen"])
         self.assertIn(
-            "Deprecated self_review.codex_review.required ignored; use diff-bound external review evidence",
+            "Deprecated self_review.codex_review.required ignored; external reviews are optional diagnostics",
             result["warnings"],
         )
 
@@ -563,7 +569,7 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertIn("Legacy Claude CLI evidence invalid and ignored: repo mismatch", result["warnings"])
         self.assertIn(
-            "Deprecated self_review.claude_review.required ignored; use diff-bound external review evidence",
+            "Deprecated self_review.claude_review.required ignored; external reviews are optional diagnostics",
             result["warnings"],
         )
 

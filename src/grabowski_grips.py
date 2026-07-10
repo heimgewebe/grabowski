@@ -746,6 +746,7 @@ def _captain_sleep(seconds: float) -> None:
 
 
 def _external_review_evidence_errors(evidence: Any, *, expected_head: str | None) -> list[str]:
+    """Validate optional legacy external-review diagnostics."""
     if not isinstance(evidence, dict):
         return ["external review evidence must be a structured object"]
     errors: list[str] = []
@@ -768,6 +769,86 @@ def _external_review_evidence_errors(evidence: Any, *, expected_head: str | None
         errors.append("findings must be a list of finding objects")
     return errors
 
+
+def _self_review_audit_errors(
+    evidence: Any,
+    *,
+    expected_head: str | None,
+    expected_diff_sha256: str | None = None,
+    expected_repo: str | None = None,
+    expected_pr: int | None = None,
+) -> list[str]:
+    if not isinstance(evidence, dict):
+        return ["self-review audit must be a structured object"]
+    errors: list[str] = []
+    if evidence.get("schema_version") != 1 or isinstance(evidence.get("schema_version"), bool):
+        errors.append("schema_version must be integer 1")
+    if evidence.get("kind") != "grabowski_self_review_audit":
+        errors.append("kind must be grabowski_self_review_audit")
+    if evidence.get("review_tier") not in {
+        "documentation",
+        "very_small",
+        "standard",
+        "important_repo",
+        "high_critical",
+    }:
+        errors.append("review_tier is missing or invalid")
+    repo = evidence.get("repo")
+    if not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo.strip()) is None:
+        errors.append("repo must have owner/repo form")
+    elif expected_repo is not None and repo.strip().lower() != expected_repo.strip().lower():
+        errors.append("repo does not match PR target")
+    pr_number = evidence.get("pr")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        errors.append("pr must be a positive integer")
+    elif expected_pr is not None and pr_number != expected_pr:
+        errors.append("pr does not match PR target")
+    generated_at = evidence.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at.strip():
+        errors.append("generated_at must be an RFC3339 timestamp with timezone")
+    else:
+        try:
+            parsed_generated_at = datetime.fromisoformat(generated_at.strip().replace("Z", "+00:00"))
+        except ValueError:
+            parsed_generated_at = None
+        if parsed_generated_at is None or parsed_generated_at.tzinfo is None:
+            errors.append("generated_at must be an RFC3339 timestamp with timezone")
+    head_sha = evidence.get("head_sha")
+    if not _is_hex_sha(head_sha, lengths=(40,)):
+        errors.append("head_sha must be a 40 character hex SHA")
+    elif expected_head is not None and head_sha != expected_head:
+        errors.append("head_sha does not match expected_head")
+    diff_sha256 = evidence.get("diff_sha256")
+    if not _is_hex_sha(diff_sha256, lengths=(64,)):
+        errors.append("diff_sha256 must be a 64 character hex SHA")
+    elif expected_diff_sha256 is not None and diff_sha256 != expected_diff_sha256:
+        errors.append("diff_sha256 does not match expected diff")
+    if evidence.get("gate_verdict") != "PASS":
+        errors.append("gate_verdict must be PASS")
+    if evidence.get("self_review_gate_valid") is not True:
+        errors.append("self_review_gate_valid must be true")
+    if evidence.get("all_findings_triaged") is not True:
+        errors.append("all_findings_triaged must be true")
+    minimum = evidence.get("minimum_review_iterations")
+    actual = evidence.get("actual_review_iterations")
+    if isinstance(minimum, bool) or not isinstance(minimum, int) or not 1 <= minimum <= 5:
+        errors.append("minimum_review_iterations must be an integer from 1 to 5")
+    if isinstance(actual, bool) or not isinstance(actual, int) or actual < 1:
+        errors.append("actual_review_iterations must be a positive integer")
+    elif isinstance(minimum, int) and not isinstance(minimum, bool) and actual < minimum:
+        errors.append("actual_review_iterations is below required minimum")
+    remaining = evidence.get("material_findings_remaining")
+    if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 0:
+        errors.append("material_findings_remaining must be an integer >= 0")
+    elif remaining > 0:
+        if evidence.get("residual_risk_accepted") is not True:
+            errors.append("material findings remain without accepted residual risk")
+        reason = evidence.get("residual_risk_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            errors.append("accepted residual risk requires a reason")
+    if evidence.get("tuning_signal") != "observe":
+        errors.append("tuning_signal must be observe for merge evidence")
+    return errors
 
 
 def _string_list_parameter(parameters: dict[str, Any], name: str, default: list[str] | None = None) -> list[str]:
@@ -1197,7 +1278,6 @@ def _summarize_pr_candidate(value: dict[str, Any]) -> dict[str, Any]:
         "head_oid": value.get("headRefOid"),
         "is_draft": value.get("isDraft"),
         "mergeable": value.get("mergeable"),
-        "review_decision": value.get("reviewDecision"),
         **check_summary,
     }
 
@@ -1225,7 +1305,7 @@ def _lookup_open_prs_for_branch(
             "--state",
             "open",
             "--json",
-            "number,url,state,baseRefName,headRefName,headRefOid,isDraft,mergeable,reviewDecision,statusCheckRollup",
+            "number,url,state,baseRefName,headRefName,headRefOid,isDraft,mergeable,statusCheckRollup",
         ],
     )
     if int(pr_result.get("returncode", 1)) != 0:
@@ -1335,10 +1415,11 @@ def _determine_situation_next_safe_grip(
             "does_not_establish": list(SITUATION_NON_CLAIMS),
         }
     if pr_summary.get("available"):
-        parameters: dict[str, Any] = {"repo": str(repo), "expected_head": orientation["head"]}
-        review_decision = pr_summary.get("review_decision")
-        if isinstance(review_decision, str):
-            parameters["review_decision"] = review_decision
+        parameters: dict[str, Any] = {
+            "repo": str(repo),
+            "expected_head": orientation["head"],
+            "self_review_required": True,
+        }
         check_results = pr_summary.get("check_results")
         if isinstance(check_results, dict) and check_results:
             parameters["check_results"] = check_results
@@ -1348,7 +1429,7 @@ def _determine_situation_next_safe_grip(
             "reason": "open PR exists for current branch and checkout is clean",
             "preconditions": [
                 "PR head is re-read before acting",
-                "checks and reviews are re-read before acting",
+                "checks, current diff hash and self-review audit are re-read before readiness can pass",
             ],
             "does_not_establish": list(SITUATION_NON_CLAIMS),
         }
@@ -1421,7 +1502,7 @@ def _run_pr_check_readiness(
         raise GripPreflightError("protected_branches must be a list of strings")
     branch_is_work = orientation["branch"] not in set(protected)
     upstream_set = orientation["upstream"] is not None
-    clean_required = bool(parameters.get("require_clean", False))
+    clean_required = _bool_parameter(parameters, "require_clean", False)
     clean_ok = not orientation["dirty"] if clean_required else True
     blocking_reasons: list[str] = []
     warnings: list[str] = []
@@ -1475,40 +1556,67 @@ def _run_pr_check_readiness(
         if not isinstance(review_decision, str):
             raise GripPreflightError("review_decision must be a string when provided")
         normalized_review = review_decision.upper()
-        if normalized_review in {"CHANGES_REQUESTED", "REQUEST_CHANGES"}:
-            _check(receipt, "review_decision", "fail", normalized_review)
-            blocking_reasons.append("review changes requested")
-        elif normalized_review == "REVIEW_REQUIRED":
-            _check(receipt, "review_decision", "fail", normalized_review)
-            blocking_reasons.append("review approval required")
-        elif normalized_review in {"APPROVED", "", "COMMENTED"}:
-            _check(receipt, "review_decision", "pass" if normalized_review == "APPROVED" else "warn", normalized_review or "empty")
-            if normalized_review != "APPROVED":
-                warnings.append("review is not approved")
-        else:
-            _check(receipt, "review_decision", "warn", normalized_review)
-            warnings.append("unknown review decision")
+        status = "pass" if normalized_review == "APPROVED" else "warn"
+        _check(receipt, "review_decision", status, normalized_review or "empty")
+        warnings.append("review_decision is deprecated advisory metadata and never satisfies or blocks self-review")
     unresolved_findings = _string_list_parameter(parameters, "unresolved_findings")
     if unresolved_findings:
         _check(receipt, "unresolved_findings", "fail", ", ".join(unresolved_findings))
         blocking_reasons.append("unresolved review findings")
     else:
         _check(receipt, "unresolved_findings", "pass", "none")
-    external_review_required = bool(parameters.get("external_review_required", False))
-    external_review_evidence = parameters.get("external_review_evidence")
-    if external_review_required and not external_review_evidence:
-        _check(receipt, "external_review_evidence", "fail", "external review required but no evidence provided")
-        blocking_reasons.append("external review evidence missing")
-    elif external_review_required:
-        expected_head_for_review = expected_head if isinstance(expected_head, str) else None
-        evidence_errors = _external_review_evidence_errors(external_review_evidence, expected_head=expected_head_for_review)
-        if evidence_errors:
-            _check(receipt, "external_review_evidence", "fail", "; ".join(evidence_errors))
-            blocking_reasons.append("external review evidence invalid")
-        else:
-            _check(receipt, "external_review_evidence", "pass", "structured evidence provided")
+    requested_self_review_required = _bool_parameter(
+        parameters, "self_review_required", True
+    )
+    self_review_required = True
+    if not requested_self_review_required:
+        warnings.append(
+            "self_review_required=false is deprecated and ignored; PR readiness always requires self-review"
+        )
+    self_review_audit = parameters.get("self_review_audit")
+    expected_head_for_review = str(orientation["head"])
+    raw_expected_review_diff = parameters.get("expected_diff_sha256")
+    expected_review_diff: str | None = None
+    if raw_expected_review_diff is not None:
+        if not isinstance(raw_expected_review_diff, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", raw_expected_review_diff):
+            raise GripPreflightError("expected_diff_sha256 must be a 64 character hex SHA when provided")
+        expected_review_diff = raw_expected_review_diff.lower()
+    if self_review_required and expected_review_diff is None:
+        _check(receipt, "self_review_diff_binding", "fail", "expected_diff_sha256 is required")
+        blocking_reasons.append("self-review diff binding missing")
+    elif expected_review_diff is not None:
+        _check(receipt, "self_review_diff_binding", "pass", expected_review_diff)
     else:
-        _check(receipt, "external_review_evidence", "skip", "not required")
+        _check(receipt, "self_review_diff_binding", "skip", "self-review not required")
+    if self_review_required and not self_review_audit:
+        _check(receipt, "self_review_audit", "fail", "self-review required but no audit provided")
+        blocking_reasons.append("self-review audit missing")
+    elif self_review_audit is not None:
+        evidence_errors = _self_review_audit_errors(
+            self_review_audit,
+            expected_head=expected_head_for_review,
+            expected_diff_sha256=expected_review_diff,
+        )
+        if evidence_errors:
+            _check(receipt, "self_review_audit", "fail", "; ".join(evidence_errors))
+            blocking_reasons.append("self-review audit invalid")
+        else:
+            _check(receipt, "self_review_audit", "pass", "diff-bound self-review audit provided")
+    else:
+        _check(receipt, "self_review_audit", "skip", "not requested on this readiness probe")
+    if parameters.get("external_review_required") is True:
+        warnings.append("external_review_required is deprecated and ignored; use self_review_required")
+    external_review_evidence = parameters.get("external_review_evidence")
+    if external_review_evidence is not None:
+        legacy_errors = _external_review_evidence_errors(
+            external_review_evidence, expected_head=expected_head_for_review
+        )
+        status = "warn" if legacy_errors else "pass"
+        detail = "; ".join(legacy_errors) if legacy_errors else "optional diagnostic evidence provided"
+        _check(receipt, "external_review_evidence", status, detail)
+        warnings.append("external review evidence is optional and never satisfies self-review")
+    else:
+        _check(receipt, "external_review_evidence", "skip", "optional and absent")
     ready = branch_is_work and upstream_set and clean_ok and not blocking_reasons
     verdict = "ready" if ready else "blocked"
     return {
@@ -1522,7 +1630,9 @@ def _run_pr_check_readiness(
         "required_checks": required_checks,
         "check_results": check_results,
         "unresolved_findings": unresolved_findings,
-        "external_review_required": external_review_required,
+        "self_review_required": self_review_required,
+        "expected_diff_sha256": expected_review_diff,
+        "external_review_required": False,
     }
 
 
@@ -1924,15 +2034,12 @@ def _scout_pr_changes(pr_items: Any, *, branch: str, head: str) -> list[dict[str
         pr_branch = item.get("headRefName")
         pr_head = item.get("headRefOid")
         merge_state = item.get("mergeStateStatus")
-        decision = item.get("reviewDecision")
         if item.get("isDraft") is True:
             changes.append(_scout_change("pr_drift", "open PR is still draft", {"number": number, "title": title}))
         if isinstance(merge_state, str) and merge_state not in {"CLEAN", "UNKNOWN", ""}:
             changes.append(_scout_change("pr_drift", "open PR merge state changed", {"number": number, "merge_state": merge_state}))
         if pr_branch == branch and isinstance(pr_head, str) and pr_head and pr_head != head:
             changes.append(_scout_change("pr_drift", "local branch head differs from open PR head", {"number": number, "local_head": head, "pr_head": pr_head}))
-        if isinstance(decision, str) and decision.upper() in {"CHANGES_REQUESTED", "REQUEST_CHANGES", "REVIEW_REQUIRED"}:
-            changes.append(_scout_change("stale_review", "open PR review state requires attention", {"number": number, "review_decision": decision}))
     return changes
 
 
@@ -1985,7 +2092,7 @@ def _run_scout(
     if github_repo is not None:
         if not isinstance(github_repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", github_repo):
             raise GripPreflightError("github_repo must have owner/repo form when provided")
-        pr_result = _github(repo, github_runner, ["pr", "list", "--repo", github_repo, "--state", "open", "--json", "number,title,headRefName,headRefOid,isDraft,mergeStateStatus,reviewDecision,updatedAt"])
+        pr_result = _github(repo, github_runner, ["pr", "list", "--repo", github_repo, "--state", "open", "--json", "number,title,headRefName,headRefOid,isDraft,mergeStateStatus,updatedAt"])
         changes.extend(_scout_pr_changes(_json_stdout(pr_result), branch=branch, head=head))
 
     for raw_path in _scout_string_list(parameters, "receipt_paths"):
@@ -2459,9 +2566,33 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
         schema["required_evidence"].extend([
             _captain_action_evidence_item(
                 "review_evidence",
-                required_fields=("head_sha", "diff_sha256", "reviews", "external_reviews_triaged"),
+                required_fields=(
+                    "schema_version",
+                    "kind",
+                    "repo",
+                    "pr",
+                    "generated_at",
+                    "head_sha",
+                    "diff_sha256",
+                    "review_tier",
+                    "gate_verdict",
+                    "self_review_gate_valid",
+                    "minimum_review_iterations",
+                    "actual_review_iterations",
+                    "all_findings_triaged",
+                    "material_findings_remaining",
+                    "tuning_signal",
+                ),
+                required_values={
+                    "schema_version": 1,
+                    "kind": "grabowski_self_review_audit",
+                    "gate_verdict": "PASS",
+                    "self_review_gate_valid": True,
+                    "all_findings_triaged": True,
+                    "tuning_signal": "observe",
+                },
                 binds=("expected_head", "diff_sha256", *common_bindings),
-                purpose="diff-bound review evidence for the exact PR head",
+                purpose="diff-bound self-review audit for the exact PR head, including risk-scaled review depth",
             ),
             _captain_action_evidence_item(
                 "ci_evidence",
@@ -3050,14 +3181,42 @@ def _captain_review_evidence_gate(parameters: dict[str, Any], actions: list[dict
             "review_evidence is missing",
             ["review_evidence_missing"],
         )
-    errors = _external_review_evidence_errors(evidence, expected_head=expected_head if isinstance(expected_head, str) else None)
+    expected_diff = parameters.get("diff_sha256")
+    pr_merge_targets = [
+        action.get("target")
+        for action in actions
+        if action.get("action") == "pr-merge" and isinstance(action.get("target"), dict)
+    ]
+    if not pr_merge_targets:
+        return _captain_gate(
+            "review-evidence-present",
+            "pass",
+            "self-review audit is not applicable because no pr-merge action is requested",
+        )
+    if len(pr_merge_targets) != 1:
+        return _captain_gate(
+            "review-evidence-present",
+            "blocked",
+            "one self-review audit can bind exactly one pr-merge action",
+            ["pr_merge_review_target_count_invalid"],
+        )
+    pr_target = pr_merge_targets[0]
+    expected_repo = pr_target.get("repo")
+    expected_pr = pr_target.get("pr")
+    errors = _self_review_audit_errors(
+        evidence,
+        expected_head=expected_head if isinstance(expected_head, str) else None,
+        expected_diff_sha256=expected_diff if isinstance(expected_diff, str) else None,
+        expected_repo=expected_repo if isinstance(expected_repo, str) else None,
+        expected_pr=expected_pr if isinstance(expected_pr, int) and not isinstance(expected_pr, bool) else None,
+    )
     errors.extend(_captain_evidence_digest_binding_errors(evidence, evidence_name="review_evidence", actions=actions))
     if errors:
-        return _captain_gate("review-evidence-present", "blocked", "review_evidence is invalid or digest-bound to another action", errors)
+        return _captain_gate("review-evidence-present", "blocked", "self-review audit is invalid or digest-bound to another action", errors)
     return _captain_gate(
         "review-evidence-present",
         "pass",
-        "triaged external review evidence recorded; review is a gate, not semantic correctness",
+        "diff-bound self-review audit records sufficient review depth and terminal triage; it is not posted to the PR",
     )
 
 

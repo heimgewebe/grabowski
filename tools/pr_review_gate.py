@@ -85,6 +85,8 @@ REQUIRED_SELF_REVIEW_FOCUS = (
     "integration",
 )
 SELF_REVIEW_DIFF_BYPASS_REASON = "legacy unit seam without live PR diff"
+SELF_REVIEW_AUDIT_KIND = "grabowski_self_review_audit"
+SELF_REVIEW_MAX_REQUIRED_ITERATIONS = 5
 RISK_PATH_MARKERS = (
     "auth",
     "access",
@@ -200,14 +202,10 @@ PR_FIELDS = (
     "headRefOid",
     "baseRefOid",
     "url",
-    "reviewDecision",
     "changedFiles",
     "additions",
     "deletions",
     "files",
-    "reviews",
-    "latestReviews",
-    "comments",
 )
 CHECK_FIELDS = ("bucket", "completedAt", "description", "event", "link", "name", "startedAt", "state", "workflow")
 MAX_JSON_EVIDENCE_BYTES = 1_000_000
@@ -303,19 +301,6 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _flatten_github_pages(raw: Any) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    if isinstance(raw, list):
-        for page in raw:
-            if isinstance(page, list):
-                items.extend(item for item in page if isinstance(item, dict))
-            elif isinstance(page, dict):
-                items.append(page)
-    elif isinstance(raw, dict):
-        items.append(raw)
-    return items
-
-
 def _target_repo_from_pr_url(value: Any, *, expected_pr: int) -> str | None:
     if not isinstance(value, str):
         return None
@@ -335,13 +320,8 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     repo_info = _run_json(repo, ["gh", "repo", "view", "--json", "nameWithOwner"])
     checkout_name = repo_info.get("nameWithOwner") if isinstance(repo_info, dict) else None
     target_name = _target_repo_from_pr_url(view.get("url"), expected_pr=pr) if isinstance(view, dict) else None
-    review_comments: list[dict[str, Any]] = []
-    pr_reviews: list[dict[str, Any]] = []
-    if target_name is not None:
-        raw_review_comments = _run_json(repo, ["gh", "api", f"repos/{target_name}/pulls/{pr}/comments", "--paginate", "--slurp"], allow_nonzero=True)
-        review_comments = _flatten_github_pages(raw_review_comments)
-        raw_pr_reviews = _run_json(repo, ["gh", "api", f"repos/{target_name}/pulls/{pr}/reviews", "--paginate", "--slurp"], allow_nonzero=True)
-        pr_reviews = _flatten_github_pages(raw_pr_reviews)
+    # Self-review evidence is local and diff-bound. PR comments, approvals and
+    # review bodies are deliberately absent from the live query and gate state.
     pr_diff_sha256: str | None = None
     pr_diff_text: str | None = None
     pr_diff_error: str | None = None
@@ -357,8 +337,6 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     return {
         "pr": view,
         "checks": checks,
-        "reviewComments": review_comments,
-        "prReviews": pr_reviews,
         "repoName": target_name,
         "checkoutRepoName": _canonical_repo_slug(checkout_name),
         "pr_diff_sha256": pr_diff_sha256,
@@ -556,7 +534,6 @@ def classify_complexity(
     very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     normalized_repo = _canonical_repo_slug(repo_name)
     important_repo = normalized_repo in IMPORTANT_REPOS
-    repo_claude_required = bool(important_repo and not docs_only)
 
     high_critical_reasons: list[str] = []
     if not docs_only:
@@ -570,50 +547,75 @@ def classify_complexity(
                 high_critical_reasons.append(reason)
     if isinstance(self_review, dict):
         uncertainty = self_review.get("uncertainty")
-        if isinstance(uncertainty, (int, float)) and float(uncertainty) > 0.35:
+        if (
+            isinstance(uncertainty, (int, float))
+            and not isinstance(uncertainty, bool)
+            and math.isfinite(float(uncertainty))
+            and 0.0 <= float(uncertainty) <= 1.0
+            and float(uncertainty) > 0.35
+        ):
             high_critical_reasons.append("high review uncertainty")
         material = self_review.get("material_findings_after_first_review")
-        if isinstance(material, int) and material > 3:
+        if (
+            isinstance(material, int)
+            and not isinstance(material, bool)
+            and material >= 0
+            and material > 3
+        ):
             high_critical_reasons.append("many material findings after first review")
 
-    external_review_reasons: list[str] = []
-    if high_critical_reasons:
-        external_review_reasons.extend(high_critical_reasons)
-    elif repo_claude_required:
-        external_review_reasons.append(f"important repository requires independent review: {normalized_repo}")
-    elif docs_only:
-        pass
-    elif very_small_uncomplicated:
-        pass
-    else:
-        external_review_reasons.append("non-trivial non-documentation change")
-
-    claude_cli_required = bool(high_critical_reasons) or repo_claude_required
+    high_critical_reasons = list(dict.fromkeys(high_critical_reasons))
+    large_documentation_change = docs_only and (changed_files > 15 or changed_lines > 500)
     if high_critical_reasons:
         review_tier = "high_critical"
-    elif repo_claude_required:
+        minimum_self_review_iterations = min(
+            SELF_REVIEW_MAX_REQUIRED_ITERATIONS,
+            3 + min(2, len(high_critical_reasons)),
+        )
+    elif important_repo and not docs_only:
         review_tier = "important_repo"
-    elif external_review_reasons:
-        review_tier = "external_llm"
+        minimum_self_review_iterations = 3
+    elif large_documentation_change:
+        review_tier = "standard"
+        minimum_self_review_iterations = 2
     elif docs_only:
-        review_tier = "exempt_documentation"
+        review_tier = "documentation"
+        minimum_self_review_iterations = 1
     elif very_small_uncomplicated:
-        review_tier = "exempt_very_small"
+        review_tier = "very_small"
+        minimum_self_review_iterations = 1
     else:
-        review_tier = "external_llm"
+        review_tier = "standard"
+        minimum_self_review_iterations = 2
+
+    depth_reasons = list(high_critical_reasons)
+    if important_repo and not docs_only and not high_critical_reasons:
+        depth_reasons.append(f"important repository: {normalized_repo}")
+    if not depth_reasons:
+        if large_documentation_change:
+            depth_reasons.append("large documentation-only change")
+        elif docs_only:
+            depth_reasons.append("ordinary documentation-only change")
+        elif very_small_uncomplicated:
+            depth_reasons.append("very small uncomplicated change")
+        else:
+            depth_reasons.append("non-trivial change")
 
     return {
         "complex": bool(high_critical_reasons),
-        "reasons": external_review_reasons,
+        "reasons": depth_reasons,
         "complex_reasons": high_critical_reasons,
         "high_critical": bool(high_critical_reasons),
         "high_critical_reasons": high_critical_reasons,
-        "external_review_required": bool(external_review_reasons),
-        "claude_cli_required": claude_cli_required,
+        "external_review_required": False,
+        "claude_cli_required": False,
+        "self_review_required": True,
+        "minimum_self_review_iterations": minimum_self_review_iterations,
         "important_repo": important_repo,
         "repo_policy": "important" if important_repo else "standard",
         "review_tier": review_tier,
         "docs_only": docs_only,
+        "large_documentation_change": large_documentation_change,
         "very_small_uncomplicated": very_small_uncomplicated,
         "changed_files": changed_files,
         "changed_lines": changed_lines,
@@ -1478,11 +1480,15 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
         "reviewed_files": paths,
         "review_focus": list(REQUIRED_SELF_REVIEW_FOCUS),
         "verdict": "PASS|NEEDS_CHANGE|BLOCK",
+        "minimum_review_iterations": classify_complexity(
+            pr, None, repo_name=repo_name
+        )["minimum_self_review_iterations"],
         "review_iterations": [],
         "all_findings_triaged": False,
         "findings": [],
         "material_findings_remaining": None,
         "material_findings_after_first_review": None,
+        "uncertainty": None,
         "stop_reason": "clean_pass|diminishing_returns|residual_only_with_reason|small_trivial_change",
         "residual_risk": {"accepted": False, "reason": ""},
     }
@@ -1502,6 +1508,81 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
         "diff_sha256": _normalize_sha256(diff_sha256),
         "required_review_focus": list(REQUIRED_SELF_REVIEW_FOCUS),
     }
+
+
+def build_self_review_audit(
+    state: dict[str, Any],
+    result: dict[str, Any],
+    self_review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
+    complexity = result.get("complexity") if isinstance(result.get("complexity"), dict) else {}
+    iterations = self_review.get("review_iterations") if isinstance(self_review, dict) else None
+    actual_iterations = len(iterations) if isinstance(iterations, list) else 0
+    residual = self_review.get("residual_risk") if isinstance(self_review, dict) else None
+    residual_accepted = isinstance(residual, dict) and residual.get("accepted") is True
+    residual_reason = residual.get("reason") if isinstance(residual, dict) else None
+    review_sources = result.get("review_sources") if isinstance(result.get("review_sources"), dict) else {}
+    self_review_gate_valid = review_sources.get("self_review_gate_valid") is True
+    required_iterations = int(complexity.get("minimum_self_review_iterations") or 0)
+    return {
+        "schema_version": 1,
+        "kind": SELF_REVIEW_AUDIT_KIND,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "repo": _canonical_repo_slug(state.get("repoName")),
+        "pr": pr.get("number"),
+        "head_sha": pr.get("headRefOid"),
+        "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
+        "review_tier": complexity.get("review_tier"),
+        "minimum_review_iterations": complexity.get("minimum_self_review_iterations"),
+        "actual_review_iterations": actual_iterations,
+        "all_findings_triaged": (
+            self_review.get("all_findings_triaged") is True
+            if isinstance(self_review, dict) else False
+        ),
+        "finding_count": (
+            len(self_review.get("findings", []))
+            if isinstance(self_review, dict) and isinstance(self_review.get("findings"), list)
+            else None
+        ),
+        "material_findings_after_first_review": (
+            self_review.get("material_findings_after_first_review")
+            if isinstance(self_review, dict) else None
+        ),
+        "material_findings_remaining": (
+            self_review.get("material_findings_remaining")
+            if isinstance(self_review, dict) else None
+        ),
+        "uncertainty": self_review.get("uncertainty") if isinstance(self_review, dict) else None,
+        "residual_risk_accepted": residual_accepted,
+        "residual_risk_reason": residual_reason if isinstance(residual_reason, str) else "",
+        "gate_verdict": result.get("verdict"),
+        "self_review_gate_valid": self_review_gate_valid,
+        "tuning_signal": (
+            "increase_depth"
+            if actual_iterations < required_iterations
+            else "repair_evidence"
+            if not self_review_gate_valid
+            else "observe"
+        ),
+    }
+
+
+def write_self_review_audit(
+    output_path: Path,
+    state: dict[str, Any],
+    result: dict[str, Any],
+    self_review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    audit = build_self_review_audit(state, result, self_review)
+    try:
+        with output_path.open("x", encoding="utf-8") as handle:
+            json.dump(audit, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except FileExistsError as exc:
+        raise GateInputError(f"self-review audit already exists: {output_path}") from exc
+    return {**audit, "path": str(output_path)}
 
 
 def _workflow_text_at_head(repo: Path, head_sha: str) -> str | None:
@@ -1707,14 +1788,11 @@ def evaluate_review_gate(
         state, pr, policy_waiver, repo_name=repo_name
     )
     waiver_valid = policy_waiver is not None and not waiver_failures
-    claude_cli_waived = bool(complexity["claude_cli_required"] and waiver_valid)
-    for failure in waiver_failures:
-        failures.append(f"Claude policy waiver invalid: {failure}")
-    if claude_cli_waived:
-        warnings.append(
-            "Claude CLI packet-review requirement waived by explicit trusted-owner evidence; "
-            "all other review and merge gates remain active"
-        )
+    claude_cli_waived = False
+    if policy_waiver is not None:
+        warnings.append("Deprecated Claude policy waiver ignored; external reviews are optional")
+        for failure in waiver_failures:
+            warnings.append(f"Deprecated Claude policy waiver invalid: {failure}")
 
     if pr.get("state") == "CLOSED":
         failures.append("PR is closed")
@@ -1740,7 +1818,7 @@ def evaluate_review_gate(
     for failure in claude_cli_failures:
         warnings.append(f"Legacy Claude CLI evidence invalid and ignored: {failure}")
     if codex_required:
-        warnings.append("Deprecated self_review.codex_review.required ignored; use diff-bound external review evidence")
+        warnings.append("Deprecated self_review.codex_review.required ignored; external reviews are optional diagnostics")
     elif not codex_seen and isinstance(codex, dict) and codex.get("unavailable_reason"):
         warnings.append("Codex review unavailable but explained")
 
@@ -1761,13 +1839,65 @@ def evaluate_review_gate(
         self_review_failures.extend(_self_review_diff_failures(state, self_review))
         if self_review.get("all_findings_triaged") is not True:
             self_review_failures.append("self-review does not assert all_findings_triaged=true")
+        uncertainty = self_review.get("uncertainty")
+        if (
+            isinstance(uncertainty, bool)
+            or not isinstance(uncertainty, (int, float))
+            or not math.isfinite(float(uncertainty))
+            or not 0.0 <= float(uncertainty) <= 1.0
+        ):
+            self_review_failures.append("self-review uncertainty must be a finite number from 0 to 1")
+        first_pass_findings = self_review.get("material_findings_after_first_review")
+        if (
+            isinstance(first_pass_findings, bool)
+            or not isinstance(first_pass_findings, int)
+            or first_pass_findings < 0
+        ):
+            self_review_failures.append(
+                "self-review material_findings_after_first_review must be an integer >= 0"
+            )
         iterations = self_review.get("review_iterations")
+        minimum_iterations = int(complexity["minimum_self_review_iterations"])
         if not isinstance(iterations, list) or not iterations:
             self_review_failures.append("self-review has no review_iterations")
         else:
             for index, iteration in enumerate(iterations):
                 if not _valid_iteration(iteration):
                     self_review_failures.append(f"review_iteration {index} lacks required evidence")
+            iteration_numbers = [
+                item.get("n") for item in iterations if isinstance(item, dict)
+            ]
+            if iteration_numbers != list(range(1, len(iterations) + 1)):
+                self_review_failures.append("self-review iteration numbers must be consecutive from 1")
+            iteration_summaries = [
+                " ".join(item.get("summary", "").split()).casefold()
+                for item in iterations
+                if isinstance(item, dict) and isinstance(item.get("summary"), str)
+            ]
+            if len(iteration_summaries) == len(iterations) and len(set(iteration_summaries)) != len(iteration_summaries):
+                self_review_failures.append("self-review iteration summaries must be distinct")
+            first_iteration = iterations[0] if iterations and isinstance(iterations[0], dict) else None
+            first_iteration_material = (
+                first_iteration.get("material_findings")
+                if isinstance(first_iteration, dict)
+                else None
+            )
+            if (
+                isinstance(first_pass_findings, int)
+                and not isinstance(first_pass_findings, bool)
+                and isinstance(first_iteration_material, int)
+                and not isinstance(first_iteration_material, bool)
+                and first_pass_findings != first_iteration_material
+            ):
+                self_review_failures.append(
+                    "self-review material_findings_after_first_review does not match iteration 1"
+                )
+            if len(iterations) < minimum_iterations:
+                self_review_failures.append(
+                    "self-review depth is insufficient for "
+                    f"{complexity['review_tier']}: {len(iterations)} iteration(s), "
+                    f"minimum {minimum_iterations}"
+                )
         if self_review.get("stop_reason") not in STOP_REASONS:
             self_review_failures.append("self-review stop_reason is missing or invalid")
         findings = self_review.get("findings", [])
@@ -1787,7 +1917,7 @@ def evaluate_review_gate(
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
     claude_required = isinstance(claude, dict) and claude.get("required") is True
     if claude_required:
-        warnings.append("Deprecated self_review.claude_review.required ignored; use diff-bound external review evidence")
+        warnings.append("Deprecated self_review.claude_review.required ignored; external reviews are optional diagnostics")
 
     if state.get("pr_diff_bypass") is True:
         warnings.append("Self-review diff binding bypass was requested")
@@ -1797,16 +1927,17 @@ def evaluate_review_gate(
     if isinstance(deprecated_external_review, dict):
         warnings.append("Deprecated self_review.external_review ignored; pass --external-review-evidence instead")
 
-    external_required = complexity["external_review_required"] or (isinstance(external_review, dict) and external_review.get("required") is True)
-    for failure in _external_review_failures(
+    external_required = False
+    external_failures = _external_review_failures(
         state,
         pr,
         external_review,
-        required=external_required,
+        required=False,
         repo_name=repo_name,
-        claude_cli_required=complexity["claude_cli_required"] and not claude_cli_waived,
-    ):
-        failures.append(f"External review evidence invalid: {failure}")
+        claude_cli_required=False,
+    )
+    for failure in external_failures:
+        warnings.append(f"Optional external review evidence invalid and ignored: {failure}")
 
     if not checks:
         failures.append("no status checks observed")
@@ -1910,6 +2041,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--policy-waiver")
     parser.add_argument("--write-external-review-packet")
     parser.add_argument("--write-self-review-template")
+    parser.add_argument("--write-self-review-audit")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     repo = args.repo.resolve()
@@ -1947,6 +2079,15 @@ def main(argv: list[str] | None = None) -> int:
             result["self_review_template"] = self_review_template
         if packet is not None:
             result["external_review_packet"] = packet
+        if args.write_self_review_audit:
+            audit_path = resolve_inside_repo(
+                repo, args.write_self_review_audit, label="self-review audit"
+            )
+            if audit_path is None:
+                raise GateInputError("self-review audit path is required")
+            result["self_review_audit"] = write_self_review_audit(
+                audit_path, state, result, self_review
+            )
     except Exception as exc:
         result = {"schema_version": 1, "verdict": "BLOCK", "failures": [str(exc)], "warnings": []}
     if args.json:

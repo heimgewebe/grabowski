@@ -17,7 +17,7 @@ Every schema has:
 
 ## Action requirements
 
-- `pr-merge` binds `repo`, `pr`, `base`, `expected_head`, `diff_sha256`, `status_projection`, `review_evidence`, `ci_evidence` and `human_authorization`. Status projection evidence requires one replay field (`receipt_ref`, `run_id` or `nonce`) and the top-level `status_projection_sha256` parameter covering the projection object. Manual authorization requires `authorized_by` plus either `statement` or `reference`.
+- `pr-merge` binds `repo`, `pr`, `base`, `expected_head`, `diff_sha256`, `status_projection`, a passing `grabowski_self_review_audit` as `review_evidence`, `ci_evidence` and `human_authorization`. The self-review audit records risk-scaled review depth, terminal triage and exact repo/PR/head/diff binding without posting review prose to the PR. Status projection evidence requires one replay field (`receipt_ref`, `run_id` or `nonce`) and the top-level `status_projection_sha256` parameter covering the projection object. Manual authorization requires `authorized_by` plus either `statement` or `reference`.
 - `runtime-deploy` binds the concrete `repo` or `service`, the concrete `environment` or `runtime_target`, `status_projection`, `deployment_boundary` and `rollback_plan`.
 - `service-restart` binds `host`, `unit`, `status_projection`, `restart_budget` and `recovery_path`.
 - `fleet-mutation` binds `fleet_target`, `operation`, `status_projection`, `dry_run_or_projection` and recovery or irreversibility evidence.
