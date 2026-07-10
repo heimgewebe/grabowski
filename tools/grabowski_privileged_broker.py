@@ -72,6 +72,14 @@ def _base_audit_record(
     if isinstance(gate, dict):
         record["gate_recovery_marker_sha256"] = gate.get("recovery_marker_sha256")
         record["gate_recovery_marker_timestamp_unix"] = gate.get("recovery_marker_timestamp_unix")
+    for optional_key in (
+        "policy_intent",
+        "argv_catalog_sha256",
+        "matched_argv_prefix_sha256",
+    ):
+        optional_value = execution.get(optional_key)
+        if optional_value is not None:
+            record[optional_key] = optional_value
     return record
 
 
