@@ -150,7 +150,12 @@ def _validate_power_argv(value: Any, *, max_argv: int, allow_shell: bool) -> lis
     return argv
 
 
-def _validate_power_argv_prefixes(value: Any, *, allow_shell: bool) -> list[list[str]]:
+def _validate_power_argv_prefixes(
+    value: Any,
+    *,
+    max_argv: int,
+    allow_shell: bool,
+) -> list[list[str]]:
     if value is None:
         return []
     if not isinstance(value, list) or not value:
@@ -161,11 +166,21 @@ def _validate_power_argv_prefixes(value: Any, *, allow_shell: bool) -> list[list
     for prefix in value:
         normalized = _validate_power_argv(
             prefix,
-            max_argv=MAX_ARGV_ITEMS,
+            max_argv=max_argv,
             allow_shell=allow_shell,
         )
         prefixes.append(normalized)
     return prefixes
+
+
+def _validate_power_policy_intent(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("power policy_intent must be a non-empty string when supplied")
+    if len(value.encode("utf-8")) > 200:
+        raise ValueError("power policy_intent exceeds size limit")
+    return value
 
 
 def _power_argv_matches_prefix(argv: list[str], prefix: list[str]) -> bool:
@@ -281,7 +296,7 @@ def _resolve_power_argv_action(
         "enabled", "mode", "target_pattern", "timeout_seconds",
         "cwd_pattern", "max_argv", "allow_shell", "gate",
     }
-    optional = {"allowed_argv_prefixes"}
+    optional = {"allowed_argv_prefixes", "policy_intent"}
     candidate_keys = set(candidate)
     if not required.issubset(candidate_keys) or candidate_keys - required - optional or candidate["enabled"] is not True:
         raise PermissionError("privileged action is disabled or malformed")
@@ -301,8 +316,10 @@ def _resolve_power_argv_action(
     allow_shell = candidate["allow_shell"]
     if not isinstance(allow_shell, bool):
         raise ValueError("power allow_shell is invalid")
+    policy_intent = _validate_power_policy_intent(candidate.get("policy_intent"))
     allowed_argv_prefixes = _validate_power_argv_prefixes(
         candidate.get("allowed_argv_prefixes"),
+        max_argv=max_argv,
         allow_shell=allow_shell,
     )
     cwd_pattern = candidate["cwd_pattern"]
@@ -320,17 +337,20 @@ def _resolve_power_argv_action(
         max_argv=max_argv,
         allow_shell=allow_shell,
     )
-    if allowed_argv_prefixes and not any(
-        _power_argv_matches_prefix(argv, prefix)
-        for prefix in allowed_argv_prefixes
-    ):
-        raise PermissionError("power argv is not allowed by configured catalog")
+    matched_argv_prefix: list[str] | None = None
+    if allowed_argv_prefixes:
+        for prefix in allowed_argv_prefixes:
+            if _power_argv_matches_prefix(argv, prefix):
+                matched_argv_prefix = prefix
+                break
+        if matched_argv_prefix is None:
+            raise PermissionError("power argv is not allowed by configured catalog")
     cwd = _validate_power_cwd(payload["cwd"], pattern=cwd_pattern)
     requested_timeout = _validate_power_timeout(
         payload["timeout_seconds"],
         configured_max=timeout,
     )
-    return {
+    execution = {
         "mode": "argv-json",
         "argv": argv,
         "cwd": cwd,
@@ -338,6 +358,12 @@ def _resolve_power_argv_action(
         "configured_timeout_seconds": timeout,
         "gate": gate,
     }
+    if policy_intent is not None:
+        execution["policy_intent"] = policy_intent
+    if allowed_argv_prefixes:
+        execution["argv_catalog_sha256"] = canonical_sha256(allowed_argv_prefixes)
+        execution["matched_argv_prefix_sha256"] = canonical_sha256(matched_argv_prefix)
+    return execution
 
 
 def resolve_execution(config: dict[str, Any], reference: dict[str, Any]) -> dict[str, Any]:

@@ -29,6 +29,7 @@
       "timeout_seconds": 600,
       "max_argv": 128,
       "allow_shell": false,
+      "policy_intent": "trusted-owner-high-power-admin-catalog",
       "allowed_argv_prefixes": [
         ["/usr/bin/systemctl", "is-active"],
         ["/usr/bin/systemctl", "status"],

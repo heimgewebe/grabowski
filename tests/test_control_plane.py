@@ -570,6 +570,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "timeout_seconds": 600,
                     "max_argv": 128,
                     "allow_shell": False,
+                    "policy_intent": "trusted-owner-high-power-admin-catalog",
                     "allowed_argv_prefixes": [
                         ["/usr/bin/systemctl", "is-active"],
                         ["/usr/bin/systemctl", "status"],
@@ -581,6 +582,42 @@ class PrivilegedBrokerTests(unittest.TestCase):
         execution = privileged_broker.resolve_execution(config, parsed)
 
         self.assertEqual(execution["argv"], ["/usr/bin/systemctl", "is-active", "grabowski-privileged-broker.socket"])
+        self.assertEqual(execution["policy_intent"], "trusted-owner-high-power-admin-catalog")
+        self.assertEqual(
+            execution["argv_catalog_sha256"],
+            privileged_broker.canonical_sha256([
+                ["/usr/bin/systemctl", "is-active"],
+                ["/usr/bin/systemctl", "status"],
+            ]),
+        )
+        self.assertEqual(
+            execution["matched_argv_prefix_sha256"],
+            privileged_broker.canonical_sha256(["/usr/bin/systemctl", "is-active"]),
+        )
+
+    def test_power_argv_json_rejects_prefix_longer_than_max_argv(self) -> None:
+        reference = self._power_reference({"argv": ["/usr/bin/systemctl", "is-active"], "cwd": "/", "timeout_seconds": 30})
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_power_argv": {
+                    "enabled": True,
+                    "mode": "argv-json",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 600,
+                    "max_argv": 1,
+                    "allow_shell": False,
+                    "allowed_argv_prefixes": [["/usr/bin/systemctl", "is-active"]],
+                    "gate": self._power_gate(self.tmp.name),
+                }
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "power argv exceeds item limit"):
+            privileged_broker.resolve_execution(config, parsed)
 
     def test_power_argv_json_rejects_uncataloged_admin_command(self) -> None:
         reference = self._power_reference({"argv": ["/usr/bin/systemctl", "restart", "grabowski-mcp.service"], "cwd": "/", "timeout_seconds": 30})
@@ -739,6 +776,12 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertIn('json.dumps(argv, ensure_ascii=False, separators=(",", ":"))', broker)
         self.assertIn("start_new_session=True", broker)
         self.assertIn("os.killpg(process.pid, signal.SIGKILL)", broker)
+
+    def test_broker_audit_records_power_catalog_metadata(self) -> None:
+        broker = (ROOT / "tools" / "grabowski_privileged_broker.py").read_text(encoding="utf-8")
+        self.assertIn('"policy_intent"', broker)
+        self.assertIn('"argv_catalog_sha256"', broker)
+        self.assertIn('"matched_argv_prefix_sha256"', broker)
 
     def test_broker_script_keeps_structured_denials_out_of_systemd_failed_state(self) -> None:
         broker = (ROOT / "tools" / "grabowski_privileged_broker.py").read_text(encoding="utf-8")

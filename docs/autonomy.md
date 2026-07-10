@@ -154,9 +154,12 @@ nichtleere Begründung; der Broker auditiert Ziel-, cwd- und argv-Hashes. Die
 root-eigene Konfiguration erzwingt zusätzlich eine Broker-seitige Gate-Prüfung
 und entscheidet, ob direkte bekannte Shell-Executables erlaubt sind.
 `allowed_argv_prefixes` kann diese Schiene in einen expliziten Admin-Katalog
-verwandeln; ohne diese Liste bleibt sie generisch. Trotzdem ist sie keine
-Sandbox: Ein aktiviertes `operator_power_argv` bedeutet bewusst beliebige
-Root-Ausführung über absolute argv.
+verwandeln; ohne diese Liste bleibt sie generisch. Für maximale trusted-owner-
+Funktionalität darf dieser Katalog bewusst breit sein. Er ist aber nur eine
+Prefix-Bremse, keine vollständige Argument- oder Zielvalidierung. Die eigentliche
+Grenze bleibt Recovery-Gate, Kill-Switch, Timeout, Audit und Broker-Ausführung.
+Ein aktiviertes `operator_power_argv` bedeutet bewusst beliebige Root-Ausführung
+über absolute argv.
 
 
 ## Kollisionskontrolle und spezialisierte Worker
