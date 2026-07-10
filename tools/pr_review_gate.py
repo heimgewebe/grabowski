@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -51,7 +52,28 @@ CLAUDE_PACKET_REVIEW_SCHEMA: dict[str, Any] = {
     "required": ["verdict", "summary", "finding_count", "findings"],
     "additionalProperties": False,
 }
+# Deliberately code-owned: changing this sticky cross-repository policy must itself pass the high-critical gate.
 IMPORTANT_REPOS = {"heimgewebe/weltgewebe"}
+CLAUDE_POLICY_WAIVER_KIND = "claude_packet_review_policy_waiver"
+CLAUDE_POLICY_WAIVER_SCOPE = "claude_packet_review_only"
+CLAUDE_POLICY_WAIVER_AUTHORITY = "trusted-owner"
+CLAUDE_POLICY_WAIVER_MAX_LIFETIME = timedelta(hours=24)
+CLAUDE_POLICY_WAIVER_CLOCK_SKEW = timedelta(minutes=5)
+CLAUDE_POLICY_WAIVER_FIELDS = {
+    "schema_version",
+    "kind",
+    "scope",
+    "repo",
+    "pr",
+    "head_sha",
+    "diff_sha256",
+    "authority",
+    "approver",
+    "reason",
+    "issued_at",
+    "expires_at",
+    "audit_reference",
+}
 SELF_REVIEW_KIND = "grabowski_self_review"
 SELF_REVIEW_MODE = "critical_diff_review"
 REQUIRED_SELF_REVIEW_FOCUS = (
@@ -604,6 +626,10 @@ def load_external_review_evidence(path: Path | None) -> dict[str, Any] | None:
     return _load_json_file(path, label="external review evidence")
 
 
+def load_policy_waiver(path: Path | None) -> dict[str, Any] | None:
+    return _load_json_file(path, label="Claude policy waiver")
+
+
 def _normalize_sha256(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -617,6 +643,104 @@ def _normalize_sha256(value: Any) -> str | None:
 
 def _valid_sha256(value: Any) -> bool:
     return _normalize_sha256(value) is not None
+
+
+def _normalize_git_sha(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if re.fullmatch(r"[0-9a-f]{40}", normalized) else None
+
+
+def _parse_aware_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip() or len(value) > 80:
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _bounded_non_empty_string(value: Any, *, maximum: int) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and len(value) <= maximum
+
+
+def _claude_policy_waiver_failures(
+    state: dict[str, Any],
+    pr: dict[str, Any],
+    waiver: Any,
+    *,
+    repo_name: str | None,
+    now: datetime | None = None,
+) -> list[str]:
+    if waiver is None:
+        return []
+    if not isinstance(waiver, dict):
+        return ["waiver is not a JSON object"]
+    failures: list[str] = []
+    keys = set(waiver)
+    missing = sorted(CLAUDE_POLICY_WAIVER_FIELDS - keys)
+    unknown = sorted(keys - CLAUDE_POLICY_WAIVER_FIELDS)
+    if missing:
+        failures.append("missing field(s): " + ", ".join(missing))
+    if unknown:
+        failures.append("unknown field(s): " + ", ".join(unknown))
+    schema_version = waiver.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != 1:
+        failures.append("schema_version is not integer 1")
+    if waiver.get("kind") != CLAUDE_POLICY_WAIVER_KIND:
+        failures.append(f"kind is not {CLAUDE_POLICY_WAIVER_KIND}")
+    if waiver.get("scope") != CLAUDE_POLICY_WAIVER_SCOPE:
+        failures.append(f"scope is not {CLAUDE_POLICY_WAIVER_SCOPE}")
+    if waiver.get("authority") != CLAUDE_POLICY_WAIVER_AUTHORITY:
+        failures.append(f"authority is not {CLAUDE_POLICY_WAIVER_AUTHORITY}")
+    if repo_name is None or _canonical_repo_slug(waiver.get("repo")) != repo_name:
+        failures.append("repo mismatch")
+    pr_number = pr.get("number")
+    waiver_pr = waiver.get("pr")
+    if (
+        isinstance(pr_number, bool)
+        or not isinstance(pr_number, int)
+        or isinstance(waiver_pr, bool)
+        or not isinstance(waiver_pr, int)
+        or waiver_pr != pr_number
+    ):
+        failures.append("pr number mismatch")
+    current_head = _normalize_git_sha(pr.get("headRefOid"))
+    if current_head is None or _normalize_git_sha(waiver.get("head_sha")) != current_head:
+        failures.append("head_sha mismatch")
+    current_diff = _normalize_sha256(state.get("pr_diff_sha256"))
+    if current_diff is None or _normalize_sha256(waiver.get("diff_sha256")) != current_diff:
+        failures.append("diff_sha256 mismatch")
+    if not _bounded_non_empty_string(waiver.get("approver"), maximum=200):
+        failures.append("approver is missing or too long")
+    if not _bounded_non_empty_string(waiver.get("reason"), maximum=2000):
+        failures.append("reason is missing or too long")
+    if not _bounded_non_empty_string(waiver.get("audit_reference"), maximum=500):
+        failures.append("audit_reference is missing or too long")
+    issued_at = _parse_aware_datetime(waiver.get("issued_at"))
+    expires_at = _parse_aware_datetime(waiver.get("expires_at"))
+    if issued_at is None:
+        failures.append("issued_at is not an RFC3339 timestamp with timezone")
+    if expires_at is None:
+        failures.append("expires_at is not an RFC3339 timestamp with timezone")
+    if issued_at is not None and expires_at is not None:
+        reference_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        if issued_at > reference_now + CLAUDE_POLICY_WAIVER_CLOCK_SKEW:
+            failures.append("issued_at is too far in the future")
+        if expires_at <= reference_now:
+            failures.append("waiver is expired")
+        if expires_at <= issued_at:
+            failures.append("expires_at must be after issued_at")
+        elif expires_at - issued_at > CLAUDE_POLICY_WAIVER_MAX_LIFETIME:
+            failures.append("waiver lifetime exceeds 24 hours")
+    return failures
 
 
 def _claude_packet_review_command_matches(command: Any) -> bool:
@@ -980,6 +1104,7 @@ def _claude_cli_review_input_failures(
     pr_number: Any,
     head_sha: Any,
     diff_sha256: Any,
+    expected_packet_prompt_sha256: str | None,
 ) -> list[str]:
     failures: list[str] = []
     review_input = external_review.get("review_input")
@@ -1002,6 +1127,10 @@ def _claude_cli_review_input_failures(
     packet_prompt_sha256 = review_input.get("packet_prompt_sha256")
     if not _valid_sha256(packet_prompt_sha256):
         failures.append("review_input.packet_prompt_sha256 is missing or invalid")
+    elif expected_packet_prompt_sha256 is None:
+        failures.append("expected packet prompt sha256 is unavailable")
+    elif _normalize_sha256(packet_prompt_sha256) != _normalize_sha256(expected_packet_prompt_sha256):
+        failures.append("review_input.packet_prompt_sha256 mismatch")
     prompt_sha256 = external_review.get("prompt_sha256")
     input_prompt_sha256 = review_input.get("prompt_sha256")
     if not _valid_sha256(input_prompt_sha256):
@@ -1073,6 +1202,19 @@ def _external_review_failures(
         failures.append("prompt_sha256 is missing or invalid")
     raw_review_input = external_review.get("review_input")
     claude_cli_input_mode = isinstance(raw_review_input, dict) and raw_review_input.get("mode") == CLAUDE_CLI_REVIEW_INPUT_MODE
+    expected_packet_prompt_sha256: str | None = None
+    normalized_diff_sha256 = _normalize_sha256(diff_sha256)
+    if (
+        isinstance(pr_number, int)
+        and not isinstance(pr_number, bool)
+        and isinstance(head, str)
+        and head
+        and normalized_diff_sha256 is not None
+    ):
+        diff_filename = f"pr-{pr_number}-{head[:12]}.diff"
+        expected_packet_prompt_sha256 = _sha256_text(
+            build_external_review_prompt(state, diff_filename, normalized_diff_sha256)
+        )
     if claude_cli_required or claude_cli_input_mode:
         failures.extend(
             _claude_cli_review_input_failures(
@@ -1081,6 +1223,7 @@ def _external_review_failures(
                 pr_number=pr_number,
                 head_sha=head,
                 diff_sha256=diff_sha256,
+                expected_packet_prompt_sha256=expected_packet_prompt_sha256,
             )
         )
     elif external_review.get("prompt_includes_diff") is not True:
@@ -1179,6 +1322,10 @@ def build_external_review_prompt(state: dict[str, Any], diff_filename: str, diff
 
 
 def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_diff: bytes) -> dict[str, Any]:
+    repo_name = _canonical_repo_slug(state.get("repoName"))
+    if repo_name is None:
+        raise GateInputError("cannot write external review packet without valid repo name")
+    output_dir = output_dir.resolve()
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     pr_number = pr.get("number")
     if isinstance(pr_number, bool) or not isinstance(pr_number, int):
@@ -1206,7 +1353,7 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
     evidence_template = {
         "schema_version": 1,
         "kind": "external_review",
-        "repo": _canonical_repo_slug(state.get("repoName")),
+        "repo": repo_name,
         "pr": pr_number,
         "head_sha": head,
         "diff_sha256": diff_sha256,
@@ -1227,7 +1374,7 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
     manifest = {
         "schema_version": 1,
         "kind": "external_review_packet",
-        "repo": _canonical_repo_slug(state.get("repoName")),
+        "repo": repo_name,
         "pr": pr_number,
         "head_sha": head,
         "diff_path": str(diff_path),
@@ -1475,6 +1622,7 @@ def evaluate_review_gate(
     self_review: dict[str, Any] | None = None,
     claude_evidence: dict[str, Any] | None = None,
     external_review_evidence: dict[str, Any] | None = None,
+    policy_waiver: dict[str, Any] | None = None,
     expected_check_names: tuple[str, ...] = DEFAULT_EXPECTED_CHECK_NAMES,
 ) -> dict[str, Any]:
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
@@ -1496,6 +1644,20 @@ def evaluate_review_gate(
     complexity = classify_complexity(pr, self_review, repo_name=repo_name)
     failures: list[str] = []
     warnings: list[str] = []
+    if repo_name is None:
+        failures.append("repository identity could not be canonicalized from repoName")
+    waiver_failures = _claude_policy_waiver_failures(
+        state, pr, policy_waiver, repo_name=repo_name
+    )
+    waiver_valid = policy_waiver is not None and not waiver_failures
+    claude_cli_waived = bool(complexity["claude_cli_required"] and waiver_valid)
+    for failure in waiver_failures:
+        failures.append(f"Claude policy waiver invalid: {failure}")
+    if claude_cli_waived:
+        warnings.append(
+            "Claude CLI packet-review requirement waived by explicit trusted-owner evidence; "
+            "all other review and merge gates remain active"
+        )
 
     if pr.get("state") == "CLOSED":
         failures.append("PR is closed")
@@ -1585,7 +1747,7 @@ def evaluate_review_gate(
         external_review,
         required=external_required,
         repo_name=repo_name,
-        claude_cli_required=complexity["claude_cli_required"],
+        claude_cli_required=complexity["claude_cli_required"] and not claude_cli_waived,
     ):
         failures.append(f"External review evidence invalid: {failure}")
 
@@ -1637,6 +1799,7 @@ def evaluate_review_gate(
             "claude_seen": claude_seen,
             "claude_cli_seen": claude_cli_seen,
             "claude_cli_required": complexity["claude_cli_required"],
+            "claude_cli_waived": claude_cli_waived,
             "external_review_required": external_required,
             "external_reviews_received": _external_review_count(external_review),
             "platform_review_required": platform_review_required,
@@ -1656,6 +1819,13 @@ def evaluate_review_gate(
             "current_head_review_item_count": len(items),
         },
         "complexity": complexity,
+        "policy_waiver": {
+            "provided": policy_waiver is not None,
+            "valid": waiver_valid,
+            "applied": claude_cli_waived,
+            "evidence": policy_waiver,
+            "failures": waiver_failures,
+        },
         "check_policy": {"expected_check_names": list(expected_check_names)},
     }
 
@@ -1680,6 +1850,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-review")
     parser.add_argument("--claude-evidence")
     parser.add_argument("--external-review-evidence")
+    parser.add_argument("--policy-waiver")
     parser.add_argument("--write-external-review-packet")
     parser.add_argument("--write-self-review-template")
     parser.add_argument("--json", action="store_true")
@@ -1689,6 +1860,7 @@ def main(argv: list[str] | None = None) -> int:
         self_review = load_self_review(resolve_inside_repo(repo, args.self_review, label="self-review"))
         claude_evidence = load_claude_evidence(resolve_inside_repo(repo, args.claude_evidence, label="Claude evidence"))
         external_review_evidence = load_external_review_evidence(resolve_inside_repo(repo, args.external_review_evidence, label="external review evidence"))
+        policy_waiver = load_policy_waiver(resolve_inside_repo(repo, args.policy_waiver, label="Claude policy waiver"))
         state = load_pr_state(repo, args.pr)
         packet = None
         self_review_template = None
@@ -1707,6 +1879,7 @@ def main(argv: list[str] | None = None) -> int:
             self_review=self_review,
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
+            policy_waiver=policy_waiver,
             expected_check_names=expected_check_names_for_repo(
                 repo,
                 repo_name=state.get("repoName"),

@@ -27,6 +27,20 @@ def _load_tool():
 claude_review = _load_tool()
 
 
+def _load_gate():
+    spec = importlib.util.spec_from_file_location(
+        "pr_review_gate_contract_test",
+        ROOT / "tools" / "pr_review_gate.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+review_gate = _load_gate()
+
+
 def _finding() -> dict[str, object]:
     return {
         "severity": "high",
@@ -343,6 +357,19 @@ class ExternalReviewClaudeTests(unittest.TestCase):
                     subprocess_side_effect=subprocess.TimeoutExpired(["claude"], 30),
                 )
             self.assertFalse((root / "evidence.json").exists())
+
+    def test_adapter_and_gate_share_an_executable_contract(self) -> None:
+        self.assertEqual(claude_review.REVIEW_SCHEMA, review_gate.CLAUDE_PACKET_REVIEW_SCHEMA)
+        command = claude_review.build_command(
+            claude_bin="claude",
+            model="opus",
+            effort="high",
+            max_budget_usd=2.0,
+        )
+        self.assertTrue(review_gate._claude_packet_review_command_matches(command))
+        mutated = list(command)
+        mutated[6] = "--tools=Bash"
+        self.assertFalse(review_gate._claude_packet_review_command_matches(mutated))
 
     def test_unknown_command_shape_is_rejected(self) -> None:
         command = claude_review.build_command(

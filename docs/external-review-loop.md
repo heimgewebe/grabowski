@@ -169,7 +169,7 @@ A required Claude entry uses:
 }
 ```
 
-The top-level prompt hash, `review_input.prompt_sha256`, and review `stdin_sha256` must match. `review_input.packet_prompt_sha256` separately binds the packet instructions. This prevents accidentally combining an old packet prompt with a new diff inside a genuine adapter run.
+The top-level prompt hash, `review_input.prompt_sha256`, and review `stdin_sha256` must match. The gate independently rebuilds the deterministic packet instructions from the current repository, PR, head, diff filename, diff hash, and PR metadata, then compares that SHA-256 with `review_input.packet_prompt_sha256`. This makes the packet-instruction hash load-bearing instead of a descriptive audit field and prevents combining another packet prompt with the current diff.
 
 ## Optional providers and optional Ultrareview
 
@@ -177,7 +177,33 @@ The top-level prompt hash, `review_input.prompt_sha256`, and review `stdin_sha25
 
 Claude CLI `ultrareview` may be run as an additional independent review when quota is available. It is never the mandatory provider and never a single point of failure for this gate. Legacy `--claude-evidence` remains accepted only as diagnostic input; it cannot satisfy `claude-cli:packet-review`.
 
-An exceptional bypass must be a separate, explicit, audit-backed policy-waiver decision outside this evidence path. This implementation provides no implicit waiver and no automatic fallback. Without an accepted waiver authority, a Claude outage keeps Claude-required lanes closed.
+## Explicit Claude policy waiver
+
+There is no silent fallback. A Claude-required lane may omit `claude-cli:packet-review` only when `pr_review_gate.py` receives an explicit waiver with `--policy-waiver <path>`. The waiver is narrow: it removes only the Claude-provider requirement. A structured, current-diff external review from another provider remains required, as do Grabowski self-review, terminal finding triage, CI, mergeability, and current head/diff binding.
+
+The waiver JSON must contain exactly these fields:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "claude_packet_review_policy_waiver",
+  "scope": "claude_packet_review_only",
+  "repo": "heimgewebe/grabowski",
+  "pr": 141,
+  "head_sha": "<current-40-hex-head>",
+  "diff_sha256": "<current-diff-sha256>",
+  "authority": "trusted-owner",
+  "approver": "<named trusted-owner decision maker>",
+  "reason": "<specific bounded exception reason>",
+  "issued_at": "2026-07-10T10:00:00+00:00",
+  "expires_at": "2026-07-10T18:00:00+00:00",
+  "audit_reference": "<durable decision or incident receipt>"
+}
+```
+
+The gate rejects missing or unknown fields, invalid authority or scope, repo/PR/head/diff mismatch, timestamps without timezone, future-dated issuance beyond five minutes of clock skew, expiry, and lifetimes longer than 24 hours. The complete waiver and its validation outcome are echoed in gate JSON. This is an auditable emergency path, not a normal alternate provider and not permission to claim Claude reviewed the PR.
+
+A successful adapter invocation is the capability proof for the installed Claude CLI and records its actual version. If an upstream CLI flag or result-envelope contract changes, the run fails closed with the CLI error; repair can proceed only through the explicit waiver plus a qualifying independent external review.
 
 ## External finding triage
 

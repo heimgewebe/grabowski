@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -128,6 +130,15 @@ def _external(**overrides: object) -> dict[str, object]:
     head_sha = overrides.get("head_sha", HEAD)
     diff_sha256 = overrides.get("diff_sha256", DIFF_SHA)
     prompt_sha256 = overrides.get("prompt_sha256", PROMPT_SHA)
+    packet_prompt = gate.build_external_review_prompt(
+        {
+            "repoName": repo,
+            "pr": {"number": pr, "headRefOid": head_sha, "title": ""},
+        },
+        f"pr-{pr}-{str(head_sha)[:12]}.diff",
+        str(diff_sha256).strip().lower(),
+    )
+    packet_prompt_sha256 = gate._sha256_text(packet_prompt)
     data: dict[str, object] = {
         "schema_version": 1,
         "kind": "external_review",
@@ -144,7 +155,7 @@ def _external(**overrides: object) -> dict[str, object]:
             "pr": pr,
             "head_sha": head_sha,
             "diff_sha256": diff_sha256,
-            "packet_prompt_sha256": PACKET_PROMPT_SHA,
+            "packet_prompt_sha256": packet_prompt_sha256,
             "prompt_sha256": prompt_sha256,
             "transport": "stdin",
         },
@@ -154,6 +165,42 @@ def _external(**overrides: object) -> dict[str, object]:
     }
     data.update(overrides)
     return data
+
+
+def _policy_waiver(**overrides: object) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    waiver: dict[str, object] = {
+        "schema_version": 1,
+        "kind": gate.CLAUDE_POLICY_WAIVER_KIND,
+        "scope": gate.CLAUDE_POLICY_WAIVER_SCOPE,
+        "repo": "heimgewebe/grabowski",
+        "pr": 7,
+        "head_sha": HEAD,
+        "diff_sha256": DIFF_SHA,
+        "authority": gate.CLAUDE_POLICY_WAIVER_AUTHORITY,
+        "approver": "trusted-owner:test",
+        "reason": "Claude CLI provider unavailable during a bounded recovery window.",
+        "issued_at": (now - timedelta(minutes=1)).isoformat(),
+        "expires_at": (now + timedelta(hours=1)).isoformat(),
+        "audit_reference": "test://waiver/7",
+    }
+    waiver.update(overrides)
+    return waiver
+
+
+def _generic_external(**overrides: object) -> dict[str, object]:
+    evidence = _external()
+    evidence.pop("review_input", None)
+    evidence["reviews"] = [
+        {
+            "source": "chatgpt",
+            "review_sha256": REVIEW_SHA,
+            "verdict": "PASS",
+            "finding_count": 0,
+        }
+    ]
+    evidence.update(overrides)
+    return evidence
 
 
 def _terminal_external_finding() -> dict[str, object]:
@@ -834,6 +881,123 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertTrue(result["complexity"]["important_repo"])
         self.assertTrue(result["review_sources"]["claude_cli_required"])
+
+    def test_valid_policy_waiver_replaces_only_claude_provider_requirement(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_generic_external(),
+            policy_waiver=_policy_waiver(),
+        )
+        self.assertEqual(result["verdict"], "PASS", result["failures"])
+        self.assertTrue(result["review_sources"]["claude_cli_required"])
+        self.assertTrue(result["review_sources"]["claude_cli_waived"])
+        self.assertTrue(result["policy_waiver"]["valid"])
+        self.assertTrue(result["policy_waiver"]["applied"])
+        self.assertEqual(result["policy_waiver"]["evidence"]["audit_reference"], "test://waiver/7")
+
+    def test_policy_waiver_does_not_remove_external_review_requirement(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            policy_waiver=_policy_waiver(),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "external review is required"), result["failures"])
+
+    def test_expired_policy_waiver_blocks(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        now = datetime.now(timezone.utc)
+        waiver = _policy_waiver(
+            issued_at=(now - timedelta(hours=2)).isoformat(),
+            expires_at=(now - timedelta(hours=1)).isoformat(),
+        )
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_generic_external(),
+            policy_waiver=waiver,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "waiver is expired"), result["failures"])
+        self.assertFalse(result["review_sources"]["claude_cli_waived"])
+
+    def test_policy_waiver_is_head_and_diff_bound(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        waiver = _policy_waiver(head_sha="b" * 40, diff_sha256="f" * 64)
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_generic_external(),
+            policy_waiver=waiver,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "head_sha mismatch"), result["failures"])
+        self.assertTrue(_has_failure(result, "diff_sha256 mismatch"), result["failures"])
+
+    def test_policy_waiver_rejects_unknown_fields_and_long_lifetime(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        now = datetime.now(timezone.utc)
+        waiver = _policy_waiver(
+            expires_at=(now + timedelta(hours=25)).isoformat(),
+            hidden_fallback=True,
+        )
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_generic_external(),
+            policy_waiver=waiver,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "unknown field(s): hidden_fallback"), result["failures"])
+        self.assertTrue(_has_failure(result, "lifetime exceeds 24 hours"), result["failures"])
+
+    def test_invalid_repo_identity_blocks_gate_explicitly(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        state["repoName"] = "not a repository"
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_external(),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "repository identity could not be canonicalized"), result["failures"])
+
+    def test_write_external_review_packet_rejects_invalid_repo_identity(self) -> None:
+        state = _state("README.md")
+        state["repoName"] = "not a repository"
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(gate.GateInputError, "valid repo name"):
+                gate.write_external_review_packet(Path(directory) / "packet", state, b"diff")
+
+    def test_write_external_review_packet_absolutizes_relative_output_dir(self) -> None:
+        state = _state("README.md")
+        with tempfile.TemporaryDirectory() as directory:
+            previous = Path.cwd()
+            os.chdir(directory)
+            try:
+                packet = gate.write_external_review_packet(Path("packet"), state, b"diff bytes")
+            finally:
+                os.chdir(previous)
+            manifest = json.loads(Path(packet["manifest_path"]).read_text(encoding="utf-8"))
+            self.assertTrue(Path(manifest["diff_path"]).is_absolute())
+            self.assertTrue(Path(manifest["prompt_path"]).is_absolute())
+            self.assertTrue(Path(manifest["diff_path"]).is_file())
+            self.assertTrue(Path(manifest["prompt_path"]).is_file())
+
+    def test_packet_prompt_hash_is_recomputed_by_gate(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external()
+        evidence["review_input"] = {**evidence["review_input"], "packet_prompt_sha256": "f" * 64}
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "review_input.packet_prompt_sha256 mismatch"), result["failures"])
 
     def test_write_external_review_packet_creates_downloadable_diff_and_template(self) -> None:
         state = _state("src/feature.py")
