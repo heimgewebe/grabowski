@@ -489,7 +489,7 @@
     },
     {
       "category": "deployment",
-      "description": "Schedule a validated self-deployment in an independent delayed systemd job.",
+      "description": "Schedule one validated self-deployment, reusing an identical in-flight job.",
       "effects": [
         "background-job-start",
         "runtime-deploy",

@@ -8,6 +8,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -593,7 +594,7 @@ class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}
-        self.assertEqual({"branch-publish", "captain-preflight", "captain-run", "mechanic-loop", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "scout", "situation", "worktree-orient"}, set(specs))
+        self.assertEqual({"branch-publish", "captain-preflight", "captain-run", "mechanic-loop", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "runtime-deploy-check", "scout", "situation", "worktree-orient"}, set(specs))
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
@@ -933,6 +934,76 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("target.branch must match parameters.branch", result["output"]["error"])
+
+    def test_mechanic_runtime_deploy_check_binds_target_to_parameters_and_adapter(self) -> None:
+        head = "a" * 40
+        base_action = {
+            "action": "runtime-deploy-check",
+            "parameters": {"adapter": "grabowski-self", "expected_head": head},
+            "target": {
+                "adapter": "grabowski-self",
+                "expected_head": head,
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+            },
+            "scope": {"operation": "read deployment readiness"},
+            "receipt_path": "receipts/mechanic/runtime-deploy-check.json",
+        }
+        invalid_targets = [
+            dict(base_action["target"], adapter="other"),
+            dict(base_action["target"], expected_head="b" * 40),
+            dict(base_action["target"], service="other-service"),
+            dict(base_action["target"], runtime_target="other-host"),
+            dict(base_action["target"], repo=None, service="grabowski-mcp", environment=None, runtime_target="heim-pc"),
+        ]
+        invalid_targets[-1]["service"] = None
+        for target in invalid_targets:
+            with self.subTest(target=target):
+                action = dict(base_action, target=target)
+                result = grips.run_grip(
+                    "mechanic-loop",
+                    {"actions": [action]},
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=FakeGh(),
+                )
+                self.assertEqual("blocked", result["receipt"]["status"])
+
+    def test_mechanic_runtime_deploy_check_accepts_null_aliases_without_selecting_them(self) -> None:
+        head = "a" * 40
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": head,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        action = {
+            "action": "runtime-deploy-check",
+            "parameters": {"adapter": "grabowski-self", "expected_head": head},
+            "target": {
+                "adapter": "grabowski-self",
+                "expected_head": head,
+                "repo": None,
+                "service": "grabowski-mcp",
+                "environment": None,
+                "runtime_target": "heim-pc",
+            },
+            "scope": {"operation": "read deployment readiness"},
+            "receipt_path": "receipts/mechanic/runtime-deploy-check.json",
+        }
+        with patch.object(grips, "_runtime_deploy_self_preflight", return_value=preflight):
+            result = grips.run_grip(
+                "mechanic-loop",
+                {"actions": [action]},
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
 
     def test_mechanic_loop_blocks_child_without_valid_receipt(self) -> None:
         original = grips.run_grip
@@ -1832,6 +1903,56 @@ class ScoutGripTests(unittest.TestCase):
         self.assertTrue(listed["scout"]["availability"]["available"])
 
 
+class RuntimeDeployGripTests(unittest.TestCase):
+    def test_runtime_deploy_check_is_read_only_and_exposed(self) -> None:
+        listed = {item["name"]: item for item in grips.list_grips("observer")}
+        self.assertIn("runtime-deploy-check", listed)
+        self.assertEqual(grips.READ_ONLY, listed["runtime-deploy-check"]["effect"])
+        self.assertTrue(listed["runtime-deploy-check"]["availability"]["available"])
+
+    def test_runtime_deploy_check_runs_registered_adapter_preflight_without_mutation(self) -> None:
+        expected = "d" * 40
+        preflight = {
+            "adapter": grips.RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF,
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": expected,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        with patch.object(grips, "_runtime_deploy_self_preflight", return_value=preflight) as check:
+            result = grips.run_grip(
+                "runtime-deploy-check",
+                {"adapter": "grabowski-self", "expected_head": expected},
+                command_runner=FakeGit(),
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["ready"])
+        self.assertFalse(result["output"]["mutation_attempted"])
+        check.assert_called_once_with(expected)
+
+    def test_runtime_deploy_check_blocks_unknown_adapter_and_failed_preflight(self) -> None:
+        unknown = grips.run_grip(
+            "runtime-deploy-check",
+            {"adapter": "shell", "expected_head": "e" * 40},
+            command_runner=FakeGit(),
+        )
+        self.assertEqual("blocked", unknown["receipt"]["status"])
+        self.assertIn("not registered", unknown["output"]["error"])
+
+        with patch.object(grips, "_runtime_deploy_self_preflight", side_effect=RuntimeError("canonical checkout is dirty")):
+            blocked = grips.run_grip(
+                "runtime-deploy-check",
+                {"adapter": "grabowski-self", "expected_head": "f" * 40},
+                command_runner=FakeGit(),
+            )
+        self.assertEqual("blocked", blocked["receipt"]["status"])
+        self.assertIn("canonical checkout is dirty", blocked["output"]["blocking_reasons"])
+        self.assertFalse(blocked["output"]["mutation_attempted"])
+
+
 CAPTAIN_HEAD = "b" * 40
 CAPTAIN_DIFF = "c" * 64
 
@@ -2457,6 +2578,307 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(1, len(merge_calls))
         self.assertIn("--match-head-commit", merge_calls[0])
         self.assertIn(CAPTAIN_HEAD, merge_calls[0])
+
+    def test_captain_run_schedules_registered_grabowski_self_deploy_without_claiming_completion(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            scope={
+                "allowed_effects": ["schedule one verified Grabowski self-deployment"],
+                "forbidden_effects": ["arbitrary shell", "other services", "other hosts"],
+                "boundaries": "single local Grabowski runtime",
+                "max_targets": 1,
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "inspect the scheduled job and roll back to the previous release",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        unit = "grabowski-job-abcdef012345"
+        job_dir = Path(preflight["job_root"]) / unit
+        expected_argv_sha256 = "d" * 64
+        command = [
+            "/usr/bin/python3",
+            preflight["runner"],
+            "--repo",
+            preflight["repository"],
+            "--expected-head",
+            CAPTAIN_HEAD,
+            "--delay-seconds",
+            "8",
+        ]
+        schedule = {
+            "scheduled": True,
+            "already_scheduled": False,
+            "expected_head": CAPTAIN_HEAD,
+            "requested_delay_seconds": 8,
+            "delay_seconds": 8,
+            "unit": unit,
+            "argv_sha256": expected_argv_sha256,
+            "metadata_path": str(job_dir / "metadata.json"),
+            "stdout_path": str(job_dir / "stdout.log"),
+            "stderr_path": str(job_dir / "stderr.log"),
+            "expected_connector_disconnect": True,
+            "status_tool": "grabowski_job_status",
+            "logs_tool": "grabowski_job_logs",
+        }
+
+        with patch.object(grips, "_runtime_deploy_self_preflight", return_value=preflight) as check, patch.object(
+            grips, "_runtime_deploy_self_schedule", return_value=schedule
+        ) as scheduler, patch.object(
+            grips, "_runtime_deploy_self_expected_argv_sha256", return_value=expected_argv_sha256
+        ) as hash_check:
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("scheduled", result["output"]["decision"])
+        self.assertEqual("scheduled", result["output"]["actions"][0]["execution"])
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["deployment_scheduled"])
+        self.assertTrue(execution["new_job_registered"])
+        self.assertTrue(execution["local_mutation_observed"])
+        self.assertFalse(execution["remote_mutation_observed"])
+        self.assertFalse(execution["deployment_completion_verified"])
+        self.assertEqual("schedule-registration", execution["verification_scope"])
+        self.assertEqual("grabowski-job-abcdef012345", execution["next_verification"]["unit"])
+        check.assert_called_once_with(CAPTAIN_HEAD)
+        scheduler.assert_called_once_with(CAPTAIN_HEAD, 8)
+        hash_check.assert_called_once_with(preflight, CAPTAIN_HEAD, 8)
+
+    def test_captain_run_marks_local_mutation_unknown_when_scheduler_receipt_is_invalid(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "inspect durable job records before retrying",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        invalid_schedule = {
+            "scheduled": True,
+            "already_scheduled": False,
+            "expected_head": CAPTAIN_HEAD,
+            "requested_delay_seconds": 8,
+            "delay_seconds": 8,
+            "unit": "grabowski-job-abcdef012345",
+            "argv_sha256": "d" * 64,
+            "metadata_path": "/wrong/metadata.json",
+            "stdout_path": "/wrong/stdout.log",
+            "stderr_path": "/wrong/stderr.log",
+            "expected_connector_disconnect": True,
+            "status_tool": "grabowski_job_status",
+            "logs_tool": "grabowski_job_logs",
+        }
+        with patch.object(grips, "_runtime_deploy_self_preflight", return_value=preflight), patch.object(
+            grips, "_runtime_deploy_self_schedule", return_value=invalid_schedule
+        ), patch.object(
+            grips, "_runtime_deploy_self_expected_argv_sha256", return_value="d" * 64
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+        execution = result["output"]["executions"][0]
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertTrue(execution["mutation_outcome_unknown"])
+        self.assertTrue(execution["local_mutation_outcome_unknown"])
+        self.assertFalse(execution["local_mutation_observed"])
+
+    def test_captain_run_preserves_unknown_mutation_outcome_when_scheduler_raises(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "inspect durable job records before retrying",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        with patch.object(grips, "_runtime_deploy_self_preflight", return_value=preflight), patch.object(
+            grips, "_runtime_deploy_self_schedule", side_effect=RuntimeError("audit append failed after job start")
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertEqual("verification_failed_after_execution", result["output"]["decision"])
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["execution_invoked"])
+        self.assertTrue(execution["execution_attempted"])
+        self.assertFalse(execution["command_returned"])
+        self.assertTrue(execution["mutation_outcome_unknown"])
+        self.assertTrue(execution["local_mutation_outcome_unknown"])
+        self.assertIn("may already have been registered", execution["verification_error"])
+
+    def test_runtime_deploy_schedule_validation_binds_delay_and_unit_namespace(self) -> None:
+        unit = "grabowski-job-abcdef012345"
+        job_root = Path.home() / ".local/state/grabowski/jobs"
+        job_prefix = "grabowski-job-"
+        job_dir = job_root / unit
+        runner = "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py"
+        repository = "/home/alex/repos/grabowski"
+        preflight = {
+            "repository": repository,
+            "runner": runner,
+            "job_root": str(job_root),
+            "job_prefix": job_prefix,
+        }
+        expected_argv_sha256 = "d" * 64
+        base = {
+            "scheduled": True,
+            "already_scheduled": False,
+            "expected_head": CAPTAIN_HEAD,
+            "requested_delay_seconds": 8,
+            "delay_seconds": 8,
+            "unit": unit,
+            "argv_sha256": expected_argv_sha256,
+            "metadata_path": str(job_dir / "metadata.json"),
+            "stdout_path": str(job_dir / "stdout.log"),
+            "stderr_path": str(job_dir / "stderr.log"),
+            "expected_connector_disconnect": True,
+            "status_tool": "grabowski_job_status",
+            "logs_tool": "grabowski_job_logs",
+        }
+        self.assertEqual(
+            [],
+            grips._runtime_deploy_schedule_errors(
+                base,
+                expected_head=CAPTAIN_HEAD,
+                expected_delay_seconds=8,
+                expected_argv_sha256=expected_argv_sha256,
+                expected_job_root=str(job_root),
+                expected_job_prefix=job_prefix,
+            ),
+        )
+        drifted = dict(
+            base,
+            requested_delay_seconds=5,
+            delay_seconds=5,
+            unit="foreign.service",
+            argv_sha256="invalid",
+            metadata_path="/state/meta",
+        )
+        errors = grips._runtime_deploy_schedule_errors(
+            drifted,
+            expected_head=CAPTAIN_HEAD,
+            expected_delay_seconds=8,
+            expected_argv_sha256=expected_argv_sha256,
+            expected_job_root=str(job_root),
+            expected_job_prefix=job_prefix,
+        )
+        self.assertIn("runtime_deploy_schedule_requested_delay_mismatch", errors)
+        self.assertIn("runtime_deploy_schedule_unit_missing_or_unbound", errors)
+        self.assertIn("runtime_deploy_schedule_argv_hash_missing_or_invalid", errors)
+        self.assertIn("runtime_deploy_schedule_paths_not_bound_to_unit", errors)
+        wrong_hash = dict(base, argv_sha256="0" * 64)
+        hash_errors = grips._runtime_deploy_schedule_errors(
+            wrong_hash,
+            expected_head=CAPTAIN_HEAD,
+            expected_delay_seconds=8,
+            expected_argv_sha256=expected_argv_sha256,
+            expected_job_root=str(job_root),
+            expected_job_prefix=job_prefix,
+        )
+        self.assertIn("runtime_deploy_schedule_argv_hash_mismatch", hash_errors)
+
+
+    def test_captain_run_blocks_runtime_deploy_target_without_registered_adapter(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        result = self.run_captain(captain_parameters([action]))
+        self.assert_blocked_gate_reason(result, "target-bound", "target.adapter")
+
 
     def test_captain_run_preserves_execution_receipt_when_post_merge_verification_fails(self) -> None:
         parameters = captain_parameters(
@@ -3284,7 +3706,34 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             blocked = self.run_captain(captain_parameters([bad]))
             self.assert_blocked_gate_reason(blocked, "target-bound", "target")
 
-        action["target"] = {"service": "grabowski-mcp", "environment": "heim-pc"}
+        for target, expected_reason in (
+            (
+                {"service": "other-service", "runtime_target": "heim-pc", "adapter": "grabowski-self"},
+                "runtime_deploy_service_does_not_match_grabowski_self_adapter",
+            ),
+            (
+                {"repo": "heimgewebe/other", "runtime_target": "heim-pc", "adapter": "grabowski-self"},
+                "runtime_deploy_repo_does_not_match_grabowski_self_adapter",
+            ),
+            (
+                {"service": "grabowski-mcp", "runtime_target": "other-host", "adapter": "grabowski-self"},
+                "runtime_deploy_target_does_not_match_local_grabowski_runtime",
+            ),
+            (
+                {"repo": "heimgewebe/grabowski", "environment": "production", "adapter": "grabowski-self"},
+                "runtime_deploy_target_does_not_match_local_grabowski_runtime",
+            ),
+        ):
+            with self.subTest(target=target):
+                bad = captain_action(
+                    action="runtime-deploy",
+                    target=target,
+                    receipt_path="receipts/captain/runtime-deploy.json",
+                )
+                blocked = self.run_captain(captain_parameters([bad]))
+                self.assert_blocked_gate_reason(blocked, "target-bound", expected_reason)
+
+        action["target"] = {"service": "grabowski-mcp", "environment": "heim-pc", "adapter": "grabowski-self"}
         parameters = captain_parameters([action])
         for key in ("status_projection", "status_projection_fresh", "status_projection_source", "status_projection_sha256"):
             parameters.pop(key)
@@ -3541,7 +3990,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         actions = [
             captain_action(
                 action="runtime-deploy",
-                target={"service": "grabowski-mcp", "environment": "heim-pc"},
+                target={"service": "grabowski-mcp", "environment": "heim-pc", "adapter": "grabowski-self"},
                 receipt_path="receipts/captain/runtime-deploy.json",
             ),
             captain_action(

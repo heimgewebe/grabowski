@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+import hashlib
 import importlib.util
 import json
 import os
@@ -34,6 +36,14 @@ def _load_self_deploy():
     operator._require_operator_capability = Mock()
     operator.grabowski_job_start = Mock()
     operator._start_job = Mock()
+    operator.JOB_PREFIX = "grabowski-job-"
+    operator.JOBS_DIR = Path.home() / ".local/state/grabowski/jobs"
+    operator._argv_hash = lambda argv: hashlib.sha256(
+        json.dumps(argv, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    operator._jobs_root = Mock()
+    operator._read_job_metadata = Mock()
+    operator.grabowski_job_status = Mock()
     base = types.ModuleType("grabowski_mcp")
     base._append_audit = Mock()
     read_surface = types.ModuleType("grabowski_read_surface")
@@ -109,11 +119,22 @@ class SelfDeployToolTests(unittest.TestCase):
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"
         expected = "c" * 40
-        job = {"unit": "grabowski-job-test", "argv_sha256": "d" * 64, "metadata_path": "/state/meta", "stdout_path": "/state/out", "stderr_path": "/state/err"}
+        unit = "grabowski-job-abcdef012345"
+        job_dir = Path("/state") / unit
+        command = SELF_DEPLOY._deploy_command(repo, runner, expected, 9)
+        job = {
+            "unit": unit,
+            "argv_sha256": SELF_DEPLOY.operator._argv_hash(command),
+            "metadata_path": str(job_dir / "metadata.json"),
+            "stdout_path": str(job_dir / "stdout.log"),
+            "stderr_path": str(job_dir / "stderr.log"),
+        }
         SELF_DEPLOY.operator._start_job.reset_mock()
         SELF_DEPLOY.base._append_audit.reset_mock()
         SELF_DEPLOY.operator._start_job.return_value = job
-        with patch.object(SELF_DEPLOY, "_canonical_preflight", return_value=(repo, runner)):
+        with patch.object(SELF_DEPLOY, "_canonical_preflight", return_value=(repo, runner)), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None):
             result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 9)
         SELF_DEPLOY.operator._start_job.assert_called_once_with(
             ["/usr/bin/python3", str(runner), "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "9"],
@@ -122,11 +143,444 @@ class SelfDeployToolTests(unittest.TestCase):
             finalization_expected_head=expected,
         )
         self.assertTrue(result["scheduled"])
+        self.assertFalse(result["already_scheduled"])
+        self.assertEqual(9, result["requested_delay_seconds"])
+        self.assertEqual(9, result["delay_seconds"])
         self.assertTrue(result["expected_connector_disconnect"])
-        self.assertEqual(result["unit"], "grabowski-job-test")
+        self.assertEqual(result["unit"], unit)
         self.assertEqual(SELF_DEPLOY.base._append_audit.call_count, 2)
         self.assertEqual(result["audit"]["intent"]["operation"], "runtime-deploy-schedule-intent")
         self.assertEqual(result["audit"]["scheduled"]["operation"], "runtime-deploy-scheduled")
+
+    def test_schedule_reuses_identical_inflight_job_without_starting_another(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        expected = "e" * 40
+        existing = {
+            "unit": "grabowski-job-abcdef012345",
+            "argv_sha256": "f" * 64,
+            "delay_seconds": 6,
+            "metadata_path": "/state/meta",
+            "stdout_path": "/state/out",
+            "stderr_path": "/state/err",
+            "final_status": "running",
+        }
+        SELF_DEPLOY.operator.grabowski_job_start.reset_mock()
+        SELF_DEPLOY.base._append_audit.reset_mock()
+        with patch.object(SELF_DEPLOY, "_canonical_preflight", return_value=(repo, runner)), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=existing) as lookup:
+            result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        lookup.assert_called_once_with(
+            SELF_DEPLOY._deploy_command(repo, runner, expected, 8),
+            repo,
+        )
+        SELF_DEPLOY.operator.grabowski_job_start.assert_not_called()
+        self.assertTrue(result["scheduled"])
+        self.assertTrue(result["already_scheduled"])
+        self.assertEqual(8, result["requested_delay_seconds"])
+        self.assertEqual(6, result["delay_seconds"])
+        self.assertEqual("grabowski-job-abcdef012345", result["unit"])
+        self.assertEqual(
+            "runtime-deploy-existing-schedule-observed",
+            result["audit"]["scheduled"]["operation"],
+        )
+        self.assertEqual(1, SELF_DEPLOY.base._append_audit.call_count)
+        self.assertIsNone(result["audit"]["intent"])
+
+    def test_deploy_identity_accepts_canonical_options_in_any_order(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        head = "a" * 40
+        command = [
+            "/usr/bin/python3",
+            str(runner),
+            "--delay-seconds",
+            "8",
+            "--expected-head",
+            head,
+            "--repo",
+            str(repo),
+        ]
+        self.assertEqual(
+            ("/usr/bin/python3", str(runner), str(repo), head),
+            SELF_DEPLOY._deploy_identity(command),
+        )
+
+    def test_deploy_identity_rejects_duplicate_or_unknown_options(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        head = "a" * 40
+        duplicate = [
+            "/usr/bin/python3", str(runner),
+            "--repo", str(repo),
+            "--repo", str(repo),
+            "--expected-head", head,
+        ]
+        unknown = [
+            "/usr/bin/python3", str(runner),
+            "--repo", str(repo),
+            "--expected-head", head,
+            "--force", "8",
+        ]
+        self.assertIsNone(SELF_DEPLOY._deploy_identity(duplicate))
+        self.assertIsNone(SELF_DEPLOY._deploy_identity(unknown))
+
+    def test_matching_inflight_job_uses_deploy_identity_and_receipt(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        command = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            expected_receipt = {
+                "metadata_path": str(job_dir / "metadata.json"),
+                "stdout_path": str(job_dir / "stdout.log"),
+                "stderr_path": str(job_dir / "stderr.log"),
+            }
+            with patch.object(
+                SELF_DEPLOY.operator, "_jobs_root", return_value=root, create=True
+            ), patch.object(SELF_DEPLOY.operator, "JOB_PREFIX", "grabowski-job-", create=True), patch.object(
+                SELF_DEPLOY.operator,
+                "_read_job_metadata",
+                return_value={
+                    "argv": SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 6),
+                    "argv_sha256": SELF_DEPLOY.operator._argv_hash(SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 6)),
+                    "cwd": str(repo),
+                    "expected_receipt": {
+                        "unit": "grabowski-job-abcdef012345",
+                        "metadata_path": str(job_dir / "metadata.json"),
+                        "stdout_path": str(job_dir / "stdout.log"),
+                        "stderr_path": str(job_dir / "stderr.log"),
+                        "status_tool": "grabowski_job_status",
+                        "logs_tool": "grabowski_job_logs",
+                    },
+                },
+                create=True,
+            ), patch.object(
+                SELF_DEPLOY.operator,
+                "grabowski_job_status",
+                return_value={
+                    "final_status": "running",
+                    "metadata": {"expected_receipt": expected_receipt},
+                },
+                create=True,
+            ):
+                result = SELF_DEPLOY._matching_inflight_deploy_job(command, repo)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual("grabowski-job-abcdef012345", result["unit"])
+        self.assertEqual("running", result["final_status"])
+        self.assertEqual(6, result["delay_seconds"])
+        self.assertEqual(expected_receipt["metadata_path"], result["metadata_path"])
+
+    def test_matching_job_with_unclear_outcome_blocks_duplicate(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        command = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": command,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(command),
+                "cwd": str(repo),
+                "expected_receipt": {
+                    "unit": job_dir.name,
+                    "metadata_path": str(job_dir / "metadata.json"),
+                    "stdout_path": str(job_dir / "stdout.log"),
+                    "stderr_path": str(job_dir / "stderr.log"),
+                    "status_tool": "grabowski_job_status",
+                    "logs_tool": "grabowski_job_logs",
+                },
+            }
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root, create=True), patch.object(
+                SELF_DEPLOY.operator, "JOB_PREFIX", "grabowski-job-", create=True
+            ), patch.object(
+                SELF_DEPLOY.operator,
+                "_read_job_metadata",
+                return_value=metadata,
+                create=True,
+            ), patch.object(
+                SELF_DEPLOY.operator,
+                "grabowski_job_status",
+                return_value={"final_status": "missing_finalization_evidence", "metadata": {}},
+                create=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(command, repo)
+
+    def _job_fixture(self, root: Path, repo: Path, runner: Path, head: str, *, delay: int = 8) -> tuple[Path, list[str], dict[str, object]]:
+        job_dir = root / "grabowski-job-abcdef012345"
+        job_dir.mkdir()
+        command = SELF_DEPLOY._deploy_command(repo, runner, head, delay)
+        metadata = {
+            "argv": command,
+            "argv_sha256": SELF_DEPLOY.operator._argv_hash(command),
+            "cwd": str(repo),
+            "expected_receipt": {
+                "unit": job_dir.name,
+                "metadata_path": str(job_dir / "metadata.json"),
+                "stdout_path": str(job_dir / "stdout.log"),
+                "stderr_path": str(job_dir / "stderr.log"),
+                "status_tool": "grabowski_job_status",
+                "logs_tool": "grabowski_job_logs",
+            },
+        }
+        return job_dir, command, metadata
+
+    def test_malformed_durable_job_argv_blocks_scan(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        malformed_values = ("not-a-list", ["/usr/bin/python3", 7])
+        for malformed in malformed_values:
+            with self.subTest(argv=malformed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                unit = "grabowski-job-abcdef012345"
+                (root / unit).mkdir()
+                with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                    SELF_DEPLOY.operator,
+                    "_read_job_metadata",
+                    return_value={"unit": unit, "argv": malformed},
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "durable job argv is malformed"):
+                        SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_unreadable_regular_job_metadata_blocks_scan(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        command = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "grabowski-job-abcdef012345").mkdir()
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", side_effect=ValueError("broken")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "metadata is unreadable"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(command, repo)
+
+    def test_exact_durable_job_symlink_blocks_scan(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            (root / "grabowski-job-abcdef012345").symlink_to(target, target_is_directory=True)
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root):
+                with self.assertRaisesRegex(RuntimeError, "not a real directory"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_exact_durable_job_regular_file_blocks_scan(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "grabowski-job-abcdef012345").write_text("invalid", encoding="utf-8")
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root):
+                with self.assertRaisesRegex(RuntimeError, "not a real directory"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_nonstandard_legacy_job_directory_is_ignored(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        command = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "grabowski-job-legacy-name").mkdir()
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata"
+            ) as read_metadata:
+                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(command, repo))
+            read_metadata.assert_not_called()
+
+    def test_running_deploy_for_different_head_blocks(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, _, metadata = self._job_fixture(root, repo, runner, "b" * 40)
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value={"final_status": "running"}
+            ):
+                with self.assertRaisesRegex(RuntimeError, "different head"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_multiple_identical_running_deploys_block(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first, _, first_metadata = self._job_fixture(root, repo, runner, "a" * 40)
+            second = root / "grabowski-job-fedcba543210"
+            second.mkdir()
+            second_metadata = dict(first_metadata)
+            second_metadata["expected_receipt"] = {
+                **first_metadata["expected_receipt"],
+                "unit": second.name,
+                "metadata_path": str(second / "metadata.json"),
+                "stdout_path": str(second / "stdout.log"),
+                "stderr_path": str(second / "stderr.log"),
+            }
+            metadata_by_unit = {first.name: first_metadata, second.name: second_metadata}
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", side_effect=lambda unit: metadata_by_unit[unit]
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value={"final_status": "running"}
+            ):
+                with self.assertRaisesRegex(RuntimeError, "multiple identical"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_tampered_command_hash_or_receipt_path_blocks(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, _, metadata = self._job_fixture(root, repo, runner, "a" * 40)
+            metadata["argv_sha256"] = "0" * 64
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ):
+                with self.assertRaisesRegex(RuntimeError, "command hash mismatch"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+            metadata["argv_sha256"] = SELF_DEPLOY.operator._argv_hash(metadata["argv"])
+            metadata["expected_receipt"]["stdout_path"] = "/other/stdout.log"
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value={"final_status": "running"}
+            ):
+                with self.assertRaisesRegex(RuntimeError, "not bound"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_terminal_legacy_job_without_receipt_allows_retry(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": desired,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(desired),
+                "cwd": str(repo),
+            }
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value={"final_status": "succeeded"}
+            ):
+                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(desired, repo))
+
+    def test_unclear_legacy_job_for_different_head_blocks(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        other = SELF_DEPLOY._deploy_command(repo, runner, "b" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": other,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(other),
+                "cwd": str(repo),
+            }
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value={"final_status": "missing_finalization_evidence"}
+            ):
+                with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_completed_finalized_job_allows_retry(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, _, metadata = self._job_fixture(root, repo, runner, "a" * 40)
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value={"final_status": "completed"}
+            ):
+                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(desired, repo))
+
+    def test_launch_failed_job_allows_retry(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, _, metadata = self._job_fixture(root, repo, runner, "a" * 40)
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value={"final_status": "launch_failed"}
+            ):
+                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(desired, repo))
+
+    def test_deploy_command_hash_uses_operator_hash_contract(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        command = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        self.assertEqual(
+            SELF_DEPLOY.operator._argv_hash(command),
+            SELF_DEPLOY._deploy_command_sha256(command),
+        )
+
+    def test_non_job_entries_do_not_consume_scan_bound(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        command = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "unrelated-a").mkdir()
+            (root / "unrelated-b").mkdir()
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY, "MAX_JOB_SCAN_ENTRIES", 1
+            ):
+                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(command, repo))
+
+    def test_schedule_lock_times_out_instead_of_hanging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lock = Path(temporary) / "lock"
+            with patch.object(SELF_DEPLOY, "DEPLOY_SCHEDULE_LOCK", lock), patch.object(
+                SELF_DEPLOY, "DEPLOY_SCHEDULE_LOCK_TIMEOUT_SECONDS", 10.0
+            ), patch.object(
+                SELF_DEPLOY.fcntl, "flock", side_effect=BlockingIOError
+            ), patch.object(
+                SELF_DEPLOY.time, "monotonic", side_effect=[0.0, 11.0]
+            ), patch.object(SELF_DEPLOY.time, "sleep"):
+                with self.assertRaisesRegex(TimeoutError, "lock acquisition timed out"):
+                    with SELF_DEPLOY._deploy_schedule_lock():
+                        pass
+
+    def test_schedule_lock_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.write_text("", encoding="utf-8")
+            lock = root / "lock"
+            lock.symlink_to(target)
+            with patch.object(SELF_DEPLOY, "DEPLOY_SCHEDULE_LOCK", lock):
+                with self.assertRaisesRegex(PermissionError, "may not be a symlink"):
+                    with SELF_DEPLOY._deploy_schedule_lock():
+                        pass
+
 
 class ScheduledDeployRunnerTests(unittest.TestCase):
     def test_capture_fails_closed_on_excess_output(self) -> None:
