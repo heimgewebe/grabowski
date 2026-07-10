@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 HEAD = "a" * 40
-DIFF_SHA = "0" * 64
+DIFF_TEXT = "diff --git a/src/example.py b/src/example.py\n+VALUE = 1\n"
+DIFF_SHA = hashlib.sha256(DIFF_TEXT.encode("utf-8")).hexdigest()
 PROMPT_SHA = "1" * 64
 REVIEW_SHA = "2" * 64
+PACKET_PROMPT_SHA = "3" * 64
+PROMPT_NONCE = "4" * 32
 
 
 def _load_gate():
@@ -52,6 +58,7 @@ def _state(path: str = "README.md", *, diff_sha: str | None = DIFF_SHA) -> dict[
     }
     if diff_sha is not None:
         state["pr_diff_sha256"] = diff_sha
+        state["pr_diff_text"] = DIFF_TEXT
     return state
 
 
@@ -79,22 +86,139 @@ def _self_review(*, diff_sha: str = DIFF_SHA, path: str = "README.md") -> dict[s
     }
 
 
+def _packet_command() -> list[str]:
+    schema = json.dumps(gate.CLAUDE_PACKET_REVIEW_SCHEMA, separators=(",", ":"), sort_keys=True)
+    return [
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
+        "--json-schema",
+        schema,
+        "--tools=",
+        "--permission-mode",
+        "plan",
+        "--no-session-persistence",
+        "--safe-mode",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+        "--max-budget-usd",
+        "2",
+    ]
+
+
+def _claude_review(**overrides: object) -> dict[str, object]:
+    review: dict[str, object] = {
+        "source": gate.CLAUDE_CLI_REVIEW_SOURCE,
+        "tool": "claude-code",
+        "tool_version": "2.1.206",
+        "command": _packet_command(),
+        "model": "opus",
+        "effort": "high",
+        "exit_code": 0,
+        "json_ok": True,
+        "review_sha256": REVIEW_SHA,
+        "verdict": "PASS",
+        "finding_count": 0,
+    }
+    review.update(overrides)
+    return review
+
+
 def _external(**overrides: object) -> dict[str, object]:
+    repo = overrides.get("repo", "heimgewebe/grabowski")
+    pr = overrides.get("pr", 7)
+    head_sha = overrides.get("head_sha", HEAD)
+    diff_sha256 = overrides.get("diff_sha256", DIFF_SHA)
+    packet_prompt = gate.build_external_review_prompt(
+        {
+            "repoName": repo,
+            "pr": {"number": pr, "headRefOid": head_sha, "title": ""},
+        },
+        f"pr-{pr}-{str(head_sha)[:12]}.diff",
+        str(diff_sha256).strip().lower(),
+    )
+    packet_prompt_sha256 = gate._sha256_text(packet_prompt)
+    reconstructed_prompt_sha256 = gate._sha256_text(
+        gate.build_claude_review_prompt(packet_prompt, DIFF_TEXT, PROMPT_NONCE)
+    )
+    prompt_sha256 = overrides.get("prompt_sha256", reconstructed_prompt_sha256)
+    supplied_reviews = overrides.get("reviews")
+    if supplied_reviews is None:
+        reviews: object = [_claude_review(stdin_sha256=prompt_sha256)]
+    elif isinstance(supplied_reviews, list):
+        normalized_reviews = [dict(item) for item in supplied_reviews]
+        for review in normalized_reviews:
+            if review.get("source") == gate.CLAUDE_CLI_REVIEW_SOURCE and "stdin_sha256" not in review:
+                review["stdin_sha256"] = prompt_sha256
+        reviews = normalized_reviews
+    else:
+        reviews = supplied_reviews
     data: dict[str, object] = {
         "schema_version": 1,
         "kind": "external_review",
+        "repo": repo,
+        "pr": pr,
+        "head_sha": head_sha,
+        "diff_sha256": diff_sha256,
+        "prompt_sha256": prompt_sha256,
+        "prompt_includes_diff": True,
+        "prompt_transmitted": True,
+        "review_input": {
+            "mode": gate.CLAUDE_CLI_REVIEW_INPUT_MODE,
+            "repo": repo,
+            "pr": pr,
+            "head_sha": head_sha,
+            "diff_sha256": diff_sha256,
+            "packet_prompt_sha256": packet_prompt_sha256,
+            "prompt_nonce": PROMPT_NONCE,
+            "prompt_sha256": prompt_sha256,
+            "transport": "stdin",
+        },
+        "reviews": reviews,
+        "external_reviews_triaged": True,
+        "findings": [],
+    }
+    data.update({key: value for key, value in overrides.items() if key != "reviews"})
+    return data
+
+
+def _policy_waiver(**overrides: object) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    waiver: dict[str, object] = {
+        "schema_version": 1,
+        "kind": gate.CLAUDE_POLICY_WAIVER_KIND,
+        "scope": gate.CLAUDE_POLICY_WAIVER_SCOPE,
         "repo": "heimgewebe/grabowski",
         "pr": 7,
         "head_sha": HEAD,
         "diff_sha256": DIFF_SHA,
-        "prompt_sha256": PROMPT_SHA,
-        "prompt_includes_diff": True,
-        "reviews": [{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 0}],
-        "external_reviews_triaged": True,
-        "findings": [],
+        "authority": gate.CLAUDE_POLICY_WAIVER_AUTHORITY,
+        "approver": "trusted-owner:test",
+        "reason": "Claude CLI provider unavailable during a bounded recovery window.",
+        "issued_at": (now - timedelta(minutes=1)).isoformat(),
+        "expires_at": (now + timedelta(hours=1)).isoformat(),
+        "audit_reference": "test://waiver/7",
     }
-    data.update(overrides)
-    return data
+    waiver.update(overrides)
+    return waiver
+
+
+def _generic_external(**overrides: object) -> dict[str, object]:
+    evidence = _external()
+    evidence.pop("review_input", None)
+    evidence["reviews"] = [
+        {
+            "source": "chatgpt",
+            "review_sha256": REVIEW_SHA,
+            "verdict": "PASS",
+            "finding_count": 0,
+        }
+    ]
+    evidence.update(overrides)
+    return evidence
 
 
 def _terminal_external_finding() -> dict[str, object]:
@@ -171,9 +295,12 @@ class ExternalReviewGateTests(unittest.TestCase):
             _state("tools/pr_review_gate.py"),
             self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
-                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1}],
+                reviews=[
+                    {"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1},
+                    _claude_review(),
+                ],
                 external_reviews_triaged=True,
-                findings=[_terminal_external_finding()],
+                findings=[_terminal_external_finding()]
             ),
         )
         self.assertEqual(result["verdict"], "PASS")
@@ -208,9 +335,12 @@ class ExternalReviewGateTests(unittest.TestCase):
             _state("tools/pr_review_gate.py"),
             self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
-                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "NEEDS_CHANGE", "finding_count": 2}],
+                reviews=[
+                    {"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "NEEDS_CHANGE", "finding_count": 2},
+                    _claude_review(),
+                ],
                 external_reviews_triaged=True,
-                findings=[_terminal_external_finding(), _terminal_external_finding()],
+                findings=[_terminal_external_finding(), _terminal_external_finding()]
             ),
         )
         self.assertEqual(result["verdict"], "PASS")
@@ -220,30 +350,27 @@ class ExternalReviewGateTests(unittest.TestCase):
             _state("tools/pr_review_gate.py"),
             self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
-                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "BLOCK", "finding_count": 0}],
+                reviews=[
+                    {"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "BLOCK", "finding_count": 0},
+                    _claude_review(),
+                ],
                 external_reviews_triaged=True,
-                findings=[_terminal_external_finding()],
+                findings=[_terminal_external_finding()]
             ),
         )
         self.assertEqual(result["verdict"], "PASS")
 
     def test_sha256_normalization_accepts_uppercase_and_whitespace(self) -> None:
-        diff_sha = "ab" * 32
-        prompt_sha = "cd" * 32
+        prompt_sha = str(_external()["prompt_sha256"])
         review_sha = "ef" * 32
         result = gate.evaluate_review_gate(
-            _state("tools/pr_review_gate.py", diff_sha=diff_sha),
-            self_review=_self_review(diff_sha=diff_sha, path="tools/pr_review_gate.py"),
+            _state("tools/pr_review_gate.py", diff_sha=DIFF_SHA),
+            self_review=_self_review(diff_sha=DIFF_SHA, path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
-                diff_sha256=f"  {diff_sha.upper()}\n",
+                diff_sha256=f"  {DIFF_SHA.upper()}\n",
                 prompt_sha256=f"\t{prompt_sha.upper()}  ",
                 reviews=[
-                    {
-                        "source": "chatgpt",
-                        "review_sha256": f"  {review_sha.upper()}\t",
-                        "verdict": "PASS",
-                        "finding_count": 0,
-                    }
+                    _claude_review(review_sha256=f"  {review_sha.upper()}\t", stdin_sha256=f"\t{prompt_sha.upper()}  "),
                 ],
             ),
         )
@@ -253,6 +380,7 @@ class ExternalReviewGateTests(unittest.TestCase):
         reviews = [
             {"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1},
             {"source": "claude", "review_sha256": "3" * 64, "verdict": "BLOCK", "finding_count": 0},
+            _claude_review(review_sha256="4" * 64),
         ]
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
@@ -490,6 +618,48 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertFalse(result["review_sources"]["external_review_required"])
         self.assertFalse(result["review_sources"]["platform_review_required"])
 
+    def test_weltgewebe_tiny_code_change_requires_claude_cli_review(self) -> None:
+        state = _state("src/tiny_feature.py")
+        state["repoName"] = "heimgewebe/weltgewebe"
+        state["pr"]["additions"] = 4
+        state["pr"]["deletions"] = 1
+        state["pr"]["reviews"] = []
+        self_review = _self_review(path="src/tiny_feature.py")
+        self_review["repo"] = "heimgewebe/weltgewebe"
+        result = gate.evaluate_review_gate(state, self_review=self_review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["complexity"]["review_tier"], "important_repo")
+        self.assertEqual(result["complexity"]["repo_policy"], "important")
+        self.assertTrue(result["review_sources"]["claude_cli_required"])
+        self.assertTrue(_has_failure(result, "external review is required"), result["failures"])
+
+    def test_weltgewebe_tiny_code_change_passes_with_claude_cli_review(self) -> None:
+        state = _state("src/tiny_feature.py")
+        state["repoName"] = "heimgewebe/weltgewebe"
+        state["pr"]["additions"] = 4
+        state["pr"]["deletions"] = 1
+        state["pr"]["reviews"] = []
+        self_review = _self_review(path="src/tiny_feature.py")
+        self_review["repo"] = "heimgewebe/weltgewebe"
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=self_review,
+            external_review_evidence=_external(repo="heimgewebe/weltgewebe"),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["complexity"]["review_tier"], "important_repo")
+
+    def test_weltgewebe_ordinary_docs_only_change_remains_exempt(self) -> None:
+        state = _state("docs/note.md")
+        state["repoName"] = "heimgewebe/weltgewebe"
+        state["pr"]["reviews"] = []
+        self_review = _self_review(path="docs/note.md")
+        self_review["repo"] = "heimgewebe/weltgewebe"
+        result = gate.evaluate_review_gate(state, self_review=self_review)
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertTrue(result["complexity"]["important_repo"])
+        self.assertFalse(result["review_sources"]["claude_cli_required"])
+
     def test_high_critical_change_requires_external_evidence_without_coding_agent_requirement(self) -> None:
         state = _state("src/runtime_boundary.py")
         state["pr"]["reviews"] = []
@@ -506,7 +676,53 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
             result["failures"],
         )
 
-    def test_high_critical_change_with_diff_bound_external_evidence_passes_without_coding_agent_review(self) -> None:
+    def test_high_critical_change_requires_claude_cli_review_entry(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_external(
+                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 0}]
+            ),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(result["review_sources"]["claude_cli_required"])
+        self.assertTrue(_has_failure(result, "Claude CLI packet review is required"), result["failures"])
+
+    def test_high_critical_claude_review_without_pr_bound_input_blocks(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        state["pr"]["reviews"] = []
+        evidence = _external(prompt_includes_diff=True, prompt_transmitted=True)
+        evidence.pop("review_input")
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "review_input is missing"), result["failures"])
+
+    def test_high_critical_claude_review_with_wrong_bound_diff_blocks(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        state["pr"]["reviews"] = []
+        evidence = _external()
+        evidence["review_input"] = {
+            "mode": gate.CLAUDE_CLI_REVIEW_INPUT_MODE,
+            "repo": "heimgewebe/grabowski",
+            "pr": 7,
+            "head_sha": HEAD,
+            "diff_sha256": "f" * 64,
+        }
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "review_input.diff_sha256 mismatch"), result["failures"])
+
+    def test_high_critical_change_with_claude_cli_review_passes(self) -> None:
         state = _state("src/runtime_boundary.py")
         state["pr"]["reviews"] = []
         result = gate.evaluate_review_gate(
@@ -515,10 +731,330 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
             external_review_evidence=_external(),
         )
         self.assertEqual(result["verdict"], "PASS")
-        self.assertTrue(result["review_sources"]["external_review_required"])
+        self.assertTrue(result["review_sources"]["claude_cli_required"])
         self.assertEqual(result["review_sources"]["external_reviews_received"], 1)
-        self.assertFalse(result["review_sources"]["platform_review_required"])
-        self.assertFalse(result["review_sources"]["platform_review_seen"])
+
+    def test_claude_packet_command_with_unknown_flag_blocks(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external()
+        review = dict(evidence["reviews"][0])
+        review["command"] = [*_packet_command(), "--extra"]
+        evidence["reviews"] = [review]
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "allowed Claude packet-review command"), result["failures"])
+
+    def test_claude_packet_command_requires_exact_schema(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external()
+        review = dict(evidence["reviews"][0])
+        command = _packet_command()
+        command[5] = json.dumps({"type": "object"})
+        review["command"] = command
+        evidence["reviews"] = [review]
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "allowed Claude packet-review command"), result["failures"])
+
+    def test_claude_packet_review_requires_opus_and_high_effort(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external(reviews=[_claude_review(model="sonnet", effort="medium")])
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "model is not opus"), result["failures"])
+        self.assertTrue(_has_failure(result, "effort is not high"), result["failures"])
+
+    def test_claude_packet_review_requires_tools_disabled(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        unsafe_command = _packet_command()
+        unsafe_command[6] = "--tools=Bash"
+        evidence = _external(reviews=[_claude_review(command=unsafe_command)])
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "allowed Claude packet-review command"), result["failures"])
+
+    def test_claude_packet_review_requires_safe_mode(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        unsafe_command = _packet_command()
+        unsafe_command[10] = "--verbose"
+        evidence = _external(reviews=[_claude_review(command=unsafe_command)])
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "allowed Claude packet-review command"), result["failures"])
+
+    def test_claude_packet_review_requires_stdin_hash_binding(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external(reviews=[_claude_review(stdin_sha256="f" * 64)])
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "stdin_sha256 does not match"), result["failures"])
+
+    def test_claude_packet_review_requires_prompt_and_transport_binding(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external()
+        evidence["review_input"] = {
+            **evidence["review_input"],
+            "packet_prompt_sha256": "not-a-sha",
+            "prompt_sha256": "f" * 64,
+            "transport": "argv",
+        }
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "packet_prompt_sha256"), result["failures"])
+        self.assertTrue(_has_failure(result, "review_input.prompt_sha256 mismatch"), result["failures"])
+        self.assertTrue(_has_failure(result, "transport is not stdin"), result["failures"])
+
+    def test_claude_packet_review_requires_transmitted_diff_prompt(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external(prompt_transmitted=False, prompt_includes_diff=False)
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "prompt_transmitted must be true"), result["failures"])
+        self.assertTrue(_has_failure(result, "prompt_includes_diff must be true"), result["failures"])
+
+    def test_claude_pass_with_findings_blocks_forged_evidence(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external(reviews=[_claude_review(verdict="PASS", finding_count=1)])
+        evidence["findings"] = [_terminal_external_finding()]
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "PASS Claude review must have finding_count 0"), result["failures"])
+
+    def test_chatgpt_alone_does_not_satisfy_weltgewebe_lane(self) -> None:
+        state = _state("src/tiny_feature.py")
+        state["repoName"] = "heimgewebe/weltgewebe"
+        self_review = _self_review(path="src/tiny_feature.py")
+        self_review["repo"] = "heimgewebe/weltgewebe"
+        evidence = _external(
+            repo="heimgewebe/weltgewebe",
+            reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 0}],
+        )
+        result = gate.evaluate_review_gate(state, self_review=self_review, external_review_evidence=evidence)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "Claude CLI packet review is required"), result["failures"])
+
+    def test_legacy_claude_evidence_cannot_bypass_packet_requirement(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        legacy = {
+            "schema_version": 1,
+            "kind": "claude_ultrareview",
+            "repo": "heimgewebe/grabowski",
+            "pr": 7,
+            "head_sha": HEAD,
+            "expected_head_sha": HEAD,
+            "tool": "claude-code",
+            "tool_version": "2.1.206",
+            "command": ["claude", "ultrareview", "7", "--json", "--timeout", "30"],
+            "exit_code": 0,
+            "json_ok": True,
+            "verdict": "PASS",
+            "finding_count": 0,
+            "findings_triaged": True,
+            "stdout_sha256": REVIEW_SHA,
+            "stderr_sha256": REVIEW_SHA,
+        }
+        evidence = _external(
+            reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 0}]
+        )
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            claude_evidence=legacy,
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "Claude CLI packet review is required"), result["failures"])
+
+    def test_weltgewebe_policy_survives_canonical_repo_forms(self) -> None:
+        state = _state("src/tiny_feature.py")
+        state["repoName"] = "HTTPS://GITHUB.COM/Heimgewebe/Weltgewebe.git"
+        self_review = _self_review(path="src/tiny_feature.py")
+        self_review["repo"] = "heimgewebe/weltgewebe"
+        result = gate.evaluate_review_gate(state, self_review=self_review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(result["complexity"]["important_repo"])
+        self.assertTrue(result["review_sources"]["claude_cli_required"])
+
+    def test_valid_policy_waiver_replaces_only_claude_provider_requirement(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_generic_external(),
+            policy_waiver=_policy_waiver(),
+        )
+        self.assertEqual(result["verdict"], "PASS", result["failures"])
+        self.assertTrue(result["review_sources"]["claude_cli_required"])
+        self.assertTrue(result["review_sources"]["claude_cli_waived"])
+        self.assertTrue(result["policy_waiver"]["valid"])
+        self.assertTrue(result["policy_waiver"]["applied"])
+        self.assertEqual(result["policy_waiver"]["evidence"]["audit_reference"], "test://waiver/7")
+
+    def test_policy_waiver_does_not_remove_external_review_requirement(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            policy_waiver=_policy_waiver(),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "external review is required"), result["failures"])
+
+    def test_expired_policy_waiver_blocks(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        now = datetime.now(timezone.utc)
+        waiver = _policy_waiver(
+            issued_at=(now - timedelta(hours=2)).isoformat(),
+            expires_at=(now - timedelta(hours=1)).isoformat(),
+        )
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_generic_external(),
+            policy_waiver=waiver,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "waiver is expired"), result["failures"])
+        self.assertFalse(result["review_sources"]["claude_cli_waived"])
+
+    def test_policy_waiver_is_head_and_diff_bound(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        waiver = _policy_waiver(head_sha="b" * 40, diff_sha256="f" * 64)
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_generic_external(),
+            policy_waiver=waiver,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "head_sha mismatch"), result["failures"])
+        self.assertTrue(_has_failure(result, "diff_sha256 mismatch"), result["failures"])
+
+    def test_policy_waiver_rejects_unknown_fields_and_long_lifetime(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        now = datetime.now(timezone.utc)
+        waiver = _policy_waiver(
+            expires_at=(now + timedelta(hours=25)).isoformat(),
+            hidden_fallback=True,
+        )
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_generic_external(),
+            policy_waiver=waiver,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "unknown field(s): hidden_fallback"), result["failures"])
+        self.assertTrue(_has_failure(result, "lifetime exceeds 24 hours"), result["failures"])
+
+    def test_invalid_repo_identity_blocks_gate_explicitly(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        state["repoName"] = "not a repository"
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_external(),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "repository identity could not be canonicalized"), result["failures"])
+
+    def test_write_external_review_packet_rejects_invalid_repo_identity(self) -> None:
+        state = _state("README.md")
+        state["repoName"] = "not a repository"
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(gate.GateInputError, "valid repo name"):
+                gate.write_external_review_packet(Path(directory) / "packet", state, b"diff")
+
+    def test_write_external_review_packet_absolutizes_relative_output_dir(self) -> None:
+        state = _state("README.md")
+        with tempfile.TemporaryDirectory() as directory:
+            previous = Path.cwd()
+            os.chdir(directory)
+            try:
+                packet = gate.write_external_review_packet(Path("packet"), state, b"diff bytes")
+            finally:
+                os.chdir(previous)
+            manifest = json.loads(Path(packet["manifest_path"]).read_text(encoding="utf-8"))
+            self.assertTrue(Path(manifest["diff_path"]).is_absolute())
+            self.assertTrue(Path(manifest["prompt_path"]).is_absolute())
+            self.assertTrue(Path(manifest["diff_path"]).is_file())
+            self.assertTrue(Path(manifest["prompt_path"]).is_file())
+
+    def test_transmitted_prompt_hash_is_independently_recomputed_by_gate(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external()
+        evidence["prompt_sha256"] = "f" * 64
+        evidence["review_input"] = {**evidence["review_input"], "prompt_sha256": "f" * 64}
+        evidence["reviews"] = [_claude_review(stdin_sha256="f" * 64)]
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(
+            _has_failure(result, "independently reconstructed stdin"),
+            result["failures"],
+        )
+
+    def test_packet_prompt_hash_does_not_depend_on_mutable_pr_title(self) -> None:
+        first = _state("src/runtime_boundary.py")
+        second = _state("src/runtime_boundary.py")
+        first["pr"]["title"] = "first title"
+        second["pr"]["title"] = "second title"
+        filename = f"pr-7-{HEAD[:12]}.diff"
+        self.assertEqual(
+            gate.build_external_review_prompt(first, filename, DIFF_SHA),
+            gate.build_external_review_prompt(second, filename, DIFF_SHA),
+        )
+
+    def test_packet_prompt_hash_is_recomputed_by_gate(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        evidence = _external()
+        evidence["review_input"] = {**evidence["review_input"], "packet_prompt_sha256": "f" * 64}
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "review_input.packet_prompt_sha256 mismatch"), result["failures"])
 
     def test_write_external_review_packet_creates_downloadable_diff_and_template(self) -> None:
         state = _state("src/feature.py")

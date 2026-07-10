@@ -29,6 +29,49 @@ pr_review_gate = _load_gate()
 REVIEW_FOCUS = ["correctness", "regression_risk", "tests", "security", "integration"]
 
 
+class PrReviewGateTargetIdentityTests(unittest.TestCase):
+    def test_pr_target_repository_not_local_fork_controls_policy_identity(self) -> None:
+        view = {
+            "number": 7,
+            "url": "https://github.com/heimgewebe/weltgewebe/pull/7",
+            "headRefOid": "a" * 40,
+            "baseRefOid": "b" * 40,
+        }
+        calls: list[list[str]] = []
+
+        def fake_run_json(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
+            del repo, allow_nonzero
+            calls.append(argv)
+            if argv[:3] == ["gh", "pr", "view"]:
+                return view
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return []
+            if argv[:3] == ["gh", "repo", "view"]:
+                return {"nameWithOwner": "contributor/weltgewebe"}
+            if argv[:3] == ["gh", "api", "repos/heimgewebe/weltgewebe/pulls/7/comments"]:
+                return []
+            if argv[:3] == ["gh", "api", "repos/heimgewebe/weltgewebe/pulls/7/reviews"]:
+                return []
+            raise AssertionError(argv)
+
+        with (
+            mock.patch.object(pr_review_gate, "_run_json", side_effect=fake_run_json),
+            mock.patch.object(pr_review_gate, "_run_bytes", return_value=b"diff --git a/x b/x\n"),
+        ):
+            state = pr_review_gate.load_pr_state(Path("/tmp/fork-checkout"), 7)
+
+        self.assertEqual(state["repoName"], "heimgewebe/weltgewebe")
+        self.assertEqual(state["checkoutRepoName"], "contributor/weltgewebe")
+        self.assertIn(
+            ["gh", "api", "repos/heimgewebe/weltgewebe/pulls/7/comments", "--paginate", "--slurp"],
+            calls,
+        )
+
+    def test_malformed_or_mismatched_pr_url_has_no_target_identity(self) -> None:
+        self.assertIsNone(pr_review_gate._target_repo_from_pr_url("https://github.com/a/b/pull/8", expected_pr=7))
+        self.assertIsNone(pr_review_gate._target_repo_from_pr_url("https://example.invalid/a/b/pull/7", expected_pr=7))
+
+
 class PrReviewGateCliTests(unittest.TestCase):
     def test_missing_external_review_cannot_be_disabled(self) -> None:
         source = (ROOT / "tools" / "pr_review_gate.py").read_text(encoding="utf-8")
