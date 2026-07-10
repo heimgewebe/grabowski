@@ -56,6 +56,12 @@ if RUNNER_SPEC is None or RUNNER_SPEC.loader is None:
 RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
 RUNNER_SPEC.loader.exec_module(RUNNER)
 
+SCHEDULER_SPEC = importlib.util.spec_from_file_location("schedule_runtime_deploy_test", ROOT / "tools" / "schedule_runtime_deploy.py")
+if SCHEDULER_SPEC is None or SCHEDULER_SPEC.loader is None:
+    raise RuntimeError("cannot load runtime deployment scheduler")
+SCHEDULER = importlib.util.module_from_spec(SCHEDULER_SPEC)
+SCHEDULER_SPEC.loader.exec_module(SCHEDULER)
+
 class SelfDeployToolTests(unittest.TestCase):
     def test_annotations_and_schema_bounds(self) -> None:
         self.assertFalse(SELF_DEPLOY.DEPLOY_MUTATING.readOnlyHint)
@@ -141,7 +147,49 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             self.assertEqual(RUNNER.main(), 0)
         self.assertEqual(verify.call_count, 2)
         self.assertEqual(streamed.call_args_list[0].args[0], ["make", "validate"])
-        self.assertEqual(streamed.call_args_list[1].args[0], ["make", "deploy"])
+        self.assertEqual(streamed.call_args_list[1].args[0], ["make", "deploy-apply"])
+
+    def test_make_deploy_schedules_not_direct_apply(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("deploy-apply: context-check deploy-tooling", makefile)
+        self.assertIn("tools/deploy_runtime_dual.py --apply", makefile)
+        self.assertIn('deploy: context-check\n>$(PYTHON) tools/schedule_runtime_deploy.py --repo "$(CURDIR)" --delay-seconds 8', makefile)
+
+
+class RuntimeDeploySchedulerTests(unittest.TestCase):
+    def test_build_systemd_run_argv_uses_fixed_runner_and_expected_head(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        head = "a" * 40
+        argv = SCHEDULER.build_systemd_run_argv(repo, runner, head, 9, now=123)
+        self.assertEqual(argv[:2], ["systemd-run", "--user"])
+        self.assertIn("grabowski-scheduled-deploy-aaaaaaaaaaaa-123", argv)
+        self.assertIn("/usr/bin/python3", argv)
+        self.assertIn(str(runner), argv)
+        self.assertEqual(argv[argv.index("--expected-head") + 1], head)
+        self.assertEqual(argv[argv.index("--delay-seconds") + 1], "9")
+
+    def test_schedule_verifies_repository_before_systemd_run(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        head = "b" * 40
+        with patch.object(SCHEDULER, "verify_repository", return_value=(repo, head, runner)) as verify, \
+            patch.object(SCHEDULER.time, "time", return_value=456), \
+            patch.object(SCHEDULER, "run_systemd_run", return_value={"returncode": 0, "stdout": "started", "stderr": ""}) as run:
+            result = SCHEDULER.schedule(repo, 8)
+        verify.assert_called_once_with(repo)
+        self.assertEqual(result["expected_head"], head)
+        self.assertEqual(result["unit"], "grabowski-scheduled-deploy-bbbbbbbbbbbb-456")
+        self.assertTrue(result["expected_connector_disconnect"])
+        self.assertIn("run_scheduled_deploy.py", result["runner"])
+        self.assertEqual(run.call_args.kwargs["cwd"], repo)
+
+    def test_schedule_bounds_delay_seconds(self) -> None:
+        with self.assertRaises(ValueError):
+            SCHEDULER.schedule(Path("/home/alex/repos/grabowski"), 4)
+        with self.assertRaises(ValueError):
+            SCHEDULER.schedule(Path("/home/alex/repos/grabowski"), 61)
+
 
 if __name__ == "__main__":
     unittest.main()

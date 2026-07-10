@@ -6,7 +6,7 @@ UV_RUNTIME_LOCK_VERSION := 0.9.18
 DEPLOY_TOOLING_VENV ?= build/deploy-tooling/.venv
 DEPLOY_TOOL_PYTHON := $(DEPLOY_TOOLING_VENV)/bin/python
 
-.PHONY: validate syntax test policy context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy
+.PHONY: validate syntax test policy context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy
 
 validate: syntax test policy context-check profiles-check runtime-lock deploy-tooling-check secrets
 
@@ -61,5 +61,10 @@ deploy-check: context-check deploy-tooling
 deploy-preflight: context-check deploy-tooling
 >$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --preflight
 
-deploy: context-check deploy-tooling
+deploy-apply: context-check deploy-tooling
 >$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --apply
+
+deploy-direct: deploy-apply
+
+deploy: context-check
+>$(PYTHON) tools/schedule_runtime_deploy.py --repo "$(CURDIR)" --delay-seconds 8
