@@ -79,17 +79,45 @@ def _self_review(*, diff_sha: str = DIFF_SHA, path: str = "README.md") -> dict[s
     }
 
 
+def _claude_review(**overrides: object) -> dict[str, object]:
+    review: dict[str, object] = {
+        "source": gate.CLAUDE_CLI_REVIEW_SOURCE,
+        "tool": "claude-code",
+        "tool_version": "2.1.206",
+        "command": ["claude", "ultrareview", "7", "--json", "--timeout", "30"],
+        "exit_code": 0,
+        "json_ok": True,
+        "review_sha256": REVIEW_SHA,
+        "verdict": "PASS",
+        "finding_count": 0,
+    }
+    review.update(overrides)
+    return review
+
+
 def _external(**overrides: object) -> dict[str, object]:
+    repo = overrides.get("repo", "heimgewebe/grabowski")
+    pr = overrides.get("pr", 7)
+    head_sha = overrides.get("head_sha", HEAD)
+    diff_sha256 = overrides.get("diff_sha256", DIFF_SHA)
     data: dict[str, object] = {
         "schema_version": 1,
         "kind": "external_review",
-        "repo": "heimgewebe/grabowski",
-        "pr": 7,
-        "head_sha": HEAD,
-        "diff_sha256": DIFF_SHA,
+        "repo": repo,
+        "pr": pr,
+        "head_sha": head_sha,
+        "diff_sha256": diff_sha256,
         "prompt_sha256": PROMPT_SHA,
-        "prompt_includes_diff": True,
-        "reviews": [{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 0}],
+        "prompt_includes_diff": False,
+        "prompt_transmitted": False,
+        "review_input": {
+            "mode": gate.CLAUDE_CLI_REVIEW_INPUT_MODE,
+            "repo": repo,
+            "pr": pr,
+            "head_sha": head_sha,
+            "diff_sha256": diff_sha256,
+        },
+        "reviews": [_claude_review()],
         "external_reviews_triaged": True,
         "findings": [],
     }
@@ -171,9 +199,12 @@ class ExternalReviewGateTests(unittest.TestCase):
             _state("tools/pr_review_gate.py"),
             self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
-                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1}],
+                reviews=[
+                    {"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1},
+                    _claude_review(),
+                ],
                 external_reviews_triaged=True,
-                findings=[_terminal_external_finding()],
+                findings=[_terminal_external_finding()]
             ),
         )
         self.assertEqual(result["verdict"], "PASS")
@@ -208,9 +239,12 @@ class ExternalReviewGateTests(unittest.TestCase):
             _state("tools/pr_review_gate.py"),
             self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
-                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "NEEDS_CHANGE", "finding_count": 2}],
+                reviews=[
+                    {"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "NEEDS_CHANGE", "finding_count": 2},
+                    _claude_review(),
+                ],
                 external_reviews_triaged=True,
-                findings=[_terminal_external_finding(), _terminal_external_finding()],
+                findings=[_terminal_external_finding(), _terminal_external_finding()]
             ),
         )
         self.assertEqual(result["verdict"], "PASS")
@@ -220,9 +254,12 @@ class ExternalReviewGateTests(unittest.TestCase):
             _state("tools/pr_review_gate.py"),
             self_review=_self_review(path="tools/pr_review_gate.py"),
             external_review_evidence=_external(
-                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "BLOCK", "finding_count": 0}],
+                reviews=[
+                    {"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "BLOCK", "finding_count": 0},
+                    _claude_review(),
+                ],
                 external_reviews_triaged=True,
-                findings=[_terminal_external_finding()],
+                findings=[_terminal_external_finding()]
             ),
         )
         self.assertEqual(result["verdict"], "PASS")
@@ -238,12 +275,7 @@ class ExternalReviewGateTests(unittest.TestCase):
                 diff_sha256=f"  {diff_sha.upper()}\n",
                 prompt_sha256=f"\t{prompt_sha.upper()}  ",
                 reviews=[
-                    {
-                        "source": "chatgpt",
-                        "review_sha256": f"  {review_sha.upper()}\t",
-                        "verdict": "PASS",
-                        "finding_count": 0,
-                    }
+                    _claude_review(review_sha256=f"  {review_sha.upper()}\t"),
                 ],
             ),
         )
@@ -253,6 +285,7 @@ class ExternalReviewGateTests(unittest.TestCase):
         reviews = [
             {"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 1},
             {"source": "claude", "review_sha256": "3" * 64, "verdict": "BLOCK", "finding_count": 0},
+            _claude_review(review_sha256="4" * 64),
         ]
         result = gate.evaluate_review_gate(
             _state("tools/pr_review_gate.py"),
@@ -490,6 +523,48 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
         self.assertFalse(result["review_sources"]["external_review_required"])
         self.assertFalse(result["review_sources"]["platform_review_required"])
 
+    def test_weltgewebe_tiny_code_change_requires_claude_cli_review(self) -> None:
+        state = _state("src/tiny_feature.py")
+        state["repoName"] = "heimgewebe/weltgewebe"
+        state["pr"]["additions"] = 4
+        state["pr"]["deletions"] = 1
+        state["pr"]["reviews"] = []
+        self_review = _self_review(path="src/tiny_feature.py")
+        self_review["repo"] = "heimgewebe/weltgewebe"
+        result = gate.evaluate_review_gate(state, self_review=self_review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["complexity"]["review_tier"], "important_repo")
+        self.assertEqual(result["complexity"]["repo_policy"], "important")
+        self.assertTrue(result["review_sources"]["claude_cli_required"])
+        self.assertTrue(_has_failure(result, "external review is required"), result["failures"])
+
+    def test_weltgewebe_tiny_code_change_passes_with_claude_cli_review(self) -> None:
+        state = _state("src/tiny_feature.py")
+        state["repoName"] = "heimgewebe/weltgewebe"
+        state["pr"]["additions"] = 4
+        state["pr"]["deletions"] = 1
+        state["pr"]["reviews"] = []
+        self_review = _self_review(path="src/tiny_feature.py")
+        self_review["repo"] = "heimgewebe/weltgewebe"
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=self_review,
+            external_review_evidence=_external(repo="heimgewebe/weltgewebe"),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["complexity"]["review_tier"], "important_repo")
+
+    def test_weltgewebe_ordinary_docs_only_change_remains_exempt(self) -> None:
+        state = _state("docs/note.md")
+        state["repoName"] = "heimgewebe/weltgewebe"
+        state["pr"]["reviews"] = []
+        self_review = _self_review(path="docs/note.md")
+        self_review["repo"] = "heimgewebe/weltgewebe"
+        result = gate.evaluate_review_gate(state, self_review=self_review)
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertTrue(result["complexity"]["important_repo"])
+        self.assertFalse(result["review_sources"]["claude_cli_required"])
+
     def test_high_critical_change_requires_external_evidence_without_coding_agent_requirement(self) -> None:
         state = _state("src/runtime_boundary.py")
         state["pr"]["reviews"] = []
@@ -506,7 +581,53 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
             result["failures"],
         )
 
-    def test_high_critical_change_with_diff_bound_external_evidence_passes_without_coding_agent_review(self) -> None:
+    def test_high_critical_change_requires_claude_cli_review_entry(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        state["pr"]["reviews"] = []
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=_external(
+                reviews=[{"source": "chatgpt", "review_sha256": REVIEW_SHA, "verdict": "PASS", "finding_count": 0}]
+            ),
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(result["review_sources"]["claude_cli_required"])
+        self.assertTrue(_has_failure(result, "Claude CLI ultrareview is required"), result["failures"])
+
+    def test_high_critical_claude_review_without_pr_bound_input_blocks(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        state["pr"]["reviews"] = []
+        evidence = _external(prompt_includes_diff=True, prompt_transmitted=True)
+        evidence.pop("review_input")
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "review_input is missing"), result["failures"])
+
+    def test_high_critical_claude_review_with_wrong_bound_diff_blocks(self) -> None:
+        state = _state("src/runtime_boundary.py")
+        state["pr"]["reviews"] = []
+        evidence = _external()
+        evidence["review_input"] = {
+            "mode": gate.CLAUDE_CLI_REVIEW_INPUT_MODE,
+            "repo": "heimgewebe/grabowski",
+            "pr": 7,
+            "head_sha": HEAD,
+            "diff_sha256": "f" * 64,
+        }
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(path="src/runtime_boundary.py"),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "review_input.diff_sha256 mismatch"), result["failures"])
+
+    def test_high_critical_change_with_claude_cli_review_passes(self) -> None:
         state = _state("src/runtime_boundary.py")
         state["pr"]["reviews"] = []
         result = gate.evaluate_review_gate(
@@ -515,10 +636,8 @@ class ExternalReviewDefaultPolicyTests(unittest.TestCase):
             external_review_evidence=_external(),
         )
         self.assertEqual(result["verdict"], "PASS")
-        self.assertTrue(result["review_sources"]["external_review_required"])
+        self.assertTrue(result["review_sources"]["claude_cli_required"])
         self.assertEqual(result["review_sources"]["external_reviews_received"], 1)
-        self.assertFalse(result["review_sources"]["platform_review_required"])
-        self.assertFalse(result["review_sources"]["platform_review_seen"])
 
     def test_write_external_review_packet_creates_downloadable_diff_and_template(self) -> None:
         state = _state("src/feature.py")

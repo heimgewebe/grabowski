@@ -22,6 +22,9 @@ TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
 SELF_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
+CLAUDE_CLI_REVIEW_SOURCE = "claude-cli:ultrareview"
+CLAUDE_CLI_REVIEW_INPUT_MODE = "claude_ultrareview_pr"
+IMPORTANT_REPOS = {"heimgewebe/weltgewebe"}
 SELF_REVIEW_KIND = "grabowski_self_review"
 SELF_REVIEW_MODE = "critical_diff_review"
 REQUIRED_SELF_REVIEW_FOCUS = (
@@ -452,12 +455,20 @@ def _is_very_small_uncomplicated_change(paths: list[str], changed_files: int, ch
     )
 
 
-def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) -> dict[str, Any]:
+def classify_complexity(
+    pr: dict[str, Any],
+    self_review: dict[str, Any] | None,
+    *,
+    repo_name: str | None = None,
+) -> dict[str, Any]:
     changed_files = int(pr.get("changedFiles") or 0)
     changed_lines = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
     paths = _paths(pr)
     docs_only = bool(paths) and all(_is_documentation_path(path) for path in paths)
     very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
+    normalized_repo = repo_name.strip().lower() if isinstance(repo_name, str) and repo_name.strip() else None
+    important_repo = normalized_repo in IMPORTANT_REPOS
+    repo_claude_required = bool(important_repo and not docs_only)
 
     high_critical_reasons: list[str] = []
     if not docs_only:
@@ -480,6 +491,8 @@ def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) 
     external_review_reasons: list[str] = []
     if high_critical_reasons:
         external_review_reasons.extend(high_critical_reasons)
+    elif repo_claude_required:
+        external_review_reasons.append(f"important repository requires independent review: {normalized_repo}")
     elif docs_only:
         pass
     elif very_small_uncomplicated:
@@ -487,8 +500,11 @@ def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) 
     else:
         external_review_reasons.append("non-trivial non-documentation change")
 
+    claude_cli_required = bool(high_critical_reasons) or repo_claude_required
     if high_critical_reasons:
         review_tier = "high_critical"
+    elif repo_claude_required:
+        review_tier = "important_repo"
     elif external_review_reasons:
         review_tier = "external_llm"
     elif docs_only:
@@ -505,6 +521,9 @@ def classify_complexity(pr: dict[str, Any], self_review: dict[str, Any] | None) 
         "high_critical": bool(high_critical_reasons),
         "high_critical_reasons": high_critical_reasons,
         "external_review_required": bool(external_review_reasons),
+        "claude_cli_required": claude_cli_required,
+        "important_repo": important_repo,
+        "repo_policy": "important" if important_repo else "standard",
         "review_tier": review_tier,
         "docs_only": docs_only,
         "very_small_uncomplicated": very_small_uncomplicated,
@@ -850,6 +869,56 @@ def _reported_external_finding_count(verdict: Any, finding_count: int) -> int:
     return 0
 
 
+def _claude_cli_external_review_failures(review: dict[str, Any], pr_number: Any) -> list[str]:
+    failures: list[str] = []
+    if review.get("source") != CLAUDE_CLI_REVIEW_SOURCE:
+        failures.append(f"source is not {CLAUDE_CLI_REVIEW_SOURCE}")
+    if review.get("tool") != "claude-code":
+        failures.append("tool is not claude-code")
+    if not isinstance(review.get("tool_version"), str) or not review.get("tool_version").strip():
+        failures.append("tool_version is missing")
+    if not _claude_ultrareview_command_matches(review.get("command"), pr_number):
+        failures.append("command is not claude ultrareview for this PR")
+    if review.get("exit_code") != 0:
+        failures.append(f"exit_code is {review.get('exit_code')}, not 0")
+    if review.get("json_ok") is not True:
+        failures.append("json_ok is not true")
+    return failures
+
+
+def _claude_cli_review_input_failures(
+    external_review: dict[str, Any],
+    *,
+    repo_name: str | None,
+    pr_number: Any,
+    head_sha: Any,
+    diff_sha256: Any,
+) -> list[str]:
+    failures: list[str] = []
+    review_input = external_review.get("review_input")
+    if not isinstance(review_input, dict):
+        return ["review_input is missing or not a JSON object"]
+    if review_input.get("mode") != CLAUDE_CLI_REVIEW_INPUT_MODE:
+        failures.append(f"review_input.mode is not {CLAUDE_CLI_REVIEW_INPUT_MODE}")
+    if repo_name is not None and review_input.get("repo") != repo_name:
+        failures.append("review_input.repo mismatch")
+    input_pr = review_input.get("pr")
+    if pr_number is not None and (isinstance(input_pr, bool) or not isinstance(input_pr, int) or input_pr != pr_number):
+        failures.append("review_input.pr mismatch")
+    if not isinstance(head_sha, str) or not head_sha or review_input.get("head_sha") != head_sha:
+        failures.append("review_input.head_sha mismatch")
+    input_diff_sha256 = review_input.get("diff_sha256")
+    if not _valid_sha256(input_diff_sha256) or not _valid_sha256(diff_sha256):
+        failures.append("review_input.diff_sha256 is missing or invalid")
+    elif _normalize_sha256(input_diff_sha256) != _normalize_sha256(diff_sha256):
+        failures.append("review_input.diff_sha256 mismatch")
+    if external_review.get("prompt_transmitted") is not False:
+        failures.append("prompt_transmitted must be false for Claude ultrareview PR input")
+    if external_review.get("prompt_includes_diff") is not False:
+        failures.append("prompt_includes_diff must be false for Claude ultrareview PR input")
+    return failures
+
+
 def _external_review_failures(
     state: dict[str, Any],
     pr: dict[str, Any],
@@ -857,6 +926,7 @@ def _external_review_failures(
     *,
     required: bool,
     repo_name: str | None = None,
+    claude_cli_required: bool = False,
 ) -> list[str]:
     if external_review is None:
         return ["external review is required but evidence is missing"] if required else []
@@ -903,11 +973,24 @@ def _external_review_failures(
             failures.append("diff_sha256 mismatch")
     if not _valid_sha256(external_review.get("prompt_sha256")):
         failures.append("prompt_sha256 is missing or invalid")
-    if external_review.get("prompt_includes_diff") is not True:
+    raw_review_input = external_review.get("review_input")
+    claude_cli_input_mode = isinstance(raw_review_input, dict) and raw_review_input.get("mode") == CLAUDE_CLI_REVIEW_INPUT_MODE
+    if claude_cli_required or claude_cli_input_mode:
+        failures.extend(
+            _claude_cli_review_input_failures(
+                external_review,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                head_sha=head,
+                diff_sha256=diff_sha256,
+            )
+        )
+    elif external_review.get("prompt_includes_diff") is not True:
         failures.append("prompt_includes_diff is not true")
 
     reviews = external_review.get("reviews")
     reported_external_findings = 0
+    valid_claude_cli_reviews = 0
     if not isinstance(reviews, list):
         failures.append("reviews is not a list")
     elif required and not reviews:
@@ -920,6 +1003,12 @@ def _external_review_failures(
             source = review.get("source")
             if not isinstance(source, str) or not source.strip():
                 failures.append(f"review {index} source is missing")
+            elif source == CLAUDE_CLI_REVIEW_SOURCE:
+                claude_failures = _claude_cli_external_review_failures(review, pr_number)
+                if claude_failures:
+                    failures.extend(f"review {index} Claude CLI evidence invalid: {failure}" for failure in claude_failures)
+                else:
+                    valid_claude_cli_reviews += 1
             if not _valid_sha256(review.get("review_sha256")):
                 failures.append(f"review {index} review_sha256 is missing or invalid")
             verdict = review.get("verdict")
@@ -930,6 +1019,9 @@ def _external_review_failures(
                 failures.append(f"review {index} finding_count must be an integer >= 0")
             else:
                 reported_external_findings += _reported_external_finding_count(verdict, finding_count)
+
+    if (claude_cli_required or claude_cli_input_mode) and valid_claude_cli_reviews == 0:
+        failures.append("Claude CLI ultrareview is required but no valid review entry was provided")
 
     if external_review.get("external_reviews_triaged") is not True:
         failures.append("external_reviews_triaged is not true")
@@ -1304,7 +1396,7 @@ def evaluate_review_gate(
     repo_name = raw_repo_name.strip() if isinstance(raw_repo_name, str) and raw_repo_name.strip() else None
     claude_cli_failures = _claude_cli_evidence_failures(pr, claude_evidence, repo_name=repo_name)
     claude_cli_seen = claude_evidence is not None and not claude_cli_failures
-    complexity = classify_complexity(pr, self_review)
+    complexity = classify_complexity(pr, self_review, repo_name=repo_name)
     failures: list[str] = []
     warnings: list[str] = []
 
@@ -1390,7 +1482,14 @@ def evaluate_review_gate(
         warnings.append("Deprecated self_review.external_review ignored; pass --external-review-evidence instead")
 
     external_required = complexity["external_review_required"] or (isinstance(external_review, dict) and external_review.get("required") is True)
-    for failure in _external_review_failures(state, pr, external_review, required=external_required, repo_name=repo_name):
+    for failure in _external_review_failures(
+        state,
+        pr,
+        external_review,
+        required=external_required,
+        repo_name=repo_name,
+        claude_cli_required=complexity["claude_cli_required"],
+    ):
         failures.append(f"External review evidence invalid: {failure}")
 
     if not checks:
@@ -1440,6 +1539,7 @@ def evaluate_review_gate(
             "codex_seen": codex_seen,
             "claude_seen": claude_seen,
             "claude_cli_seen": claude_cli_seen,
+            "claude_cli_required": complexity["claude_cli_required"],
             "external_review_required": external_required,
             "external_reviews_received": _external_review_count(external_review),
             "platform_review_required": platform_review_required,

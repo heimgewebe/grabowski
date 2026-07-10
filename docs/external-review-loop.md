@@ -1,6 +1,6 @@
 # External review loop
 
-`tools/pr_review_gate.py` requires separate diff-bound external review evidence for every pull request except documentation-only changes and very small uncomplicated changes. High-critical pull requests require external review evidence, but they do not require a privileged Codex or Claude platform review. High-critical classification is derived from large file/line counts, generic runtime/deploy/security/migration/privilege/recovery/policy path markers, Grabowski operator-critical paths, self-review uncertainty, and material findings after the first review.
+`tools/pr_review_gate.py` requires separate diff-bound external review evidence for every pull request except documentation-only changes and very small uncomplicated changes. High-critical pull requests require that evidence to contain a valid Claude CLI `ultrareview` entry. This is an independent-review requirement, not a privileged GitHub platform-review requirement. Weltgewebe is an important repository: every non-documentation-only Weltgewebe PR requires external review evidence with Claude CLI `ultrareview`, including very small code changes. High-critical classification is derived from large file/line counts, generic runtime/deploy/security/migration/privilege/recovery/policy path markers, Grabowski operator-critical paths, self-review uncertainty, and material findings after the first review.
 
 The external loop is separate from Grabowski self-review. Self-review remains internal evidence; external review evidence is passed with its own CLI argument. Use the packet writer whenever an external LLM review is needed so the diff is available as a downloadable artifact:
 
@@ -34,6 +34,20 @@ python3 tools/pr_review_gate.py \
   --json
 ```
 
+## Claude CLI provider for critical PRs
+
+For high-critical PRs and every non-documentation-only PR in `heimgewebe/weltgewebe`, run Claude CLI through the packet-bound adapter. The adapter verifies the repository identity, current PR head, live `gh pr diff` hash, packet paths, and packet hashes before review and rechecks head and diff after review. It invokes the exact command shape required by the gate and writes a structured `claude-cli:ultrareview` review entry. Because `ultrareview` receives a PR target rather than the packet prompt, the evidence records `prompt_transmitted: false`, `prompt_includes_diff: false`, and a separate `review_input` object bound to repo, PR, head SHA, and diff SHA-256. The gate requires that explicit tool-input binding on Claude-required lanes.
+
+```bash
+python3 tools/external_review_claude.py \
+  --manifest evidence/pr-<PR_NUMBER>-external/pr-<PR_NUMBER>-<head>-external-review-manifest.json \
+  --repo /path/to/repository \
+  --output evidence/pr-<PR_NUMBER>-external/claude-external-review-evidence.json \
+  --timeout-minutes 30
+```
+
+Claude is the mandatory independent first reviewer on these lanes, but not the sole truth source. A clean Claude result does not replace Grabowski self-review, CI, mergeability, current-head binding, current-diff binding, or terminal triage. Claude findings are stored but are not auto-triaged; `NEEDS_CHANGE`, `BLOCK`, or any positive finding count keeps the gate closed until the findings are resolved and terminally recorded. CLI failure, timeout, invalid JSON, repository mismatch, head drift, or diff drift fails closed and produces no passing evidence.
+
 ## Optional agy/Gemini provider
 
 `tools/external_review_agy.py` can produce `--external-review-evidence` from a packet written by `tools/pr_review_gate.py`. It is a convenience provider, not a privileged trust anchor. The tool reads the packet manifest, verifies that the prompt and diff files are inside the packet directory, checks their SHA-256 values against the manifest, builds one inline prompt containing the full diff, invokes `gemini`/`agy` in print mode, stores the raw model response, and writes evidence shaped for the review gate.
@@ -55,7 +69,7 @@ Do not pipe the prompt through stdin for this provider; `agy --print` requires t
 
 Passing provider evidence is created only for `PASS` reviews with `finding_count: 0`. Any `NEEDS_CHANGE`, `BLOCK`, or positive finding count is stored as raw review output and raw findings, but `external_reviews_triaged` remains false so the normal gate blocks until Grabowski records terminal triage in top-level `findings[]`. Upstream failures, timeouts, empty output, invalid JSON, missing packet files, or manifest hash drift also fail closed and must not be treated as evidence.
 
-For external-review-exempt PRs, still pass completed `--self-review` evidence and omit only `--external-review-evidence`. `--claude-evidence` remains accepted as legacy diagnostic input, but it is not required for high-critical PRs and does not replace `--external-review-evidence`.
+For external-review-exempt PRs, still pass completed `--self-review` evidence and omit only `--external-review-evidence`. `--claude-evidence` remains accepted as legacy diagnostic input, but it does not satisfy the critical-PR Claude CLI rule and does not replace `--external-review-evidence`.
 
 Minimal self-review evidence object:
 
@@ -107,7 +121,12 @@ Minimal external evidence object:
   "prompt_includes_diff": true,
   "reviews": [
     {
-      "source": "chatgpt|claude|gemini|other|user_pasted_review",
+      "source": "claude-cli:ultrareview|chatgpt|gemini|other|user_pasted_review",
+      "tool": "claude-code when source is claude-cli:ultrareview",
+      "tool_version": "<non-empty Claude CLI version when required>",
+      "command": ["claude", "ultrareview", "<PR_NUMBER>", "--json", "--timeout", "30"],
+      "exit_code": 0,
+      "json_ok": true,
       "review_sha256": "<sha256 of returned review text>",
       "verdict": "PASS|NEEDS_CHANGE|BLOCK",
       "finding_count": 0
@@ -123,10 +142,10 @@ Rules:
 - `head_sha` must match the current PR head.
 - `diff_sha256` must match the current PR diff hash computed by the gate from `gh pr diff`.
 - `prompt_sha256` and each `review_sha256` must be valid SHA-256 hex strings.
-- `prompt_includes_diff` must be true, but this is only the operator's assertion that the external prompt contained the diff.
+- Generic external-review evidence requires `prompt_includes_diff: true`; this is only the operator's assertion that the external prompt contained the diff. Claude CLI `ultrareview` evidence instead requires `prompt_includes_diff: false`, `prompt_transmitted: false`, and `review_input.mode: claude_ultrareview_pr` bound to the exact repo, PR, head SHA, and diff SHA-256.
 - `reviews` must be a list and must be non-empty when the external loop is required.
 - Each review entry must include `source`, `review_sha256`, `verdict`, and integer `finding_count >= 0`.
-- `source` is a human-readable label for traceability. It is not a trust anchor and does not prove reviewer identity.
+- `source` is normally a human-readable trace label. For a required Claude CLI review it must be exactly `claude-cli:ultrareview`, accompanied by `tool: claude-code`, a non-empty `tool_version`, the exact PR-bound `claude ultrareview ... --json --timeout ...` command, `exit_code: 0`, and `json_ok: true`.
 - `external_review.required`, when present, must be a boolean. A required external review cannot be disabled by setting `required=false` in evidence.
 - `external_reviews_triaged` must be true.
 - `findings` must be a list, and every finding must be terminally triaged with the same terminal status rules as Grabowski self-review findings.
@@ -135,11 +154,11 @@ Rules:
 - V1 uses count coverage rather than finding IDs: reported external findings must be no greater than terminal top-level findings, and a non-PASS review with `finding_count: 0` counts as one reported finding.
 - Count coverage is not identity-binding. It only prevents obvious under-recording; it does not bind a specific reported finding to a specific terminal finding.
 - Deprecated `self_review.external_review` is ignored. Use `--external-review-evidence` for external evidence.
-- Documentation-only PRs and very small uncomplicated PRs with no external evidence do not block. If voluntary external evidence is passed, its findings are still validated.
+- Documentation-only PRs and very small uncomplicated PRs with no external evidence do not block under the standard repository policy. Weltgewebe overrides the tiny-change exemption for every non-documentation-only PR. If voluntary external evidence is passed, its findings are still validated.
 - Policy-critical documentation such as `GRABOWSKI.md`, `AGENTS.md`, `docs/external-review-loop.md`, and operator/recovery/deploy doctrine is not documentation-exempt.
 - Very small changes are not exempt when they touch build, config, CI, packaging, controlled tool paths, structured data, lock files, or zero-line/binary-like diffs.
 - Non-trivial non-documentation PRs require diff-bound external review evidence. The reviewer may be ChatGPT in the current conversation or another external LLM, as long as the review was based on the current PR diff and is recorded in structured evidence.
-- High-critical PRs require diff-bound external review evidence, not a Codex/Claude platform-review special case. If Codex or Claude review signals exist, the gate may report them as diagnostics, but they are not privileged trust anchors. GitHub merge protection remains separate: non-clean `mergeStateStatus`, non-mergeable PRs, or non-green checks still block.
+- High-critical PRs require diff-bound external review evidence containing a valid Claude CLI `ultrareview` entry. All non-documentation-only Weltgewebe PRs inherit the same Claude CLI requirement even when otherwise tiny. This does not make Claude a sole or privileged truth anchor: GitHub platform signals remain diagnostics, while self-review, CI, mergeability, head/diff binding, and finding triage remain independent blockers.
 - Required Python matrix checks are derived from the target repository's regular `.github/workflows/validate.yml` or `.yaml`. Grabowski's own fallback remains `validate (3.10)` plus `validate (3.12)`. A foreign repository with a missing, unreadable, duplicate, or non-literal Python matrix fails closed instead of inheriting Grabowski's versions.
 
 Threat model:
@@ -150,4 +169,4 @@ The hashes are audit and integrity handles, not identity guarantees. They help d
 
 A stronger model would use stable finding IDs, signed prompt/review artifacts, branch protection, externally stored attestations, or reviewer identity backed by a system outside the operator's write path. Those are outside this PR.
 
-This is not a substitute for Grabowski self-review or CI. It is a contrast loop: different reviewer failure modes, not ritual mass. Coding-agent reviews may be useful inputs, but the gate does not prioritize them over a diff-bound review returned to ChatGPT or pasted from another external LLM.
+This is not a substitute for Grabowski self-review or CI. It is a contrast loop: different reviewer failure modes, not ritual mass. The policy deliberately selects Claude CLI as the required independent reviewer only for high-critical and important-repository lanes; ordinary non-exempt PRs may still use another diff-bound external LLM review.
