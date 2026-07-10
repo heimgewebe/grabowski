@@ -140,7 +140,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
         with (
             mock.patch.object(
                 claude_review,
-                "current_repo_name",
+                "current_pr_repo_name",
                 side_effect=[repo_before, repo_after],
             ),
             mock.patch.object(claude_review, "current_pr_head", side_effect=[head_before, head_after]),
@@ -177,6 +177,33 @@ class ExternalReviewClaudeTests(unittest.TestCase):
                 prompt_nonce="4" * 32,
             )
         return evidence, output, run, manifest, prompt_path, diff_path
+
+    def test_current_pr_repo_name_uses_target_repository_from_pr_url(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["gh", "pr", "view"],
+            0,
+            "https://github.com/heimgewebe/weltgewebe/pull/7\n",
+            "",
+        )
+        with mock.patch.object(claude_review, "run_checked", return_value=completed) as run:
+            result = claude_review.current_pr_repo_name(Path("/tmp/fork-checkout"), 7)
+        self.assertEqual(result, "heimgewebe/weltgewebe")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["gh", "pr", "view", "7", "--json", "url", "--jq", ".url"],
+        )
+
+    def test_target_repository_parser_matches_gate_contract(self) -> None:
+        url = "https://github.com/heimgewebe/weltgewebe/pull/7"
+        self.assertEqual(
+            claude_review.target_repo_from_pr_url(url, expected_pr=7),
+            review_gate._target_repo_from_pr_url(url, expected_pr=7),
+        )
+        with self.assertRaisesRegex(claude_review.ClaudeReviewError, "target repository"):
+            claude_review.target_repo_from_pr_url(
+                "https://github.com/contributor/weltgewebe/pull/8",
+                expected_pr=7,
+            )
 
     def test_passing_packet_review_creates_stdin_bound_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -342,7 +369,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     claude_review,
-                    "current_repo_name",
+                    "current_pr_repo_name",
                     return_value="heimgewebe/grabowski",
                 ),
                 mock.patch.object(claude_review, "current_pr_head", return_value=HEAD),
