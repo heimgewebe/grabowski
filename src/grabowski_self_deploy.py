@@ -84,25 +84,48 @@ def _deploy_command_sha256(command: list[str]) -> str:
     return operator._argv_hash(command)
 
 
-def _deploy_identity(command: Any) -> tuple[str, ...] | None:
+def _deploy_command_fields(command: Any) -> dict[str, str] | None:
     if (
         not isinstance(command, list)
         or len(command) != 8
         or not all(isinstance(item, str) for item in command)
         or command[0] != "/usr/bin/python3"
-        or command[2] != "--repo"
-        or command[4] != "--expected-head"
-        or command[6] != "--delay-seconds"
-        or not OBJECT_ID_RE.fullmatch(command[5])
     ):
         return None
+    values: dict[str, str] = {}
+    allowed = {"--repo", "--expected-head", "--delay-seconds"}
+    for index in range(2, len(command), 2):
+        option = command[index]
+        if option not in allowed or option in values:
+            return None
+        values[option] = command[index + 1]
+    if set(values) != allowed or not OBJECT_ID_RE.fullmatch(values["--expected-head"]):
+        return None
     try:
-        delay_seconds = int(command[7])
+        delay_seconds = int(values["--delay-seconds"])
     except ValueError:
         return None
     if not 5 <= delay_seconds <= 60:
         return None
-    return tuple(command[:6])
+    return {
+        "python": command[0],
+        "runner": command[1],
+        "repository": values["--repo"],
+        "expected_head": values["--expected-head"],
+        "delay_seconds": str(delay_seconds),
+    }
+
+
+def _deploy_identity(command: Any) -> tuple[str, ...] | None:
+    fields = _deploy_command_fields(command)
+    if fields is None:
+        return None
+    return (
+        fields["python"],
+        fields["runner"],
+        fields["repository"],
+        fields["expected_head"],
+    )
 
 
 @contextmanager
@@ -187,8 +210,10 @@ def _matching_inflight_deploy_job(command: list[str], repository: Path) -> dict[
         except (OSError, ValueError, PermissionError) as exc:
             raise RuntimeError(f"durable job metadata is unreadable: {entry.name}") from exc
         candidate_command = metadata.get("argv")
-        if not isinstance(candidate_command, list):
-            continue
+        if not isinstance(candidate_command, list) or not all(
+            isinstance(item, str) for item in candidate_command
+        ):
+            raise RuntimeError(f"durable job argv is malformed: {entry.name}")
         references_self_deploy = (
             len(candidate_command) >= 2
             and candidate_command[0] == "/usr/bin/python3"
@@ -196,8 +221,9 @@ def _matching_inflight_deploy_job(command: list[str], repository: Path) -> dict[
         )
         if not references_self_deploy:
             continue
+        candidate_fields = _deploy_command_fields(candidate_command)
         candidate_identity = _deploy_identity(candidate_command)
-        if candidate_identity is None or metadata.get("cwd") != str(repository):
+        if candidate_fields is None or candidate_identity is None or metadata.get("cwd") != str(repository):
             raise RuntimeError(f"self deploy job metadata is malformed: {entry.name}")
         argv_sha256 = metadata.get("argv_sha256")
         if argv_sha256 != _deploy_command_sha256(candidate_command):
@@ -221,7 +247,7 @@ def _matching_inflight_deploy_job(command: list[str], repository: Path) -> dict[
             {
                 "unit": entry.name,
                 "argv_sha256": argv_sha256,
-                "delay_seconds": int(candidate_command[7]),
+                "delay_seconds": int(candidate_fields["delay_seconds"]),
                 **receipt_paths,
                 "final_status": final_status,
             }
@@ -239,7 +265,7 @@ def _schedule_result(
     requested_delay_seconds: int,
     effective_delay_seconds: int,
     job: dict[str, Any],
-    intent: dict[str, Any],
+    intent: dict[str, Any] | None,
     scheduled: dict[str, Any],
     already_scheduled: bool,
 ) -> dict[str, Any]:
@@ -331,13 +357,6 @@ def grabowski_runtime_deploy_schedule(
     command = _deploy_command(repository, runner, expected_head, delay_seconds)
 
     with _deploy_schedule_lock():
-        intent = {
-            "timestamp_unix": int(time.time()),
-            "operation": "runtime-deploy-schedule-intent",
-            "expected_head": expected_head,
-            "delay_seconds": delay_seconds,
-        }
-        base._append_audit(intent)
         existing = _matching_inflight_deploy_job(command, repository)
         if existing is not None:
             observed = {
@@ -356,11 +375,18 @@ def grabowski_runtime_deploy_schedule(
                 requested_delay_seconds=delay_seconds,
                 effective_delay_seconds=existing["delay_seconds"],
                 job=existing,
-                intent=intent,
+                intent=None,
                 scheduled=observed,
                 already_scheduled=True,
             )
 
+        intent = {
+            "timestamp_unix": int(time.time()),
+            "operation": "runtime-deploy-schedule-intent",
+            "expected_head": expected_head,
+            "delay_seconds": delay_seconds,
+        }
+        base._append_audit(intent)
         job = operator._start_job(
             command,
             cwd=str(repository),

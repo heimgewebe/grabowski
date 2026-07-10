@@ -3706,6 +3706,33 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             blocked = self.run_captain(captain_parameters([bad]))
             self.assert_blocked_gate_reason(blocked, "target-bound", "target")
 
+        for target, expected_reason in (
+            (
+                {"service": "other-service", "runtime_target": "heim-pc", "adapter": "grabowski-self"},
+                "runtime_deploy_service_does_not_match_grabowski_self_adapter",
+            ),
+            (
+                {"repo": "heimgewebe/other", "runtime_target": "heim-pc", "adapter": "grabowski-self"},
+                "runtime_deploy_repo_does_not_match_grabowski_self_adapter",
+            ),
+            (
+                {"service": "grabowski-mcp", "runtime_target": "other-host", "adapter": "grabowski-self"},
+                "runtime_deploy_target_does_not_match_local_grabowski_runtime",
+            ),
+            (
+                {"repo": "heimgewebe/grabowski", "environment": "production", "adapter": "grabowski-self"},
+                "runtime_deploy_target_does_not_match_local_grabowski_runtime",
+            ),
+        ):
+            with self.subTest(target=target):
+                bad = captain_action(
+                    action="runtime-deploy",
+                    target=target,
+                    receipt_path="receipts/captain/runtime-deploy.json",
+                )
+                blocked = self.run_captain(captain_parameters([bad]))
+                self.assert_blocked_gate_reason(blocked, "target-bound", expected_reason)
+
         action["target"] = {"service": "grabowski-mcp", "environment": "heim-pc", "adapter": "grabowski-self"}
         parameters = captain_parameters([action])
         for key in ("status_projection", "status_projection_fresh", "status_projection_source", "status_projection_sha256"):

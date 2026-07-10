@@ -2312,6 +2312,26 @@ def _captain_exactly_one_target_key(target: dict[str, Any], keys: tuple[str, ...
     return present[0]
 
 
+def _captain_runtime_deploy_binding_errors(
+    *,
+    adapter: Any,
+    origin_key: str,
+    origin_value: Any,
+    runtime_value: Any,
+) -> list[str]:
+    errors: list[str] = []
+    if adapter != RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF:
+        errors.append("runtime_deploy_adapter_must_be_grabowski_self")
+    if origin_key == "repo":
+        if origin_value != RUNTIME_DEPLOY_GRABOWSKI_REPO:
+            errors.append("runtime_deploy_repo_does_not_match_grabowski_self_adapter")
+    elif origin_value != RUNTIME_DEPLOY_GRABOWSKI_SERVICE:
+        errors.append("runtime_deploy_service_does_not_match_grabowski_self_adapter")
+    if runtime_value != RUNTIME_DEPLOY_GRABOWSKI_TARGET:
+        errors.append("runtime_deploy_target_does_not_match_local_grabowski_runtime")
+    return errors
+
+
 def _validate_captain_target(action_name: str, target: dict[str, Any], *, index: int) -> None:
     if action_name == "pr-merge":
         repo = _captain_target_string(target, "repo", index=index)
@@ -2326,13 +2346,24 @@ def _validate_captain_target(action_name: str, target: dict[str, Any], *, index:
         )
         if origin_key == "repo":
             _captain_validate_repo_slug(runtime_origin, context=f"actions[{index}].target.repo")
-        _captain_exactly_one_target_key(
+        runtime_key, runtime_target = _captain_exactly_one_target_key(
             target, ("environment", "runtime_target"), index=index, action_name="runtime-deploy"
         )
         adapter = _captain_concrete_string(target, "adapter", index=index, action_name="runtime-deploy")
         if adapter not in RUNTIME_DEPLOY_ADAPTERS:
             raise GripPreflightError(
                 f"actions[{index}].target.adapter is not registered; expected one of {sorted(RUNTIME_DEPLOY_ADAPTERS)}"
+            )
+        binding_errors = _captain_runtime_deploy_binding_errors(
+            adapter=adapter,
+            origin_key=origin_key,
+            origin_value=runtime_origin,
+            runtime_value=runtime_target,
+        )
+        if binding_errors:
+            raise GripPreflightError(
+                f"actions[{index}].target is not bound to the registered {adapter} adapter: "
+                + ", ".join(binding_errors)
             )
     elif action_name == "service-restart":
         _captain_concrete_string(target, "host", index=index, action_name="service-restart")
@@ -3586,25 +3617,18 @@ def _run_captain_pr_merge(
 
 def _captain_runtime_deploy_target_errors(action: dict[str, Any]) -> list[str]:
     target = action["target"]
-    errors: list[str] = []
-    adapter = target.get("adapter")
-    if adapter != RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF:
-        errors.append("runtime_deploy_adapter_must_be_grabowski_self")
     origin_key = "repo" if isinstance(target.get("repo"), str) and target.get("repo") else "service"
-    origin_value = target.get(origin_key)
-    if origin_key == "repo":
-        if origin_value != RUNTIME_DEPLOY_GRABOWSKI_REPO:
-            errors.append("runtime_deploy_repo_does_not_match_grabowski_self_adapter")
-    elif origin_value != RUNTIME_DEPLOY_GRABOWSKI_SERVICE:
-        errors.append("runtime_deploy_service_does_not_match_grabowski_self_adapter")
     runtime_key = (
         "environment"
         if isinstance(target.get("environment"), str) and target.get("environment")
         else "runtime_target"
     )
-    if target.get(runtime_key) != RUNTIME_DEPLOY_GRABOWSKI_TARGET:
-        errors.append("runtime_deploy_target_does_not_match_local_grabowski_runtime")
-    return errors
+    return _captain_runtime_deploy_binding_errors(
+        adapter=target.get("adapter"),
+        origin_key=origin_key,
+        origin_value=target.get(origin_key),
+        runtime_value=target.get(runtime_key),
+    )
 
 
 def _runtime_deploy_schedule_errors(
@@ -3663,9 +3687,8 @@ def _runtime_deploy_schedule_errors(
             "stdout_path": "stdout.log",
             "stderr_path": "stderr.log",
         }
-        parents = {path.parent for path in path_values.values()}
         expected_parent = Path(expected_job_root) / unit
-        if len(parents) != 1 or next(iter(parents)) != expected_parent:
+        if any(path.parent != expected_parent for path in path_values.values()):
             errors.append("runtime_deploy_schedule_paths_not_bound_to_unit")
         for key, expected_name in expected_names.items():
             if path_values[key].name != expected_name:

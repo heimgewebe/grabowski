@@ -185,7 +185,46 @@ class SelfDeployToolTests(unittest.TestCase):
             "runtime-deploy-existing-schedule-observed",
             result["audit"]["scheduled"]["operation"],
         )
-        self.assertEqual(2, SELF_DEPLOY.base._append_audit.call_count)
+        self.assertEqual(1, SELF_DEPLOY.base._append_audit.call_count)
+        self.assertIsNone(result["audit"]["intent"])
+
+    def test_deploy_identity_accepts_canonical_options_in_any_order(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        head = "a" * 40
+        command = [
+            "/usr/bin/python3",
+            str(runner),
+            "--delay-seconds",
+            "8",
+            "--expected-head",
+            head,
+            "--repo",
+            str(repo),
+        ]
+        self.assertEqual(
+            ("/usr/bin/python3", str(runner), str(repo), head),
+            SELF_DEPLOY._deploy_identity(command),
+        )
+
+    def test_deploy_identity_rejects_duplicate_or_unknown_options(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        head = "a" * 40
+        duplicate = [
+            "/usr/bin/python3", str(runner),
+            "--repo", str(repo),
+            "--repo", str(repo),
+            "--expected-head", head,
+        ]
+        unknown = [
+            "/usr/bin/python3", str(runner),
+            "--repo", str(repo),
+            "--expected-head", head,
+            "--force", "8",
+        ]
+        self.assertIsNone(SELF_DEPLOY._deploy_identity(duplicate))
+        self.assertIsNone(SELF_DEPLOY._deploy_identity(unknown))
 
     def test_matching_inflight_job_uses_deploy_identity_and_receipt(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
@@ -291,6 +330,24 @@ class SelfDeployToolTests(unittest.TestCase):
             },
         }
         return job_dir, command, metadata
+
+    def test_malformed_durable_job_argv_blocks_scan(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        malformed_values = ("not-a-list", ["/usr/bin/python3", 7])
+        for malformed in malformed_values:
+            with self.subTest(argv=malformed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                unit = "grabowski-job-abcdef012345"
+                (root / unit).mkdir()
+                with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                    SELF_DEPLOY.operator,
+                    "_read_job_metadata",
+                    return_value={"unit": unit, "argv": malformed},
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "durable job argv is malformed"):
+                        SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
 
     def test_unreadable_regular_job_metadata_blocks_scan(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
