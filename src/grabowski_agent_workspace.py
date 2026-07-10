@@ -1375,8 +1375,10 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         and collection.get("writer_head") == snapshot.get("writer_head")
         and collection.get("diff_sha256") == snapshot.get("diff_sha256")
     )
+    creation_ready = manifest.get("creation_state") == "ready"
     closeable = bool(
-        all_terminal
+        creation_ready
+        and all_terminal
         and collection_complete
         and snapshot_matches
         and start_intents_clear
@@ -1406,6 +1408,8 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
     close_integrity = _close_integrity_status(manifest, manifest.get("close_receipt"))
     return {
         "workspace_id": manifest["workspace_id"],
+        "creation_state": manifest.get("creation_state"),
+        "creation_ready": creation_ready,
         "binding": manifest["binding"],
         "repository": manifest["repository"],
         "expected_base_head": manifest["expected_base_head"],
@@ -1660,7 +1664,7 @@ def _existing_workspace_response(
         tmux_live = _tmux_has_session(str(plan["session_name"]))
         observed_pane_ids = _tmux_pane_ids(str(plan["session_name"])) if tmux_live else set()
         writer_task = _task_public(expected_writer_task_id)
-        writer_snapshot = _git_snapshot(manifest, _run)
+        writer_identity = _writer_create_identity(manifest, _run)
     except Exception as exc:
         return {
             "workspace_id": workspace_id,
@@ -1687,14 +1691,10 @@ def _existing_workspace_response(
         runtime_errors.append("writer_task_argv_mismatch")
     if writer_task.get("cwd") != manifest["writer_worktree"]:
         runtime_errors.append("writer_task_cwd_mismatch")
-    if writer_snapshot.get("writer_branch_matches") is not True:
+    if writer_identity.get("writer_branch_matches") is not True:
         runtime_errors.append("writer_branch_mismatch")
-    if writer_snapshot.get("writer_head") != manifest["expected_base_head"]:
+    if writer_identity.get("writer_head") != manifest["expected_base_head"]:
         runtime_errors.append("writer_head_mismatch")
-    if writer_snapshot.get("base_drift") is not False:
-        runtime_errors.append("canonical_base_drift")
-    if writer_snapshot.get("scope_passed") is not True:
-        runtime_errors.append("writer_scope_violation")
     if runtime_errors:
         return {
             "workspace_id": workspace_id,
@@ -1702,7 +1702,7 @@ def _existing_workspace_response(
             "state": "creation_runtime_incomplete",
             "runtime_errors": runtime_errors,
             "writer_task": writer_task,
-            "writer_snapshot": writer_snapshot,
+            "writer_identity": writer_identity,
             "live_lease_keys": sorted(observed_lease_keys),
             "tmux_live": tmux_live,
             "observed_pane_ids": sorted(observed_pane_ids),
@@ -1713,7 +1713,7 @@ def _existing_workspace_response(
     return {
         "workspace": manifest,
         "writer_task": writer_task,
-        "writer_snapshot": writer_snapshot,
+        "writer_identity": writer_identity,
         "live_lease_keys": sorted(observed_lease_keys),
         "tmux_live": True,
         "observed_pane_ids": sorted(observed_pane_ids),
@@ -2011,6 +2011,8 @@ def grabowski_agent_workspace_attach(workspace_id: str) -> dict[str, Any]:
         "workspace_id": workspace_id,
         "session_name": session,
         "session_live": live,
+        "creation_state": manifest.get("creation_state"),
+        "workspace_ready": manifest.get("creation_state") == "ready",
         "attach_argv": [str(TMUX), "attach-session", "-t", session],
         "creates_state": False,
         "establishes_success": False,
@@ -2025,6 +2027,13 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
     identifier = _required_string(workspace_id, "workspace_id", max_length=80)
     with _lock(identifier):
         manifest = _manifest(identifier)
+        if manifest.get("creation_state") != "ready":
+            return {
+                "workspace_id": identifier,
+                "state": "creation_incomplete",
+                "completion_errors": ["creation_state_not_ready"],
+                "receipt_status": "blocked",
+            }
         if manifest.get("close_receipt") is not None:
             raise AgentWorkspaceError("workspace is already closed")
         writer = _task_public(manifest["tasks"]["writer"])
@@ -2404,6 +2413,10 @@ def grabowski_agent_workspace_close(
         raise AgentWorkspaceError("close bindings must be canonical hashes")
     with _lock(identifier):
         manifest = _manifest(identifier)
+        if manifest.get("creation_state") != "ready":
+            raise AgentWorkspaceError(
+                "workspace creation is incomplete: creation_state_not_ready"
+            )
         existing = manifest.get("close_receipt")
         if isinstance(existing, dict):
             if not _close_integrity_status(manifest, existing)["valid"]:

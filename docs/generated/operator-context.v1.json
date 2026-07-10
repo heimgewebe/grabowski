@@ -1633,7 +1633,7 @@
     "runtime_sources": {
       "src/grabowski_agent_role.py": "496ce69903653725be8cffbb23b0e0b6a62b336dfc15bb8f82ff1e44e8acc1f9",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
-      "src/grabowski_agent_workspace.py": "b6dff88cc55272707003605c188f030791d3946cc48c15b0a57ec5324161af92",
+      "src/grabowski_agent_workspace.py": "8d6111a214274ee0b605ec51d7ecc655fd2987317560c30cfe939f18fa17ac53",
       "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
       "src/grabowski_capabilities.py": "a5eff9a9bc726f05181ffc25aa9bf636897f1799c94775953e18bb6712df9265",

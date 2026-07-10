@@ -161,6 +161,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         directory.mkdir(parents=True, exist_ok=True)
         value = {
             "schema_version": 1,
+            "creation_state": "ready",
             "workspace_id": identifier,
             "session_name": session,
             "binding": {"kind": "thread_focus", "id": "thread-1"},
@@ -764,6 +765,39 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertIn("--cap-drop", argv)
         self.assertNotIn("--unshare-net", argv)
 
+    def test_partial_creation_blocks_status_success_collect_and_close(self) -> None:
+        manifest = self.manifest()
+        manifest["creation_state"] = "creating"
+        workspace._write_manifest(manifest)
+        with (
+            mock.patch.object(workspace, "_git_snapshot", return_value={"dirty": False}),
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={"state": "completed", "terminal": True},
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+        ):
+            status = workspace.grabowski_agent_workspace_status(manifest["workspace_id"])
+        self.assertFalse(status["creation_ready"])
+        self.assertFalse(status["closeable"])
+        self.assertFalse(status["success_ready"])
+
+        with mock.patch.object(workspace.operator, "_require_operator_mutation"):
+            collected = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual(collected["state"], "creation_incomplete")
+        self.assertIn("creation_state_not_ready", collected["completion_errors"])
+
+        with mock.patch.object(workspace.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(workspace.AgentWorkspaceError, "creation is incomplete"):
+                workspace.grabowski_agent_workspace_close(
+                    manifest["workspace_id"],
+                    self.git.base,
+                    "0" * 64,
+                    "1" * 64,
+                )
+
     def test_create_rollback_preserves_dirty_writer_worktree(self) -> None:
         plan_id, _ = workspace._workspace_identity("thread_focus", "thread-rollback", self.git.repo, self.git.base)
         def fake_task_start(**kwargs):
@@ -798,6 +832,70 @@ class AgentWorkspaceTests(unittest.TestCase):
         failure = json.loads((self.state / plan_id / "create-failure.json").read_text())
         self.assertTrue(failure["worktree_preserved"])
 
+
+    def test_create_audit_failure_never_publishes_ready_workspace(self) -> None:
+        binding_id = "thread-audit-failure"
+        plan_id, _ = workspace._workspace_identity(
+            "thread_focus", binding_id, self.git.repo, self.git.base
+        )
+        cancel = mock.Mock(
+            return_value={"task": {"state": "cancelled"}, "result": {"returncode": 0}}
+        )
+        release = mock.Mock(return_value={"released": []})
+
+        def fake_task_start(**kwargs):
+            return {
+                "task": {
+                    "task_id": "writer-task",
+                    "host": kwargs["host"],
+                    "argv_sha256": workspace._sha256_json(kwargs["argv"]),
+                    "cwd": kwargs["cwd"],
+                }
+            }
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace, "_verify_bureau_binding", side_effect=binding_evidence),
+            mock.patch.object(workspace.resources, "acquire_resources", return_value={"leases": [{}]}),
+            mock.patch.object(workspace.resources, "release_resources", release),
+            mock.patch.object(workspace.tasks, "grabowski_task_start", side_effect=fake_task_start),
+            mock.patch.object(workspace.tasks, "grabowski_task_cancel", cancel),
+            mock.patch.object(
+                workspace,
+                "_create_tmux",
+                return_value={"captain": "%1", "writer": "%2", "tests": "%3", "review": "%4"},
+            ),
+            mock.patch.object(
+                workspace,
+                "_tmux_result",
+                return_value={"returncode": 0, "stdout": "", "stderr": ""},
+            ),
+            mock.patch.object(workspace.base, "_append_audit", side_effect=RuntimeError("audit unavailable")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
+                workspace.grabowski_agent_workspace_create(
+                    binding_kind="thread_focus",
+                    binding_id=binding_id,
+                    repository=str(self.git.repo),
+                    expected_base_head=self.git.base,
+                    writer_branch="feat/audit-failure",
+                    writer_worktree=str(self.root / "audit-failure-writer"),
+                    allowed_paths=["src"],
+                    writer_argv=["true"],
+                    test_argv=["true"],
+                    review_argv=["true"],
+                    runtime_seconds=600,
+                )
+        manifest = workspace._manifest(plan_id)
+        self.assertEqual(manifest["creation_state"], "creating")
+        failure = json.loads(
+            (self.state / plan_id / "create-failure.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("audit unavailable", failure["error"])
+        self.assertTrue(failure["writer_cancel_confirmed"])
+        self.assertTrue(failure["lease_released"])
+        cancel.assert_called_once_with("writer-task")
+        release.assert_called_once()
 
     def test_create_retry_returns_only_complete_live_workspace_as_idempotent(self) -> None:
         binding_id = "thread-idempotent"
@@ -858,14 +956,12 @@ class AgentWorkspaceTests(unittest.TestCase):
             ),
             mock.patch.object(
                 workspace,
-                "_git_snapshot",
+                "_writer_create_identity",
                 return_value={
                     "writer_branch_matches": True,
                     "writer_head": self.git.base,
                     "writer_branch": "feat/idempotent",
                     "writer_worktree": str(worktree),
-                    "base_drift": False,
-                    "scope_passed": True,
                 },
             ),
             mock.patch.object(workspace, "_validate_new_workspace_collisions") as collision_check,
@@ -898,6 +994,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         manifest = {
             **plan,
             "plan_sha256": workspace._sha256_json(plan),
+            "creation_state": "ready",
             "created_at": workspace._utc(),
             "updated_at": workspace._utc(),
             "tasks": {"writer": "writer-task", "tests": None, "review": None},
@@ -916,48 +1013,52 @@ class AgentWorkspaceTests(unittest.TestCase):
             "argv_sha256": workspace._sha256_json(workspace._writer_task_argv(manifest)),
             "cwd": plan["writer_worktree"],
         }
-        valid_snapshot = {
+        valid_identity = {
             "writer_branch_matches": True,
             "writer_head": self.git.base,
             "writer_branch": plan["writer_branch"],
             "writer_worktree": plan["writer_worktree"],
-            "base_drift": False,
-            "scope_passed": True,
         }
         cases = (
             (
                 "tmux_pane_inventory_mismatch",
                 {"%1", "%2", "%3", "%99"},
                 valid_task,
-                valid_snapshot,
+                valid_identity,
             ),
             (
                 "writer_task_argv_mismatch",
                 {"%1", "%2", "%3", "%4"},
                 {**valid_task, "argv_sha256": "0" * 64},
-                valid_snapshot,
+                valid_identity,
             ),
             (
                 "writer_task_cwd_mismatch",
                 {"%1", "%2", "%3", "%4"},
                 {**valid_task, "cwd": str(self.root / "other")},
-                valid_snapshot,
+                valid_identity,
             ),
             (
                 "writer_branch_mismatch",
                 {"%1", "%2", "%3", "%4"},
                 valid_task,
-                {**valid_snapshot, "writer_branch_matches": False},
+                {**valid_identity, "writer_branch_matches": False},
+            ),
+            (
+                "writer_head_mismatch",
+                {"%1", "%2", "%3", "%4"},
+                valid_task,
+                {**valid_identity, "writer_head": "f" * 40},
             ),
         )
-        for expected_error, pane_ids, task_state, snapshot in cases:
+        for expected_error, pane_ids, task_state, identity in cases:
             with self.subTest(expected_error=expected_error):
                 with (
                     mock.patch.object(workspace.resources, "list_resources", return_value=leases),
                     mock.patch.object(workspace, "_tmux_has_session", return_value=True),
                     mock.patch.object(workspace, "_tmux_pane_ids", return_value=pane_ids),
                     mock.patch.object(workspace, "_task_public", return_value=task_state),
-                    mock.patch.object(workspace, "_git_snapshot", return_value=snapshot),
+                    mock.patch.object(workspace, "_writer_create_identity", return_value=identity),
                 ):
                     result = workspace._existing_workspace_response(
                         directory=directory,
