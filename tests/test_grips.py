@@ -2041,6 +2041,22 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertFalse(result["output"]["status_projection"]["source_trusted"])
         self.assertIn("bureau status-projection", result["output"]["status_projection"]["allowlisted_sources"])
 
+    def test_reports_allowlisted_status_projection_source(self) -> None:
+        result = self.run_captain(captain_parameters())
+
+        status_projection = result["output"]["status_projection"]
+        self.assertTrue(status_projection["source_allowlisted"])
+        self.assertTrue(status_projection["source_trusted"])
+        self.assertEqual("bureau status-projection", status_projection["source"])
+        self.assertIn("bureau status-projection", status_projection["allowlisted_sources"])
+
+    def test_reports_run_id_status_projection_replay_reference_kind(self) -> None:
+        result = self.run_captain(captain_parameters())
+
+        status_projection = result["output"]["status_projection"]
+        self.assertEqual("captain-status-projection-test-run", status_projection["replay_reference"])
+        self.assertEqual("run_id", status_projection["replay_reference_kind"])
+
     def test_blocks_status_projection_source_swap_after_hash(self) -> None:
         parameters = captain_parameters(status_projection_source="caller supplied flag")
         parameters["status_projection_source"] = "bureau status-projection"
@@ -2122,6 +2138,19 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(captain_parameters(status_projection=projection, status_projection_sha256=grips.sha256_json(projection)))
 
         self.assertIn("status_projection_generated_at_in_future", result["output"]["blocked_reasons"])
+
+    def test_accepts_numeric_unix_timestamp_status_projection_generated_at(self) -> None:
+        projection = {
+            "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
+            "source": "bureau status-projection",
+            "healthy": True,
+            "generated_at": datetime.now(timezone.utc).timestamp(),
+            "run_id": "numeric-generated-at-run",
+        }
+        result = self.run_captain(captain_parameters(status_projection=projection, status_projection_sha256=grips.sha256_json(projection)))
+
+        self.assertNotIn("status_projection_generated_at_invalid", result["output"]["blocked_reasons"])
+        self.assertEqual("pass", self.gate(result, "status-projection-fresh")["status"])
 
     def test_blocks_stale_generated_at_status_projection(self) -> None:
         projection = {

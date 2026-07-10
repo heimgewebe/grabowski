@@ -273,6 +273,7 @@ CAPTAIN_STATUS_PROJECTION_ALLOWLISTED_SOURCES = frozenset({
     "grabowski status-projection",
     "captain status-projection",
 })
+# Compatibility alias for older receipts/tests; new callers should use source_allowlisted.
 CAPTAIN_STATUS_PROJECTION_TRUSTED_SOURCES = CAPTAIN_STATUS_PROJECTION_ALLOWLISTED_SOURCES
 CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS = 3600
 CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS = 300
