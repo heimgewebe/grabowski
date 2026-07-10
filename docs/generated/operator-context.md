@@ -125,6 +125,11 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_gui_worker_status` | gui-worker | yes | low | Observe one isolated GUI worker and reconcile terminal leases. |
 | `grabowski_gui_worker_stop` | gui-worker | no | medium | Stop one isolated GUI worker and clean ephemeral XDG state. |
 | `grabowski_gui_worker_list` | gui-worker | yes | low | List isolated GUI workers. |
+| `grabowski_agent_workspace_create` | agent-workspace | no | high | Create one task-bound four-pane tmux workspace with one isolated writer worktree. |
+| `grabowski_agent_workspace_status` | agent-workspace | yes | low | Derive workspace state from Grabowski tasks, Git and tmux without treating pane state as success. |
+| `grabowski_agent_workspace_attach` | agent-workspace | yes | low | Return the exact attach command for an existing non-authoritative tmux workspace UI. |
+| `grabowski_agent_workspace_collect` | agent-workspace | no | high | Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt. |
+| `grabowski_agent_workspace_close` | agent-workspace | no | high | Close one collected workspace while preserving its branch and writer worktree. |
 
 ## Policy contract
 

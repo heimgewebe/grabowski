@@ -733,6 +733,47 @@ TOOL_PROFILES.update(
 )
 
 
+TOOL_PROFILES.update(
+    {
+        "grabowski_agent_workspace_create": {
+            "category": "agent-workspace",
+            "purpose": "Create one task-bound four-pane tmux workspace with one isolated writer worktree.",
+            "risk_class": "high",
+            "effects": ["worktree-create", "branch-create", "task-start", "tmux-session-create", "lease-create"],
+            "reversibility": "close-and-preserved-worktree",
+        },
+        "grabowski_agent_workspace_status": {
+            "category": "agent-workspace",
+            "purpose": "Derive workspace state from Grabowski tasks, Git and tmux without treating pane state as success.",
+            "risk_class": "low",
+            "effects": ["task-state-refresh"],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_agent_workspace_attach": {
+            "category": "agent-workspace",
+            "purpose": "Return the exact attach command for an existing non-authoritative tmux workspace UI.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_agent_workspace_collect": {
+            "category": "agent-workspace",
+            "purpose": "Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt.",
+            "risk_class": "high",
+            "effects": ["task-start", "receipt-create", "task-state-refresh"],
+            "reversibility": "preserved-worktree-and-receipts",
+        },
+        "grabowski_agent_workspace_close": {
+            "category": "agent-workspace",
+            "purpose": "Close one collected workspace while preserving its branch and writer worktree.",
+            "risk_class": "high",
+            "effects": ["possible-task-stop", "tmux-session-remove", "lease-release", "receipt-create"],
+            "reversibility": "preserved-worktree-and-branch",
+        },
+    }
+)
+
+
 PROFILE_CATEGORIES: dict[str, set[str] | None] = {
     "concise": None,
     "repository-work": {
@@ -752,6 +793,7 @@ PROFILE_CATEGORIES: dict[str, set[str] | None] = {
         "artifact",
         "browser-worker",
         "gui-worker",
+        "agent-workspace",
     },
     "host-operations": {
         "context",
