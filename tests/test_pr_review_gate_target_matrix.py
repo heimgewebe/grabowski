@@ -205,6 +205,8 @@ jobs:
             "stop_reason": "clean_pass",
             "findings": [],
             "material_findings_remaining": 0,
+            "material_findings_after_first_review": 0,
+            "uncertainty": 0.1,
         }
         result = pr_review_gate.evaluate_review_gate(
             state,

@@ -66,12 +66,14 @@ def _self_review(path: str) -> dict:
         "stop_reason": "clean_pass",
         "findings": [],
         "material_findings_remaining": 0,
+            "material_findings_after_first_review": 0,
+            "uncertainty": 0.1,
         "claude_review": {"required": False, "reason": "claimed small diff"},
     }
 
 
 class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
-    def test_mutating_runtime_support_modules_require_independent_review(self) -> None:
+    def test_mutating_runtime_support_modules_require_deep_self_review(self) -> None:
         for path in (
             "src/grabowski_tasks.py",
             "src/grabowski_checkouts.py",
@@ -86,10 +88,12 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
                     any("high-critical Grabowski operator path touched" in reason for reason in result["complexity"]["reasons"]),
                     result["complexity"]["reasons"],
                 )
-                self.assertIn(
-                    "External review evidence invalid: external review is required but evidence is missing",
+                self.assertEqual(result["complexity"]["minimum_self_review_iterations"], 4)
+                self.assertTrue(
+                    any("minimum 4" in failure for failure in result["failures"]),
                     result["failures"],
                 )
+                self.assertFalse(result["review_sources"]["external_review_required"])
 
 
 if __name__ == "__main__":

@@ -166,7 +166,7 @@ Build these first because they reduce the most repeated friction.
    - report canonical checkout, runtime-matching worktree, feature worktrees, dirty worktrees and stale candidates.
 
 3. `pr-check-readiness`
-   - report PR head, base, checks, review state, self-review, external review need, findings, merge risk and verdict.
+   - report PR head, base, checks, review state, self-review depth, optional external diagnostics, findings, merge risk and verdict.
 
 4. `post-merge-sync`
    - after merge, report local/main/runtime relationship, deployment need and follow-up branch/worktree action.

@@ -44,6 +44,8 @@ def _self_review() -> dict:
         "stop_reason": "clean_pass",
         "findings": [],
         "material_findings_remaining": 0,
+            "material_findings_after_first_review": 0,
+            "uncertainty": 0.1,
         "claude_review": {"required": False, "reason": "small low-risk diff"},
     }
 
@@ -174,7 +176,7 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertFalse(result["review_sources"]["codex_seen"])
         self.assertIn(
-            "Deprecated self_review.codex_review.required ignored; use diff-bound external review evidence",
+            "Deprecated self_review.codex_review.required ignored; external reviews are optional diagnostics",
             result["warnings"],
         )
 

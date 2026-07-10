@@ -85,38 +85,44 @@ The live context tools compute runtime and checkout state on every call. Static 
 
 ## PR review gate
 
-Before any Grabowski-assisted PR merge, review evidence must be evaluated rather than assumed. Every PR requires current self-review evidence; non-exempt PRs also require external review evidence. Generate self-review templates and external review packets in a separate create-only step; then run the gate against completed evidence in a repeatable check step. Treat a BLOCK verdict as merge-blocking. The self-review template is only a scaffold; it is not passing evidence until Grabowski has actually reviewed the diff, recorded a PASS verdict, review iterations, reviewed files, focus axes, and terminal finding triage.
+Before any Grabowski-assisted PR merge, the current pull-request diff must pass a head- and diff-bound Grabowski self-review. External reviews are optional diagnostics. They are never required, never replace self-review, and are not read from PR comments or GitHub review bodies.
 
-For a non-exempt PR, first generate review scaffolds:
-
-```bash
-python3 tools/pr_review_gate.py --pr <number> --write-self-review-template <path> --write-external-review-packet <dir> --json
-```
-
-Then run the repeatable gate check after evidence is completed:
+Generate a create-only self-review template for the current PR head and diff:
 
 ```bash
-python3 tools/pr_review_gate.py --pr <number> --self-review <path> --external-review-evidence <path> --json
+python3 tools/pr_review_gate.py --pr <number> --write-self-review-template .review-audits/pr-<number>-self-review.json --json
 ```
 
-The gate derives repository policy from the live pull request's target-repository URL, not from a local fork checkout. Invalid or PR-mismatched target identity blocks.
-
-`tools/external_review_claude.py` is the required provider for high-critical PRs and for every non-documentation-only PR in `heimgewebe/weltgewebe`. It combines the packet instructions with the exact PR diff behind a per-invocation random nonce fence, places authoritative instructions after the untrusted diff, hashes the exact UTF-8 bytes sent through stdin, resolves one Claude executable for both version probe and execution, invokes `claude -p` with no tools, Plan permission mode, no persistent session, Safe Mode, model `opus`, effort `high`, and a finite budget, accepts only schema-validated `structured_output`, and rechecks repository identity, head, and diff after the review. Raw stdout/stderr are retained for failed or drifted attempts but never promoted to evidence. It fails closed on packet mismatch, drift, timeout, command/API/auth/budget failure, empty output, or invalid structured JSON. `tools/external_review_agy.py` remains an optional provider for ordinary non-exempt PRs. Claude CLI `ultrareview` is optional additional evidence and is never the mandatory provider or a single point of failure. No provider replaces self-review, CI, mergeability, current head/diff binding, or finding triage.
-
-For an external-review-exempt PR, still provide completed self-review evidence and omit only the external packet/evidence arguments from the relevant command.
-
-The gate requires a head-SHA- and `gh pr diff` SHA-256-bound Grabowski self-review, iterative review evidence, terminal triage for every finding at every severity, and expected green checks named `validate (3.10)` and `validate (3.12)`. External LLM review evidence is required for every PR except ordinary documentation-only changes and very small uncomplicated changes. Policy-critical documentation and build/config/CI/packaging/tooling changes are not exempt merely because they are text or small. High-critical changes require a valid `claude-cli:packet-review` entry whose packet-prompt hash and complete nonce-bound stdin hash are independently reconstructed from current PR state and whose top-level prompt hash and `stdin_sha256` agree. Weltgewebe is an important repository, so every non-documentation-only Weltgewebe PR inherits that Claude requirement even when tiny; ChatGPT, Gemini/agy, platform reviews, and legacy `--claude-evidence` alone do not satisfy it. Claude remains one independent reviewer, not a substitute for the other gates. A Claude outage keeps the lane closed unless `--policy-waiver` supplies a trusted-owner authority record bound to repo/PR/head/diff, timezone-valid, audit-referenced, and lasting no more than 24 hours; that waiver removes only the Claude-provider requirement and still requires a qualifying independent external review plus every normal merge gate. Like all local evidence in this threat model, that authority record is audit-bound rather than cryptographically authenticated.
-
-Self-review evidence must use the same diff source as the gate:
+Complete the template only after reviewing the actual `gh pr diff` on all required axes, then run the repeatable gate and write an immutable audit receipt when useful:
 
 ```bash
-gh pr diff <number> --repo <owner>/<repo> > evidence/pr-<number>.diff
-sha256sum evidence/pr-<number>.diff
-# macOS: shasum -a 256 evidence/pr-<number>.diff
+python3 tools/pr_review_gate.py \
+  --pr <number> \
+  --self-review .review-audits/pr-<number>-self-review.json \
+  --write-self-review-audit .review-audits/pr-<number>-self-review-audit.json \
+  --json
 ```
 
-The self-review JSON must include `schema_version: 1`, `kind: "grabowski_self_review"`, `review_mode: "critical_diff_review"`, `repo`, `pr`, `verdict: "PASS"`, `head_sha`, `diff_sha256`, `diff_reviewed: true`, complete `reviewed_files` coverage for the current PR files, `review_focus` covering `correctness`, `regression_risk`, `tests`, `security`, and `integration`, `all_findings_triaged: true`, non-empty `review_iterations`, terminal `findings`, `material_findings_remaining`, and a `stop_reason`. The self-review must be a critical review performed by Grabowski against the actual diff; do not post the self-review text into the PR. A PR comment, review body, or inline comment is not self-review evidence. Existing self-review evidence without the required workflow fields or without `diff_sha256` must be regenerated against the current head and current `gh pr diff` output before merge.
+A `BLOCK` verdict blocks merge. The gate derives repository identity from the live pull request target URL, checks the current head and SHA-256 of `gh pr diff`, requires exact changed-file coverage, terminal finding triage, and green checks named `validate (3.10)` and `validate (3.12)`. A PR comment, review body, approval, or inline comment is not self-review evidence and is not fetched as a merge prerequisite.
 
-The self-review gate checks structural compliance, exact PR file coverage, and current head/diff binding. That reduces self-deception but does not prove review quality by itself; external review evidence remains the collision-reduction layer for every non-exempt PR. `review_focus` records that every required axis was consciously considered. There is no per-axis exemption: if an axis yields no issue for a specific PR, keep the axis in `review_focus` and record concrete non-applicable findings only when useful. Template placeholders such as `PASS|NEEDS_CHANGE|BLOCK` must be replaced before the object can be passing evidence.
+Review depth is risk-scaled:
 
-Allowed terminal finding states are `fixed`, `accepted`, `false_positive`, `deferred_with_reason`, and `not_applicable`; accepted or deferred findings require reasons. Blocking findings cannot be merely accepted or deferred. Severity values `p0`, `p1`, `high`, and `critical` are treated as blocking for this purpose. Pending, cancelled, or missing checks block the gate.
+| Tier | Minimum self-review iterations | Typical case |
+| --- | ---: | --- |
+| `documentation` | 1 | ordinary documentation-only change up to 500 changed lines and 15 files |
+| `very_small` | 1 | very small uncomplicated code change |
+| `standard` | 2 | normal non-trivial change or large documentation-only change |
+| `important_repo` | 3 | non-documentation change in `heimgewebe/weltgewebe` |
+| `high_critical` | 4–5 | operator, security, deployment, workflow, packaging or large/high-uncertainty change |
+
+Distinct critical signals raise the required depth up to five iterations. High review uncertainty and many material findings after the first pass also raise the tier. Documentation-only changes above 500 changed lines or 15 files require two passes. Iterations must be numbered consecutively, have distinct summaries, and represent separate review passes rather than duplicated prose.
+
+The self-review JSON must include `schema_version: 1`, `kind: "grabowski_self_review"`, `review_mode: "critical_diff_review"`, `repo`, `pr`, `verdict: "PASS"`, `head_sha`, `diff_sha256`, `diff_reviewed: true`, complete `reviewed_files`, `review_focus` covering `correctness`, `regression_risk`, `tests`, `security`, and `integration`, `all_findings_triaged: true`, sufficient `review_iterations`, terminal `findings`, `material_findings_remaining`, `material_findings_after_first_review`, finite `uncertainty` from 0 to 1, `stop_reason`, and explicit residual-risk handling. Template placeholders are not passing evidence.
+
+Self-review content remains local evidence and must not be copied into the PR. The optional audit contains only compact measurements and outcome fields: tier, required and actual iteration count, first-pass and remaining material findings, uncertainty, residual-risk state, gate verdict, and a tuning signal. The first-pass metric must equal the material finding count recorded for iteration 1. Captain `review_evidence` for `pr-merge` is this `grabowski_self_review_audit`, bound to the exact repository, PR number, head and diff. `pr-check-readiness` requires the audit and an independently supplied expected diff SHA-256 by default; GitHub review decisions are advisory metadata only.
+
+Use audit history to tune future depth, not to reward high review volume. Increase depth when failures escape review, uncertainty remains high, material findings appear late, or audits repeatedly return `increase_depth`; repair malformed measurements when they return `repair_evidence`. Consider reducing depth only after a meaningful sample of low-risk reviews remains clean and post-merge checks show no escaped defects. No automatic reduction is made by the gate.
+
+`--external-review-evidence`, `tools/external_review_claude.py`, `tools/external_review_agy.py`, and legacy Claude evidence remain available for optional second opinions or incident investigation. Invalid optional external evidence is warned about but does not block a valid self-review. Legacy `external_review_required`, `self_review_required=false`, and Claude policy waivers are deprecated and ignored.
+
+Allowed terminal finding states are `fixed`, `accepted`, `false_positive`, `deferred_with_reason`, and `not_applicable`; accepted or deferred findings require reasons. Blocking findings cannot be merely accepted or deferred. Severity values `p0`, `p1`, `high`, and `critical` are blocking. Pending, cancelled, or missing checks block the gate.
