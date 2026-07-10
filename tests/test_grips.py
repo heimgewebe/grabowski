@@ -2150,7 +2150,21 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(captain_parameters(status_projection=projection, status_projection_sha256=grips.sha256_json(projection)))
 
         self.assertNotIn("status_projection_generated_at_invalid", result["output"]["blocked_reasons"])
+        self.assertTrue(result["output"]["status_projection"]["generated_at"].endswith("Z"))
         self.assertEqual("pass", self.gate(result, "status-projection-fresh")["status"])
+
+    def test_blocks_boolean_status_projection_generated_at(self) -> None:
+        projection = {
+            "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
+            "source": "bureau status-projection",
+            "healthy": True,
+            "generated_at": True,
+            "run_id": "boolean-generated-at-run",
+        }
+        result = self.run_captain(captain_parameters(status_projection=projection, status_projection_sha256=grips.sha256_json(projection)))
+
+        self.assertIn("status_projection_generated_at_invalid", result["output"]["blocked_reasons"])
+        self.assertEqual("blocked", self.gate(result, "status-projection-fresh")["status"])
 
     def test_blocks_stale_generated_at_status_projection(self) -> None:
         projection = {
