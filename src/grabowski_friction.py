@@ -1379,9 +1379,12 @@ def _read_private_text(path: Path, *, max_bytes: int, require_private: bool = Fa
         size_bytes = metadata.st_size
         if size_bytes > max_bytes:
             raise RuntimeError(f"{path.name} exceeds bounded byte limit")
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        with os.fdopen(fd, "rb") as handle:
             fd = -1
-            return handle.read(max_bytes + 1)
+            payload = handle.read(max_bytes + 1)
+        if len(payload) > max_bytes:
+            raise RuntimeError(f"{path.name} exceeds bounded byte limit")
+        return payload.decode("utf-8")
     finally:
         if fd >= 0:
             os.close(fd)
@@ -1538,6 +1541,21 @@ def _closeout_signature(record: dict[str, Any]) -> tuple[Any, ...]:
     ))
 
 
+def _closeout_binding_mismatch_ids(
+    events: list[dict[str, Any]],
+    closeouts: dict[str, dict[str, Any]],
+) -> list[str]:
+    mismatches: set[str] = set()
+    for event in events:
+        if not _has_event_id(event):
+            continue
+        event_id = _event_id(event)
+        closeout = closeouts.get(event_id)
+        if closeout is not None and closeout.get("failure_class") != classify_friction_event(event):
+            mismatches.add(event_id)
+    return sorted(mismatches)
+
+
 def resolve_friction(
     *,
     status: str,
@@ -1586,6 +1604,11 @@ def resolve_friction(
             raise RuntimeError("friction decision log contains duplicate closeouts")
         if not closeout_meta["integrity_valid"]:
             raise RuntimeError("friction decision log integrity is invalid")
+        binding_mismatches = _closeout_binding_mismatch_ids(events, closeouts)
+        if binding_mismatches:
+            raise RuntimeError(
+                "friction decision log closeout binding mismatch: " + ",".join(binding_mismatches[:20])
+            )
         if event_selector:
             if event_selector not in by_id:
                 raise ValueError("event_id not found in friction ledger")
@@ -1723,18 +1746,13 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
     else:
         for event_id in duplicate_event_ids:
             closeouts.pop(event_id, None)
-        for event in events:
-            if not _has_event_id(event):
-                continue
-            event_id = _event_id(event)
-            closeout = closeouts.get(event_id)
-            if closeout is not None and closeout.get("failure_class") != classify_friction_event(event):
-                closeout_binding_mismatch_event_ids.append(event_id)
-                closeouts.pop(event_id, None)
+        closeout_binding_mismatch_event_ids = _closeout_binding_mismatch_ids(events, closeouts)
+        for event_id in closeout_binding_mismatch_event_ids:
+            closeouts.pop(event_id, None)
     event_log_integrity = {
         "duplicate_event_ids": duplicate_event_ids[:20],
         "duplicate_event_ids_truncated": len(duplicate_event_ids) > 20,
-        "integrity_valid": not duplicate_event_ids,
+        "integrity_valid": not duplicate_event_ids and not closeout_binding_mismatch_event_ids,
         "scope": "returned_recent_valid_events",
         "closeout_policy": "ignore closeouts for duplicate event ids or failure-class binding mismatches",
         "closeout_binding_mismatch_event_ids": sorted(closeout_binding_mismatch_event_ids)[:20],

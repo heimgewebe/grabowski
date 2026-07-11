@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -1326,6 +1327,21 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_private_reader_rechecks_actual_bytes_after_metadata_bound(self) -> None:
+        module = self._load_module()
+        path = module.FRICTION_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"abcd")
+        real_fstat = module.os.fstat
+
+        def understated_fstat(fd: int):
+            metadata = real_fstat(fd)
+            return type("Metadata", (), {"st_mode": metadata.st_mode, "st_size": 1})()
+
+        with patch.object(module.os, "fstat", side_effect=understated_fstat):
+            with self.assertRaisesRegex(RuntimeError, "byte limit"):
+                module._read_private_text(path, max_bytes=2)
+
     def test_closeout_loader_bounds_bytes_and_all_nonempty_lines(self) -> None:
         module = self._load_module()
         path = module.FRICTION_DECISION_LOG
@@ -1587,10 +1603,19 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
 
         summary = module.friction_summary(limit=10)
         self.assertEqual(summary["unresolved"], 3)
+        self.assertFalse(summary["event_log_integrity"]["integrity_valid"])
         self.assertEqual(
             summary["event_log_integrity"]["closeout_binding_mismatch_event_ids"],
             ["filter-1"],
         )
+        with self.assertRaisesRegex(RuntimeError, "closeout binding mismatch"):
+            module.resolve_friction(
+                event_id="filter-2",
+                status="resolved",
+                decision="must remain blocked",
+                evidence_ref="receipt:binding-block",
+                resolved_by="operator",
+            )
 
     def test_summary_read_rejects_event_log_symlink(self) -> None:
         module = self._load_module()
