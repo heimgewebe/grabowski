@@ -107,6 +107,9 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_friction_record` | operations-observability | no | medium | Record one bounded operator-friction event for later analysis. |
 | `grabowski_friction_resolve` | operations-observability | no | medium | Append evidence-bound closeout decisions for friction events or classes without rewriting history. |
 | `grabowski_friction_summary` | operations-observability | yes | low | Summarize recent bounded operator-friction events. |
+| `grabowski_execution_shape` | operations-observability | yes | low | Recommend one bounded execution shape from typed inputs and evidence-bound friction fingerprints without executing it. |
+| `grabowski_execution_outcome_record` | operations-observability | no | medium | Append secret-free predicted-versus-actual routing outcomes for shadow evaluation. |
+| `grabowski_execution_governor_summary` | operations-observability | yes | low | Summarize evidence thresholds, time decay and circuit-breaker state without enabling live routing. |
 | `grabowski_connector_transport_diagnostics` | operations-observability | yes | low | Run bounded read-only diagnostics for connector transport failures. |
 | `grabowski_operator_recall_export` | operations-observability | yes | low | Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth. |
 | `grabowski_resource_acquire` | resource | no | medium | Atomically acquire typed resource leases for one owner. |

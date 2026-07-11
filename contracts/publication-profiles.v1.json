@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "cb557e0d982610ea8989c6bf3a8e47a36208fc75d7dae7200b49209660e8f5f3"
+    "sha256": "9e073354720c82bbb8ca52787b6249d41806d057a0b6a2dcea7f2d02fe8a8f3f"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "6164400e6b96f7f00ab202011053e59fa25bdfc2095592d6130c0f8d7cca0530"
+    "sha256": "05a8b33d821621a0aded3ac873aa89f070114cedf9bc25ac07a8b1bf254fb9c7"
   },
   "counts": {
     "core": 21,
-    "full": 106,
-    "operator": 91
+    "full": 109,
+    "operator": 94
   },
   "profiles": {
     "core": [
@@ -119,6 +119,9 @@
       "grabowski_friction_record",
       "grabowski_friction_resolve",
       "grabowski_friction_summary",
+      "grabowski_execution_shape",
+      "grabowski_execution_outcome_record",
+      "grabowski_execution_governor_summary",
       "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
       "grabowski_resource_acquire",
@@ -212,6 +215,9 @@
       "grabowski_friction_record",
       "grabowski_friction_resolve",
       "grabowski_friction_summary",
+      "grabowski_execution_shape",
+      "grabowski_execution_outcome_record",
+      "grabowski_execution_governor_summary",
       "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
       "grabowski_resource_acquire",
