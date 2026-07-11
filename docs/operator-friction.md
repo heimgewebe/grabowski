@@ -41,6 +41,32 @@ Periodically run `grabowski_friction_summary`. Recurring `platform_filter` entri
 
 The summary also emits `next_grip_proposals`. These are proposal-only, read-only recommendations. They group repeated command-chain, blocked-gate, stale-snapshot, review-loop and missing-receipt-field patterns, link recommendations to bounded unresolved `event_id` evidence, and state what the evidence does not prove. Matching is heuristic: one event can support multiple proposal groups, unmatched events do not prove the absence of friction, and recommendations do not prove root cause or implementation readiness. They do not create Bureau tasks, change queue priority, execute grips, resume tasks, merge, deploy or authorize policy exceptions.
 
+## Evidence-bound closeout decisions
+
+`grabowski_friction_resolve` closes or deliberately parks friction without rewriting `events.jsonl`. It appends one decision per event to `~/.local/state/grabowski/friction/decisions.jsonl`; each line follows `contracts/operator-friction-decision.v1.schema.json` and binds the closeout to an `event_id`, evidence reference, actor and UTC closeout time.
+
+Exactly one selector is required:
+
+- `event_id` closes one known event.
+- `failure_class` closes the next bounded batch of currently unresolved events in that class.
+
+The canonical API status codes are:
+
+- `resolved`
+- `superseded`
+- `deferred`
+- `accepted_risk` (accepted-risk)
+- `wont_fix` (won't-fix)
+- `linked_to_task` (linked-to-task)
+
+`deferred` requires a reason. `linked_to_task` requires a Bureau task ID. Repeating the exact same closeout is idempotent; a conflicting second decision for the same event is rejected. A Bureau link is evidence of tracking only: it does not make the task ready, authorize work, or establish merge readiness.
+
+Class-wide closeouts are deterministic and bounded to 100 events per call. The receipt reports the total matches, the applied batch, truncation and remaining count; repeat the operation only after reviewing that receipt. Duplicate raw `event_id` values fail closed: mutations scan the bounded ledger and stop; summaries ignore closeouts for duplicated IDs in the returned recent-event window.
+
+`grabowski_friction_summary` overlays valid closeouts onto recent events and reports separate lifecycle counts. Closed, superseded, deferred, accepted-risk, won't-fix and task-linked events no longer inflate `decision_required_count` or proposal-only recommendations. The raw event ledger remains append-only and unchanged.
+
+The decision log is read under a local file lock and validated before use. Malformed records or duplicate/conflicting decisions fail closed: summaries ignore the untrusted closeouts, and new closeout mutations stop until the ledger is repaired.
+
 ## Connector transport failures
 
 Treat 502 upstream errors, `streamable_http` exceptions, `Received exception from stream`, MCP `POST /mcp` stream failures and connector-side timeouts as `connector_transport`, not as command return codes and not as policy-gate results.

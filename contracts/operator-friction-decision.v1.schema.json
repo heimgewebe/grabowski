@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grabowski.local/contracts/operator-friction-decision.v1.schema.json",
+  "title": "Grabowski Operator Friction Decision v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "closeout_id",
+    "event_id",
+    "failure_class",
+    "decision",
+    "status",
+    "evidence_ref",
+    "resolved_by",
+    "closed_at",
+    "closed_at_unix",
+    "reason",
+    "bureau_task_id",
+    "non_claims"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "closeout_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[0-9A-Za-z][0-9A-Za-z_.:-]{0,127}$"
+    },
+    "failure_class": {
+      "type": "string",
+      "enum": [
+        "connector_transport",
+        "contract_error",
+        "expected_red_phase",
+        "superseded",
+        "environment_tooling",
+        "platform_filter",
+        "policy_gate",
+        "actionable_failure",
+        "unknown"
+      ]
+    },
+    "decision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "resolved",
+        "superseded",
+        "deferred",
+        "accepted_risk",
+        "wont_fix",
+        "linked_to_task"
+      ]
+    },
+    "evidence_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "resolved_by": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "closed_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "closed_at_unix": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "reason": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "bureau_task_id": {
+      "type": "string",
+      "maxLength": 200,
+      "anyOf": [
+        {
+          "const": ""
+        },
+        {
+          "pattern": "^[A-Z0-9][A-Z0-9_.:-]{0,199}$"
+        }
+      ]
+    },
+    "non_claims": {
+      "const": [
+        "does_not_prove_root_cause",
+        "does_not_authorize_task_resume",
+        "does_not_establish_merge_readiness",
+        "does_not_rewrite_raw_friction_history",
+        "does_not_make_a_linked_bureau_task_ready"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "deferred"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "reason": {
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "linked_to_task"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "bureau_task_id": {
+            "pattern": "^[A-Z0-9][A-Z0-9_.:-]{0,199}$",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  ]
+}

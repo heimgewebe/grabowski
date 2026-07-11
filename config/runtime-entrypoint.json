@@ -80,6 +80,7 @@
     "grabowski_recovery_status",
     "grabowski_recovery_server_probe",
     "grabowski_friction_record",
+    "grabowski_friction_resolve",
     "grabowski_friction_summary",
     "grabowski_connector_transport_diagnostics",
     "grabowski_operator_recall_export",

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "a5eff9a9bc726f05181ffc25aa9bf636897f1799c94775953e18bb6712df9265",
+  "capability_source_sha256": "dedde7fbedf5392e18d5d84eacb3e0b73aa2367ca6f56bcbd1c86067853cf997",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "08ec0af8bdec035e54c80487640ff6471604bdcce424b06616a1719fc907fc36",
+  "contract_sha256": "cb557e0d982610ea8989c6bf3a8e47a36208fc75d7dae7200b49209660e8f5f3",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -998,6 +998,20 @@
       "reversibility": "append-only-observation",
       "risk_class": "medium",
       "tool": "grabowski_friction_record"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Append evidence-bound friction closeout decisions without rewriting history.",
+      "effects": [
+        "state-append",
+        "audit-record"
+      ],
+      "id": "grabowski_friction_resolve",
+      "purpose": "Append evidence-bound closeout decisions for friction events or classes without rewriting history.",
+      "read_only": false,
+      "reversibility": "append-only-decision",
+      "risk_class": "medium",
+      "tool": "grabowski_friction_resolve"
     },
     {
       "category": "operations-observability",
