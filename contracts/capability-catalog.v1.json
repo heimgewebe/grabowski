@@ -568,7 +568,7 @@
     },
     {
       "category": "version-control",
-      "description": "Run Git in one repository with protected-main force-push guard.",
+      "description": "Run Git with a config-aware protected-main force-push guard.",
       "effects": [
         "git-dependent"
       ],

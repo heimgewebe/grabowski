@@ -983,6 +983,352 @@ class OperatorContractTests(unittest.TestCase):
                         operator._guard_git(arguments, Path("/repo"))
             branch.assert_not_called()
 
+    def test_protected_force_push_guard_applies_in_trusted_owner_mode(self) -> None:
+        operator = _load_operator_module()
+        with (
+            patch.object(operator, "_trusted_owner_mode", return_value=True),
+            patch.object(operator, "_git_branch", return_value="feature"),
+        ):
+            with self.assertRaisesRegex(PermissionError, "trusted-owner mode"):
+                operator._guard_git(
+                    ["push", "--force", "origin", "HEAD:main"],
+                    Path("/repo"),
+                )
+
+    def test_combined_short_force_option_is_blocked_for_protected_target(self) -> None:
+        operator = _load_operator_module()
+        with patch.object(operator, "_git_branch", return_value="feature"):
+            with self.assertRaisesRegex(PermissionError, "protected main branch"):
+                operator._guard_git(
+                    ["push", "-fu", "origin", "HEAD:main"],
+                    Path("/repo"),
+                )
+
+    def test_push_option_values_are_not_misclassified_as_force_or_targets(self) -> None:
+        operator = _load_operator_module()
+        arguments = [
+            "-o",
+            "+force-main-*",
+            "--push-option=delete-main-*",
+            "origin",
+            "HEAD:feature",
+        ]
+        self.assertFalse(operator._force_push_requested(arguments))
+        self.assertFalse(operator._aggregate_push_requested(arguments))
+        self.assertFalse(operator._push_mentions_protected_branch(arguments))
+        self.assertFalse(operator._push_deletes_protected_branch(arguments))
+        self.assertFalse(operator._force_push_requested(["-ofoo", "origin", "HEAD:feature"]))
+        self.assertFalse(operator._push_deletes_protected_branch(["-odata", "origin", "feature"]))
+        self.assertTrue(operator._force_push_requested(["-fu", "origin", "HEAD:feature"]))
+        self.assertTrue(operator._push_deletes_protected_branch(["-dv", "origin", "main"]))
+
+    def test_force_if_includes_alone_is_not_treated_as_force(self) -> None:
+        operator = _load_operator_module()
+        with (
+            patch.object(operator, "_git_branch", return_value="feature"),
+            patch.object(operator, "_git_config_entries", return_value=[]),
+        ):
+            operator._guard_git(["push", "--force-if-includes", "origin"], Path("/repo"))
+        self.assertFalse(operator._force_push_requested(["--force-if-includes"]))
+
+    def test_command_line_force_push_refspec_configuration_is_blocked(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "symbolic-ref", "HEAD", "refs/heads/feature"],
+                check=True,
+            )
+            for configured in (
+                "+HEAD:refs/heads/main",
+                "+refs/heads/*:refs/heads/*",
+            ):
+                with self.subTest(configured=configured):
+                    with self.assertRaisesRegex(PermissionError, "protected main branch|aggregate"):
+                        operator._guard_git(
+                            [
+                                "-c",
+                                f"remote.origin.push={configured}",
+                                "push",
+                                "origin",
+                            ],
+                            repo,
+                        )
+
+    def test_force_flag_with_nonforce_configured_main_refspec_is_blocked(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "symbolic-ref", "HEAD", "refs/heads/feature"],
+                check=True,
+            )
+            with self.assertRaisesRegex(PermissionError, "protected main branch"):
+                operator._guard_git(
+                    [
+                        "-c",
+                        "remote.origin.push=HEAD:refs/heads/main",
+                        "push",
+                        "--force",
+                        "origin",
+                    ],
+                    repo,
+                )
+
+    def test_repository_configured_force_refspec_is_blocked(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "symbolic-ref", "HEAD", "refs/heads/feature"],
+                check=True,
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "remote.origin.push",
+                    "+HEAD:refs/heads/main",
+                ],
+                check=True,
+            )
+            with self.assertRaisesRegex(PermissionError, "protected main branch"):
+                operator._guard_git(["push", "origin"], repo)
+
+    def test_force_with_matching_push_default_is_blocked_as_aggregate(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "symbolic-ref", "HEAD", "refs/heads/feature"],
+                check=True,
+            )
+            with self.assertRaisesRegex(PermissionError, "aggregate"):
+                operator._guard_git(
+                    ["-c", "push.default=matching", "push", "--force", "origin"],
+                    repo,
+                )
+
+    def test_git_repository_rebinding_and_indirect_config_are_blocked(self) -> None:
+        operator = _load_operator_module()
+        for arguments in (
+            ["-C", "/tmp/other", "push", "origin"],
+            ["--git-dir=/tmp/other.git", "push", "origin"],
+            ["--work-tree", "/tmp/other", "status"],
+            ["--config-env=remote.origin.push=FORCE_REFSPEC", "push", "origin"],
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(PermissionError):
+                    operator._guard_git(arguments, Path("/repo"))
+
+    def test_git_alias_injection_and_configured_alias_are_blocked(self) -> None:
+        operator = _load_operator_module()
+        with self.assertRaisesRegex(PermissionError, "alias injection"):
+            operator._guard_git(
+                ["-c", "alias.ship=push --force origin HEAD:main", "ship"],
+                Path("/repo"),
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "alias.ship",
+                    "push --force origin HEAD:main",
+                ],
+                check=True,
+            )
+            with self.assertRaisesRegex(PermissionError, "Configured Git aliases"):
+                operator._guard_git(["ship"], repo)
+
+    def test_protected_branch_deletion_is_blocked(self) -> None:
+        operator = _load_operator_module()
+        with patch.object(operator, "_git_branch", return_value="feature"):
+            for arguments in (
+                ["push", "origin", ":main"],
+                ["push", "--delete", "origin", "main"],
+                ["push", "-d", "origin", "refs/heads/master"],
+                ["push", "--prune", "origin", "refs/heads/*:refs/heads/*"],
+            ):
+                with self.subTest(arguments=arguments):
+                    with self.assertRaisesRegex(PermissionError, "Deletion"):
+                        operator._guard_git(arguments, Path("/repo"))
+
+    def test_configured_protected_deletion_and_remote_mirror_are_blocked(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "symbolic-ref", "HEAD", "refs/heads/feature"],
+                check=True,
+            )
+            with self.assertRaisesRegex(PermissionError, "Deletion"):
+                operator._guard_git(
+                    ["-c", "remote.backup.push=:refs/heads/main", "push", "backup"],
+                    repo,
+                )
+            for configured in (
+                "remote.backup.mirror=true",
+                "remote.backup.with.dot.mirror=1",
+            ):
+                with self.subTest(configured=configured):
+                    with self.assertRaisesRegex(PermissionError, "mirroring"):
+                        operator._guard_git(["-c", configured, "push", "backup"], repo)
+
+    def test_remote_name_with_dot_does_not_bypass_force_refspec_guard(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "symbolic-ref", "HEAD", "refs/heads/feature"],
+                check=True,
+            )
+            with self.assertRaisesRegex(PermissionError, "protected main branch"):
+                operator._guard_git(
+                    [
+                        "-c",
+                        "remote.backup.with.dot.push=+HEAD:refs/heads/main",
+                        "push",
+                        "backup.with.dot",
+                    ],
+                    repo,
+                )
+
+    def test_git_config_control_characters_are_rejected(self) -> None:
+        operator = _load_operator_module()
+        with self.assertRaisesRegex(ValueError, "control characters"):
+            operator._guard_git(
+                ["-c", "remote.origin.push=+HEAD:main\nalias.ship=!sh", "push"],
+                Path("/repo"),
+            )
+
+    def test_implicit_force_push_to_protected_upstream_is_blocked(self) -> None:
+        operator = _load_operator_module()
+        with (
+            patch.object(operator, "_git_branch", return_value="feature"),
+            patch.object(operator, "_git_config_entries", return_value=[]),
+            patch.object(
+                operator,
+                "_implicit_push_target",
+                return_value="refs/remotes/origin/main",
+            ),
+        ):
+            with self.assertRaisesRegex(PermissionError, "implicit protected"):
+                operator._guard_git(["push", "--force", "origin"], Path("/repo"))
+
+    def test_unresolved_implicit_force_push_target_fails_closed(self) -> None:
+        operator = _load_operator_module()
+        with (
+            patch.object(operator, "_git_branch", return_value="feature"),
+            patch.object(operator, "_git_config_entries", return_value=[]),
+            patch.object(operator, "_implicit_push_target", return_value=None),
+        ):
+            with self.assertRaisesRegex(PermissionError, "could not be resolved"):
+                operator._guard_git(["push", "--force", "origin"], Path("/repo"))
+
+    def test_explicit_feature_refspec_does_not_use_implicit_push_target(self) -> None:
+        operator = _load_operator_module()
+        with (
+            patch.object(operator, "_git_branch", return_value="feature"),
+            patch.object(operator, "_git_config_entries", return_value=[]),
+            patch.object(operator, "_implicit_push_target") as implicit_target,
+        ):
+            operator._guard_git(
+                ["push", "--force", "--repo", "origin", "HEAD:feature"],
+                Path("/repo"),
+            )
+        implicit_target.assert_not_called()
+
+    def test_push_positional_parser_skips_option_values(self) -> None:
+        operator = _load_operator_module()
+        arguments = [
+            "--repo",
+            "origin",
+            "--receive-pack",
+            "git-receive-pack",
+            "-o",
+            "ci.skip",
+            "HEAD:feature",
+        ]
+        self.assertEqual(operator._push_positionals(arguments), ["HEAD:feature"])
+        self.assertTrue(operator._push_has_explicit_refspec(arguments))
+        with self.assertRaisesRegex(ValueError, "requires a value"):
+            operator._push_positionals(["--repo"])
+
+    def test_git_environment_strips_repository_and_config_injection(self) -> None:
+        operator = _load_operator_module()
+        injected = {
+            "PATH": "/usr/bin",
+            "SSH_AUTH_SOCK": "/run/user/1000/agent",
+            "GIT_DIR": "/tmp/other.git",
+            "GIT_WORK_TREE": "/tmp/other",
+            "GIT_EXEC_PATH": "/tmp/git-tools",
+            "GIT_CONFIG": "/tmp/gitconfig",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "remote.origin.push",
+            "GIT_CONFIG_VALUE_0": "+HEAD:refs/heads/main",
+        }
+        with patch.object(operator, "_safe_environment", return_value=injected):
+            environment = operator._git_environment()
+        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(environment["SSH_AUTH_SOCK"], "/run/user/1000/agent")
+        for key in injected:
+            if key.startswith("GIT_CONFIG_") or key in operator.GIT_ENVIRONMENT_EXACT_DENY:
+                self.assertNotIn(key, environment)
+        self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(environment["GCM_INTERACTIVE"], "never")
+
+    def test_prune_and_direct_remote_write_bypasses_are_blocked(self) -> None:
+        operator = _load_operator_module()
+        for arguments in (
+            ["push", "--prune", "origin"],
+            ["send-pack", "--force", "origin", "HEAD:main"],
+            ["http-push", "--force", "origin", "HEAD:main"],
+            ["subtree", "push", "--prefix", "docs", "origin", "pages"],
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(PermissionError):
+                    operator._guard_git(arguments, Path("/repo"))
+
+    def test_grabowski_git_uses_sanitized_git_environment(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            environment = {"PATH": "/usr/bin", "GIT_TERMINAL_PROMPT": "0"}
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_guard_git", return_value=None),
+                patch.object(operator, "_validate_argv", side_effect=lambda argv, cwd: argv),
+                patch.object(operator, "_git_environment", return_value=environment),
+                patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+            ):
+                operator.grabowski_git(str(repo), ["status"])
+        self.assertEqual(run.call_args.kwargs["environment"], environment)
+
+    def test_benign_global_config_and_normal_feature_push_remain_allowed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "symbolic-ref", "HEAD", "refs/heads/feature"],
+                check=True,
+            )
+            operator._guard_git(["-c", "core.pager=cat", "status"], repo)
+            operator._guard_git(["push", "--force", "origin", "HEAD:feature"], repo)
+
     def test_privileged_reference_has_expiry_replay_policy_and_bound_hash(self) -> None:
         operator = _load_operator_module()
         with (

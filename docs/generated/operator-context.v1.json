@@ -556,7 +556,7 @@
     },
     {
       "category": "version-control",
-      "description": "Run Git in one repository with protected-main force-push guard.",
+      "description": "Run Git with a config-aware protected-main force-push guard.",
       "effects": [
         "git-dependent"
       ],
@@ -1660,7 +1660,7 @@
       "src/grabowski_grips.py": "454820d02dfc534aaf9d611c7f0eeae58433d910728511c0b44edeadae33ef9c",
       "src/grabowski_mcp.py": "678424507aa17bae755f7282781d4ee8f0ea3e788015f827252d8ede253df55a",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
-      "src/grabowski_operator.py": "cc370d7530e579a44d437dbc2cc7ea61db89cf1e3562e086c7b113d75d42af74",
+      "src/grabowski_operator.py": "4f838bbe684284a9be8c7f94ce97d1b6daf479cbae8e556add850f171c2d4bd7",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",
       "src/grabowski_read_surface.py": "78c096c2c15b68b7e0fbfac71bed0b71d13fa701f8a4244f4bb7dd91ac6fbaf6",
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
