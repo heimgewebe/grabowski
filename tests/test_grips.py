@@ -104,6 +104,9 @@ class FakeGh:
         merge_exception: bool = False,
         view_sequence: list[dict[str, object]] | None = None,
         view_results: list[object] | None = None,
+        repo_settings: dict[str, object] | None = None,
+        repo_settings_returncode: int = 0,
+        repo_settings_invalid_json: bool = False,
     ):
         self.existing = existing
         self.failure = failure
@@ -131,6 +134,13 @@ class FakeGh:
         self.merge_exception = merge_exception
         self.view_sequence = list(view_sequence or [])
         self.view_results = list(view_results or [])
+        self.repo_settings = repo_settings or {
+            "allow_merge_commit": True,
+            "allow_squash_merge": True,
+            "allow_rebase_merge": True,
+        }
+        self.repo_settings_returncode = repo_settings_returncode
+        self.repo_settings_invalid_json = repo_settings_invalid_json
         self.merged = False
         self.calls: list[tuple[str, ...]] = []
 
@@ -155,6 +165,12 @@ class FakeGh:
             else:
                 value = [self.existing]
             return {"returncode": 0, "stdout": json.dumps(value), "stderr": ""}
+        if argv[:1] == ["api"]:
+            if self.repo_settings_returncode != 0:
+                return {"returncode": self.repo_settings_returncode, "stdout": "", "stderr": "repo policy failed"}
+            if self.repo_settings_invalid_json:
+                return {"returncode": 0, "stdout": "{", "stderr": ""}
+            return {"returncode": 0, "stdout": json.dumps(self.repo_settings), "stderr": ""}
         if argv[:2] == ["pr", "create"]:
             return {"returncode": 0, "stdout": str(self.view["url"]), "stderr": ""}
         if argv[:2] == ["pr", "edit"]:
@@ -2817,6 +2833,100 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(1, len(merge_calls))
         self.assertIn("--match-head-commit", merge_calls[0])
         self.assertIn(CAPTAIN_HEAD, merge_calls[0])
+        self.assertIn("--merge", merge_calls[0])
+        execution = result["output"]["executions"][0]
+        self.assertEqual("merge", execution["merge_policy"]["selected_method"])
+        self.assertEqual(["merge", "squash", "rebase"], execution["merge_policy"]["allowed_methods"])
+
+    def test_captain_run_uses_allowed_repository_merge_method(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            repo_settings={
+                "allow_merge_commit": False,
+                "allow_squash_merge": True,
+                "allow_rebase_merge": True,
+            },
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertEqual("squash", execution["merge_policy"]["selected_method"])
+        self.assertEqual(["squash", "rebase"], execution["merge_policy"]["allowed_methods"])
+        merge_call = next(call for call in gh.calls if call[:2] == ("pr", "merge"))
+        self.assertIn("--squash", merge_call)
+        self.assertNotIn("--merge", merge_call)
+
+    def test_captain_run_blocks_when_repository_merge_policy_is_unusable(self) -> None:
+        matching_view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        for gh, expected in (
+            (FakeGh(view=matching_view, repo_settings_returncode=1), "repository_merge_policy_query_failed"),
+            (FakeGh(view=matching_view, repo_settings_invalid_json=True), "repository_merge_policy_invalid_json"),
+            (
+                FakeGh(view=matching_view, repo_settings={
+                    "allow_merge_commit": False,
+                    "allow_squash_merge": False,
+                    "allow_rebase_merge": False,
+                }),
+                "repository_all_merge_methods_disabled",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                parameters = captain_parameters(
+                    trusted_owner_mode=True,
+                    autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+                    allow_execution=True,
+                )
+                parameters.pop("human_authorization")
+                parameters.pop("execution_authority")
+                result = grips.grip_run(
+                    "captain-run",
+                    parameters,
+                    profile="captain",
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=gh,
+                )
+                self.assertEqual("blocked", result["receipt"]["status"])
+                self.assertEqual("blocked", result["output"]["decision"])
+                execution = result["output"]["executions"][0]
+                self.assertFalse(execution["execution_invoked"])
+                self.assertFalse(execution["execution_attempted"])
+                self.assertIn(expected, execution["verification_error"])
+                self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
     def test_captain_run_schedules_registered_grabowski_self_deploy_without_claiming_completion(self) -> None:
         action = captain_action(

@@ -102,6 +102,7 @@ Job-Metadaten sind dauerhafte Evidence, keine Erfolgsmeldung. Ein Job-Record ent
 ### Session capability profiles
 
 Access profiles attenuate a session beyond coarse capabilities. A profile declares `read_roots`, `write_roots`, `allowed_grips`, `forbidden_hosts` and `max_risk_level`. `grip_run` checks the active session profile before dispatch: low-risk read-only grips can be allowed while medium mutating grips or high-risk Captain grips remain blocked. High-risk grip execution additionally requires `session_escalation` with target, reason, expiry and recovery or irreversibility metadata. Operator argv validation rejects configured `forbidden_hosts` in command targets before execution. These checks do not establish host reachability, action safety or successful execution; they are preconditions.
+For `pr-merge`, Captain also reads the repository's current GitHub merge policy before mutation. It selects the first allowed method in the deterministic order `merge`, `squash`, `rebase`, binds the selected flag to the execution receipt and blocks if the policy query is missing, malformed or disables every method. This policy read is a precondition; post-merge target verification remains mandatory.
 
 ## Git und GitHub
 

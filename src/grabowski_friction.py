@@ -1364,19 +1364,47 @@ def _validate_bureau_task_id(value: str) -> str:
     return text
 
 
-def _load_jsonl_records(path: Path, *, maximum: int = MAX_FRICTION_RECORDS) -> dict[str, Any]:
-    if not path.exists():
+def _read_private_text(path: Path, *, max_bytes: int, require_private: bool = False) -> str | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        metadata = os.fstat(fd)
+        if not statmod.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"{path.name} is not a regular file")
+        if require_private:
+            _require_private_regular_fd(fd, label=path.name)
+        size_bytes = metadata.st_size
+        if size_bytes > max_bytes:
+            raise RuntimeError(f"{path.name} exceeds bounded byte limit")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            return handle.read(max_bytes + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _load_jsonl_records(
+    path: Path,
+    *,
+    maximum: int = MAX_FRICTION_RECORDS,
+    require_private: bool = False,
+) -> dict[str, Any]:
+    text = _read_private_text(
+        path,
+        max_bytes=MAX_FRICTION_LEDGER_BYTES,
+        require_private=require_private,
+    )
+    if text is None:
         return {"records": [], "scanned_lines": 0, "invalid_lines": 0, "non_object_lines": 0}
-    if path.is_symlink() or not path.is_file():
-        raise RuntimeError(f"{path.name} is not a regular file")
-    size_bytes = path.stat().st_size
-    if size_bytes > MAX_FRICTION_LEDGER_BYTES:
-        raise RuntimeError(f"{path.name} exceeds bounded byte limit")
     records: list[dict[str, Any]] = []
     scanned_lines = 0
     invalid_lines = 0
     non_object_lines = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         if not line.strip():
             continue
         scanned_lines += 1
@@ -1454,7 +1482,7 @@ def _valid_closeout_record(record: dict[str, Any]) -> bool:
 
 
 def _closeout_index() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    loaded = _load_jsonl_records(FRICTION_DECISION_LOG)
+    loaded = _load_jsonl_records(FRICTION_DECISION_LOG, require_private=True)
     index: dict[str, dict[str, Any]] = {}
     invalid_record_count = 0
     duplicate_event_ids: set[str] = set()
@@ -1637,16 +1665,15 @@ def resolve_friction(
 
 
 def _load_event_records(limit: int) -> dict[str, Any]:
-    if not FRICTION_LOG.exists():
+    text = _read_private_text(FRICTION_LOG, max_bytes=MAX_FRICTION_LEDGER_BYTES)
+    if text is None:
         return {
             "events": [],
             "scanned_lines": 0,
             "invalid_lines": 0,
             "non_event_lines": 0,
         }
-    if FRICTION_LOG.is_symlink() or not FRICTION_LOG.is_file():
-        raise RuntimeError("friction log is not a regular file")
-    lines = FRICTION_LOG.read_text(encoding="utf-8").splitlines()
+    lines = text.splitlines()
     reversed_events: list[dict[str, Any]] = []
     scanned_lines = 0
     invalid_lines = 0
@@ -1690,17 +1717,28 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
     )
     with _decision_log_lock(exclusive=False):
         closeouts, closeout_meta = _closeout_index()
+    closeout_binding_mismatch_event_ids: list[str] = []
     if not closeout_meta["integrity_valid"]:
         closeouts = {}
     else:
         for event_id in duplicate_event_ids:
             closeouts.pop(event_id, None)
+        for event in events:
+            if not _has_event_id(event):
+                continue
+            event_id = _event_id(event)
+            closeout = closeouts.get(event_id)
+            if closeout is not None and closeout.get("failure_class") != classify_friction_event(event):
+                closeout_binding_mismatch_event_ids.append(event_id)
+                closeouts.pop(event_id, None)
     event_log_integrity = {
         "duplicate_event_ids": duplicate_event_ids[:20],
         "duplicate_event_ids_truncated": len(duplicate_event_ids) > 20,
         "integrity_valid": not duplicate_event_ids,
         "scope": "returned_recent_valid_events",
-        "closeout_policy": "ignore_closeouts_for_duplicate_event_ids",
+        "closeout_policy": "ignore closeouts for duplicate event ids or failure-class binding mismatches",
+        "closeout_binding_mismatch_event_ids": sorted(closeout_binding_mismatch_event_ids)[:20],
+        "closeout_binding_mismatch_event_ids_truncated": len(closeout_binding_mismatch_event_ids) > 20,
     }
     by_kind: dict[str, int] = {}
     by_surface: dict[str, int] = {}

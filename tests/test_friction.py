@@ -1513,6 +1513,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             json.dumps({"event_id": "filter-1"}) + "\n",
             encoding="utf-8",
         )
+        module.FRICTION_DECISION_LOG.chmod(0o600)
 
         summary = module.friction_summary(limit=10)
         self.assertEqual(summary["unresolved"], 3)
@@ -1568,6 +1569,37 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         record = json.loads(module.FRICTION_DECISION_LOG.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(record["bureau_task_id"], "GRABOWSKI-OPERATOR-SURFACE-V1-T020")
         self.assertIn("does_not_make_a_linked_bureau_task_ready", record["non_claims"])
+
+    def test_summary_ignores_closeout_with_failure_class_binding_mismatch(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        module.resolve_friction(
+            event_id="filter-1",
+            status="resolved",
+            decision="valid before tamper",
+            evidence_ref="receipt:binding",
+            resolved_by="operator",
+        )
+        record = json.loads(module.FRICTION_DECISION_LOG.read_text(encoding="utf-8"))
+        record["failure_class"] = "policy_gate"
+        module.FRICTION_DECISION_LOG.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        module.FRICTION_DECISION_LOG.chmod(0o600)
+
+        summary = module.friction_summary(limit=10)
+        self.assertEqual(summary["unresolved"], 3)
+        self.assertEqual(
+            summary["event_log_integrity"]["closeout_binding_mismatch_event_ids"],
+            ["filter-1"],
+        )
+
+    def test_summary_read_rejects_event_log_symlink(self) -> None:
+        module = self._load_module()
+        target = module.FRICTION_LOG.parent / "summary-target.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n", encoding="utf-8")
+        module.FRICTION_LOG.symlink_to(target)
+        with self.assertRaises(OSError):
+            module.friction_summary(limit=10)
 
     def test_append_rejects_symlink_and_nonprivate_ledgers(self) -> None:
         module = self._load_module()
