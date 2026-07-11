@@ -80,6 +80,88 @@ class RuntimeRetentionTests(unittest.TestCase):
             path.chmod(0o600)
         return directory
 
+    def _worker_state_dbs(
+        self,
+        root: Path,
+        *,
+        worker_id: str,
+        kind: str = "gui",
+        state: str = "failed",
+        lease_keys: list[str] | None = None,
+        live_lease: bool = False,
+    ) -> tuple[Path, Path, str]:
+        worker_root = root / "workers"
+        worker_root.mkdir(mode=0o700)
+        worker_db = worker_root / "workers.sqlite3"
+        unit = f"grabowski-{kind}-worker-{worker_id}.service"
+        connection = sqlite3.connect(worker_db)
+        try:
+            connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute("INSERT INTO metadata(key, value) VALUES ('schema_version', '1')")
+            connection.execute(
+                """
+                CREATE TABLE workers (
+                    worker_id TEXT,
+                    kind TEXT,
+                    unit TEXT,
+                    state TEXT,
+                    lease_keys_json TEXT,
+                    updated_at_unix INTEGER,
+                    last_observation_json TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO workers VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    worker_id,
+                    kind,
+                    unit,
+                    state,
+                    json.dumps(lease_keys or []),
+                    900,
+                    json.dumps({
+                        "state": "failed",
+                        "properties": {
+                            "LoadState": "loaded",
+                            "ActiveState": "failed",
+                            "SubState": "dead",
+                            "Result": "timeout",
+                            "ExecMainStatus": "0",
+                        },
+                    }),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        worker_db.chmod(0o600)
+
+        resource_db = root / "resources.sqlite3"
+        connection = sqlite3.connect(resource_db)
+        try:
+            connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute("INSERT INTO metadata(key, value) VALUES ('schema_version', '1')")
+            connection.execute(
+                """
+                CREATE TABLE leases (
+                    resource_key TEXT,
+                    owner_id TEXT,
+                    expires_at_unix INTEGER
+                )
+                """
+            )
+            if live_lease:
+                connection.execute(
+                    "INSERT INTO leases VALUES (?, ?, ?)",
+                    ((lease_keys or ["display:98"])[0], f"worker:{worker_id}", 2_000),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        resource_db.chmod(0o600)
+        return worker_db, resource_db, unit
+
     def test_plan_resets_only_proven_terminal_units_and_preserves_unknown_classes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -107,6 +189,228 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [job_unit])
             self.assertEqual(plan["blocked"][0]["unit"], "grabowski-gui-worker-deadbeef.service")
             self.assertRegex(plan["plan_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_failed_worker_reset_requires_bound_db_systemd_and_no_live_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            worker_id = "1" * 20
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root,
+                worker_id=worker_id,
+                lease_keys=["display:98"],
+            )
+            state = self._state(
+                unit,
+                active="failed",
+                load="loaded",
+                result="timeout",
+            )
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+
+            self.assertEqual(plan["schema_version"], 3)
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            self.assertEqual(plan["blocked"], [])
+            evidence = plan["worker_reset_evidence"][0]
+            self.assertEqual(evidence["worker_id"], worker_id)
+            self.assertEqual(evidence["declared_lease_keys"], ["display:98"])
+            self.assertEqual(
+                evidence["terminal_evidence"],
+                "worker_db_and_systemd_failed_without_live_leases",
+            )
+
+    def test_failed_worker_with_live_lease_stays_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            worker_id = "2" * 20
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root,
+                worker_id=worker_id,
+                lease_keys=["display:99"],
+                live_lease=True,
+            )
+            state = self._state(
+                unit,
+                active="failed",
+                load="loaded",
+                result="timeout",
+            )
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+
+            self.assertEqual(plan["reset_failed_units"], [])
+            self.assertEqual(plan["worker_reset_evidence"], [])
+            self.assertIn("live resource leases", plan["blocked"][0]["reason"])
+
+    def test_worker_reset_revalidation_detects_state_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            worker_id = "3" * 20
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root,
+                worker_id=worker_id,
+            )
+            state = self._state(
+                unit,
+                active="failed",
+                load="loaded",
+                result="timeout",
+            )
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+            connection = sqlite3.connect(worker_db)
+            try:
+                connection.execute("UPDATE workers SET updated_at_unix=901")
+                connection.commit()
+            finally:
+                connection.close()
+            worker_db.chmod(0o600)
+
+            with patch.object(RETENTION, "_systemd_unit_states", return_value={unit: state}):
+                with self.assertRaisesRegex(RuntimeError, "drifted"):
+                    RETENTION._prepare_worker_resets(plan)
+
+    def test_failed_worker_oversized_observation_stays_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            worker_id = "4" * 20
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root,
+                worker_id=worker_id,
+            )
+            connection = sqlite3.connect(worker_db)
+            try:
+                connection.execute(
+                    "UPDATE workers SET last_observation_json=?",
+                    ("x" * (RETENTION.MAX_WORKER_OBSERVATION_JSON_BYTES + 1),),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            worker_db.chmod(0o600)
+            state = self._state(
+                unit,
+                active="failed",
+                load="loaded",
+                result="timeout",
+            )
+
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+
+            self.assertEqual(plan["reset_failed_units"], [])
+            self.assertIn("exceeds its bound", plan["blocked"][0]["reason"])
+
+    def test_apply_worker_reset_requires_kind_capability_and_revalidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            worker_id = "5" * 20
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root,
+                worker_id=worker_id,
+                kind="gui",
+            )
+            state = self._state(
+                unit,
+                active="failed",
+                load="loaded",
+                result="timeout",
+            )
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict(
+                "sys.modules",
+                {
+                    "grabowski_self_deploy": fake_self_deploy,
+                    "grabowski_mcp": fake_base,
+                },
+            ), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION,
+                "_systemd_unit_states",
+                return_value={unit: state},
+            ):
+                result = RETENTION.apply_plan(
+                    plan,
+                    expected_plan_sha256=plan["plan_sha256"],
+                )
+
+            self.assertTrue(result["completed"])
+            self.assertEqual(result["reset_failed"][0]["unit"], unit)
+            self.assertEqual(
+                [call.args[0] for call in fake_base._require_capability.call_args_list],
+                ["durable_job", "gui_worker"],
+            )
+            self.assertGreaterEqual(reset.call_count, 1)
+            self.assertEqual(reset.call_args.args[0], ["systemctl", "--user", "reset-failed", unit])
 
     def test_unknown_task_outcome_remains_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

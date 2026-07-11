@@ -21,9 +21,14 @@ JOBS_ROOT = STATE_ROOT / "jobs"
 ARCHIVE_ROOT = STATE_ROOT / "job-archive"
 RECEIPT_ROOT = STATE_ROOT / "retention-receipts"
 TASK_DB = STATE_ROOT / "tasks.sqlite3"
+WORKER_DB = STATE_ROOT / "workers" / "workers.sqlite3"
+RESOURCE_DB = STATE_ROOT / "resources.sqlite3"
 JOB_NAME = re.compile(r"grabowski-job-[0-9a-f]{12}\Z")
 JOB_UNIT = re.compile(r"grabowski-job-[0-9a-f]{12}\.service\Z")
 TASK_UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
+WORKER_UNIT = re.compile(
+    r"grabowski-(browser|gui)-worker-([0-9a-f]{20})\.service\Z"
+)
 TERMINAL_TASK_STATES = {
     "completed",
     "failed",
@@ -40,6 +45,10 @@ SYSTEMD_SHOW_CHUNK_SIZE = 100
 MAX_ARCHIVE_FILES = 32
 MAX_ARCHIVE_FILE_BYTES = 128 * 1024 * 1024
 MAX_JSON_BYTES = 128 * 1024
+MAX_WORKER_LEASE_KEYS = 32
+MAX_WORKER_LEASE_JSON_BYTES = 16 * 1024
+MAX_WORKER_OBSERVATION_JSON_BYTES = 128 * 1024
+WORKER_EVIDENCE_CLOCK_SKEW_SECONDS = 300
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -185,7 +194,11 @@ def _parse_systemd_show(stdout: str) -> dict[str, dict[str, str]]:
             if separator:
                 properties[key] = value
         unit = properties.get("Id")
-        if not unit or not (JOB_UNIT.fullmatch(unit) or TASK_UNIT.fullmatch(unit)):
+        if not unit or not (
+            JOB_UNIT.fullmatch(unit)
+            or TASK_UNIT.fullmatch(unit)
+            or WORKER_UNIT.fullmatch(unit)
+        ):
             raise RuntimeError("systemd show returned an unbound unit block")
         if unit in states:
             raise RuntimeError(f"systemd show returned a duplicate unit block: {unit}")
@@ -256,6 +269,180 @@ def _task_state(unit: str, task_db: Path) -> str | None:
     finally:
         connection.close()
     return row[0] if row and isinstance(row[0], str) else None
+
+
+
+def _private_sqlite_file(path: Path) -> Path:
+    parent = _private_directory(path.parent)
+    candidate = parent / path.name
+    descriptor, _ = _open_private_regular(candidate, max_bytes=512 * 1024 * 1024)
+    os.close(descriptor)
+    for suffix, max_bytes in (("-wal", 512 * 1024 * 1024), ("-shm", 64 * 1024 * 1024)):
+        sidecar = Path(str(candidate) + suffix)
+        if not sidecar.exists() and not sidecar.is_symlink():
+            continue
+        sidecar_descriptor, _ = _open_private_regular(sidecar, max_bytes=max_bytes)
+        os.close(sidecar_descriptor)
+    return candidate.resolve(strict=True)
+
+
+def _sqlite_schema_version(connection: sqlite3.Connection, *, expected: str) -> None:
+    try:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError("state database metadata is unavailable") from exc
+    if row is None or row[0] != expected:
+        raise RuntimeError("state database schema is unsupported")
+
+
+def _worker_unit_parts(unit: str) -> tuple[str, str]:
+    match = WORKER_UNIT.fullmatch(unit)
+    if match is None:
+        raise RuntimeError("worker reset requires a typed worker unit")
+    return match.group(1), match.group(2)
+
+
+def _worker_reset_evidence(
+    unit: str,
+    *,
+    worker_db: Path,
+    resource_db: Path,
+    now: int,
+    systemd_state: dict[str, str],
+) -> dict[str, Any]:
+    kind, worker_id = _worker_unit_parts(unit)
+    worker_path = _private_sqlite_file(worker_db)
+    connection = sqlite3.connect(f"file:{worker_path}?mode=ro", uri=True)
+    try:
+        _sqlite_schema_version(connection, expected="1")
+        rows = connection.execute(
+            """
+            SELECT worker_id, kind, unit, state, lease_keys_json,
+                   updated_at_unix, last_observation_json
+            FROM workers WHERE unit=? LIMIT 2
+            """,
+            (unit,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"worker state lookup failed: {unit}") from exc
+    finally:
+        connection.close()
+    if len(rows) != 1:
+        raise RuntimeError(f"worker unit does not have exactly one state record: {unit}")
+    row = rows[0]
+    if row[0] != worker_id or row[1] != kind or row[2] != unit:
+        raise RuntimeError(f"worker state identity is not bound to its unit: {unit}")
+    if row[3] != "failed":
+        raise RuntimeError(f"worker state is not terminal failed: {unit}")
+    updated_at = row[5]
+    if (
+        isinstance(updated_at, bool)
+        or not isinstance(updated_at, int)
+        or updated_at < 0
+        or updated_at > now + WORKER_EVIDENCE_CLOCK_SKEW_SECONDS
+    ):
+        raise RuntimeError(f"worker update time is invalid: {unit}")
+    lease_keys_raw = row[4]
+    observation_raw = row[6]
+    if (
+        not isinstance(lease_keys_raw, str)
+        or len(lease_keys_raw.encode("utf-8")) > MAX_WORKER_LEASE_JSON_BYTES
+        or not isinstance(observation_raw, str)
+        or len(observation_raw.encode("utf-8")) > MAX_WORKER_OBSERVATION_JSON_BYTES
+    ):
+        raise RuntimeError(f"worker state JSON is invalid or exceeds its bound: {unit}")
+    try:
+        lease_keys = json.loads(lease_keys_raw)
+        observation = json.loads(observation_raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"worker state JSON is invalid: {unit}") from exc
+    if (
+        not isinstance(lease_keys, list)
+        or len(lease_keys) > MAX_WORKER_LEASE_KEYS
+        or any(
+            not isinstance(key, str)
+            or not key
+            or len(key.encode("utf-8")) > 512
+            or "\x00" in key
+            for key in lease_keys
+        )
+        or len(lease_keys) != len(set(lease_keys))
+    ):
+        raise RuntimeError(f"worker lease-key evidence is invalid: {unit}")
+    if not isinstance(observation, dict) or observation.get("state") != "failed":
+        raise RuntimeError(f"worker terminal observation is unavailable: {unit}")
+    observed_properties = observation.get("properties")
+    if not isinstance(observed_properties, dict):
+        raise RuntimeError(f"worker terminal properties are unavailable: {unit}")
+    if (
+        observed_properties.get("ActiveState") != "failed"
+        or observed_properties.get("Result") in {None, "", "success"}
+    ):
+        raise RuntimeError(f"worker terminal observation is not failed: {unit}")
+    if (
+        systemd_state.get("Id") != unit
+        or systemd_state.get("ActiveState") != "failed"
+        or systemd_state.get("Result") in {None, "", "success"}
+    ):
+        raise RuntimeError(f"worker systemd terminality is not proven: {unit}")
+    for key in ("LoadState", "ActiveState", "SubState", "Result", "ExecMainStatus"):
+        if str(observed_properties.get(key, "")) != str(systemd_state.get(key, "")):
+            raise RuntimeError(f"worker observation drifted from systemd state: {unit}")
+
+    resource_path = _private_sqlite_file(resource_db)
+    resource_connection = sqlite3.connect(f"file:{resource_path}?mode=ro", uri=True)
+    try:
+        _sqlite_schema_version(resource_connection, expected="1")
+        clauses = ["owner_id=?"]
+        parameters: list[Any] = [f"worker:{worker_id}"]
+        if lease_keys:
+            clauses.append(f"resource_key IN ({','.join('?' for _ in lease_keys)})")
+            parameters.extend(lease_keys)
+        parameters.append(now)
+        live_rows = resource_connection.execute(
+            "SELECT resource_key, owner_id, expires_at_unix FROM leases "
+            f"WHERE ({' OR '.join(clauses)}) AND expires_at_unix>? LIMIT 2",
+            parameters,
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"worker resource lookup failed: {unit}") from exc
+    finally:
+        resource_connection.close()
+    if live_rows:
+        raise RuntimeError(f"worker still owns or references live resource leases: {unit}")
+
+    systemd_projection = {
+        key: systemd_state.get(key, "")
+        for key in (
+            "Id",
+            "LoadState",
+            "ActiveState",
+            "SubState",
+            "Result",
+            "ExecMainCode",
+            "ExecMainStatus",
+        )
+    }
+    record_material = {
+        "worker_id": worker_id,
+        "kind": kind,
+        "unit": unit,
+        "state": row[3],
+        "lease_keys": lease_keys,
+        "updated_at_unix": updated_at,
+        "last_observation": observation,
+    }
+    return {
+        "unit": unit,
+        "worker_id": worker_id,
+        "kind": kind,
+        "worker_record_sha256": _sha256(record_material),
+        "declared_lease_keys": lease_keys,
+        "systemd_state": systemd_projection,
+        "terminal_evidence": "worker_db_and_systemd_failed_without_live_leases",
+    }
 
 
 def _job_record(
@@ -401,6 +588,8 @@ def build_plan(
     archive_root: Path = ARCHIVE_ROOT,
     receipt_root: Path = RECEIPT_ROOT,
     task_db: Path = TASK_DB,
+    worker_db: Path = WORKER_DB,
+    resource_db: Path = RESOURCE_DB,
     failed_units: list[str] | None = None,
     unit_states: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
@@ -436,8 +625,10 @@ def build_plan(
         raise RuntimeError("job registry exceeds the bounded retention scan")
     typed_entries = [entry for entry in entries if JOB_NAME.fullmatch(entry.name)]
     job_units = [entry.name + ".service" for entry in typed_entries]
-    states = _systemd_unit_states(job_units) if unit_states is None else unit_states
-    missing_states = sorted(set(job_units) - set(states))
+    worker_units = [unit for unit in failed if WORKER_UNIT.fullmatch(unit)]
+    observed_units = sorted(set(job_units + worker_units))
+    states = _systemd_unit_states(observed_units) if unit_states is None else unit_states
+    missing_states = sorted(set(observed_units) - set(states))
     if missing_states:
         raise RuntimeError(
             f"job-state inventory omitted units: {', '.join(missing_states[:5])}"
@@ -503,6 +694,7 @@ def build_plan(
     reset_units: list[str] = []
     deferred_failed_units: list[dict[str, str]] = []
     recovered_archived_failed_units: list[dict[str, Any]] = []
+    worker_reset_evidence: list[dict[str, Any]] = []
     for unit in failed:
         if JOB_UNIT.fullmatch(unit):
             record = records_by_unit.get(unit)
@@ -542,16 +734,33 @@ def build_plan(
             else:
                 block(unit, f"task state is not proven terminal: {state}")
             continue
+        if WORKER_UNIT.fullmatch(unit):
+            try:
+                evidence = _worker_reset_evidence(
+                    unit,
+                    worker_db=worker_db,
+                    resource_db=resource_db,
+                    now=observed_now,
+                    systemd_state=states[unit],
+                )
+            except RuntimeError as exc:
+                block(unit, str(exc))
+                continue
+            worker_reset_evidence.append(evidence)
+            reset_units.append(unit)
+            continue
         block(unit, "unit class has no retention contract")
 
     material = {
-        "schema_version": 2,
+        "schema_version": 3,
         "minimum_job_age_seconds": minimum_job_age_seconds,
         "max_archive_jobs": max_archive_jobs,
         "jobs_root": str(jobs_root),
         "archive_root": str(archive_root),
         "receipt_root": str(receipt_root),
         "task_db": str(task_db),
+        "worker_db": str(worker_db),
+        "resource_db": str(resource_db),
         "job_scan_count": len(entries),
         "archive_eligible_count": len(eligible),
         "archive_deferred_count": archive_deferred_count,
@@ -568,6 +777,10 @@ def build_plan(
             key=lambda item: item["unit"],
         ),
         "reset_failed_units": sorted(set(reset_units)),
+        "worker_reset_evidence": sorted(
+            worker_reset_evidence,
+            key=lambda item: item["unit"],
+        ),
         "archive_jobs": archive_jobs,
         "blocked": sorted(blocked, key=lambda item: (item["unit"], item["reason"])),
     }
@@ -651,7 +864,11 @@ def _write_json_atomic(
 
 
 def _reset_failed(unit: str) -> dict[str, Any]:
-    if not (JOB_UNIT.fullmatch(unit) or TASK_UNIT.fullmatch(unit)):
+    if not (
+        JOB_UNIT.fullmatch(unit)
+        or TASK_UNIT.fullmatch(unit)
+        or WORKER_UNIT.fullmatch(unit)
+    ):
         raise RuntimeError(f"retention reset unit is outside the typed contract: {unit}")
     result = _run(["systemctl", "--user", "reset-failed", unit])
     return {
@@ -672,7 +889,7 @@ def _validated_plan(plan: dict[str, Any], expected_plan_sha256: str) -> dict[str
     material = {key: value for key, value in plan.items() if key != "plan_sha256"}
     if _sha256(material) != actual or expected_plan_sha256 != actual:
         raise RuntimeError("retention plan hash mismatch")
-    if plan.get("schema_version") != 2:
+    if plan.get("schema_version") != 3:
         raise RuntimeError("retention plan schema is unsupported")
     max_archive_jobs = plan.get("max_archive_jobs")
     if (
@@ -683,7 +900,12 @@ def _validated_plan(plan: dict[str, Any], expected_plan_sha256: str) -> dict[str
         raise RuntimeError("retention plan archive bound is invalid")
     reset_units = plan.get("reset_failed_units")
     archive_jobs = plan.get("archive_jobs")
-    if not isinstance(reset_units, list) or not isinstance(archive_jobs, list):
+    worker_evidence = plan.get("worker_reset_evidence")
+    if (
+        not isinstance(reset_units, list)
+        or not isinstance(archive_jobs, list)
+        or not isinstance(worker_evidence, list)
+    ):
         raise RuntimeError("retention plan action lists are invalid")
     if len(reset_units) != len(set(reset_units)):
         raise RuntimeError("retention plan contains duplicate reset units")
@@ -691,11 +913,82 @@ def _validated_plan(plan: dict[str, Any], expected_plan_sha256: str) -> dict[str
         raise RuntimeError("retention plan exceeds its archive batch bound")
     for unit in reset_units:
         if not isinstance(unit, str) or not (
-            JOB_UNIT.fullmatch(unit) or TASK_UNIT.fullmatch(unit)
+            JOB_UNIT.fullmatch(unit)
+            or TASK_UNIT.fullmatch(unit)
+            or WORKER_UNIT.fullmatch(unit)
         ):
             raise RuntimeError("retention plan contains an invalid reset unit")
+    if not isinstance(plan.get("worker_db"), str) or not plan["worker_db"]:
+        raise RuntimeError("retention plan worker database path is invalid")
+    if not isinstance(plan.get("resource_db"), str) or not plan["resource_db"]:
+        raise RuntimeError("retention plan resource database path is invalid")
+    evidence_units: list[str] = []
+    expected_worker_keys = {
+        "unit",
+        "worker_id",
+        "kind",
+        "worker_record_sha256",
+        "declared_lease_keys",
+        "systemd_state",
+        "terminal_evidence",
+    }
+    for evidence in worker_evidence:
+        if not isinstance(evidence, dict) or set(evidence) != expected_worker_keys:
+            raise RuntimeError("retention plan worker evidence shape is invalid")
+        unit = evidence.get("unit")
+        match = WORKER_UNIT.fullmatch(unit) if isinstance(unit, str) else None
+        if match is None:
+            raise RuntimeError("retention plan worker evidence unit is invalid")
+        if (
+            evidence.get("kind") != match.group(1)
+            or evidence.get("worker_id") != match.group(2)
+            or not isinstance(evidence.get("worker_record_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", evidence["worker_record_sha256"]) is None
+            or evidence.get("terminal_evidence")
+            != "worker_db_and_systemd_failed_without_live_leases"
+            or not isinstance(evidence.get("declared_lease_keys"), list)
+            or not isinstance(evidence.get("systemd_state"), dict)
+            or evidence["systemd_state"].get("Id") != unit
+            or evidence["systemd_state"].get("ActiveState") != "failed"
+        ):
+            raise RuntimeError("retention plan worker evidence binding is invalid")
+        evidence_units.append(unit)
+    if len(evidence_units) != len(set(evidence_units)):
+        raise RuntimeError("retention plan contains duplicate worker evidence")
+    reset_worker_units = sorted(
+        unit for unit in reset_units if isinstance(unit, str) and WORKER_UNIT.fullmatch(unit)
+    )
+    if sorted(evidence_units) != reset_worker_units:
+        raise RuntimeError("retention plan worker evidence is not bound to reset units")
     return plan
 
+
+
+def _prepare_worker_resets(
+    plan: dict[str, Any],
+    *,
+    units: list[str] | None = None,
+) -> None:
+    selected = None if units is None else set(units)
+    expected = {
+        item["unit"]: item
+        for item in plan["worker_reset_evidence"]
+        if selected is None or item["unit"] in selected
+    }
+    if not expected:
+        return
+    states = _systemd_unit_states(sorted(expected))
+    now = int(time.time())
+    for unit, prior in expected.items():
+        current = _worker_reset_evidence(
+            unit,
+            worker_db=Path(plan["worker_db"]),
+            resource_db=Path(plan["resource_db"]),
+            now=now,
+            systemd_state=states[unit],
+        )
+        if current != prior:
+            raise RuntimeError(f"worker reset evidence drifted before apply: {unit}")
 
 def _prepare_archives(plan: dict[str, Any]) -> tuple[Path, Path, Path, list[dict[str, Any]]]:
     jobs_root = _private_directory(Path(plan["jobs_root"]))
@@ -812,8 +1105,13 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
 
     base._require_mutations_enabled("user_service_control")
     base._require_capability("durable_job")
+    for evidence in plan["worker_reset_evidence"]:
+        base._require_capability(
+            "browser_worker" if evidence["kind"] == "browser" else "gui_worker"
+        )
     intent_audit = _append_intent_audit(plan)
     jobs_root, archive_root, receipt_root, prepared = _prepare_archives(plan)
+    _prepare_worker_resets(plan)
 
     import grabowski_self_deploy as self_deploy
 
@@ -870,13 +1168,18 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 }
             )
 
-    reset_results = [_reset_failed(unit) for unit in plan["reset_failed_units"]]
+    reset_results: list[dict[str, Any]] = []
+    for unit in plan["reset_failed_units"]:
+        if WORKER_UNIT.fullmatch(unit):
+            _prepare_worker_resets(plan, units=[unit])
+        reset_results.append(_reset_failed(unit))
     failed_resets = [item for item in reset_results if item["returncode"] != 0]
     receipt = {
-        "schema_version": 2,
+        "schema_version": 3,
         "operation": "grabowski-runtime-state-retention",
         "plan_sha256": plan["plan_sha256"],
         "reset_failed": reset_results,
+        "worker_reset_evidence": plan.get("worker_reset_evidence", []),
         "archived_jobs": archived,
         "preserved_blocked_units": plan.get("blocked", []),
         "archive_deferred_count": plan.get("archive_deferred_count", 0),

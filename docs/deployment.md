@@ -183,14 +183,23 @@ Nachlauf sicher verstrichen ist. Aktive, junge oder sonst uneindeutige Jobs
 bleiben sichtbar und unangetastet.
 
 Nur eindeutig terminale Grabowski-Jobs und -Tasks werden für ein gezieltes
-`systemctl --user reset-failed <unit>` vorgesehen. Alle terminalen Jobs, die
-älter als `RETENTION_MIN_AGE_SECONDS` sind (Standard: 86.400 Sekunden), werden
-nicht gelöscht, sondern mit Datei-Hashes und Archivmanifest nach
-`~/.local/state/grabowski/job-archive/` verschoben. Pro Lauf werden höchstens
-`RETENTION_MAX_ARCHIVE_JOBS` Jobs archiviert (Standard: 128); weitere
-Kandidaten erscheinen als `archive_deferred_count` und werden durch spätere
-hashgebundene Läufe abgearbeitet. Ein alter fehlgeschlagener Job behält seinen
-Failed-Zustand, solange seine Archivierung durch diese Batchgrenze noch
+`systemctl --user reset-failed <unit>` vorgesehen. Terminale Browser- und
+GUI-Worker sind ebenfalls zulässig, aber nur unter einem engeren Vertrag: Die
+Unit muss exakt an einen fehlgeschlagenen Worker-Datensatz gebunden sein, die
+letzte Worker-Beobachtung muss mit dem aktuellen systemd-Fehlerzustand
+übereinstimmen und weder eine deklarierte Ressource noch der Worker-Owner darf
+eine aktive Lease besitzen. Diese Evidence wird in den Plan-Hash aufgenommen,
+vor jeder Mutation erneut gelesen und benötigt zusätzlich die jeweilige
+`browser_worker`- oder `gui_worker`-Fähigkeit. Worker-Datensätze und
+Worker-Dateien werden dabei nicht gelöscht oder archiviert.
+
+Alle terminalen Jobs, die älter als `RETENTION_MIN_AGE_SECONDS` sind (Standard:
+86.400 Sekunden), werden nicht gelöscht, sondern mit Datei-Hashes und
+Archivmanifest nach `~/.local/state/grabowski/job-archive/` verschoben. Pro Lauf
+werden höchstens `RETENTION_MAX_ARCHIVE_JOBS` Jobs archiviert (Standard: 128);
+weitere Kandidaten erscheinen als `archive_deferred_count` und werden durch
+spätere hashgebundene Läufe abgearbeitet. Ein alter fehlgeschlagener Job behält
+seinen Failed-Zustand, solange seine Archivierung durch diese Batchgrenze noch
 aufgeschoben ist.
 
 Ein Apply wird nur ausgeführt, wenn die erneut berechnete Vorschau exakt zum
