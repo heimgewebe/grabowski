@@ -71,7 +71,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_job_status` | command | yes | low | Read durable metadata and current service state for one Grabowski job. |
 | `grabowski_job_logs` | command | yes | low | Read redacted persistent output for one Grabowski job. |
 | `grabowski_job_cancel` | command | no | medium | Stop one Grabowski-owned background job. |
-| `grabowski_git` | version-control | no | variable | Run Git in one repository with protected-main force-push protection. |
+| `grabowski_git` | version-control | no | variable | Run Git in one repository; generic push is limited to one explicit unprotected branch ref. |
 | `grabowski_git_branch` | version-control | no | medium | Create or switch local branches through a typed, audited branch operation. |
 | `grabowski_checkout_inventory` | checkout-lifecycle | yes | low | Return deterministic linked-checkout inventory with retention, task, process and resource coordination state. |
 | `grabowski_checkout_retain` | checkout-lifecycle | no | medium | Assign explicit retention ownership to one temporary linked Git checkout. |

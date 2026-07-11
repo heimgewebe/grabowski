@@ -106,11 +106,11 @@ For `pr-merge`, Captain also reads the repository's current GitHub merge policy 
 
 ## Git und GitHub
 
-`grabowski_git` führt Git mit explizitem Repo-Pfad und bereinigter Git-Umgebung aus. Der Guard zerlegt vorangestellte Git- und Push-Optionen, prüft explizite, konfigurierte und implizite Push-Ziele und blockiert Repo-Rebinding, indirekte Konfiguration, Alias-Injektion, Push-Mirroring, `push --prune`, direkte Remote-Write-Unterbefehle sowie erzwungene oder löschende Änderungen an `main` und `master`. Diese Grenze gilt auch im Trusted-Owner-Modus.
+`grabowski_git` führt Git mit explizitem Repo-Pfad und bereinigter Git-Umgebung aus. Sein generischer Push-Pfad akzeptiert nur einen benannten SSH-Remote und genau ein explizites RefSpec der Form `QUELLE:refs/heads/ARBEITSBRANCH`. Ziele auf `main` oder `master`, implizite oder mehrere Ziele, Tags, Wildcards, Löschungen, alle Force-Varianten, Aggregate, semantikändernde Push-Optionen, Push-Konfiguration und direkte Remote-Write-Unterbefehle werden fail-closed blockiert. Vor der Ausführung werden Hooks, Signaturprogramme, alternative Transporthelfer, SSH-Benutzerkonfiguration, lokale oder erweiterbare Protokolle sowie semantikändernde Push-Konfiguration neutralisiert. Für normale Veröffentlichungen bleibt der typisierte Grip `branch-publish` der vorgesehene Weg; auch dort sind `main` und `master` unveränderlich geschützt, Remote-Namen validiert und dieselben Ausführungshelfer deaktiviert. Diese Grenze gilt auch im Trusted-Owner-Modus.
 
 `grabowski_github` stellt GitHub CLI bereit.
 
-Der lokale Guard ist Defense-in-Depth und ersetzt keine serverseitige Branch-Regel: andere erlaubte Ausführungspfade oder gleichzeitige Konfigurationsänderungen können nur am Remote-Ende vollständig beherrscht werden.
+Der lokale Guard ist Defense-in-Depth und ersetzt keine serverseitige Branch-Regel. Der enge generische Vertrag reduziert lokale Fehlbedienung; die Remote-Regel bleibt für konkurrierende Clients und serverseitige Autorisierung maßgeblich.
 
 ## Notwendige Grenzen
 

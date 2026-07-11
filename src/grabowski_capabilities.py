@@ -242,7 +242,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_git": {
         "category": "version-control",
-        "purpose": "Run Git in one repository with protected-main force-push protection.",
+        "purpose": "Run Git in one repository; generic push is limited to one explicit unprotected branch ref.",
         "risk_class": "variable",
         "effects": ["git-dependent"],
         "reversibility": "git-dependent",

@@ -556,12 +556,12 @@
     },
     {
       "category": "version-control",
-      "description": "Run Git with a config-aware protected-main force-push guard.",
+      "description": "Run Git with a fail-closed single-branch push subset.",
       "effects": [
         "git-dependent"
       ],
       "id": "grabowski_git",
-      "purpose": "Run Git in one repository with protected-main force-push protection.",
+      "purpose": "Run Git in one repository; generic push is limited to one explicit unprotected branch ref.",
       "read_only": false,
       "reversibility": "git-dependent",
       "risk_class": "variable",
@@ -1635,7 +1635,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "dedde7fbedf5392e18d5d84eacb3e0b73aa2367ca6f56bcbd1c86067853cf997"
+      "sha256": "bf5ec1b8cf88513a4065e2ba4c7a86722c47e63b97ca3f426304f1913a7fb03e"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1651,16 +1651,16 @@
       "src/grabowski_agent_workspace.py": "8d6111a214274ee0b605ec51d7ecc655fd2987317560c30cfe939f18fa17ac53",
       "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "dedde7fbedf5392e18d5d84eacb3e0b73aa2367ca6f56bcbd1c86067853cf997",
+      "src/grabowski_capabilities.py": "bf5ec1b8cf88513a4065e2ba4c7a86722c47e63b97ca3f426304f1913a7fb03e",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "0331cbdeb29e5efa435003f53f6053e91a110c843034f0061f3f40666f2a7fee",
       "src/grabowski_grip_orchestration.py": "2c1d594433f92edbae23adc43a303b212bfff89d298121c516974d790259051d",
-      "src/grabowski_grips.py": "454820d02dfc534aaf9d611c7f0eeae58433d910728511c0b44edeadae33ef9c",
+      "src/grabowski_grips.py": "0c0e0890c5cd3a2d965419be880a6f2105fc6a605dcd6b6fb90a6daae8170e79",
       "src/grabowski_mcp.py": "678424507aa17bae755f7282781d4ee8f0ea3e788015f827252d8ede253df55a",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
-      "src/grabowski_operator.py": "4f838bbe684284a9be8c7f94ce97d1b6daf479cbae8e556add850f171c2d4bd7",
+      "src/grabowski_operator.py": "dca5f63343136cbe7452d9d74a1f9e173b1a2b04cdc40f017af02cbff829680b",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",
       "src/grabowski_read_surface.py": "78c096c2c15b68b7e0fbfac71bed0b71d13fa701f8a4244f4bb7dd91ac6fbaf6",
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
