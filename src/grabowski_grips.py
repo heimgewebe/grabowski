@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import grabowski_repobrief
 import grabowski_grip_orchestration
@@ -1826,6 +1827,134 @@ def _run_post_merge_sync(
     }
 
 
+def _reject_branch_publish_configuration(
+    repo: Path,
+    remote: str,
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> None:
+    escaped_remote = re.escape(remote)
+    pattern = (
+        rf"^(remote\.{escaped_remote}\.(push|pushurl|mirror|receivepack)"
+        rf"|push\.(pushoption|followtags|gpgsign|recursesubmodules))$"
+    )
+    result = _git_optional(repo, runner, ["config", "--get-regexp", pattern])
+    returncode = int(result.get("returncode", 1))
+    stdout = str(result.get("stdout", "")).strip()
+    if returncode == 1 and not stdout:
+        _check(receipt, "push_configuration", "pass", "no semantic push configuration")
+        return
+    if returncode != 0:
+        _check(receipt, "push_configuration", "fail", "git config query failed")
+        raise GripPreflightError("branch-publish could not verify Git push configuration")
+    if stdout:
+        _check(receipt, "push_configuration", "fail", "semantic push configuration present")
+        raise GripPreflightError(
+            "branch-publish refuses repository or user configuration that can alter push semantics"
+        )
+    _check(receipt, "push_configuration", "pass", "no semantic push configuration")
+
+
+def _remote_target_identity(url: str) -> tuple[str, str, str, bool] | None:
+    if not url or any(character.isspace() or ord(character) < 32 for character in url):
+        return None
+    is_ssh = False
+    ssh_user = ""
+    if "://" in url:
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return None
+        if not host or parsed.password is not None or parsed.query or parsed.fragment:
+            return None
+        scheme = parsed.scheme.casefold()
+        is_ssh = scheme in {"ssh", "git+ssh", "ssh+git"}
+        if is_ssh:
+            ssh_user = parsed.username or ""
+        default_port = {
+            "http": 80,
+            "https": 443,
+            "ssh": 22,
+            "git+ssh": 22,
+            "ssh+git": 22,
+        }.get(scheme)
+        host_identity = host.casefold()
+        if port is not None and port != default_port:
+            host_identity = f"{host_identity}:{port}"
+        path = parsed.path.lstrip("/")
+    else:
+        match = re.fullmatch(r"(?:([^/@:]+)@)?([^/:]+):(.+)", url)
+        if match is None:
+            return None
+        ssh_user = match.group(1) or ""
+        host_identity = match.group(2).casefold()
+        path = match.group(3).lstrip("/")
+        is_ssh = True
+    if host_identity.startswith("-") or ssh_user.startswith("-"):
+        return None
+    path = path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not path or path in {".", ".."}:
+        return None
+    return host_identity, path, ssh_user, is_ssh
+
+
+def _validate_branch_publish_remote_target(
+    repo: Path,
+    remote: str,
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> None:
+    configured = _git_optional(repo, runner, ["config", "--get-all", f"remote.{remote}.url"])
+    configured_urls = (
+        str(configured.get("stdout", "")).splitlines()
+        if int(configured.get("returncode", 1)) == 0
+        else []
+    )
+    if len(configured_urls) != 1:
+        _check(receipt, "push_remote_target", "fail", "configured_url_count_not_one")
+        raise GripPreflightError(
+            "branch-publish requires exactly one configured URL for the selected remote"
+        )
+    effective = _git_optional(repo, runner, ["remote", "get-url", "--push", "--all", remote])
+    effective_urls = (
+        str(effective.get("stdout", "")).splitlines()
+        if int(effective.get("returncode", 1)) == 0
+        else []
+    )
+    if len(effective_urls) != 1:
+        _check(receipt, "push_remote_target", "fail", "effective_url_count_not_one")
+        raise GripPreflightError(
+            "branch-publish requires exactly one effective URL for the selected remote"
+        )
+    configured_identity = _remote_target_identity(configured_urls[0])
+    effective_identity = _remote_target_identity(effective_urls[0])
+    if configured_identity is None or effective_identity is None:
+        _check(receipt, "push_remote_target", "fail", "unsupported_network_target")
+        raise GripPreflightError("branch-publish requires a supported network target")
+    if not effective_identity[3]:
+        _check(receipt, "push_remote_target", "fail", "effective_target_not_ssh")
+        raise GripPreflightError("branch-publish requires one effective SSH remote target")
+    same_repository = effective_identity[:2] == configured_identity[:2]
+    configured_ssh_user = configured_identity[2] if configured_identity[3] else ""
+    effective_ssh_user = effective_identity[2]
+    same_user_contract = (
+        effective_ssh_user == configured_ssh_user
+        if configured_identity[3]
+        else effective_ssh_user in {"", "git"}
+    )
+    if not same_repository or not same_user_contract:
+        _check(receipt, "push_remote_target", "fail", "url_rewrite_changed_identity")
+        raise GripPreflightError(
+            "branch-publish refuses URL rewrite configuration that changes the push target"
+        )
+    detail = "identity_preserving_ssh_rewrite" if effective_urls[0] != configured_urls[0] else "single_ssh_target"
+    _check(receipt, "push_remote_target", "pass", detail)
+
+
 def _run_branch_publish(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -1848,6 +1977,9 @@ def _run_branch_publish(
         _check(receipt, "protected_branch", "fail", f"branch={branch}")
         raise GripPreflightError("branch-publish refuses protected branches")
     _check(receipt, "protected_branch", "pass", f"branch={branch}")
+    repo = _repo_path(parameters)
+    _reject_branch_publish_configuration(repo, remote, receipt, runner)
+    _validate_branch_publish_remote_target(repo, remote, receipt, runner)
     orientation = _run_repo_orient(spec, parameters, receipt, runner)
     if orientation["branch"] != branch:
         _check(
@@ -1885,8 +2017,6 @@ def _run_branch_publish(
             f"remote.{remote}.mirror=false",
             "-c",
             f"remote.{remote}.receivepack=git-receive-pack",
-            "-c",
-            f"remote.{remote}.push=",
             "-c",
             "push.followTags=false",
             "-c",

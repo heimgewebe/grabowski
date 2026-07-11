@@ -1078,6 +1078,7 @@ class OperatorContractTests(unittest.TestCase):
         operator = _load_operator_module()
         configurations = (
             ("remote.origin.push", "HEAD:refs/heads/feature"),
+            ("remote.origin.pushurl", "git@evil.invalid:other/repo.git"),
             ("remote.origin.mirror", "true"),
             ("remote.origin.receivepack", "git-receive-pack"),
             ("push.pushOption", "ci.skip"),
@@ -1106,6 +1107,10 @@ class OperatorContractTests(unittest.TestCase):
             repo = Path(directory)
             operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
             operator.subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:heimgewebe/grabowski.git"],
+                check=True,
+            )
+            operator.subprocess.run(
                 ["git", "-C", str(repo), "config", "remote.backup.mirror", "true"],
                 check=True,
             )
@@ -1113,6 +1118,129 @@ class OperatorContractTests(unittest.TestCase):
                 ["push", "origin", "HEAD:refs/heads/feature"],
                 repo,
             )
+
+    def test_rewritten_or_multiple_remote_push_targets_are_blocked(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", "ssh://safe.example/repo.git"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "url.ssh://redirect.example/.pushInsteadOf", "ssh://safe.example/"],
+                check=True,
+            )
+            with self.assertRaisesRegex(PermissionError, "rewrite"):
+                operator._guard_git(["push", "origin", "HEAD:refs/heads/feature"], repo)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", "ssh://one.example/repo.git"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "--add", "remote.origin.url", "ssh://two.example/repo.git"],
+                check=True,
+            )
+            with self.assertRaisesRegex(PermissionError, "exactly one configured URL"):
+                operator._guard_git(["push", "origin", "HEAD:refs/heads/feature"], repo)
+
+    def test_identity_preserving_https_to_ssh_rewrite_is_allowed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/heimgewebe/grabowski.git",
+                ],
+                check=True,
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "url.git@github.com:.pushInsteadOf",
+                    "https://github.com/",
+                ],
+                check=True,
+            )
+            operator._guard_git(["push", "origin", "HEAD:refs/heads/feature"], repo)
+
+    def test_ssh_user_change_and_url_parameters_are_blocked(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "remote",
+                    "add",
+                    "origin",
+                    "git@github.com:heimgewebe/grabowski.git",
+                ],
+                check=True,
+            )
+            with patch.object(
+                operator,
+                "_git_config_values",
+                return_value=["git@github.com:heimgewebe/grabowski.git"],
+            ), patch.object(
+                operator.subprocess,
+                "run",
+                return_value=types.SimpleNamespace(
+                    returncode=0,
+                    stdout="root@github.com:heimgewebe/grabowski.git\n",
+                    stderr="",
+                ),
+            ):
+                with self.assertRaisesRegex(PermissionError, "changes the selected push target"):
+                    operator._validate_push_remote_target(repo, "origin")
+
+        for url in (
+            "ssh://git:secret@example.invalid/repo.git",
+            "ssh://git@example.invalid/repo.git?command=other",
+            "ssh://git@example.invalid/repo.git#fragment",
+            "-oProxyCommand=evil:repo.git",
+            "-oProxyCommand=evil@github.com:repo.git",
+        ):
+            with self.subTest(url=url):
+                self.assertIsNone(operator._remote_target_identity(url))
+
+    def test_https_target_without_ssh_resolution_is_blocked(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.invalid/heimgewebe/grabowski.git",
+                ],
+                check=True,
+            )
+            with self.assertRaisesRegex(PermissionError, "SSH remote target"):
+                operator._guard_git(["push", "origin", "HEAD:refs/heads/feature"], repo)
 
     def test_git_repository_rebinding_and_alias_injection_are_blocked(self) -> None:
         operator = _load_operator_module()
@@ -1148,6 +1276,14 @@ class OperatorContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:heimgewebe/grabowski.git"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "backup.with.dot", "git@github.com:heimgewebe/grabowski.git"],
+                check=True,
+            )
             for arguments in (
                 ["push", "origin", "HEAD:refs/heads/feature"],
                 [
@@ -1239,12 +1375,59 @@ class OperatorContractTests(unittest.TestCase):
         self.assertIn("protocol.ext.allow=never", command)
         self.assertIn("remote.origin.mirror=false", command)
         self.assertIn("remote.origin.receivepack=git-receive-pack", command)
-        self.assertIn("remote.origin.push=", command)
+        self.assertNotIn("remote.origin.push=", command)
         self.assertIn("push.followTags=false", command)
         self.assertIn("push.pushOption=", command)
         self.assertIn("push.gpgSign=false", command)
         self.assertIn("push.recurseSubmodules=no", command)
         self.assertEqual(environment, run.call_args.kwargs["environment"])
+
+    def test_grabowski_git_safe_dry_run_does_not_inject_empty_remote_push_refspec(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bare = root / "remote.git"
+            repo = root / "repo"
+            fake_ssh = root / "fake-ssh.py"
+            fake_ssh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, shlex, sys\n"
+                "command = shlex.split(sys.argv[-1])\n"
+                "if len(command) != 2 or command[0] != 'git-receive-pack':\n"
+                "    raise SystemExit(64)\n"
+                "os.execvp(command[0], command)\n"
+            )
+            fake_ssh.chmod(0o700)
+            operator.subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            operator.subprocess.run(["git", "-C", str(repo), "config", "user.name", "Grabowski Test"], check=True)
+            operator.subprocess.run(["git", "-C", str(repo), "config", "user.email", "grabowski@example.invalid"], check=True)
+            (repo / "README.md").write_text("push safety dry run\n")
+            operator.subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            operator.subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "test"], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", f"ssh://test.invalid{bare}"],
+                check=True,
+            )
+            environment = operator._git_push_environment()
+            environment["GIT_SSH_COMMAND"] = str(fake_ssh)
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_git_push_environment", return_value=environment),
+            ):
+                result = operator.grabowski_git(
+                    str(repo),
+                    ["push", "--dry-run", "origin", "HEAD:refs/heads/feature"],
+                )
+            self.assertEqual(0, result["returncode"], result.get("stderr"))
+            remote_head = operator.subprocess.run(
+                ["git", "--git-dir", str(bare), "rev-parse", "--verify", "refs/heads/feature"],
+                stdout=operator.subprocess.PIPE,
+                stderr=operator.subprocess.PIPE,
+                check=False,
+                text=True,
+            )
+            self.assertNotEqual(0, remote_head.returncode)
 
     def test_git_push_environment_disables_executable_transport_overrides(self) -> None:
         operator = _load_operator_module()
@@ -1274,6 +1457,10 @@ class OperatorContractTests(unittest.TestCase):
             operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
             operator.subprocess.run(
                 ["git", "-C", str(repo), "symbolic-ref", "HEAD", "refs/heads/feature"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:heimgewebe/grabowski.git"],
                 check=True,
             )
             operator._guard_git(["-c", "core.pager=cat", "status"], repo)

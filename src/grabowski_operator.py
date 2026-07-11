@@ -18,6 +18,7 @@ import subprocess
 import time
 from typing import Any
 import uuid
+from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -1673,6 +1674,108 @@ def _git_config_entries(repo: Path, pattern: str) -> list[tuple[str, str]]:
     return entries
 
 
+def _git_config_values(repo: Path, key: str) -> list[str]:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get-all", key],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+        env=_git_environment(),
+    )
+    if completed.returncode == 1 and not completed.stdout.strip():
+        return []
+    if completed.returncode != 0:
+        raise ValueError(completed.stderr.strip() or "Git configuration query failed")
+    return completed.stdout.splitlines()
+
+
+def _remote_target_identity(url: str) -> tuple[str, str, str, bool] | None:
+    if not url or any(character.isspace() or ord(character) < 32 for character in url):
+        return None
+    is_ssh = False
+    ssh_user = ""
+    if "://" in url:
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return None
+        if not host or parsed.password is not None or parsed.query or parsed.fragment:
+            return None
+        scheme = parsed.scheme.casefold()
+        is_ssh = scheme in {"ssh", "git+ssh", "ssh+git"}
+        if is_ssh:
+            ssh_user = parsed.username or ""
+        default_port = {
+            "http": 80,
+            "https": 443,
+            "ssh": 22,
+            "git+ssh": 22,
+            "ssh+git": 22,
+        }.get(scheme)
+        host_identity = host.casefold()
+        if port is not None and port != default_port:
+            host_identity = f"{host_identity}:{port}"
+        path = parsed.path.lstrip("/")
+    else:
+        match = re.fullmatch(r"(?:([^/@:]+)@)?([^/:]+):(.+)", url)
+        if match is None:
+            return None
+        ssh_user = match.group(1) or ""
+        host_identity = match.group(2).casefold()
+        path = match.group(3).lstrip("/")
+        is_ssh = True
+    if host_identity.startswith("-") or ssh_user.startswith("-"):
+        return None
+    path = path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not path or path in {".", ".."}:
+        return None
+    return host_identity, path, ssh_user, is_ssh
+
+
+def _validate_push_remote_target(repo: Path, remote: str) -> None:
+    configured_urls = _git_config_values(repo, f"remote.{remote}.url")
+    if len(configured_urls) != 1:
+        raise PermissionError(
+            "Generic Git push requires exactly one configured URL for the selected remote."
+        )
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "remote", "get-url", "--push", "--all", remote],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+        env=_git_environment(),
+    )
+    effective_urls = completed.stdout.splitlines() if completed.returncode == 0 else []
+    if completed.returncode != 0 or len(effective_urls) != 1:
+        raise PermissionError(
+            "Generic Git push requires exactly one effective URL for the selected remote."
+        )
+    configured_identity = _remote_target_identity(configured_urls[0])
+    effective_identity = _remote_target_identity(effective_urls[0])
+    if configured_identity is None or effective_identity is None:
+        raise PermissionError("Git push remote URL is not a supported network target.")
+    if not effective_identity[3]:
+        raise PermissionError("Git push requires one effective SSH remote target.")
+    same_repository = effective_identity[:2] == configured_identity[:2]
+    configured_ssh_user = configured_identity[2] if configured_identity[3] else ""
+    effective_ssh_user = effective_identity[2]
+    same_user_contract = (
+        effective_ssh_user == configured_ssh_user
+        if configured_identity[3]
+        else effective_ssh_user in {"", "git"}
+    )
+    if not same_repository or not same_user_contract:
+        raise PermissionError(
+            "Git URL rewrite configuration is blocked because it changes the selected push target."
+        )
+
+
 def _reject_git_alias_configuration(configurations: list[tuple[str, str]]) -> None:
     if any(key.startswith("alias.") for key, _value in configurations):
         raise PermissionError(
@@ -1753,7 +1856,7 @@ def _parse_safe_push_arguments(push_arguments: list[str]) -> tuple[str, str, str
 def _reject_push_configuration(repo: Path, remote: str) -> None:
     escaped_remote = re.escape(remote)
     pattern = (
-        rf"^(remote\.{escaped_remote}\.(push|mirror|receivepack)"
+        rf"^(remote\.{escaped_remote}\.(push|pushurl|mirror|receivepack)"
         rf"|push\.(pushoption|followtags|gpgsign|recursesubmodules))$"
     )
     if _git_config_entries(repo, pattern):
@@ -1786,6 +1889,7 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
         )
     remote, _source, _destination = _parse_safe_push_arguments(command_arguments)
     _reject_push_configuration(repo, remote)
+    _validate_push_remote_target(repo, remote)
 
 
 @mcp.tool(name="grabowski_terminal_run", annotations=MUTATING)
@@ -2155,8 +2259,6 @@ def grabowski_git(
             f"remote.{remote}.mirror=false",
             "-c",
             f"remote.{remote}.receivepack=git-receive-pack",
-            "-c",
-            f"remote.{remote}.push=",
             "-c",
             "push.followTags=false",
             "-c",
