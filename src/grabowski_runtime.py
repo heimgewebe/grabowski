@@ -12,6 +12,7 @@ import grabowski_operations
 import grabowski_privileged
 import grabowski_recovery
 import grabowski_friction
+import grabowski_agent_bootstrap
 import grabowski_recall
 import grabowski_resources
 import grabowski_tasks

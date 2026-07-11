@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "31baee805136d667b2a397888e799da8a300774134cae4915bbae829b1deeff0",
+  "capability_source_sha256": "99d15a5580a35ec1011f1f7afe99cc4c6ab92c3ee023650a9298ace58902bb10",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "9e073354720c82bbb8ca52787b6249d41806d057a0b6a2dcea7f2d02fe8a8f3f",
+  "contract_sha256": "c47063baadaec7dbe8189fd25f21040299de713a37aa5539610ad42f1522ea84",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1379,6 +1379,28 @@
       "reversibility": "preserved-worktree-and-branch",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_close"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Return a bounded adaptive agent entry capsule for the current runtime evidence.",
+      "effects": [],
+      "id": "grabowski_agent_bootstrap",
+      "purpose": "Return a release-evidence-bound adaptive agent entry capsule without authorizing execution.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_bootstrap"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Lint one proposed tool-call shape before execution without authorizing it.",
+      "effects": [],
+      "id": "grabowski_call_shape_check",
+      "purpose": "Deterministically lint one proposed tool-call shape before execution.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_call_shape_check"
     }
   ]
 }
