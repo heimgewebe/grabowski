@@ -53,12 +53,20 @@ class FakeGit:
         upstream: str | None = "origin/feat/work",
         head: str = "a" * 40,
         remote_head: str | None = None,
+        push_config_entries: list[tuple[str, str]] | None = None,
+        configured_urls: list[str] | None = None,
+        effective_push_urls: list[str] | None = None,
     ):
         self.branch = branch
         self.dirty = dirty
         self.upstream = upstream
         self.head = head
         self.remote_head = remote_head or head
+        self.push_config_entries = list(push_config_entries or [])
+        self.configured_urls = list(
+            configured_urls or ["git@github.com:heimgewebe/grabowski.git"]
+        )
+        self.effective_push_urls = list(effective_push_urls or self.configured_urls)
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
@@ -69,6 +77,19 @@ class FakeGit:
             return {"returncode": 0, "stdout": self.branch, "stderr": ""}
         if argv == ["rev-parse", "HEAD"]:
             return {"returncode": 0, "stdout": self.head, "stderr": ""}
+        if len(argv) == 3 and argv[:2] == ["config", "--get-regexp"]:
+            if not self.push_config_entries:
+                return {"returncode": 1, "stdout": "", "stderr": ""}
+            stdout = "\n".join(f"{key} {value}" for key, value in self.push_config_entries)
+            return {"returncode": 0, "stdout": stdout, "stderr": ""}
+        if argv == ["config", "--get-all", "remote.origin.url"]:
+            if not self.configured_urls:
+                return {"returncode": 1, "stdout": "", "stderr": ""}
+            return {"returncode": 0, "stdout": "\n".join(self.configured_urls), "stderr": ""}
+        if argv == ["remote", "get-url", "--push", "--all", "origin"]:
+            if not self.effective_push_urls:
+                return {"returncode": 2, "stdout": "", "stderr": "no such remote"}
+            return {"returncode": 0, "stdout": "\n".join(self.effective_push_urls), "stderr": ""}
         if argv == ["status", "--short", "--branch"]:
             body = "\n M src/example.py" if self.dirty else ""
             upstream = self.upstream or ""
@@ -808,8 +829,6 @@ class GripFoundationTests(unittest.TestCase):
                 "remote.origin.mirror=false",
                 "-c",
                 "remote.origin.receivepack=git-receive-pack",
-                "-c",
-                "remote.origin.push=",
                 "-c",
                 "push.followTags=false",
                 "-c",
@@ -1903,11 +1922,113 @@ class GripFoundationTests(unittest.TestCase):
         push = next(call for call in fake.calls if "push" in call)
         self.assertIn("remote.origin.mirror=false", push)
         self.assertIn("remote.origin.receivepack=git-receive-pack", push)
-        self.assertIn("remote.origin.push=", push)
+        self.assertNotIn("remote.origin.push=", push)
         self.assertIn("push.followTags=false", push)
         self.assertIn("push.pushOption=", push)
         self.assertIn("push.gpgSign=false", push)
         self.assertIn("push.recurseSubmodules=no", push)
+
+    def test_branch_publish_rejects_semantic_push_configuration_before_push(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit(
+                branch="feat/work",
+                push_config_entries=[("remote.origin.push", "HEAD:refs/heads/other")],
+            )
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertFalse(any("push" in call for call in fake.calls))
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["push_configuration"])
+
+    def test_branch_publish_allows_identity_preserving_https_to_ssh_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit(
+                branch="feat/work",
+                configured_urls=["https://github.com/heimgewebe/grabowski.git"],
+                effective_push_urls=["git@github.com:heimgewebe/grabowski.git"],
+            )
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
+        target_check = next(
+            item for item in result["receipt"]["checks"] if item["id"] == "push_remote_target"
+        )
+        self.assertEqual("pass", target_check["status"])
+        self.assertEqual("identity_preserving_ssh_rewrite", target_check["detail"])
+
+    def test_branch_publish_config_query_failure_is_redacted_and_fail_closed(self) -> None:
+        secret = "transport-secret-value"
+
+        class FailingConfigGit(FakeGit):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if len(argv) == 3 and argv[:2] == ["config", "--get-regexp"]:
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 2, "stdout": "", "stderr": secret}
+                return super().__call__(repo, argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FailingConfigGit(branch="feat/work")
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertFalse(any("push" in call for call in fake.calls))
+        self.assertNotIn(secret, json.dumps(result, sort_keys=True))
+        checks = {item["id"]: item for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["push_configuration"]["status"])
+        self.assertEqual("git config query failed", checks["push_configuration"]["detail"])
+
+    def test_branch_publish_rejects_multiple_or_rewritten_push_targets(self) -> None:
+        cases = (
+            {
+                "configured_urls": ["git@github.com:heimgewebe/grabowski.git", "git@evil.invalid:other/repo.git"],
+                "effective_push_urls": ["git@github.com:heimgewebe/grabowski.git", "git@evil.invalid:other/repo.git"],
+                "detail": "configured_url_count_not_one",
+            },
+            {
+                "configured_urls": ["git@github.com:heimgewebe/grabowski.git"],
+                "effective_push_urls": ["git@evil.invalid:other/repo.git"],
+                "detail": "url_rewrite_changed_identity",
+            },
+            {
+                "configured_urls": ["git@github.com:heimgewebe/grabowski.git"],
+                "effective_push_urls": ["root@github.com:heimgewebe/grabowski.git"],
+                "detail": "url_rewrite_changed_identity",
+            },
+        )
+        for case in cases:
+            with self.subTest(detail=case["detail"]), tempfile.TemporaryDirectory() as tmp:
+                fake = FakeGit(
+                    branch="feat/work",
+                    configured_urls=case["configured_urls"],
+                    effective_push_urls=case["effective_push_urls"],
+                )
+                result = grips.run_grip(
+                    "branch-publish",
+                    {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                    allow_mutation=True,
+                    command_runner=fake,
+                )
+            self.assertEqual("blocked", result["receipt"]["status"])
+            self.assertFalse(any("push" in call for call in fake.calls))
+            target_check = next(
+                item for item in result["receipt"]["checks"] if item["id"] == "push_remote_target"
+            )
+            self.assertEqual("fail", target_check["status"])
+            self.assertEqual(case["detail"], target_check["detail"])
 
     def test_branch_publish_rejects_fully_qualified_branch_ref_before_git(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
