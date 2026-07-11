@@ -285,6 +285,15 @@ CONNECTOR_ERROR_MESSAGE_TERMS = {
     "external service error": "upstream_error",
 }
 CONNECTOR_STRONG_TIMEOUT_TERMS = ("timed out", "deadline exceeded")
+SYSTEMD_STOP_COMPLETED_MESSAGE_ID = "9d1aaa27d60140bd96365438aad20286"
+CONNECTOR_PLANNED_STOP_ISSUE_COMPONENTS = {
+    "failed to release dispatcher worker pool": "dispatcher",
+    "harpoon server stopped": "",
+}
+CONNECTOR_PLANNED_STOP_SEQUENCE_MESSAGES = frozenset({
+    "OnStop hook executing",
+    "OnStop hook executed",
+})
 
 CONNECTOR_TRANSPORT_TERMS = frozenset({
     "502",
@@ -617,7 +626,76 @@ def _explicit_http_statuses(payload: dict[str, Any]) -> list[int]:
     return sorted(statuses)
 
 
-def _journal_transport_event(record: dict[str, Any]) -> dict[str, Any]:
+def _journal_realtime_microseconds(record: dict[str, Any]) -> int | None:
+    value = record.get("__REALTIME_TIMESTAMP")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _journal_invocation_id(record: dict[str, Any]) -> str | None:
+    for key in ("_SYSTEMD_INVOCATION_ID", "USER_INVOCATION_ID"):
+        value = record.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value):
+            return value
+    return None
+
+
+def _stop_invocation_context(
+    records: list[dict[str, Any]],
+    *,
+    unit: str,
+) -> tuple[set[str], dict[str, int]]:
+    completed: set[str] = set()
+    completed_at: dict[str, int] = {}
+    stop_sequence_messages: dict[str, set[str]] = {}
+    stop_sequence_latest_at: dict[str, int] = {}
+    for record in records:
+        invocation = _journal_invocation_id(record)
+        realtime = _journal_realtime_microseconds(record)
+        payload = _journal_record_payload(record)
+        message = payload.get("msg") if isinstance(payload.get("msg"), str) else ""
+        if (
+            invocation
+            and realtime is not None
+            and message in CONNECTOR_PLANNED_STOP_SEQUENCE_MESSAGES
+            and str(payload.get("component", "")) == ""
+        ):
+            stop_sequence_messages.setdefault(invocation, set()).add(message)
+            stop_sequence_latest_at[invocation] = max(
+                stop_sequence_latest_at.get(invocation, realtime),
+                realtime,
+            )
+        if (
+            record.get("MESSAGE_ID") != SYSTEMD_STOP_COMPLETED_MESSAGE_ID
+            or record.get("USER_UNIT") != unit
+            or record.get("JOB_TYPE") != "stop"
+            or record.get("JOB_RESULT") != "done"
+        ):
+            continue
+        user_invocation = record.get("USER_INVOCATION_ID")
+        if isinstance(user_invocation, str) and re.fullmatch(r"[0-9a-f]{32}", user_invocation):
+            completed.add(user_invocation)
+            if realtime is not None:
+                completed_at[user_invocation] = realtime
+    qualified = {
+        invocation: completion_time
+        for invocation, completion_time in completed_at.items()
+        if stop_sequence_messages.get(invocation) == set(CONNECTOR_PLANNED_STOP_SEQUENCE_MESSAGES)
+        and stop_sequence_latest_at.get(invocation, completion_time + 1) <= completion_time
+    }
+    return completed, qualified
+
+
+def _journal_transport_event(
+    record: dict[str, Any],
+    *,
+    completed_stop_invocations: dict[str, int] | None = None,
+) -> dict[str, Any]:
     payload = _journal_record_payload(record)
     message = payload.get("msg") if isinstance(payload.get("msg"), str) else ""
     lowered = message.lower()
@@ -650,14 +728,34 @@ def _journal_transport_event(record: dict[str, Any]) -> dict[str, Any]:
         domains.add("reported_error")
     elif isinstance(error_value, dict) and error_value:
         domains.add("reported_error")
+    invocation_id = _journal_invocation_id(record)
+    expected_stop_component = CONNECTOR_PLANNED_STOP_ISSUE_COMPONENTS.get(message)
+    completed_stop_at = (
+        completed_stop_invocations.get(invocation_id)
+        if completed_stop_invocations and invocation_id
+        else None
+    )
+    realtime_microseconds = _journal_realtime_microseconds(record)
+    planned_lifecycle_issue = bool(
+        domains
+        and expected_stop_component is not None
+        and str(payload.get("component", "")) == expected_stop_component
+        and invocation_id
+        and completed_stop_at is not None
+        and realtime_microseconds is not None
+        and realtime_microseconds <= completed_stop_at
+    )
     activity = CONNECTOR_ACTIVITY_MESSAGES.get(message)
     return {
         "timestamp": str(payload.get("time") or record.get("__REALTIME_TIMESTAMP") or "")[:80],
+        "realtime_microseconds": realtime_microseconds,
+        "invocation_id": invocation_id,
         "level": level[:16],
         "component": str(payload.get("component", ""))[:80],
         "http_statuses": statuses,
         "error_domains": sorted(domains),
         "activity": activity,
+        "planned_lifecycle_issue": planned_lifecycle_issue,
     }
 
 
@@ -677,13 +775,8 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
         timeout_seconds=30,
         max_output_bytes=131_072,
     )
-    error_domains: Counter[str] = Counter()
-    http_statuses: Counter[str] = Counter()
-    activity_counts: Counter[str] = Counter()
-    samples: list[dict[str, Any]] = []
-    parsed_records = 0
+    parsed: list[dict[str, Any]] = []
     invalid_json_records = 0
-    transport_error_count = 0
     for line in str(result.get("stdout", "")).splitlines():
         try:
             record = json.loads(line)
@@ -693,25 +786,96 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
         if not isinstance(record, dict):
             invalid_json_records += 1
             continue
-        parsed_records += 1
-        event = _journal_transport_event(record)
+        parsed.append(record)
+
+    completed_stop_invocations, qualified_stop_invocations = _stop_invocation_context(
+        parsed,
+        unit=name,
+    )
+    error_domains: Counter[str] = Counter()
+    http_statuses: Counter[str] = Counter()
+    activity_counts: Counter[str] = Counter()
+    planned_lifecycle_domains: Counter[str] = Counter()
+    planned_lifecycle_http_statuses: Counter[str] = Counter()
+    post_error_activity_counts: Counter[str] = Counter()
+    samples: list[dict[str, Any]] = []
+    planned_lifecycle_samples: list[dict[str, Any]] = []
+    transport_error_count = 0
+    planned_lifecycle_issue_count = 0
+    last_transport_error_microseconds: int | None = None
+    activity_events: list[tuple[int | None, str]] = []
+
+    for record in parsed:
+        event = _journal_transport_event(
+            record,
+            completed_stop_invocations=qualified_stop_invocations,
+        )
         if event["activity"]:
             activity_counts[event["activity"]] += 1
+            activity_events.append((event["realtime_microseconds"], event["activity"]))
+        if event["planned_lifecycle_issue"]:
+            planned_lifecycle_issue_count += 1
+            for domain in event["error_domains"]:
+                planned_lifecycle_domains[domain] += 1
+            for status in event["http_statuses"]:
+                planned_lifecycle_http_statuses[str(status)] += 1
+            if len(planned_lifecycle_samples) < CONNECTOR_DIAGNOSTIC_SAMPLE_LIMIT:
+                planned_lifecycle_samples.append({
+                    "timestamp": event["timestamp"],
+                    "invocation_id": event["invocation_id"],
+                    "level": event["level"],
+                    "component": event["component"],
+                    "http_statuses": event["http_statuses"],
+                    "error_domains": event["error_domains"],
+                })
+            continue
         for status in event["http_statuses"]:
             http_statuses[str(status)] += 1
         if not event["error_domains"]:
             continue
         transport_error_count += 1
+        event_microseconds = event["realtime_microseconds"]
+        if event_microseconds is not None:
+            last_transport_error_microseconds = max(
+                last_transport_error_microseconds or event_microseconds,
+                event_microseconds,
+            )
         for domain in event["error_domains"]:
             error_domains[domain] += 1
         if len(samples) < CONNECTOR_DIAGNOSTIC_SAMPLE_LIMIT:
             samples.append({
                 "timestamp": event["timestamp"],
+                "invocation_id": event["invocation_id"],
                 "level": event["level"],
                 "component": event["component"],
                 "http_statuses": event["http_statuses"],
                 "error_domains": event["error_domains"],
             })
+
+    if last_transport_error_microseconds is not None:
+        for timestamp, activity in activity_events:
+            if timestamp is not None and timestamp > last_transport_error_microseconds:
+                post_error_activity_counts[activity] += 1
+    journal_window_complete = bool(
+        result["returncode"] == 0
+        and not result["timed_out"]
+        and not result["stdout_truncated"]
+        and not result["stderr_truncated"]
+        and invalid_json_records == 0
+    )
+    if not journal_window_complete:
+        window_state = (
+            "indeterminate_truncated"
+            if result["stdout_truncated"]
+            else "indeterminate_incomplete"
+        )
+    elif transport_error_count == 0:
+        window_state = "no_errors"
+    elif post_error_activity_counts:
+        window_state = "errors_followed_by_activity"
+    else:
+        window_state = "errors_without_later_activity"
+
     return {
         "unit": name,
         "max_lines": max_lines,
@@ -719,14 +883,30 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
         "timed_out": result["timed_out"],
         "stdout_truncated": result["stdout_truncated"],
         "stderr_truncated": result["stderr_truncated"],
-        "parsed_records": parsed_records,
+        "parsed_records": len(parsed),
         "invalid_json_records": invalid_json_records,
         "transport_error_count": transport_error_count,
+        "journal_window_complete": journal_window_complete,
+        "window_state": window_state,
+        "post_error_activity_counts": dict(sorted(post_error_activity_counts.items())),
         "error_domain_counts": dict(sorted(error_domains.items())),
         "http_status_counts": dict(sorted(http_statuses.items())),
         "activity_counts": dict(sorted(activity_counts.items())),
         "error_samples": samples,
         "error_samples_truncated": transport_error_count > len(samples),
+        "completed_stop_invocation_count": len(completed_stop_invocations),
+        "qualified_planned_stop_invocation_count": len(qualified_stop_invocations),
+        "planned_lifecycle_issue_count": planned_lifecycle_issue_count,
+        "planned_lifecycle_error_domain_counts": dict(
+            sorted(planned_lifecycle_domains.items())
+        ),
+        "planned_lifecycle_http_status_counts": dict(
+            sorted(planned_lifecycle_http_statuses.items())
+        ),
+        "planned_lifecycle_samples": planned_lifecycle_samples,
+        "planned_lifecycle_samples_truncated": (
+            planned_lifecycle_issue_count > len(planned_lifecycle_samples)
+        ),
         "stderr_preview": _bounded_summary_text(result.get("stderr"), max_chars=240),
     }
 
@@ -798,8 +978,25 @@ def connector_transport_live_diagnostics(
     transport_error_count = sum(
         probe["transport_error_count"] for probe in journal_probes.values()
     )
+    planned_lifecycle_issue_count = sum(
+        probe["planned_lifecycle_issue_count"] for probe in journal_probes.values()
+    )
+    post_error_activity_counts: Counter[str] = Counter()
+    for probe in journal_probes.values():
+        post_error_activity_counts.update(probe["post_error_activity_counts"])
+    window_states = {unit: probe["window_state"] for unit, probe in journal_probes.items()}
+    if "errors_without_later_activity" in window_states.values():
+        transport_window_state = "errors_without_later_activity"
+    elif "errors_followed_by_activity" in window_states.values():
+        transport_window_state = "errors_followed_by_activity"
+    elif "indeterminate_truncated" in window_states.values():
+        transport_window_state = "indeterminate_truncated"
+    elif "indeterminate_incomplete" in window_states.values():
+        transport_window_state = "indeterminate_incomplete"
+    else:
+        transport_window_state = "no_errors"
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "authority": "read_only_transport_diagnostic_receipt",
         "source": "friction-log-and-local-user-systemd",
         "limit": limit,
@@ -816,8 +1013,16 @@ def connector_transport_live_diagnostics(
         "runtime_status": _runtime_status_probe(),
         "service_statuses": service_statuses,
         "journal_transport_probes": journal_probes,
+        "transport_errors_observed_in_window": transport_error_count > 0,
         "live_transport_errors_observed": transport_error_count > 0,
+        "live_transport_errors_observed_semantics": (
+            "transport_error_present_in_bounded_journal_window_not_current_outage_proof"
+        ),
         "transport_error_count": transport_error_count,
+        "transport_window_state": transport_window_state,
+        "transport_window_state_by_unit": window_states,
+        "post_error_activity_counts": dict(sorted(post_error_activity_counts.items())),
+        "planned_lifecycle_issue_count": planned_lifecycle_issue_count,
         "recommended_next_policy": history["split_retry_policy"],
         "does_not_establish": list(CONNECTOR_TRANSPORT_DOES_NOT_ESTABLISH),
     }
