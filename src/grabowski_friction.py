@@ -2428,6 +2428,7 @@ def _execution_load_outcomes(*, limit: int) -> dict[str, Any]:
         return {
             "records": [],
             "scanned_lines": 0,
+            "valid_records_total": 0,
             "invalid_lines": 0,
             "duplicate_outcome_ids": [],
             "duplicate_outcome_ids_truncated": False,
@@ -2436,9 +2437,9 @@ def _execution_load_outcomes(*, limit: int) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     invalid_lines = 0
     scanned_lines = 0
-    for line in reversed(text.splitlines()):
-        if len(records) >= limit:
-            break
+    valid_records_total = 0
+    outcome_id_counts: Counter[str] = Counter()
+    for line in text.splitlines():
         if not line.strip():
             continue
         scanned_lines += 1
@@ -2451,23 +2452,25 @@ def _execution_load_outcomes(*, limit: int) -> dict[str, Any]:
         if record is None:
             invalid_lines += 1
             continue
+        valid_records_total += 1
+        outcome_id_counts[record["outcome_id"]] += 1
         records.append(record)
-    records.reverse()
-    outcome_ids = [record["outcome_id"] for record in records]
+    if len(records) > limit:
+        records = records[-limit:]
     duplicate_outcome_ids = sorted(
         outcome_id
-        for outcome_id, count in Counter(outcome_ids).items()
+        for outcome_id, count in outcome_id_counts.items()
         if count > 1
     )
     return {
         "records": records,
         "scanned_lines": scanned_lines,
+        "valid_records_total": valid_records_total,
         "invalid_lines": invalid_lines,
         "duplicate_outcome_ids": duplicate_outcome_ids[:20],
         "duplicate_outcome_ids_truncated": len(duplicate_outcome_ids) > 20,
         "integrity_valid": not invalid_lines and not duplicate_outcome_ids,
     }
-
 
 def record_execution_outcome(
     *,
@@ -2565,7 +2568,7 @@ def record_execution_outcome(
         existing = _execution_load_outcomes(limit=EXECUTION_GOVERNOR_MAX_RECORDS)
         if existing["integrity_valid"] is not True:
             raise RuntimeError("execution outcome ledger integrity is invalid")
-        if len(existing["records"]) >= EXECUTION_GOVERNOR_MAX_RECORDS:
+        if existing["valid_records_total"] >= EXECUTION_GOVERNOR_MAX_RECORDS:
             raise RuntimeError("execution outcome ledger record limit reached")
         _append_jsonl(EXECUTION_OUTCOME_LOG, record)
     base._append_audit({
@@ -2699,6 +2702,7 @@ def execution_governor_summary(
         "exists": EXECUTION_OUTCOME_LOG.exists(),
         "limit": limit,
         "scanned_lines": loaded["scanned_lines"],
+        "valid_records_total": loaded["valid_records_total"],
         "invalid_lines": loaded["invalid_lines"],
         "duplicate_outcome_ids": loaded["duplicate_outcome_ids"],
         "duplicate_outcome_ids_truncated": loaded["duplicate_outcome_ids_truncated"],

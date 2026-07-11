@@ -470,6 +470,54 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertEqual(summary["invalid_lines"], 0)
         self.assertEqual(summary["duplicate_outcome_ids"], [])
 
+    def test_integrity_scan_covers_lines_older_than_summary_window(self) -> None:
+        module = self._load_module()
+        now = 1_783_773_600
+
+        def record(*, outcome_id: str, recommendation_id: str) -> dict[str, object]:
+            return {
+                "schema_version": 1,
+                "outcome_id": outcome_id,
+                "recorded_at_unix": now,
+                "recommendation_id": recommendation_id,
+                "operation_class": "read",
+                "risk_level": "low",
+                "recommended_route": "typed_tool",
+                "actual_route": "typed_tool",
+                "first_pass_success": True,
+                "unchanged_retries": 0,
+                "ambiguous_mutation_outcomes": 0,
+                "tool_call_count": 1,
+                "elapsed_ms": 1,
+                "regression_signal": False,
+                "friction_event_ids": [],
+                "evidence_ref": "receipt:full-ledger-integrity",
+            }
+
+        duplicate = record(outcome_id="1" * 32, recommendation_id="a" * 64)
+        recent = record(outcome_id="2" * 32, recommendation_id="b" * 64)
+        module.EXECUTION_OUTCOME_LOG.parent.mkdir(parents=True, exist_ok=True)
+        module.EXECUTION_OUTCOME_LOG.write_text(
+            "not-json\n"
+            + json.dumps(duplicate, sort_keys=True) + "\n"
+            + json.dumps(duplicate, sort_keys=True) + "\n"
+            + json.dumps(recent, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        module.EXECUTION_OUTCOME_LOG.chmod(0o600)
+
+        summary = module.execution_governor_summary(limit=1, now_unix=now)
+        self.assertEqual(summary["returned"], 1)
+        self.assertEqual(summary["valid_records_total"], 3)
+        self.assertEqual(summary["scanned_lines"], 4)
+        self.assertEqual(summary["invalid_lines"], 1)
+        self.assertEqual(summary["duplicate_outcome_ids"], ["1" * 32])
+        self.assertFalse(summary["ledger_integrity_valid"])
+        candidate = summary["candidates"][0]
+        self.assertEqual(candidate["status"], "disabled_by_integrity_gate")
+        self.assertTrue(candidate["circuit_breaker_open"])
+        self.assertFalse(candidate["promotion_eligible"])
+
     def test_invalid_or_duplicate_outcome_ledger_opens_integrity_gate(self) -> None:
         module = self._load_module()
         now = 1_783_773_600
