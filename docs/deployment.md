@@ -208,9 +208,14 @@ Intent-Audit geschrieben. Direkt vor der Archivierung werden systemd-Zustand,
 Metadaten und Dateihashes erneut geprüft. Nach dem atomaren Move werden beide
 Elternverzeichnisse fsync-gesichert und die Zieldateien erneut gehasht. Erst
 danach folgen gezieltes `reset-failed`, create-only Receipt und
-Completion-Audit. Unbekannte Unit-Klassen, unklare Task-Zustände und
-nichtterminale Jobs bleiben unangetastet und werden im Receipt als blockiert
-beziehungsweise geschützt geführt.
+Completion-Audit. Scheitert nach bereits erfolgten Archivierungen eine erneute
+Worker-Prüfung oder der Reset-Aufruf, bleibt die betroffene Unit unangetastet.
+Der Lauf schreibt trotzdem ein gehashtes Partial-Result-Receipt mit
+`completed=false`, redigierter Fehlerart und Fehlerhash und endet mit Fehler.
+Ein Retry beginnt mit einer neuen Vorschau aus dem aktuellen Livezustand; er
+verwendet nicht blind den alten Plan. Unbekannte Unit-Klassen, unklare
+Task-Zustände und nichtterminale Jobs bleiben unangetastet und werden im
+Receipt als blockiert beziehungsweise geschützt geführt.
 
 ## Integritätsgeprüfte Releases
 

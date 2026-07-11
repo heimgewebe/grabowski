@@ -49,6 +49,8 @@ MAX_WORKER_LEASE_KEYS = 32
 MAX_WORKER_LEASE_JSON_BYTES = 16 * 1024
 MAX_WORKER_OBSERVATION_JSON_BYTES = 128 * 1024
 WORKER_EVIDENCE_CLOCK_SKEW_SECONDS = 300
+MAX_RETENTION_RECEIPT_ATTEMPTS = 16
+MAX_RETENTION_RECEIPT_BYTES = 16 * 1024 * 1024
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -880,6 +882,21 @@ def _reset_failed(unit: str) -> dict[str, Any]:
     }
 
 
+def _redacted_reset_failure(
+    *, unit: str, stage: str, error: BaseException
+) -> dict[str, str]:
+    if stage not in {"worker_revalidation", "reset_command"}:
+        raise RuntimeError("retention reset failure stage is invalid")
+    return {
+        "unit": unit,
+        "stage": stage,
+        "error_type": type(error).__name__,
+        "error_sha256": hashlib.sha256(
+            str(error).encode("utf-8", errors="replace")
+        ).hexdigest(),
+    }
+
+
 def _validated_plan(plan: dict[str, Any], expected_plan_sha256: str) -> dict[str, Any]:
     if not isinstance(plan, dict):
         raise RuntimeError("retention plan is not an object")
@@ -1073,11 +1090,18 @@ def _append_audit_record(record: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
-def _append_intent_audit(plan: dict[str, Any]) -> dict[str, Any]:
+def _append_intent_audit(
+    plan: dict[str, Any],
+    *,
+    attempt: int,
+    previous_receipt_sha256: str | None,
+) -> dict[str, Any]:
     return _append_audit_record({
         "timestamp_unix": int(time.time()),
         "operation": "runtime-state-retention-intent",
         "plan_sha256": plan["plan_sha256"],
+        "attempt": attempt,
+        "previous_receipt_sha256": previous_receipt_sha256,
         "reset_failed_count": len(plan["reset_failed_units"]),
         "archive_job_count": len(plan["archive_jobs"]),
         "archive_deferred_count": plan.get("archive_deferred_count", 0),
@@ -1090,11 +1114,77 @@ def _append_completion_audit(receipt: dict[str, Any]) -> dict[str, Any]:
         "operation": "runtime-state-retention-complete",
         "plan_sha256": receipt["plan_sha256"],
         "receipt_sha256": receipt["receipt_sha256"],
+        "attempt": receipt["attempt"],
+        "previous_receipt_sha256": receipt["previous_receipt_sha256"],
         "reset_failed_count": len(receipt["reset_failed"]),
+        "reset_failure_count": len(receipt.get("reset_failures", [])),
         "archived_job_count": len(receipt["archived_jobs"]),
         "completed": receipt["completed"],
     })
 
+
+
+def _verified_partial_receipt(
+    path: Path,
+    *,
+    plan_sha256: str,
+    expected_attempt: int,
+    expected_previous_receipt_sha256: str | None,
+) -> str:
+    payload, _ = _read_json_file(path, max_bytes=MAX_RETENTION_RECEIPT_BYTES)
+    receipt_sha256 = payload.get("receipt_sha256")
+    if (
+        not isinstance(receipt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
+        or _sha256(
+            {key: value for key, value in payload.items() if key != "receipt_sha256"}
+        )
+        != receipt_sha256
+    ):
+        raise RuntimeError(f"retention receipt integrity is invalid: {path}")
+    if (
+        payload.get("schema_version") != 3
+        or payload.get("operation") != "grabowski-runtime-state-retention"
+        or payload.get("plan_sha256") != plan_sha256
+        or payload.get("attempt") != expected_attempt
+        or payload.get("previous_receipt_sha256")
+        != expected_previous_receipt_sha256
+    ):
+        raise RuntimeError(f"retention receipt chain binding is invalid: {path}")
+    retry = payload.get("retry")
+    if payload.get("completed") is not False or not isinstance(retry, dict):
+        raise RuntimeError(f"retention plan already has terminal receipt: {path}")
+    if (
+        retry.get("required") is not True
+        or retry.get("strategy")
+        != "rebuild_live_plan_and_chain_partial_receipt"
+    ):
+        raise RuntimeError(f"retention partial receipt is not retryable: {path}")
+    return receipt_sha256
+
+
+def _select_receipt_target(
+    receipt_root: Path,
+    *,
+    plan_sha256: str,
+) -> tuple[Path, int, str | None]:
+    previous_receipt_sha256: str | None = None
+    for attempt in range(1, MAX_RETENTION_RECEIPT_ATTEMPTS + 1):
+        name = (
+            f"{plan_sha256}.json"
+            if attempt == 1
+            else f"{plan_sha256}.retry-{attempt:02d}.json"
+        )
+        path = receipt_root / name
+        if not path.exists() and not path.is_symlink():
+            return path, attempt, previous_receipt_sha256
+        previous_receipt_sha256 = _verified_partial_receipt(
+            path,
+            plan_sha256=plan_sha256,
+            expected_attempt=attempt,
+            expected_previous_receipt_sha256=previous_receipt_sha256,
+        )
+    raise RuntimeError("retention receipt retry bound exhausted")
 
 def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, Any]:
     plan = _validated_plan(plan, expected_plan_sha256)
@@ -1109,14 +1199,22 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         base._require_capability(
             "browser_worker" if evidence["kind"] == "browser" else "gui_worker"
         )
-    intent_audit = _append_intent_audit(plan)
-    jobs_root, archive_root, receipt_root, prepared = _prepare_archives(plan)
-    _prepare_worker_resets(plan)
 
     import grabowski_self_deploy as self_deploy
 
-    archived: list[dict[str, Any]] = []
     with self_deploy._deploy_schedule_lock():
+        jobs_root, archive_root, receipt_root, prepared = _prepare_archives(plan)
+        _prepare_worker_resets(plan)
+        receipt_target, attempt, previous_receipt_sha256 = _select_receipt_target(
+            receipt_root, plan_sha256=plan["plan_sha256"]
+        )
+        intent_audit = _append_intent_audit(
+            plan,
+            attempt=attempt,
+            previous_receipt_sha256=previous_receipt_sha256,
+        )
+
+        archived: list[dict[str, Any]] = []
         index = self_deploy._read_deploy_index(jobs_root)
         indexed_units = set(index["units"]) if index is not None else set()
         for item in prepared:
@@ -1168,41 +1266,64 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 }
             )
 
-    reset_results: list[dict[str, Any]] = []
-    for unit in plan["reset_failed_units"]:
-        if WORKER_UNIT.fullmatch(unit):
-            _prepare_worker_resets(plan, units=[unit])
-        reset_results.append(_reset_failed(unit))
-    failed_resets = [item for item in reset_results if item["returncode"] != 0]
-    receipt = {
-        "schema_version": 3,
-        "operation": "grabowski-runtime-state-retention",
-        "plan_sha256": plan["plan_sha256"],
-        "reset_failed": reset_results,
-        "worker_reset_evidence": plan.get("worker_reset_evidence", []),
-        "archived_jobs": archived,
-        "preserved_blocked_units": plan.get("blocked", []),
-        "archive_deferred_count": plan.get("archive_deferred_count", 0),
-        "protected_nonterminal_jobs": plan.get("protected_nonterminal_jobs", []),
-        "recovered_archived_failed_units": plan.get(
-            "recovered_archived_failed_units", []
-        ),
-        "deferred_failed_units": plan.get("deferred_failed_units", []),
-        "completed": not failed_resets,
-        "completed_at_unix": int(time.time()),
-    }
-    receipt["receipt_sha256"] = _sha256(receipt)
-    receipt_path = _write_json_atomic(
-        receipt_root / f"{plan['plan_sha256']}.json",
-        receipt,
-    )
-    try:
-        completion_audit = _append_completion_audit(receipt)
-    except Exception as exc:
-        raise RuntimeError(
-            "retention mutations completed but completion audit failed; "
-            f"receipt={receipt_path}"
-        ) from exc
+        reset_results: list[dict[str, Any]] = []
+        reset_failures: list[dict[str, str]] = []
+        for unit in plan["reset_failed_units"]:
+            if WORKER_UNIT.fullmatch(unit):
+                try:
+                    _prepare_worker_resets(plan, units=[unit])
+                except Exception as exc:
+                    reset_failures.append(
+                        _redacted_reset_failure(
+                            unit=unit, stage="worker_revalidation", error=exc
+                        )
+                    )
+                    continue
+            try:
+                reset_results.append(_reset_failed(unit))
+            except Exception as exc:
+                reset_failures.append(
+                    _redacted_reset_failure(
+                        unit=unit, stage="reset_command", error=exc
+                    )
+                )
+        failed_resets = [item for item in reset_results if item["returncode"] != 0]
+        receipt = {
+            "schema_version": 3,
+            "operation": "grabowski-runtime-state-retention",
+            "plan_sha256": plan["plan_sha256"],
+            "attempt": attempt,
+            "previous_receipt_sha256": previous_receipt_sha256,
+            "reset_failed": reset_results,
+            "reset_failures": reset_failures,
+            "worker_reset_evidence": plan.get("worker_reset_evidence", []),
+            "archived_jobs": archived,
+            "preserved_blocked_units": plan.get("blocked", []),
+            "archive_deferred_count": plan.get("archive_deferred_count", 0),
+            "protected_nonterminal_jobs": plan.get(
+                "protected_nonterminal_jobs", []
+            ),
+            "recovered_archived_failed_units": plan.get(
+                "recovered_archived_failed_units", []
+            ),
+            "deferred_failed_units": plan.get("deferred_failed_units", []),
+            "completed": not failed_resets and not reset_failures,
+            "retry": {
+                "required": bool(failed_resets or reset_failures),
+                "strategy": "rebuild_live_plan_and_chain_partial_receipt",
+            },
+            "completed_at_unix": int(time.time()),
+        }
+        receipt["receipt_sha256"] = _sha256(receipt)
+        receipt_path = _write_json_atomic(receipt_target, receipt)
+        try:
+            completion_audit = _append_completion_audit(receipt)
+        except Exception as exc:
+            raise RuntimeError(
+                "retention mutations completed but completion audit failed; "
+                f"receipt={receipt_path}"
+            ) from exc
+
     result = {
         **receipt,
         "receipt_path": str(receipt_path),
@@ -1211,9 +1332,10 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
             "completion": completion_audit,
         },
     }
-    if failed_resets:
+    if failed_resets or reset_failures:
         raise RuntimeError(
-            f"reset-failed did not complete for every bound unit; receipt={receipt_path}"
+            "retention reset phase did not complete for every bound unit; "
+            f"receipt={receipt_path}"
         )
     return result
 
