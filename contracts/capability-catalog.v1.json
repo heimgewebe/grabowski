@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "bf5ec1b8cf88513a4065e2ba4c7a86722c47e63b97ca3f426304f1913a7fb03e",
+  "capability_source_sha256": "31baee805136d667b2a397888e799da8a300774134cae4915bbae829b1deeff0",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "cb557e0d982610ea8989c6bf3a8e47a36208fc75d7dae7200b49209660e8f5f3",
+  "contract_sha256": "9e073354720c82bbb8ca52787b6249d41806d057a0b6a2dcea7f2d02fe8a8f3f",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1023,6 +1023,42 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_friction_summary"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Recommend one bounded execution shape from typed inputs and friction evidence.",
+      "effects": [],
+      "id": "grabowski_execution_shape",
+      "purpose": "Recommend one bounded execution shape from typed inputs and evidence-bound friction fingerprints without executing it.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_execution_shape"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Record bounded predicted-versus-actual execution evidence in shadow mode.",
+      "effects": [
+        "state-append",
+        "audit-record"
+      ],
+      "id": "grabowski_execution_outcome_record",
+      "purpose": "Append secret-free predicted-versus-actual routing outcomes for shadow evaluation.",
+      "read_only": false,
+      "reversibility": "append-only-observation",
+      "risk_class": "medium",
+      "tool": "grabowski_execution_outcome_record"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Summarize shadow outcomes, decay and circuit-breaker candidates.",
+      "effects": [],
+      "id": "grabowski_execution_governor_summary",
+      "purpose": "Summarize evidence thresholds, time decay and circuit-breaker state without enabling live routing.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_execution_governor_summary"
     },
     {
       "category": "operations-observability",

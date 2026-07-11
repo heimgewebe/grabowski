@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1871,3 +1872,927 @@ def grabowski_connector_transport_diagnostics(
         limit=limit,
         max_log_lines=max_log_lines,
     )
+
+EXECUTION_OUTCOME_LOG = Path(os.environ.get(
+    "GRABOWSKI_EXECUTION_OUTCOME_LOG",
+    str(operator.STATE_DIR / "friction/execution-outcomes.jsonl"),
+)).expanduser()
+EXECUTION_OPERATION_CLASSES = frozenset({
+    "read",
+    "broad_read",
+    "mutation",
+    "external_mutation",
+    "long_running",
+    "high_impact",
+})
+EXECUTION_RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
+EXECUTION_LEASE_STATES = frozenset({"free", "owned", "conflict", "unknown"})
+EXECUTION_ROUTES = frozenset({
+    "typed_tool",
+    "grip",
+    "durable_task",
+    "split_read",
+    "isolated_mutation",
+    "explicit_preflight",
+    "stop_resource_conflict",
+    "stop_missing_readback",
+    "operator_stop",
+    "state_readback",
+    "manual_fallback",
+})
+EXECUTION_GOVERNOR_MIN_EVIDENCE = 5
+EXECUTION_GOVERNOR_DECAY_SECONDS = 7 * 24 * 60 * 60
+EXECUTION_GOVERNOR_MAX_OUTCOME_BYTES = 16 * 1024 * 1024
+EXECUTION_GOVERNOR_MAX_EVENT_IDS = 20
+EXECUTION_GOVERNOR_MAX_RECORDS = 10000
+EXECUTION_GOVERNOR_IMMUTABLE_BOUNDARIES = (
+    "user_intent",
+    "authorization",
+    "secret_handling",
+    "recovery",
+    "kill_switch",
+    "review",
+    "merge",
+    "deployment",
+    "privileged_execution",
+)
+EXECUTION_GOVERNOR_NON_CLAIMS = (
+    "automatic_task_creation_authority",
+    "automatic_policy_mutation_authority",
+    "merge_or_deploy_permission",
+    "root_cause_proof",
+    "safe_unchanged_mutation_retry",
+    "live_routing_promotion",
+    "caller_supplied_outcome_correctness",
+)
+EXECUTION_RECOMMENDATION_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+EXECUTION_OUTCOME_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+EXECUTION_EVIDENCE_REF_RE = re.compile(
+    r"^(?:receipt|task|run|pr|artifact|event):[0-9A-Za-z][0-9A-Za-z_./:@#-]{0,399}$"
+)
+EXECUTION_OUTCOME_RECORD_KEYS = frozenset({
+    "schema_version",
+    "outcome_id",
+    "recorded_at_unix",
+    "recommendation_id",
+    "operation_class",
+    "risk_level",
+    "recommended_route",
+    "actual_route",
+    "first_pass_success",
+    "unchanged_retries",
+    "ambiguous_mutation_outcomes",
+    "tool_call_count",
+    "elapsed_ms",
+    "regression_signal",
+    "friction_event_ids",
+    "evidence_ref",
+})
+
+
+def _execution_enum(value: str, *, label: str, allowed: frozenset[str]) -> str:
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"{label} must be one of {sorted(allowed)}")
+    return value
+
+
+def _execution_int(value: int, *, label: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer")
+    if value < minimum or value > maximum:
+        raise ValueError(f"{label} must be between {minimum} and {maximum}")
+    return value
+
+
+def _execution_bool(value: bool, *, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} must be a boolean")
+    return value
+
+
+def _execution_sha256(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _execution_event_ids(values: list[str] | None) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        raise ValueError("friction_event_ids must be a list")
+    if len(values) > EXECUTION_GOVERNOR_MAX_EVENT_IDS:
+        raise ValueError("friction_event_ids has too many entries")
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        event_id = _validate_event_id(value)
+        if event_id not in seen:
+            result.append(event_id)
+            seen.add(event_id)
+    return result
+
+
+def _execution_friction_evidence(*, limit: int, prior_failure_class: str) -> dict[str, Any]:
+    summary = friction_summary(limit=limit)
+    classification = summary["failure_classification"]
+    unresolved = dict(classification.get("unresolved_by_failure_class", {}))
+    decision_events = classification.get("decision_required_events", [])
+    evidence_ids = [
+        str(event.get("event_id"))
+        for event in decision_events
+        if isinstance(event, dict)
+        and event.get("failure_class") in {prior_failure_class, "connector_transport", "platform_filter"}
+        and isinstance(event.get("event_id"), str)
+        and event.get("event_id")
+    ][:EXECUTION_GOVERNOR_MAX_EVENT_IDS]
+    event_invalid_lines = int(summary.get("invalid_lines", 0))
+    event_non_event_lines = int(summary.get("non_event_lines", 0))
+    fingerprint_payload = {
+        "unresolved_by_failure_class": dict(sorted(unresolved.items())),
+        "evidence_event_ids": evidence_ids,
+        "event_invalid_lines": event_invalid_lines,
+        "event_non_event_lines": event_non_event_lines,
+        "event_log_integrity_valid": (
+            summary.get("event_log_integrity", {}).get("integrity_valid") is True
+            and event_invalid_lines == 0
+            and event_non_event_lines == 0
+        ),
+        "decision_log_integrity_valid": summary.get("decision_log", {}).get("integrity_valid") is True,
+    }
+    return {
+        **fingerprint_payload,
+        "fingerprint_sha256": _execution_sha256(fingerprint_payload),
+    }
+
+
+def execution_shape_recommendation(
+    *,
+    operation_class: str,
+    risk_level: str,
+    may_mutate: bool,
+    command_count: int = 1,
+    expected_output_bytes: int = 0,
+    resource_keys_count: int = 1,
+    typed_tool_available: bool = False,
+    grip_available: bool = False,
+    durable_task_available: bool = False,
+    lease_state: str = "unknown",
+    prior_failure_class: str = "unknown",
+    transport_sensitive: bool = False,
+    post_state_read_available: bool = True,
+    friction_limit: int = 100,
+) -> dict[str, Any]:
+    operation_class = _execution_enum(
+        operation_class,
+        label="operation_class",
+        allowed=EXECUTION_OPERATION_CLASSES,
+    )
+    risk_level = _execution_enum(
+        risk_level,
+        label="risk_level",
+        allowed=EXECUTION_RISK_LEVELS,
+    )
+    lease_state = _execution_enum(
+        lease_state,
+        label="lease_state",
+        allowed=EXECUTION_LEASE_STATES,
+    )
+    prior_failure_class = _execution_enum(
+        prior_failure_class,
+        label="prior_failure_class",
+        allowed=FAILURE_CLASSES,
+    )
+    may_mutate = _execution_bool(may_mutate, label="may_mutate")
+    typed_tool_available = _execution_bool(
+        typed_tool_available,
+        label="typed_tool_available",
+    )
+    grip_available = _execution_bool(grip_available, label="grip_available")
+    durable_task_available = _execution_bool(
+        durable_task_available,
+        label="durable_task_available",
+    )
+    transport_sensitive = _execution_bool(
+        transport_sensitive,
+        label="transport_sensitive",
+    )
+    post_state_read_available = _execution_bool(
+        post_state_read_available,
+        label="post_state_read_available",
+    )
+    command_count = _execution_int(
+        command_count,
+        label="command_count",
+        minimum=1,
+        maximum=100,
+    )
+    expected_output_bytes = _execution_int(
+        expected_output_bytes,
+        label="expected_output_bytes",
+        minimum=0,
+        maximum=16 * 1024 * 1024,
+    )
+    resource_keys_count = _execution_int(
+        resource_keys_count,
+        label="resource_keys_count",
+        minimum=0,
+        maximum=100,
+    )
+    friction_limit = _execution_int(
+        friction_limit,
+        label="friction_limit",
+        minimum=1,
+        maximum=500,
+    )
+
+    mutating_classes = {"mutation", "external_mutation", "high_impact"}
+    if operation_class in mutating_classes and not may_mutate:
+        raise ValueError("mutating operation_class requires may_mutate=true")
+    if operation_class in {"read", "broad_read"} and may_mutate:
+        raise ValueError("read operation_class requires may_mutate=false")
+
+    friction = _execution_friction_evidence(
+        limit=friction_limit,
+        prior_failure_class=prior_failure_class,
+    )
+    unresolved = friction["unresolved_by_failure_class"]
+    recurring_transport = int(unresolved.get("connector_transport", 0)) >= 2
+    recurring_filter = int(unresolved.get("platform_filter", 0)) >= 2
+    high_impact = operation_class == "high_impact" or risk_level in {"high", "critical"}
+    broad_read = (
+        operation_class == "broad_read"
+        or command_count > 1
+        or expected_output_bytes > 65_536
+        or resource_keys_count > 3
+        or transport_sensitive
+        or prior_failure_class in {"connector_transport", "platform_filter"}
+    )
+
+    reasons: list[str] = []
+    preflight: list[str] = []
+    route_feasible = True
+    route: str
+    friction_integrity_valid = (
+        friction["event_log_integrity_valid"] is True
+        and friction["decision_log_integrity_valid"] is True
+    )
+
+    if not friction_integrity_valid:
+        route = "operator_stop"
+        route_feasible = False
+        reasons.append("friction_evidence_integrity_invalid")
+        preflight.append("repair or isolate the friction evidence before routing")
+    elif may_mutate and lease_state == "conflict":
+        route = "stop_resource_conflict"
+        route_feasible = False
+        reasons.append("resource_lease_conflict")
+        preflight.append("wait for or deliberately resolve the current resource owner")
+    elif may_mutate and not post_state_read_available:
+        route = "stop_missing_readback"
+        route_feasible = False
+        reasons.append("mutation_without_post_state_readback")
+        preflight.append("add a bounded target-state read before mutation")
+    elif may_mutate and prior_failure_class == "connector_transport":
+        route = "state_readback"
+        reasons.append("possible_mutation_outcome_unknown")
+        preflight.append("read the exact target state before considering another mutation")
+    elif prior_failure_class == "platform_filter":
+        route = "operator_stop"
+        route_feasible = False
+        reasons.append("platform_filter_requires_alternative_surface")
+        preflight.append("select a narrower allowed surface; do not retry unchanged")
+    elif prior_failure_class == "policy_gate":
+        route = "operator_stop"
+        route_feasible = False
+        reasons.append("policy_gate_requires_deliberate_evidence_or_policy_decision")
+        preflight.append("satisfy the gate evidence or change policy deliberately")
+    elif high_impact:
+        route = "explicit_preflight"
+        route_feasible = False
+        reasons.append("immutable_high_impact_boundary")
+        preflight.extend([
+            "bind target and scope",
+            "verify authorization and recovery evidence",
+            "verify current review and validation evidence",
+            "execute at most one mutation",
+            "read back the target state and retain a receipt",
+        ])
+    elif operation_class == "long_running" and durable_task_available:
+        route = "durable_task"
+        reasons.append("long_running_work_requires_durable_identity")
+        if may_mutate:
+            preflight.extend(["verify resource lease", "bind expected post-state readback"])
+    elif may_mutate:
+        if grip_available:
+            route = "grip"
+            reasons.append("receipt_bound_grip_available")
+        elif typed_tool_available:
+            route = "typed_tool"
+            reasons.append("typed_mutation_surface_available")
+        else:
+            route = "isolated_mutation"
+            reasons.append("no_narrower_typed_surface_available")
+        preflight.extend(["verify target and resource lease", "capture current target state"])
+    elif broad_read:
+        route = "split_read"
+        reasons.append("broad_or_transport_sensitive_read")
+        if typed_tool_available:
+            reasons.append("prefer_single_purpose_typed_reads")
+    elif typed_tool_available:
+        route = "typed_tool"
+        reasons.append("typed_read_surface_available")
+    elif grip_available:
+        route = "grip"
+        reasons.append("read_only_grip_available")
+    else:
+        route = "split_read"
+        reasons.append("fallback_to_bounded_single_purpose_reads")
+
+    if prior_failure_class == "platform_filter" and recurring_filter:
+        reasons.append("recurring_platform_filter_evidence")
+    if (prior_failure_class == "connector_transport" or transport_sensitive) and recurring_transport:
+        reasons.append("recurring_connector_transport_evidence")
+    if lease_state == "unknown" and may_mutate:
+        preflight.append("resolve resource lease state")
+
+    retry_limit = 0 if may_mutate or prior_failure_class == "platform_filter" else 1
+    if route.startswith("stop_") or route == "explicit_preflight":
+        retry_limit = 0
+
+    typed_input = {
+        "operation_class": operation_class,
+        "risk_level": risk_level,
+        "may_mutate": may_mutate,
+        "command_count": command_count,
+        "expected_output_bytes": expected_output_bytes,
+        "resource_keys_count": resource_keys_count,
+        "typed_tool_available": typed_tool_available,
+        "grip_available": grip_available,
+        "durable_task_available": durable_task_available,
+        "lease_state": lease_state,
+        "prior_failure_class": prior_failure_class,
+        "transport_sensitive": transport_sensitive,
+        "post_state_read_available": post_state_read_available,
+        "friction_fingerprint_sha256": friction["fingerprint_sha256"],
+    }
+    recommendation_id = _execution_sha256(typed_input)
+
+    return {
+        "schema_version": 1,
+        "authority": "proposal_only_shadow_mode",
+        "mode": "shadow",
+        "recommendation_id": recommendation_id,
+        "execution_authorized": False,
+        "route_feasible": route_feasible,
+        "recommended_route": route,
+        "reason_codes": reasons,
+        "action_shape": {
+            "batch_reads": route in {"typed_tool", "grip"} and not may_mutate,
+            "split_reads": route == "split_read",
+            "isolated_mutation": route in {"typed_tool", "grip", "isolated_mutation"}
+            and may_mutate,
+            "one_mutation_per_attempt": may_mutate,
+            "durable_identity": route == "durable_task",
+            "state_readback_only": route == "state_readback",
+            "stop": route.startswith("stop_") or route == "operator_stop",
+        },
+        "preflight_required": preflight,
+        "retry_policy": {
+            "retry_limit": retry_limit,
+            "unchanged_retry_allowed": False,
+            "platform_filter_rule": "do not retry the same blocked call unchanged",
+            "read_only_transport_rule": "retry at most once as smaller typed or single-purpose reads",
+            "possible_mutation_transport_rule": "classify outcome as unknown and read target state before any retry",
+        },
+        "post_state_readback": {
+            "required": may_mutate,
+            "available": post_state_read_available,
+            "unknown_outcome_until_readback": (
+                may_mutate and prior_failure_class == "connector_transport"
+            ),
+        },
+        "friction_evidence": friction,
+        "promotion": {
+            "applied": False,
+            "authority": "none_in_shadow_mode",
+            "eligible_risk_levels": ["low", "medium"],
+            "minimum_evidence": EXECUTION_GOVERNOR_MIN_EVIDENCE,
+            "time_decay_seconds": EXECUTION_GOVERNOR_DECAY_SECONDS,
+        },
+        "immutable_boundaries": list(EXECUTION_GOVERNOR_IMMUTABLE_BOUNDARIES),
+        "does_not_establish": list(EXECUTION_GOVERNOR_NON_CLAIMS),
+    }
+
+
+def _execution_evidence_ref(value: str) -> str:
+    text = _clean_text(value, label="evidence_ref", max_bytes=400)
+    if not EXECUTION_EVIDENCE_REF_RE.fullmatch(text):
+        raise ValueError(
+            "evidence_ref must use receipt:, task:, run:, pr:, artifact: or event:"
+        )
+    return text
+
+
+def _validated_execution_outcome_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != EXECUTION_OUTCOME_RECORD_KEYS:
+        return None
+    try:
+        if value.get("schema_version") != 1:
+            return None
+        outcome_id = value.get("outcome_id")
+        recommendation_id = value.get("recommendation_id")
+        if not isinstance(outcome_id, str) or not EXECUTION_OUTCOME_ID_RE.fullmatch(outcome_id):
+            return None
+        if (
+            not isinstance(recommendation_id, str)
+            or not EXECUTION_RECOMMENDATION_ID_RE.fullmatch(recommendation_id)
+        ):
+            return None
+        recorded_at_unix = _execution_int(
+            value.get("recorded_at_unix"),
+            label="recorded_at_unix",
+            minimum=0,
+            maximum=4_102_444_800,
+        )
+        operation_class = _execution_enum(
+            value.get("operation_class"),
+            label="operation_class",
+            allowed=EXECUTION_OPERATION_CLASSES,
+        )
+        risk_level = _execution_enum(
+            value.get("risk_level"),
+            label="risk_level",
+            allowed=EXECUTION_RISK_LEVELS,
+        )
+        recommended_route = _execution_enum(
+            value.get("recommended_route"),
+            label="recommended_route",
+            allowed=EXECUTION_ROUTES,
+        )
+        actual_route = _execution_enum(
+            value.get("actual_route"),
+            label="actual_route",
+            allowed=EXECUTION_ROUTES,
+        )
+        first_pass_success = _execution_bool(
+            value.get("first_pass_success"),
+            label="first_pass_success",
+        )
+        unchanged_retries = _execution_int(
+            value.get("unchanged_retries"),
+            label="unchanged_retries",
+            minimum=0,
+            maximum=20,
+        )
+        ambiguous_mutation_outcomes = _execution_int(
+            value.get("ambiguous_mutation_outcomes"),
+            label="ambiguous_mutation_outcomes",
+            minimum=0,
+            maximum=20,
+        )
+        tool_call_count = _execution_int(
+            value.get("tool_call_count"),
+            label="tool_call_count",
+            minimum=1,
+            maximum=1000,
+        )
+        elapsed_ms = _execution_int(
+            value.get("elapsed_ms"),
+            label="elapsed_ms",
+            minimum=0,
+            maximum=86_400_000,
+        )
+        regression_signal = _execution_bool(
+            value.get("regression_signal"),
+            label="regression_signal",
+        )
+        friction_event_ids = _execution_event_ids(value.get("friction_event_ids"))
+        evidence_ref = _execution_evidence_ref(value.get("evidence_ref"))
+    except (TypeError, ValueError):
+        return None
+    return {
+        "schema_version": 1,
+        "outcome_id": outcome_id,
+        "recorded_at_unix": recorded_at_unix,
+        "recommendation_id": recommendation_id,
+        "operation_class": operation_class,
+        "risk_level": risk_level,
+        "recommended_route": recommended_route,
+        "actual_route": actual_route,
+        "first_pass_success": first_pass_success,
+        "unchanged_retries": unchanged_retries,
+        "ambiguous_mutation_outcomes": ambiguous_mutation_outcomes,
+        "tool_call_count": tool_call_count,
+        "elapsed_ms": elapsed_ms,
+        "regression_signal": regression_signal,
+        "friction_event_ids": friction_event_ids,
+        "evidence_ref": evidence_ref,
+    }
+
+
+@contextmanager
+def _execution_outcome_log_lock(*, exclusive: bool):
+    lock_path = Path(f"{EXECUTION_OUTCOME_LOG}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        _require_private_regular_fd(fd, label=lock_path.name)
+        with os.fdopen(fd, "a+", encoding="utf-8") as handle:
+            fd = -1
+            fcntl.flock(
+                handle.fileno(),
+                fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+            )
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _execution_load_outcomes(*, limit: int) -> dict[str, Any]:
+    text = _read_private_text(
+        EXECUTION_OUTCOME_LOG,
+        max_bytes=EXECUTION_GOVERNOR_MAX_OUTCOME_BYTES,
+        require_private=True,
+    )
+    if text is None:
+        return {
+            "records": [],
+            "scanned_lines": 0,
+            "invalid_lines": 0,
+            "duplicate_outcome_ids": [],
+            "duplicate_outcome_ids_truncated": False,
+            "integrity_valid": True,
+        }
+    records: list[dict[str, Any]] = []
+    invalid_lines = 0
+    scanned_lines = 0
+    for line in reversed(text.splitlines()):
+        if len(records) >= limit:
+            break
+        if not line.strip():
+            continue
+        scanned_lines += 1
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            invalid_lines += 1
+            continue
+        record = _validated_execution_outcome_record(value)
+        if record is None:
+            invalid_lines += 1
+            continue
+        records.append(record)
+    records.reverse()
+    outcome_ids = [record["outcome_id"] for record in records]
+    duplicate_outcome_ids = sorted(
+        outcome_id
+        for outcome_id, count in Counter(outcome_ids).items()
+        if count > 1
+    )
+    return {
+        "records": records,
+        "scanned_lines": scanned_lines,
+        "invalid_lines": invalid_lines,
+        "duplicate_outcome_ids": duplicate_outcome_ids[:20],
+        "duplicate_outcome_ids_truncated": len(duplicate_outcome_ids) > 20,
+        "integrity_valid": not invalid_lines and not duplicate_outcome_ids,
+    }
+
+
+def record_execution_outcome(
+    *,
+    recommendation_id: str,
+    operation_class: str,
+    risk_level: str,
+    recommended_route: str,
+    actual_route: str,
+    first_pass_success: bool,
+    unchanged_retries: int,
+    ambiguous_mutation_outcomes: int,
+    tool_call_count: int,
+    elapsed_ms: int,
+    evidence_ref: str,
+    regression_signal: bool = False,
+    friction_event_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(recommendation_id, str) or not EXECUTION_RECOMMENDATION_ID_RE.fullmatch(
+        recommendation_id
+    ):
+        raise ValueError("recommendation_id must be a lowercase SHA-256 hex digest")
+    operation_class = _execution_enum(
+        operation_class,
+        label="operation_class",
+        allowed=EXECUTION_OPERATION_CLASSES,
+    )
+    risk_level = _execution_enum(
+        risk_level,
+        label="risk_level",
+        allowed=EXECUTION_RISK_LEVELS,
+    )
+    recommended_route = _execution_enum(
+        recommended_route,
+        label="recommended_route",
+        allowed=EXECUTION_ROUTES,
+    )
+    actual_route = _execution_enum(
+        actual_route,
+        label="actual_route",
+        allowed=EXECUTION_ROUTES,
+    )
+    first_pass_success = _execution_bool(
+        first_pass_success,
+        label="first_pass_success",
+    )
+    regression_signal = _execution_bool(
+        regression_signal,
+        label="regression_signal",
+    )
+    unchanged_retries = _execution_int(
+        unchanged_retries,
+        label="unchanged_retries",
+        minimum=0,
+        maximum=20,
+    )
+    ambiguous_mutation_outcomes = _execution_int(
+        ambiguous_mutation_outcomes,
+        label="ambiguous_mutation_outcomes",
+        minimum=0,
+        maximum=20,
+    )
+    tool_call_count = _execution_int(
+        tool_call_count,
+        label="tool_call_count",
+        minimum=1,
+        maximum=1000,
+    )
+    elapsed_ms = _execution_int(
+        elapsed_ms,
+        label="elapsed_ms",
+        minimum=0,
+        maximum=86_400_000,
+    )
+    event_ids = _execution_event_ids(friction_event_ids)
+    evidence_ref = _execution_evidence_ref(evidence_ref)
+    record = {
+        "schema_version": 1,
+        "outcome_id": uuid.uuid4().hex,
+        "recorded_at_unix": int(time.time()),
+        "recommendation_id": recommendation_id,
+        "operation_class": operation_class,
+        "risk_level": risk_level,
+        "recommended_route": recommended_route,
+        "actual_route": actual_route,
+        "first_pass_success": first_pass_success,
+        "unchanged_retries": unchanged_retries,
+        "ambiguous_mutation_outcomes": ambiguous_mutation_outcomes,
+        "tool_call_count": tool_call_count,
+        "elapsed_ms": elapsed_ms,
+        "regression_signal": regression_signal,
+        "friction_event_ids": event_ids,
+        "evidence_ref": evidence_ref,
+    }
+    with _execution_outcome_log_lock(exclusive=True):
+        existing = _execution_load_outcomes(limit=EXECUTION_GOVERNOR_MAX_RECORDS)
+        if existing["integrity_valid"] is not True:
+            raise RuntimeError("execution outcome ledger integrity is invalid")
+        if len(existing["records"]) >= EXECUTION_GOVERNOR_MAX_RECORDS:
+            raise RuntimeError("execution outcome ledger record limit reached")
+        _append_jsonl(EXECUTION_OUTCOME_LOG, record)
+    base._append_audit({
+        "timestamp_unix": record["recorded_at_unix"],
+        "operation": "execution-governor-outcome-record",
+        "outcome_id": record["outcome_id"],
+        "recommendation_id": recommendation_id,
+        "risk_level": risk_level,
+        "recommended_route": recommended_route,
+        "actual_route": actual_route,
+        "regression_signal": regression_signal,
+    })
+    return {
+        "recorded": True,
+        "outcome_id": record["outcome_id"],
+        "recommendation_id": recommendation_id,
+        "path": str(EXECUTION_OUTCOME_LOG),
+        "shadow_mode": True,
+        "promotion_applied": False,
+    }
+
+
+def execution_governor_summary(
+    *,
+    limit: int = 200,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    limit = _execution_int(limit, label="limit", minimum=1, maximum=500)
+    if now_unix is None:
+        now = int(time.time())
+    else:
+        now = _execution_int(
+            now_unix,
+            label="now_unix",
+            minimum=0,
+            maximum=4_102_444_800,
+        )
+    with _execution_outcome_log_lock(exclusive=False):
+        loaded = _execution_load_outcomes(limit=limit)
+    decayed_before = now - EXECUTION_GOVERNOR_DECAY_SECONDS
+    expired_records = [
+        record
+        for record in loaded["records"]
+        if record["recorded_at_unix"] < decayed_before
+    ]
+    future_records = [
+        record
+        for record in loaded["records"]
+        if record["recorded_at_unix"] > now + 60
+    ]
+    active_records = [
+        record
+        for record in loaded["records"]
+        if decayed_before <= record["recorded_at_unix"] <= now + 60
+    ]
+    ledger_integrity_valid = loaded["integrity_valid"] is True and not future_records
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for record in active_records:
+        key = (
+            str(record.get("operation_class", "unknown")),
+            str(record.get("risk_level", "unknown")),
+            str(record.get("recommended_route", "unknown")),
+        )
+        groups.setdefault(key, []).append(record)
+
+    candidates: list[dict[str, Any]] = []
+    for (operation_class, risk_level, route), records in sorted(groups.items()):
+        count = len(records)
+        successes = sum(record.get("first_pass_success") is True for record in records)
+        retries = sum(
+            int(record.get("unchanged_retries", 0))
+            for record in records
+            if isinstance(record.get("unchanged_retries", 0), int)
+        )
+        ambiguous = sum(
+            int(record.get("ambiguous_mutation_outcomes", 0))
+            for record in records
+            if isinstance(record.get("ambiguous_mutation_outcomes", 0), int)
+        )
+        regressions = sum(record.get("regression_signal") is True for record in records)
+        success_rate = successes / count if count else 0.0
+        average_unchanged_retries = retries / count if count else 0.0
+        circuit_breaker_open = (
+            not ledger_integrity_valid
+            or regressions >= 2
+            or ambiguous > 0
+            or (count >= EXECUTION_GOVERNOR_MIN_EVIDENCE and success_rate < 0.60)
+        )
+        eligible_risk = risk_level in {"low", "medium"}
+        eligible = (
+            eligible_risk
+            and count >= EXECUTION_GOVERNOR_MIN_EVIDENCE
+            and success_rate >= 0.80
+            and average_unchanged_retries <= 0.20
+            and ambiguous == 0
+            and regressions == 0
+            and not circuit_breaker_open
+        )
+        if not ledger_integrity_valid:
+            status = "disabled_by_integrity_gate"
+        elif not eligible_risk:
+            status = "excluded_high_risk"
+        elif circuit_breaker_open:
+            status = "disabled_by_circuit_breaker"
+        elif eligible:
+            status = "eligible_shadow_candidate"
+        else:
+            status = "insufficient_or_unproven_evidence"
+        candidates.append({
+            "operation_class": operation_class,
+            "risk_level": risk_level,
+            "route": route,
+            "active_evidence_count": count,
+            "minimum_evidence": EXECUTION_GOVERNOR_MIN_EVIDENCE,
+            "first_pass_success_rate": round(success_rate, 4),
+            "average_unchanged_retries": round(average_unchanged_retries, 4),
+            "ambiguous_mutation_outcomes": ambiguous,
+            "regression_signals": regressions,
+            "circuit_breaker_open": circuit_breaker_open,
+            "status": status,
+            "promotion_eligible": eligible,
+            "promotion_applied": False,
+            "reversible": True,
+            "rollback_state": "not_applicable_shadow_only",
+        })
+
+    summary_core = {
+        "schema_version": 1,
+        "authority": "shadow_evaluation_only",
+        "path": str(EXECUTION_OUTCOME_LOG),
+        "exists": EXECUTION_OUTCOME_LOG.exists(),
+        "limit": limit,
+        "scanned_lines": loaded["scanned_lines"],
+        "invalid_lines": loaded["invalid_lines"],
+        "duplicate_outcome_ids": loaded["duplicate_outcome_ids"],
+        "duplicate_outcome_ids_truncated": loaded["duplicate_outcome_ids_truncated"],
+        "ledger_integrity_valid": ledger_integrity_valid,
+        "returned": len(loaded["records"]),
+        "active_after_decay": len(active_records),
+        "expired_by_decay": len(expired_records),
+        "future_dated": len(future_records),
+        "decay_seconds": EXECUTION_GOVERNOR_DECAY_SECONDS,
+        "minimum_evidence": EXECUTION_GOVERNOR_MIN_EVIDENCE,
+        "candidates": candidates,
+        "live_promotions": [],
+        "automatic_live_routing_enabled": False,
+        "immutable_boundaries": list(EXECUTION_GOVERNOR_IMMUTABLE_BOUNDARIES),
+        "does_not_establish": list(EXECUTION_GOVERNOR_NON_CLAIMS),
+    }
+    return {
+        **summary_core,
+        "summary_sha256": _execution_sha256(summary_core),
+    }
+
+
+@mcp.tool(name="grabowski_execution_shape", annotations=READ_ONLY)
+def grabowski_execution_shape(
+    operation_class: str,
+    risk_level: str,
+    may_mutate: bool,
+    command_count: int = 1,
+    expected_output_bytes: int = 0,
+    resource_keys_count: int = 1,
+    typed_tool_available: bool = False,
+    grip_available: bool = False,
+    durable_task_available: bool = False,
+    lease_state: str = "unknown",
+    prior_failure_class: str = "unknown",
+    transport_sensitive: bool = False,
+    post_state_read_available: bool = True,
+    friction_limit: int = 100,
+) -> dict[str, Any]:
+    """Recommend one bounded execution shape from typed inputs and friction evidence."""
+    return execution_shape_recommendation(
+        operation_class=operation_class,
+        risk_level=risk_level,
+        may_mutate=may_mutate,
+        command_count=command_count,
+        expected_output_bytes=expected_output_bytes,
+        resource_keys_count=resource_keys_count,
+        typed_tool_available=typed_tool_available,
+        grip_available=grip_available,
+        durable_task_available=durable_task_available,
+        lease_state=lease_state,
+        prior_failure_class=prior_failure_class,
+        transport_sensitive=transport_sensitive,
+        post_state_read_available=post_state_read_available,
+        friction_limit=friction_limit,
+    )
+
+
+@mcp.tool(name="grabowski_execution_outcome_record", annotations=MUTATING)
+def grabowski_execution_outcome_record(
+    recommendation_id: str,
+    operation_class: str,
+    risk_level: str,
+    recommended_route: str,
+    actual_route: str,
+    first_pass_success: bool,
+    unchanged_retries: int,
+    ambiguous_mutation_outcomes: int,
+    tool_call_count: int,
+    elapsed_ms: int,
+    evidence_ref: str,
+    regression_signal: bool = False,
+    friction_event_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Record bounded predicted-versus-actual execution evidence in shadow mode."""
+    base._require_mutations_enabled("friction_record")
+    return record_execution_outcome(
+        recommendation_id=recommendation_id,
+        operation_class=operation_class,
+        risk_level=risk_level,
+        recommended_route=recommended_route,
+        actual_route=actual_route,
+        first_pass_success=first_pass_success,
+        unchanged_retries=unchanged_retries,
+        ambiguous_mutation_outcomes=ambiguous_mutation_outcomes,
+        tool_call_count=tool_call_count,
+        elapsed_ms=elapsed_ms,
+        evidence_ref=evidence_ref,
+        regression_signal=regression_signal,
+        friction_event_ids=friction_event_ids,
+    )
+
+
+@mcp.tool(name="grabowski_execution_governor_summary", annotations=READ_ONLY)
+def grabowski_execution_governor_summary(limit: int = 200) -> dict[str, Any]:
+    """Summarize shadow outcomes, decay and circuit-breaker candidates."""
+    return execution_governor_summary(limit=limit)

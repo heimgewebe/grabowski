@@ -429,6 +429,27 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_execution_shape": {
+        "category": "operations-observability",
+        "purpose": "Recommend one bounded execution shape from typed inputs and evidence-bound friction fingerprints without executing it.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_execution_outcome_record": {
+        "category": "operations-observability",
+        "purpose": "Append secret-free predicted-versus-actual routing outcomes for shadow evaluation.",
+        "risk_class": "medium",
+        "effects": ["state-append", "audit-record"],
+        "reversibility": "append-only-observation",
+    },
+    "grabowski_execution_governor_summary": {
+        "category": "operations-observability",
+        "purpose": "Summarize evidence thresholds, time decay and circuit-breaker state without enabling live routing.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_connector_transport_diagnostics": {
         "category": "operations-observability",
         "purpose": "Run bounded read-only diagnostics for connector transport failures.",
