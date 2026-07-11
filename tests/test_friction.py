@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,6 +24,7 @@ class FrictionLedgerContractTests(unittest.TestCase):
         source = (ROOT / "src/grabowski_friction.py").read_text(encoding="utf-8")
         self.assertIn('name="grabowski_friction_record"', source)
         self.assertIn('name="grabowski_friction_summary"', source)
+        self.assertIn('name="grabowski_friction_resolve"', source)
         self.assertIn('name="grabowski_connector_transport_diagnostics"', source)
         self.assertIn('MAX_TEXT_BYTES = 2000', source)
         self.assertIn('MAX_NOTE_COUNT = 20', source)
@@ -37,6 +39,34 @@ class FrictionLedgerContractTests(unittest.TestCase):
         self.assertIn('operator._redact(text)', source)
         self.assertIn('base._require_mutations_enabled("friction_record")', source)
         self.assertNotIn('operator._require_operator_mutation("friction_record")', source)
+
+    def test_decision_schema_is_strict_and_evidence_bound(self) -> None:
+        schema = json.loads((ROOT / "contracts/operator-friction-decision.v1.schema.json").read_text(encoding="utf-8"))
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 1)
+        self.assertIn("deferred", schema["properties"]["status"]["enum"])
+        self.assertIn("linked_to_task", schema["properties"]["status"]["enum"])
+        self.assertIn("evidence_ref", schema["required"])
+        self.assertIn("non_claims", schema["required"])
+
+        self.assertEqual(
+            set(schema["properties"]["status"]["enum"]),
+            {"resolved", "superseded", "deferred", "accepted_risk", "wont_fix", "linked_to_task"},
+        )
+        self.assertEqual(
+            schema["properties"]["non_claims"]["const"],
+            [
+                "does_not_prove_root_cause",
+                "does_not_authorize_task_resume",
+                "does_not_establish_merge_readiness",
+                "does_not_rewrite_raw_friction_history",
+                "does_not_make_a_linked_bureau_task_ready",
+            ],
+        )
+        condition_statuses = {
+            rule["if"]["properties"]["status"]["const"] for rule in schema["allOf"]
+        }
+        self.assertEqual(condition_statuses, {"deferred", "linked_to_task"})
 
 
 
@@ -120,6 +150,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
 
         self.addCleanup(restore_modules)
         module.FRICTION_LOG = root / "state" / "friction" / "events.jsonl"
+        module.FRICTION_DECISION_LOG = root / "state" / "friction" / "decisions.jsonl"
         return module
 
     def test_classifies_and_keeps_corrupt_lines_bounded(self) -> None:
@@ -1259,6 +1290,383 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertTrue(groups["review_loops"]["repeated"])
         self.assertFalse(groups["review_loops"]["actionable_repeated"])
 
+
+    def _write_closeout_events(self, module) -> None:
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "event_id": "filter-1",
+                "recorded_at_unix": 1,
+                "kind": "platform_filter",
+                "surface": "github",
+                "operation": "merge",
+                "symptom": "blocked",
+                "resolved": False,
+            },
+            {
+                "event_id": "filter-2",
+                "recorded_at_unix": 2,
+                "kind": "platform_filter",
+                "surface": "terminal",
+                "operation": "push",
+                "symptom": "blocked",
+                "resolved": False,
+            },
+            {
+                "event_id": "gate-1",
+                "recorded_at_unix": 3,
+                "kind": "fail_closed_gate",
+                "surface": "runtime",
+                "operation": "gate",
+                "symptom": "fail closed",
+                "resolved": False,
+            },
+        ]
+        module.FRICTION_LOG.write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+    def test_private_reader_rechecks_actual_bytes_after_metadata_bound(self) -> None:
+        module = self._load_module()
+        path = module.FRICTION_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"abcd")
+        real_fstat = module.os.fstat
+
+        def understated_fstat(fd: int):
+            metadata = real_fstat(fd)
+            return type("Metadata", (), {"st_mode": metadata.st_mode, "st_size": 1})()
+
+        with patch.object(module.os, "fstat", side_effect=understated_fstat):
+            with self.assertRaisesRegex(RuntimeError, "byte limit"):
+                module._read_private_text(path, max_bytes=2)
+
+    def test_closeout_loader_bounds_bytes_and_all_nonempty_lines(self) -> None:
+        module = self._load_module()
+        path = module.FRICTION_DECISION_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x" * 33, encoding="utf-8")
+        module.MAX_FRICTION_LEDGER_BYTES = 32
+        with self.assertRaisesRegex(RuntimeError, "byte limit"):
+            module._load_jsonl_records(path)
+
+        module.MAX_FRICTION_LEDGER_BYTES = 1024
+        path.write_text("not-json\nnot-json\nnot-json\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "line limit"):
+            module._load_jsonl_records(path, maximum=2)
+
+    def test_resolve_one_event_is_append_only_and_reduces_summary_noise(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        before = module.FRICTION_LOG.read_bytes()
+
+        result = module.resolve_friction(
+            event_id="filter-1",
+            status="resolved",
+            decision="Typed lifecycle grip now handles this operation.",
+            evidence_ref="pr:heimgewebe/grabowski#152",
+            resolved_by="chatgpt-grabowski",
+        )
+
+        self.assertEqual(result["appended_count"], 1)
+        self.assertEqual(module.FRICTION_LOG.read_bytes(), before)
+        summary = module.friction_summary(limit=10)
+        self.assertEqual(summary["schema_version"], 1)
+        self.assertEqual(summary["unresolved"], 2)
+        self.assertEqual(summary["resolution_counts"]["resolved"], 1)
+        event = next(item for item in summary["events"] if item["event_id"] == "filter-1")
+        self.assertEqual(event["resolution_status"], "resolved")
+        self.assertEqual(event["closeout"]["evidence_ref"], "pr:heimgewebe/grabowski#152")
+        self.assertEqual(summary["failure_classification"]["decision_required_count"], 2)
+
+    def test_resolve_class_can_defer_recurring_failure_class(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+
+        result = module.resolve_friction(
+            failure_class="platform_filter",
+            status="deferred",
+            decision="Defer old platform-filter incidents after provider-neutral replacement.",
+            evidence_ref="bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T019",
+            resolved_by="chatgpt-grabowski",
+            reason="Historical incidents are retained but no longer require individual action.",
+        )
+
+        self.assertEqual(result["target_count"], 2)
+        self.assertEqual(result["appended_count"], 2)
+        summary = module.friction_summary(limit=10)
+        self.assertEqual(summary["resolution_counts"]["deferred"], 2)
+        self.assertEqual(summary["unresolved"], 1)
+        self.assertEqual(summary["failure_classification"]["decision_required_count"], 1)
+
+    def test_class_closeout_is_bounded_and_reports_remaining_targets(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "event_id": f"filter-{index:03d}",
+                "recorded_at_unix": index,
+                "kind": "platform_filter",
+                "surface": "github",
+                "operation": "merge",
+                "symptom": "blocked",
+                "resolved": False,
+            }
+            for index in range(module.MAX_FRICTION_CLOSEOUT_BATCH + 2)
+        ]
+        module.FRICTION_LOG.write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+        first = module.resolve_friction(
+            failure_class="platform_filter",
+            status="deferred",
+            decision="Close one bounded batch.",
+            evidence_ref="receipt:bulk-1",
+            resolved_by="operator",
+            reason="Bounded triage batch.",
+        )
+        self.assertEqual(first["target_count"], module.MAX_FRICTION_CLOSEOUT_BATCH)
+        self.assertEqual(first["matched_target_count"], module.MAX_FRICTION_CLOSEOUT_BATCH + 2)
+        self.assertTrue(first["targets_truncated"])
+        self.assertEqual(first["remaining_target_count"], 2)
+        self.assertEqual(module.friction_summary(limit=500)["unresolved"], 2)
+
+        second = module.resolve_friction(
+            failure_class="platform_filter",
+            status="deferred",
+            decision="Close the remaining bounded batch.",
+            evidence_ref="receipt:bulk-2",
+            resolved_by="operator",
+            reason="Bounded triage batch.",
+        )
+        self.assertEqual(second["target_count"], 2)
+        self.assertFalse(second["targets_truncated"])
+        self.assertEqual(second["remaining_target_count"], 0)
+
+    def test_summary_ignores_closeout_for_duplicate_raw_event_id(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        module.resolve_friction(
+            event_id="filter-1",
+            status="resolved",
+            decision="Resolved before ledger duplication.",
+            evidence_ref="receipt:before-duplicate",
+            resolved_by="operator",
+        )
+        duplicate = {
+            "event_id": "filter-1",
+            "recorded_at_unix": 4,
+            "kind": "platform_filter",
+            "surface": "chat_tool",
+            "operation": "merge",
+            "symptom": "duplicate id",
+            "resolved": False,
+        }
+        with module.FRICTION_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(duplicate, sort_keys=True) + "\n")
+
+        summary = module.friction_summary(limit=10)
+        self.assertEqual(summary["unresolved"], 4)
+        self.assertFalse(summary["event_log_integrity"]["integrity_valid"])
+        self.assertEqual(summary["event_log_integrity"]["duplicate_event_ids"], ["filter-1"])
+        duplicate_events = [event for event in summary["events"] if event["event_id"] == "filter-1"]
+        self.assertEqual([event["resolution_status"] for event in duplicate_events], ["unresolved", "unresolved"])
+        with self.assertRaisesRegex(RuntimeError, "duplicate event_id"):
+            module.resolve_friction(
+                event_id="filter-1",
+                status="resolved",
+                decision="Must remain blocked.",
+                evidence_ref="receipt:duplicate",
+                resolved_by="operator",
+            )
+
+    def test_duplicate_closeout_is_idempotent_but_conflict_is_rejected(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        kwargs = {
+            "event_id": "filter-1",
+            "status": "resolved",
+            "decision": "Resolved by typed lifecycle.",
+            "evidence_ref": "receipt:abc",
+            "resolved_by": "operator",
+        }
+        first = module.resolve_friction(**kwargs)
+        second = module.resolve_friction(**kwargs)
+        self.assertEqual(first["appended_count"], 1)
+        self.assertEqual(second["appended_count"], 0)
+        self.assertEqual(second["already_recorded_count"], 1)
+        with self.assertRaisesRegex(ValueError, "different closeout"):
+            module.resolve_friction(**{**kwargs, "decision": "Conflicting decision."})
+
+    def test_invalid_event_and_deferred_without_reason_are_rejected(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        with self.assertRaisesRegex(ValueError, "event_id not found"):
+            module.resolve_friction(
+                event_id="missing",
+                status="resolved",
+                decision="No such event.",
+                evidence_ref="receipt:none",
+                resolved_by="operator",
+            )
+        with self.assertRaisesRegex(ValueError, "requires reason"):
+            module.resolve_friction(
+                event_id="filter-1",
+                status="deferred",
+                decision="Later.",
+                evidence_ref="bureau:TASK",
+                resolved_by="operator",
+            )
+
+    def test_malformed_closeout_fails_closed_for_summary_and_mutation(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        module.FRICTION_DECISION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        module.FRICTION_DECISION_LOG.write_text(
+            json.dumps({"event_id": "filter-1"}) + "\n",
+            encoding="utf-8",
+        )
+        module.FRICTION_DECISION_LOG.chmod(0o600)
+
+        summary = module.friction_summary(limit=10)
+        self.assertEqual(summary["unresolved"], 3)
+        self.assertFalse(summary["decision_log"]["integrity_valid"])
+        self.assertEqual(summary["decision_log"]["invalid_record_count"], 1)
+        with self.assertRaisesRegex(RuntimeError, "decision log integrity"):
+            module.resolve_friction(
+                event_id="filter-2",
+                status="resolved",
+                decision="Would otherwise close the event.",
+                evidence_ref="receipt:blocked",
+                resolved_by="operator",
+            )
+
+    def test_conflicting_duplicate_closeouts_do_not_suppress_event(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        module.resolve_friction(
+            event_id="filter-1",
+            status="resolved",
+            decision="Resolved by typed lifecycle.",
+            evidence_ref="receipt:first",
+            resolved_by="operator",
+        )
+        first = json.loads(module.FRICTION_DECISION_LOG.read_text(encoding="utf-8").splitlines()[0])
+        conflict = {
+            **first,
+            "closeout_id": "b" * 32,
+            "status": "deferred",
+            "decision": "Conflicting decision.",
+            "reason": "Later.",
+        }
+        with module.FRICTION_DECISION_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(conflict, sort_keys=True) + "\n")
+
+        summary = module.friction_summary(limit=10)
+        self.assertEqual(summary["unresolved"], 3)
+        self.assertFalse(summary["decision_log"]["integrity_valid"])
+        self.assertEqual(summary["decision_log"]["conflicting_event_ids"], ["filter-1"])
+
+    def test_linked_bureau_task_is_recorded_without_readiness_claim(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        result = module.resolve_friction(
+            event_id="gate-1",
+            status="linked_to_task",
+            decision="Track the gate remediation in Bureau.",
+            evidence_ref="bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T020",
+            resolved_by="operator",
+            bureau_task_id="GRABOWSKI-OPERATOR-SURFACE-V1-T020",
+        )
+        self.assertEqual(result["appended_count"], 1)
+        record = json.loads(module.FRICTION_DECISION_LOG.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(record["bureau_task_id"], "GRABOWSKI-OPERATOR-SURFACE-V1-T020")
+        self.assertIn("does_not_make_a_linked_bureau_task_ready", record["non_claims"])
+
+    def test_summary_ignores_closeout_with_failure_class_binding_mismatch(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        module.resolve_friction(
+            event_id="filter-1",
+            status="resolved",
+            decision="valid before tamper",
+            evidence_ref="receipt:binding",
+            resolved_by="operator",
+        )
+        record = json.loads(module.FRICTION_DECISION_LOG.read_text(encoding="utf-8"))
+        record["failure_class"] = "policy_gate"
+        module.FRICTION_DECISION_LOG.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        module.FRICTION_DECISION_LOG.chmod(0o600)
+
+        summary = module.friction_summary(limit=10)
+        self.assertEqual(summary["unresolved"], 3)
+        self.assertFalse(summary["event_log_integrity"]["integrity_valid"])
+        self.assertEqual(
+            summary["event_log_integrity"]["closeout_binding_mismatch_event_ids"],
+            ["filter-1"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "closeout binding mismatch"):
+            module.resolve_friction(
+                event_id="filter-2",
+                status="resolved",
+                decision="must remain blocked",
+                evidence_ref="receipt:binding-block",
+                resolved_by="operator",
+            )
+
+    def test_summary_read_rejects_event_log_symlink(self) -> None:
+        module = self._load_module()
+        target = module.FRICTION_LOG.parent / "summary-target.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n", encoding="utf-8")
+        module.FRICTION_LOG.symlink_to(target)
+        with self.assertRaises(OSError):
+            module.friction_summary(limit=10)
+
+    def test_append_rejects_symlink_and_nonprivate_ledgers(self) -> None:
+        module = self._load_module()
+        target = module.FRICTION_LOG.parent / "target.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+        module.FRICTION_LOG.symlink_to(target)
+        with self.assertRaises(OSError):
+            module.record_friction_event(
+                kind="operator_bug",
+                surface="runtime",
+                operation="symlink smoke",
+                symptom="must fail closed",
+            )
+
+        module.FRICTION_LOG.unlink()
+        module.FRICTION_LOG.write_text("", encoding="utf-8")
+        module.FRICTION_LOG.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "private owner-controlled"):
+            module.record_friction_event(
+                kind="operator_bug",
+                surface="runtime",
+                operation="mode smoke",
+                symptom="must fail closed",
+            )
+
+    def test_decision_lock_rejects_symlink(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        lock_path = Path(f"{module.FRICTION_DECISION_LOG}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        target = lock_path.parent / "lock-target"
+        target.write_text("", encoding="utf-8")
+        lock_path.symlink_to(target)
+        with self.assertRaises(OSError):
+            module.resolve_friction(
+                event_id="filter-1",
+                status="resolved",
+                decision="must not follow lock symlink",
+                evidence_ref="receipt:lock-smoke",
+                resolved_by="operator",
+            )
 
 
 if __name__ == "__main__":

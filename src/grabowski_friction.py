@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
+import stat as statmod
 import subprocess
 import time
 import uuid
@@ -25,6 +28,32 @@ FRICTION_LOG = Path(os.environ.get(
     "GRABOWSKI_FRICTION_LOG",
     str(operator.STATE_DIR / "friction/events.jsonl"),
 )).expanduser()
+FRICTION_DECISION_LOG = Path(os.environ.get(
+    "GRABOWSKI_FRICTION_DECISION_LOG",
+    str(operator.STATE_DIR / "friction/decisions.jsonl"),
+)).expanduser()
+FRICTION_CLOSEOUT_STATUSES = frozenset({
+    "resolved",
+    "superseded",
+    "deferred",
+    "accepted_risk",
+    "wont_fix",
+    "linked_to_task",
+})
+FRICTION_CLOSEOUT_NON_CLAIMS = (
+    "does_not_prove_root_cause",
+    "does_not_authorize_task_resume",
+    "does_not_establish_merge_readiness",
+    "does_not_rewrite_raw_friction_history",
+    "does_not_make_a_linked_bureau_task_ready",
+)
+FRICTION_EVENT_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_.:-]{0,127}$")
+FRICTION_CLOSEOUT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+FRICTION_CLOSED_AT_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+BUREAU_TASK_ID_RE = re.compile(r"^[A-Z0-9][A-Z0-9_.:-]{0,199}$")
+MAX_FRICTION_RECORDS = 10000
+MAX_FRICTION_LEDGER_BYTES = 16 * 1024 * 1024
+MAX_FRICTION_CLOSEOUT_BATCH = 100
 
 FRICTION_KINDS = {
     "platform_filter",
@@ -359,21 +388,32 @@ def _validate_enum(value: str, *, label: str, allowed: set[str]) -> str:
     return value
 
 
+def _require_private_regular_fd(fd: int, *, label: str) -> None:
+    metadata = os.fstat(fd)
+    if (
+        not statmod.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise RuntimeError(f"{label} must be a private owner-controlled regular file")
+
+
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o600)
     try:
+        _require_private_regular_fd(fd, label=path.name)
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            fd = -1
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
     finally:
-        try:
+        if fd >= 0:
             os.close(fd)
-        except OSError:
-            pass
 
 
 def _redacted_string(value: Any) -> str:
@@ -419,6 +459,7 @@ def _event_haystack(event: dict[str, Any]) -> str:
 
 def _bounded_event(event: dict[str, Any]) -> dict[str, Any]:
     notes = event.get("notes")
+    closeout = event.get("closeout") if isinstance(event.get("closeout"), dict) else None
     return {
         "event_id": _bounded_summary_text(event.get("event_id"), max_chars=80),
         "recorded_at_unix": (
@@ -433,6 +474,22 @@ def _bounded_event(event: dict[str, Any]) -> dict[str, Any]:
         "suspected_trigger": _bounded_summary_text(event.get("suspected_trigger")),
         "fallback": _bounded_summary_text(event.get("fallback")),
         "resolved": event.get("resolved") is True,
+        "resolution_status": (
+            _bounded_summary_text(closeout.get("status"), max_chars=40)
+            if closeout is not None
+            else ("legacy_resolved" if event.get("resolved") is True else "unresolved")
+        ),
+        "closeout": (
+            {
+                "decision": _bounded_summary_text(closeout.get("decision")),
+                "evidence_ref": _bounded_summary_text(closeout.get("evidence_ref")),
+                "resolved_by": _bounded_summary_text(closeout.get("resolved_by"), max_chars=120),
+                "closed_at": _bounded_summary_text(closeout.get("closed_at"), max_chars=40),
+                "bureau_task_id": _bounded_summary_text(closeout.get("bureau_task_id"), max_chars=200),
+            }
+            if closeout is not None
+            else None
+        ),
         "notes_count": len(notes) if isinstance(notes, list) else 0,
     }
 
@@ -1293,17 +1350,353 @@ def record_friction_event(
     }
 
 
+def _validate_event_id(value: str) -> str:
+    text = _clean_text(value, label="event_id", max_bytes=128)
+    if not FRICTION_EVENT_ID_RE.fullmatch(text):
+        raise ValueError("event_id has invalid format")
+    return text
+
+
+def _validate_bureau_task_id(value: str) -> str:
+    text = _clean_text(value, label="bureau_task_id", max_bytes=200)
+    if not BUREAU_TASK_ID_RE.fullmatch(text):
+        raise ValueError("bureau_task_id has invalid format")
+    return text
+
+
+def _read_private_text(path: Path, *, max_bytes: int, require_private: bool = False) -> str | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        metadata = os.fstat(fd)
+        if not statmod.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"{path.name} is not a regular file")
+        if require_private:
+            _require_private_regular_fd(fd, label=path.name)
+        size_bytes = metadata.st_size
+        if size_bytes > max_bytes:
+            raise RuntimeError(f"{path.name} exceeds bounded byte limit")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            payload = handle.read(max_bytes + 1)
+        if len(payload) > max_bytes:
+            raise RuntimeError(f"{path.name} exceeds bounded byte limit")
+        return payload.decode("utf-8")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _load_jsonl_records(
+    path: Path,
+    *,
+    maximum: int = MAX_FRICTION_RECORDS,
+    require_private: bool = False,
+) -> dict[str, Any]:
+    text = _read_private_text(
+        path,
+        max_bytes=MAX_FRICTION_LEDGER_BYTES,
+        require_private=require_private,
+    )
+    if text is None:
+        return {"records": [], "scanned_lines": 0, "invalid_lines": 0, "non_object_lines": 0}
+    records: list[dict[str, Any]] = []
+    scanned_lines = 0
+    invalid_lines = 0
+    non_object_lines = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        scanned_lines += 1
+        if scanned_lines > maximum:
+            raise RuntimeError(f"{path.name} exceeds bounded line limit")
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            invalid_lines += 1
+            continue
+        if not isinstance(value, dict):
+            non_object_lines += 1
+            continue
+        records.append(value)
+    return {
+        "records": records,
+        "scanned_lines": scanned_lines,
+        "invalid_lines": invalid_lines,
+        "non_object_lines": non_object_lines,
+    }
+
+
+@contextmanager
+def _decision_log_lock(*, exclusive: bool):
+    lock_path = Path(f"{FRICTION_DECISION_LOG}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        _require_private_regular_fd(fd, label=lock_path.name)
+        with os.fdopen(fd, "a+", encoding="utf-8") as handle:
+            fd = -1
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _valid_closeout_record(record: dict[str, Any]) -> bool:
+    required = {
+        "schema_version", "closeout_id", "event_id", "failure_class", "decision",
+        "status", "evidence_ref", "resolved_by", "closed_at", "closed_at_unix",
+        "reason", "bureau_task_id", "non_claims",
+    }
+    if set(record) != required or record.get("schema_version") != 1:
+        return False
+    if not isinstance(record.get("closeout_id"), str) or not FRICTION_CLOSEOUT_ID_RE.fullmatch(record["closeout_id"]):
+        return False
+    if not isinstance(record.get("event_id"), str) or not FRICTION_EVENT_ID_RE.fullmatch(record["event_id"]):
+        return False
+    if record.get("failure_class") not in FAILURE_CLASSES or record.get("status") not in FRICTION_CLOSEOUT_STATUSES:
+        return False
+    for key, maximum in (("decision", MAX_TEXT_BYTES), ("evidence_ref", MAX_TEXT_BYTES), ("resolved_by", 200), ("reason", MAX_TEXT_BYTES), ("bureau_task_id", 200)):
+        value = record.get(key)
+        if not isinstance(value, str) or "\x00" in value or len(value.encode("utf-8")) > maximum:
+            return False
+    if not record["decision"].strip() or not record["evidence_ref"].strip() or not record["resolved_by"].strip():
+        return False
+    if record["status"] == "deferred" and not record["reason"].strip():
+        return False
+    if record["bureau_task_id"] and not BUREAU_TASK_ID_RE.fullmatch(record["bureau_task_id"]):
+        return False
+    if record["status"] == "linked_to_task" and not record["bureau_task_id"]:
+        return False
+    if not isinstance(record.get("closed_at"), str) or not FRICTION_CLOSED_AT_RE.fullmatch(record["closed_at"]):
+        return False
+    closed_at_unix = record.get("closed_at_unix")
+    if isinstance(closed_at_unix, bool) or not isinstance(closed_at_unix, int) or closed_at_unix < 0:
+        return False
+    return record.get("non_claims") == list(FRICTION_CLOSEOUT_NON_CLAIMS)
+
+
+def _closeout_index() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    loaded = _load_jsonl_records(FRICTION_DECISION_LOG, require_private=True)
+    index: dict[str, dict[str, Any]] = {}
+    invalid_record_count = 0
+    duplicate_event_ids: set[str] = set()
+    conflicting_event_ids: set[str] = set()
+    for record in loaded["records"]:
+        if not _valid_closeout_record(record):
+            invalid_record_count += 1
+            continue
+        event_id = record["event_id"]
+        existing = index.get(event_id)
+        if existing is not None:
+            duplicate_event_ids.add(event_id)
+            if _closeout_signature(existing) != _closeout_signature(record):
+                conflicting_event_ids.add(event_id)
+            continue
+        index[event_id] = record
+    for event_id in conflicting_event_ids:
+        index.pop(event_id, None)
+    integrity_valid = not any((
+        loaded["invalid_lines"],
+        loaded["non_object_lines"],
+        invalid_record_count,
+        duplicate_event_ids,
+        conflicting_event_ids,
+    ))
+    return index, {
+        "path": str(FRICTION_DECISION_LOG),
+        "exists": FRICTION_DECISION_LOG.exists(),
+        "records": len(loaded["records"]),
+        "scanned_lines": loaded["scanned_lines"],
+        "valid_records": len(index),
+        "invalid_lines": loaded["invalid_lines"],
+        "non_object_lines": loaded["non_object_lines"],
+        "invalid_record_count": invalid_record_count,
+        "invalid_records": invalid_record_count,
+        "duplicate_event_ids": sorted(duplicate_event_ids)[:20],
+        "duplicate_event_ids_truncated": len(duplicate_event_ids) > 20,
+        "conflicting_event_ids": sorted(conflicting_event_ids)[:20],
+        "conflicting_event_ids_truncated": len(conflicting_event_ids) > 20,
+        "integrity_valid": integrity_valid,
+    }
+
+
+def _closeout_signature(record: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(record.get(key) for key in (
+        "event_id",
+        "status",
+        "decision",
+        "evidence_ref",
+        "resolved_by",
+        "reason",
+        "bureau_task_id",
+    ))
+
+
+def _closeout_binding_mismatch_ids(
+    events: list[dict[str, Any]],
+    closeouts: dict[str, dict[str, Any]],
+) -> list[str]:
+    mismatches: set[str] = set()
+    for event in events:
+        if not _has_event_id(event):
+            continue
+        event_id = _event_id(event)
+        closeout = closeouts.get(event_id)
+        if closeout is not None and closeout.get("failure_class") != classify_friction_event(event):
+            mismatches.add(event_id)
+    return sorted(mismatches)
+
+
+def resolve_friction(
+    *,
+    status: str,
+    decision: str,
+    evidence_ref: str,
+    resolved_by: str,
+    event_id: str = "",
+    failure_class: str = "",
+    reason: str = "",
+    bureau_task_id: str = "",
+) -> dict[str, Any]:
+    event_selector = _clean_text(event_id, label="event_id", required=False, max_bytes=128)
+    class_selector = _clean_text(failure_class, label="failure_class", required=False, max_bytes=80)
+    if bool(event_selector) == bool(class_selector):
+        raise ValueError("exactly one of event_id or failure_class is required")
+    if event_selector:
+        event_selector = _validate_event_id(event_selector)
+    if class_selector and class_selector not in FAILURE_CLASSES:
+        raise ValueError(f"failure_class must be one of {sorted(FAILURE_CLASSES)}")
+    closeout_status = _validate_enum(status, label="status", allowed=set(FRICTION_CLOSEOUT_STATUSES))
+    clean_decision = _clean_text(decision, label="decision")
+    clean_evidence_ref = _clean_text(evidence_ref, label="evidence_ref")
+    clean_resolved_by = _clean_text(resolved_by, label="resolved_by", max_bytes=200)
+    clean_reason = _clean_text(reason, label="reason", required=False)
+    clean_task_id = _validate_bureau_task_id(bureau_task_id) if bureau_task_id else ""
+    if closeout_status == "deferred" and not clean_reason:
+        raise ValueError("deferred closeout requires reason")
+    if closeout_status == "linked_to_task" and not clean_task_id:
+        raise ValueError("linked_to_task closeout requires bureau_task_id")
+
+    raw = _load_jsonl_records(FRICTION_LOG)
+    events = [record for record in raw["records"] if _has_event_id(record)]
+    event_ids = [_event_id(event) for event in events]
+    duplicate_raw_ids = sorted(event_id for event_id, count in Counter(event_ids).items() if count > 1)
+    if duplicate_raw_ids:
+        raise RuntimeError("friction ledger contains duplicate event_id values")
+    by_id = {_event_id(event): event for event in events}
+    now_unix = int(time.time())
+    closed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_unix))
+    appended: list[dict[str, Any]] = []
+    already_recorded: list[str] = []
+
+    with _decision_log_lock(exclusive=True):
+        closeouts, closeout_meta = _closeout_index()
+        if closeout_meta["duplicate_event_ids"]:
+            raise RuntimeError("friction decision log contains duplicate closeouts")
+        if not closeout_meta["integrity_valid"]:
+            raise RuntimeError("friction decision log integrity is invalid")
+        binding_mismatches = _closeout_binding_mismatch_ids(events, closeouts)
+        if binding_mismatches:
+            raise RuntimeError(
+                "friction decision log closeout binding mismatch: " + ",".join(binding_mismatches[:20])
+            )
+        if event_selector:
+            if event_selector not in by_id:
+                raise ValueError("event_id not found in friction ledger")
+            targets = [by_id[event_selector]]
+        else:
+            matching_targets = [
+                event
+                for event in events
+                if classify_friction_event(event) == class_selector
+                and event.get("resolved") is not True
+                and _event_id(event) not in closeouts
+            ]
+            targets = matching_targets[:MAX_FRICTION_CLOSEOUT_BATCH]
+
+        matched_target_count = len(targets) if event_selector else len(matching_targets)
+        targets_truncated = matched_target_count > len(targets)
+        remaining_target_count = matched_target_count - len(targets)
+
+        for event in targets:
+            target_event_id = _event_id(event)
+            candidate = {
+                "schema_version": 1,
+                "closeout_id": uuid.uuid4().hex,
+                "event_id": target_event_id,
+                "failure_class": classify_friction_event(event),
+                "decision": clean_decision,
+                "status": closeout_status,
+                "evidence_ref": clean_evidence_ref,
+                "resolved_by": clean_resolved_by,
+                "closed_at": closed_at,
+                "closed_at_unix": now_unix,
+                "reason": clean_reason,
+                "bureau_task_id": clean_task_id,
+                "non_claims": list(FRICTION_CLOSEOUT_NON_CLAIMS),
+            }
+            existing = closeouts.get(target_event_id)
+            if existing is not None:
+                if _closeout_signature(existing) == _closeout_signature(candidate):
+                    already_recorded.append(target_event_id)
+                    continue
+                raise ValueError(f"event_id already has a different closeout: {target_event_id}")
+            _append_jsonl(FRICTION_DECISION_LOG, candidate)
+            closeouts[target_event_id] = candidate
+            appended.append(candidate)
+
+    base._append_audit({
+        "timestamp_unix": now_unix,
+        "operation": "friction-resolve",
+        "selector": event_selector or class_selector,
+        "selector_kind": "event_id" if event_selector else "failure_class",
+        "status": closeout_status,
+        "appended_count": len(appended),
+        "already_recorded_count": len(already_recorded),
+        "event_ids": [record["event_id"] for record in appended][:20],
+    })
+    return {
+        "schema_version": 1,
+        "path": str(FRICTION_DECISION_LOG),
+        "selector": {
+            "event_id": event_selector or None,
+            "failure_class": class_selector or None,
+        },
+        "status": closeout_status,
+        "target_count": len(targets),
+        "matched_target_count": matched_target_count,
+        "targets_truncated": targets_truncated,
+        "remaining_target_count": remaining_target_count,
+        "max_batch_size": MAX_FRICTION_CLOSEOUT_BATCH,
+        "appended_count": len(appended),
+        "already_recorded_count": len(already_recorded),
+        "closeout_ids": [record["closeout_id"] for record in appended],
+        "event_ids": [record["event_id"] for record in appended],
+        "already_recorded_event_ids": already_recorded,
+        "decision_log_before": closeout_meta,
+        "non_claims": list(FRICTION_CLOSEOUT_NON_CLAIMS),
+    }
+
+
 def _load_event_records(limit: int) -> dict[str, Any]:
-    if not FRICTION_LOG.exists():
+    text = _read_private_text(FRICTION_LOG, max_bytes=MAX_FRICTION_LEDGER_BYTES)
+    if text is None:
         return {
             "events": [],
             "scanned_lines": 0,
             "invalid_lines": 0,
             "non_event_lines": 0,
         }
-    if FRICTION_LOG.is_symlink() or not FRICTION_LOG.is_file():
-        raise RuntimeError("friction log is not a regular file")
-    lines = FRICTION_LOG.read_text(encoding="utf-8").splitlines()
+    lines = text.splitlines()
     reversed_events: list[dict[str, Any]] = []
     scanned_lines = 0
     invalid_lines = 0
@@ -1341,33 +1734,73 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
         raise ValueError("limit must be between 1 and 500")
     records = _load_event_records(limit)
     events = list(records["events"])
+    event_ids = [_event_id(event) for event in events if _has_event_id(event)]
+    duplicate_event_ids = sorted(
+        event_id for event_id, count in Counter(event_ids).items() if count > 1
+    )
+    with _decision_log_lock(exclusive=False):
+        closeouts, closeout_meta = _closeout_index()
+    closeout_binding_mismatch_event_ids: list[str] = []
+    if not closeout_meta["integrity_valid"]:
+        closeouts = {}
+    else:
+        for event_id in duplicate_event_ids:
+            closeouts.pop(event_id, None)
+        closeout_binding_mismatch_event_ids = _closeout_binding_mismatch_ids(events, closeouts)
+        for event_id in closeout_binding_mismatch_event_ids:
+            closeouts.pop(event_id, None)
+    event_log_integrity = {
+        "duplicate_event_ids": duplicate_event_ids[:20],
+        "duplicate_event_ids_truncated": len(duplicate_event_ids) > 20,
+        "integrity_valid": not duplicate_event_ids and not closeout_binding_mismatch_event_ids,
+        "scope": "returned_recent_valid_events",
+        "closeout_policy": "ignore closeouts for duplicate event ids or failure-class binding mismatches",
+        "closeout_binding_mismatch_event_ids": sorted(closeout_binding_mismatch_event_ids)[:20],
+        "closeout_binding_mismatch_event_ids_truncated": len(closeout_binding_mismatch_event_ids) > 20,
+    }
     by_kind: dict[str, int] = {}
     by_surface: dict[str, int] = {}
-    unresolved = 0
-    for event in events:
+    resolution_counts: Counter[str] = Counter()
+    overlaid_events: list[dict[str, Any]] = []
+    for original in events:
+        event = dict(original)
+        event_id = _event_id(event) if _has_event_id(event) else ""
+        closeout = closeouts.get(event_id)
+        if closeout is not None:
+            event["closeout"] = closeout
+            event["resolved"] = True
+            resolution_counts[str(closeout.get("status") or "unknown")] += 1
+        elif event.get("resolved") is True:
+            resolution_counts["legacy_resolved"] += 1
+        else:
+            resolution_counts["unresolved"] += 1
         kind = _known_enum_value(event.get("kind"), FRICTION_KINDS)
         surface = _known_enum_value(event.get("surface"), FRICTION_SURFACES)
         by_kind[kind] = by_kind.get(kind, 0) + 1
         by_surface[surface] = by_surface.get(surface, 0) + 1
-        if event.get("resolved") is not True:
-            unresolved += 1
+        overlaid_events.append(event)
+    unresolved = resolution_counts["unresolved"]
     return {
         "schema_version": 1,
+        "decision_overlay_schema_version": 1,
         "path": str(FRICTION_LOG),
         "exists": FRICTION_LOG.exists(),
+        "decision_log": closeout_meta,
+        "event_log_integrity": event_log_integrity,
         "limit": limit,
         "limit_scope": "recent_valid_events",
         "scanned_lines": records["scanned_lines"],
         "invalid_lines": records["invalid_lines"],
         "non_event_lines": records["non_event_lines"],
-        "returned": len(events),
+        "returned": len(overlaid_events),
         "unresolved": unresolved,
+        "resolution_counts": dict(sorted(resolution_counts.items())),
         "by_kind": dict(sorted(by_kind.items())),
         "by_surface": dict(sorted(by_surface.items())),
-        "failure_classification": classify_failure_events(events),
-        "connector_transport_diagnostics": connector_transport_diagnostics(events),
-        "next_grip_proposals": propose_next_grip_from_friction(events),
-        "events": [_bounded_event(event) for event in events],
+        "failure_classification": classify_failure_events(overlaid_events),
+        "connector_transport_diagnostics": connector_transport_diagnostics(overlaid_events),
+        "next_grip_proposals": propose_next_grip_from_friction(overlaid_events),
+        "events": [_bounded_event(event) for event in overlaid_events],
     }
 
 
@@ -1393,6 +1826,31 @@ def grabowski_friction_record(
         fallback=fallback,
         resolved=resolved,
         notes=notes,
+    )
+
+
+@mcp.tool(name="grabowski_friction_resolve", annotations=MUTATING)
+def grabowski_friction_resolve(
+    status: str,
+    decision: str,
+    evidence_ref: str,
+    resolved_by: str,
+    event_id: str = "",
+    failure_class: str = "",
+    reason: str = "",
+    bureau_task_id: str = "",
+) -> dict[str, Any]:
+    """Append evidence-bound friction closeout decisions without rewriting history."""
+    base._require_mutations_enabled("friction_record")
+    return resolve_friction(
+        status=status,
+        decision=decision,
+        evidence_ref=evidence_ref,
+        resolved_by=resolved_by,
+        event_id=event_id,
+        failure_class=failure_class,
+        reason=reason,
+        bureau_task_id=bureau_task_id,
     )
 
 

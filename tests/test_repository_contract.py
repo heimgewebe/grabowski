@@ -105,6 +105,11 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('"python_runtime_identity_valid"', source)
         self.assertNotIn('"manifest_valid"', source)
 
+    def test_make_test_uses_unique_test_home(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn('mktemp -d "$(CURDIR)/build/test-home.XXXXXX"', makefile)
+        self.assertNotIn('test_home="$(CURDIR)/build/test-home"', makefile)
+
     def test_runtime_entrypoint_contract_exists(self) -> None:
         contract = json.loads(
             (
@@ -117,7 +122,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 105)
+        self.assertEqual(len(tools), 106)
         legacy_tools = {
             "grabowski_status",
             "grabowski_context",
@@ -161,6 +166,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("grabowski_privileged_action_reference", tools)
         self.assertIn("grabowski_recovery_server_probe", tools)
         self.assertIn("grabowski_friction_record", tools)
+        self.assertIn("grabowski_friction_resolve", tools)
         self.assertIn("grabowski_friction_summary", tools)
         self.assertIn("grabowski_connector_transport_diagnostics", tools)
         self.assertIn("grabowski_operator_recall_export", tools)

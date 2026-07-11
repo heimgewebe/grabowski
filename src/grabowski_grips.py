@@ -1865,11 +1865,16 @@ def _run_branch_publish(
 
 
 def _open_pr_from_stdout(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
+    if not isinstance(value, list):
         raise GripActionError("unexpected PR lookup output")
-    return value
+    if len(value) > 1:
+        raise GripActionError("multiple open PRs found for branch")
+    if not value:
+        return None
+    item = value[0]
+    if not isinstance(item, dict):
+        raise GripActionError("unexpected PR lookup item")
+    return item
 
 
 def _run_pr_create_or_update(
@@ -1941,8 +1946,6 @@ def _run_pr_create_or_update(
             "open",
             "--json",
             "number,url,baseRefName,headRefName,headRefOid",
-            "--jq",
-            ".[0] // null",
         ],
     ))
     existing = _open_pr_from_stdout(lookup)
@@ -3676,6 +3679,82 @@ def _captain_pr_merge_post_view(
     return last_viewed, attempts, last_errors, summary
 
 
+CAPTAIN_PR_MERGE_METHOD_PREFERENCE = (
+    ("merge", "allow_merge_commit", "--merge"),
+    ("squash", "allow_squash_merge", "--squash"),
+    ("rebase", "allow_rebase_merge", "--rebase"),
+)
+
+
+def _captain_repository_merge_policy(
+    repo_path: Path,
+    github_runner: GithubRunner,
+    *,
+    repo_slug: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
+    policy_args = [
+        "api",
+        f"repos/{repo_slug}",
+        "--jq",
+        "{allow_merge_commit,allow_squash_merge,allow_rebase_merge}",
+    ]
+    try:
+        policy_result = github_runner(repo_path, policy_args)
+    except Exception as exc:  # pragma: no cover - defensive receipt boundary
+        policy_result = {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": f"gh api runner exception: {type(exc).__name__}: {exc}",
+        }
+    info = {"command": ["gh", *policy_args], **_command_result_info(policy_result)}
+    if info["returncode"] != 0:
+        raw_error = info.get("stderr") or info.get("stdout") or "gh api repository policy failed"
+        info["error"] = raw_error
+        return None, info, ["repository_merge_policy_query_failed"]
+    try:
+        raw_policy = _json_stdout(policy_result)
+    except GripActionError as exc:
+        info["error"] = str(exc)
+        return None, info, ["repository_merge_policy_invalid_json"]
+    if not isinstance(raw_policy, dict):
+        info["error"] = "unexpected repository merge policy output"
+        return None, info, ["repository_merge_policy_not_mapping"]
+
+    settings: dict[str, bool] = {}
+    invalid_fields: list[str] = []
+    for _method, field, _flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE:
+        value = raw_policy.get(field)
+        if not isinstance(value, bool):
+            invalid_fields.append(field)
+        else:
+            settings[field] = value
+    if invalid_fields:
+        info["invalid_fields"] = invalid_fields
+        return None, info, [f"repository_merge_policy_invalid_fields:{','.join(invalid_fields)}"]
+
+    allowed_methods = [
+        method
+        for method, field, _flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE
+        if settings[field]
+    ]
+    if not allowed_methods:
+        return None, info, ["repository_all_merge_methods_disabled"]
+    selected_method, selected_field, selected_flag = next(
+        (method, field, flag)
+        for method, field, flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE
+        if settings[field]
+    )
+    policy = {
+        "settings": settings,
+        "allowed_methods": allowed_methods,
+        "selected_method": selected_method,
+        "selected_policy_field": selected_field,
+        "selected_flag": selected_flag,
+        "preference_order": [method for method, _field, _flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE],
+    }
+    return policy, info, []
+
+
 def _run_captain_pr_merge(
     repo_path: Path,
     action: dict[str, Any],
@@ -3721,6 +3800,18 @@ def _run_captain_pr_merge(
         execution_result["preflight_errors"] = preflight_errors
         execution_result["verification_error"] = "pre-execution PR state did not match the bound target; merge not attempted"
         return execution_result
+    merge_policy, merge_policy_query, merge_policy_errors = _captain_repository_merge_policy(
+        repo_path,
+        github_runner,
+        repo_slug=repo_slug,
+    )
+    execution_result["merge_policy_query"] = merge_policy_query
+    execution_result["merge_policy"] = merge_policy
+    if merge_policy_errors or merge_policy is None:
+        execution_result["preflight_errors"] = merge_policy_errors
+        detail = "; ".join(merge_policy_errors) if merge_policy_errors else "repository_merge_policy_unavailable"
+        execution_result["verification_error"] = f"repository merge policy unavailable; merge not attempted: {detail}"
+        return execution_result
     execution_result["preflight_passed"] = True
     merge_args = [
         "pr",
@@ -3728,7 +3819,7 @@ def _run_captain_pr_merge(
         pr_number,
         "--repo",
         repo_slug,
-        "--merge",
+        merge_policy["selected_flag"],
         "--match-head-commit",
         expected_head,
     ]

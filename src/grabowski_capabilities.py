@@ -415,6 +415,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["state-append", "audit-record"],
         "reversibility": "append-only-observation",
     },
+    "grabowski_friction_resolve": {
+        "category": "operations-observability",
+        "purpose": "Append evidence-bound closeout decisions for friction events or classes without rewriting history.",
+        "risk_class": "medium",
+        "effects": ["state-append", "audit-record"],
+        "reversibility": "append-only-decision",
+    },
     "grabowski_friction_summary": {
         "category": "operations-observability",
         "purpose": "Summarize recent bounded operator-friction events.",
