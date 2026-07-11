@@ -134,7 +134,7 @@ class FakeGh:
         self.merge_exception = merge_exception
         self.view_sequence = list(view_sequence or [])
         self.view_results = list(view_results or [])
-        self.repo_settings = repo_settings or {
+        self.repo_settings = repo_settings if repo_settings is not None else {
             "allow_merge_commit": True,
             "allow_squash_merge": True,
             "allow_rebase_merge": True,
@@ -2895,6 +2895,13 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         for gh, expected in (
             (FakeGh(view=matching_view, repo_settings_returncode=1), "repository_merge_policy_query_failed"),
             (FakeGh(view=matching_view, repo_settings_invalid_json=True), "repository_merge_policy_invalid_json"),
+            (
+                FakeGh(view=matching_view, repo_settings={
+                    "allow_merge_commit": True,
+                    "allow_squash_merge": False,
+                }),
+                "repository_merge_policy_invalid_fields:allow_rebase_merge",
+            ),
             (
                 FakeGh(view=matching_view, repo_settings={
                     "allow_merge_commit": False,

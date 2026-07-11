@@ -66,6 +66,7 @@ Class-wide closeouts are deterministic and bounded to 100 events per call. The r
 `grabowski_friction_summary` overlays valid closeouts onto recent events and reports separate lifecycle counts. Closed, superseded, deferred, accepted-risk, won't-fix and task-linked events no longer inflate `decision_required_count` or proposal-only recommendations. The raw event ledger remains append-only and unchanged.
 
 The decision log is read under a local file lock and validated before use. Malformed records or duplicate/conflicting decisions fail closed: summaries ignore the untrusted closeouts, and new closeout mutations stop until the ledger is repaired.
+Ledger reads reject symlinks, enforce bounded bytes after the file descriptor is opened and require private ownership/mode for decision evidence. A closeout whose stored failure class no longer matches its raw event is treated as an integrity failure: summaries leave the event open and mutations stop.
 
 ## Connector transport failures
 
