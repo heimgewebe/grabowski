@@ -179,6 +179,8 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     'grabowski_execution_shape': (),
     'grabowski_execution_outcome_record': ('friction_record',),
     'grabowski_execution_governor_summary': (),
+    'grabowski_agent_bootstrap': (),
+    'grabowski_call_shape_check': (),
     'grabowski_connector_transport_diagnostics': ('user_service_control',),
     'grabowski_operator_recall_export': (),
     'grabowski_resource_acquire': ('resource_lease',),

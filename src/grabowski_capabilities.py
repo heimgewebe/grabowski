@@ -450,6 +450,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_agent_bootstrap": {
+        "category": "operations-observability",
+        "purpose": "Return a release-evidence-bound adaptive agent entry capsule without authorizing execution.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_call_shape_check": {
+        "category": "operations-observability",
+        "purpose": "Deterministically lint one proposed tool-call shape before execution.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_connector_transport_diagnostics": {
         "category": "operations-observability",
         "purpose": "Run bounded read-only diagnostics for connector transport failures.",

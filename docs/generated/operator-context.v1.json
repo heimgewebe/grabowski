@@ -1367,6 +1367,28 @@
       "reversibility": "preserved-worktree-and-branch",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_close"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Return a bounded adaptive agent entry capsule for the current runtime evidence.",
+      "effects": [],
+      "id": "grabowski_agent_bootstrap",
+      "purpose": "Return a release-evidence-bound adaptive agent entry capsule without authorizing execution.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_bootstrap"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Lint one proposed tool-call shape before execution without authorizing it.",
+      "effects": [],
+      "id": "grabowski_call_shape_check",
+      "purpose": "Deterministically lint one proposed tool-call shape before execution.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_call_shape_check"
     }
   ],
   "integrity": {
@@ -1551,7 +1573,9 @@
       "grabowski_agent_workspace_status",
       "grabowski_agent_workspace_attach",
       "grabowski_agent_workspace_collect",
-      "grabowski_agent_workspace_close"
+      "grabowski_agent_workspace_close",
+      "grabowski_agent_bootstrap",
+      "grabowski_call_shape_check"
     ],
     "module": "grabowski_operator",
     "source": "src/grabowski_runtime.py",
@@ -1663,6 +1687,10 @@
       {
         "module": "grabowski_agent_writer",
         "source": "src/grabowski_agent_writer.py"
+      },
+      {
+        "module": "grabowski_agent_bootstrap",
+        "source": "src/grabowski_agent_bootstrap.py"
       }
     ]
   },
@@ -1674,7 +1702,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "31baee805136d667b2a397888e799da8a300774134cae4915bbae829b1deeff0"
+      "sha256": "99d15a5580a35ec1011f1f7afe99cc4c6ab92c3ee023650a9298ace58902bb10"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1682,22 +1710,23 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "9e073354720c82bbb8ca52787b6249d41806d057a0b6a2dcea7f2d02fe8a8f3f"
+      "sha256": "c47063baadaec7dbe8189fd25f21040299de713a37aa5539610ad42f1522ea84"
     },
     "runtime_sources": {
+      "src/grabowski_agent_bootstrap.py": "c413e520172f70296c42e18e4c0f1fcb95a1931afa0fda7b7c36dba4b2d52e56",
       "src/grabowski_agent_role.py": "496ce69903653725be8cffbb23b0e0b6a62b336dfc15bb8f82ff1e44e8acc1f9",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
       "src/grabowski_agent_workspace.py": "8d6111a214274ee0b605ec51d7ecc655fd2987317560c30cfe939f18fa17ac53",
       "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "31baee805136d667b2a397888e799da8a300774134cae4915bbae829b1deeff0",
+      "src/grabowski_capabilities.py": "99d15a5580a35ec1011f1f7afe99cc4c6ab92c3ee023650a9298ace58902bb10",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "15f4de8cacfaacfb6d5e1bc95bb82064d800bdbb46fd8ce67901f0bdf8a2ee8c",
       "src/grabowski_grip_orchestration.py": "2c1d594433f92edbae23adc43a303b212bfff89d298121c516974d790259051d",
       "src/grabowski_grips.py": "6e8c2eba1cad3ff7e2db8533411f8ae04710e377b79e0de6a3013a4cd74e6706",
-      "src/grabowski_mcp.py": "e3a8ddbe7944cb183bc17936270bc17f2d6b7bb611cfb72560a6285cd518978d",
+      "src/grabowski_mcp.py": "88bd0c41b0f65ba62a23ccc6c3aebf281343e2c66914afd5c3dc6a04452c08a9",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "7aaaca985ccf404934fd1dd07d7a718d69cb0b23826691da9096f6f3d4f20e54",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",
@@ -1706,7 +1735,7 @@
       "src/grabowski_recovery.py": "b0c5124271498639f6c16614ccb51f7b3b696ebfd88011ad2291d353e56d0fe6",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
-      "src/grabowski_runtime.py": "0cea86d3e646f19478f6777ef722925980f3046d24ff25fc9c3f4080c9439ed7",
+      "src/grabowski_runtime.py": "6446b3ebc0d20c251a3af6fbe7dd1d630ae8afb859742417d19465b6c7f7d551",
       "src/grabowski_runtime_extensions.py": "8b73b1d98d0aaa35f3c2c5efecf1198b90344600cfd73ebd188a6a175142d574",
       "src/grabowski_self_deploy.py": "1c4a9517564c2b17c39a87a076e397f0bcb2f428467be782b1b48007b063a49a",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",

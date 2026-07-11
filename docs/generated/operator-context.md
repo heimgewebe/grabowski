@@ -134,6 +134,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_workspace_attach` | agent-workspace | yes | low | Return the exact attach command for an existing non-authoritative tmux workspace UI. |
 | `grabowski_agent_workspace_collect` | agent-workspace | no | high | Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt. |
 | `grabowski_agent_workspace_close` | agent-workspace | no | high | Close one collected workspace while preserving its branch and writer worktree. |
+| `grabowski_agent_bootstrap` | operations-observability | yes | low | Return a release-evidence-bound adaptive agent entry capsule without authorizing execution. |
+| `grabowski_call_shape_check` | operations-observability | yes | low | Deterministically lint one proposed tool-call shape before execution. |
 
 ## Policy contract
 
