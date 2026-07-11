@@ -29,6 +29,9 @@ TASK_UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
 WORKER_UNIT = re.compile(
     r"grabowski-(browser|gui)-worker-([0-9a-f]{20})\.service\Z"
 )
+LEGACY_SELF_DEPLOY_COLLECTION = re.compile(
+    r"legacy-self-deploy-without-finalization-([0-9]{10})\Z"
+)
 TERMINAL_TASK_STATES = {
     "completed",
     "failed",
@@ -51,6 +54,13 @@ MAX_WORKER_OBSERVATION_JSON_BYTES = 128 * 1024
 WORKER_EVIDENCE_CLOCK_SKEW_SECONDS = 300
 MAX_RETENTION_RECEIPT_ATTEMPTS = 16
 MAX_RETENTION_RECEIPT_BYTES = 16 * 1024 * 1024
+MAX_LEGACY_ARCHIVE_COLLECTIONS = 64
+MAX_LEGACY_ARCHIVE_ROOT_ENTRIES = 4_000
+MAX_LEGACY_ARCHIVE_ENTRIES = 512
+MAX_LEGACY_COLLECTION_BYTES = 256 * 1024 * 1024
+LEGACY_SELF_DEPLOY_REASON = (
+    "legacy self-deploy completed and superseded, but lacks finalization receipt"
+)
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -445,6 +455,319 @@ def _worker_reset_evidence(
         "systemd_state": systemd_projection,
         "terminal_evidence": "worker_db_and_systemd_failed_without_live_leases",
     }
+
+
+def _validate_legacy_self_deploy_collection(
+    collection: Path,
+    *,
+    jobs_root: Path,
+) -> dict[str, Any]:
+    directory = _private_directory(collection)
+    collection_match = LEGACY_SELF_DEPLOY_COLLECTION.fullmatch(directory.name)
+    if collection_match is None:
+        raise RuntimeError("legacy collection name is outside the typed contract")
+    manifest, manifest_file_sha256 = _read_json_file(directory / "manifest.json")
+    expected_manifest_keys = {
+        "schema_version",
+        "created_at_unix",
+        "repo_head",
+        "operation",
+        "reversible",
+        "entries",
+    }
+    if set(manifest) != expected_manifest_keys or manifest.get("schema_version") != 1:
+        raise RuntimeError("legacy collection manifest shape is invalid")
+    created_at = manifest.get("created_at_unix")
+    repo_head = manifest.get("repo_head")
+    if (
+        isinstance(created_at, bool)
+        or not isinstance(created_at, int)
+        or created_at < 0
+        or not isinstance(repo_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", repo_head) is None
+        or created_at != int(collection_match.group(1))
+        or manifest.get("operation") != "archive_legacy_self_deploy_jobs"
+        or manifest.get("reversible") is not True
+    ):
+        raise RuntimeError("legacy collection manifest identity is invalid")
+    entries = manifest.get("entries")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_LEGACY_ARCHIVE_ENTRIES:
+        raise RuntimeError("legacy collection entry list is invalid")
+    expected_entry_keys = {
+        "destination",
+        "expected_head",
+        "metadata_sha256",
+        "reason",
+        "source",
+        "stdout_sha256",
+        "unit",
+    }
+    names: list[str] = []
+    verified: list[dict[str, Any]] = []
+    observed_collection_bytes = (directory / "manifest.json").stat().st_size
+    if observed_collection_bytes > MAX_LEGACY_COLLECTION_BYTES:
+        raise RuntimeError("legacy collection exceeds its total byte bound")
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != expected_entry_keys:
+            raise RuntimeError("legacy collection entry shape is invalid")
+        unit = entry.get("unit")
+        expected_head = entry.get("expected_head")
+        if (
+            not isinstance(unit, str)
+            or JOB_NAME.fullmatch(unit) is None
+            or not isinstance(expected_head, str)
+            or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None
+            or entry.get("reason") != LEGACY_SELF_DEPLOY_REASON
+        ):
+            raise RuntimeError("legacy collection entry identity is invalid")
+        destination = directory / unit
+        if entry.get("destination") != str(destination):
+            raise RuntimeError(f"legacy collection destination is unbound: {unit}")
+        if entry.get("source") != str(jobs_root / unit):
+            raise RuntimeError(f"legacy collection source is unbound: {unit}")
+        child = _private_directory(destination)
+        if child.parent != directory:
+            raise RuntimeError(f"legacy collection child escaped its root: {unit}")
+        child_entries = []
+        for path in child.iterdir():
+            child_entries.append(path)
+            if len(child_entries) > 4:
+                raise RuntimeError(f"legacy collection child file set is invalid: {unit}")
+        actual_files = sorted(path.name for path in child_entries)
+        allowed_file_sets = {
+            ("metadata.json", "stderr.log", "stdout.log"),
+            ("finalization.json", "metadata.json", "stderr.log", "stdout.log"),
+        }
+        if tuple(actual_files) not in allowed_file_sets:
+            raise RuntimeError(f"legacy collection child file set is invalid: {unit}")
+        metadata, metadata_file_sha256 = _read_json_file(child / "metadata.json")
+        metadata_size = (child / "metadata.json").stat().st_size
+        stdout_size, stdout_sha256 = _private_file_digest(
+            child / "stdout.log", max_bytes=MAX_ARCHIVE_FILE_BYTES
+        )
+        stderr_size, stderr_sha256 = _private_file_digest(
+            child / "stderr.log", max_bytes=MAX_ARCHIVE_FILE_BYTES
+        )
+        observed_collection_bytes += metadata_size + stdout_size + stderr_size
+        if observed_collection_bytes > MAX_LEGACY_COLLECTION_BYTES:
+            raise RuntimeError("legacy collection exceeds its total byte bound")
+        if (
+            metadata_file_sha256 != entry.get("metadata_sha256")
+            or stdout_sha256 != entry.get("stdout_sha256")
+        ):
+            raise RuntimeError(f"legacy collection content hash mismatch: {unit}")
+        argv = metadata.get("argv")
+        expected_head_positions = (
+            [
+                index
+                for index in range(len(argv) - 1)
+                if argv[index] == "--expected-head"
+            ]
+            if isinstance(argv, list)
+            and 1 <= len(argv) <= 128
+            and all(
+                isinstance(value, str)
+                and "\x00" not in value
+                and len(value.encode("utf-8")) <= 4096
+                for value in argv
+            )
+            else []
+        )
+        expected_head_bound = (
+            len(expected_head_positions) == 1
+            and argv[expected_head_positions[0] + 1] == expected_head
+        )
+        if metadata.get("unit") != unit or not expected_head_bound:
+            raise RuntimeError(f"legacy collection metadata binding is invalid: {unit}")
+        finalization_projection: dict[str, Any] | None = None
+        if "finalization.json" in actual_files:
+            finalization, finalization_file_sha256 = _read_json_file(
+                child / "finalization.json"
+            )
+            observed_collection_bytes += (child / "finalization.json").stat().st_size
+            if observed_collection_bytes > MAX_LEGACY_COLLECTION_BYTES:
+                raise RuntimeError("legacy collection exceeds its total byte bound")
+            expected_finalization_keys = {
+                "argv_sha256",
+                "completion_status",
+                "expected_head",
+                "failure_type",
+                "final_status",
+                "job_id",
+                "kind",
+                "payload_sha256",
+                "receipt_paths",
+                "release_id",
+                "repo_head",
+                "schema_version",
+                "timestamp_unix",
+                "unit",
+            }
+            payload_sha256 = finalization.get("payload_sha256")
+            payload_material = {
+                key: value
+                for key, value in finalization.items()
+                if key != "payload_sha256"
+            }
+            receipt_paths = finalization.get("receipt_paths")
+            expected_receipt_paths = {
+                "finalization": str(jobs_root / unit / "finalization.json"),
+                "metadata": str(jobs_root / unit / "metadata.json"),
+                "stderr": str(jobs_root / unit / "stderr.log"),
+                "stdout": str(jobs_root / unit / "stdout.log"),
+            }
+            timestamp_unix = finalization.get("timestamp_unix")
+            release_id = finalization.get("release_id")
+            if (
+                set(finalization) != expected_finalization_keys
+                or finalization.get("schema_version") != 1
+                or finalization.get("kind") != "grabowski_runtime_deploy_finalization"
+                or finalization.get("unit") != unit
+                or finalization.get("job_id") != unit.removeprefix("grabowski-job-")
+                or finalization.get("expected_head") != expected_head
+                or finalization.get("repo_head") != expected_head
+                or finalization.get("completion_status") != "complete"
+                or finalization.get("final_status") != "completed"
+                or finalization.get("failure_type") is not None
+                or finalization.get("argv_sha256") != metadata.get("argv_sha256")
+                or receipt_paths != expected_receipt_paths
+                or isinstance(timestamp_unix, bool)
+                or not isinstance(timestamp_unix, int)
+                or timestamp_unix < 0
+                or not isinstance(release_id, str)
+                or not release_id
+                or len(release_id.encode("utf-8")) > 512
+                or not isinstance(payload_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None
+                or _sha256(payload_material) != payload_sha256
+            ):
+                raise RuntimeError(
+                    f"legacy collection finalization binding is invalid: {unit}"
+                )
+            finalization_projection = {
+                "file_sha256": finalization_file_sha256,
+                "payload_sha256": payload_sha256,
+                "release_id": finalization.get("release_id"),
+            }
+        names.append(unit)
+        verified.append({
+            "unit": unit,
+            "expected_head": expected_head,
+            "metadata_sha256": metadata_file_sha256,
+            "stdout_sha256": stdout_sha256,
+            "stderr_sha256": stderr_sha256,
+            "finalization": finalization_projection,
+        })
+    if len(names) != len(set(names)):
+        raise RuntimeError("legacy collection contains duplicate units")
+    collection_entries = []
+    for path in directory.iterdir():
+        collection_entries.append(path)
+        if len(collection_entries) > MAX_LEGACY_ARCHIVE_ENTRIES + 1:
+            raise RuntimeError("legacy collection directory membership exceeds its bound")
+    actual_directories = sorted(path.name for path in collection_entries if path.is_dir())
+    actual_non_directories = sorted(
+        path.name for path in collection_entries if not path.is_dir()
+    )
+    if actual_directories != sorted(names) or actual_non_directories != ["manifest.json"]:
+        raise RuntimeError("legacy collection directory membership is invalid")
+    return {
+        "collection": directory.name,
+        "valid": True,
+        "entry_count": len(verified),
+        "observed_bytes": observed_collection_bytes,
+        "created_at_unix": created_at,
+        "repo_head": repo_head,
+        "manifest_file_sha256": manifest_file_sha256,
+        "observed_entries_sha256": _sha256(verified),
+        "reversible": True,
+        "bound_files_per_entry": ["metadata.json", "stdout.log"],
+        "self_bound_optional_files": ["finalization.json"],
+        "self_bound_finalization_count": sum(
+            1 for item in verified if item["finalization"] is not None
+        ),
+        "observed_unbound_files_per_entry": ["stderr.log"],
+    }
+
+
+def _legacy_archive_collection_statuses(
+    archive_root: Path,
+    *,
+    jobs_root: Path,
+) -> list[dict[str, Any]]:
+    if not archive_root.exists() and not archive_root.is_symlink():
+        return []
+    root = _private_directory(archive_root)
+    candidates: list[Path] = []
+    root_entry_count = 0
+    for path in root.iterdir():
+        root_entry_count += 1
+        if root_entry_count > MAX_LEGACY_ARCHIVE_ROOT_ENTRIES:
+            raise RuntimeError("legacy archive root scan exceeds its bound")
+        if path.name.startswith("legacy-self-deploy-without-finalization-"):
+            candidates.append(path)
+            if len(candidates) > MAX_LEGACY_ARCHIVE_COLLECTIONS:
+                raise RuntimeError("legacy archive collection scan exceeds its bound")
+    candidates.sort()
+    statuses: list[dict[str, Any]] = []
+    for candidate in candidates:
+        match = LEGACY_SELF_DEPLOY_COLLECTION.fullmatch(candidate.name)
+        if match is None:
+            statuses.append({
+                "collection": candidate.name,
+                "valid": False,
+                "error": "legacy collection name is outside the typed contract",
+            })
+            continue
+        try:
+            statuses.append(
+                _validate_legacy_self_deploy_collection(
+                    candidate,
+                    jobs_root=jobs_root,
+                )
+            )
+        except RuntimeError as exc:
+            statuses.append({
+                "collection": candidate.name,
+                "valid": False,
+                "error": str(exc)[:240],
+            })
+    return statuses
+
+
+def legacy_archive_status(
+    *,
+    archive_root: Path = ARCHIVE_ROOT,
+    jobs_root: Path = JOBS_ROOT,
+    now: int | None = None,
+) -> dict[str, Any]:
+    jobs = _private_directory(jobs_root)
+    collections = _legacy_archive_collection_statuses(
+        archive_root,
+        jobs_root=jobs,
+    )
+    observed_at = int(time.time()) if now is None else now
+    if isinstance(observed_at, bool) or not isinstance(observed_at, int) or observed_at < 0:
+        raise ValueError("now must be a non-negative integer")
+    material = {
+        "schema_version": 1,
+        "authority": "read_only_legacy_archive_evidence",
+        "observed_at_unix": observed_at,
+        "jobs_root": str(jobs),
+        "archive_root": str(archive_root),
+        "collection_count": len(collections),
+        "valid_collection_count": sum(1 for item in collections if item.get("valid") is True),
+        "invalid_collection_count": sum(1 for item in collections if item.get("valid") is not True),
+        "collections": collections,
+        "does_not_establish": [
+            "job_completion_outside_bound_legacy_evidence",
+            "safe_cleanup_or_deletion",
+            "runtime_health",
+            "mutation_authority",
+            "migration_authority",
+        ],
+    }
+    return {**material, "status_sha256": _sha256(material)}
 
 
 def _job_record(
@@ -1350,8 +1673,23 @@ def main() -> int:
     )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--expected-plan-sha256")
+    parser.add_argument("--legacy-archive-status", action="store_true")
     args = parser.parse_args()
     try:
+        if args.legacy_archive_status:
+            if args.apply or args.expected_plan_sha256:
+                raise ValueError(
+                    "--legacy-archive-status is incompatible with apply arguments"
+                )
+            print(
+                json.dumps(
+                    legacy_archive_status(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                )
+            )
+            return 0
         plan = build_plan(
             minimum_job_age_seconds=args.minimum_job_age_seconds,
             max_archive_jobs=args.max_archive_jobs,

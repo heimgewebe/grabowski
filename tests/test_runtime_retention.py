@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -162,6 +163,101 @@ class RuntimeRetentionTests(unittest.TestCase):
         resource_db.chmod(0o600)
         return worker_db, resource_db, unit
 
+    def _legacy_collection(
+        self,
+        jobs: Path,
+        archive: Path,
+        *,
+        tamper_stdout: bool = False,
+        include_finalization: bool = False,
+        tamper_finalization: bool = False,
+    ) -> Path:
+        jobs.mkdir(mode=0o700, exist_ok=True)
+        archive.mkdir(mode=0o700, exist_ok=True)
+        collection = archive / "legacy-self-deploy-without-finalization-1783721038"
+        collection.mkdir(mode=0o700)
+        unit = "grabowski-job-012345abcdef"
+        child = collection / unit
+        child.mkdir(mode=0o700)
+        expected_head = "a" * 40
+        metadata_bytes = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "unit": unit,
+                    "argv": ["python3", "runner.py", "--expected-head", expected_head],
+                    "argv_sha256": "c" * 64,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode()
+        stdout_bytes = b"PASS: Deployment erfolgreich\n"
+        stderr_bytes = b""
+        for name, payload in (
+            ("metadata.json", metadata_bytes),
+            ("stdout.log", stdout_bytes),
+            ("stderr.log", stderr_bytes),
+        ):
+            target = child / name
+            target.write_bytes(payload)
+            target.chmod(0o600)
+        if include_finalization:
+            finalization_material = {
+                "argv_sha256": "c" * 64,
+                "completion_status": "complete",
+                "expected_head": expected_head,
+                "failure_type": None,
+                "final_status": "completed",
+                "job_id": unit.removeprefix("grabowski-job-"),
+                "kind": "grabowski_runtime_deploy_finalization",
+                "receipt_paths": {
+                    "finalization": str(jobs / unit / "finalization.json"),
+                    "metadata": str(jobs / unit / "metadata.json"),
+                    "stderr": str(jobs / unit / "stderr.log"),
+                    "stdout": str(jobs / unit / "stdout.log"),
+                },
+                "release_id": "release-test",
+                "repo_head": expected_head,
+                "schema_version": 1,
+                "timestamp_unix": 1_000,
+                "unit": unit,
+            }
+            finalization = {
+                **finalization_material,
+                "payload_sha256": RETENTION._sha256(finalization_material),
+            }
+            if tamper_finalization:
+                finalization["repo_head"] = "d" * 40
+            finalization_path = child / "finalization.json"
+            finalization_path.write_text(json.dumps(finalization, sort_keys=True) + "\n")
+            finalization_path.chmod(0o600)
+        manifest = {
+            "schema_version": 1,
+            "created_at_unix": 1_783_721_038,
+            "repo_head": "b" * 40,
+            "operation": "archive_legacy_self_deploy_jobs",
+            "reversible": True,
+            "entries": [
+                {
+                    "destination": str(child),
+                    "expected_head": expected_head,
+                    "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+                    "reason": RETENTION.LEGACY_SELF_DEPLOY_REASON,
+                    "source": str(jobs / unit),
+                    "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+                    "unit": unit,
+                }
+            ],
+        }
+        manifest_path = collection / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+        manifest_path.chmod(0o600)
+        if tamper_stdout:
+            (child / "stdout.log").write_text("tampered\n")
+            (child / "stdout.log").chmod(0o600)
+        return collection
+
     def test_plan_resets_only_proven_terminal_units_and_preserves_unknown_classes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -305,6 +401,233 @@ class RuntimeRetentionTests(unittest.TestCase):
             with patch.object(RETENTION, "_systemd_unit_states", return_value={unit: state}):
                 with self.assertRaisesRegex(RuntimeError, "drifted"):
                     RETENTION._prepare_worker_resets(plan)
+
+    def test_legacy_self_deploy_collection_is_validated_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            self._legacy_collection(jobs, archive)
+            receipt = RETENTION.legacy_archive_status(
+                jobs_root=jobs,
+                archive_root=archive,
+                now=1_000,
+            )
+
+            self.assertEqual(receipt["authority"], "read_only_legacy_archive_evidence")
+            self.assertEqual(receipt["collection_count"], 1)
+            self.assertRegex(receipt["status_sha256"], r"^[0-9a-f]{64}$")
+            status = receipt["collections"][0]
+            self.assertTrue(status["valid"])
+            self.assertEqual(status["entry_count"], 1)
+            self.assertGreater(status["observed_bytes"], 0)
+            self.assertEqual(status["bound_files_per_entry"], ["metadata.json", "stdout.log"])
+            self.assertEqual(status["observed_unbound_files_per_entry"], ["stderr.log"])
+            self.assertRegex(status["manifest_file_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(status["observed_entries_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_legacy_status_is_read_only_and_excluded_from_retention_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            self._legacy_collection(jobs, archive, include_finalization=True)
+
+            def snapshot() -> dict[str, bytes]:
+                return {
+                    str(path.relative_to(root)): path.read_bytes()
+                    for path in sorted(root.rglob("*"))
+                    if path.is_file() and not path.is_symlink()
+                }
+
+            before = snapshot()
+            plan_before = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=archive,
+                receipt_root=root / "receipts",
+                task_db=root / "missing.sqlite3",
+                failed_units=[],
+                unit_states={},
+            )
+            status = RETENTION.legacy_archive_status(
+                jobs_root=jobs, archive_root=archive, now=1_000
+            )
+            plan_after = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=archive,
+                receipt_root=root / "receipts",
+                task_db=root / "missing.sqlite3",
+                failed_units=[],
+                unit_states={},
+            )
+
+            self.assertEqual(snapshot(), before)
+            self.assertEqual(plan_after["plan_sha256"], plan_before["plan_sha256"])
+            self.assertFalse(any("legacy" in key for key in plan_after))
+            self.assertEqual(status["collection_count"], 1)
+
+    def test_legacy_self_deploy_collection_accepts_self_bound_finalization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            self._legacy_collection(jobs, archive, include_finalization=True)
+            receipt = RETENTION.legacy_archive_status(
+                jobs_root=jobs,
+                archive_root=archive,
+                now=1_000,
+            )
+
+            self.assertEqual(receipt["authority"], "read_only_legacy_archive_evidence")
+            self.assertEqual(receipt["collection_count"], 1)
+            self.assertRegex(receipt["status_sha256"], r"^[0-9a-f]{64}$")
+            status = receipt["collections"][0]
+            self.assertTrue(status["valid"])
+            self.assertEqual(status["self_bound_finalization_count"], 1)
+
+    def test_legacy_self_deploy_collection_rejects_tampered_finalization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            self._legacy_collection(
+                jobs,
+                archive,
+                include_finalization=True,
+                tamper_finalization=True,
+            )
+            receipt = RETENTION.legacy_archive_status(
+                jobs_root=jobs,
+                archive_root=archive,
+                now=1_000,
+            )
+
+            self.assertEqual(receipt["authority"], "read_only_legacy_archive_evidence")
+            self.assertEqual(receipt["collection_count"], 1)
+            self.assertRegex(receipt["status_sha256"], r"^[0-9a-f]{64}$")
+            status = receipt["collections"][0]
+            self.assertFalse(status["valid"])
+            self.assertIn("finalization binding", status["error"])
+
+    def test_legacy_self_deploy_collection_rejects_ambiguous_expected_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            collection = self._legacy_collection(jobs, archive)
+            unit = "grabowski-job-012345abcdef"
+            metadata_path = collection / unit / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["argv"].extend(["--expected-head", "d" * 40])
+            metadata_bytes = (json.dumps(metadata, sort_keys=True) + "\n").encode()
+            metadata_path.write_bytes(metadata_bytes)
+            metadata_path.chmod(0o600)
+            manifest_path = collection / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["entries"][0]["metadata_sha256"] = hashlib.sha256(
+                metadata_bytes
+            ).hexdigest()
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+            manifest_path.chmod(0o600)
+
+            receipt = RETENTION.legacy_archive_status(
+                jobs_root=jobs, archive_root=archive, now=1_000
+            )
+            self.assertFalse(receipt["collections"][0]["valid"])
+            self.assertIn("metadata binding", receipt["collections"][0]["error"])
+
+    def test_legacy_self_deploy_collection_rejects_symlink_and_hardlink_files(self) -> None:
+        for link_kind in ("symlink", "hardlink"):
+            with self.subTest(link_kind=link_kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                root.chmod(0o700)
+                jobs = root / "jobs"
+                archive = root / "archive"
+                collection = self._legacy_collection(jobs, archive)
+                unit = "grabowski-job-012345abcdef"
+                target = root / "outside.log"
+                target.write_text("outside\n", encoding="utf-8")
+                target.chmod(0o600)
+                candidate = collection / unit / "stderr.log"
+                candidate.unlink()
+                if link_kind == "symlink":
+                    candidate.symlink_to(target)
+                else:
+                    candidate.hardlink_to(target)
+
+                receipt = RETENTION.legacy_archive_status(
+                    jobs_root=jobs, archive_root=archive, now=1_000
+                )
+                status = receipt["collections"][0]
+                self.assertFalse(status["valid"])
+                self.assertTrue(
+                    "symlink" in status["error"]
+                    or "bounded private" in status["error"]
+                )
+
+    def test_legacy_self_deploy_collection_total_bytes_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            self._legacy_collection(jobs, archive)
+            with patch.object(RETENTION, "MAX_LEGACY_COLLECTION_BYTES", 1):
+                receipt = RETENTION.legacy_archive_status(
+                    jobs_root=jobs,
+                    archive_root=archive,
+                    now=1_000,
+                )
+
+            status = receipt["collections"][0]
+            self.assertFalse(status["valid"])
+            self.assertIn("total byte bound", status["error"])
+
+    def test_legacy_archive_root_scan_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            archive = root / "archive"
+            archive.mkdir(mode=0o700)
+            (archive / "ordinary-a").mkdir(mode=0o700)
+            (archive / "ordinary-b").mkdir(mode=0o700)
+
+            with patch.object(RETENTION, "MAX_LEGACY_ARCHIVE_ROOT_ENTRIES", 1):
+                with self.assertRaisesRegex(RuntimeError, "root scan exceeds"):
+                    RETENTION.legacy_archive_status(
+                        jobs_root=jobs,
+                        archive_root=archive,
+                        now=1_000,
+                    )
+
+    def test_legacy_self_deploy_collection_hash_tamper_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            self._legacy_collection(jobs, archive, tamper_stdout=True)
+            receipt = RETENTION.legacy_archive_status(
+                jobs_root=jobs,
+                archive_root=archive,
+                now=1_000,
+            )
+
+            self.assertEqual(receipt["authority"], "read_only_legacy_archive_evidence")
+            self.assertEqual(receipt["collection_count"], 1)
+            self.assertRegex(receipt["status_sha256"], r"^[0-9a-f]{64}$")
+            status = receipt["collections"][0]
+            self.assertFalse(status["valid"])
+            self.assertIn("hash mismatch", status["error"])
 
     def test_failed_worker_oversized_observation_stays_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
