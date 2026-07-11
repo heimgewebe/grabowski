@@ -1865,11 +1865,16 @@ def _run_branch_publish(
 
 
 def _open_pr_from_stdout(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
+    if not isinstance(value, list):
         raise GripActionError("unexpected PR lookup output")
-    return value
+    if len(value) > 1:
+        raise GripActionError("multiple open PRs found for branch")
+    if not value:
+        return None
+    item = value[0]
+    if not isinstance(item, dict):
+        raise GripActionError("unexpected PR lookup item")
+    return item
 
 
 def _run_pr_create_or_update(
@@ -1941,8 +1946,6 @@ def _run_pr_create_or_update(
             "open",
             "--json",
             "number,url,baseRefName,headRefName,headRefOid",
-            "--jq",
-            ".[0] // null",
         ],
     ))
     existing = _open_pr_from_stdout(lookup)

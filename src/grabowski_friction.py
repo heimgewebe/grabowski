@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat as statmod
 import subprocess
 import time
 import uuid
@@ -387,21 +388,32 @@ def _validate_enum(value: str, *, label: str, allowed: set[str]) -> str:
     return value
 
 
+def _require_private_regular_fd(fd: int, *, label: str) -> None:
+    metadata = os.fstat(fd)
+    if (
+        not statmod.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise RuntimeError(f"{label} must be a private owner-controlled regular file")
+
+
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o600)
     try:
+        _require_private_regular_fd(fd, label=path.name)
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            fd = -1
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
     finally:
-        try:
+        if fd >= 0:
             os.close(fd)
-        except OSError:
-            pass
 
 
 def _redacted_string(value: Any) -> str:
@@ -1391,9 +1403,10 @@ def _load_jsonl_records(path: Path, *, maximum: int = MAX_FRICTION_RECORDS) -> d
 def _decision_log_lock(*, exclusive: bool):
     lock_path = Path(f"{FRICTION_DECISION_LOG}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(lock_path, flags, 0o600)
     try:
+        _require_private_regular_fd(fd, label=lock_path.name)
         with os.fdopen(fd, "a+", encoding="utf-8") as handle:
             fd = -1
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)

@@ -1892,6 +1892,8 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("created", result["output"]["action"])
+        list_call = next(call for call in fake_gh.calls if call[:2] == ("pr", "list"))
+        self.assertNotIn("--jq", list_call)
         self.assertIn(("pr", "create", "--base", "main", "--head", "feat/work", "--title", "Test", "--body", "Body"), fake_gh.calls)
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["remote_head"])
@@ -1912,6 +1914,23 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("updated", result["output"]["action"])
         self.assertIn(("pr", "edit", "77", "--title", "Updated"), fake_gh.calls)
+
+    def test_pr_create_or_update_blocks_ambiguous_open_pr_list(self) -> None:
+        existing = [
+            {"number": 77, "url": "https://github.com/heimgewebe/grabowski/pull/77", "baseRefName": "main", "headRefName": "feat/work", "headRefOid": "a" * 40},
+            {"number": 78, "url": "https://github.com/heimgewebe/grabowski/pull/78", "baseRefName": "main", "headRefName": "feat/work", "headRefOid": "a" * 40},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "pr-create-or-update",
+                {"repo": tmp, "branch": "feat/work", "base": "main", "expected_head": "a" * 40, "title": "Test"},
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", head="a" * 40),
+                github_runner=FakeGh(existing=existing),
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("multiple open PRs", result["output"]["error"])
 
     def test_pr_create_or_update_blocks_existing_base_mismatch(self) -> None:
         existing = {"number": 77, "url": "https://github.com/heimgewebe/grabowski/pull/77", "baseRefName": "develop", "headRefName": "feat/work", "headRefOid": "a" * 40}

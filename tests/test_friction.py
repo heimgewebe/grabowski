@@ -1569,6 +1569,48 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(record["bureau_task_id"], "GRABOWSKI-OPERATOR-SURFACE-V1-T020")
         self.assertIn("does_not_make_a_linked_bureau_task_ready", record["non_claims"])
 
+    def test_append_rejects_symlink_and_nonprivate_ledgers(self) -> None:
+        module = self._load_module()
+        target = module.FRICTION_LOG.parent / "target.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+        module.FRICTION_LOG.symlink_to(target)
+        with self.assertRaises(OSError):
+            module.record_friction_event(
+                kind="operator_bug",
+                surface="runtime",
+                operation="symlink smoke",
+                symptom="must fail closed",
+            )
+
+        module.FRICTION_LOG.unlink()
+        module.FRICTION_LOG.write_text("", encoding="utf-8")
+        module.FRICTION_LOG.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "private owner-controlled"):
+            module.record_friction_event(
+                kind="operator_bug",
+                surface="runtime",
+                operation="mode smoke",
+                symptom="must fail closed",
+            )
+
+    def test_decision_lock_rejects_symlink(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        lock_path = Path(f"{module.FRICTION_DECISION_LOG}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        target = lock_path.parent / "lock-target"
+        target.write_text("", encoding="utf-8")
+        lock_path.symlink_to(target)
+        with self.assertRaises(OSError):
+            module.resolve_friction(
+                event_id="filter-1",
+                status="resolved",
+                decision="must not follow lock symlink",
+                evidence_ref="receipt:lock-smoke",
+                resolved_by="operator",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
