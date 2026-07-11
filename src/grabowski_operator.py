@@ -42,6 +42,15 @@ TRUSTED_MAX_OUTPUT_BYTES = 33_554_432
 MAX_NOTIFY_ON_DONE_CHANNELS = 5
 MAX_NOTIFY_ON_DONE_TEXT = 200
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
+DYNAMIC_SECRET_GLOBAL_MIN_LENGTH = 8
+COMMON_SHORT_SECRET_VALUES = frozenset(
+    {"0", "1", "true", "false", "yes", "no", "on", "off", "null", "none"}
+)
+JOB_METADATA_TEMP_STALE_SECONDS = 3600
+JOB_METADATA_DIRECTORY_SWEEP_LIMIT = 256
+JOB_METADATA_ENTRY_SWEEP_LIMIT = 4096
+JOB_METADATA_TEMP_SWEEP_LIMIT = 64
+JOB_METADATA_TEMP_RE = re.compile(r"metadata\.json\.[0-9a-f]{32}\.tmp")
 FINALIZATION_RECEIPT_NAME = "finalization.json"
 RUNTIME_DEPLOY_FINALIZATION_KIND = "grabowski_runtime_deploy_finalization"
 RESERVED_RUNTIME_DEPLOY_RUNNER = (HOME / "repos" / "grabowski" / "tools" / "run_scheduled_deploy.py").resolve()
@@ -171,13 +180,31 @@ def _find_server() -> FastMCP:
 mcp = _find_server()
 
 
+def _redact_dynamic_secret(text: str, secret: str) -> str:
+    if not secret:
+        return text
+
+    escaped = re.escape(secret)
+    result = re.sub(rf"(?m)^{escaped}$", "<REDACTED>", text)
+    result = re.sub(
+        rf"(?i)(\b[A-Z0-9_-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|COOKIE|CREDENTIAL|AUTHORIZATION|API_KEY|APIKEY)[A-Z0-9_-]*\s*[:=]\s*){escaped}(?=$|[\s,;])",
+        rf"\1<REDACTED>",
+        result,
+    )
+    if (
+        len(secret) >= DYNAMIC_SECRET_GLOBAL_MIN_LENGTH
+        and secret.casefold() not in COMMON_SHORT_SECRET_VALUES
+    ):
+        result = result.replace(secret, "<REDACTED>")
+    return result
+
+
 def _redact(text: str, extra_secrets: list[str] | None = None) -> str:
     result = text
     for pattern, replacement in REDACTIONS:
         result = pattern.sub(replacement, result)
     for secret in sorted(set(extra_secrets or []), key=len, reverse=True):
-        if secret:
-            result = result.replace(secret, "<REDACTED>")
+        result = _redact_dynamic_secret(result, secret)
     return result
 
 
@@ -669,7 +696,7 @@ def _job_finalization_contract(
 
 
 def _read_finalization_receipt_file(path: Path) -> dict[str, Any]:
-    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -1325,6 +1352,90 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _cleanup_stale_job_metadata_temps(
+    root: Path,
+    *,
+    now_unix: int | None = None,
+) -> dict[str, int]:
+    current = int(time.time()) if now_unix is None else now_unix
+    inspected = 0
+    entries_scanned = 0
+    removed = 0
+    errors = 0
+    if root.is_symlink() or not root.is_dir():
+        return {"inspected": 0, "removed": 0, "errors": 1}
+
+    try:
+        job_entries = os.scandir(root)
+    except OSError:
+        return {"inspected": 0, "removed": 0, "errors": 1}
+
+    with job_entries:
+        for directory_index, job_entry in enumerate(job_entries):
+            if (
+                directory_index >= JOB_METADATA_DIRECTORY_SWEEP_LIMIT
+                or entries_scanned >= JOB_METADATA_ENTRY_SWEEP_LIMIT
+                or inspected >= JOB_METADATA_TEMP_SWEEP_LIMIT
+            ):
+                break
+            try:
+                if not job_entry.is_dir(follow_symlinks=False):
+                    continue
+                directory_status = job_entry.stat(follow_symlinks=False)
+            except OSError:
+                errors += 1
+                continue
+            if (
+                directory_status.st_uid != os.getuid()
+                or directory_status.st_mode & 0o022
+            ):
+                continue
+            job_directory = Path(job_entry.path)
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                directory_flags |= os.O_NOFOLLOW
+            try:
+                directory_fd = os.open(job_directory, directory_flags)
+            except OSError:
+                errors += 1
+                continue
+            try:
+                candidates = os.scandir(directory_fd)
+            except OSError:
+                os.close(directory_fd)
+                errors += 1
+                continue
+            try:
+                with candidates:
+                    for candidate in candidates:
+                        if (
+                            inspected >= JOB_METADATA_TEMP_SWEEP_LIMIT
+                            or entries_scanned >= JOB_METADATA_ENTRY_SWEEP_LIMIT
+                        ):
+                            break
+                        entries_scanned += 1
+                        if not JOB_METADATA_TEMP_RE.fullmatch(candidate.name):
+                            continue
+                        inspected += 1
+                        try:
+                            status = candidate.stat(follow_symlinks=False)
+                            if (
+                                not candidate.is_file(follow_symlinks=False)
+                                or status.st_uid != os.getuid()
+                                or status.st_mode & 0o022
+                                or current - int(status.st_mtime)
+                                < JOB_METADATA_TEMP_STALE_SECONDS
+                            ):
+                                continue
+                            os.unlink(candidate.name, dir_fd=directory_fd)
+                            removed += 1
+                        except OSError:
+                            errors += 1
+            finally:
+                os.close(directory_fd)
+    return {"inspected": inspected, "removed": removed, "errors": errors}
+
+
 def _replace_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
     path = directory / "metadata.json"
     temp_path = directory / f"metadata.json.{uuid.uuid4().hex}.tmp"
@@ -1537,6 +1648,7 @@ def _start_job(
         if reserved_unit is not None
         else JOB_PREFIX + uuid.uuid4().hex[:12]
     )
+    metadata_temp_cleanup = _cleanup_stale_job_metadata_temps(_jobs_root())
     directory = _job_directory(unit, create=True)
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
@@ -1688,6 +1800,7 @@ def _start_job(
         **metadata,
         "metadata_path": str(metadata_path),
         "launcher": result,
+        "metadata_temp_cleanup": metadata_temp_cleanup,
     }
 
 
