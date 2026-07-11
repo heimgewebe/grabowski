@@ -77,7 +77,14 @@ class FakeGit:
             if self.upstream is None:
                 return {"returncode": 128, "stdout": "", "stderr": "no upstream"}
             return {"returncode": 0, "stdout": self.upstream, "stderr": ""}
-        if argv == ["push", "origin", f"HEAD:{self.branch}"]:
+        push_argv = list(argv)
+        while len(push_argv) >= 2 and push_argv[0] == "-c":
+            push_argv = push_argv[2:]
+        if push_argv == [
+            "push",
+            "origin",
+            f"HEAD:refs/heads/{self.branch}",
+        ]:
             return {"returncode": 0, "stdout": "", "stderr": "pushed"}
         if argv == ["ls-remote", "origin", f"refs/heads/{self.branch}"]:
             return {"returncode": 0, "stdout": f"{self.remote_head}\trefs/heads/{self.branch}", "stderr": ""}
@@ -795,7 +802,28 @@ class GripFoundationTests(unittest.TestCase):
         self.assertTrue(result["output"]["complete"])
         self.assertEqual("branch-publish", result["output"]["actions"][0]["grip"])
         self.assertEqual("mutating", result["output"]["actions"][0]["effect"])
-        self.assertIn(("push", "origin", "HEAD:feat/work"), fake_git.calls)
+        self.assertIn(
+            (
+                "-c",
+                "remote.origin.mirror=false",
+                "-c",
+                "remote.origin.receivepack=git-receive-pack",
+                "-c",
+                "remote.origin.push=",
+                "-c",
+                "push.followTags=false",
+                "-c",
+                "push.pushOption=",
+                "-c",
+                "push.gpgSign=false",
+                "-c",
+                "push.recurseSubmodules=no",
+                "push",
+                "origin",
+                "HEAD:refs/heads/feat/work",
+            ),
+            fake_git.calls,
+        )
 
     def test_mechanic_loop_stops_on_blocked_child_but_keeps_child_receipt(self) -> None:
         head = "a" * 40
@@ -1824,6 +1852,63 @@ class GripFoundationTests(unittest.TestCase):
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["remote_head"])
 
+    def test_branch_publish_rejects_remote_option_injection_before_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit(branch="feat/work")
+            for remote in ("--mirror", "-f", ".", "../remote", "https://example.invalid/repo.git"):
+                with self.subTest(remote=remote):
+                    result = grips.run_grip(
+                        "branch-publish",
+                        {
+                            "repo": tmp,
+                            "branch": "feat/work",
+                            "expected_head": "a" * 40,
+                            "remote": remote,
+                        },
+                        allow_mutation=True,
+                        command_runner=fake,
+                    )
+                    self.assertEqual("blocked", result["receipt"]["status"])
+                    self.assertEqual("preflight", result["receipt"]["phase"])
+            self.assertEqual([], fake.calls)
+
+    def test_branch_publish_intrinsically_protects_main_and_master(self) -> None:
+        for branch in ("main", "master"):
+            with self.subTest(branch=branch), tempfile.TemporaryDirectory() as tmp:
+                fake = FakeGit(branch=branch)
+                result = grips.run_grip(
+                    "branch-publish",
+                    {
+                        "repo": tmp,
+                        "branch": branch,
+                        "expected_head": "a" * 40,
+                        "protected_branches": ["release"],
+                    },
+                    allow_mutation=True,
+                    command_runner=fake,
+                )
+                self.assertEqual("blocked", result["receipt"]["status"])
+                self.assertEqual([], fake.calls)
+
+    def test_branch_publish_overrides_semantic_push_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit(branch="feat/work", head="a" * 40)
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
+        push = next(call for call in fake.calls if "push" in call)
+        self.assertIn("remote.origin.mirror=false", push)
+        self.assertIn("remote.origin.receivepack=git-receive-pack", push)
+        self.assertIn("remote.origin.push=", push)
+        self.assertIn("push.followTags=false", push)
+        self.assertIn("push.pushOption=", push)
+        self.assertIn("push.gpgSign=false", push)
+        self.assertIn("push.recurseSubmodules=no", push)
+
     def test_branch_publish_rejects_fully_qualified_branch_ref_before_git(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fake = FakeGit(branch="refs/heads/main")
@@ -2013,9 +2098,16 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(30, calls["timeout"])
         self.assertEqual("0", env["GIT_TERMINAL_PROMPT"])
         self.assertEqual("0", env["GIT_OPTIONAL_LOCKS"])
-        self.assertEqual("1", env["GIT_CONFIG_COUNT"])
+        self.assertEqual("3", env["GIT_CONFIG_COUNT"])
         self.assertEqual("core.fsmonitor", env["GIT_CONFIG_KEY_0"])
         self.assertEqual("false", env["GIT_CONFIG_VALUE_0"])
+        self.assertEqual("core.hooksPath", env["GIT_CONFIG_KEY_1"])
+        self.assertEqual("/dev/null", env["GIT_CONFIG_VALUE_1"])
+        self.assertEqual("protocol.ext.allow", env["GIT_CONFIG_KEY_2"])
+        self.assertEqual("never", env["GIT_CONFIG_VALUE_2"])
+        self.assertEqual("ssh", env["GIT_ALLOW_PROTOCOL"])
+        self.assertEqual("/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", env["GIT_SSH_COMMAND"])
+        self.assertEqual("/bin/false", env["GIT_ASKPASS"])
         self.assertEqual("cat", env["GIT_PAGER"])
         self.assertEqual("cat", env["PAGER"])
 

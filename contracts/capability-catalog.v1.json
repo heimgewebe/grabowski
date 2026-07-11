@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "dedde7fbedf5392e18d5d84eacb3e0b73aa2367ca6f56bcbd1c86067853cf997",
+  "capability_source_sha256": "bf5ec1b8cf88513a4065e2ba4c7a86722c47e63b97ca3f426304f1913a7fb03e",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "cb557e0d982610ea8989c6bf3a8e47a36208fc75d7dae7200b49209660e8f5f3",
   "integrity": {
@@ -568,12 +568,12 @@
     },
     {
       "category": "version-control",
-      "description": "Run Git with a config-aware protected-main force-push guard.",
+      "description": "Run Git with a fail-closed single-branch push subset.",
       "effects": [
         "git-dependent"
       ],
       "id": "grabowski_git",
-      "purpose": "Run Git in one repository with protected-main force-push protection.",
+      "purpose": "Run Git in one repository; generic push is limited to one explicit unprotected branch ref.",
       "read_only": false,
       "reversibility": "git-dependent",
       "risk_class": "variable",

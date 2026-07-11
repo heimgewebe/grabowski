@@ -37,6 +37,8 @@ GRIP_RECEIPT_KIND = "grabowski.operator_grip_receipt"
 GRIP_RECEIPT_SCHEMA_VERSION = 1
 READ_ONLY = "read_only"
 MUTATING = "mutating"
+INTRINSIC_PROTECTED_BRANCHES = frozenset({"main", "master"})
+REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 SITUATION_ACCEPTANCE_IDS = (
     "situation-readonly",
@@ -415,27 +417,54 @@ def utc_now() -> str:
 def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
     command = ["git", "--no-optional-locks", "-C", str(repo), *argv]
     env = os.environ.copy()
-    for key in (
+    exact_deny = {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_EXEC_PATH",
+        "GIT_CONFIG",
         "GIT_EXTERNAL_DIFF",
         "GIT_DIFF_OPTS",
         "GIT_PAGER",
         "GIT_EDITOR",
         "GIT_SEQUENCE_EDITOR",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_PROXY_COMMAND",
         "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_ALLOW_PROTOCOL",
         "PAGER",
-    ):
-        env.pop(key, None)
+    }
+    for key in tuple(env):
+        if key in exact_deny or key.startswith("GIT_CONFIG_"):
+            env.pop(key, None)
+    command_config = (
+        ("core.fsmonitor", "false"),
+        ("core.hooksPath", "/dev/null"),
+        ("protocol.ext.allow", "never"),
+    )
     env.update(
         {
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "core.fsmonitor",
-            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_COUNT": str(len(command_config)),
             "GIT_PAGER": "cat",
             "PAGER": "cat",
+            "GIT_ALLOW_PROTOCOL": "ssh",
+            "GIT_SSH_COMMAND": "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
+            "GIT_SSH_VARIANT": "ssh",
+            "GIT_ASKPASS": "/bin/false",
+            "SSH_ASKPASS": "/bin/false",
         }
     )
+    for index, (key, value) in enumerate(command_config):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
     try:
         completed = subprocess.run(
             command,
@@ -1809,10 +1838,13 @@ def _run_branch_publish(
     if not isinstance(remote, str) or not remote.strip():
         raise GripPreflightError("remote parameter must be a non-empty string")
     remote = remote.strip()
+    if remote in {".", ".."} or not REMOTE_NAME_RE.fullmatch(remote):
+        raise GripPreflightError("remote parameter must be a configured remote name")
     protected = parameters.get("protected_branches", ["main", "master"])
     if not isinstance(protected, list) or not all(isinstance(item, str) for item in protected):
         raise GripPreflightError("protected_branches must be a list of strings")
-    if branch in set(protected):
+    effective_protected = INTRINSIC_PROTECTED_BRANCHES | set(protected)
+    if branch in effective_protected:
         _check(receipt, "protected_branch", "fail", f"branch={branch}")
         raise GripPreflightError("branch-publish refuses protected branches")
     _check(receipt, "protected_branch", "pass", f"branch={branch}")
@@ -1845,7 +1877,29 @@ def _run_branch_publish(
         raise GripPreflightError("branch-publish requires a clean worktree unless allow_dirty=true")
     _check(receipt, "clean_worktree", "pass" if not orientation["dirty"] else "warn", "clean" if not orientation["dirty"] else "allow_dirty=true")
     ref = f"refs/heads/{branch}"
-    push = _git(repo=Path(orientation["root"]), runner=runner, argv=["push", remote, f"HEAD:{branch}"])
+    push = _git(
+        repo=Path(orientation["root"]),
+        runner=runner,
+        argv=[
+            "-c",
+            f"remote.{remote}.mirror=false",
+            "-c",
+            f"remote.{remote}.receivepack=git-receive-pack",
+            "-c",
+            f"remote.{remote}.push=",
+            "-c",
+            "push.followTags=false",
+            "-c",
+            "push.pushOption=",
+            "-c",
+            "push.gpgSign=false",
+            "-c",
+            "push.recurseSubmodules=no",
+            "push",
+            remote,
+            f"HEAD:refs/heads/{branch}",
+        ],
+    )
     remote_result = _git(repo=Path(orientation["root"]), runner=runner, argv=["ls-remote", remote, ref])
     remote_line = str(remote_result.get("stdout", "")).splitlines()[0] if remote_result.get("stdout") else ""
     remote_head = remote_line.split()[0] if remote_line.split() else ""
