@@ -2221,7 +2221,7 @@ def execution_shape_recommendation(
         preflight.append("resolve resource lease state")
 
     retry_limit = 0 if may_mutate or prior_failure_class == "platform_filter" else 1
-    if route.startswith("stop_") or route == "explicit_preflight":
+    if route.startswith("stop_") or route in {"explicit_preflight", "operator_stop"}:
         retry_limit = 0
 
     typed_input = {
@@ -2429,6 +2429,7 @@ def _execution_load_outcomes(*, limit: int) -> dict[str, Any]:
             "records": [],
             "scanned_lines": 0,
             "valid_records_total": 0,
+            "recorded_at_unix_values": [],
             "invalid_lines": 0,
             "duplicate_outcome_ids": [],
             "duplicate_outcome_ids_truncated": False,
@@ -2438,6 +2439,7 @@ def _execution_load_outcomes(*, limit: int) -> dict[str, Any]:
     invalid_lines = 0
     scanned_lines = 0
     valid_records_total = 0
+    recorded_at_unix_values: list[int] = []
     outcome_id_counts: Counter[str] = Counter()
     for line in text.splitlines():
         if not line.strip():
@@ -2453,6 +2455,7 @@ def _execution_load_outcomes(*, limit: int) -> dict[str, Any]:
             invalid_lines += 1
             continue
         valid_records_total += 1
+        recorded_at_unix_values.append(record["recorded_at_unix"])
         outcome_id_counts[record["outcome_id"]] += 1
         records.append(record)
     if len(records) > limit:
@@ -2466,6 +2469,7 @@ def _execution_load_outcomes(*, limit: int) -> dict[str, Any]:
         "records": records,
         "scanned_lines": scanned_lines,
         "valid_records_total": valid_records_total,
+        "recorded_at_unix_values": recorded_at_unix_values,
         "invalid_lines": invalid_lines,
         "duplicate_outcome_ids": duplicate_outcome_ids[:20],
         "duplicate_outcome_ids_truncated": len(duplicate_outcome_ids) > 20,
@@ -2549,7 +2553,7 @@ def record_execution_outcome(
     record = {
         "schema_version": 1,
         "outcome_id": uuid.uuid4().hex,
-        "recorded_at_unix": int(time.time()),
+        "recorded_at_unix": 0,
         "recommendation_id": recommendation_id,
         "operation_class": operation_class,
         "risk_level": risk_level,
@@ -2565,8 +2569,14 @@ def record_execution_outcome(
         "evidence_ref": evidence_ref,
     }
     with _execution_outcome_log_lock(exclusive=True):
+        record["recorded_at_unix"] = int(time.time())
         existing = _execution_load_outcomes(limit=EXECUTION_GOVERNOR_MAX_RECORDS)
         if existing["integrity_valid"] is not True:
+            raise RuntimeError("execution outcome ledger integrity is invalid")
+        if any(
+            recorded_at_unix > record["recorded_at_unix"] + 60
+            for recorded_at_unix in existing["recorded_at_unix_values"]
+        ):
             raise RuntimeError("execution outcome ledger integrity is invalid")
         if existing["valid_records_total"] >= EXECUTION_GOVERNOR_MAX_RECORDS:
             raise RuntimeError("execution outcome ledger record limit reached")
@@ -2614,17 +2624,18 @@ def execution_governor_summary(
         for record in loaded["records"]
         if record["recorded_at_unix"] < decayed_before
     ]
-    future_records = [
-        record
-        for record in loaded["records"]
-        if record["recorded_at_unix"] > now + 60
-    ]
+    future_dated_total = sum(
+        recorded_at_unix > now + 60
+        for recorded_at_unix in loaded["recorded_at_unix_values"]
+    )
     active_records = [
         record
         for record in loaded["records"]
         if decayed_before <= record["recorded_at_unix"] <= now + 60
     ]
-    ledger_integrity_valid = loaded["integrity_valid"] is True and not future_records
+    ledger_integrity_valid = (
+        loaded["integrity_valid"] is True and future_dated_total == 0
+    )
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for record in active_records:
         key = (
@@ -2710,7 +2721,7 @@ def execution_governor_summary(
         "returned": len(loaded["records"]),
         "active_after_decay": len(active_records),
         "expired_by_decay": len(expired_records),
-        "future_dated": len(future_records),
+        "future_dated": future_dated_total,
         "decay_seconds": EXECUTION_GOVERNOR_DECAY_SECONDS,
         "minimum_evidence": EXECUTION_GOVERNOR_MIN_EVIDENCE,
         "candidates": candidates,

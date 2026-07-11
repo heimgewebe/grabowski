@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import inspect
 import json
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -223,6 +224,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertEqual(result["recommended_route"], "operator_stop")
         self.assertFalse(result["route_feasible"])
         self.assertIn("friction_evidence_integrity_invalid", result["reason_codes"])
+        self.assertEqual(result["retry_policy"]["retry_limit"], 0)
 
     def test_post_mutation_transport_failure_requires_state_readback(self) -> None:
         module = self._load_module()
@@ -255,6 +257,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertEqual(result["recommended_route"], "operator_stop")
         self.assertFalse(result["route_feasible"])
         self.assertIn("policy_gate_requires_deliberate_evidence_or_policy_decision", result["reason_codes"])
+        self.assertEqual(result["retry_policy"]["retry_limit"], 0)
 
     def test_mutation_stops_on_resource_conflict_or_missing_readback(self) -> None:
         module = self._load_module()
@@ -470,6 +473,37 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertEqual(summary["invalid_lines"], 0)
         self.assertEqual(summary["duplicate_outcome_ids"], [])
 
+    def test_outcome_timestamp_is_captured_after_append_lock(self) -> None:
+        module = self._load_module()
+        before_lock = 1_783_773_500
+        after_lock = 1_783_773_600
+        clock = Mock(return_value=before_lock)
+
+        @contextmanager
+        def delayed_lock(*, exclusive: bool):
+            self.assertTrue(exclusive)
+            clock.return_value = after_lock
+            yield
+
+        with patch.object(module, "_execution_outcome_log_lock", delayed_lock):
+            with patch.object(module.time, "time", clock):
+                module.record_execution_outcome(
+                    recommendation_id="9" * 64,
+                    operation_class="read",
+                    risk_level="low",
+                    recommended_route="typed_tool",
+                    actual_route="typed_tool",
+                    first_pass_success=True,
+                    unchanged_retries=0,
+                    ambiguous_mutation_outcomes=0,
+                    tool_call_count=1,
+                    elapsed_ms=1,
+                    evidence_ref="receipt:post-lock-timestamp",
+                )
+
+        record = json.loads(module.EXECUTION_OUTCOME_LOG.read_text(encoding="utf-8"))
+        self.assertEqual(record["recorded_at_unix"], after_lock)
+
     def test_integrity_scan_covers_lines_older_than_summary_window(self) -> None:
         module = self._load_module()
         now = 1_783_773_600
@@ -517,6 +551,64 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertEqual(candidate["status"], "disabled_by_integrity_gate")
         self.assertTrue(candidate["circuit_breaker_open"])
         self.assertFalse(candidate["promotion_eligible"])
+
+    def test_future_dated_record_outside_summary_window_opens_integrity_gate(self) -> None:
+        module = self._load_module()
+        now = 1_783_773_600
+
+        def record(*, outcome_id: str, recorded_at: int) -> dict[str, object]:
+            return {
+                "schema_version": 1,
+                "outcome_id": outcome_id,
+                "recorded_at_unix": recorded_at,
+                "recommendation_id": "a" * 64,
+                "operation_class": "read",
+                "risk_level": "low",
+                "recommended_route": "typed_tool",
+                "actual_route": "typed_tool",
+                "first_pass_success": True,
+                "unchanged_retries": 0,
+                "ambiguous_mutation_outcomes": 0,
+                "tool_call_count": 1,
+                "elapsed_ms": 1,
+                "regression_signal": False,
+                "friction_event_ids": [],
+                "evidence_ref": "receipt:future-date-integrity",
+            }
+
+        future = record(outcome_id="1" * 32, recorded_at=now + 61)
+        recent = record(outcome_id="2" * 32, recorded_at=now)
+        module.EXECUTION_OUTCOME_LOG.parent.mkdir(parents=True, exist_ok=True)
+        module.EXECUTION_OUTCOME_LOG.write_text(
+            json.dumps(future, sort_keys=True) + "\n"
+            + json.dumps(recent, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        module.EXECUTION_OUTCOME_LOG.chmod(0o600)
+
+        summary = module.execution_governor_summary(limit=1, now_unix=now)
+        self.assertEqual(summary["returned"], 1)
+        self.assertEqual(summary["future_dated"], 1)
+        self.assertFalse(summary["ledger_integrity_valid"])
+        candidate = summary["candidates"][0]
+        self.assertEqual(candidate["status"], "disabled_by_integrity_gate")
+        self.assertTrue(candidate["circuit_breaker_open"])
+        self.assertFalse(candidate["promotion_eligible"])
+        with patch.object(module.time, "time", return_value=now):
+            with self.assertRaisesRegex(RuntimeError, "integrity"):
+                module.record_execution_outcome(
+                    recommendation_id="b" * 64,
+                    operation_class="read",
+                    risk_level="low",
+                    recommended_route="typed_tool",
+                    actual_route="typed_tool",
+                    first_pass_success=True,
+                    unchanged_retries=0,
+                    ambiguous_mutation_outcomes=0,
+                    tool_call_count=1,
+                    elapsed_ms=1,
+                    evidence_ref="receipt:blocked-future-date-append",
+                )
 
     def test_invalid_or_duplicate_outcome_ledger_opens_integrity_gate(self) -> None:
         module = self._load_module()
