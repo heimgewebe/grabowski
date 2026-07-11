@@ -3,8 +3,10 @@ import ast
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -861,6 +863,40 @@ class OperatorContractTests(unittest.TestCase):
         self.assertIn("<REDACTED>", result["stdout"])
         self.assertIn("<REDACTED>", result["stderr"])
 
+    def test_short_secret_values_do_not_corrupt_diagnostic_output(self) -> None:
+        operator = _load_operator_module()
+        script = "print('status=true count=1 build=101 feature=false')"
+        with tempfile.TemporaryDirectory() as directory:
+            result = operator._run(
+                [sys.executable, "-c", script, "--token", "true"],
+                cwd=Path(directory),
+                timeout_seconds=30,
+                max_output_bytes=10000,
+            )
+        self.assertEqual(
+            result["stdout"],
+            "status=true count=1 build=101 feature=false\n",
+        )
+
+    def test_short_secret_value_is_redacted_when_emitted_as_complete_line(self) -> None:
+        operator = _load_operator_module()
+        script = "import sys; print(sys.argv[2])"
+        with tempfile.TemporaryDirectory() as directory:
+            result = operator._run(
+                [sys.executable, "-c", script, "--token", "1"],
+                cwd=Path(directory),
+                timeout_seconds=30,
+                max_output_bytes=10000,
+            )
+        self.assertEqual(result["stdout"], "<REDACTED>\n")
+
+    def test_short_secret_value_is_redacted_in_named_context(self) -> None:
+        operator = _load_operator_module()
+        self.assertEqual(
+            operator._redact("token: 1 status=101", ["1"]),
+            "token: <REDACTED> status=101",
+        )
+
     def test_validate_argv_uses_forbidden_host_guard_fail_closed(self) -> None:
         operator = _load_operator_module()
         observed: list[list[str]] = []
@@ -1250,6 +1286,56 @@ class DurableJobFinalizationReceiptTests(unittest.TestCase):
             )
         self.assertEqual(status["final_status"], "missing_finalization_evidence")
         self.assertEqual(status["finalization_receipt"]["reason"], "receipt_symlink")
+
+    def test_fifo_receipt_is_rejected_without_blocking(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            fifo = Path(temporary) / "finalization.json"
+            os.mkfifo(fifo, 0o600)
+            started = time.monotonic()
+            result = operator._read_finalization_receipt_file(fifo)
+            duration = time.monotonic() - started
+        self.assertLess(duration, 0.5)
+        self.assertEqual(result["state"], "invalid_receipt")
+        self.assertEqual(result["reason"], "receipt_not_regular_file")
+
+    def test_stale_metadata_temp_cleanup_is_bounded_and_conservative(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job = root / "grabowski-job-cleanup0001"
+            job.mkdir(mode=0o700)
+            stale = job / ("metadata.json." + "a" * 32 + ".tmp")
+            fresh = job / ("metadata.json." + "b" * 32 + ".tmp")
+            malformed = job / "metadata.json.not-a-uuid.tmp"
+            stale.write_text("stale", encoding="utf-8")
+            fresh.write_text("fresh", encoding="utf-8")
+            malformed.write_text("keep", encoding="utf-8")
+            now = 10_000
+            os.utime(stale, (now - operator.JOB_METADATA_TEMP_STALE_SECONDS - 1,) * 2)
+            os.utime(fresh, (now,) * 2)
+            result = operator._cleanup_stale_job_metadata_temps(root, now_unix=now)
+            self.assertEqual(result, {"inspected": 2, "removed": 1, "errors": 0})
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(malformed.exists())
+
+    def test_metadata_temp_cleanup_bounds_nonmatching_entries(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job = root / "grabowski-job-entrybound01"
+            job.mkdir(mode=0o700)
+            for index in range(4):
+                (job / f"unrelated-{index}").write_text("keep", encoding="utf-8")
+            stale = job / ("metadata.json." + "c" * 32 + ".tmp")
+            stale.write_text("stale", encoding="utf-8")
+            now = 10_000
+            os.utime(stale, (now - operator.JOB_METADATA_TEMP_STALE_SECONDS - 1,) * 2)
+            with patch.object(operator, "JOB_METADATA_ENTRY_SWEEP_LIMIT", 0):
+                result = operator._cleanup_stale_job_metadata_temps(root, now_unix=now)
+            self.assertEqual(result["inspected"], 0)
+            self.assertTrue(stale.exists())
 
     def test_visible_systemd_status_remains_primary_over_valid_receipt(self) -> None:
         operator = _load_operator_module()
