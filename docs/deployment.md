@@ -202,6 +202,27 @@ spätere hashgebundene Läufe abgearbeitet. Ein alter fehlgeschlagener Job behä
 seinen Failed-Zustand, solange seine Archivierung durch diese Batchgrenze noch
 aufgeschoben ist.
 
+Historische Sammelarchive des Vertrags
+`legacy-self-deploy-without-finalization-<unix>` werden über einen getrennten,
+ausschließlich lesenden Statuspfad inventarisiert:
+
+```bash
+make runtime-legacy-status
+```
+
+Der Validator scannt Archivwurzel, Sammlungsanzahl, Eintragsanzahl und
+Gesamtbytes unter festen Grenzen. Logdateien werden für die Hashprüfung
+streaming gelesen. Er bindet Sammlung, Unit, Quell- und Zielpfad, erwarteten
+Head sowie die im Legacy-Manifest hinterlegten Metadaten- und stdout-Hashes. Optional
+vorhandene moderne `finalization.json`-Dateien müssen ihren eigenen
+Payload-Hash, die Jobidentität, den Head und die alten Receipt-Pfade korrekt
+binden. `stderr.log` bleibt als beobachtete, aber vom alten Sammelmanifest nicht
+kryptografisch gebundene Datei ausdrücklich sichtbar. Das Statusreceipt ist
+von Retention-Plan und Apply-Receipt getrennt; es erteilt weder Migrations- noch
+Lösch- oder Mutationserlaubnis. Ungültige Sammlungen werden gemeldet, niemals
+stillschweigend migriert. Lose Legacy-Verzeichnisse außerhalb dieses Vertrags
+bleiben im normalen Retention-Plan blockiert.
+
 Ein Apply wird nur ausgeführt, wenn die erneut berechnete Vorschau exakt zum
 angegebenen Plan-Hash passt. Vor der ersten Zustandsmutation wird ein
 Intent-Audit geschrieben. Direkt vor der Archivierung werden systemd-Zustand,
