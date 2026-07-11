@@ -402,17 +402,74 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             diagnostics["service_statuses"]["grabowski-operator.service"]["properties"]["ActiveState"],
             "active",
         )
-        self.assertEqual(diagnostics["schema_version"], 2)
+        self.assertEqual(diagnostics["schema_version"], 3)
         self.assertTrue(diagnostics["live_transport_errors_observed"])
         probe = diagnostics["journal_transport_probes"]["grabowski-operator.service"]
         self.assertEqual(probe["max_lines"], 25)
         self.assertEqual(probe["transport_error_count"], 1)
         self.assertEqual(probe["http_status_counts"], {"502": 1})
         self.assertEqual(probe["activity_counts"], {"forwarded_to_mcp": 1})
+        self.assertEqual(probe["window_state"], "errors_without_later_activity")
+        self.assertEqual(probe["post_error_activity_counts"], {})
+        self.assertEqual(diagnostics["transport_window_state"], "errors_without_later_activity")
+        self.assertEqual(diagnostics["planned_lifecycle_issue_count"], 0)
         self.assertIn("command_success_or_failure", diagnostics["does_not_establish"])
         self.assertIn("target state is re-read", diagnostics["recommended_next_policy"]["mutation_rule"])
         rendered = json.dumps(diagnostics, sort_keys=True)
         self.assertNotIn("host python[1]", rendered)
+
+    def test_connector_transport_live_diagnostics_preserves_known_error_over_incomplete_peer(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        module.FRICTION_LOG.write_text("", encoding="utf-8")
+
+        def fake_run(argv, *, timeout_seconds=30, max_output_bytes=131_072):
+            if argv[0] == "systemctl":
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+            if argv[0] == "journalctl":
+                unit = argv[argv.index("--unit") + 1]
+                if unit == "grabowski-operator.service":
+                    record = {
+                        "__REALTIME_TIMESTAMP": "100",
+                        "MESSAGE": json.dumps({
+                            "level": "ERROR",
+                            "msg": "Received exception from stream: 502 upstream/external service error",
+                        }),
+                    }
+                    return {
+                        "returncode": 0,
+                        "timed_out": False,
+                        "stdout": json.dumps(record) + "\n",
+                        "stderr": "",
+                        "stdout_truncated": False,
+                        "stderr_truncated": False,
+                    }
+                return {
+                    "returncode": 1,
+                    "timed_out": False,
+                    "stdout": "",
+                    "stderr": "journal unavailable",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+            raise AssertionError(argv)
+
+        module._run_diagnostic_command = fake_run
+        diagnostics = module.connector_transport_live_diagnostics(limit=1, max_log_lines=25)
+
+        self.assertEqual(diagnostics["transport_error_count"], 1)
+        self.assertEqual(diagnostics["transport_window_state"], "errors_without_later_activity")
+        self.assertEqual(
+            diagnostics["transport_window_state_by_unit"]["tunnel-client-grabowski.service"],
+            "indeterminate_incomplete",
+        )
 
     def test_connector_transport_probe_uses_journal_priority_for_plain_errors(self) -> None:
         module = self._load_module()
@@ -500,6 +557,423 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(probe["transport_error_count"], 0)
         self.assertEqual(probe["http_status_counts"], {})
         self.assertEqual(probe["activity_counts"], {"forwarded_to_mcp": 1})
+
+    def test_connector_transport_probe_separates_completed_stop_lifecycle_issues(self) -> None:
+        module = self._load_module()
+        invocation = "a" * 32
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR",
+                    "msg": "harpoon server stopped",
+                    "error": {"kind": "shutdown"},
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "105",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "INFO",
+                    "msg": "OnStop hook executing",
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "106",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "INFO",
+                    "msg": "OnStop hook executed",
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "USER_UNIT": "tunnel-client-grabowski.service",
+                "USER_INVOCATION_ID": invocation,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+                "MESSAGE": "Stopped Grabowski MCP Tunnel.",
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["transport_error_count"], 0)
+        self.assertEqual(probe["window_state"], "no_errors")
+        self.assertEqual(probe["completed_stop_invocation_count"], 1)
+        self.assertEqual(probe["qualified_planned_stop_invocation_count"], 1)
+        self.assertEqual(probe["planned_lifecycle_issue_count"], 1)
+        self.assertEqual(
+            probe["planned_lifecycle_error_domain_counts"],
+            {"reported_error": 1},
+        )
+        self.assertEqual(probe["planned_lifecycle_samples"][0]["invocation_id"], invocation)
+
+    def test_connector_transport_probe_requires_visible_onstop_sequence(self) -> None:
+        module = self._load_module()
+        invocation = "9" * 32
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR",
+                    "msg": "harpoon server stopped",
+                    "error": {"kind": "shutdown"},
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "USER_UNIT": "tunnel-client-grabowski.service",
+                "USER_INVOCATION_ID": invocation,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+                "MESSAGE": "Stopped Grabowski MCP Tunnel.",
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["completed_stop_invocation_count"], 1)
+        self.assertEqual(probe["qualified_planned_stop_invocation_count"], 0)
+        self.assertEqual(probe["planned_lifecycle_issue_count"], 0)
+        self.assertEqual(probe["transport_error_count"], 1)
+
+    def test_connector_transport_probe_fails_closed_without_exact_completed_stop(self) -> None:
+        module = self._load_module()
+        invocation = "b" * 32
+        error_record = {
+            "__REALTIME_TIMESTAMP": "100",
+            "_SYSTEMD_INVOCATION_ID": invocation,
+            "MESSAGE": json.dumps({
+                "level": "ERROR",
+                "component": "dispatcher",
+                "msg": "harpoon server stopped",
+                "error": {"kind": "shutdown"},
+            }),
+        }
+        markers = [
+            None,
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "USER_UNIT": "tunnel-client-grabowski.service",
+                "USER_INVOCATION_ID": invocation,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "failed",
+                "MESSAGE": "Stop failed.",
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "USER_UNIT": "tunnel-client-grabowski.service",
+                "USER_INVOCATION_ID": "c" * 32,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+                "MESSAGE": "Stopped Grabowski MCP Tunnel.",
+            },
+        ]
+        for marker_record in markers:
+            with self.subTest(marker=marker_record):
+                records = [error_record] + ([marker_record] if marker_record else [])
+                module._run_diagnostic_command = lambda *args, **kwargs: {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": "".join(json.dumps(record) + "\n" for record in records),
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+                probe = module._journal_transport_probe(
+                    "tunnel-client-grabowski.service",
+                    25,
+                )
+                self.assertEqual(probe["transport_error_count"], 1)
+                self.assertEqual(probe["planned_lifecycle_issue_count"], 0)
+                self.assertEqual(probe["window_state"], "errors_without_later_activity")
+
+    def test_connector_transport_probe_requires_shutdown_component_binding(self) -> None:
+        module = self._load_module()
+        invocation = "f" * 32
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR",
+                    "component": "controlplane",
+                    "msg": "failed to release dispatcher worker pool",
+                    "error": {"kind": "shutdown"},
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "USER_UNIT": "tunnel-client-grabowski.service",
+                "USER_INVOCATION_ID": invocation,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+                "MESSAGE": "Stopped Grabowski MCP Tunnel.",
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["transport_error_count"], 1)
+        self.assertEqual(probe["planned_lifecycle_issue_count"], 0)
+
+    def test_connector_transport_probe_keeps_unknown_error_in_completed_stop_invocation(self) -> None:
+        module = self._load_module()
+        invocation = "e" * 32
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR",
+                    "component": "dispatcher",
+                    "msg": "failed to post response to control plane",
+                    "error": {"kind": "temporary"},
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "USER_UNIT": "tunnel-client-grabowski.service",
+                "USER_INVOCATION_ID": invocation,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+                "MESSAGE": "Stopped Grabowski MCP Tunnel.",
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["transport_error_count"], 1)
+        self.assertEqual(probe["planned_lifecycle_issue_count"], 0)
+        self.assertEqual(probe["completed_stop_invocation_count"], 1)
+        self.assertEqual(probe["qualified_planned_stop_invocation_count"], 0)
+
+    def test_connector_transport_probe_reports_activity_after_real_error(self) -> None:
+        module = self._load_module()
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": "d" * 32,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR",
+                    "component": "dispatcher",
+                    "msg": "failed to post response to control plane",
+                    "error": {"kind": "temporary"},
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "200",
+                "MESSAGE": json.dumps({
+                    "level": "INFO",
+                    "component": "dispatcher",
+                    "msg": "dispatcher forwarded command to MCP server",
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "300",
+                "MESSAGE": json.dumps({
+                    "level": "INFO",
+                    "component": "dispatcher",
+                    "msg": "dispatcher acknowledged notification with control plane",
+                }),
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["transport_error_count"], 1)
+        self.assertEqual(probe["window_state"], "errors_followed_by_activity")
+        self.assertEqual(
+            probe["post_error_activity_counts"],
+            {"control_plane_ack": 1, "forwarded_to_mcp": 1},
+        )
+
+    def test_connector_transport_probe_requires_complete_ordered_onstop_sequence(self) -> None:
+        module = self._load_module()
+        invocation = "8" * 32
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executing"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "USER_UNIT": "tunnel-client-grabowski.service",
+                "USER_INVOCATION_ID": invocation,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+                "MESSAGE": "Stopped Grabowski MCP Tunnel.",
+            },
+            {
+                "__REALTIME_TIMESTAMP": "120",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executed"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "105",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR",
+                    "msg": "harpoon server stopped",
+                    "error": {"kind": "shutdown"},
+                }),
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["completed_stop_invocation_count"], 1)
+        self.assertEqual(probe["qualified_planned_stop_invocation_count"], 0)
+        self.assertEqual(probe["planned_lifecycle_issue_count"], 0)
+        self.assertEqual(probe["transport_error_count"], 1)
+
+    def test_connector_transport_probe_keeps_error_after_completed_stop(self) -> None:
+        module = self._load_module()
+        invocation = "7" * 32
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executing"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "101",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executed"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "USER_UNIT": "tunnel-client-grabowski.service",
+                "USER_INVOCATION_ID": invocation,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+                "MESSAGE": "Stopped Grabowski MCP Tunnel.",
+            },
+            {
+                "__REALTIME_TIMESTAMP": "120",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR",
+                    "msg": "harpoon server stopped",
+                    "error": {"kind": "shutdown"},
+                }),
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["qualified_planned_stop_invocation_count"], 1)
+        self.assertEqual(probe["planned_lifecycle_issue_count"], 0)
+        self.assertEqual(probe["transport_error_count"], 1)
+
+    def test_connector_transport_probe_marks_failed_or_invalid_window_incomplete(self) -> None:
+        module = self._load_module()
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 1,
+            "timed_out": False,
+            "stdout": "not-json\n",
+            "stderr": "journal unavailable",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertFalse(probe["journal_window_complete"])
+        self.assertEqual(probe["window_state"], "indeterminate_incomplete")
+        self.assertEqual(probe["invalid_json_records"], 1)
+
+    def test_connector_transport_probe_marks_truncated_window_indeterminate(self) -> None:
+        module = self._load_module()
+        record = {
+            "__REALTIME_TIMESTAMP": "100",
+            "MESSAGE": json.dumps({
+                "level": "INFO",
+                "component": "dispatcher",
+                "msg": "dispatcher forwarded command to MCP server",
+            }),
+        }
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": json.dumps(record) + "\n",
+            "stderr": "",
+            "stdout_truncated": True,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertFalse(probe["journal_window_complete"])
+        self.assertEqual(probe["window_state"], "indeterminate_truncated")
 
     def test_connector_transport_live_diagnostics_bounds_log_lines(self) -> None:
         module = self._load_module()
