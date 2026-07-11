@@ -80,6 +80,88 @@ class RuntimeRetentionTests(unittest.TestCase):
             path.chmod(0o600)
         return directory
 
+    def _worker_state_dbs(
+        self,
+        root: Path,
+        *,
+        worker_id: str,
+        kind: str = "gui",
+        state: str = "failed",
+        lease_keys: list[str] | None = None,
+        live_lease: bool = False,
+    ) -> tuple[Path, Path, str]:
+        worker_root = root / "workers"
+        worker_root.mkdir(mode=0o700)
+        worker_db = worker_root / "workers.sqlite3"
+        unit = f"grabowski-{kind}-worker-{worker_id}.service"
+        connection = sqlite3.connect(worker_db)
+        try:
+            connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute("INSERT INTO metadata(key, value) VALUES ('schema_version', '1')")
+            connection.execute(
+                """
+                CREATE TABLE workers (
+                    worker_id TEXT,
+                    kind TEXT,
+                    unit TEXT,
+                    state TEXT,
+                    lease_keys_json TEXT,
+                    updated_at_unix INTEGER,
+                    last_observation_json TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO workers VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    worker_id,
+                    kind,
+                    unit,
+                    state,
+                    json.dumps(lease_keys or []),
+                    900,
+                    json.dumps({
+                        "state": "failed",
+                        "properties": {
+                            "LoadState": "loaded",
+                            "ActiveState": "failed",
+                            "SubState": "dead",
+                            "Result": "timeout",
+                            "ExecMainStatus": "0",
+                        },
+                    }),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        worker_db.chmod(0o600)
+
+        resource_db = root / "resources.sqlite3"
+        connection = sqlite3.connect(resource_db)
+        try:
+            connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute("INSERT INTO metadata(key, value) VALUES ('schema_version', '1')")
+            connection.execute(
+                """
+                CREATE TABLE leases (
+                    resource_key TEXT,
+                    owner_id TEXT,
+                    expires_at_unix INTEGER
+                )
+                """
+            )
+            if live_lease:
+                connection.execute(
+                    "INSERT INTO leases VALUES (?, ?, ?)",
+                    ((lease_keys or ["display:98"])[0], f"worker:{worker_id}", 2_000),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        resource_db.chmod(0o600)
+        return worker_db, resource_db, unit
+
     def test_plan_resets_only_proven_terminal_units_and_preserves_unknown_classes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -107,6 +189,228 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [job_unit])
             self.assertEqual(plan["blocked"][0]["unit"], "grabowski-gui-worker-deadbeef.service")
             self.assertRegex(plan["plan_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_failed_worker_reset_requires_bound_db_systemd_and_no_live_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            worker_id = "1" * 20
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root,
+                worker_id=worker_id,
+                lease_keys=["display:98"],
+            )
+            state = self._state(
+                unit,
+                active="failed",
+                load="loaded",
+                result="timeout",
+            )
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+
+            self.assertEqual(plan["schema_version"], 3)
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            self.assertEqual(plan["blocked"], [])
+            evidence = plan["worker_reset_evidence"][0]
+            self.assertEqual(evidence["worker_id"], worker_id)
+            self.assertEqual(evidence["declared_lease_keys"], ["display:98"])
+            self.assertEqual(
+                evidence["terminal_evidence"],
+                "worker_db_and_systemd_failed_without_live_leases",
+            )
+
+    def test_failed_worker_with_live_lease_stays_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            worker_id = "2" * 20
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root,
+                worker_id=worker_id,
+                lease_keys=["display:99"],
+                live_lease=True,
+            )
+            state = self._state(
+                unit,
+                active="failed",
+                load="loaded",
+                result="timeout",
+            )
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+
+            self.assertEqual(plan["reset_failed_units"], [])
+            self.assertEqual(plan["worker_reset_evidence"], [])
+            self.assertIn("live resource leases", plan["blocked"][0]["reason"])
+
+    def test_worker_reset_revalidation_detects_state_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            worker_id = "3" * 20
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root,
+                worker_id=worker_id,
+            )
+            state = self._state(
+                unit,
+                active="failed",
+                load="loaded",
+                result="timeout",
+            )
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+            connection = sqlite3.connect(worker_db)
+            try:
+                connection.execute("UPDATE workers SET updated_at_unix=901")
+                connection.commit()
+            finally:
+                connection.close()
+            worker_db.chmod(0o600)
+
+            with patch.object(RETENTION, "_systemd_unit_states", return_value={unit: state}):
+                with self.assertRaisesRegex(RuntimeError, "drifted"):
+                    RETENTION._prepare_worker_resets(plan)
+
+    def test_failed_worker_oversized_observation_stays_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            worker_id = "4" * 20
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root,
+                worker_id=worker_id,
+            )
+            connection = sqlite3.connect(worker_db)
+            try:
+                connection.execute(
+                    "UPDATE workers SET last_observation_json=?",
+                    ("x" * (RETENTION.MAX_WORKER_OBSERVATION_JSON_BYTES + 1),),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            worker_db.chmod(0o600)
+            state = self._state(
+                unit,
+                active="failed",
+                load="loaded",
+                result="timeout",
+            )
+
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+
+            self.assertEqual(plan["reset_failed_units"], [])
+            self.assertIn("exceeds its bound", plan["blocked"][0]["reason"])
+
+    def test_apply_worker_reset_requires_kind_capability_and_revalidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            worker_id = "5" * 20
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root,
+                worker_id=worker_id,
+                kind="gui",
+            )
+            state = self._state(
+                unit,
+                active="failed",
+                load="loaded",
+                result="timeout",
+            )
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict(
+                "sys.modules",
+                {
+                    "grabowski_self_deploy": fake_self_deploy,
+                    "grabowski_mcp": fake_base,
+                },
+            ), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION,
+                "_systemd_unit_states",
+                return_value={unit: state},
+            ):
+                result = RETENTION.apply_plan(
+                    plan,
+                    expected_plan_sha256=plan["plan_sha256"],
+                )
+
+            self.assertTrue(result["completed"])
+            self.assertEqual(result["reset_failed"][0]["unit"], unit)
+            self.assertEqual(
+                [call.args[0] for call in fake_base._require_capability.call_args_list],
+                ["durable_job", "gui_worker"],
+            )
+            self.assertGreaterEqual(reset.call_count, 1)
+            self.assertEqual(reset.call_args.args[0], ["systemctl", "--user", "reset-failed", unit])
 
     def test_unknown_task_outcome_remains_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -504,6 +808,293 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(list(receipts.glob("*.json")), [])
             reset.assert_not_called()
             fake_base._append_audit.assert_called_once()
+
+    def test_worker_revalidation_failure_after_archive_writes_partial_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            receipts = root / "receipts"
+            job_name = "grabowski-job-555555555555"
+            job_unit = job_name + ".service"
+            self._job(jobs, job_name, 100)
+            worker_db, resource_db, worker_unit = self._worker_state_dbs(
+                root, worker_id="6" * 20
+            )
+            job_state = self._state(job_unit)
+            worker_state = self._state(
+                worker_unit, active="failed", load="loaded", result="timeout"
+            )
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50,
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=archive,
+                receipt_root=receipts,
+                task_db=root / "missing-tasks.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[job_unit, worker_unit],
+                unit_states={job_unit: job_state, worker_unit: worker_state},
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            audit_records: list[dict[str, object]] = []
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = audit_records.append
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            sensitive_error = "worker database path /private/secret drifted"
+
+            with patch.dict(
+                "sys.modules",
+                {
+                    "grabowski_self_deploy": fake_self_deploy,
+                    "grabowski_mcp": fake_base,
+                },
+            ), patch.object(
+                RETENTION,
+                "_prepare_worker_resets",
+                side_effect=[None, RuntimeError(sensitive_error)],
+            ), patch.object(
+                RETENTION, "_systemd_unit_states", return_value={job_unit: job_state}
+            ), patch.object(RETENTION, "_run", reset):
+                with self.assertRaisesRegex(RuntimeError, "receipt="):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+
+            receipt_path = receipts / f"{plan['plan_sha256']}.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertFalse(receipt["completed"])
+            self.assertTrue(receipt["retry"]["required"])
+            self.assertEqual(
+                receipt["retry"]["strategy"], "rebuild_live_plan_and_chain_partial_receipt"
+            )
+            self.assertEqual(receipt["archived_jobs"][0]["unit"], job_unit)
+            self.assertEqual(
+                receipt["reset_failures"][0]["stage"], "worker_revalidation"
+            )
+            self.assertEqual(
+                receipt["reset_failures"][0]["error_type"], "RuntimeError"
+            )
+            self.assertNotIn(sensitive_error, receipt_path.read_text(encoding="utf-8"))
+            reset_units = [call.args[0][-1] for call in reset.call_args_list]
+            self.assertIn(job_unit, reset_units)
+            self.assertNotIn(worker_unit, reset_units)
+            self.assertEqual(len(audit_records), 2)
+            self.assertFalse(audit_records[-1]["completed"])
+            self.assertEqual(audit_records[-1]["reset_failure_count"], 1)
+
+    def test_reset_exception_after_archive_writes_redacted_partial_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            receipts = root / "receipts"
+            job_name = "grabowski-job-666666666666"
+            unit = job_name + ".service"
+            self._job(jobs, job_name, 100)
+            state = self._state(unit)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50,
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=archive,
+                receipt_root=receipts,
+                task_db=root / "missing.sqlite3",
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            sensitive_error = "systemd internal path /private/secret failed"
+
+            with patch.dict(
+                "sys.modules",
+                {
+                    "grabowski_self_deploy": fake_self_deploy,
+                    "grabowski_mcp": fake_base,
+                },
+            ), patch.object(
+                RETENTION, "_systemd_unit_states", return_value={unit: state}
+            ), patch.object(
+                RETENTION, "_run", side_effect=RuntimeError(sensitive_error)
+            ):
+                with self.assertRaisesRegex(RuntimeError, "receipt="):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+
+            receipt_path = receipts / f"{plan['plan_sha256']}.json"
+            receipt_text = receipt_path.read_text(encoding="utf-8")
+            receipt = json.loads(receipt_text)
+            self.assertFalse(receipt["completed"])
+            self.assertEqual(receipt["reset_failures"][0]["stage"], "reset_command")
+            self.assertNotIn(sensitive_error, receipt_text)
+            self.assertTrue((archive / job_name).is_dir())
+
+    def test_reset_only_retry_chains_partial_receipt_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            receipts = root / "receipts"
+            worker_db, resource_db, unit = self._worker_state_dbs(
+                root, worker_id="7" * 20
+            )
+            state = self._state(
+                unit, active="failed", load="loaded", result="timeout"
+            )
+            plan = RETENTION.build_plan(
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=receipts,
+                task_db=root / "missing.sqlite3",
+                worker_db=worker_db,
+                resource_db=resource_db,
+                failed_units=[unit],
+                unit_states={unit: state},
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            audit_records: list[dict[str, object]] = []
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = audit_records.append
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(
+                side_effect=[
+                    RuntimeError("transient reset transport detail"),
+                    Mock(returncode=0, stderr=""),
+                ]
+            )
+
+            with patch.dict(
+                "sys.modules",
+                {
+                    "grabowski_self_deploy": fake_self_deploy,
+                    "grabowski_mcp": fake_base,
+                },
+            ), patch.object(
+                RETENTION, "_systemd_unit_states", return_value={unit: state}
+            ), patch.object(RETENTION, "_run", reset):
+                with self.assertRaisesRegex(RuntimeError, "receipt="):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+                first_path = receipts / f"{plan['plan_sha256']}.json"
+                first = json.loads(first_path.read_text(encoding="utf-8"))
+                result = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+                with self.assertRaisesRegex(RuntimeError, "terminal receipt"):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+
+            self.assertEqual(first["attempt"], 1)
+            self.assertIsNone(first["previous_receipt_sha256"])
+            self.assertFalse(first["completed"])
+            self.assertEqual(result["attempt"], 2)
+            self.assertEqual(
+                result["previous_receipt_sha256"], first["receipt_sha256"]
+            )
+            self.assertTrue(result["completed"])
+            self.assertTrue(result["receipt_path"].endswith(".retry-02.json"))
+            self.assertEqual(reset.call_count, 2)
+            self.assertEqual(len(audit_records), 4)
+
+    def test_private_sqlite_file_rejects_symlink_and_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            real = root / "real.sqlite3"
+            real.write_bytes(b"sqlite")
+            real.chmod(0o600)
+            symlink = root / "symlink.sqlite3"
+            symlink.symlink_to(real)
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                RETENTION._private_sqlite_file(symlink)
+            hardlink = root / "hardlink.sqlite3"
+            hardlink.hardlink_to(real)
+            with self.assertRaisesRegex(RuntimeError, "bounded private"):
+                RETENTION._private_sqlite_file(hardlink)
+
+    def test_private_sqlite_file_rejects_unsafe_sidecars_and_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            database = root / "workers.sqlite3"
+            database.write_bytes(b"sqlite")
+            database.chmod(0o600)
+            target = root / "target"
+            target.write_bytes(b"wal")
+            target.chmod(0o600)
+            wal = Path(str(database) + "-wal")
+            wal.symlink_to(target)
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                RETENTION._private_sqlite_file(database)
+            wal.unlink()
+            wal.touch(mode=0o600)
+            with wal.open("r+b") as handle:
+                handle.truncate(512 * 1024 * 1024 + 1)
+            with self.assertRaisesRegex(RuntimeError, "bounded private"):
+                RETENTION._private_sqlite_file(database)
+
+    def test_large_valid_partial_receipt_can_open_bounded_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            plan_sha256 = "a" * 64
+            payload = {
+                "schema_version": 3,
+                "operation": "grabowski-runtime-state-retention",
+                "plan_sha256": plan_sha256,
+                "attempt": 1,
+                "previous_receipt_sha256": None,
+                "completed": False,
+                "retry": {
+                    "required": True,
+                    "strategy": "rebuild_live_plan_and_chain_partial_receipt",
+                },
+                "preserved_blocked_units": [
+                    {
+                        "unit": f"grabowski-job-{index:012x}.service",
+                        "reason": "bounded evidence " + "x" * 64,
+                    }
+                    for index in range(2_000)
+                ],
+            }
+            payload["receipt_sha256"] = RETENTION._sha256(payload)
+            path = root / f"{plan_sha256}.json"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            self.assertGreater(path.stat().st_size, RETENTION.MAX_JSON_BYTES)
+            self.assertLess(path.stat().st_size, RETENTION.MAX_RETENTION_RECEIPT_BYTES)
+            target, attempt, previous = RETENTION._select_receipt_target(
+                root, plan_sha256=plan_sha256
+            )
+            self.assertEqual(attempt, 2)
+            self.assertEqual(previous, payload["receipt_sha256"])
+            self.assertTrue(target.name.endswith(".retry-02.json"))
 
     def test_retention_receipt_is_create_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
