@@ -464,12 +464,13 @@ def _run(
     cwd: Path,
     timeout_seconds: int,
     max_output_bytes: int,
+    environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     process = subprocess.Popen(
         argv,
         cwd=cwd,
-        env=_safe_environment(),
+        env=_safe_environment() if environment is None else environment,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1508,6 +1509,33 @@ def _read_job_log(path: Path, max_lines: int) -> dict[str, Any]:
     }
 
 
+GIT_ENVIRONMENT_EXACT_DENY = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_EXEC_PATH",
+        "GIT_CONFIG",
+    }
+)
+
+
+def _git_environment() -> dict[str, str]:
+    environment = _safe_environment()
+    for key in tuple(environment):
+        if key in GIT_ENVIRONMENT_EXACT_DENY or key.startswith("GIT_CONFIG_"):
+            environment.pop(key, None)
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["GCM_INTERACTIVE"] = "never"
+    environment["GIT_PAGER"] = "cat"
+    environment["PAGER"] = "cat"
+    return environment
+
+
 def _git_branch(repo: Path) -> str:
     completed = subprocess.run(
         ["git", "-C", str(repo), "branch", "--show-current"],
@@ -1515,32 +1543,269 @@ def _git_branch(repo: Path) -> str:
         stderr=subprocess.PIPE,
         check=False,
         text=True,
+        env=_git_environment(),
     )
     if completed.returncode != 0:
         raise ValueError(completed.stderr.strip() or "Not a Git repository")
     return completed.stdout.strip()
 
 
-def _force_push_requested(arguments: list[str]) -> bool:
-    return any(
-        item in {"-f", "--force", "--force-with-lease"}
-        or item.startswith("--force=")
-        or item.startswith("--force-with-lease=")
-        or item.startswith("+")
-        for item in arguments[1:]
+GIT_SAFE_GLOBAL_FLAGS = frozenset(
+    {
+        "-p",
+        "--paginate",
+        "-P",
+        "--no-pager",
+        "--no-replace-objects",
+        "--literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+        "--icase-pathspecs",
+        "--no-optional-locks",
+        "--no-lazy-fetch",
+    }
+)
+GIT_REPOSITORY_REBIND_OPTIONS = frozenset(
+    {"-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--bare"}
+)
+GIT_FORCE_OPTIONS = frozenset({"-f", "--force", "--force-with-lease"})
+GIT_CONFIG_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+")
+GIT_REMOTE_PUSH_KEY_RE = re.compile(r"remote\..+\.push", re.IGNORECASE)
+GIT_REMOTE_MIRROR_KEY_RE = re.compile(r"remote\..+\.mirror", re.IGNORECASE)
+GIT_TRUE_VALUES = frozenset({"true", "yes", "on", "1"})
+GIT_REMOTE_WRITE_BYPASS_SUBCOMMANDS = frozenset({"send-pack", "http-push"})
+GIT_PUSH_OPTIONS_WITH_VALUE = frozenset(
+    {"--repo", "--receive-pack", "--exec", "--recurse-submodules", "--push-option", "-o"}
+)
+
+
+def _git_config_assignment(value: str) -> tuple[str, str]:
+    if "=" not in value:
+        raise ValueError("Git -c configuration must use name=value")
+    key, configured = value.split("=", 1)
+    if any(character in configured for character in ("\x00", "\n", "\r")):
+        raise ValueError("Git -c configuration value contains control characters")
+    if not GIT_CONFIG_KEY_RE.fullmatch(key):
+        raise ValueError("Git -c configuration key is invalid")
+    return key.casefold(), configured
+
+
+def _split_git_invocation(arguments: list[str]) -> tuple[str, list[str], list[tuple[str, str]]]:
+    configurations: list[tuple[str, str]] = []
+    index = 0
+    while index < len(arguments):
+        item = arguments[index]
+        if item == "-c":
+            if index + 1 >= len(arguments):
+                raise ValueError("Git -c requires name=value")
+            configurations.append(_git_config_assignment(arguments[index + 1]))
+            index += 2
+            continue
+        if item == "--config-env" or item.startswith("--config-env="):
+            raise PermissionError(
+                "Git --config-env is blocked because indirect configuration cannot be audited."
+            )
+        if item in GIT_REPOSITORY_REBIND_OPTIONS:
+            if item != "--bare" and index + 1 >= len(arguments):
+                raise ValueError(f"Git {item} requires a value")
+            raise PermissionError(
+                f"Git repository rebinding option is blocked in grabowski_git: {item}"
+            )
+        if any(
+            item.startswith(prefix)
+            for prefix in (
+                "--git-dir=",
+                "--work-tree=",
+                "--namespace=",
+                "--super-prefix=",
+            )
+        ):
+            raise PermissionError(
+                "Git repository rebinding options are blocked in grabowski_git."
+            )
+        if item in GIT_SAFE_GLOBAL_FLAGS:
+            index += 1
+            continue
+        if item.startswith("-"):
+            raise ValueError(f"Unsupported Git global option before subcommand: {item}")
+        return item, arguments[index + 1 :], configurations
+    raise ValueError("Git subcommand is missing")
+
+
+def _git_config_entries(repo: Path, pattern: str) -> list[tuple[str, str]]:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get-regexp", pattern],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+        env=_git_environment(),
+    )
+    if completed.returncode == 1 and not completed.stdout.strip():
+        return []
+    if completed.returncode != 0:
+        raise ValueError(completed.stderr.strip() or "Git configuration query failed")
+    entries: list[tuple[str, str]] = []
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if not separator or not key:
+            raise ValueError("Git configuration query returned malformed output")
+        entries.append((key.casefold(), value))
+    return entries
+
+
+def _push_positionals(push_arguments: list[str]) -> list[str]:
+    positionals: list[str] = []
+    skip_value = False
+    positional_only = False
+    for item in push_arguments:
+        if skip_value:
+            skip_value = False
+            continue
+        if positional_only:
+            positionals.append(item)
+            continue
+        if item == "--":
+            positional_only = True
+            continue
+        if item in GIT_PUSH_OPTIONS_WITH_VALUE:
+            skip_value = True
+            continue
+        if any(
+            item.startswith(prefix)
+            for prefix in (
+                "--repo=",
+                "--receive-pack=",
+                "--exec=",
+                "--recurse-submodules=",
+                "--push-option=",
+            )
+        ):
+            continue
+        if item.startswith("-o") and item != "-o":
+            continue
+        if item.startswith("-"):
+            continue
+        positionals.append(item)
+    if skip_value:
+        raise ValueError("Git push option requires a value")
+    return positionals
+
+
+def _short_push_option_has_flag(item: str, flag: str) -> bool:
+    if not item.startswith("-") or item.startswith("--") or len(item) < 2:
+        return False
+    for character in item[1:]:
+        if character == "o":
+            return False
+        if character == flag:
+            return True
+    return False
+
+
+def _push_option_present(
+    push_arguments: list[str],
+    *,
+    exact: frozenset[str] = frozenset(),
+    prefixes: tuple[str, ...] = (),
+    short_flag: str | None = None,
+) -> bool:
+    skip_value = False
+    positional_only = False
+    for item in push_arguments:
+        if skip_value:
+            skip_value = False
+            continue
+        if positional_only:
+            continue
+        if item == "--":
+            positional_only = True
+            continue
+        if item in GIT_PUSH_OPTIONS_WITH_VALUE:
+            skip_value = True
+            continue
+        if any(
+            item.startswith(prefix)
+            for prefix in (
+                "--repo=",
+                "--receive-pack=",
+                "--exec=",
+                "--recurse-submodules=",
+                "--push-option=",
+            )
+        ):
+            continue
+        if item.startswith("-o") and item != "-o":
+            continue
+        if item in exact or any(item.startswith(prefix) for prefix in prefixes):
+            return True
+        if short_flag is not None and _short_push_option_has_flag(item, short_flag):
+            return True
+    if skip_value:
+        raise ValueError("Git push option requires a value")
+    return False
+
+
+def _push_has_explicit_refspec(push_arguments: list[str]) -> bool:
+    positionals = _push_positionals(push_arguments)
+    repository_via_option = any(
+        item == "--repo" or item.startswith("--repo=")
+        for item in push_arguments
+    )
+    return bool(positionals) if repository_via_option else len(positionals) >= 2
+
+
+def _implicit_push_target(
+    repo: Path,
+    configurations: list[tuple[str, str]],
+) -> str | None:
+    command = ["git", "-C", str(repo)]
+    for key, value in configurations:
+        command.extend(["-c", f"{key}={value}"])
+    command.extend(["rev-parse", "--symbolic-full-name", "@{push}"])
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+        env=_git_environment(),
+    )
+    if completed.returncode != 0:
+        return None
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    return lines[0]
+
+
+def _symbolic_push_target_is_protected(target: str) -> bool:
+    return target in {f"refs/heads/{branch}" for branch in PROTECTED_BRANCHES} or any(
+        target.endswith(f"/{branch}") for branch in PROTECTED_BRANCHES
     )
 
 
-def _aggregate_push_requested(arguments: list[str]) -> bool:
-    return any(
-        item in {"--all", "--mirror", "--tags"}
-        or "*" in item
-        for item in arguments[1:]
+def _force_push_requested(push_arguments: list[str]) -> bool:
+    return _push_option_present(
+        push_arguments,
+        exact=GIT_FORCE_OPTIONS,
+        prefixes=("--force=", "--force-with-lease="),
+        short_flag="f",
+    ) or any(item.startswith("+") for item in _push_positionals(push_arguments))
+
+
+def _aggregate_push_requested(push_arguments: list[str]) -> bool:
+    return _push_option_present(
+        push_arguments,
+        exact=frozenset({"--all", "--mirror", "--tags"}),
+    ) or any("*" in item for item in _push_positionals(push_arguments))
+
+
+def _mirror_push_requested(push_arguments: list[str]) -> bool:
+    return _push_option_present(
+        push_arguments,
+        exact=frozenset({"--mirror"}),
     )
-
-
-def _mirror_push_requested(arguments: list[str]) -> bool:
-    return "--mirror" in arguments[1:]
 
 
 def _normal_branch_name(ref: str) -> str:
@@ -1551,35 +1816,170 @@ def _normal_branch_name(ref: str) -> str:
     return value
 
 
-def _push_mentions_protected_branch(arguments: list[str]) -> bool:
-    for item in arguments[1:]:
-        if not item or item.startswith("-"):
-            continue
-        if _normal_branch_name(item) in PROTECTED_BRANCHES:
-            return True
-    return False
+def _refspec_targets_protected_branch(refspec: str) -> bool:
+    value = refspec.removeprefix("+")
+    destination = value.rsplit(":", 1)[1] if ":" in value else value
+    if "*" in destination:
+        return True
+    return _normal_branch_name(destination) in PROTECTED_BRANCHES
+
+
+def _push_mentions_protected_branch(push_arguments: list[str]) -> bool:
+    return any(
+        _refspec_targets_protected_branch(item)
+        for item in _push_positionals(push_arguments)
+    )
+
+
+def _refspec_deletes_protected_branch(refspec: str) -> bool:
+    value = refspec.removeprefix("+")
+    if ":" not in value:
+        return False
+    source, destination = value.rsplit(":", 1)
+    return not source and _refspec_targets_protected_branch(destination)
+
+
+def _push_deletes_protected_branch(push_arguments: list[str]) -> bool:
+    delete_option = _push_option_present(
+        push_arguments,
+        exact=frozenset({"-d", "--delete"}),
+        short_flag="d",
+    )
+    refspec_deletion = any(
+        _refspec_deletes_protected_branch(item)
+        for item in _push_positionals(push_arguments)
+    )
+    named_delete = delete_option and _push_mentions_protected_branch(push_arguments)
+    return refspec_deletion or named_delete
+
+
+def _configured_push_refspecs(
+    repo: Path,
+    configurations: list[tuple[str, str]],
+) -> list[str]:
+    values = [
+        value
+        for key, value in _git_config_entries(repo, r"^remote\..*\.push$")
+        if GIT_REMOTE_PUSH_KEY_RE.fullmatch(key)
+    ]
+    values.extend(
+        value
+        for key, value in configurations
+        if GIT_REMOTE_PUSH_KEY_RE.fullmatch(key)
+    )
+    return values
+
+
+def _configured_remote_mirror(
+    repo: Path,
+    configurations: list[tuple[str, str]],
+) -> bool:
+    values = [
+        value
+        for key, value in _git_config_entries(repo, r"^remote\..*\.mirror$")
+        if GIT_REMOTE_MIRROR_KEY_RE.fullmatch(key)
+    ]
+    values.extend(
+        value
+        for key, value in configurations
+        if GIT_REMOTE_MIRROR_KEY_RE.fullmatch(key)
+    )
+    return any(value.casefold() in GIT_TRUE_VALUES for value in values)
+
+
+def _push_default_is_matching(
+    repo: Path,
+    configurations: list[tuple[str, str]],
+) -> bool:
+    configured = [value for key, value in configurations if key == "push.default"]
+    if configured:
+        return configured[-1].casefold() == "matching"
+    entries = _git_config_entries(repo, r"^push\.default$")
+    return bool(entries and entries[-1][1].casefold() == "matching")
+
+
+def _reject_git_alias_configuration(configurations: list[tuple[str, str]]) -> None:
+    if any(key.startswith("alias.") for key, _value in configurations):
+        raise PermissionError(
+            "Git alias injection is blocked because it can conceal a push operation."
+        )
+
+
+def _reject_configured_alias(repo: Path, subcommand: str) -> None:
+    aliases = _git_config_entries(repo, rf"^alias\.{re.escape(subcommand)}$")
+    if aliases:
+        raise PermissionError(
+            "Configured Git aliases are blocked in grabowski_git because they can conceal a push operation."
+        )
 
 
 def _guard_git(arguments: list[str], repo: Path) -> None:
     if not arguments:
         raise ValueError("Git arguments must not be empty")
-    if _trusted_owner_mode():
+
+    subcommand, command_arguments, configurations = _split_git_invocation(arguments)
+    _reject_git_alias_configuration(configurations)
+    if subcommand in GIT_REMOTE_WRITE_BYPASS_SUBCOMMANDS:
+        raise PermissionError(
+            f"Direct Git remote-write subcommand is blocked; use push: {subcommand}"
+        )
+    if subcommand == "subtree" and command_arguments[:1] == ["push"]:
+        raise PermissionError(
+            "Git subtree push is blocked in grabowski_git; use the typed publication path."
+        )
+    if subcommand != "push":
+        _reject_configured_alias(repo, subcommand)
         return
 
-    if arguments[0] != "push":
-        return
-
-    force = _force_push_requested(arguments)
-    if _aggregate_push_requested(arguments) and (
-        force or _mirror_push_requested(arguments)
-    ):
-        raise PermissionError("Forced aggregate Git pushes are blocked.")
-    if force and (
-        _git_branch(repo) in PROTECTED_BRANCHES
-        or _push_mentions_protected_branch(arguments)
+    force = _force_push_requested(command_arguments)
+    if _push_option_present(
+        command_arguments,
+        exact=frozenset({"--prune"}),
     ):
         raise PermissionError(
-            "Force-push to a protected main branch is blocked."
+            "Deletion via Git push --prune is blocked because it can remove protected remote refs."
+        )
+    command_aggregate = _aggregate_push_requested(command_arguments)
+    command_protected = _push_mentions_protected_branch(command_arguments)
+    if _push_deletes_protected_branch(command_arguments):
+        raise PermissionError("Deletion of a protected main branch is blocked.")
+    if command_aggregate and (force or _mirror_push_requested(command_arguments)):
+        raise PermissionError("Forced aggregate Git pushes are blocked.")
+    current_branch_protected = force and _git_branch(repo) in PROTECTED_BRANCHES
+    if force and (current_branch_protected or command_protected):
+        raise PermissionError(
+            "Force-push to a protected main branch is blocked, including in trusted-owner mode."
+        )
+
+    configured_refspecs = _configured_push_refspecs(repo, configurations)
+    if any(_refspec_deletes_protected_branch(value) for value in configured_refspecs):
+        raise PermissionError("Deletion of a protected main branch is blocked.")
+    if _configured_remote_mirror(repo, configurations):
+        raise PermissionError(
+            "Configured Git push mirroring is blocked because it can force or delete protected refs."
+        )
+    configured_force = any(value.startswith("+") for value in configured_refspecs)
+    configured_protected = any(
+        _refspec_targets_protected_branch(value) for value in configured_refspecs
+    )
+    configured_aggregate = _push_default_is_matching(repo, configurations)
+    if configured_aggregate and (force or configured_force):
+        raise PermissionError("Forced aggregate Git pushes are blocked.")
+    if force and not configured_refspecs and not _push_has_explicit_refspec(
+        command_arguments
+    ):
+        implicit_target = _implicit_push_target(repo, configurations)
+        if implicit_target is None:
+            raise PermissionError(
+                "Implicit force-push target could not be resolved; provide an explicit safe refspec."
+            )
+        if _symbolic_push_target_is_protected(implicit_target):
+            raise PermissionError(
+                "Force-push to an implicit protected main branch is blocked."
+            )
+    if (force or configured_force) and configured_protected:
+        raise PermissionError(
+            "Force-push to a protected main branch is blocked, including in trusted-owner mode."
         )
 
 
@@ -1927,7 +2327,7 @@ def grabowski_git(
     arguments: list[str],
     timeout_seconds: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """Run Git in one repository with protected-main force-push guard."""
+    """Run Git with a config-aware protected-main force-push guard."""
     _require_operator_mutation("git_cli")
     path = Path(repo).expanduser().resolve(strict=True)
     if not path.is_dir():
@@ -1941,6 +2341,7 @@ def grabowski_git(
         cwd=path,
         timeout_seconds=_timeout(timeout_seconds),
         max_output_bytes=MAX_OUTPUT_BYTES,
+        environment=_git_environment(),
     )
 
 

@@ -106,10 +106,11 @@ For `pr-merge`, Captain also reads the repository's current GitHub merge policy 
 
 ## Git und GitHub
 
-`grabowski_git` führt Git mit explizitem Repo-Pfad aus.
+`grabowski_git` führt Git mit explizitem Repo-Pfad und bereinigter Git-Umgebung aus. Der Guard zerlegt vorangestellte Git- und Push-Optionen, prüft explizite, konfigurierte und implizite Push-Ziele und blockiert Repo-Rebinding, indirekte Konfiguration, Alias-Injektion, Push-Mirroring, `push --prune`, direkte Remote-Write-Unterbefehle sowie erzwungene oder löschende Änderungen an `main` und `master`. Diese Grenze gilt auch im Trusted-Owner-Modus.
+
 `grabowski_github` stellt GitHub CLI bereit.
 
-Force-Pushes auf `main` und `master` bleiben gesperrt.
+Der lokale Guard ist Defense-in-Depth und ersetzt keine serverseitige Branch-Regel: andere erlaubte Ausführungspfade oder gleichzeitige Konfigurationsänderungen können nur am Remote-Ende vollständig beherrscht werden.
 
 ## Notwendige Grenzen
 
