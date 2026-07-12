@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -72,6 +73,28 @@ def _load_operator_module():
     fake_base._kill_switch_state = lambda: {"engaged": False}
     fake_base._require_valid_audit_chain = lambda: None
     fake_base._reject_forbidden_hosts_in_argv = lambda argv, *, policy=None: None
+
+    def read_bound_regular_bytes(path, max_bytes):
+        path = Path(path)
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise PermissionError("not one regular file")
+        payload = path.read_bytes()
+        if len(payload) > max_bytes:
+            raise ValueError("file too large")
+        return {
+            "data": payload,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "mtime_ns": metadata.st_mtime_ns,
+            "ctime_ns": metadata.st_ctime_ns,
+            "dev": metadata.st_dev,
+            "ino": metadata.st_ino,
+        }
+
+    fake_base._read_bound_regular_bytes = read_bound_regular_bytes
+    fake_base._append_audit = lambda record: None
 
     module_name = "grabowski_operator_contract_test"
     spec = importlib.util.spec_from_file_location(
@@ -154,6 +177,8 @@ class OperatorContractTests(unittest.TestCase):
             "grabowski_terminal_run",
             "grabowski_job_start",
             "grabowski_job_status",
+            "grabowski_job_notification_list",
+            "grabowski_job_notification_ack",
             "grabowski_job_logs",
             "grabowski_job_cancel",
             "grabowski_git",
@@ -288,6 +313,7 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(persisted["terminalization_evidence"]["source"], "systemd-run-launch")
             invoked = run.call_args_list[0].args[0]
             self.assertIn("systemd-run", invoked)
+            self.assertEqual(invoked.count("--property=LimitCORE=0"), 1)
             self.assertNotIn("mail", invoked)
             self.assertNotIn("notify-send", invoked)
 
@@ -494,7 +520,7 @@ class OperatorContractTests(unittest.TestCase):
             self.assertTrue(status["job_record"]["notify_on_done"]["requested"])
             self.assertEqual(status["job_record"]["notify_on_done"]["channels"], ["chat"])
             self.assertFalse(status["notification_evidence"]["delivery_enabled"])
-            self.assertEqual(status["notification_evidence"]["delivery_state"], "not_sent")
+            self.assertEqual(status["notification_evidence"]["delivery_state"], "missing_receipt")
             self.assertEqual(status["notification_evidence"]["final_status_preserved"], "failed")
             self.assertIn("hidden_finalization_failure", status["terminalization_evidence"]["does_not_establish"])
 

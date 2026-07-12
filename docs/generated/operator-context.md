@@ -73,6 +73,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_terminal_run` | command | no | variable | Run one bounded non-interactive command as the current user. |
 | `grabowski_job_start` | command | no | variable | Start a durable bounded background command as a transient user service. |
 | `grabowski_job_status` | command | yes | low | Read durable metadata and current service state for one Grabowski job. |
+| `grabowski_job_notification_list` | command | yes | low | List persistent operator-outbox receipts for completed durable jobs. |
+| `grabowski_job_notification_ack` | command | no | medium | Acknowledge one exact persistent operator-outbox receipt. |
 | `grabowski_job_logs` | command | yes | low | Read redacted persistent output for one Grabowski job. |
 | `grabowski_job_cancel` | command | no | medium | Stop one Grabowski-owned background job. |
 | `grabowski_git` | version-control | no | variable | Run Git in one repository; generic push is limited to one explicit unprotected branch ref. |

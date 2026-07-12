@@ -44,6 +44,8 @@
     "grabowski_terminal_run",
     "grabowski_job_start",
     "grabowski_job_status",
+    "grabowski_job_notification_list",
+    "grabowski_job_notification_ack",
     "grabowski_job_logs",
     "grabowski_job_cancel",
     "grabowski_git",
@@ -247,6 +249,10 @@
     {
       "module": "grabowski_agent_bootstrap",
       "source": "src/grabowski_agent_bootstrap.py"
+    },
+    {
+      "module": "grabowski_job_finalizer",
+      "source": "src/grabowski_job_finalizer.py"
     }
   ]
 }

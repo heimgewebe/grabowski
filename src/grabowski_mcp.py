@@ -145,6 +145,8 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     'grabowski_terminal_run': ('terminal_execute',),
     'grabowski_job_start': ('durable_job',),
     'grabowski_job_status': ('durable_job',),
+    'grabowski_job_notification_list': ('durable_job',),
+    'grabowski_job_notification_ack': ('durable_job',),
     'grabowski_job_logs': ('durable_job',),
     'grabowski_job_cancel': ('durable_job',),
     'grabowski_git': ('git_cli',),
@@ -229,6 +231,8 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     'grabowski_terminal_run',
     'grabowski_job_start',
     'grabowski_job_status',
+    'grabowski_job_notification_list',
+    'grabowski_job_notification_ack',
     'grabowski_job_logs',
     'grabowski_job_cancel',
     'grabowski_git',
@@ -3007,39 +3011,193 @@ def _operator_relay_protocol() -> dict[str, Any]:
     }
 
 
+STATUS_VIEWS = frozenset({"minimal", "standard", "evidence"})
+STATUS_VIEW_ALIASES = {"concise": "minimal", "full": "evidence"}
+
+
+def _normalize_status_view(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("view must be a string")
+    selected = STATUS_VIEW_ALIASES.get(value, value)
+    if selected not in STATUS_VIEWS:
+        raise ValueError(f"view must be one of {sorted(STATUS_VIEWS)}")
+    return selected
+
+
+def _project_status_fields(
+    payload: dict[str, Any],
+    fields: list[str] | None,
+) -> dict[str, Any]:
+    if fields is None:
+        return payload
+    if not isinstance(fields, list) or len(fields) > 40:
+        raise ValueError("fields must be a list with at most 40 entries")
+    normalized: list[str] = []
+    for field in fields:
+        if not isinstance(field, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", field):
+            raise ValueError("fields entries must be bounded lower-case identifiers")
+        if field not in normalized:
+            normalized.append(field)
+    unknown = sorted(set(normalized) - set(payload))
+    if unknown:
+        raise ValueError(f"Unknown response field(s): {', '.join(unknown)}")
+    required = {
+        "schema_version",
+        "view",
+        "healthy",
+        "warnings",
+        "recommended_next_action",
+        "does_not_establish",
+    }
+    keep = set(normalized) | (required & set(payload))
+    projected = {key: value for key, value in payload.items() if key in keep}
+    projected["projection"] = {
+        "selected_fields": sorted(keep),
+        "omitted_fields": sorted(set(payload) - keep),
+        "required_fields_preserved": sorted(required & set(payload)),
+    }
+    return projected
+
+
 @mcp.tool(name="grabowski_status", annotations=READ_ANNOTATIONS)
-def grabowski_status() -> dict[str, Any]:
-    """Return Grabowski's bounded read/write policy and current local state."""
+def grabowski_status(
+    view: str = "minimal",
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return a consumer-shaped Grabowski status with opt-in evidence detail."""
+    selected_view = _normalize_status_view(view)
     policy = _load_policy()
     active_profile = _active_profile(policy)
-    return {
+    deployment = _deployment_metadata()
+    tool_contract = _runtime_tool_contract_summary()
+    audit = _verify_audit_log(AUDIT_LOG)
+    kill_switch = _kill_switch_state()
+    integrity_fields = (
+        "manifest_parse_valid",
+        "manifest_schema_valid",
+        "repo_head_valid",
+        "runtime_binding_valid",
+        "environment_compatibility_valid",
+        "provenance_valid",
+        "artifact_integrity_valid",
+    )
+    integrity = {key: bool(deployment.get(key)) for key in integrity_fields}
+    warnings: list[dict[str, Any]] = []
+    if deployment.get("completion_status") != "complete" or not all(integrity.values()):
+        warnings.append({
+            "code": "deployment_integrity_incomplete",
+            "failed_checks": sorted(key for key, value in integrity.items() if not value),
+        })
+    if not bool(audit.get("valid")):
+        warnings.append({"code": "audit_invalid", "error": audit.get("error")})
+    if bool(kill_switch.get("engaged")):
+        warnings.append({"code": "kill_switch_engaged"})
+    if not bool(tool_contract.get("runtime_matches_deployment_contract")):
+        warnings.append({"code": "runtime_tool_contract_drift"})
+    if not bool(tool_contract.get("client_snapshot_observable")):
+        warnings.append({
+            "code": "client_snapshot_unobservable",
+            "detail": "server runtime cannot prove the connector's frozen client tool view",
+        })
+    healthy = (
+        deployment.get("completion_status") == "complete"
+        and all(integrity.values())
+        and bool(audit.get("valid"))
+        and not bool(kill_switch.get("engaged"))
+        and bool(tool_contract.get("runtime_matches_deployment_contract"))
+    )
+    base_payload: dict[str, Any] = {
+        "schema_version": 2,
+        "view": selected_view,
         "service": "grabowski-mcp",
+        "healthy": healthy,
         "mode": policy.get("mode", "bounded-read-write"),
         "active_profile": active_profile["name"],
-        "trusted_owner": _trusted_owner_enabled(policy),
         "access_profiles": sorted(policy.get("profiles", {})),
-        "capabilities": sorted(_effective_capabilities(policy)),
-        "state_dir": str(STATE_DIR),
-        "policy_path": str(POLICY_PATH),
-        "read_roots": _profile_values(policy, "read_roots"),
-        "write_roots": _profile_values(policy, "write_roots"),
-        "write_excluded_roots": _profile_values(
-            policy,
-            "write_excluded_roots",
-        ) or [],
-        "secret_roots": _secret_root_values(policy),
-        "browser_profile_roots": _browser_profile_root_values(policy),
-        "secret_export_roots": _secret_export_root_values(policy),
-        "latest_complete_bundles_path": str(BUNDLE_REGISTRY),
-        "latest_complete_bundles_exists": BUNDLE_REGISTRY.is_file(),
-        "deployment": _deployment_metadata(),
-        "operating_protocol": _operator_relay_protocol(),
-        "tool_contract": _runtime_tool_contract_summary(),
-        "capability_requirements": _capability_requirement_summary(policy),
-        "forbidden_capabilities": policy.get("forbidden_capabilities", []),
-        "kill_switch": _kill_switch_state(),
-        "audit": _verify_audit_log(AUDIT_LOG),
+        "runtime": {
+            "release_id": deployment.get("release_id"),
+            "repo_head": deployment.get("repo_head"),
+            "completion_status": deployment.get("completion_status"),
+            "integrity": integrity,
+        },
+        "tool_contract": {
+            "expected_tool_count": tool_contract.get("expected_tool_count"),
+            "registered_tool_count": tool_contract.get("registered_tool_count"),
+            "runtime_matches_deployment_contract": tool_contract.get(
+                "runtime_matches_deployment_contract"
+            ),
+            "client_snapshot_observable": tool_contract.get("client_snapshot_observable"),
+            "refresh_required_when_client_count_or_hash_differs": tool_contract.get(
+                "refresh_required_when_client_count_or_hash_differs"
+            ),
+        },
+        "warnings": warnings,
+        "recommended_next_action": (
+            "inspect warnings before mutation" if warnings else "none"
+        ),
+        "evidence_refs": {
+            "release_id": deployment.get("release_id"),
+            "repo_head": deployment.get("repo_head"),
+            "audit_last_record_sha256": audit.get("last_record_sha256"),
+        },
+        "does_not_establish": [
+            "client_snapshot_freshness",
+            "individual_tool_behavior_correctness",
+            "future_action_authority",
+        ],
     }
+    if selected_view in {"standard", "evidence"}:
+        operating_protocol = _operator_relay_protocol()
+        workspace_model = operating_protocol.get("workspace_execution_model", {})
+        base_payload.update({
+            "capabilities": sorted(_effective_capabilities(policy)),
+            "roots": {
+                "read": _profile_values(policy, "read_roots"),
+                "write": _profile_values(policy, "write_roots"),
+                "write_excluded": _profile_values(policy, "write_excluded_roots") or [],
+            },
+            "kill_switch": kill_switch,
+            "audit": {
+                "valid": audit.get("valid"),
+                "records": audit.get("records"),
+                "last_record_sha256": audit.get("last_record_sha256"),
+                "error": audit.get("error"),
+            },
+            "operating_protocol": {
+                "name": operating_protocol.get("name"),
+                "control_loop": operating_protocol.get("control_loop", []),
+                "external_agent_delegation": workspace_model.get(
+                    "external_agent_delegation"
+                ),
+                "automatic_patch_apply": workspace_model.get("automatic_patch_apply"),
+                "automatic_winner_selection": workspace_model.get(
+                    "automatic_winner_selection"
+                ),
+                "does_not_establish": operating_protocol.get(
+                    "does_not_establish", []
+                ),
+            },
+        })
+    if selected_view == "evidence":
+        base_payload.update({
+            "operating_protocol": _operator_relay_protocol(),
+            "trusted_owner": _trusted_owner_enabled(policy),
+            "state_dir": str(STATE_DIR),
+            "policy_path": str(POLICY_PATH),
+            "read_roots": _profile_values(policy, "read_roots"),
+            "write_roots": _profile_values(policy, "write_roots"),
+            "write_excluded_roots": _profile_values(policy, "write_excluded_roots") or [],
+            "secret_roots": _secret_root_values(policy),
+            "browser_profile_roots": _browser_profile_root_values(policy),
+            "secret_export_roots": _secret_export_root_values(policy),
+            "latest_complete_bundles_path": str(BUNDLE_REGISTRY),
+            "latest_complete_bundles_exists": BUNDLE_REGISTRY.is_file(),
+            "deployment": deployment,
+            "tool_contract_evidence": tool_contract,
+            "capability_requirements": _capability_requirement_summary(policy),
+            "forbidden_capabilities": policy.get("forbidden_capabilities", []),
+        })
+    return _project_status_fields(base_payload, fields)
 
 
 @mcp.tool(name="grabowski_list_directory", annotations=READ_ANNOTATIONS)

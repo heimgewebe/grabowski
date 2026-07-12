@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -389,48 +390,124 @@ def grabowski_contract_drift() -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_checkout_summary", annotations=LOCAL_READ)
-def grabowski_checkout_summary() -> dict[str, Any]:
-    """Return a bounded summary of Grabowski repository worktrees."""
+def grabowski_checkout_summary(
+    view: str = "minimal",
+    limit: int = 20,
+    cursor: str | None = None,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return a paginated consumer-shaped summary of Grabowski worktrees."""
+    selected_view = operator._normalize_consumer_view(view)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_WORKTREES:
+        raise ValueError(f"limit must be between 1 and {MAX_WORKTREES}")
     deployment = base._deployment_metadata()
     runtime_head = deployment.get("repo_head")
     context = runtime_extensions._worktree_context(
         runtime_head if isinstance(runtime_head, str) else None
     )
-    worktrees = context.get("worktrees", [])
-    if not isinstance(worktrees, list):
-        worktrees = []
-    selected = []
-    for item in worktrees[:MAX_WORKTREES]:
-        if not isinstance(item, dict):
-            continue
-        selected.append(
+    raw_worktrees = context.get("worktrees", [])
+    if not isinstance(raw_worktrees, list):
+        raw_worktrees = []
+    worktrees = sorted(
+        (item for item in raw_worktrees if isinstance(item, dict)),
+        key=lambda item: str(item.get("path", "")),
+    )
+    snapshot_digest = hashlib.sha256(
+        operator._canonical_json_bytes([
             {
-                key: item.get(key)
-                for key in (
-                    "path",
-                    "head",
-                    "branch",
-                    "detached",
-                    "bare",
-                    "prunable",
-                    "matches_runtime",
-                )
-                if key in item
+                "path": item.get("path"),
+                "head": item.get("head"),
+                "branch": item.get("branch"),
+                "prunable": bool(item.get("prunable")),
             }
+            for item in worktrees
+        ])
+    ).hexdigest()
+    scope = f"checkout-summary:{selected_view}:{snapshot_digest}"
+    position = operator._decode_consumer_cursor(cursor, scope)
+    offset = 0 if position is None else position.get("offset")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("cursor offset is invalid")
+    page = worktrees[offset : offset + limit]
+    item_fields = (
+        "path",
+        "head",
+        "branch",
+        "matches_runtime",
+        "prunable",
+    )
+    if selected_view in {"standard", "evidence"}:
+        item_fields = (
+            "path",
+            "head",
+            "branch",
+            "detached",
+            "bare",
+            "prunable",
+            "matches_runtime",
         )
-    canonical = context.get("canonical_checkout")
-    return {
+    selected = [
+        {key: item.get(key) for key in item_fields if key in item}
+        for item in page
+    ]
+    next_offset = offset + len(page)
+    next_cursor = (
+        operator._encode_consumer_cursor(scope, {"offset": next_offset})
+        if next_offset < len(worktrees)
+        else None
+    )
+    warnings: list[dict[str, Any]] = []
+    if not bool(context.get("canonical_matches_runtime")):
+        warnings.append({"code": "canonical_runtime_head_mismatch"})
+    prunable_count = sum(bool(item.get("prunable")) for item in worktrees)
+    if prunable_count:
+        warnings.append({"code": "prunable_worktrees", "count": prunable_count})
+    payload: dict[str, Any] = {
+        "schema_version": 2,
+        "view": selected_view,
         "repository": context.get("repository"),
         "exists": bool(context.get("exists")),
-        "canonical_checkout": canonical,
+        "canonical_checkout": context.get("canonical_checkout"),
         "canonical_matches_runtime": bool(context.get("canonical_matches_runtime")),
         "runtime_matching_worktree_count": len(
             context.get("runtime_matching_worktrees", [])
         ),
         "worktree_count": len(worktrees),
         "worktrees": selected,
-        "truncated": len(worktrees) > MAX_WORKTREES,
+        "pagination": {
+            "limit": limit,
+            "returned": len(selected),
+            "offset": offset,
+            "has_more": next_cursor is not None,
+            "next_cursor": next_cursor,
+            "snapshot_sha256": snapshot_digest,
+        },
+        "warnings": warnings,
+        "recommended_next_action": (
+            "inspect prunable or mismatched worktrees" if warnings else "none"
+        ),
+        "does_not_establish": [
+            "worktree_safe_to_delete",
+            "branch_merged",
+            "process_or_lease_absence",
+        ],
     }
+    if selected_view == "evidence":
+        payload["command_returncode"] = context.get("command_returncode")
+        payload["runtime_matching_worktrees"] = context.get(
+            "runtime_matching_worktrees", []
+        )
+    return operator._project_consumer_fields(
+        payload,
+        fields=fields,
+        required=(
+            "schema_version",
+            "view",
+            "warnings",
+            "recommended_next_action",
+            "does_not_establish",
+        ),
+    )
 
 
 @mcp.tool(name="grabowski_git_status", annotations=LOCAL_READ)

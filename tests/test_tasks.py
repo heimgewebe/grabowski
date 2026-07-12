@@ -118,6 +118,7 @@ class TaskTests(unittest.TestCase):
         self.assertIn(" argv=", descriptions[0])
         self.assertNotIn("\n", descriptions[0])
         self.assertIn("--slice=grabowski-tasks.slice", launch)
+        self.assertEqual(launch.count("--property=LimitCORE=0"), 1)
         self.assertIn("--property=CPUWeight=50", launch)
         self.assertIn("--property=IOWeight=25", launch)
         self.assertIn("--property=MemoryMax=67108864", launch)
