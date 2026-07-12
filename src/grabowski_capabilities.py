@@ -805,6 +805,13 @@ TOOL_PROFILES.update(
             "effects": ["task-start", "receipt-create", "task-state-refresh"],
             "reversibility": "preserved-worktree-and-receipts",
         },
+        "grabowski_agent_workspace_role_retry": {
+            "category": "agent-workspace",
+            "purpose": "Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot.",
+            "risk_class": "high",
+            "effects": ["task-start", "receipt-create", "task-state-refresh"],
+            "reversibility": "preserved-worktree-and-receipts",
+        },
         "grabowski_agent_workspace_close": {
             "category": "agent-workspace",
             "purpose": "Close one collected workspace while preserving its branch and writer worktree.",
