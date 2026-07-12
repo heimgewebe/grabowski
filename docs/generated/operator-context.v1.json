@@ -1384,6 +1384,32 @@
       "tool": "grabowski_agent_workspace_close"
     },
     {
+      "category": "agent-workspace",
+      "description": "Return an immutable-evidence process report without mutating or retrying the workspace.",
+      "effects": [
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_observe",
+      "purpose": "Read one bounded immutable workspace event timeline and emit a facts/inferences/proposals process report.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_workspace_observe"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Derive advisory cross-workspace proposals from at least two immutable reports.",
+      "effects": [
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_optimize",
+      "purpose": "Derive advisory cross-workspace optimization proposals from at least two immutable reports.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_workspace_optimize"
+    },
+    {
       "category": "operations-observability",
       "description": "Return a bounded adaptive agent entry capsule for the current runtime evidence.",
       "effects": [],
@@ -1626,6 +1652,8 @@
       "grabowski_agent_workspace_collect",
       "grabowski_agent_workspace_role_retry",
       "grabowski_agent_workspace_close",
+      "grabowski_agent_workspace_observe",
+      "grabowski_agent_workspace_optimize",
       "grabowski_agent_bootstrap",
       "grabowski_call_shape_check"
     ],
@@ -1651,6 +1679,10 @@
       {
         "module": "grabowski_grip_orchestration",
         "source": "src/grabowski_grip_orchestration.py"
+      },
+      {
+        "module": "grabowski_agent_workspace_observer",
+        "source": "src/grabowski_agent_workspace_observer.py"
       },
       {
         "module": "grabowski_capabilities",
@@ -1758,7 +1790,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "0ff044ebc93bfdaeb8371b0cbe6be706bfd1c3e3e1ccc13b666efaff71c57a3b"
+      "sha256": "18318278e3c30d4adc432ee8b1af67f19a5f6443629f6f86840253b7e44a063a"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1766,23 +1798,24 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "b218ad32cad92a6afe1163e09352df7d3790e6c51b4e90c95eb7e25113b825b8"
+      "sha256": "58b8d0c09335be64f10d13b687260f4b42f75517d5b776cba87bfc98fb1faabe"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c413e520172f70296c42e18e4c0f1fcb95a1931afa0fda7b7c36dba4b2d52e56",
       "src/grabowski_agent_role.py": "abef0db4aa6fffcd52976e2c60deb5f68abfadf76528ec5ac79dfebeddafe8bf",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
-      "src/grabowski_agent_workspace.py": "87babe15b210f38d09b8fab8a9b4977eeff901493534bb870be270e0a60f1474",
+      "src/grabowski_agent_workspace.py": "1a6495a53600c1022ab717cd2f79bc444031039a0c81bebbc5f0d13bab17cf97",
+      "src/grabowski_agent_workspace_observer.py": "192a3602db277c5b19a9553095cfa8b37ca60f39ca47f16d526c8a50365c64ba",
       "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "0ff044ebc93bfdaeb8371b0cbe6be706bfd1c3e3e1ccc13b666efaff71c57a3b",
+      "src/grabowski_capabilities.py": "18318278e3c30d4adc432ee8b1af67f19a5f6443629f6f86840253b7e44a063a",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "15f4de8cacfaacfb6d5e1bc95bb82064d800bdbb46fd8ce67901f0bdf8a2ee8c",
       "src/grabowski_grip_orchestration.py": "2c1d594433f92edbae23adc43a303b212bfff89d298121c516974d790259051d",
       "src/grabowski_grips.py": "f7fee83b8424d40ff1f3785a771a685c1ce2bb73e3029d38de1b7e2da073968a",
-      "src/grabowski_mcp.py": "6a21f97db4be4dbe58d9d0d01e7f3d39e02bc9e001320a3e9ea299f7337998bf",
+      "src/grabowski_mcp.py": "531030669506c70ebf1bb98dac620860efad8ef1b85cbf1eb6d2741e6e7fcd79",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "7aaaca985ccf404934fd1dd07d7a718d69cb0b23826691da9096f6f3d4f20e54",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",
@@ -1791,7 +1824,7 @@
       "src/grabowski_recovery.py": "b0c5124271498639f6c16614ccb51f7b3b696ebfd88011ad2291d353e56d0fe6",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
-      "src/grabowski_runtime.py": "6446b3ebc0d20c251a3af6fbe7dd1d630ae8afb859742417d19465b6c7f7d551",
+      "src/grabowski_runtime.py": "4d73adda5943adceeebb5eaf25385dd22711a2146193806d44d0146c1253ba58",
       "src/grabowski_runtime_extensions.py": "8b73b1d98d0aaa35f3c2c5efecf1198b90344600cfd73ebd188a6a175142d574",
       "src/grabowski_self_deploy.py": "1c4a9517564c2b17c39a87a076e397f0bcb2f428467be782b1b48007b063a49a",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",

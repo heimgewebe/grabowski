@@ -8,6 +8,7 @@ import grabowski_self_deploy
 import grabowski_fleet
 import grabowski_artifacts
 import grabowski_agent_workspace
+import grabowski_agent_workspace_observer
 import grabowski_operations
 import grabowski_privileged
 import grabowski_recovery

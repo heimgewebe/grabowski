@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "0ff044ebc93bfdaeb8371b0cbe6be706bfd1c3e3e1ccc13b666efaff71c57a3b",
+  "capability_source_sha256": "18318278e3c30d4adc432ee8b1af67f19a5f6443629f6f86840253b7e44a063a",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "b218ad32cad92a6afe1163e09352df7d3790e6c51b4e90c95eb7e25113b825b8",
+  "contract_sha256": "58b8d0c09335be64f10d13b687260f4b42f75517d5b776cba87bfc98fb1faabe",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1394,6 +1394,32 @@
       "reversibility": "preserved-worktree-and-branch",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_close"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Return an immutable-evidence process report without mutating or retrying the workspace.",
+      "effects": [
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_observe",
+      "purpose": "Read one bounded immutable workspace event timeline and emit a facts/inferences/proposals process report.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_workspace_observe"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Derive advisory cross-workspace proposals from at least two immutable reports.",
+      "effects": [
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_optimize",
+      "purpose": "Derive advisory cross-workspace optimization proposals from at least two immutable reports.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_workspace_optimize"
     },
     {
       "category": "operations-observability",

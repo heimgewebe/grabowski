@@ -64,6 +64,7 @@ PLAN_FIELDS = (
     "scope",
     "commands",
     "roles",
+    "role_ownership",
     "resources",
 )
 PANE_ID_RE = re.compile(r"^%[0-9]+$")
@@ -80,6 +81,8 @@ WORKSPACE_LOCK_TIMEOUT_SECONDS = 10.0
 WORKSPACE_LOCK_POLL_SECONDS = 0.05
 AGENT_WORKSPACE_TASK_HOST = "heim-pc"
 MAX_ROLE_RETRIES = 1
+MAX_WORKSPACE_EVENTS = 512
+MAX_WORKSPACE_EVENT_BYTES = 1024 * 1024
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 BindingVerifier = Callable[[str, str], dict[str, Any]]
 
@@ -489,6 +492,111 @@ def _load_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _event_log_path(workspace_id: str) -> Path:
+    return _workspace_dir(workspace_id) / "events.jsonl"
+
+
+def _event_log_sequence(path: Path, workspace_id: str) -> int:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return 0
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise PermissionError("workspace event log must be one private regular file")
+    if metadata.st_size > MAX_WORKSPACE_EVENT_BYTES:
+        raise AgentWorkspaceError("workspace event log byte limit reached")
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise PermissionError("workspace event log descriptor is unsafe")
+        raw = os.read(descriptor, MAX_WORKSPACE_EVENT_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > MAX_WORKSPACE_EVENT_BYTES:
+        raise AgentWorkspaceError("workspace event log byte limit reached")
+    expected = 1
+    for line in raw.splitlines():
+        if not line:
+            continue
+        if expected > MAX_WORKSPACE_EVENTS:
+            raise AgentWorkspaceError("workspace event count limit reached")
+        try:
+            event = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AgentWorkspaceError("workspace event log contains invalid JSON") from exc
+        if not isinstance(event, dict):
+            raise AgentWorkspaceError("workspace event log contains a non-object")
+        observed_hash = event.get("event_sha256")
+        unsigned = {key: value for key, value in event.items() if key != "event_sha256"}
+        if (
+            event.get("schema_version") != 1
+            or event.get("workspace_id") != workspace_id
+            or event.get("sequence") != expected
+            or not isinstance(observed_hash, str)
+            or observed_hash != _sha256_json(unsigned)
+        ):
+            raise AgentWorkspaceError("workspace event log integrity is invalid")
+        expected += 1
+    return expected - 1
+
+
+def _append_workspace_event(
+    manifest: dict[str, Any],
+    event_type: str,
+    *,
+    role: str | None = None,
+    outcome: str | None = None,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Append one bounded, redacted workspace lifecycle event."""
+    workspace_id = _required_string(manifest.get("workspace_id"), "workspace_id", max_length=80)
+    clean_type = _required_string(event_type, "event_type", max_length=80)
+    if role is not None and role not in (*ALL_ROLES, "observer"):
+        raise AgentWorkspaceError("invalid workspace event role")
+    path = _event_log_path(workspace_id)
+    current_sequence = _event_log_sequence(path, workspace_id)
+    manifest_sequence = int(manifest.get("event_sequence", 0))
+    if manifest_sequence > current_sequence:
+        raise AgentWorkspaceError("workspace manifest event sequence is ahead of event log")
+    if current_sequence >= MAX_WORKSPACE_EVENTS:
+        raise AgentWorkspaceError("workspace event count limit reached")
+    event = {
+        "schema_version": 1,
+        "workspace_id": workspace_id,
+        "sequence": current_sequence + 1,
+        "event_type": clean_type,
+        "recorded_at": _utc(),
+        "role": role,
+        "outcome": None if outcome is None else _required_string(outcome, "outcome", max_length=120),
+        "evidence": evidence or {},
+    }
+    event["event_sha256"] = _sha256_json(event)
+    line = (_canonical_json(event) + "\n").encode("utf-8")
+    if len(line) > 16384:
+        raise AgentWorkspaceError("workspace event exceeds bounded size")
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None:
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise PermissionError("workspace event log must be one private regular file")
+        if metadata.st_size + len(line) > MAX_WORKSPACE_EVENT_BYTES:
+            raise AgentWorkspaceError("workspace event log byte limit reached")
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or stat.S_IMODE(opened.st_mode) != 0o600:
+            raise PermissionError("workspace event log descriptor is unsafe")
+        os.write(descriptor, line)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    manifest["event_sequence"] = event["sequence"]
+    return event
+
+
 def _manifest_path(workspace_id: str) -> Path:
     return _workspace_dir(workspace_id) / "manifest.json"
 
@@ -796,6 +904,16 @@ def _normalize_create(
             "writer": {"access": "write_worktree", "merge_authority": False},
             "tests": {"access": "read_only", "merge_authority": False},
             "review": {"access": "read_only", "merge_authority": False},
+        },
+        "role_ownership": {
+            "operator_may_coordinate_all_roles": True,
+            "single_unisolated_agent_may_not_substitute_for_all_roles": True,
+            "captain": "operator_control_plane",
+            "writer": "isolated_mutating_execution",
+            "tests": "deterministic_read_only_validation",
+            "review": "independently_bound_read_only_review",
+            "observer": "optional_read_only_process_analysis",
+            "reason": "coordination may be unified, but write, validation and review evidence remain technically isolated to avoid self-confirming success",
         },
         "resources": {
             "owner_id": f"agent-workspace:{workspace_id}",
@@ -2220,6 +2338,7 @@ def grabowski_agent_workspace_create(
         "pane_ids": {},
         "collection": None,
         "close_receipt": None,
+        "event_sequence": 0,
         "truth_model": {
             "bureau": "binding and ball truth",
             "git_github": "code, branch, diff, PR and merge truth",
@@ -2227,6 +2346,13 @@ def grabowski_agent_workspace_create(
             "tmux": "non-authoritative process UI only",
         },
     }
+    _append_workspace_event(
+        manifest,
+        "plan_created",
+        outcome="planned",
+        evidence={"plan_sha256": plan_sha256, "binding": manifest["binding"]},
+    )
+    _write_manifest(manifest)
     writer_task_argv = _writer_task_argv(manifest)
     writer_task_argv_sha256 = _sha256_json(writer_task_argv)
     try:
@@ -2297,6 +2423,10 @@ def grabowski_agent_workspace_create(
             expected_cwd=str(worktree),
         )
         manifest["tasks"]["writer"] = writer_task["task_id"]
+        _append_workspace_event(
+            manifest, "role_started", role="writer", outcome="started",
+            evidence={"task_id": writer_task["task_id"], "command_sha256": plan["commands"] and _sha256_json(plan["commands"]["writer"])},
+        )
         writer_intents = dict(manifest.get("task_start_intents", {}))
         writer_intents.pop("writer", None)
         manifest["task_start_intents"] = writer_intents
@@ -2317,6 +2447,7 @@ def grabowski_agent_workspace_create(
             }
         )
         manifest["creation_state"] = "ready"
+        _append_workspace_event(manifest, "workspace_ready", outcome="ready", evidence={"pane_count": len(panes)})
         _write_manifest(manifest)
     except Exception as exc:
         writer_cancel_confirmed = not writer_start_attempted
@@ -2448,6 +2579,8 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
     identifier = _required_string(workspace_id, "workspace_id", max_length=80)
     with _lock(identifier):
         manifest = _manifest(identifier)
+        _append_workspace_event(manifest, "collection_requested", outcome="observing")
+        _write_manifest(manifest)
         if manifest.get("creation_state") != "ready":
             return {
                 "workspace_id": identifier,
@@ -2636,6 +2769,11 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
         for role in READ_ONLY_ROLES:
             if tasks_map.get(role) is None:
                 preflight = _role_toolchain_preflight(manifest, role, manifest["commands"][role])
+                _append_workspace_event(
+                    manifest, "role_preflight", role=role,
+                    outcome="passed" if preflight["passed"] else "environment_failure",
+                    evidence={"command_sha256": preflight.get("command_sha256"), "failure_classification": preflight.get("failure_classification")},
+                )
                 if not preflight["passed"]:
                     blocks = dict(manifest.get("role_preflight_blocks", {}))
                     role_blocks = list(blocks.get(role, []))
@@ -2678,6 +2816,10 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 public = _start_role_task(manifest, role, snapshot)
                 tasks_map[role] = public["task_id"]
                 manifest["tasks"] = dict(tasks_map)
+                _append_workspace_event(
+                    manifest, "role_started", role=role, outcome="started",
+                    evidence={"task_id": public["task_id"], "writer_head": snapshot["writer_head"], "diff_sha256": snapshot["diff_sha256"]},
+                )
                 intents = dict(manifest.get("task_start_intents", {}))
                 intents.pop(role, None)
                 manifest["task_start_intents"] = intents
@@ -2776,6 +2918,12 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 "error": "review receipt findings must be a list",
                 "receipt_status": "blocked",
             }
+        for observed_role, observed_receipt in (("tests", test_receipt), ("review", review_receipt)):
+            _append_workspace_event(
+                manifest, "role_finished", role=observed_role,
+                outcome="passed" if observed_receipt.get("returncode") == 0 else "failed",
+                evidence={"receipt_sha256": observed_receipt.get("receipt_sha256"), "returncode": observed_receipt.get("returncode")},
+            )
         result = {
             "schema_version": 1,
             "workspace_id": identifier,
@@ -2813,6 +2961,10 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
         result["state"] = "complete"
         result["result_sha256"] = _collection_result_sha256(result)
         manifest["collection"] = result
+        _append_workspace_event(
+            manifest, "collection_completed", outcome="complete",
+            evidence={"result_sha256": result["result_sha256"], "writer_head": result["writer_head"], "diff_sha256": result["diff_sha256"]},
+        )
         _write_manifest(manifest)
         _atomic_json(_workspace_dir(identifier) / "collection-receipt.json", result)
         base._append_audit(
@@ -2849,6 +3001,8 @@ def grabowski_agent_workspace_role_retry(
         raise AgentWorkspaceError(f"role_retry supports only {sorted(READ_ONLY_ROLES)}; writer may never be retried")
     with _lock(identifier):
         manifest = _manifest(identifier)
+        _append_workspace_event(manifest, "retry_decision", role=role_name, outcome="requested")
+        _write_manifest(manifest)
         if manifest.get("creation_state") != "ready":
             raise AgentWorkspaceError("workspace creation is incomplete: creation_state_not_ready")
         if manifest.get("close_receipt") is not None:
@@ -2927,6 +3081,11 @@ def grabowski_agent_workspace_role_retry(
         previous_attempt = _role_final_attempt(manifest, role_name) if previous_task_id is not None else 0
         attempt_number = previous_attempt + 1
         preflight = _role_toolchain_preflight(manifest, role_name, command)
+        _append_workspace_event(
+            manifest, "role_preflight", role=role_name,
+            outcome="passed" if preflight["passed"] else "environment_failure",
+            evidence={"command_sha256": preflight.get("command_sha256"), "failure_classification": preflight.get("failure_classification"), "retry": True},
+        )
         if not preflight["passed"]:
             blocks = dict(manifest.get("role_preflight_blocks", {}))
             role_blocks = list(blocks.get(role_name, []))
@@ -3055,6 +3214,10 @@ def grabowski_agent_workspace_role_retry(
         role_retry_state["attempts"] = [*role_retry_state["attempts"], attempt_record]
         retries[role_name] = role_retry_state
         manifest["role_retries"] = retries
+        _append_workspace_event(
+            manifest, "role_retry_started", role=role_name, outcome="started",
+            evidence={"attempt": attempt_number, "new_task_id": public["task_id"], "previous_failure_classification": previous_failure_classification, "old_command_sha256": old_command_sha256, "new_command_sha256": new_command_sha256},
+        )
         _write_manifest(manifest)
         base._append_audit(
             {
@@ -3103,6 +3266,11 @@ def grabowski_agent_workspace_close(
         raise AgentWorkspaceError("close bindings must be canonical hashes")
     with _lock(identifier):
         manifest = _manifest(identifier)
+        _append_workspace_event(
+            manifest, "close_requested", outcome="requested",
+            evidence={"expected_head": head, "expected_diff_sha256": diff_sha, "expected_result_sha256": result_sha, "abandon_failed_roles": abandon_failed_roles},
+        )
+        _write_manifest(manifest)
         if manifest.get("creation_state") != "ready":
             raise AgentWorkspaceError(
                 "workspace creation is incomplete: creation_state_not_ready"
@@ -3259,10 +3427,19 @@ def grabowski_agent_workspace_close(
                 "resource release incomplete; remaining keys: "
                 + ", ".join(sorted(remaining_resource_keys))
             )
+        _append_workspace_event(
+            manifest, "workspace_lease_release",
+            outcome="verified" if not remaining_resource_keys else "incomplete",
+            evidence={"released_resource_keys": sorted(released_resource_keys), "remaining_resource_keys": sorted(remaining_resource_keys)},
+        )
         receipt["state"] = "complete"
         receipt["receipt_sha256"] = _sha256_json(receipt)
         _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
         manifest["close_receipt"] = receipt
+        _append_workspace_event(
+            manifest, "workspace_closed", outcome=receipt["closure_outcome"],
+            evidence={"receipt_sha256": receipt["receipt_sha256"], "resources_released": receipt["resources_released"]},
+        )
         _write_manifest(manifest)
         base._append_audit(
             {
