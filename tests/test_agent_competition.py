@@ -582,6 +582,59 @@ class AgentCompetitionTests(unittest.TestCase):
         with self.assertRaisesRegex(competition.AgentCompetitionError, "cannot open candidate receipt|bounded regular file"):
             competition._receipt(started["competition_id"])
 
+    def test_receipt_shape_rejects_missing_required_key_even_with_optional_key(self) -> None:
+        started = self._start()
+        receipt = self._write_receipt(
+            started["competition_id"], changed_paths=["src/sample.py"], risks=[], tests=[]
+        )
+        path = self.state / started["competition_id"] / "receipt.json"
+        path.unlink()
+        del receipt["before"]
+        receipt["total_cost_usd"] = 0.25
+        receipt["receipt_sha256"] = competition._sha256_json(
+            {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        )
+        competition._atomic_json(path, receipt)
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "receipt shape"):
+            competition._receipt(started["competition_id"])
+
+    def test_receipt_shape_accepts_declared_optional_fields(self) -> None:
+        started = self._start()
+        receipt = self._write_receipt(
+            started["competition_id"], changed_paths=["src/sample.py"], risks=[], tests=[]
+        )
+        path = self.state / started["competition_id"] / "receipt.json"
+        path.unlink()
+        receipt["total_cost_usd"] = 0.25
+        receipt["output_wrapper"] = {
+            "kind": "none",
+            "discarded_prefix_bytes": 0,
+            "discarded_suffix_bytes": 0,
+            "discarded_wrapper_sha256": competition._sha256_bytes(b""),
+        }
+        receipt["receipt_sha256"] = competition._sha256_json(
+            {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        )
+        competition._atomic_json(path, receipt)
+        validated = competition._receipt(started["competition_id"])
+        self.assertEqual(validated["total_cost_usd"], 0.25)
+        self.assertEqual(validated["output_wrapper"]["kind"], "none")
+
+    def test_receipt_shape_rejects_unknown_extra_field(self) -> None:
+        started = self._start()
+        receipt = self._write_receipt(
+            started["competition_id"], changed_paths=["src/sample.py"], risks=[], tests=[]
+        )
+        path = self.state / started["competition_id"] / "receipt.json"
+        path.unlink()
+        receipt["unexpected"] = "value"
+        receipt["receipt_sha256"] = competition._sha256_json(
+            {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        )
+        competition._atomic_json(path, receipt)
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "receipt shape"):
+            competition._receipt(started["competition_id"])
+
     def test_self_hashed_receipt_cannot_change_manifest_binding(self) -> None:
         started = self._start()
         receipt = self._write_receipt(started["competition_id"], changed_paths=["src/sample.py"], risks=[], tests=[])

@@ -876,7 +876,8 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
         "does_not_establish", "receipt_sha256",
     }
     allowed = required | {"total_cost_usd", "output_wrapper"}
-    if set(receipt) < required or not set(receipt) <= allowed:
+    receipt_fields = set(receipt)
+    if not required <= receipt_fields <= allowed:
         raise AgentCompetitionError("candidate receipt shape is invalid")
     if receipt["schema_version"] != 1 or receipt["kind"] != "external_programming_candidate_receipt":
         raise AgentCompetitionError("candidate receipt contract is invalid")
