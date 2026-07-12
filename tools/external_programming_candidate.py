@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -130,45 +131,123 @@ def atomic_json(path: Path, value: dict[str, Any], *, create_only: bool = True) 
 
 
 
-def run_git(repo: Path, args: list[str], *, input_bytes: bytes | None = None, timeout: int = 60) -> subprocess.CompletedProcess[bytes]:
-    env = os.environ.copy()
-    env.update({
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ASKPASS": "/bin/false",
-        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes",
-    })
+def _git_environment(*, index_file: Path | None = None) -> dict[str, str]:
+    allowed = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+    environment = {key: value for key, value in os.environ.items() if key in allowed}
+    environment.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    environment.setdefault("LANG", "C.UTF-8")
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "/bin/false",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        }
+    )
+    if index_file is not None:
+        resolved = index_file.expanduser()
+        if not resolved.is_absolute() or "\x00" in str(resolved):
+            raise CandidateError("temporary Git index path is invalid")
+        environment["GIT_INDEX_FILE"] = str(resolved)
+    return environment
+
+
+def run_git(
+    repo: Path,
+    args: list[str],
+    *,
+    input_bytes: bytes | None = None,
+    timeout: int = 60,
+    index_file: Path | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.external=", *args],
+        [
+            "git",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false",
+            "-c", "diff.external=",
+            "-c", "diff.trustExitCode=false",
+            "-c", "protocol.file.allow=never",
+            *args,
+        ],
         cwd=repo,
         input=input_bytes,
         capture_output=True,
         check=False,
         timeout=timeout,
-        env=env,
+        env=_git_environment(index_file=index_file),
     )
 
 
+def _commit_blob(repo: Path, expected_head: str, relative: str) -> bytes:
+    listing = run_git(repo, ["ls-tree", "-z", expected_head, "--", relative])
+    if listing.returncode != 0:
+        raise CandidateError(f"cannot resolve context path at bound commit: {relative}")
+    records = [record for record in listing.stdout.split(b"\x00") if record]
+    if len(records) != 1 or b"\t" not in records[0]:
+        raise CandidateError(f"context path is not one tracked blob at bound commit: {relative}")
+    metadata, raw_path = records[0].split(b"\t", 1)
+    fields = metadata.split()
+    if len(fields) != 3 or fields[1] != b"blob" or re.fullmatch(rb"[0-9a-f]{40,64}", fields[2]) is None:
+        raise CandidateError(f"context path metadata is invalid at bound commit: {relative}")
+    try:
+        observed_path = raw_path.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CandidateError(f"context path is not UTF-8 at bound commit: {relative}") from exc
+    if observed_path != relative:
+        raise CandidateError(f"context path identity drifted at bound commit: {relative}")
+    blob = run_git(repo, ["cat-file", "blob", fields[2].decode("ascii")])
+    if blob.returncode != 0:
+        raise CandidateError(f"cannot read context blob at bound commit: {relative}")
+    return blob.stdout
+
+
 def repo_snapshot(repo: Path, expected_head: str, context: list[dict[str, Any]]) -> dict[str, Any]:
-    head = run_git(repo, ["rev-parse", "HEAD^{commit}"])
-    if head.returncode != 0 or head.stdout.decode().strip().lower() != expected_head:
-        raise CandidateError("repository HEAD does not match packet")
-    status = run_git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
-    if status.returncode != 0 or status.stdout:
-        raise CandidateError("repository must be clean for external candidate generation")
+    resolved = run_git(repo, ["rev-parse", "--verify", f"{expected_head}^{{commit}}"])
+    if resolved.returncode != 0 or resolved.stdout.decode().strip().lower() != expected_head:
+        raise CandidateError("bound repository commit is unavailable")
     for item in context:
         relative = item["path"]
-        target = repo.joinpath(*PurePosixPath(relative).parts)
-        try:
-            metadata = target.lstat()
-        except FileNotFoundError as exc:
-            raise CandidateError(f"context path disappeared: {relative}") from exc
-        if target.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise CandidateError(f"context path is unsafe: {relative}")
-        raw = target.read_bytes()
+        raw = _commit_blob(repo, expected_head, relative)
         if sha256_bytes(raw) != item["sha256"]:
-            raise CandidateError(f"context path drifted: {relative}")
-    return {"head": expected_head, "clean": True, "context_count": len(context)}
+            raise CandidateError(f"context path does not match bound commit: {relative}")
+    return {
+        "head": expected_head,
+        "commit_bound": True,
+        "context_count": len(context),
+        "worktree_clean_required": False,
+    }
+
+
+def check_patch_against_commit(
+    repo: Path,
+    expected_head: str,
+    patch: bytes,
+    *,
+    scratch_dir: Path,
+) -> subprocess.CompletedProcess[bytes]:
+    descriptor, raw_index = tempfile.mkstemp(prefix=".candidate-index.", dir=scratch_dir)
+    os.close(descriptor)
+    index_path = Path(raw_index)
+    index_path.unlink()
+    try:
+        initialized = run_git(repo, ["read-tree", expected_head], index_file=index_path)
+        if initialized.returncode != 0:
+            return initialized
+        return run_git(
+            repo,
+            ["apply", "--cached", "--check", "--recount", "--whitespace=error-all", "-"],
+            input_bytes=patch,
+            index_file=index_path,
+        )
+    finally:
+        try:
+            index_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def normalize_relative(value: Any, *, label: str) -> str:
@@ -316,15 +395,18 @@ def build_prompt(packet: dict[str, Any]) -> str:
 
 def parse_plain_json(stdout: str) -> dict[str, Any]:
     stripped = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stdout).strip()
-    starts = [index for index, char in enumerate(stripped) if char == "{"]
-    for start in starts:
+    candidates = [stripped]
+    fenced = re.fullmatch(r"```(?:json)?[ \t]*\n(?P<body>.*)\n```", stripped, flags=re.IGNORECASE | re.DOTALL)
+    if fenced is not None:
+        candidates.append(fenced.group("body").strip())
+    for candidate in candidates:
         try:
-            parsed, end = json.JSONDecoder().raw_decode(stripped[start:])
+            parsed = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict) and not stripped[start + end :].strip():
+        if isinstance(parsed, dict):
             return parsed
-    raise CandidateError("external agent output does not contain one standalone JSON object")
+    raise CandidateError("external agent output must be one JSON object, optionally in one exact JSON code fence")
 
 
 def parse_claude_json(stdout: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -340,7 +422,13 @@ def parse_claude_json(stdout: str) -> tuple[dict[str, Any], dict[str, Any]]:
     return envelope, candidate
 
 
-def validate_candidate(candidate: dict[str, Any], packet: dict[str, Any], repo: Path) -> dict[str, Any]:
+def validate_candidate(
+    candidate: dict[str, Any],
+    packet: dict[str, Any],
+    repo: Path,
+    *,
+    scratch_dir: Path | None = None,
+) -> dict[str, Any]:
     if set(candidate) != set(CANDIDATE_SCHEMA["required"]):
         raise CandidateError("candidate output shape is invalid")
     string_limits = {"approach_id": 120, "approach_summary": 4000}
@@ -403,7 +491,13 @@ def validate_candidate(candidate: dict[str, Any], packet: dict[str, Any], repo: 
         "syntax_accepted": patch_rejection is None,
     }
     if patch:
-        completed = run_git(repo, ["apply", "--check", "--recount", "--whitespace=error-all", "-"], input_bytes=patch.encode("utf-8"))
+        scratch = Path.cwd() if scratch_dir is None else scratch_dir
+        completed = check_patch_against_commit(
+            repo,
+            packet["expected_head"],
+            patch.encode("utf-8"),
+            scratch_dir=scratch,
+        )
         patch_check = {
             "attempted": True,
             "applies": completed.returncode == 0,
@@ -552,7 +646,12 @@ def main(argv: list[str] | None = None) -> int:
             envelope, candidate_raw = parse_claude_json(text)
         else:
             candidate_raw = parse_plain_json(text)
-        candidate = validate_candidate(candidate_raw, packet, repo)
+        candidate = validate_candidate(
+            candidate_raw,
+            packet,
+            repo,
+            scratch_dir=candidate_directory,
+        )
         after = repo_snapshot(repo, packet["expected_head"], packet["context"])
         receipt: dict[str, Any] = {
             "schema_version": 1,

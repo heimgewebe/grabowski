@@ -81,6 +81,79 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             self.assertIn("BEGIN UNTRUSTED SOURCE", prompt)
             self.assertIn(packet["packet_nonce"], prompt)
 
+    def test_plain_json_accepts_one_exact_fence_and_rejects_prose(self) -> None:
+        value = self._candidate()
+        fenced = "```json\n" + json.dumps(value) + "\n```"
+        self.assertEqual(candidate_tool.parse_plain_json(fenced), value)
+        with self.assertRaisesRegex(candidate_tool.CandidateError, "one JSON object"):
+            candidate_tool.parse_plain_json("Here is the result:\n" + json.dumps(value))
+        with self.assertRaisesRegex(candidate_tool.CandidateError, "one JSON object"):
+            candidate_tool.parse_plain_json(fenced + "\n" + fenced)
+
+    def test_git_environment_discards_repository_rebinding(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"PATH": "/usr/bin", "HOME": "/tmp/home", "GIT_DIR": "/tmp/evil", "GIT_CONFIG_COUNT": "1"},
+            clear=True,
+        ):
+            environment = candidate_tool._git_environment()
+        self.assertNotIn("GIT_DIR", environment)
+        self.assertNotIn("GIT_CONFIG_COUNT", environment)
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
+
+    def test_commit_snapshot_ignores_later_worktree_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            (repo / "src").mkdir()
+            source = b"VALUE = 1\n"
+            (repo / "src" / "sample.py").write_bytes(source)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            (repo / "src" / "sample.py").write_text("DIRTY = True\n", encoding="utf-8")
+            snapshot = candidate_tool.repo_snapshot(
+                repo,
+                head,
+                [{"path": "src/sample.py", "sha256": hashlib.sha256(source).hexdigest(), "text": source.decode()}],
+            )
+        self.assertTrue(snapshot["commit_bound"])
+        self.assertFalse(snapshot["worktree_clean_required"])
+
+    def test_patch_check_uses_bound_commit_not_dirty_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            (repo / "src").mkdir()
+            (repo / "src" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            (repo / "src" / "sample.py").write_text("UNRELATED = 'dirty'\n", encoding="utf-8")
+            value = self._candidate()
+            value["patch"] = (
+                "diff --git a/src/sample.py b/src/sample.py\n"
+                "--- a/src/sample.py\n"
+                "+++ b/src/sample.py\n"
+                "@@ -1 +1 @@\n"
+                "-VALUE = 1\n"
+                "+VALUE = 2\n"
+            )
+            packet = {"allowed_paths": ["src"], "forbidden_paths": [], "expected_head": head}
+            result = candidate_tool.validate_candidate(value, packet, repo, scratch_dir=root)
+            self.assertTrue(result["patch_check"]["applies"])
+            self.assertEqual((repo / "src" / "sample.py").read_text(), "UNRELATED = 'dirty'\n")
+            self.assertEqual(list(repo.glob(".candidate-index.*")), [])
+            self.assertEqual(list(root.glob(".candidate-index.*")), [])
+
     def test_validate_candidate_rejects_scope_escape(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp)
@@ -140,12 +213,17 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
 
             def fake_git(_repo, args, **kwargs):
                 git_calls.append(args)
-                if args[:2] == ["rev-parse", "HEAD^{commit}"]:
+                if args[:2] == ["rev-parse", "--verify"]:
                     return subprocess.CompletedProcess(args, 0, b"a" * 40 + b"\n", b"")
-                if args and args[0] == "status":
-                    return subprocess.CompletedProcess(args, 0, b"", b"")
-                if args[:2] == ["apply", "--check"]:
-                    return subprocess.CompletedProcess(args, 0, b"", b"")
+                if args and args[0] == "ls-tree":
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        b"100644 blob " + b"b" * 40 + b"\tsrc/sample.py\x00",
+                        b"",
+                    )
+                if args[:2] == ["cat-file", "blob"]:
+                    return subprocess.CompletedProcess(args, 0, b"VALUE = 1\n", b"")
                 raise AssertionError(args)
 
             calls = []
@@ -180,7 +258,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             self.assertTrue((directory / "prompt.txt").is_file())
             self.assertIn("Required JSON Schema", (directory / "prompt.txt").read_text())
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
-            self.assertGreaterEqual(len(git_calls), 4)
+            self.assertGreaterEqual(len(git_calls), 6)
 
     def test_main_rejects_output_escape_before_provider_call(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
