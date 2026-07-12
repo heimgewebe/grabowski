@@ -56,6 +56,59 @@ MAX_FRICTION_RECORDS = 10000
 MAX_FRICTION_LEDGER_BYTES = 16 * 1024 * 1024
 MAX_FRICTION_CLOSEOUT_BATCH = 100
 
+
+def _consumer_view(value: str, *, default: str = "minimal") -> str:
+    helper = getattr(operator, "_normalize_consumer_view", None)
+    if callable(helper):
+        return helper(value, default=default)
+    selected = default if value is None else value
+    selected = {"concise": "minimal", "full": "evidence"}.get(selected, selected)
+    if selected not in {"minimal", "standard", "evidence"}:
+        raise ValueError("view must be minimal, standard or evidence")
+    return selected
+
+
+def _consumer_decode_cursor(cursor: str | None, scope: str) -> dict[str, Any] | None:
+    helper = getattr(operator, "_decode_consumer_cursor", None)
+    if callable(helper):
+        return helper(cursor, scope)
+    if cursor in (None, ""):
+        return None
+    raise ValueError("cursor support is unavailable in this runtime seam")
+
+
+def _consumer_encode_cursor(scope: str, position: dict[str, Any]) -> str:
+    helper = getattr(operator, "_encode_consumer_cursor", None)
+    if callable(helper):
+        return helper(scope, position)
+    material = json.dumps(
+        {"scope": scope, "position": position},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "fallback-" + hashlib.sha256(material).hexdigest()
+
+
+def _consumer_project(
+    payload: dict[str, Any],
+    *,
+    fields: list[str] | None,
+    required: tuple[str, ...],
+) -> dict[str, Any]:
+    helper = getattr(operator, "_project_consumer_fields", None)
+    if callable(helper):
+        return helper(payload, fields=fields, required=required)
+    if fields is None:
+        return payload
+    if not isinstance(fields, list) or not all(isinstance(item, str) for item in fields):
+        raise ValueError("fields must be a list of strings")
+    unknown = sorted(set(fields) - set(payload))
+    if unknown:
+        raise ValueError(f"Unknown response field(s): {', '.join(unknown)}")
+    keep = set(fields) | {key for key in required if key in payload}
+    return {key: value for key, value in payload.items() if key in keep}
+
 FRICTION_KINDS = {
     "platform_filter",
     "connector_snapshot",
@@ -1688,7 +1741,30 @@ def resolve_friction(
     }
 
 
-def _load_event_records(limit: int) -> dict[str, Any]:
+def _friction_snapshot_sha256() -> str:
+    parts: list[dict[str, Any]] = []
+    for path in (FRICTION_LOG, FRICTION_DECISION_LOG):
+        try:
+            metadata = path.stat()
+        except FileNotFoundError:
+            parts.append({"path": str(path), "exists": False})
+            continue
+        if path.is_symlink() or not statmod.S_ISREG(metadata.st_mode):
+            raise OSError(f"friction ledger must be a regular file: {path}")
+        parts.append({
+            "path": str(path),
+            "exists": True,
+            "size": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+        })
+    return hashlib.sha256(
+        json.dumps(parts, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _load_event_records(limit: int, *, offset: int = 0) -> dict[str, Any]:
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
     text = _read_private_text(FRICTION_LOG, max_bytes=MAX_FRICTION_LEDGER_BYTES)
     if text is None:
         return {
@@ -1696,12 +1772,14 @@ def _load_event_records(limit: int) -> dict[str, Any]:
             "scanned_lines": 0,
             "invalid_lines": 0,
             "non_event_lines": 0,
+            "skipped_valid_events": 0,
         }
     lines = text.splitlines()
     reversed_events: list[dict[str, Any]] = []
     scanned_lines = 0
     invalid_lines = 0
     non_event_lines = 0
+    skipped_valid_events = 0
     for line in reversed(lines):
         if len(reversed_events) >= limit:
             break
@@ -1714,6 +1792,9 @@ def _load_event_records(limit: int) -> dict[str, Any]:
             invalid_lines += 1
             continue
         if isinstance(value, dict):
+            if skipped_valid_events < offset:
+                skipped_valid_events += 1
+                continue
             reversed_events.append(value)
         else:
             non_event_lines += 1
@@ -1723,6 +1804,7 @@ def _load_event_records(limit: int) -> dict[str, Any]:
         "scanned_lines": scanned_lines,
         "invalid_lines": invalid_lines,
         "non_event_lines": non_event_lines,
+        "skipped_valid_events": skipped_valid_events,
     }
 
 
@@ -1730,11 +1812,59 @@ def _load_events(limit: int) -> list[dict[str, Any]]:
     return list(_load_event_records(limit)["events"])
 
 
-def friction_summary(*, limit: int = 50) -> dict[str, Any]:
-    if not isinstance(limit, int) or limit < 1 or limit > 500:
-        raise ValueError("limit must be between 1 and 500")
-    records = _load_event_records(limit)
-    events = list(records["events"])
+def _compact_friction_event(event: dict[str, Any]) -> dict[str, Any]:
+    bounded = _bounded_event(event)
+    result = {
+        key: bounded.get(key)
+        for key in (
+            "event_id",
+            "recorded_at",
+            "recorded_at_unix",
+            "kind",
+            "surface",
+            "operation",
+            "symptom",
+            "resolved",
+            "resolution_status",
+            "notes_count",
+        )
+        if key in bounded
+    }
+    result["failure_class"] = classify_friction_event(event)
+    if isinstance(bounded.get("closeout"), dict):
+        result["closeout"] = {
+            key: bounded["closeout"].get(key)
+            for key in ("status", "evidence_ref", "bureau_task_id", "closed_at")
+            if bounded["closeout"].get(key) not in (None, "")
+        }
+    return result
+
+
+def friction_summary(
+    *,
+    limit: int = 20,
+    view: str = "minimal",
+    cursor: str | None = None,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    selected_view = _consumer_view(view)
+    max_limit = 500 if selected_view == "evidence" else 100
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > max_limit:
+        raise ValueError(f"limit must be between 1 and {max_limit} for view={selected_view}")
+    snapshot_sha256 = _friction_snapshot_sha256()
+    scope = f"friction-summary:{selected_view}:{snapshot_sha256}"
+    position = _consumer_decode_cursor(cursor, scope)
+    offset = 0 if position is None else position.get("offset")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("cursor offset is invalid")
+    records = _load_event_records(limit + 1, offset=offset)
+    raw_events = list(records["events"])
+    has_more = len(raw_events) > limit
+    events = raw_events[-limit:] if has_more else raw_events
+    # _load_event_records returns chronological order. When limit+1 was read,
+    # the oldest item is the page-overflow marker and must be excluded.
+    if has_more:
+        events = raw_events[1:]
     event_ids = [_event_id(event) for event in events if _has_event_id(event)]
     duplicate_event_ids = sorted(
         event_id for event_id, count in Counter(event_ids).items() if count > 1
@@ -1781,13 +1911,39 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
         by_surface[surface] = by_surface.get(surface, 0) + 1
         overlaid_events.append(event)
     unresolved = resolution_counts["unresolved"]
-    return {
-        "schema_version": 1,
+    classification = classify_failure_events(overlaid_events)
+    diagnostics = connector_transport_diagnostics(overlaid_events)
+    proposals = propose_next_grip_from_friction(overlaid_events)
+    next_offset = offset + len(events)
+    next_cursor = (
+        _consumer_encode_cursor(scope, {"offset": next_offset})
+        if has_more
+        else None
+    )
+    warnings: list[dict[str, Any]] = []
+    if not event_log_integrity["integrity_valid"]:
+        warnings.append({"code": "friction_event_log_integrity_invalid"})
+    if not closeout_meta.get("integrity_valid", False):
+        warnings.append({"code": "friction_decision_log_integrity_invalid"})
+    if unresolved:
+        warnings.append({"code": "unresolved_friction", "count": unresolved})
+    payload: dict[str, Any] = {
+        "schema_version": 2,
         "decision_overlay_schema_version": 1,
-        "path": str(FRICTION_LOG),
-        "exists": FRICTION_LOG.exists(),
-        "decision_log": closeout_meta,
+        "view": selected_view,
         "event_log_integrity": event_log_integrity,
+        "decision_log": {
+            key: closeout_meta.get(key)
+            for key in (
+                "exists",
+                "integrity_valid",
+                "record_count",
+                "invalid_record_count",
+                "duplicate_event_ids",
+                "conflicting_event_ids",
+            )
+            if key in closeout_meta
+        },
         "limit": limit,
         "limit_scope": "recent_valid_events",
         "scanned_lines": records["scanned_lines"],
@@ -1798,11 +1954,81 @@ def friction_summary(*, limit: int = 50) -> dict[str, Any]:
         "resolution_counts": dict(sorted(resolution_counts.items())),
         "by_kind": dict(sorted(by_kind.items())),
         "by_surface": dict(sorted(by_surface.items())),
-        "failure_classification": classify_failure_events(overlaid_events),
-        "connector_transport_diagnostics": connector_transport_diagnostics(overlaid_events),
-        "next_grip_proposals": propose_next_grip_from_friction(overlaid_events),
-        "events": [_bounded_event(event) for event in overlaid_events],
+        "failure_classification": {
+            "by_failure_class": classification.get("by_failure_class", {}),
+            "unresolved_by_failure_class": classification.get(
+                "unresolved_by_failure_class", {}
+            ),
+            "decision_required_count": classification.get("decision_required_count", 0),
+            "authority": classification.get("authority"),
+            "does_not_establish": classification.get("does_not_establish", []),
+        },
+        "next_grip_proposals": {
+            "has_recommendations": proposals.get("has_recommendations", False),
+            "recommendations": [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "pattern",
+                        "title",
+                        "recommendation_type",
+                        "unresolved",
+                        "evidence_event_ids",
+                    )
+                }
+                for item in proposals.get("recommendations", [])[:5]
+                if isinstance(item, dict)
+            ],
+            "authority": proposals.get("authority"),
+            "does_not_establish": proposals.get("does_not_establish", []),
+        },
+        "events": [_compact_friction_event(event) for event in overlaid_events],
+        "pagination": {
+            "limit": limit,
+            "returned": len(overlaid_events),
+            "offset": offset,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+            "snapshot_sha256": snapshot_sha256,
+        },
+        "warnings": warnings,
+        "recommended_next_action": (
+            "resolve log integrity before automation"
+            if any("integrity" in item["code"] for item in warnings)
+            else (
+                "inspect the highest repeated unresolved failure class"
+                if unresolved
+                else "none"
+            )
+        ),
+        "does_not_establish": [
+            "root_cause",
+            "task_creation_authority",
+            "safe_unchanged_mutation_retry",
+        ],
     }
+    if selected_view in {"standard", "evidence"}:
+        payload["connector_transport_diagnostics"] = diagnostics
+    if selected_view == "evidence":
+        payload.update({
+            "failure_classification": classification,
+            "next_grip_proposals": proposals,
+            "path": str(FRICTION_LOG),
+            "exists": FRICTION_LOG.exists(),
+            "decision_log": closeout_meta,
+            "events": [_bounded_event(event) for event in overlaid_events],
+        })
+    return _consumer_project(
+        payload,
+        fields=fields,
+        required=(
+            "schema_version",
+            "view",
+            "warnings",
+            "recommended_next_action",
+            "does_not_establish",
+        ),
+    )
 
 
 @mcp.tool(name="grabowski_friction_record", annotations=MUTATING)
@@ -1856,9 +2082,14 @@ def grabowski_friction_resolve(
 
 
 @mcp.tool(name="grabowski_friction_summary", annotations=READ_ONLY)
-def grabowski_friction_summary(limit: int = 50) -> dict[str, Any]:
-    """Summarize recent bounded operator-friction events."""
-    return friction_summary(limit=limit)
+def grabowski_friction_summary(
+    limit: int = 20,
+    view: str = "minimal",
+    cursor: str | None = None,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Summarize recent friction with compact default output and pagination."""
+    return friction_summary(limit=limit, view=view, cursor=cursor, fields=fields)
 
 
 @mcp.tool(name="grabowski_connector_transport_diagnostics", annotations=READ_ONLY)
@@ -1998,7 +2229,7 @@ def _execution_event_ids(values: list[str] | None) -> list[str]:
 
 
 def _execution_friction_evidence(*, limit: int, prior_failure_class: str) -> dict[str, Any]:
-    summary = friction_summary(limit=limit)
+    summary = friction_summary(limit=limit, view="evidence")
     classification = summary["failure_classification"]
     unresolved = dict(classification.get("unresolved_by_failure_class", {}))
     decision_events = classification.get("decision_required_events", [])

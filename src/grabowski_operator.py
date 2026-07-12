@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import errno
 from datetime import datetime, timezone
 
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -15,6 +18,7 @@ import shlex
 import signal
 import stat
 import subprocess
+import sys
 import time
 from typing import Any
 import uuid
@@ -68,6 +72,104 @@ EXPECTED_RECEIPT_NON_CLAIMS = (
     "job_success",
     "notification_delivery",
 )
+CONSUMER_VIEWS = frozenset({"minimal", "standard", "evidence"})
+CONSUMER_VIEW_ALIASES = {"concise": "minimal", "full": "evidence"}
+MAX_CONSUMER_FIELDS = 40
+MAX_CONSUMER_CURSOR_BYTES = 2048
+JOB_NOTIFICATION_RECEIPT_NAME = "notification.json"
+JOB_NOTIFICATION_ACK_NAME = "notification-ack.json"
+JOB_NOTIFICATION_NON_CLAIMS = (
+    "external_push_delivery",
+    "user_has_seen_notification",
+    "job_success",
+)
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _normalize_consumer_view(value: str | None, *, default: str = "minimal") -> str:
+    selected = default if value is None else value
+    if not isinstance(selected, str):
+        raise ValueError("view must be a string")
+    selected = CONSUMER_VIEW_ALIASES.get(selected, selected)
+    if selected not in CONSUMER_VIEWS:
+        raise ValueError(f"view must be one of {sorted(CONSUMER_VIEWS)}")
+    return selected
+
+
+def _normalize_consumer_fields(fields: list[str] | None) -> list[str] | None:
+    if fields is None:
+        return None
+    if not isinstance(fields, list) or len(fields) > MAX_CONSUMER_FIELDS:
+        raise ValueError(f"fields must be a list with at most {MAX_CONSUMER_FIELDS} entries")
+    normalized: list[str] = []
+    for field in fields:
+        if (
+            not isinstance(field, str)
+            or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", field)
+        ):
+            raise ValueError("fields entries must be bounded lower-case identifiers")
+        if field not in normalized:
+            normalized.append(field)
+    return normalized
+
+
+def _project_consumer_fields(
+    payload: dict[str, Any],
+    *,
+    fields: list[str] | None,
+    required: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    selected = _normalize_consumer_fields(fields)
+    if selected is None:
+        return payload
+    unknown = sorted(set(selected) - set(payload))
+    if unknown:
+        raise ValueError(f"Unknown response field(s): {', '.join(unknown)}")
+    keep = set(selected) | {key for key in required if key in payload}
+    projected = {key: value for key, value in payload.items() if key in keep}
+    projected["projection"] = {
+        "selected_fields": sorted(keep),
+        "omitted_fields": sorted(set(payload) - keep),
+        "required_fields_preserved": [key for key in required if key in payload],
+    }
+    return projected
+
+
+def _encode_consumer_cursor(scope: str, position: dict[str, Any]) -> str:
+    if not isinstance(scope, str) or not scope or len(scope) > 200:
+        raise ValueError("cursor scope is invalid")
+    body = {"schema_version": 1, "scope": scope, "position": position}
+    body["checksum"] = hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+    encoded = base64.urlsafe_b64encode(_canonical_json_bytes(body)).decode("ascii").rstrip("=")
+    if len(encoded) > MAX_CONSUMER_CURSOR_BYTES:
+        raise ValueError("cursor is too large")
+    return encoded
+
+
+def _decode_consumer_cursor(cursor: str | None, scope: str) -> dict[str, Any] | None:
+    if cursor in (None, ""):
+        return None
+    if not isinstance(cursor, str) or len(cursor) > MAX_CONSUMER_CURSOR_BYTES:
+        raise ValueError("cursor is invalid")
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(cursor + padding))
+    except (ValueError, json.JSONDecodeError, binascii.Error) as exc:
+        raise ValueError("cursor is invalid") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise ValueError("cursor schema is invalid")
+    checksum = value.pop("checksum", None)
+    expected = hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+    if not isinstance(checksum, str) or not hmac.compare_digest(checksum, expected):
+        raise ValueError("cursor checksum is invalid")
+    if value.get("scope") != scope or not isinstance(value.get("position"), dict):
+        raise ValueError("cursor does not match this result set")
+    return value["position"]
 
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
@@ -1167,6 +1269,218 @@ def _job_notification_evidence(notify_on_done: dict[str, Any], terminalization: 
     return evidence
 
 
+def _read_job_notification_json(directory: Path, name: str) -> dict[str, Any] | None:
+    if name not in {JOB_NOTIFICATION_RECEIPT_NAME, JOB_NOTIFICATION_ACK_NAME}:
+        raise ValueError("invalid notification receipt name")
+    path = directory / name
+    try:
+        snapshot = base._read_bound_regular_bytes(
+            path,
+            MAX_FINALIZATION_RECEIPT_BYTES,
+        )
+    except FileNotFoundError:
+        return None
+    if int(snapshot["mode"]) & 0o077:
+        raise ValueError("job notification receipt must be private")
+    try:
+        value = json.loads(snapshot["data"].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("job notification receipt is invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("job notification receipt must be an object")
+    return value
+
+
+def _validated_job_notification(directory: Path, unit: str) -> dict[str, Any] | None:
+    receipt = _read_job_notification_json(directory, JOB_NOTIFICATION_RECEIPT_NAME)
+    if receipt is None:
+        return None
+    if receipt.get("kind") != "grabowski_job_notification" or receipt.get("unit") != unit:
+        raise ValueError("job notification receipt identity mismatch")
+    stored_hash = receipt.get("receipt_sha256")
+    unsigned = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    expected_hash = hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest()
+    if not isinstance(stored_hash, str) or not hmac.compare_digest(stored_hash, expected_hash):
+        raise ValueError("job notification receipt hash mismatch")
+    return receipt
+
+
+def _validated_job_notification_ack(
+    directory: Path,
+    unit: str,
+    receipt: dict[str, Any],
+) -> dict[str, Any] | None:
+    acknowledgement = _read_job_notification_json(directory, JOB_NOTIFICATION_ACK_NAME)
+    if acknowledgement is None:
+        return None
+    if (
+        acknowledgement.get("kind") != "grabowski_job_notification_ack"
+        or acknowledgement.get("unit") != unit
+        or acknowledgement.get("job_id") != receipt.get("job_id")
+        or acknowledgement.get("notification_id") != receipt.get("notification_id")
+        or acknowledgement.get("receipt_sha256") != receipt.get("receipt_sha256")
+    ):
+        raise ValueError("job notification acknowledgement binding mismatch")
+    non_claims = acknowledgement.get("does_not_establish")
+    if (
+        not isinstance(non_claims, list)
+        or not {"external_push_delivery", "job_success"}.issubset(set(non_claims))
+    ):
+        raise ValueError("job notification acknowledgement non-claims are invalid")
+    stored_hash = acknowledgement.get("ack_sha256")
+    unsigned = {
+        key: value
+        for key, value in acknowledgement.items()
+        if key != "ack_sha256"
+    }
+    expected_hash = hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest()
+    if not isinstance(stored_hash, str) or not hmac.compare_digest(stored_hash, expected_hash):
+        raise ValueError("job notification acknowledgement hash mismatch")
+    return acknowledgement
+
+
+def _publish_private_create_only_json(
+    directory: Path,
+    target: Path,
+    payload: dict[str, Any],
+) -> bool:
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_FINALIZATION_RECEIPT_BYTES:
+        raise ValueError("job notification acknowledgement is too large")
+    temporary = directory / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    published = False
+    temporary_identity: tuple[int, int] | None = None
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_metadata = temporary.lstat()
+        temporary_identity = (temporary_metadata.st_dev, temporary_metadata.st_ino)
+        if (
+            not stat.S_ISREG(temporary_metadata.st_mode)
+            or stat.S_IMODE(temporary_metadata.st_mode) != 0o600
+            or temporary_metadata.st_nlink != 1
+        ):
+            raise RuntimeError("temporary notification acknowledgement is unsafe")
+        try:
+            os.link(temporary, target, follow_symlinks=False)
+        except FileExistsError:
+            return False
+        published = True
+        try:
+            temporary.unlink()
+        except OSError:
+            try:
+                current = target.lstat()
+                if (current.st_dev, current.st_ino) == temporary_identity:
+                    target.unlink()
+                    published = False
+            finally:
+                raise
+        target_metadata = target.lstat()
+        if (
+            not stat.S_ISREG(target_metadata.st_mode)
+            or stat.S_IMODE(target_metadata.st_mode) != 0o600
+            or target_metadata.st_nlink != 1
+            or (target_metadata.st_dev, target_metadata.st_ino) != temporary_identity
+        ):
+            try:
+                current = target.lstat()
+                if (current.st_dev, current.st_ino) == temporary_identity:
+                    target.unlink()
+                    published = False
+            except FileNotFoundError:
+                published = False
+            raise RuntimeError("published notification acknowledgement failed integrity validation")
+        _fsync_directory(directory)
+        return True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        if published and temporary_identity is not None:
+            try:
+                current = target.lstat()
+            except FileNotFoundError as exc:
+                raise RuntimeError("published notification acknowledgement disappeared") from exc
+            if current.st_nlink != 1:
+                if (current.st_dev, current.st_ino) == temporary_identity:
+                    target.unlink()
+                raise RuntimeError(
+                    "published notification acknowledgement lost single-link integrity"
+                )
+
+
+def _job_notification_evidence_for_unit(
+    unit: str,
+    notify_on_done: dict[str, Any],
+    terminalization: dict[str, Any],
+) -> dict[str, Any]:
+    base_evidence = _job_notification_evidence(notify_on_done, terminalization)
+    if notify_on_done.get("requested") is not True:
+        return base_evidence
+    directory = _job_directory(unit)
+    try:
+        receipt = _validated_job_notification(directory, unit)
+    except (OSError, ValueError) as exc:
+        return {
+            **base_evidence,
+            "delivery_mode": "operator_outbox",
+            "delivery_state": "invalid_receipt",
+            "reason": _redact(str(exc))[:MAX_NOTIFY_ON_DONE_TEXT],
+            "does_not_establish": list(JOB_NOTIFICATION_NON_CLAIMS),
+        }
+    if receipt is None:
+        running = terminalization.get("final_status") == "running"
+        return {
+            **base_evidence,
+            "delivery_mode": "operator_outbox",
+            "delivery_state": "pending_finalization" if running else "missing_receipt",
+            "reason": (
+                "job is still running"
+                if running
+                else "terminal job has no notification receipt"
+            ),
+            "does_not_establish": list(JOB_NOTIFICATION_NON_CLAIMS),
+        }
+    try:
+        acknowledgement = _validated_job_notification_ack(directory, unit, receipt)
+    except (OSError, ValueError) as exc:
+        return {
+            **base_evidence,
+            "delivery_mode": "operator_outbox",
+            "delivery_state": "invalid_acknowledgement",
+            "reason": _redact(str(exc))[:MAX_NOTIFY_ON_DONE_TEXT],
+            "notification": receipt,
+            "does_not_establish": list(JOB_NOTIFICATION_NON_CLAIMS),
+        }
+    state = "acknowledged" if acknowledgement is not None else "queued"
+    return {
+        "requested": True,
+        "delivery_enabled": True,
+        "delivery_mode": "operator_outbox",
+        "delivery_state": state,
+        "final_status_preserved": terminalization.get("final_status"),
+        "notification": receipt,
+        "ack_sha256": (
+            acknowledgement.get("ack_sha256")
+            if acknowledgement is not None
+            else None
+        ),
+        "does_not_establish": list(JOB_NOTIFICATION_NON_CLAIMS),
+    }
+
 def _job_paths_for_unit(unit: str) -> dict[str, Path]:
     directory = _job_directory(unit)
     return {
@@ -1299,7 +1613,9 @@ def _job_status_record(
         "final_status": terminalization["final_status"],
         "terminalization_evidence": terminalization,
         "finalization_receipt": finalization_receipt,
-        "notification_evidence": _job_notification_evidence(notify_on_done, terminalization),
+        "notification_evidence": _job_notification_evidence_for_unit(
+            unit, notify_on_done, terminalization
+        ),
     }
 
 
@@ -2035,8 +2351,11 @@ def _start_job(
         "--property=Type=exec",
         "--property=KillMode=control-group",
         "--property=TimeoutStopSec=10s",
+        "--property=LimitCORE=0",
         f"--property=RuntimeMaxSec={runtime}s",
         f"--property=WorkingDirectory={working_directory}",
+        f"--setenv=GRABOWSKI_JOB_DIRECTORY={directory}",
+        f"--property=ExecStopPost={sys.executable} -m grabowski_job_finalizer",
         f"--property=StandardOutput=append:{stdout_path}",
         f"--property=StandardError=append:{stderr_path}",
     ]
@@ -2178,6 +2497,121 @@ def grabowski_job_status(unit: str) -> dict[str, Any]:
         "properties": properties,
         "stderr": result["stderr"],
     }
+
+
+@mcp.tool(name="grabowski_job_notification_list", annotations=READ_ONLY)
+def grabowski_job_notification_list(
+    limit: int = 50,
+    state: str = "queued",
+) -> dict[str, Any]:
+    """List durable operator-outbox notifications without claiming external push."""
+    _require_operator_capability("durable_job")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+        raise ValueError("limit must be between 1 and 200")
+    if state not in {"queued", "acknowledged", "all"}:
+        raise ValueError("state must be queued, acknowledged or all")
+    rows: list[dict[str, Any]] = []
+    invalid: list[dict[str, str]] = []
+    for directory in sorted(_jobs_root().iterdir(), key=lambda item: item.name, reverse=True):
+        if len(rows) >= limit:
+            break
+        if directory.is_symlink() or not directory.is_dir() or not directory.name.startswith(JOB_PREFIX):
+            continue
+        try:
+            receipt = _validated_job_notification(directory, directory.name)
+            if receipt is None:
+                continue
+            acknowledgement = _validated_job_notification_ack(
+                directory,
+                directory.name,
+                receipt,
+            )
+            delivery_state = "acknowledged" if acknowledgement is not None else "queued"
+            if state != "all" and delivery_state != state:
+                continue
+            rows.append({
+                "unit": directory.name,
+                "job_id": receipt.get("job_id"),
+                "notification_id": receipt.get("notification_id"),
+                "terminal_status": receipt.get("terminal_status"),
+                "delivery_state": delivery_state,
+                "requested_channels": receipt.get("requested_channels", []),
+                "note": receipt.get("note"),
+                "receipt_sha256": receipt.get("receipt_sha256"),
+                "ack_sha256": (
+                    acknowledgement.get("ack_sha256")
+                    if acknowledgement is not None
+                    else None
+                ),
+            })
+        except (OSError, ValueError) as exc:
+            invalid.append({
+                "unit": directory.name,
+                "error": _redact(str(exc))[:MAX_NOTIFY_ON_DONE_TEXT],
+            })
+    return {
+        "schema_version": 1,
+        "delivery_mode": "operator_outbox",
+        "state_filter": state,
+        "returned": len(rows),
+        "notifications": rows,
+        "invalid_receipts": invalid[:20],
+        "does_not_establish": list(JOB_NOTIFICATION_NON_CLAIMS),
+    }
+
+
+@mcp.tool(name="grabowski_job_notification_ack", annotations=MUTATING)
+def grabowski_job_notification_ack(
+    unit: str,
+    expected_receipt_sha256: str,
+) -> dict[str, Any]:
+    """Acknowledge one exact operator-outbox receipt idempotently."""
+    _require_operator_mutation("durable_job")
+    name = _validate_unit(unit, job_only=True)
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_receipt_sha256):
+        raise ValueError("expected_receipt_sha256 must be a SHA-256 digest")
+    directory = _job_directory(name)
+    receipt = _validated_job_notification(directory, name)
+    if receipt is None:
+        raise ValueError("job notification receipt does not exist")
+    if not hmac.compare_digest(
+        str(receipt.get("receipt_sha256", "")), expected_receipt_sha256
+    ):
+        raise ValueError("job notification receipt changed")
+
+    existing = _validated_job_notification_ack(directory, name, receipt)
+    if existing is not None:
+        return {"created": False, "acknowledgement": existing}
+
+    now_unix, now_iso = _job_timestamp()
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_job_notification_ack",
+        "unit": name,
+        "job_id": receipt.get("job_id"),
+        "notification_id": receipt.get("notification_id"),
+        "receipt_sha256": expected_receipt_sha256,
+        "acknowledged_at": now_iso,
+        "acknowledged_at_unix": now_unix,
+        "does_not_establish": ["external_push_delivery", "job_success"],
+    }
+    payload["ack_sha256"] = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+    target = directory / JOB_NOTIFICATION_ACK_NAME
+    created = _publish_private_create_only_json(directory, target, payload)
+    if not created:
+        winner = _validated_job_notification_ack(directory, name, receipt)
+        if winner is None:
+            raise RuntimeError("notification acknowledgement publish race has no winner")
+        return {"created": False, "acknowledgement": winner}
+
+    base._append_audit({
+        "timestamp_unix": now_unix,
+        "operation": "job-notification-ack",
+        "unit": name,
+        "receipt_sha256": expected_receipt_sha256,
+        "ack_sha256": payload["ack_sha256"],
+    })
+    return {"created": True, "acknowledgement": payload}
 
 
 @mcp.tool(name="grabowski_job_logs", annotations=READ_ONLY)

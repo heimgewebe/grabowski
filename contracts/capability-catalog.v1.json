@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "10337a53e31e6a4f0baf18f0d3af1b3f93b10624b8a3621d18585c93dd6f15c4",
+  "capability_source_sha256": "fdbbb1ec3f5545d589a0b167ce6703dbc146122e67a8269f1dbfbd049f92e655",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "f5b5aa65ec197281b4bec4b3eacf93f90d5f30cbf78d77b5ee2e726bd98b28e4",
+  "contract_sha256": "b46393fca5a96be78c0c3ffa95b71928a27ee228dd6ee22efe58935135b84fc9",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -14,7 +14,7 @@
   "tools": [
     {
       "category": "context",
-      "description": "Return Grabowski's bounded read/write policy and current local state.",
+      "description": "Return a consumer-shaped Grabowski status with opt-in evidence detail.",
       "effects": [],
       "id": "grabowski_status",
       "purpose": "Read policy, deployment provenance and the current bounded operating mode.",
@@ -25,7 +25,7 @@
     },
     {
       "category": "context",
-      "description": "Return a task-oriented live operator context and explicit drift findings.",
+      "description": "Return compact operator context; full evidence is explicitly opt-in.",
       "effects": [],
       "id": "grabowski_context",
       "purpose": "Return a task-oriented live operator context and explicit drift findings.",
@@ -386,7 +386,7 @@
     },
     {
       "category": "version-control",
-      "description": "Return a bounded summary of Grabowski repository worktrees.",
+      "description": "Return a paginated consumer-shaped summary of Grabowski worktrees.",
       "effects": [],
       "id": "grabowski_checkout_summary",
       "purpose": "Read a bounded summary of Grabowski repository worktrees.",
@@ -541,6 +541,30 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_job_status"
+    },
+    {
+      "category": "command",
+      "description": "List durable operator-outbox notifications without claiming external push.",
+      "effects": [],
+      "id": "grabowski_job_notification_list",
+      "purpose": "List persistent operator-outbox receipts for completed durable jobs.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_job_notification_list"
+    },
+    {
+      "category": "command",
+      "description": "Acknowledge one exact operator-outbox receipt idempotently.",
+      "effects": [
+        "state-create"
+      ],
+      "id": "grabowski_job_notification_ack",
+      "purpose": "Acknowledge one exact persistent operator-outbox receipt.",
+      "read_only": false,
+      "reversibility": "receipt-retained",
+      "risk_class": "medium",
+      "tool": "grabowski_job_notification_ack"
     },
     {
       "category": "command",
@@ -912,7 +936,7 @@
     },
     {
       "category": "task",
-      "description": "List recent persistent task records, optionally filtered by state.",
+      "description": "List persistent tasks with keyset pagination and compact default records.",
       "effects": [],
       "id": "grabowski_task_list",
       "purpose": "List recent persistent task records with optional state filtering.",
@@ -1015,7 +1039,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Summarize recent bounded operator-friction events.",
+      "description": "Summarize recent friction with compact default output and pagination.",
       "effects": [],
       "id": "grabowski_friction_summary",
       "purpose": "Summarize recent bounded operator-friction events.",

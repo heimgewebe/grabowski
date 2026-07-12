@@ -226,6 +226,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_job_notification_list": {
+        "category": "command",
+        "purpose": "List persistent operator-outbox receipts for completed durable jobs.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_job_notification_ack": {
+        "category": "command",
+        "purpose": "Acknowledge one exact persistent operator-outbox receipt.",
+        "risk_class": "medium",
+        "effects": ["state-create"],
+        "reversibility": "receipt-retained",
+    },
     "grabowski_job_logs": {
         "category": "command",
         "purpose": "Read redacted persistent output for one Grabowski job.",

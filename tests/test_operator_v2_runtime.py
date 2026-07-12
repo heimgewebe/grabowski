@@ -693,14 +693,14 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 capabilities=capabilities,
             )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
-                status = grabowski_mcp.grabowski_status()
+                status = grabowski_mcp.grabowski_status(view="evidence")
 
         missing = {
             item["tool"]: item["missing_capabilities"]
             for item in status["capability_requirements"]["missing_enabled_requirements"]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 118)
+        self.assertEqual(summary["registered_tool_requirements"], 120)
         self.assertEqual(missing["grabowski_remove_path"], ["file_delete"])
         self.assertEqual(missing["grabowski_restore_removed_path"], ["file_delete"])
         self.assertEqual(missing["rlens_bundle_discover"], ["bundle_registry"])

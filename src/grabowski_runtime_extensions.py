@@ -136,67 +136,170 @@ def _validate_branch_name(repo: Path, branch: str) -> str:
 
 
 @mcp.tool(name="grabowski_context", annotations=READ_ONLY)
-def grabowski_context(profile: str = "concise") -> dict[str, Any]:
-    """Return a task-oriented live operator context and explicit drift findings."""
+def grabowski_context(
+    profile: str = "concise",
+    view: str | None = None,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return compact operator context; full evidence is explicitly opt-in."""
+    default_view = "minimal" if profile == "concise" else "standard"
+    selected_view = operator._normalize_consumer_view(view, default=default_view)
+    if profile not in capabilities.PROFILE_CATEGORIES:
+        raise ValueError(f"profile must be one of {sorted(capabilities.PROFILE_CATEGORIES)}")
     snapshot = _runtime_contract_snapshot()
     contract = snapshot["contract"]
     expected_tools = contract.get("expected_tools", [])
     if not isinstance(expected_tools, list):
         expected_tools = []
-    records = capabilities.capability_records(expected_tools)
     classification = capabilities.classify_contract(expected_tools)
     deployment = base._deployment_metadata()
     runtime_head = deployment.get("repo_head")
-    worktrees = _worktree_context(runtime_head if isinstance(runtime_head, str) else None)
+    repository = HOME / "repos" / "grabowski"
+    canonical = _git_state(repository) if repository.is_dir() else {
+        "path": str(repository),
+        "head": None,
+        "branch": None,
+        "dirty": None,
+    }
+    canonical_matches_runtime = bool(
+        isinstance(runtime_head, str) and canonical.get("head") == runtime_head
+    )
+    policy = base._load_policy()
+    active_profile = base._active_profile(policy)
     known_gaps: list[str] = []
     for key, values in classification.items():
         if values:
-            known_gaps.append(f"{key}: {', '.join(values)}")
+            known_gaps.append(f"{key}: {', '.join(values[:20])}")
     if not expected_tools:
         known_gaps.append("runtime entrypoint contract is unavailable")
-    known_gaps.append("the connector's frozen client-side tool snapshot is not observable from the local runtime")
-    policy = base._load_policy()
-    active_profile = base._active_profile(policy)
-    return {
-        "schema_version": capabilities.CONTEXT_SCHEMA_VERSION,
+    known_gaps.append(
+        "the connector's frozen client-side tool snapshot is not observable from the local runtime"
+    )
+    warnings: list[dict[str, Any]] = []
+    if not canonical_matches_runtime:
+        warnings.append({
+            "code": "canonical_runtime_head_mismatch",
+            "canonical_head": canonical.get("head"),
+            "runtime_head": runtime_head,
+        })
+    if any(classification.values()):
+        warnings.append({"code": "capability_catalog_drift", "classification": classification})
+    warnings.append({"code": "client_snapshot_unobservable"})
+    payload: dict[str, Any] = {
+        "schema_version": 2,
         "profile": profile,
+        "view": selected_view,
         "generated_at_unix": int(time.time()),
         "runtime": {
             "service": LOGICAL_RUNTIME_SERVICE,
             "service_model": runtime_service_model(deployment),
-            "contract_source": snapshot["source"],
-            "expected_tools": expected_tools,
-            "deployment": deployment,
+            "completion_status": deployment.get("completion_status"),
+            "provenance_valid": bool(deployment.get("provenance_valid")),
+            "runtime_binding_valid": bool(deployment.get("runtime_binding_valid")),
         },
         "policy": {
             "mode": policy.get("mode"),
             "active_profile": active_profile["name"],
             "trusted_owner": base._trusted_owner_enabled(policy),
             "access_profiles": sorted(policy.get("profiles", {})),
-            "capabilities": sorted(base._effective_capabilities(policy)),
-            "read_roots": base._profile_values(policy, "read_roots"),
-            "write_roots": base._profile_values(policy, "write_roots"),
-            "write_excluded_roots": (
-                base._profile_values(policy, "write_excluded_roots") or []
-            ),
-            "secret_roots": base._secret_root_values(policy),
-            "browser_profile_roots": base._browser_profile_root_values(policy),
-            "secret_export_roots": base._secret_export_root_values(policy),
-            "forbidden_capabilities": policy.get("forbidden_capabilities", []),
-            "kill_switch": base._kill_switch_state(),
-            "audit": base._verify_audit_log(base.AUDIT_LOG),
+            "max_risk_level": base._profile_values(policy, "max_risk_level") or "high",
         },
-        "capabilities": capabilities.filter_capabilities(records, profile),
-        "classification": classification,
-        "checkout": worktrees,
-        "drift": {
+        "catalog": {
+            "expected_tool_count": len(expected_tools),
             "catalog_matches_contract": not any(classification.values()),
-            "canonical_checkout_matches_runtime": worktrees.get("canonical_matches_runtime"),
-            "runtime_matching_worktree_count": len(worktrees.get("runtime_matching_worktrees", [])),
-            "connector_snapshot_observable": False,
+            "classification": classification,
         },
+        "checkout": {
+            "repository": str(repository),
+            "canonical_checkout": canonical,
+            "canonical_matches_runtime": canonical_matches_runtime,
+        },
+        "warnings": warnings,
         "known_gaps": known_gaps,
+        "recommended_next_action": (
+            "inspect warnings before mutation" if warnings else "none"
+        ),
+        "evidence_refs": {
+            "contract_source": snapshot["source"],
+            "release_id": deployment.get("release_id"),
+            "repo_head": runtime_head,
+        },
+        "does_not_establish": [
+            "client_snapshot_freshness",
+            "repository_correctness",
+            "action_authority",
+        ],
     }
+    if selected_view in {"standard", "evidence"}:
+        records = capabilities.capability_records(expected_tools)
+        selected_records = capabilities.filter_capabilities(records, profile)
+        category_counts: dict[str, int] = {}
+        for record in selected_records:
+            category = str(record.get("category", "unknown"))
+            category_counts[category] = category_counts.get(category, 0) + 1
+        worktrees = _worktree_context(runtime_head if isinstance(runtime_head, str) else None)
+        payload["capability_summary"] = {
+            "selected_count": len(selected_records),
+            "by_category": dict(sorted(category_counts.items())),
+            "sample": selected_records[:20],
+            "sample_truncated": len(selected_records) > 20,
+        }
+        payload["checkout"].update({
+            "worktree_count": len(worktrees.get("worktrees", [])),
+            "runtime_matching_worktree_count": len(
+                worktrees.get("runtime_matching_worktrees", [])
+            ),
+        })
+    if selected_view == "evidence":
+        records = capabilities.capability_records(expected_tools)
+        worktrees = _worktree_context(runtime_head if isinstance(runtime_head, str) else None)
+        payload.update({
+            "runtime_evidence": {
+                "contract_source": snapshot["source"],
+                "expected_tools": expected_tools,
+                "deployment": deployment,
+            },
+            "policy_evidence": {
+                "capabilities": sorted(base._effective_capabilities(policy)),
+                "read_roots": base._profile_values(policy, "read_roots"),
+                "write_roots": base._profile_values(policy, "write_roots"),
+                "write_excluded_roots": base._profile_values(
+                    policy, "write_excluded_roots"
+                ) or [],
+                "secret_roots": base._secret_root_values(policy),
+                "browser_profile_roots": base._browser_profile_root_values(policy),
+                "secret_export_roots": base._secret_export_root_values(policy),
+                "forbidden_capabilities": policy.get("forbidden_capabilities", []),
+                "kill_switch": base._kill_switch_state(),
+                "audit": base._verify_audit_log(base.AUDIT_LOG),
+            },
+            "capabilities": capabilities.filter_capabilities(records, profile),
+            "classification": classification,
+            "checkout_evidence": worktrees,
+            "drift": {
+                "catalog_matches_contract": not any(classification.values()),
+                "canonical_checkout_matches_runtime": worktrees.get(
+                    "canonical_matches_runtime"
+                ),
+                "runtime_matching_worktree_count": len(
+                    worktrees.get("runtime_matching_worktrees", [])
+                ),
+                "connector_snapshot_observable": False,
+            },
+        })
+    return operator._project_consumer_fields(
+        payload,
+        fields=fields,
+        required=(
+            "schema_version",
+            "profile",
+            "view",
+            "warnings",
+            "known_gaps",
+            "recommended_next_action",
+            "does_not_establish",
+        ),
+    )
 
 
 @mcp.tool(name="grabowski_git_branch", annotations=MUTATING)

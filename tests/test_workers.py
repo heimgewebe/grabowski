@@ -90,6 +90,7 @@ class WorkerTests(unittest.TestCase):
         self.assertIn(" argv=", descriptions[0])
         self.assertNotIn("\n", descriptions[0])
         self.assertIn("--slice=grabowski-workers.slice", launch)
+        self.assertEqual(launch.count("--property=LimitCORE=0"), 1)
         self.assertIn("--property=NoNewPrivileges=yes", launch)
         self.assertEqual(
             workers.resources.inspect_resource("port:9222")["owner_id"],

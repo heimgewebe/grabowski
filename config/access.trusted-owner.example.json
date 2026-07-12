@@ -1,21 +1,7 @@
 {
-  "version": 2,
-  "mode": "trusted-owner",
   "active_profile": "trusted-owner",
-  "read_roots": [
-    "/"
-  ],
-  "write_roots": [
-    "/"
-  ],
-  "write_excluded_roots": [],
-  "secret_roots": [
-    "${HOME}/.ssh",
-    "${HOME}/.gnupg",
-    "${HOME}/.aws",
-    "${HOME}/.kube",
-    "${HOME}/.password-store",
-    "${HOME}/.local/share/keyrings"
+  "allowed_grips": [
+    "*"
   ],
   "browser_profile_roots": [
     "${HOME}/.mozilla/firefox",
@@ -23,64 +9,144 @@
     "${HOME}/.config/google-chrome",
     "${HOME}/.config/chromium"
   ],
-  "secret_export_roots": [
-    "${HOME}"
-  ],
-  "max_read_bytes": 33554432,
-  "max_write_bytes": 33554432,
-  "max_list_entries": 100000,
-  "max_secret_use_output_bytes": 33554432,
-  "max_secret_use_seconds": 3600,
-  "forbid_symlinks": false,
-  "forbidden_components": [],
-  "forbidden_file_patterns": [],
-  "forbidden_capabilities": [],
   "capability_definitions": {
-    "file_read": "Read bounded, non-secret text and metadata inside configured roots.",
-    "file_write": "Create and replace bounded text files with hash preconditions, audit and quarantine.",
+    "artifact_transfer": "Transfer regular files with hash-bound source and destination preconditions.",
+    "audit_verify": "Verify the tamper-evident write audit chain.",
+    "browser_profile_read": "Read bounded browser profile metadata and text under explicit browser profile roots; binary databases are metadata-only.",
+    "browser_worker": "Start and control isolated agent-owned browser workers with loopback-only debugging.",
+    "bundle_registry": "Read the curated Lens/repoLens latest-complete bundle registry.",
+    "durable_job": "Start long-running transient user-systemd jobs with extended Trusted Owner budgets.",
     "file_delete": "Remove regular files or empty directories into quarantine for audit-backed restoration.",
     "file_destroy": "Irreversibly remove regular files or empty directories only through a separate explicit capability.",
-    "audit_verify": "Verify the tamper-evident write audit chain.",
+    "file_read": "Read bounded, non-secret text and metadata inside configured roots.",
+    "file_write": "Create and replace bounded text files with hash preconditions, audit and quarantine.",
+    "git_cli": "Run guarded Git commands inside a repository.",
+    "github_cli": "Run GitHub CLI with redacted output.",
+    "gui_worker": "Start and control isolated Xvfb GUI workers without a remote display listener.",
+    "port_inspect": "Inspect listening sockets.",
+    "power_execute": "Run explicitly enabled recovery-gated privileged broker actions.",
+    "privileged_reference": "Create privileged references and use the installed trusted-owner root broker escape hatch.",
+    "process_inspect": "Inspect current-user processes.",
+    "process_signal": "Signal current-user processes with protected PID checks.",
+    "resource_lease": "Acquire, renew, inspect and release typed collision-control resource leases.",
     "rollback_text": "Restore a quarantined preimage from an audited replace transaction.",
-    "bundle_registry": "Read the curated Lens/repoLens latest-complete bundle registry.",
+    "secret_export": "Atomically create a local 0600 copy inside configured secret export roots with a source hash precondition.",
     "secret_inspect": "Inspect metadata and bounded directory listings under explicit secret roots without returning file content.",
     "secret_reveal": "Break-glass reveal only with a current SHA-256, justification and explicit context-exposure acknowledgement; prefer secret_use.",
     "secret_use": "Run bounded argv-only commands with a secret supplied through an inherited file descriptor or restrictive temporary fallback.",
-    "secret_export": "Atomically create a local 0600 copy inside configured secret export roots with a source hash precondition.",
-    "browser_profile_read": "Read bounded browser profile metadata and text under explicit browser profile roots; binary databases are metadata-only.",
     "terminal_execute": "Run arbitrary host-visible commands, including shells and privilege frontends, with audit and redacted output.",
-    "durable_job": "Start long-running transient user-systemd jobs with extended Trusted Owner budgets.",
-    "git_cli": "Run guarded Git commands inside a repository.",
-    "github_cli": "Run GitHub CLI with redacted output.",
-    "user_service_control": "Inspect and control user-level systemd units.",
     "tmux_interaction": "Read or send literal input to existing tmux panes.",
-    "process_inspect": "Inspect current-user processes.",
-    "process_signal": "Signal current-user processes with protected PID checks.",
-    "port_inspect": "Inspect listening sockets.",
-    "privileged_reference": "Create privileged references and use the installed trusted-owner root broker escape hatch.",
-    "power_execute": "Run explicitly enabled recovery-gated privileged broker actions.",
-    "resource_lease": "Acquire, renew, inspect and release typed collision-control resource leases.",
-    "artifact_transfer": "Transfer regular files with hash-bound source and destination preconditions.",
-    "browser_worker": "Start and control isolated agent-owned browser workers with loopback-only debugging.",
-    "gui_worker": "Start and control isolated Xvfb GUI workers without a remote display listener."
+    "user_service_control": "Inspect and control user-level systemd units."
   },
+  "forbid_symlinks": false,
+  "forbidden_capabilities": [],
+  "forbidden_components": [],
+  "forbidden_file_patterns": [],
+  "forbidden_hosts": [],
+  "max_list_entries": 100000,
+  "max_read_bytes": 33554432,
+  "max_risk_level": "high",
+  "max_secret_use_output_bytes": 33554432,
+  "max_secret_use_seconds": 3600,
+  "max_write_bytes": 33554432,
+  "mode": "trusted-owner",
   "profiles": {
-    "trusted-owner": {
-      "description": "Trusted owner profile: unrestricted host-visible user execution, broad filesystem access, full capabilities, and compatibility with the root broker escape hatch.",
+    "maintain": {
+      "allowed_grips": [
+        "repo-orient",
+        "worktree-orient",
+        "worktree-ensure",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync",
+        "mechanic-loop",
+        "branch-publish",
+        "pr-create-or-update"
+      ],
+      "browser_profile_roots": [],
+      "capabilities": [
+        "file_read",
+        "file_write",
+        "audit_verify",
+        "rollback_text",
+        "bundle_registry",
+        "durable_job",
+        "git_cli",
+        "github_cli",
+        "user_service_control",
+        "resource_lease",
+        "artifact_transfer",
+        "browser_worker",
+        "gui_worker",
+        "process_inspect",
+        "port_inspect",
+        "friction_record"
+      ],
+      "description": "Bounded maintenance profile for repository and operator-state changes with audit, receipts and medium-risk grips. It excludes terminal execution, secrets, tmux, process signals, privilege and irreversible destroy.",
+      "forbidden_hosts": [],
+      "max_list_entries": 500,
+      "max_read_bytes": 2000000,
+      "max_risk_level": "medium",
+      "max_secret_use_output_bytes": 250000,
+      "max_secret_use_seconds": 30,
+      "max_write_bytes": 2000000,
       "read_roots": [
-        "/"
+        "${HOME}/repos",
+        "${HOME}/grabowski-workspace",
+        "${HOME}/.local/state/grabowski"
+      ],
+      "secret_export_roots": [],
+      "secret_roots": [],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
       ],
       "write_roots": [
-        "/"
+        "${HOME}/repos",
+        "${HOME}/grabowski-workspace"
+      ]
+    },
+    "observe": {
+      "allowed_grips": [
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync"
       ],
-      "write_excluded_roots": [],
-      "secret_roots": [
-        "${HOME}/.ssh",
-        "${HOME}/.gnupg",
-        "${HOME}/.aws",
-        "${HOME}/.kube",
-        "${HOME}/.password-store",
-        "${HOME}/.local/share/keyrings"
+      "browser_profile_roots": [],
+      "capabilities": [
+        "file_read",
+        "audit_verify",
+        "bundle_registry",
+        "process_inspect",
+        "port_inspect",
+        "friction_record"
+      ],
+      "description": "Read/status profile. It intentionally omits coarse capabilities that currently unlock mutating tools.",
+      "forbidden_hosts": [],
+      "max_list_entries": 500,
+      "max_read_bytes": 2000000,
+      "max_risk_level": "low",
+      "max_secret_use_output_bytes": 250000,
+      "max_secret_use_seconds": 30,
+      "max_write_bytes": 2000000,
+      "read_roots": [
+        "${HOME}/repos",
+        "${HOME}/grabowski-workspace",
+        "${HOME}/.local/state/grabowski"
+      ],
+      "secret_export_roots": [],
+      "secret_roots": [],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
+      ],
+      "write_roots": []
+    },
+    "trusted-owner": {
+      "allowed_grips": [
+        "*"
       ],
       "browser_profile_roots": [
         "${HOME}/.mozilla/firefox",
@@ -88,14 +154,6 @@
         "${HOME}/.config/google-chrome",
         "${HOME}/.config/chromium"
       ],
-      "secret_export_roots": [
-        "${HOME}"
-      ],
-      "max_read_bytes": 33554432,
-      "max_write_bytes": 33554432,
-      "max_list_entries": 100000,
-      "max_secret_use_output_bytes": 33554432,
-      "max_secret_use_seconds": 3600,
       "capabilities": [
         "file_read",
         "file_write",
@@ -128,18 +186,53 @@
         "chmod",
         "chown"
       ],
-      "trusted_owner": true,
-      "allowed_grips": [
-        "*"
-      ],
+      "description": "Trusted owner profile: unrestricted host-visible user execution, broad filesystem access, full capabilities, and compatibility with the root broker escape hatch.",
+      "forbidden_hosts": [],
+      "max_list_entries": 100000,
+      "max_read_bytes": 33554432,
       "max_risk_level": "high",
-      "forbidden_hosts": []
+      "max_secret_use_output_bytes": 33554432,
+      "max_secret_use_seconds": 3600,
+      "max_write_bytes": 33554432,
+      "read_roots": [
+        "/"
+      ],
+      "secret_export_roots": [
+        "${HOME}"
+      ],
+      "secret_roots": [
+        "${HOME}/.ssh",
+        "${HOME}/.gnupg",
+        "${HOME}/.aws",
+        "${HOME}/.kube",
+        "${HOME}/.password-store",
+        "${HOME}/.local/share/keyrings"
+      ],
+      "trusted_owner": true,
+      "write_excluded_roots": [],
+      "write_roots": [
+        "/"
+      ]
     }
   },
-  "trusted_owner": true,
-  "allowed_grips": [
-    "*"
+  "read_roots": [
+    "/"
   ],
-  "forbidden_hosts": [],
-  "max_risk_level": "high"
+  "secret_export_roots": [
+    "${HOME}"
+  ],
+  "secret_roots": [
+    "${HOME}/.ssh",
+    "${HOME}/.gnupg",
+    "${HOME}/.aws",
+    "${HOME}/.kube",
+    "${HOME}/.password-store",
+    "${HOME}/.local/share/keyrings"
+  ],
+  "trusted_owner": true,
+  "version": 2,
+  "write_excluded_roots": [],
+  "write_roots": [
+    "/"
+  ]
 }

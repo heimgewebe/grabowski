@@ -230,6 +230,7 @@ def _launch_argv(record: dict[str, Any], writable_paths: list[Path]) -> list[str
         "--property=Type=exec",
         "--property=KillMode=control-group",
         "--property=TimeoutStopSec=10s",
+        "--property=LimitCORE=0",
         "--property=NoNewPrivileges=yes",
         "--property=ProtectSystem=full",
         "--property=ProtectHome=read-only",

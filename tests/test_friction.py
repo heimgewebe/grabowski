@@ -123,6 +123,12 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         fake_operator._parse_show = lambda text: dict(
             line.split("=", 1) for line in text.splitlines() if "=" in line
         )
+        fake_operator._normalize_consumer_view = lambda view, default="minimal": {
+            "concise": "minimal", "full": "evidence"
+        }.get(view or default, view or default)
+        fake_operator._decode_consumer_cursor = lambda cursor, scope: None
+        fake_operator._encode_consumer_cursor = lambda scope, position: "test-cursor"
+        fake_operator._project_consumer_fields = lambda payload, **kwargs: payload
 
         old_base = sys_mod.modules.get("grabowski_mcp")
         old_core = sys_mod.modules.get("grabowski_operator_core")
@@ -221,7 +227,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
-        summary = module.friction_summary(limit=10)
+        summary = module.friction_summary(view="evidence", limit=10)
         self.assertEqual(summary["invalid_lines"], 1)
         self.assertEqual(summary["non_event_lines"], 1)
         self.assertEqual(summary["returned"], 2)
@@ -266,7 +272,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
-        summary = module.friction_summary(limit=2)
+        summary = module.friction_summary(view="evidence", limit=2)
         self.assertEqual(summary["limit_scope"], "recent_valid_events")
         self.assertEqual(summary["returned"], 2)
         self.assertEqual(summary["invalid_lines"], 1)
@@ -292,7 +298,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             json.dumps(event, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        summary = module.friction_summary(limit=1)
+        summary = module.friction_summary(view="evidence", limit=1)
         rendered = json.dumps(summary["events"], sort_keys=True)
         self.assertNotIn("private note body", rendered)
         self.assertEqual(summary["by_kind"]["unknown"], 1)
@@ -335,7 +341,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        summary = module.friction_summary(limit=10)
+        summary = module.friction_summary(view="evidence", limit=10)
         classification = summary["failure_classification"]
         diagnostics = summary["connector_transport_diagnostics"]
         proposals = summary["next_grip_proposals"]
@@ -1055,7 +1061,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+        proposals = module.friction_summary(view="evidence", limit=10)["next_grip_proposals"]
 
         self.assertEqual(proposals["authority"], "proposal_only")
         self.assertIn("bureau_queue_mutation", proposals["does_not_establish"])
@@ -1092,7 +1098,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         }
         module.FRICTION_LOG.write_text(json.dumps(event, sort_keys=True) + "\n", encoding="utf-8")
 
-        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+        proposals = module.friction_summary(view="evidence", limit=10)["next_grip_proposals"]
 
         self.assertEqual(proposals["recommendations"], [])
         self.assertFalse(proposals["has_recommendations"])
@@ -1143,7 +1149,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+        proposals = module.friction_summary(view="evidence", limit=10)["next_grip_proposals"]
         groups = {group["pattern"]: group for group in proposals["groups"]}
         recommendation = {item["pattern"]: item for item in proposals["recommendations"]}["blocked_gates"]
 
@@ -1177,7 +1183,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+        proposals = module.friction_summary(view="evidence", limit=10)["next_grip_proposals"]
 
         self.assertEqual(proposals["recommendations"], [])
         self.assertEqual(proposals["matched_event_count"], 0)
@@ -1199,7 +1205,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         ]
         module.FRICTION_LOG.write_text(json.dumps(events[0], sort_keys=True) + "\n", encoding="utf-8")
 
-        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+        proposals = module.friction_summary(view="evidence", limit=10)["next_grip_proposals"]
         groups = {group["pattern"]: group for group in proposals["groups"]}
 
         self.assertIn("blocked_gates", groups)
@@ -1233,7 +1239,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+        proposals = module.friction_summary(view="evidence", limit=10)["next_grip_proposals"]
         group = {group["pattern"]: group for group in proposals["groups"]}["missing_receipt_fields"]
         recommendation = {item["pattern"]: item for item in proposals["recommendations"]}["missing_receipt_fields"]
 
@@ -1282,7 +1288,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        proposals = module.friction_summary(limit=10)["next_grip_proposals"]
+        proposals = module.friction_summary(view="evidence", limit=10)["next_grip_proposals"]
 
         self.assertEqual(proposals["recommendation_count"], 0)
         self.assertTrue(proposals["no_action"]["recommended"])
@@ -1371,8 +1377,8 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result["appended_count"], 1)
         self.assertEqual(module.FRICTION_LOG.read_bytes(), before)
-        summary = module.friction_summary(limit=10)
-        self.assertEqual(summary["schema_version"], 1)
+        summary = module.friction_summary(view="evidence", limit=10)
+        self.assertEqual(summary["schema_version"], 2)
         self.assertEqual(summary["unresolved"], 2)
         self.assertEqual(summary["resolution_counts"]["resolved"], 1)
         event = next(item for item in summary["events"] if item["event_id"] == "filter-1")
@@ -1395,7 +1401,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result["target_count"], 2)
         self.assertEqual(result["appended_count"], 2)
-        summary = module.friction_summary(limit=10)
+        summary = module.friction_summary(view="evidence", limit=10)
         self.assertEqual(summary["resolution_counts"]["deferred"], 2)
         self.assertEqual(summary["unresolved"], 1)
         self.assertEqual(summary["failure_classification"]["decision_required_count"], 1)
@@ -1432,7 +1438,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(first["matched_target_count"], module.MAX_FRICTION_CLOSEOUT_BATCH + 2)
         self.assertTrue(first["targets_truncated"])
         self.assertEqual(first["remaining_target_count"], 2)
-        self.assertEqual(module.friction_summary(limit=500)["unresolved"], 2)
+        self.assertEqual(module.friction_summary(view="evidence", limit=500)["unresolved"], 2)
 
         second = module.resolve_friction(
             failure_class="platform_filter",
@@ -1468,7 +1474,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         with module.FRICTION_LOG.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(duplicate, sort_keys=True) + "\n")
 
-        summary = module.friction_summary(limit=10)
+        summary = module.friction_summary(view="evidence", limit=10)
         self.assertEqual(summary["unresolved"], 4)
         self.assertFalse(summary["event_log_integrity"]["integrity_valid"])
         self.assertEqual(summary["event_log_integrity"]["duplicate_event_ids"], ["filter-1"])
@@ -1531,7 +1537,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         )
         module.FRICTION_DECISION_LOG.chmod(0o600)
 
-        summary = module.friction_summary(limit=10)
+        summary = module.friction_summary(view="evidence", limit=10)
         self.assertEqual(summary["unresolved"], 3)
         self.assertFalse(summary["decision_log"]["integrity_valid"])
         self.assertEqual(summary["decision_log"]["invalid_record_count"], 1)
@@ -1565,7 +1571,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         with module.FRICTION_DECISION_LOG.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(conflict, sort_keys=True) + "\n")
 
-        summary = module.friction_summary(limit=10)
+        summary = module.friction_summary(view="evidence", limit=10)
         self.assertEqual(summary["unresolved"], 3)
         self.assertFalse(summary["decision_log"]["integrity_valid"])
         self.assertEqual(summary["decision_log"]["conflicting_event_ids"], ["filter-1"])
@@ -1601,7 +1607,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         module.FRICTION_DECISION_LOG.write_text(json.dumps(record) + "\n", encoding="utf-8")
         module.FRICTION_DECISION_LOG.chmod(0o600)
 
-        summary = module.friction_summary(limit=10)
+        summary = module.friction_summary(view="evidence", limit=10)
         self.assertEqual(summary["unresolved"], 3)
         self.assertFalse(summary["event_log_integrity"]["integrity_valid"])
         self.assertEqual(
@@ -1624,7 +1630,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         target.write_text("{}\n", encoding="utf-8")
         module.FRICTION_LOG.symlink_to(target)
         with self.assertRaises(OSError):
-            module.friction_summary(limit=10)
+            module.friction_summary(view="evidence", limit=10)
 
     def test_append_rejects_symlink_and_nonprivate_ledgers(self) -> None:
         module = self._load_module()

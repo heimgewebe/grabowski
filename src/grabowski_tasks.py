@@ -398,6 +398,7 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
         "--property=Type=exec",
         "--property=KillMode=control-group",
         "--property=TimeoutStopSec=10s",
+        "--property=LimitCORE=0",
         "--property=NoNewPrivileges=no",
         "--property=ProtectSystem=off",
         "--property=ProtectHome=no",
@@ -453,6 +454,50 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
         "chronik_outbox_enabled": bool(record.get("chronik_outbox_enabled")),
         "chronik_outbox_state_root": record.get("chronik_outbox_state_root"),
     }
+
+
+def _task_recommended_next_action(state: str) -> str:
+    if state in {"launching", "running", "interrupted"}:
+        return "read grabowski_task_status before deciding the next action"
+    if state == "outcome_unknown":
+        return "reconcile and read post-state before any unchanged retry"
+    if state in {"failed", "timed_out", "signalled"}:
+        return "inspect bounded task logs and recovery evidence"
+    if state == "completed":
+        return "consume the outcome receipt and close external bookkeeping"
+    if state == "cancelled":
+        return "confirm resource release and retained evidence"
+    return "inspect task status"
+
+
+def _public_for_view(record: dict[str, Any], view: str) -> dict[str, Any]:
+    full = _public(record)
+    if view == "evidence":
+        return full
+    minimal = {
+        "task_id": full["task_id"],
+        "host": full["host"],
+        "unit": full["unit"],
+        "attempt": full["attempt"],
+        "state": full["state"],
+        "resume_policy": full["resume_policy"],
+        "argv_sha256": full["argv_sha256"],
+        "created_at_unix": full["created_at_unix"],
+        "updated_at_unix": full["updated_at_unix"],
+        "resource_keys": full["resource_keys"],
+        "recommended_next_action": _task_recommended_next_action(full["state"]),
+    }
+    if view == "standard":
+        minimal.update({
+            "argv": full["argv"],
+            "cwd": full["cwd"],
+            "runtime_seconds": full["runtime_seconds"],
+            "memory_max_bytes": full["memory_max_bytes"],
+            "last_observation": full["last_observation"],
+            "lease_owner_id": full["lease_owner_id"],
+            "chronik_outbox_enabled": full["chronik_outbox_enabled"],
+        })
+    return minimal
 
 
 def _set_state(
@@ -1109,29 +1154,114 @@ def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:
 
 @mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
 def grabowski_task_list(
-    limit: int = 50,
+    limit: int = 20,
     state: str | None = None,
+    view: str = "minimal",
+    cursor: str | None = None,
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
-    """List recent persistent task records, optionally filtered by state."""
+    """List persistent tasks with keyset pagination and compact default records."""
     operator._require_operator_capability("durable_job")
-    if not isinstance(limit, int) or not 1 <= limit <= 500:
-        raise ValueError("limit must be between 1 and 500")
+    selected_view = operator._normalize_consumer_view(view)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
     if state is not None and state not in TASK_STATES:
         raise ValueError(f"state must be one of {sorted(TASK_STATES)}")
+    scope = f"task-list:{selected_view}:{state or 'all'}"
+    position = operator._decode_consumer_cursor(cursor, scope)
+    cursor_created_at: int | None = None
+    cursor_task_id: str | None = None
+    if position is not None:
+        cursor_created_at = position.get("created_at_unix")
+        cursor_task_id = position.get("task_id")
+        if (
+            isinstance(cursor_created_at, bool)
+            or not isinstance(cursor_created_at, int)
+            or cursor_created_at < 0
+            or not isinstance(cursor_task_id, str)
+            or not TASK_ID.fullmatch(cursor_task_id)
+        ):
+            raise ValueError("cursor position is invalid")
+    where: list[str] = []
+    parameters: list[Any] = []
+    if state is not None:
+        where.append("state=?")
+        parameters.append(state)
+    if cursor_created_at is not None and cursor_task_id is not None:
+        where.append("(created_at_unix < ? OR (created_at_unix = ? AND task_id < ?))")
+        parameters.extend([cursor_created_at, cursor_created_at, cursor_task_id])
+    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
     with _database() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM tasks{where_sql} "
+            "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
+            (*parameters, limit + 1),
+        ).fetchall()
         if state is None:
-            rows = connection.execute(
-                "SELECT * FROM tasks ORDER BY created_at_unix DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            total_matching = int(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
         else:
-            rows = connection.execute(
-                "SELECT * FROM tasks WHERE state=? "
-                "ORDER BY created_at_unix DESC LIMIT ?",
-                (state, limit),
-            ).fetchall()
-    return {
-        "database": str(TASK_DB),
-        "count": len(rows),
-        "tasks": [_public(dict(row)) for row in rows],
+            total_matching = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE state=?", (state,)
+                ).fetchone()[0]
+            )
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    tasks = [_public_for_view(dict(row), selected_view) for row in page_rows]
+    next_cursor = None
+    if has_more and page_rows:
+        last = dict(page_rows[-1])
+        next_cursor = operator._encode_consumer_cursor(
+            scope,
+            {
+                "created_at_unix": int(last["created_at_unix"]),
+                "task_id": str(last["task_id"]),
+            },
+        )
+    warning_states = {"failed", "timed_out", "signalled", "outcome_unknown"}
+    warnings = [
+        {
+            "code": "task_requires_attention",
+            "task_id": task["task_id"],
+            "state": task["state"],
+        }
+        for task in tasks
+        if task.get("state") in warning_states
+    ]
+    payload: dict[str, Any] = {
+        "schema_version": 2,
+        "view": selected_view,
+        "count": len(tasks),
+        "total_matching": total_matching,
+        "state_filter": state,
+        "tasks": tasks,
+        "pagination": {
+            "limit": limit,
+            "returned": len(tasks),
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+            "ordering": "created_at_unix_desc_task_id_desc",
+        },
+        "warnings": warnings,
+        "recommended_next_action": (
+            "inspect attention tasks before retry" if warnings else "none"
+        ),
+        "does_not_establish": [
+            "task_output_correctness",
+            "safe_unchanged_retry",
+            "resource_release_complete",
+        ],
     }
+    if selected_view == "evidence":
+        payload["database"] = str(TASK_DB)
+    return operator._project_consumer_fields(
+        payload,
+        fields=fields,
+        required=(
+            "schema_version",
+            "view",
+            "warnings",
+            "recommended_next_action",
+            "does_not_establish",
+        ),
+    )

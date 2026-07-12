@@ -56,7 +56,8 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_status_exposes_live_tool_contract_fingerprint(self) -> None:
         source = (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
-        self.assertIn('"tool_contract": _runtime_tool_contract_summary()', source)
+        self.assertIn("tool_contract = _runtime_tool_contract_summary()", source)
+        self.assertIn('"tool_contract": {', source)
         self.assertIn('"registered_names_sha256"', source)
         self.assertIn('"client_snapshot_observable": False', source)
 
@@ -90,7 +91,8 @@ class RepositoryContractTests(unittest.TestCase):
             ROOT / "src" / "grabowski_mcp.py"
         ).read_text(encoding="utf-8")
         self.assertIn("DEPLOYMENT_MANIFEST", source)
-        self.assertIn('"deployment": _deployment_metadata()', source)
+        self.assertIn("deployment = _deployment_metadata()", source)
+        self.assertIn('"deployment": deployment', source)
         self.assertIn('"active_profile"', source)
         self.assertIn('"capabilities"', source)
         self.assertIn('"kill_switch"', source)
@@ -126,7 +128,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 118)
+        self.assertEqual(len(tools), 120)
         legacy_tools = {
             "grabowski_status",
             "grabowski_context",

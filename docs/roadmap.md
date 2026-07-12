@@ -70,6 +70,21 @@ Status: live in the deployed runtime; follow-up work is typed agent/fleet integr
 - tamper-evidente Audit-Verifikation,
 - unprivilegierter Referenzvertrag für spätere privilegierte Aktionen.
 
+## GRABOWSKI-CONSUMER-SURFACE-V1
+
+Status: implementation and local validation complete; live status follows the merge and controlled runtime deployment.
+
+- shared `minimal`, `standard` and `evidence` response contract;
+- field projection that preserves warnings, next action and epistemic limits;
+- view-, filter- and snapshot-bound pagination for large read surfaces;
+- `observe`, `maintain` and authority-preserving `trusted-owner` profiles;
+- private hash-bound durable job notification outbox with idempotent acknowledgement;
+- `LimitCORE=0` for operator, jobs, tasks and workers;
+- versioned effect evidence under `docs/proofs/consumer-surface-v1-benchmark-20260712.md`;
+- operating contract under `docs/consumer-surface-v1.md`.
+
+Future ideas are parked in `docs/visionsboard.md`. That document grants no priority, task, lease or implementation authority.
+
 ## GRABOWSKI-GIT-001
 
 - Git-Lese- und Schreiboperationen,

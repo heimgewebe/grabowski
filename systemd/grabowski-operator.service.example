@@ -24,6 +24,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
+LimitCORE=0
 SystemCallArchitectures=native
 
 [Install]
