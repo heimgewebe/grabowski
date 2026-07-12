@@ -377,13 +377,31 @@ def validate_candidate(candidate: dict[str, Any], packet: dict[str, Any], repo: 
     patch = candidate["patch"]
     if not isinstance(patch, str) or len(patch.encode("utf-8")) > MAX_PATCH_BYTES:
         raise CandidateError("candidate patch is invalid or too large")
-    parsed_paths = patch_paths(patch)
+    original_patch_sha256 = sha256_bytes(patch.encode("utf-8"))
+    patch_rejection: dict[str, Any] | None = None
+    try:
+        parsed_paths = patch_paths(patch)
+    except CandidateError as exc:
+        patch_rejection = {
+            "rejected": True,
+            "reason": str(exc),
+            "original_patch_sha256": original_patch_sha256,
+            "original_patch_size_bytes": len(patch.encode("utf-8")),
+        }
+        patch = ""
+        parsed_paths = []
     if not set(parsed_paths).issubset(set(normalized_changed)):
         raise CandidateError("patch paths are not declared in changed_paths")
     for path in parsed_paths:
         if not path_in_scope(path, packet["allowed_paths"]) or path_in_scope(path, packet["forbidden_paths"]):
             raise CandidateError(f"patch path is outside scope: {path}")
-    patch_check = {"attempted": bool(patch), "applies": False, "returncode": None, "stderr_sha256": None}
+    patch_check = {
+        "attempted": bool(patch),
+        "applies": False,
+        "returncode": None,
+        "stderr_sha256": None,
+        "syntax_accepted": patch_rejection is None,
+    }
     if patch:
         completed = run_git(repo, ["apply", "--check", "--recount", "--whitespace=error-all", "-"], input_bytes=patch.encode("utf-8"))
         patch_check = {
@@ -391,8 +409,17 @@ def validate_candidate(candidate: dict[str, Any], packet: dict[str, Any], repo: 
             "applies": completed.returncode == 0,
             "returncode": completed.returncode,
             "stderr_sha256": sha256_bytes(completed.stderr),
+            "syntax_accepted": True,
         }
-    return {**candidate, "changed_paths": normalized_changed, "patch_paths": parsed_paths, "patch_sha256": sha256_bytes(patch.encode("utf-8")), "patch_check": patch_check}
+    return {
+        **candidate,
+        "changed_paths": normalized_changed,
+        "patch": patch,
+        "patch_paths": parsed_paths,
+        "patch_sha256": sha256_bytes(patch.encode("utf-8")),
+        "patch_check": patch_check,
+        "patch_rejection": patch_rejection,
+    }
 
 
 def provider_command(

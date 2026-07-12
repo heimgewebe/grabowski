@@ -90,6 +90,19 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             with self.assertRaisesRegex(candidate_tool.CandidateError, "outside scope"):
                 candidate_tool.validate_candidate(value, packet, repo)
 
+    def test_invalid_optional_patch_is_dropped_but_reasoning_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            value = self._candidate()
+            value["patch"] = "No patch proposed; reasoning only."
+            packet = {"allowed_paths": ["src"], "forbidden_paths": []}
+            result = candidate_tool.validate_candidate(value, packet, repo)
+        self.assertEqual(result["patch"], "")
+        self.assertEqual(result["patch_paths"], [])
+        self.assertFalse(result["patch_check"]["syntax_accepted"])
+        self.assertTrue(result["patch_rejection"]["rejected"])
+        self.assertEqual(result["approach_summary"], value["approach_summary"])
+
     def test_environment_does_not_forward_secret_variables(self) -> None:
         with mock.patch.dict(os.environ, {"SECRET_TOKEN": "do-not-forward", "PATH": "/usr/bin", "HOME": "/tmp/home"}, clear=True):
             environment = candidate_tool.provider_environment()

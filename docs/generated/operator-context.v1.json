@@ -1883,7 +1883,7 @@
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c413e520172f70296c42e18e4c0f1fcb95a1931afa0fda7b7c36dba4b2d52e56",
-      "src/grabowski_agent_competition.py": "6bd64f200df7e4bea5c76c57e3466c724be1183c29249c797c5693134a48842f",
+      "src/grabowski_agent_competition.py": "4ceca05cdec5c11dd8fc74d658a96919b104f05fffc156851ff6469b1e133813",
       "src/grabowski_agent_role.py": "abef0db4aa6fffcd52976e2c60deb5f68abfadf76528ec5ac79dfebeddafe8bf",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
       "src/grabowski_agent_workspace.py": "1a6495a53600c1022ab717cd2f79bc444031039a0c81bebbc5f0d13bab17cf97",

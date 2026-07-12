@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -42,7 +41,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.server.fastmcp"] = fake_fastmcp
     sys.modules["mcp.types"] = fake_types
 
-import grabowski_agent_competition as competition
+import grabowski_agent_competition as competition  # noqa: E402
 
 
 class AgentCompetitionTests(unittest.TestCase):

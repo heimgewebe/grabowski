@@ -773,6 +773,8 @@ def _candidate_summary(receipt: dict[str, Any]) -> dict[str, Any]:
         "patch_size_bytes": len(candidate["patch"].encode("utf-8")),
         "patch_available": bool(candidate["patch"]),
         "patch_applies": candidate["patch_check"]["applies"],
+        "patch_syntax_accepted": candidate["patch_check"].get("syntax_accepted", True),
+        "patch_rejection": candidate.get("patch_rejection"),
         "assumptions": candidate["assumptions"],
         "design_invariants": candidate["design_invariants"],
         "tradeoffs": candidate["tradeoffs"],
