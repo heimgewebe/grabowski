@@ -100,8 +100,22 @@ class OperatorContextTests(unittest.TestCase):
             ["claude", "codex", "agy", "cline"],
         )
         self.assertEqual(
+            protocol["workspace_execution_model"],
+            {
+                "default": "chatgpt_operator_native",
+                "lane_owner": "chatgpt_operator",
+                "operator_self_serves_lanes": ["captain", "writer", "tests", "review"],
+                "external_agent_delegation": "opt_in_only",
+                "delegation_triggers": [
+                    "bounded_large_implementation",
+                    "independent_contrast",
+                    "capacity_fallback",
+                ],
+            },
+        )
+        self.assertEqual(
             protocol["routing_roles"]["complex_code_task"],
-            "chatgpt_operator_then_claude_codex_agy_cline",
+            "chatgpt_operator_external_opt_in_claude_codex_agy_cline",
         )
         self.assertIn(
             "blocked_action_protocol",

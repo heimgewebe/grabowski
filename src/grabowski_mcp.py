@@ -2933,6 +2933,17 @@ def _operator_relay_protocol() -> dict[str, Any]:
             "agy",
             "cline",
         ],
+        "workspace_execution_model": {
+            "default": "chatgpt_operator_native",
+            "lane_owner": "chatgpt_operator",
+            "operator_self_serves_lanes": ["captain", "writer", "tests", "review"],
+            "external_agent_delegation": "opt_in_only",
+            "delegation_triggers": [
+                "bounded_large_implementation",
+                "independent_contrast",
+                "capacity_fallback",
+            ],
+        },
         "operator_first_for": [
             "task_decomposition",
             "bounded_code_change",
@@ -2941,11 +2952,11 @@ def _operator_relay_protocol() -> dict[str, Any]:
             "recovery",
         ],
         "routing_roles": {
-            "complex_code_task": "chatgpt_operator_then_claude_codex_agy_cline",
-            "quick_light_reasoning": "chatgpt_operator_then_agy_print",
+            "complex_code_task": "chatgpt_operator_external_opt_in_claude_codex_agy_cline",
+            "quick_light_reasoning": "chatgpt_operator_external_opt_in_agy_print",
             "local_micro_reasoning": "ollama_api_qwen_coder",
             "shell_or_git_grip": "grabowski_task",
-            "security_or_architecture_review": "chatgpt_operator_then_claude",
+            "security_or_architecture_review": "chatgpt_operator_external_opt_in_claude",
             "session_resume": "tmux_first_agy_when_useful",
             "memory_prioritization": "bureau",
             "patch_file_relay": "operator_patch_relay",

@@ -939,19 +939,43 @@ def _role_final_attempt(manifest: dict[str, Any], role: str) -> int:
     return 1
 
 
-def _expected_role_argv_sha256(manifest: dict[str, Any], role: str) -> str:
+def _role_attempt_record(
+    manifest: dict[str, Any], role: str, attempt: int
+) -> dict[str, Any] | None:
+    """Return exactly one persisted retry record for one concrete role attempt."""
     retries = manifest.get("role_retries")
-    if isinstance(retries, dict):
-        role_retry = retries.get(role)
-        if isinstance(role_retry, dict):
-            attempts = role_retry.get("attempts")
-            if isinstance(attempts, list) and attempts:
-                latest = attempts[-1]
-                if isinstance(latest, dict):
-                    candidate = latest.get("new_command_sha256")
-                    if isinstance(candidate, str) and SHA256_RE.fullmatch(candidate):
-                        return candidate
-    return _sha256_json(manifest["commands"][role])
+    if not isinstance(retries, dict):
+        return None
+    role_retry = retries.get(role)
+    if not isinstance(role_retry, dict):
+        return None
+    attempts = role_retry.get("attempts")
+    if not isinstance(attempts, list):
+        return None
+    matches = [
+        item
+        for item in attempts
+        if isinstance(item, dict)
+        and item.get("attempt") == attempt
+        and not isinstance(item.get("attempt"), bool)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _expected_role_argv_sha256(
+    manifest: dict[str, Any], role: str, *, attempt: int | None = None
+) -> str | None:
+    """Return the command hash bound to the selected concrete role attempt."""
+    resolved_attempt = _role_final_attempt(manifest, role) if attempt is None else attempt
+    retry_record = _role_attempt_record(manifest, role, resolved_attempt)
+    if retry_record is not None:
+        candidate = retry_record.get("new_command_sha256")
+        if isinstance(candidate, str) and SHA256_RE.fullmatch(candidate):
+            return candidate
+        return None
+    if resolved_attempt == 1:
+        return _sha256_json(manifest["commands"][role])
+    return None
 
 
 def _writer_patch_path(manifest: dict[str, Any]) -> Path:
@@ -1390,10 +1414,27 @@ def _role_receipt(manifest: dict[str, Any], role: str, *, attempt: int | None = 
     return _load_json(path) if path.exists() else None
 
 
+def _role_start_intent_classification(
+    manifest: dict[str, Any], role: str
+) -> tuple[str, dict[str, Any]] | None:
+    start_intents = manifest.get("task_start_intents", {})
+    if not isinstance(start_intents, dict):
+        return "role_start_intents_invalid", {}
+    if role in start_intents:
+        return "role_start_outcome_unknown", {
+            "task_start_intent": start_intents[role],
+            "reconcile_required": True,
+        }
+    return None
+
+
 def _role_retry_classification(
     manifest: dict[str, Any], role: str, frozen: dict[str, Any]
 ) -> tuple[str, dict[str, Any]]:
     """Classify whether one read-only role may be retried, and why."""
+    start_intent = _role_start_intent_classification(manifest, role)
+    if start_intent is not None:
+        return start_intent
     task_id = manifest.get("tasks", {}).get(role)
     if task_id is None:
         blocks = manifest.get("role_preflight_blocks", {})
@@ -1518,6 +1559,32 @@ def _collection_failed_roles(collection: Any) -> list[str]:
     return failed
 
 
+def _role_retry_state(
+    manifest: dict[str, Any], role: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return one structurally valid retry state or a fail-closed error."""
+    retries = manifest.get("role_retries", {})
+    if not isinstance(retries, dict):
+        return None, "role_retries_not_object"
+    raw = retries.get(role)
+    if raw is None:
+        return {"count": 0, "attempts": []}, None
+    if not isinstance(raw, dict):
+        return None, "role_retry_state_not_object"
+    count = raw.get("count", 0)
+    attempts = raw.get("attempts", [])
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        or not isinstance(attempts, list)
+        or count != len(attempts)
+        or any(not isinstance(item, dict) for item in attempts)
+    ):
+        return None, "role_retry_state_invalid"
+    return {**raw, "count": count, "attempts": list(attempts)}, None
+
+
 def _status_role_retry(manifest: dict[str, Any]) -> dict[str, Any]:
     frozen = manifest.get("frozen_writer")
     result: dict[str, Any] = {}
@@ -1526,11 +1593,18 @@ def _status_role_retry(manifest: dict[str, Any]) -> dict[str, Any]:
             result[role_name] = {"classification": "not_collected", "eligible": False}
             continue
         classification, detail = _role_retry_classification(manifest, role_name, frozen)
-        retries = manifest.get("role_retries", {})
-        role_retry_state = retries.get(role_name) if isinstance(retries, dict) else None
-        retries_used = role_retry_state.get("count", 0) if isinstance(role_retry_state, dict) else 0
-        if not isinstance(retries_used, int) or isinstance(retries_used, bool):
-            retries_used = 0
+        role_retry_state, retry_state_error = _role_retry_state(manifest, role_name)
+        if retry_state_error is not None or role_retry_state is None:
+            result[role_name] = {
+                "classification": "retry_state_invalid",
+                "eligible": False,
+                "retries_used": None,
+                "max_retries": MAX_ROLE_RETRIES,
+                "error": retry_state_error,
+                **detail,
+            }
+            continue
+        retries_used = role_retry_state["count"]
         eligible = classification == "eligible" and retries_used < MAX_ROLE_RETRIES
         effective_classification = classification
         if classification == "eligible" and not eligible:
@@ -1573,6 +1647,12 @@ def _recommended_next_action(
         return "none_closed"
     if not creation_ready:
         return "await_creation"
+    if any(
+        value.get("classification") == "role_start_outcome_unknown"
+        for value in role_retry.values()
+        if isinstance(value, dict)
+    ):
+        return "reconcile_role_start_outcome"
     for role_name in sorted(role_retry):
         if role_retry[role_name].get("eligible"):
             return f"retry_role:{role_name}"
@@ -1772,6 +1852,7 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         "recommended_next_action": recommended_next_action,
         "close_integrity": close_integrity,
         "closed": close_integrity["valid"],
+        "external_closeout_checklist": _external_closeout_checklist(manifest),
     }
 
 
@@ -2542,7 +2623,7 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
         unresolved_intents = {
             role: intents_value[role]
             for role in READ_ONLY_ROLES
-            if tasks_map.get(role) is None and role in intents_value
+            if role in intents_value
         }
         if unresolved_intents:
             return {
@@ -2787,6 +2868,16 @@ def grabowski_agent_workspace_role_retry(
             }
         worktree = Path(str(manifest["writer_worktree"]))
         command = _role_argv(replacement_argv, "replacement_argv", cwd=worktree)
+        start_intent = _role_start_intent_classification(manifest, role_name)
+        if start_intent is not None:
+            classification, detail = start_intent
+            return {
+                "workspace_id": identifier,
+                "role": role_name,
+                "state": classification,
+                **detail,
+                "retry_status": "blocked",
+            }
         live = _git_snapshot(manifest, _run)
         if (
             live["writer_head"] != frozen.get("writer_head")
@@ -2814,10 +2905,16 @@ def grabowski_agent_workspace_role_retry(
                 **detail,
                 "retry_status": "blocked",
             }
+        role_retry_state, retry_state_error = _role_retry_state(manifest, role_name)
+        if retry_state_error is not None or role_retry_state is None:
+            return {
+                "workspace_id": identifier,
+                "role": role_name,
+                "state": "retry_state_invalid",
+                "error": retry_state_error,
+                "retry_status": "blocked",
+            }
         retries = dict(manifest.get("role_retries", {}))
-        role_retry_state = dict(retries.get(role_name, {}))
-        role_retry_state.setdefault("count", 0)
-        role_retry_state.setdefault("attempts", [])
         if role_retry_state["count"] >= MAX_ROLE_RETRIES:
             return {
                 "workspace_id": identifier,
@@ -2862,6 +2959,21 @@ def grabowski_agent_workspace_role_retry(
         old_command_sha256 = _expected_role_argv_sha256(manifest, role_name)
         new_command_sha256 = _sha256_json(command)
         output_path = _role_receipt_path(manifest, role_name, attempt=attempt_number)
+        try:
+            output_path.lstat()
+        except FileNotFoundError:
+            attempt_receipt_exists = False
+        else:
+            attempt_receipt_exists = True
+        if attempt_receipt_exists:
+            return {
+                "workspace_id": identifier,
+                "role": role_name,
+                "state": "attempt_receipt_already_exists",
+                "attempt": attempt_number,
+                "receipt_path": str(output_path),
+                "retry_status": "blocked",
+            }
         task_argv = _role_task_argv(
             manifest,
             role_name,
@@ -2921,15 +3033,23 @@ def grabowski_agent_workspace_role_retry(
         final_attempts = dict(manifest.get("role_final_attempt", {}))
         final_attempts[role_name] = attempt_number
         manifest["role_final_attempt"] = final_attempts
+        previous_failure_classification = detail.get("prior_failure_classification")
+        retry_reason = (
+            "toolchain_preflight_blocked"
+            if previous_failure_classification == "toolchain_preflight_blocked"
+            else "terminal_environment_toolchain_failure"
+        )
         attempt_record = {
             "attempt": attempt_number,
             "created_at": _utc(),
+            "retry_reason": retry_reason,
+            "previous_failure_classification": previous_failure_classification,
             "previous_task_id": previous_task_id,
             "previous_receipt_sha256": previous_receipt_sha256,
-            "failure_classification": detail.get("prior_failure_classification"),
             "old_command_sha256": old_command_sha256,
             "new_command_sha256": new_command_sha256,
             "new_task_id": public["task_id"],
+            "selected_final_attempt": attempt_number,
         }
         role_retry_state["count"] += 1
         role_retry_state["attempts"] = [*role_retry_state["attempts"], attempt_record]
@@ -2944,6 +3064,8 @@ def grabowski_agent_workspace_role_retry(
                 "role": role_name,
                 "attempt": attempt_number,
                 "new_task_id": public["task_id"],
+                "retry_reason": retry_reason,
+                "previous_failure_classification": previous_failure_classification,
                 "old_command_sha256": old_command_sha256,
                 "new_command_sha256": new_command_sha256,
             }
