@@ -1434,7 +1434,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Start one durable read-only external competitor or contrast programmer.",
+      "description": "Start one durable advisory-only external competitor or contrast programmer.",
       "effects": [
         "state-create",
         "durable-task-start",

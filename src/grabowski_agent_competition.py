@@ -1104,7 +1104,7 @@ def grabowski_agent_competition_start(
     timeout_seconds: int = 900,
     max_budget_usd: float = 2.0,
 ) -> dict[str, Any]:
-    """Start one durable read-only external competitor or contrast programmer."""
+    """Start one durable advisory-only external competitor or contrast programmer."""
     operator._require_operator_mutation("durable_job")
     operator._require_operator_capability("git_cli")
     request_value = workspace._required_string(request_id, "request_id", max_length=80)
