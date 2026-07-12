@@ -7,6 +7,7 @@ import os
 from pathlib import Path, PurePosixPath
 import stat
 import subprocess
+import sys
 from typing import Any
 
 from grabowski_agent_sandbox import minimal_sandbox_argv, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
@@ -17,6 +18,26 @@ MAX_ROLE_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_JSON_BYTES = 1024 * 1024
 MAX_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
 MAX_UNTRACKED_TOTAL_BYTES = 64 * 1024 * 1024
+SANDBOX_LABEL = "bubblewrap-minimal-root-read-only-worktree-v1"
+TOOLCHAIN_PROBE_OUTPUT_LIMIT = 64 * 1024
+PYTHON_EXECUTABLE_NAMES = frozenset(
+    {"python", "python3"} | {f"python3.{minor}" for minor in range(0, 20)}
+)
+_TOOLCHAIN_PROBE_SOURCE = (
+    "import importlib.util, json, shutil, sys\n"
+    "executable = sys.argv[1]\n"
+    "module = sys.argv[2] if len(sys.argv) > 2 else ''\n"
+    "result = {'executable_found': shutil.which(executable) is not None}\n"
+    "if module:\n"
+    "    try:\n"
+    "        spec = importlib.util.find_spec(module)\n"
+    "    except (ImportError, ValueError, ModuleNotFoundError, TypeError):\n"
+    "        spec = None\n"
+    "    result['module_found'] = spec is not None\n"
+    "else:\n"
+    "    result['module_found'] = True\n"
+    "sys.stdout.write(json.dumps(result))\n"
+)
 
 
 def canonical(value: Any) -> str:
@@ -96,7 +117,7 @@ def current_binding(repo: Path, base: str) -> tuple[str, str, bool]:
     ), dirty
 
 
-def write_receipt(path: Path, payload: dict[str, Any]) -> None:
+def write_receipt(path: Path, payload: dict[str, Any], *, create_only: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.exists():
         metadata = path.lstat()
@@ -107,6 +128,8 @@ def write_receipt(path: Path, payload: dict[str, Any]) -> None:
             or stat.S_IMODE(metadata.st_mode) & 0o077
         ):
             raise PermissionError("role receipt target must be one owner-controlled regular file")
+        if create_only:
+            raise FileExistsError("role attempt receipt already exists")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
@@ -148,6 +171,102 @@ def sandbox_argv(repo: Path, command: list[str]) -> list[str]:
         git_common_dir=common,
     )
 
+
+def declared_python_module(command: list[str]) -> str | None:
+    """Return one safe top-level module declared by a literal Python ``-m`` call."""
+    if len(command) < 3 or Path(command[0]).name not in PYTHON_EXECUTABLE_NAMES or command[1] != "-m":
+        return None
+    module = command[2]
+    if not module or module.startswith("-") or "/" in module or "\x00" in module:
+        return None
+    return module.split(".", 1)[0]
+
+
+def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
+    """Resolve declared prerequisites inside the exact read-only role sandbox."""
+    executable = command[0]
+    module = declared_python_module(command)
+    result: dict[str, Any] = {
+        "executable": executable,
+        "declared_python_module": module,
+        "passed": False,
+        "missing_executable": False,
+        "missing_python_module": False,
+        "probe_error": None,
+    }
+    probe_command = [sys.executable, "-c", _TOOLCHAIN_PROBE_SOURCE, executable, *([module] if module else [])]
+    try:
+        completed = run_bounded_capture(
+            runtime_sandbox_argv(sandbox_argv(repo, probe_command)),
+            stdout_limit=TOOLCHAIN_PROBE_OUTPUT_LIMIT,
+            stderr_limit=TOOLCHAIN_PROBE_OUTPUT_LIMIT,
+            stdout_content_limit=TOOLCHAIN_PROBE_OUTPUT_LIMIT,
+        )
+    except Exception as exc:
+        result["probe_error"] = f"{type(exc).__name__}: {exc}"[:4000]
+        result["failure_classification"] = "toolchain_probe_error"
+        return result
+    if (
+        completed.returncode != 0
+        or completed.output_limit_exceeded
+        or completed.stdout_content is None
+        or completed.stdout_content_exceeded
+    ):
+        result["probe_error"] = "toolchain probe did not complete cleanly"
+        result["probe_returncode"] = completed.returncode
+        result["failure_classification"] = "toolchain_probe_error"
+        return result
+    try:
+        payload = json.loads(completed.stdout_content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        result["probe_error"] = f"toolchain probe returned invalid JSON: {exc}"
+        result["failure_classification"] = "toolchain_probe_error"
+        return result
+    if not isinstance(payload, dict):
+        result["probe_error"] = "toolchain probe returned a non-object payload"
+        result["failure_classification"] = "toolchain_probe_error"
+        return result
+    executable_found = payload.get("executable_found") is True
+    module_found = module is None or payload.get("module_found") is True
+    result.update(
+        {
+            "passed": executable_found and module_found,
+            "missing_executable": not executable_found,
+            "missing_python_module": module is not None and not module_found,
+            "probe_returncode": completed.returncode,
+            "failure_classification": (
+                "passed" if executable_found and module_found else "environment_toolchain_failure"
+            ),
+        }
+    )
+    return result
+
+
+def classify_result(role: str, command: list[str], repo: Path, payload: dict[str, Any]) -> str:
+    """Classify one final role result without trusting user-controlled output text."""
+    returncode = payload.get("returncode")
+    if payload.get("error") == "read-only role observed writer mutation":
+        return "writer_binding_violation"
+    if payload.get("error") == "role stdout or stderr exceeded the bounded capture limit":
+        return "output_limit_exceeded"
+    if role == "review":
+        verdict = payload.get("verdict")
+        if verdict in {"NEEDS_CHANGE", "BLOCK"}:
+            return "review_verdict"
+        if verdict == "PASS" and returncode == 0:
+            return "passed"
+    elif returncode == 0:
+        return "passed"
+    if isinstance(returncode, int) and not isinstance(returncode, bool) and returncode != 0:
+        probe = toolchain_probe(repo, command)
+        payload["post_failure_toolchain_probe"] = probe
+        if probe.get("failure_classification") == "environment_toolchain_failure":
+            return "environment_toolchain_failure"
+    if role == "review":
+        if payload.get("verdict") == "INVALID" or returncode == 126:
+            return "invalid_review_output"
+        return "review_execution_failure"
+    return "semantic_test_failure"
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
@@ -207,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         "stdout_tail": completed.stdout_tail,
         "stderr_tail": completed.stderr_tail,
         "output_limit_bytes": MAX_ROLE_OUTPUT_BYTES,
-        "sandbox": "bubblewrap-minimal-root-read-only-worktree-v1",
+        "sandbox": SANDBOX_LABEL,
     }
     if completed.output_limit_exceeded:
         payload["returncode"] = 124
@@ -259,9 +378,10 @@ def main(argv: list[str] | None = None) -> int:
                     elif verdict != "PASS" and not findings:
                         payload["returncode"] = 126
                         payload["error"] = "non-PASS review must contain findings"
+    payload["failure_classification"] = classify_result(args.role, command, repo, payload)
     stable = dict(payload)
     payload["receipt_sha256"] = digest(stable)
-    write_receipt(output, payload)
+    write_receipt(output, payload, create_only=True)
     return int(payload["returncode"])
 
 

@@ -15,6 +15,7 @@ import sys
 import time
 from typing import Any, Callable, Iterable
 
+import grabowski_agent_role as agent_role
 import grabowski_mcp as base
 import grabowski_resources as resources
 import grabowski_tasks as tasks
@@ -78,7 +79,7 @@ WRITER_FREEZE_SETTLE_SECONDS = 0.1
 WORKSPACE_LOCK_TIMEOUT_SECONDS = 10.0
 WORKSPACE_LOCK_POLL_SECONDS = 0.05
 AGENT_WORKSPACE_TASK_HOST = "heim-pc"
-
+MAX_ROLE_RETRIES = 1
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 BindingVerifier = Callable[[str, str], dict[str, Any]]
 
@@ -176,6 +177,22 @@ def _role_argv(value: Any, field: str, *, cwd: Path) -> list[str]:
         raise AgentWorkspaceError(f"{field} appears to contain secret material")
     return list(validated)
 
+
+def _declared_python_module(command: list[str]) -> str | None:
+    return agent_role.declared_python_module(command)
+
+
+def _role_toolchain_preflight(manifest: dict[str, Any], role: str, command: list[str]) -> dict[str, Any]:
+    """Validate role prerequisites inside the exact read-only role sandbox."""
+    worktree = Path(str(manifest["writer_worktree"]))
+    probe = agent_role.toolchain_probe(worktree, command)
+    return {
+        "role": role,
+        "command_sha256": _sha256_json(command),
+        "checked_at": _utc(),
+        "sandbox": agent_role.SANDBOX_LABEL,
+        **probe,
+    }
 
 def _absolute_path(value: Any, field: str, *, must_exist: bool) -> Path:
     raw = _required_string(value, field)
@@ -906,8 +923,35 @@ def _remove_created_worktree(
             return False
     return not worktree.exists() and _local_branch_head(repo, branch, runner) is None
 
-def _role_receipt_path(manifest: dict[str, Any], role: str) -> Path:
-    return _workspace_dir(str(manifest["workspace_id"])) / f"{role}-receipt.json"
+def _role_receipt_path(manifest: dict[str, Any], role: str, *, attempt: int = 1) -> Path:
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise AgentWorkspaceError("attempt must be a positive integer")
+    name = f"{role}-receipt.json" if attempt == 1 else f"{role}-receipt.attempt-{attempt}.json"
+    return _workspace_dir(str(manifest["workspace_id"])) / name
+
+
+def _role_final_attempt(manifest: dict[str, Any], role: str) -> int:
+    attempts = manifest.get("role_final_attempt")
+    if isinstance(attempts, dict):
+        value = attempts.get(role)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+            return value
+    return 1
+
+
+def _expected_role_argv_sha256(manifest: dict[str, Any], role: str) -> str:
+    retries = manifest.get("role_retries")
+    if isinstance(retries, dict):
+        role_retry = retries.get(role)
+        if isinstance(role_retry, dict):
+            attempts = role_retry.get("attempts")
+            if isinstance(attempts, list) and attempts:
+                latest = attempts[-1]
+                if isinstance(latest, dict):
+                    candidate = latest.get("new_command_sha256")
+                    if isinstance(candidate, str) and SHA256_RE.fullmatch(candidate):
+                        return candidate
+    return _sha256_json(manifest["commands"][role])
 
 
 def _writer_patch_path(manifest: dict[str, Any]) -> Path:
@@ -938,7 +982,16 @@ def _writer_task_argv(manifest: dict[str, Any]) -> list[str]:
     ]
 
 
-def _role_task_argv(manifest: dict[str, Any], role: str, head: str, diff_sha256: str, dirty: bool) -> list[str]:
+def _role_task_argv(
+    manifest: dict[str, Any],
+    role: str,
+    head: str,
+    diff_sha256: str,
+    dirty: bool,
+    *,
+    command: list[str] | None = None,
+    output_path: Path | None = None,
+) -> list[str]:
     return [
         sys.executable,
         "-m",
@@ -956,9 +1009,9 @@ def _role_task_argv(manifest: dict[str, Any], role: str, head: str, diff_sha256:
         "--expected-dirty",
         "true" if dirty else "false",
         "--output",
-        str(_role_receipt_path(manifest, role)),
+        str(output_path if output_path is not None else _role_receipt_path(manifest, role)),
         "--",
-        *list(manifest["commands"][role]),
+        *(list(command) if command is not None else list(manifest["commands"][role])),
     ]
 
 
@@ -1331,10 +1384,277 @@ def _close_integrity_status(manifest: dict[str, Any], receipt: Any) -> dict[str,
     return result
 
 
-def _role_receipt(manifest: dict[str, Any], role: str) -> dict[str, Any] | None:
-    path = _role_receipt_path(manifest, role)
+def _role_receipt(manifest: dict[str, Any], role: str, *, attempt: int | None = None) -> dict[str, Any] | None:
+    resolved_attempt = _role_final_attempt(manifest, role) if attempt is None else attempt
+    path = _role_receipt_path(manifest, role, attempt=resolved_attempt)
     return _load_json(path) if path.exists() else None
 
+
+def _role_retry_classification(
+    manifest: dict[str, Any], role: str, frozen: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Classify whether one read-only role may be retried, and why."""
+    task_id = manifest.get("tasks", {}).get(role)
+    if task_id is None:
+        blocks = manifest.get("role_preflight_blocks", {})
+        role_blocks = blocks.get(role) if isinstance(blocks, dict) else None
+        if isinstance(role_blocks, list) and role_blocks:
+            latest = role_blocks[-1]
+            if isinstance(latest, dict) and latest.get("failure_classification") == "environment_toolchain_failure":
+                return "eligible", {
+                    "prior_failure_classification": "toolchain_preflight_blocked",
+                    "prior_preflight": latest,
+                    "prior_attempt_consumed": False,
+                }
+            return "preflight_probe_error", {"prior_preflight": latest}
+        return "not_attempted", {}
+    task_public = _task_public(task_id)
+    if not task_public["terminal"]:
+        return "role_running", {"task": task_public}
+    if task_public["state"] in {"observation_error", "outcome_unknown", "interrupted"}:
+        return "unknown_prior_outcome", {"task": task_public}
+    receipt = _role_receipt(manifest, role)
+    if receipt is None:
+        return "unknown_prior_outcome", {"task": task_public}
+    if (
+        not _receipt_integrity(receipt)
+        or receipt.get("role") != role
+        or receipt.get("expected_head") != frozen.get("writer_head")
+        or receipt.get("expected_base_head") != manifest.get("expected_base_head")
+        or receipt.get("expected_diff_sha256") != frozen.get("diff_sha256")
+        or receipt.get("expected_dirty") != frozen.get("dirty")
+        or receipt.get("head_before") != frozen.get("writer_head")
+        or receipt.get("head_after") != frozen.get("writer_head")
+        or receipt.get("diff_after") != frozen.get("diff_sha256")
+        or receipt.get("worktree_dirty_after") != frozen.get("dirty")
+        or receipt.get("argv_sha256") != _expected_role_argv_sha256(manifest, role)
+        or receipt.get("sandbox") != agent_role.SANDBOX_LABEL
+    ):
+        return "invalid_receipt", {"receipt_present": True}
+    returncode = receipt.get("returncode")
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        return "invalid_receipt", {"receipt_present": True}
+    failure_classification = receipt.get("failure_classification")
+    environment_detail: dict[str, Any] | None = None
+    if failure_classification == "environment_toolchain_failure" and returncode != 0:
+        environment_detail = {"typed_failure_classification": failure_classification}
+    if environment_detail is not None:
+        return "eligible", {
+            "prior_failure_classification": "environment_toolchain_failure",
+            "previous_task_id": task_id,
+            "previous_receipt_sha256": receipt.get("receipt_sha256"),
+            "prior_attempt_consumed": True,
+            **environment_detail,
+        }
+    if returncode == 0 and task_public.get("state") != "completed":
+        return "unknown_prior_outcome", {"task": task_public}
+    if role == "tests":
+        if returncode == 0:
+            return "already_succeeded", {"receipt_sha256": receipt.get("receipt_sha256")}
+        return "semantic_test_failure", {
+            "receipt_sha256": receipt.get("receipt_sha256"),
+            "returncode": returncode,
+            "failure_classification": failure_classification,
+        }
+    verdict = receipt.get("verdict")
+    if verdict == "PASS" and returncode == 0:
+        return "already_succeeded", {"receipt_sha256": receipt.get("receipt_sha256")}
+    if verdict in {"NEEDS_CHANGE", "BLOCK"}:
+        return "review_verdict_blocks_retry", {
+            "verdict": verdict,
+            "receipt_sha256": receipt.get("receipt_sha256"),
+        }
+    return "invalid_receipt", {
+        "verdict": verdict,
+        "receipt_sha256": receipt.get("receipt_sha256"),
+        "failure_classification": failure_classification,
+    }
+
+def _collection_incomplete_roles(collection: Any) -> list[str]:
+    if not isinstance(collection, dict) or collection.get("state") != "complete":
+        return list(READ_ONLY_ROLES)
+    incomplete: list[str] = []
+    tests = collection.get("tests")
+    if not (
+        isinstance(tests, dict)
+        and tests.get("status") in {"passed", "failed"}
+        and isinstance(tests.get("returncode"), int)
+        and not isinstance(tests.get("returncode"), bool)
+        and isinstance(tests.get("receipt_sha256"), str)
+        and SHA256_RE.fullmatch(tests["receipt_sha256"]) is not None
+    ):
+        incomplete.append("tests")
+    review = collection.get("review")
+    if not (
+        isinstance(review, dict)
+        and review.get("status") in {"passed", "failed"}
+        and isinstance(review.get("returncode"), int)
+        and not isinstance(review.get("returncode"), bool)
+        and review.get("verdict") in {"PASS", "NEEDS_CHANGE", "BLOCK", "INVALID"}
+        and isinstance(review.get("findings"), list)
+        and all(isinstance(item, dict) for item in review["findings"])
+        and isinstance(review.get("receipt_sha256"), str)
+        and SHA256_RE.fullmatch(review["receipt_sha256"]) is not None
+    ):
+        incomplete.append("review")
+    return incomplete
+
+
+def _collection_failed_roles(collection: Any) -> list[str]:
+    if _collection_incomplete_roles(collection):
+        return []
+    failed: list[str] = []
+    tests = collection["tests"]
+    if tests["status"] != "passed" or tests["returncode"] != 0:
+        failed.append("tests")
+    review = collection["review"]
+    if (
+        review["status"] != "passed"
+        or review["returncode"] != 0
+        or review["verdict"] != "PASS"
+        or review["findings"]
+    ):
+        failed.append("review")
+    return failed
+
+
+def _status_role_retry(manifest: dict[str, Any]) -> dict[str, Any]:
+    frozen = manifest.get("frozen_writer")
+    result: dict[str, Any] = {}
+    for role_name in READ_ONLY_ROLES:
+        if not isinstance(frozen, dict):
+            result[role_name] = {"classification": "not_collected", "eligible": False}
+            continue
+        classification, detail = _role_retry_classification(manifest, role_name, frozen)
+        retries = manifest.get("role_retries", {})
+        role_retry_state = retries.get(role_name) if isinstance(retries, dict) else None
+        retries_used = role_retry_state.get("count", 0) if isinstance(role_retry_state, dict) else 0
+        if not isinstance(retries_used, int) or isinstance(retries_used, bool):
+            retries_used = 0
+        eligible = classification == "eligible" and retries_used < MAX_ROLE_RETRIES
+        effective_classification = classification
+        if classification == "eligible" and not eligible:
+            effective_classification = "retry_limit_reached"
+        result[role_name] = {
+            "classification": effective_classification,
+            "eligible": eligible,
+            "retries_used": retries_used,
+            "max_retries": MAX_ROLE_RETRIES,
+            **detail,
+        }
+    return result
+
+
+def _prospective_closure_outcome(manifest: dict[str, Any], collection: Any) -> str:
+    close_receipt = manifest.get("close_receipt")
+    if isinstance(close_receipt, dict):
+        if not _close_integrity_status(manifest, close_receipt)["valid"]:
+            return "unknown"
+        outcome = close_receipt.get("closure_outcome")
+        return outcome if isinstance(outcome, str) else "unknown"
+    if not isinstance(collection, dict) or collection.get("state") != "complete":
+        return "not_ready"
+    if _collection_incomplete_roles(collection):
+        return "incomplete_role_evidence"
+    return "would_abandon_failed_roles" if _collection_failed_roles(collection) else "would_be_successful"
+
+
+def _recommended_next_action(
+    *,
+    creation_ready: bool,
+    closed: bool,
+    closeable: bool,
+    success_ready: bool,
+    role_retry: dict[str, Any],
+    failed_roles: list[str],
+    incomplete_roles: list[str],
+) -> str:
+    if closed:
+        return "none_closed"
+    if not creation_ready:
+        return "await_creation"
+    for role_name in sorted(role_retry):
+        if role_retry[role_name].get("eligible"):
+            return f"retry_role:{role_name}"
+    if incomplete_roles:
+        return "recollect_or_reconcile_incomplete_role_evidence"
+    if not closeable:
+        return "await_collection_or_reconcile"
+    if success_ready:
+        return "close"
+    if failed_roles:
+        return "close_with_abandon_failed_roles"
+    return "collect"
+
+
+def _external_closeout_checklist(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    close_receipt = manifest.get("close_receipt")
+    close_valid = bool(
+        isinstance(close_receipt, dict)
+        and _close_integrity_status(manifest, close_receipt)["valid"]
+    )
+    lease_verified = bool(
+        close_valid
+        and close_receipt.get("state") == "complete"
+        and close_receipt.get("resources_released") is True
+        and not close_receipt.get("remaining_resource_keys")
+    )
+    return [
+        {
+            "item": "pr_integration_truth",
+            "description": (
+                "Confirm pull request and branch integration truth with Git/GitHub tools; "
+                "this workspace only observes local Git state, never merge or PR status."
+            ),
+            "status": "unknown",
+            "source_of_truth": "git_github",
+        },
+        {
+            "item": "bureau_task_reconciliation",
+            "description": (
+                "Reconcile the bound Bureau binding or task with Bureau directly; "
+                "binding_evidence is a point-in-time snapshot, not live truth."
+            ),
+            "status": "unknown",
+            "source_of_truth": "bureau",
+            "binding": manifest.get("binding"),
+        },
+        {
+            "item": "workspace_lease_release",
+            "description": (
+                "Release this workspace's resource leases via close, or verify manual release; "
+                "leases block conflicting writers until released."
+            ),
+            "status": "verified" if lease_verified else "unknown",
+            "source_of_truth": "grabowski_resources",
+            "evidence": (
+                {
+                    "close_receipt_sha256": close_receipt.get("receipt_sha256"),
+                    "resources_released": True,
+                }
+                if lease_verified
+                else None
+            ),
+        },
+        {
+            "item": "writer_worktree_archive_or_cleanup",
+            "description": (
+                "Archive or remove the preserved writer worktree and branch with the checkout tools; "
+                "close never deletes them."
+            ),
+            "status": "unknown",
+            "source_of_truth": "grabowski_checkouts",
+        },
+        {
+            "item": "operator_final_summary",
+            "description": (
+                "Publish an operator-facing final summary of this workspace's outcome; "
+                "Agent Workspace v1 does not itself produce or track one."
+            ),
+            "status": "unknown",
+            "source_of_truth": "operator",
+        },
+    ]
 
 def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict[str, Any]:
     snapshot: dict[str, Any]
@@ -1376,10 +1696,12 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         and collection.get("diff_sha256") == snapshot.get("diff_sha256")
     )
     creation_ready = manifest.get("creation_state") == "ready"
+    incomplete_roles = _collection_incomplete_roles(collection) if collection_complete else []
     closeable = bool(
         creation_ready
         and all_terminal
         and collection_complete
+        and not incomplete_roles
         and snapshot_matches
         and start_intents_clear
     )
@@ -1395,6 +1717,7 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
     )
     success_ready = bool(
         closeable
+        and not incomplete_roles
         and all_completed
         and result_valid
         and not snapshot.get("base_drift")
@@ -1406,6 +1729,18 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         and collection.get("review", {}).get("verdict") == "PASS"
     )
     close_integrity = _close_integrity_status(manifest, manifest.get("close_receipt"))
+    failed_roles = _collection_failed_roles(collection)
+    role_retry = _status_role_retry(manifest)
+    closure_outcome = _prospective_closure_outcome(manifest, collection)
+    recommended_next_action = _recommended_next_action(
+        creation_ready=creation_ready,
+        closed=close_integrity["valid"],
+        closeable=closeable,
+        success_ready=success_ready,
+        role_retry=role_retry,
+        failed_roles=failed_roles,
+        incomplete_roles=incomplete_roles,
+    )
     return {
         "workspace_id": manifest["workspace_id"],
         "creation_state": manifest.get("creation_state"),
@@ -1428,8 +1763,13 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         "collection": collection,
         "collection_integrity": collection_integrity,
         "unresolved_findings": findings,
+        "failed_roles": failed_roles,
+        "incomplete_roles": incomplete_roles,
+        "role_retry": role_retry,
         "closeable": closeable,
         "success_ready": success_ready,
+        "closure_outcome": closure_outcome,
+        "recommended_next_action": recommended_next_action,
         "close_integrity": close_integrity,
         "closed": close_integrity["valid"],
     }
@@ -2214,6 +2554,21 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
             }
         for role in READ_ONLY_ROLES:
             if tasks_map.get(role) is None:
+                preflight = _role_toolchain_preflight(manifest, role, manifest["commands"][role])
+                if not preflight["passed"]:
+                    blocks = dict(manifest.get("role_preflight_blocks", {}))
+                    role_blocks = list(blocks.get(role, []))
+                    role_blocks.append({**preflight, "attempt": None, "attempt_consumed": False, "proposed_attempt": 1, "source": "collect"})
+                    blocks[role] = role_blocks
+                    manifest["role_preflight_blocks"] = blocks
+                    _write_manifest(manifest)
+                    return {
+                        "workspace_id": identifier,
+                        "state": "role_toolchain_preflight_failed",
+                        "role": role,
+                        "preflight": preflight,
+                        "receipt_status": "blocked",
+                    }
                 intents = dict(manifest.get("task_start_intents", {}))
                 role_task_argv = _role_task_argv(
                     manifest,
@@ -2309,8 +2664,8 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 or receipt.get("head_after") != snapshot["writer_head"]
                 or receipt.get("diff_after") != snapshot["diff_sha256"]
                 or receipt.get("worktree_dirty_after") != snapshot["dirty"]
-                or receipt.get("argv_sha256") != _sha256_json(manifest["commands"][role])
-                or receipt.get("sandbox") != "bubblewrap-minimal-root-read-only-worktree-v1"
+                or receipt.get("argv_sha256") != _expected_role_argv_sha256(manifest, role)
+                or receipt.get("sandbox") != agent_role.SANDBOX_LABEL
             ):
                 return {
                     "workspace_id": identifier,
@@ -2389,7 +2744,219 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 "result_sha256": result["result_sha256"],
             }
         )
-        return {"workspace_id": identifier, "state": "complete", "result": result, "receipt_status": "passed"}
+        return {
+            "workspace_id": identifier,
+            "state": "complete",
+            "result": result,
+            "receipt_status": "passed",
+            "external_closeout_checklist": _external_closeout_checklist(manifest),
+        }
+
+
+@mcp.tool(name="grabowski_agent_workspace_role_retry", annotations=MUTATING)
+def grabowski_agent_workspace_role_retry(
+    workspace_id: str,
+    role: str,
+    replacement_argv: list[str],
+) -> dict[str, Any]:
+    """Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot."""
+    operator._require_operator_mutation("durable_job")
+    operator._require_operator_mutation("git_cli")
+    identifier = _required_string(workspace_id, "workspace_id", max_length=80)
+    role_name = _required_string(role, "role", max_length=16)
+    if role_name not in READ_ONLY_ROLES:
+        raise AgentWorkspaceError(f"role_retry supports only {sorted(READ_ONLY_ROLES)}; writer may never be retried")
+    with _lock(identifier):
+        manifest = _manifest(identifier)
+        if manifest.get("creation_state") != "ready":
+            raise AgentWorkspaceError("workspace creation is incomplete: creation_state_not_ready")
+        if manifest.get("close_receipt") is not None:
+            return {
+                "workspace_id": identifier,
+                "role": role_name,
+                "state": "workspace_closed",
+                "retry_status": "blocked",
+            }
+        frozen = manifest.get("frozen_writer")
+        if not isinstance(frozen, dict):
+            return {
+                "workspace_id": identifier,
+                "role": role_name,
+                "state": "not_collected",
+                "retry_status": "blocked",
+            }
+        worktree = Path(str(manifest["writer_worktree"]))
+        command = _role_argv(replacement_argv, "replacement_argv", cwd=worktree)
+        live = _git_snapshot(manifest, _run)
+        if (
+            live["writer_head"] != frozen.get("writer_head")
+            or live["diff_sha256"] != frozen.get("diff_sha256")
+            or live["dirty"] != frozen.get("dirty")
+        ):
+            return {
+                "workspace_id": identifier,
+                "role": role_name,
+                "state": "binding_drift",
+                "snapshot": live,
+                "frozen_writer": {
+                    "writer_head": frozen.get("writer_head"),
+                    "diff_sha256": frozen.get("diff_sha256"),
+                    "dirty": frozen.get("dirty"),
+                },
+                "retry_status": "blocked",
+            }
+        classification, detail = _role_retry_classification(manifest, role_name, frozen)
+        if classification != "eligible":
+            return {
+                "workspace_id": identifier,
+                "role": role_name,
+                "state": classification,
+                **detail,
+                "retry_status": "blocked",
+            }
+        retries = dict(manifest.get("role_retries", {}))
+        role_retry_state = dict(retries.get(role_name, {}))
+        role_retry_state.setdefault("count", 0)
+        role_retry_state.setdefault("attempts", [])
+        if role_retry_state["count"] >= MAX_ROLE_RETRIES:
+            return {
+                "workspace_id": identifier,
+                "role": role_name,
+                "state": "retry_limit_reached",
+                "max_retries": MAX_ROLE_RETRIES,
+                "retry_status": "blocked",
+            }
+        previous_task_id = manifest["tasks"].get(role_name)
+        previous_attempt = _role_final_attempt(manifest, role_name) if previous_task_id is not None else 0
+        attempt_number = previous_attempt + 1
+        preflight = _role_toolchain_preflight(manifest, role_name, command)
+        if not preflight["passed"]:
+            blocks = dict(manifest.get("role_preflight_blocks", {}))
+            role_blocks = list(blocks.get(role_name, []))
+            role_blocks.append(
+                {
+                    **preflight,
+                    "attempt": None,
+                    "attempt_consumed": False,
+                    "proposed_attempt": attempt_number,
+                    "source": "retry",
+                }
+            )
+            blocks[role_name] = role_blocks
+            manifest["role_preflight_blocks"] = blocks
+            _write_manifest(manifest)
+            return {
+                "workspace_id": identifier,
+                "role": role_name,
+                "state": "role_toolchain_preflight_failed",
+                "preflight": preflight,
+                "attempt": None,
+                "attempt_consumed": False,
+                "proposed_attempt": attempt_number,
+                "retry_status": "blocked",
+            }
+        previous_receipt = _role_receipt(manifest, role_name) if previous_task_id is not None else None
+        previous_receipt_sha256 = (
+            previous_receipt.get("receipt_sha256") if isinstance(previous_receipt, dict) else None
+        )
+        old_command_sha256 = _expected_role_argv_sha256(manifest, role_name)
+        new_command_sha256 = _sha256_json(command)
+        output_path = _role_receipt_path(manifest, role_name, attempt=attempt_number)
+        task_argv = _role_task_argv(
+            manifest,
+            role_name,
+            str(frozen["writer_head"]),
+            str(frozen["diff_sha256"]),
+            bool(frozen["dirty"]),
+            command=command,
+            output_path=output_path,
+        )
+        cwd = str(manifest["writer_worktree"])
+        host = _bound_task_host(manifest)
+        intents = dict(manifest.get("task_start_intents", {}))
+        intents[role_name] = {
+            "role": role_name,
+            "kind": "retry",
+            "attempt": attempt_number,
+            "created_at": _utc(),
+            "nonce": hashlib.sha256(
+                f"{identifier}:{role_name}:retry:{attempt_number}:{time.time_ns()}".encode("utf-8")
+            ).hexdigest()[:24],
+            "writer_head": frozen["writer_head"],
+            "diff_sha256": frozen["diff_sha256"],
+            "dirty": frozen["dirty"],
+            "command_sha256": new_command_sha256,
+            "task_argv_sha256": _sha256_json(task_argv),
+            "task_host": host,
+            "task_cwd": cwd,
+        }
+        manifest["task_start_intents"] = intents
+        _write_manifest(manifest)
+        started = tasks.grabowski_task_start(
+            host=host,
+            argv=task_argv,
+            cwd=cwd,
+            runtime_seconds=int(manifest["resources"]["runtime_seconds"]),
+            resume_policy="never",
+            cpu_weight=100,
+            io_weight=100,
+            memory_max_bytes=manifest["resources"]["memory_max_bytes"],
+            resource_keys=None,
+            chronik_outbox=True,
+        )
+        public = started.get("task") if isinstance(started, dict) else None
+        public = _validate_started_task(
+            public,
+            role=role_name,
+            expected_host=host,
+            expected_argv=task_argv,
+            expected_cwd=cwd,
+        )
+        intents = dict(manifest.get("task_start_intents", {}))
+        intents.pop(role_name, None)
+        manifest["task_start_intents"] = intents
+        tasks_map = dict(manifest["tasks"])
+        tasks_map[role_name] = public["task_id"]
+        manifest["tasks"] = tasks_map
+        final_attempts = dict(manifest.get("role_final_attempt", {}))
+        final_attempts[role_name] = attempt_number
+        manifest["role_final_attempt"] = final_attempts
+        attempt_record = {
+            "attempt": attempt_number,
+            "created_at": _utc(),
+            "previous_task_id": previous_task_id,
+            "previous_receipt_sha256": previous_receipt_sha256,
+            "failure_classification": detail.get("prior_failure_classification"),
+            "old_command_sha256": old_command_sha256,
+            "new_command_sha256": new_command_sha256,
+            "new_task_id": public["task_id"],
+        }
+        role_retry_state["count"] += 1
+        role_retry_state["attempts"] = [*role_retry_state["attempts"], attempt_record]
+        retries[role_name] = role_retry_state
+        manifest["role_retries"] = retries
+        _write_manifest(manifest)
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "agent-workspace-role-retry",
+                "workspace_id": identifier,
+                "role": role_name,
+                "attempt": attempt_number,
+                "new_task_id": public["task_id"],
+                "old_command_sha256": old_command_sha256,
+                "new_command_sha256": new_command_sha256,
+            }
+        )
+        return {
+            "workspace_id": identifier,
+            "role": role_name,
+            "state": "retry_started",
+            "attempt": attempt_number,
+            "task": public,
+            "attempt_record": attempt_record,
+            "retry_status": "passed",
+        }
 
 
 @mcp.tool(name="grabowski_agent_workspace_close", annotations=MUTATING)
@@ -2400,6 +2967,7 @@ def grabowski_agent_workspace_close(
     expected_result_sha256: str,
     cancel_running: bool = False,
     remove_tmux_session: bool = True,
+    abandon_failed_roles: bool = False,
 ) -> dict[str, Any]:
     """Close one collected workspace without deleting its writer worktree or branch."""
     operator._require_operator_mutation("durable_job")
@@ -2423,7 +2991,12 @@ def grabowski_agent_workspace_close(
                 raise AgentWorkspaceError("existing close receipt integrity is invalid")
             if existing.get("expected_head") != head or existing.get("expected_diff_sha256") != diff_sha or existing.get("expected_result_sha256") != result_sha:
                 raise AgentWorkspaceError("workspace was closed with different bindings")
-            return {"workspace_id": identifier, "close_receipt": existing, "idempotent": True}
+            return {
+                "workspace_id": identifier,
+                "close_receipt": existing,
+                "idempotent": True,
+                "external_closeout_checklist": _external_closeout_checklist(manifest),
+            }
         collection = manifest.get("collection")
         if not isinstance(collection, dict) or collection.get("state") != "complete":
             raise AgentWorkspaceError("workspace has no complete collection receipt")
@@ -2439,6 +3012,24 @@ def grabowski_agent_workspace_close(
             or not snapshot["writer_branch_matches"]
         ):
             raise AgentWorkspaceError("writer state changed after collection")
+        incomplete_roles = _collection_incomplete_roles(collection)
+        if incomplete_roles:
+            return {
+                "workspace_id": identifier,
+                "state": "incomplete_role_evidence",
+                "incomplete_roles": incomplete_roles,
+                "receipt_status": "blocked",
+                "external_closeout_checklist": _external_closeout_checklist(manifest),
+            }
+        failed_roles = _collection_failed_roles(collection)
+        if failed_roles and not abandon_failed_roles:
+            return {
+                "workspace_id": identifier,
+                "state": "failed_roles_require_explicit_abandonment",
+                "failed_roles": failed_roles,
+                "receipt_status": "blocked",
+                "external_closeout_checklist": _external_closeout_checklist(manifest),
+            }
         task_states = {
             role: _task_public(manifest["tasks"].get(role))
             for role in ("writer", "tests", "review")
@@ -2452,6 +3043,7 @@ def grabowski_agent_workspace_close(
                 "active_roles": active,
                 "tasks": task_states,
                 "receipt_status": "blocked",
+                "external_closeout_checklist": _external_closeout_checklist(manifest),
             }
         if active:
             for role in active:
@@ -2483,6 +3075,9 @@ def grabowski_agent_workspace_close(
             "tmux_removed": False,
             "resources_released": False,
             "no_unsecured_changes_discarded": True,
+            "failed_roles": failed_roles,
+            "abandon_failed_roles": abandon_failed_roles,
+            "closure_outcome": "abandoned_failed_roles" if failed_roles else "successful",
         }
         _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
         if remove_tmux_session and _tmux_has_session(str(manifest["session_name"])):
@@ -2558,7 +3153,12 @@ def grabowski_agent_workspace_close(
                 "worktree_preserved": True,
             }
         )
-        return {"workspace_id": identifier, "close_receipt": receipt, "idempotent": False}
+        return {
+            "workspace_id": identifier,
+            "close_receipt": receipt,
+            "idempotent": False,
+            "external_closeout_checklist": _external_closeout_checklist(manifest),
+        }
 
 
 def _pane_snapshot(workspace_id: str, role: str) -> str:

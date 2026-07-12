@@ -1354,6 +1354,21 @@
     },
     {
       "category": "agent-workspace",
+      "description": "Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot.",
+      "effects": [
+        "task-start",
+        "receipt-create",
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_role_retry",
+      "purpose": "Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot.",
+      "read_only": false,
+      "reversibility": "preserved-worktree-and-receipts",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_role_retry"
+    },
+    {
+      "category": "agent-workspace",
       "description": "Close one collected workspace without deleting its writer worktree or branch.",
       "effects": [
         "possible-task-stop",
@@ -1400,6 +1415,12 @@
   },
   "kind": "repository-operator-context",
   "operating_protocol": {
+    "coding_agent_priority": [
+      "claude",
+      "codex",
+      "agy",
+      "cline"
+    ],
     "control_loop": [
       "typed_grabowski_tool",
       "grabowski_micro_task",
@@ -1415,21 +1436,35 @@
       "durable_agent_autonomy",
       "steuerboard_report_action_approval"
     ],
+    "execution_priority": [
+      "chatgpt_operator",
+      "claude",
+      "codex",
+      "agy",
+      "cline"
+    ],
     "name": "Operator Relay v0",
+    "operator_first_for": [
+      "task_decomposition",
+      "bounded_code_change",
+      "integration",
+      "critical_self_review",
+      "recovery"
+    ],
     "routing_roles": {
       "audit": "grabowski_git",
-      "complex_code_task": "codex_exec_or_codex_review",
+      "complex_code_task": "chatgpt_operator_then_claude_codex_agy_cline",
       "local_micro_reasoning": "ollama_api_qwen_coder",
       "memory_prioritization": "bureau",
       "patch_fallback": "aider_no_auto_commit",
       "patch_file_relay": "operator_patch_relay",
-      "quick_light_reasoning": "agy_print",
+      "quick_light_reasoning": "chatgpt_operator_then_agy_print",
       "repo_state_context": "steuerboard_operator_report",
-      "security_or_architecture_review": "claude",
+      "security_or_architecture_review": "chatgpt_operator_then_claude",
       "session_resume": "tmux_first_agy_when_useful",
       "shell_or_git_grip": "grabowski_task"
     },
-    "rule": "Keep ChatGPT as operator. Run the Grabowski control loop first, then route bounded helper work by task class."
+    "rule": "Keep ChatGPT as operator and execute bounded work first. Delegate only when a helper adds useful scale or independent contrast."
   },
   "policy_contract": {
     "access_profiles": [
@@ -1573,6 +1608,7 @@
       "grabowski_agent_workspace_status",
       "grabowski_agent_workspace_attach",
       "grabowski_agent_workspace_collect",
+      "grabowski_agent_workspace_role_retry",
       "grabowski_agent_workspace_close",
       "grabowski_agent_bootstrap",
       "grabowski_call_shape_check"
@@ -1702,11 +1738,11 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "a56e717c0c0441f45654e44936d5f4a45e85a68a4ff1f90cc5f4bb0ab206346c"
+      "sha256": "9ef6a1e8cf1aeaea2ee2530772c88cf339e1ce4c1a1a4f13ef3eaeb88d422b51"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "99d15a5580a35ec1011f1f7afe99cc4c6ab92c3ee023650a9298ace58902bb10"
+      "sha256": "0ff044ebc93bfdaeb8371b0cbe6be706bfd1c3e3e1ccc13b666efaff71c57a3b"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1714,23 +1750,23 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "b70eb2b4f969b7c0a4308a52705d956f0010e9e390234731f8f159ff76893237"
+      "sha256": "b218ad32cad92a6afe1163e09352df7d3790e6c51b4e90c95eb7e25113b825b8"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c413e520172f70296c42e18e4c0f1fcb95a1931afa0fda7b7c36dba4b2d52e56",
-      "src/grabowski_agent_role.py": "496ce69903653725be8cffbb23b0e0b6a62b336dfc15bb8f82ff1e44e8acc1f9",
+      "src/grabowski_agent_role.py": "bd0aff0f9bcc42cad9a146a0acba28eaa2392f7896c13ec0cbc5394cd645008c",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
-      "src/grabowski_agent_workspace.py": "8d6111a214274ee0b605ec51d7ecc655fd2987317560c30cfe939f18fa17ac53",
+      "src/grabowski_agent_workspace.py": "c41666bf1f7399e16c2dd4950cfa4265a31c7c9429c4c695a293e631d37224f5",
       "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "99d15a5580a35ec1011f1f7afe99cc4c6ab92c3ee023650a9298ace58902bb10",
+      "src/grabowski_capabilities.py": "0ff044ebc93bfdaeb8371b0cbe6be706bfd1c3e3e1ccc13b666efaff71c57a3b",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "15f4de8cacfaacfb6d5e1bc95bb82064d800bdbb46fd8ce67901f0bdf8a2ee8c",
       "src/grabowski_grip_orchestration.py": "2c1d594433f92edbae23adc43a303b212bfff89d298121c516974d790259051d",
       "src/grabowski_grips.py": "f7fee83b8424d40ff1f3785a771a685c1ce2bb73e3029d38de1b7e2da073968a",
-      "src/grabowski_mcp.py": "88bd0c41b0f65ba62a23ccc6c3aebf281343e2c66914afd5c3dc6a04452c08a9",
+      "src/grabowski_mcp.py": "cc9f2e0750e76181e07152bbbb4eb973bb788801952bb4237a39049ad5934fc4",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "7aaaca985ccf404934fd1dd07d7a718d69cb0b23826691da9096f6f3d4f20e54",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",

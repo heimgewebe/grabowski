@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "99d15a5580a35ec1011f1f7afe99cc4c6ab92c3ee023650a9298ace58902bb10",
+  "capability_source_sha256": "0ff044ebc93bfdaeb8371b0cbe6be706bfd1c3e3e1ccc13b666efaff71c57a3b",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "b70eb2b4f969b7c0a4308a52705d956f0010e9e390234731f8f159ff76893237",
+  "contract_sha256": "b218ad32cad92a6afe1163e09352df7d3790e6c51b4e90c95eb7e25113b825b8",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1363,6 +1363,21 @@
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_collect"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot.",
+      "effects": [
+        "task-start",
+        "receipt-create",
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_role_retry",
+      "purpose": "Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot.",
+      "read_only": false,
+      "reversibility": "preserved-worktree-and-receipts",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_role_retry"
     },
     {
       "category": "agent-workspace",

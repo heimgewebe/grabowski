@@ -35,7 +35,9 @@ class BlockedActionProtocolDocTests(unittest.TestCase):
 
     def test_routing_roles_match_live_operator_protocol(self) -> None:
         for phrase in (
-            "Codex exec/review",
+            "ChatGPT Operator",
+            "Claude -> Codex -> agy -> Cline",
+            "Cline",
             "agy --print",
             "Ollama API mit qwen coder",
             "tmux ist Standard",
