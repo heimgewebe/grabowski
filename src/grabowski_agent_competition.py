@@ -520,9 +520,161 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
     return manifest
 
 
+
+def _receipt_patch_paths(patch: str) -> list[str]:
+    paths: list[str] = []
+    for line in patch.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        parts = line.split(" ")
+        if len(parts) != 4 or not parts[2].startswith("a/") or not parts[3].startswith("b/"):
+            raise AgentCompetitionError("candidate receipt patch has an unsupported diff header")
+        left = _normalize_relative(parts[2][2:], label="candidate receipt patch path")
+        right = _normalize_relative(parts[3][2:], label="candidate receipt patch path")
+        if left != right:
+            raise AgentCompetitionError("candidate receipt patch may not contain renames or copies")
+        paths.append(left)
+    if patch and not paths:
+        raise AgentCompetitionError("candidate receipt non-empty patch contains no diff headers")
+    if "GIT binary patch" in patch or "Binary files " in patch:
+        raise AgentCompetitionError("candidate receipt patch may not contain binary data")
+    return sorted(set(paths))
+
+
+def _bounded_string_list(
+    value: Any,
+    *,
+    label: str,
+    max_items: int,
+    max_length: int,
+) -> list[str]:
+    if not isinstance(value, list) or len(value) > max_items:
+        raise AgentCompetitionError(f"candidate receipt {label} is invalid")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or len(item) > max_length or "\x00" in item:
+            raise AgentCompetitionError(f"candidate receipt {label} is invalid")
+        result.append(item)
+    return result
+
+
+def _validate_receipt_candidate(candidate: Any, packet: dict[str, Any]) -> dict[str, Any]:
+    required = {
+        "approach_id", "approach_summary", "assumptions", "design_invariants", "tradeoffs",
+        "risks", "proposed_tests", "changed_paths", "patch", "contrast_observations",
+        "confidence", "patch_paths", "patch_sha256", "patch_check", "patch_rejection",
+    }
+    if not isinstance(candidate, dict) or set(candidate) != required:
+        raise AgentCompetitionError("candidate receipt candidate shape is invalid")
+    approach_id = candidate["approach_id"]
+    approach_summary = candidate["approach_summary"]
+    if (
+        not isinstance(approach_id, str)
+        or not approach_id.strip()
+        or len(approach_id) > 120
+        or "\x00" in approach_id
+        or not isinstance(approach_summary, str)
+        or not approach_summary.strip()
+        or len(approach_summary) > 4000
+        or "\x00" in approach_summary
+    ):
+        raise AgentCompetitionError("candidate receipt approach fields are invalid")
+    _bounded_string_list(candidate["assumptions"], label="assumptions", max_items=20, max_length=1000)
+    _bounded_string_list(candidate["design_invariants"], label="design_invariants", max_items=20, max_length=1000)
+    _bounded_string_list(candidate["tradeoffs"], label="tradeoffs", max_items=20, max_length=1000)
+    _bounded_string_list(candidate["risks"], label="risks", max_items=20, max_length=1000)
+    _bounded_string_list(candidate["proposed_tests"], label="proposed_tests", max_items=30, max_length=1000)
+    _bounded_string_list(
+        candidate["contrast_observations"],
+        label="contrast_observations",
+        max_items=20,
+        max_length=1200,
+    )
+    if candidate["confidence"] not in {"low", "medium", "high"}:
+        raise AgentCompetitionError("candidate receipt confidence is invalid")
+    changed_raw = candidate["changed_paths"]
+    if not isinstance(changed_raw, list) or len(changed_raw) > 50:
+        raise AgentCompetitionError("candidate receipt changed_paths is invalid")
+    changed_paths = [
+        _normalize_relative(item, label="candidate receipt changed path")
+        for item in changed_raw
+    ]
+    if len(set(changed_paths)) != len(changed_paths):
+        raise AgentCompetitionError("candidate receipt changed_paths contains duplicates")
+    allowed = packet.get("allowed_paths")
+    forbidden = packet.get("forbidden_paths")
+    if not isinstance(allowed, list) or not isinstance(forbidden, list):
+        raise AgentCompetitionError("candidate packet path scope is invalid")
+    for path in changed_paths:
+        if not _path_in_scope(path, allowed) or _path_in_scope(path, forbidden):
+            raise AgentCompetitionError(f"candidate receipt changed path is outside scope: {path}")
+    patch = candidate["patch"]
+    patch_hash = candidate["patch_sha256"]
+    if not isinstance(patch, str) or len(patch.encode("utf-8")) > 300_000:
+        raise AgentCompetitionError("candidate receipt patch is invalid")
+    if not isinstance(patch_hash, str) or patch_hash != _sha256_bytes(patch.encode("utf-8")):
+        raise AgentCompetitionError("candidate receipt patch hash is invalid")
+    parsed_patch_paths = _receipt_patch_paths(patch)
+    recorded_patch_paths = candidate["patch_paths"]
+    if not isinstance(recorded_patch_paths, list):
+        raise AgentCompetitionError("candidate receipt patch_paths is invalid")
+    normalized_patch_paths = [
+        _normalize_relative(item, label="candidate receipt patch path")
+        for item in recorded_patch_paths
+    ]
+    if normalized_patch_paths != parsed_patch_paths:
+        raise AgentCompetitionError("candidate receipt patch_paths do not match patch headers")
+    if not set(parsed_patch_paths).issubset(set(changed_paths)):
+        raise AgentCompetitionError("candidate receipt patch paths are not declared in changed_paths")
+    patch_check = candidate["patch_check"]
+    if (
+        not isinstance(patch_check, dict)
+        or set(patch_check) != {"attempted", "applies", "returncode", "stderr_sha256", "syntax_accepted"}
+        or type(patch_check["attempted"]) is not bool
+        or type(patch_check["applies"]) is not bool
+        or type(patch_check["syntax_accepted"]) is not bool
+        or (
+            patch_check["returncode"] is not None
+            and (isinstance(patch_check["returncode"], bool) or not isinstance(patch_check["returncode"], int))
+        )
+        or (
+            patch_check["stderr_sha256"] is not None
+            and (
+                not isinstance(patch_check["stderr_sha256"], str)
+                or SHA256_RE.fullmatch(patch_check["stderr_sha256"]) is None
+            )
+        )
+        or patch_check["attempted"] != bool(patch)
+        or (not patch and patch_check["applies"])
+    ):
+        raise AgentCompetitionError("candidate receipt patch_check is invalid")
+    rejection = candidate["patch_rejection"]
+    if rejection is not None:
+        if (
+            not isinstance(rejection, dict)
+            or set(rejection) != {
+                "rejected", "reason", "original_patch_sha256", "original_patch_size_bytes"
+            }
+            or rejection["rejected"] is not True
+            or not isinstance(rejection["reason"], str)
+            or not rejection["reason"].strip()
+            or len(rejection["reason"]) > 1000
+            or not isinstance(rejection["original_patch_sha256"], str)
+            or SHA256_RE.fullmatch(rejection["original_patch_sha256"]) is None
+            or isinstance(rejection["original_patch_size_bytes"], bool)
+            or not isinstance(rejection["original_patch_size_bytes"], int)
+            or not 0 <= rejection["original_patch_size_bytes"] <= 300_000
+            or patch
+            or patch_check["syntax_accepted"] is not False
+        ):
+            raise AgentCompetitionError("candidate receipt patch_rejection is invalid")
+    elif patch_check["syntax_accepted"] is not True:
+        raise AgentCompetitionError("candidate receipt patch syntax state is invalid")
+    return candidate
+
 def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[str, Any] | None:
     path = _competition_dir(identifier) / "receipt.json"
-    if not path.exists():
+    if not path.exists() and not path.is_symlink():
         return None
     bound_manifest = _validated_manifest(identifier) if manifest is None else manifest
     receipt = _load_private_json(path, label="candidate receipt")
@@ -589,15 +741,11 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
             or SHA256_RE.fullmatch(wrapper["discarded_wrapper_sha256"]) is None
         ):
             raise AgentCompetitionError("candidate receipt output wrapper is invalid")
-    candidate = receipt["candidate"]
-    if not isinstance(candidate, dict):
-        raise AgentCompetitionError("candidate receipt candidate is invalid")
-    patch = candidate.get("patch")
-    patch_hash = candidate.get("patch_sha256")
-    if not isinstance(patch, str) or len(patch.encode("utf-8")) > 300_000:
-        raise AgentCompetitionError("candidate receipt patch is invalid")
-    if not isinstance(patch_hash, str) or patch_hash != _sha256_bytes(patch.encode("utf-8")):
-        raise AgentCompetitionError("candidate receipt patch hash is invalid")
+    packet = _load_private_json(
+        _competition_dir(identifier) / "packet.json",
+        label="candidate packet",
+    )
+    _validate_receipt_candidate(receipt["candidate"], packet)
     return receipt
 
 
@@ -1090,7 +1238,11 @@ def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str,
     path_sets = [set(item["changed_paths"]) for item in candidates]
     risk_sets = [set(item["risks"]) for item in candidates]
     invariant_sets = [set(item["design_invariants"]) for item in candidates]
-    test_counter: Counter[str] = Counter(test for item in candidates for test in item["proposed_tests"])
+    test_counter: Counter[str] = Counter(
+        test
+        for item in candidates
+        for test in set(item["proposed_tests"])
+    )
     shared_paths = sorted(set.intersection(*path_sets)) if path_sets else []
     all_paths = sorted(set.union(*path_sets)) if path_sets else []
     shared_risks = sorted(set.intersection(*risk_sets)) if risk_sets else []

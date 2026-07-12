@@ -131,9 +131,16 @@ class AgentCompetitionTests(unittest.TestCase):
             "patch": patch,
             "contrast_observations": ["compare boundaries"],
             "confidence": "medium",
-            "patch_paths": [],
+            "patch_paths": competition._receipt_patch_paths(patch),
             "patch_sha256": hashlib.sha256(patch.encode()).hexdigest(),
-            "patch_check": {"attempted": bool(patch), "applies": False, "returncode": None, "stderr_sha256": None},
+            "patch_check": {
+                "attempted": bool(patch),
+                "applies": False,
+                "returncode": None,
+                "stderr_sha256": None,
+                "syntax_accepted": True,
+            },
+            "patch_rejection": None,
         }
         receipt = {
             "schema_version": 1,
@@ -485,6 +492,27 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertNotIn("patch", status["candidate"])
         self.assertEqual(status["candidate"]["patch_size_bytes"], 0)
 
+    def test_receipt_absence_remains_optional(self) -> None:
+        started = self._start()
+        self.assertIsNone(competition._receipt(started["competition_id"]))
+
+    def test_dangling_receipt_symlink_fails_closed(self) -> None:
+        started = self._start()
+        path = self.state / started["competition_id"] / "receipt.json"
+        path.symlink_to(path.with_name("missing-receipt.json"))
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "regular private file"):
+            competition._receipt(started["competition_id"])
+
+    def test_receipt_symlink_to_regular_file_fails_closed(self) -> None:
+        started = self._start()
+        directory = self.state / started["competition_id"]
+        target = directory / "other-receipt.json"
+        target.write_text("{}\n", encoding="utf-8")
+        target.chmod(0o600)
+        (directory / "receipt.json").symlink_to(target)
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "regular private file"):
+            competition._receipt(started["competition_id"])
+
     def test_self_hashed_receipt_cannot_change_manifest_binding(self) -> None:
         started = self._start()
         receipt = self._write_receipt(started["competition_id"], changed_paths=["src/sample.py"], risks=[], tests=[])
@@ -495,6 +523,47 @@ class AgentCompetitionTests(unittest.TestCase):
         competition._atomic_json(path, receipt)
         with self.assertRaisesRegex(competition.AgentCompetitionError, "binding mismatch"):
             competition._receipt(started["competition_id"])
+
+    def test_self_hashed_receipt_with_invalid_candidate_shape_fails_closed(self) -> None:
+        started = self._start()
+        receipt = self._write_receipt(
+            started["competition_id"],
+            changed_paths=["src/sample.py"],
+            risks=[],
+            tests=[],
+        )
+        path = self.state / started["competition_id"] / "receipt.json"
+        path.unlink()
+        del receipt["candidate"]["patch_check"]
+        receipt["receipt_sha256"] = competition._sha256_json(
+            {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        )
+        competition._atomic_json(path, receipt)
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "candidate shape"):
+            competition._receipt(started["competition_id"])
+
+    def test_one_candidate_cannot_create_validation_consensus_by_repeating_a_test(self) -> None:
+        first = self._start(provider="claude", mode="competitor", task="duplicate test")
+        second = self._start(provider="agy", mode="contrast", task="duplicate test")
+        self._write_receipt(
+            first["competition_id"],
+            changed_paths=[],
+            risks=[],
+            tests=["same test", "same test"],
+        )
+        self._write_receipt(
+            second["competition_id"],
+            changed_paths=[],
+            risks=[],
+            tests=["other test"],
+        )
+        result = competition.grabowski_agent_competition_compare(
+            [first["competition_id"], second["competition_id"]]
+        )
+        self.assertEqual(result["consensus"]["proposed_tests"], [])
+        self.assertFalse(
+            any(item["kind"] == "validation_consensus" for item in result["insights"])
+        )
 
     def test_compare_does_not_claim_identical_empty_patches_or_perfect_empty_paths(self) -> None:
         first = self._start(provider="claude", mode="competitor", task="empty comparison")
