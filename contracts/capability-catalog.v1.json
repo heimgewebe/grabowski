@@ -1473,7 +1473,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Read one candidate lifecycle, including fail-closed pre-manifest start outcomes.",
+      "description": "Read one candidate lifecycle with deterministic phases and fail-closed reconciliation evidence.",
       "effects": [
         "task-state-refresh"
       ],

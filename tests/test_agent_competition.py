@@ -159,7 +159,7 @@ class AgentCompetitionTests(unittest.TestCase):
             "worktree_clean_required": False,
         }
         receipt = {
-            "schema_version": 1,
+            "schema_version": manifest["schema_version"],
             "kind": "external_programming_candidate_receipt",
             "competition_id": identifier,
             "request_id": manifest["request_id"],
@@ -193,6 +193,8 @@ class AgentCompetitionTests(unittest.TestCase):
                 "correctness", "test_pass", "review_pass", "merge_readiness", "preferred_candidate"
             ],
         }
+        if manifest["schema_version"] == 2:
+            receipt["budget_contract"] = manifest["budget_contract"]
         receipt["receipt_sha256"] = competition._sha256_json(receipt)
         competition._atomic_json(self.state / identifier / "receipt.json", receipt)
         return receipt
@@ -722,14 +724,473 @@ class AgentCompetitionTests(unittest.TestCase):
     def test_compare_emits_consensus_and_divergence_without_winner(self) -> None:
         first = self._start(provider="claude", mode="competitor", task="same task")
         second = self._start(provider="agy", mode="contrast", task="same task")
-        self._write_receipt(first["competition_id"], changed_paths=["src/sample.py", "tests/test_sample.py"], risks=["race"], tests=["unit test"])
-        self._write_receipt(second["competition_id"], changed_paths=["src/sample.py"], risks=["race"], tests=["unit test"])
+        self._write_receipt(
+            first["competition_id"],
+            changed_paths=["src/sample.py", "tests/test_sample.py"],
+            risks=["race", "left risk"],
+            tests=["unit test", "left test"],
+        )
+        self._write_receipt(
+            second["competition_id"],
+            changed_paths=["src/sample.py"],
+            risks=["race", "right risk"],
+            tests=["unit test", "right test"],
+        )
         result = competition.grabowski_agent_competition_compare([first["competition_id"], second["competition_id"]])
         self.assertEqual(result["consensus"]["changed_paths"], ["src/sample.py"])
         self.assertEqual(result["divergence"]["changed_paths"], ["tests/test_sample.py"])
         self.assertFalse(result["winner_selected"])
         self.assertFalse(result["automatic_apply"])
+        self.assertEqual(result["schema_version"], 2)
         self.assertIn("unit test", result["consensus"]["proposed_tests"])
+        self.assertIn(
+            "left risk",
+            result["divergence"]["unique_risks_by_candidate"][first["competition_id"]],
+        )
+        self.assertIn(
+            "right test",
+            result["divergence"]["unique_tests_by_candidate"][second["competition_id"]],
+        )
+
+
+    def test_agy_budget_contract_is_explicit_and_hard_requirement_fails_closed(self) -> None:
+        started = self._start(provider="agy")
+        self.assertFalse(started["budget_contract"]["hard_limit"])
+        self.assertEqual(started["budget_contract"]["enforcement"], "not_supported_by_provider")
+        self.assertTrue(started["budget_contract"]["timeout_is_not_budget"])
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "cannot enforce a hard USD budget"):
+            competition.grabowski_agent_competition_start(
+                request_id="agy-hard-budget",
+                provider="agy",
+                mode="contrast",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Review sample",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+                require_hard_budget=True,
+            )
+
+    def test_task_start_exception_reconciles_one_exact_persistent_task(self) -> None:
+        request_id = "reconcile-exact"
+
+        def task_list(*, limit=20, state=None, view="minimal", cursor=None, fields=None):
+            del state, fields
+            self.assertEqual(limit, competition.START_RECONCILE_PAGE_LIMIT)
+            self.assertEqual(view, "standard")
+            self.assertIsNone(cursor)
+            directories = [item for item in self.state.iterdir() if item.is_dir()]
+            self.assertEqual(len(directories), 1)
+            directory = directories[0]
+            intent = json.loads((directory / "start-intent.json").read_text())
+            return {
+                "tasks": [{
+                    "task_id": "reconciled-task",
+                    "host": "heim-pc",
+                    "unit": "grabowski-task-reconciled-task-a1.service",
+                    "attempt": 1,
+                    "state": "running",
+                    "resume_policy": "never",
+                    "argv_sha256": intent["command_sha256"],
+                    "cwd": str(directory),
+                    "resource_keys": [f"path:{directory}"],
+                    "created_at_unix": intent["created_at_unix"],
+                }],
+                "pagination": {"has_more": False, "next_cursor": None},
+            }
+
+        with (
+            mock.patch.object(competition.tasks, "grabowski_task_start", side_effect=RuntimeError("transport lost")),
+            mock.patch.object(competition.tasks, "grabowski_task_list", side_effect=task_list),
+        ):
+            result = competition.grabowski_agent_competition_start(
+                request_id=request_id,
+                provider="claude",
+                mode="competitor",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Improve sample",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+            )
+        self.assertTrue(result["start_reconciled"])
+        self.assertEqual(result["task_id"], "reconciled-task")
+        manifest = competition._validated_manifest(result["competition_id"])
+        self.assertEqual(manifest["task_id"], "reconciled-task")
+
+    def test_ambiguous_task_reconciliation_remains_fail_closed(self) -> None:
+        request_id = "reconcile-ambiguous"
+        task = "Improve sample"
+
+        def task_list(*, limit=20, state=None, view="minimal", cursor=None, fields=None):
+            del state, fields
+            self.assertEqual(limit, competition.START_RECONCILE_PAGE_LIMIT)
+            self.assertEqual(view, "standard")
+            self.assertIsNone(cursor)
+            directory = next(item for item in self.state.iterdir() if item.is_dir())
+            intent = json.loads((directory / "start-intent.json").read_text())
+            base = {
+                "host": "heim-pc",
+                "unit": "u",
+                "attempt": 1,
+                "state": "running",
+                "resume_policy": "never",
+                "argv_sha256": intent["command_sha256"],
+                "cwd": str(directory),
+                "resource_keys": [f"path:{directory}"],
+                "created_at_unix": intent["created_at_unix"],
+            }
+            return {
+                "tasks": [{**base, "task_id": "one"}, {**base, "task_id": "two"}],
+                "pagination": {"has_more": False, "next_cursor": None},
+            }
+
+        with (
+            mock.patch.object(competition.tasks, "grabowski_task_start", side_effect=RuntimeError("transport lost")),
+            mock.patch.object(competition.tasks, "grabowski_task_list", side_effect=task_list),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "transport lost"):
+                competition.grabowski_agent_competition_start(
+                    request_id=request_id,
+                    provider="claude",
+                    mode="competitor",
+                    repository=str(self.repo),
+                    expected_head=self.head,
+                    task=task,
+                    allowed_paths=["src", "tests"],
+                    context_paths=["src/sample.py"],
+                    timeout_seconds=120,
+                )
+            identifier = competition._competition_id(
+                "claude", "competitor", competition._sha256_bytes(task.encode()), request_id
+            )
+            status = competition.grabowski_agent_competition_status(identifier)
+        self.assertEqual(status["start_reconciliation"]["state"], "ambiguous_matches")
+        self.assertTrue(status["retry_blocked"])
+        self.assertEqual(status["lifecycle_state"], "task_start_outcome_unknown")
+
+    def test_reconciliation_uses_standard_paginated_task_contract(self) -> None:
+        started = self._start()
+        identifier = started["competition_id"]
+        directory = self.state / identifier
+        intent = competition._validated_start_intent(identifier)
+        expected = {
+            "task_id": "exact-on-page-two",
+            "host": "heim-pc",
+            "unit": "u",
+            "attempt": 1,
+            "state": "running",
+            "resume_policy": "never",
+            "argv_sha256": intent["command_sha256"],
+            "cwd": str(directory),
+            "resource_keys": [f"path:{directory}"],
+            "created_at_unix": intent["created_at_unix"],
+        }
+        calls: list[dict[str, object]] = []
+
+        def task_list(*, limit=20, state=None, view="minimal", cursor=None, fields=None):
+            del state, fields
+            calls.append({"limit": limit, "view": view, "cursor": cursor})
+            if cursor is None:
+                return {
+                    "tasks": [{
+                        **expected,
+                        "task_id": "newer-unrelated",
+                        "argv_sha256": "f" * 64,
+                        "created_at_unix": intent["created_at_unix"] + 1,
+                    }],
+                    "pagination": {"has_more": True, "next_cursor": "page-two"},
+                }
+            self.assertEqual(cursor, "page-two")
+            return {
+                "tasks": [expected, {**expected, "task_id": "older", "created_at_unix": intent["created_at_unix"] - 1}],
+                "pagination": {"has_more": True, "next_cursor": "unused"},
+            }
+
+        with mock.patch.object(competition.tasks, "grabowski_task_list", side_effect=task_list):
+            result = competition._start_reconciliation(identifier, intent)
+        self.assertEqual(result["state"], "unique_match")
+        self.assertEqual(result["matches"], ["exact-on-page-two"])
+        self.assertEqual(
+            calls,
+            [
+                {"limit": competition.START_RECONCILE_PAGE_LIMIT, "view": "standard", "cursor": None},
+                {"limit": competition.START_RECONCILE_PAGE_LIMIT, "view": "standard", "cursor": "page-two"},
+            ],
+        )
+
+    def test_path_policy_blocks_keys_and_generated_trees_without_tokenizer_false_positive(self) -> None:
+        self.assertFalse(competition._path_is_sensitive("src/tokenizer.py"))
+        self.assertFalse(competition._path_is_sensitive("src/token_count.py"))
+        self.assertTrue(competition._path_is_sensitive("config/service-token.json"))
+        self.assertTrue(competition._path_is_sensitive("certs/server.pem"))
+        self.assertTrue(competition._path_is_sensitive("config/.env.production"))
+        self.assertTrue(competition._path_has_default_forbidden_component("web/node_modules/pkg/index.js"))
+        self.assertTrue(competition._path_has_default_forbidden_component("rust/target/debug/app"))
+        self.assertTrue(competition._path_has_default_forbidden_component("frontend/build/assets/app.js"))
+
+    def test_default_forbidden_allowed_scope_is_rejected(self) -> None:
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "default-forbidden allowed"):
+            competition.grabowski_agent_competition_start(
+                request_id="forbidden-tree",
+                provider="claude",
+                mode="competitor",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="task",
+                allowed_paths=["node_modules"],
+                context_paths=["src/sample.py"],
+            )
+
+    def test_stale_competition_temp_cleanup_is_bounded_and_preserves_fresh_files(self) -> None:
+        directory = self.state / "cleanup"
+        directory.mkdir(mode=0o700)
+        stale = directory / ".manifest.json.1234.aaaaaaaaaaaaaaaa.tmp"
+        fresh = directory / ".packet.json.1234.bbbbbbbbbbbbbbbb.tmp"
+        stale.write_text("old", encoding="utf-8")
+        fresh.write_text("new", encoding="utf-8")
+        stale.chmod(0o600)
+        fresh.chmod(0o600)
+        os.utime(stale, (0, 0))
+        os.utime(fresh, (1000, 1000))
+        result = competition._cleanup_stale_competition_temps(directory, now_unix=1000)
+        self.assertEqual(result, {"inspected": 2, "removed": 1, "errors": 0})
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_manifest_publish_readback_prevents_cancel_of_visible_bound_manifest(self) -> None:
+        original_atomic = competition._atomic_json
+
+        def publish_then_fail(path, value):
+            result = original_atomic(path, value)
+            if path.name == "manifest.json":
+                raise OSError("directory fsync uncertain")
+            return result
+
+        with (
+            mock.patch.object(competition, "_atomic_json", side_effect=publish_then_fail),
+            mock.patch.object(
+                competition.tasks,
+                "grabowski_task_start",
+                return_value=self._task_start("visible-manifest-task"),
+            ),
+            mock.patch.object(competition.tasks, "grabowski_task_cancel") as cancel,
+        ):
+            result = competition.grabowski_agent_competition_start(
+                request_id="manifest-readback",
+                provider="claude",
+                mode="competitor",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Improve sample",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+            )
+        self.assertTrue(result["manifest_publish_readback_recovered"])
+        cancel.assert_not_called()
+
+    def test_status_uses_deterministic_provider_phase(self) -> None:
+        started = self._start()
+        with mock.patch.object(
+            competition.tasks,
+            "grabowski_task_status",
+            return_value={"task_id": started["task_id"], "state": "running", "unit": "u"},
+        ):
+            status = competition.grabowski_agent_competition_status(started["competition_id"])
+        self.assertEqual(status["lifecycle_state"], "provider_running")
+        self.assertEqual(status["phase"], "provider_execution")
+
+    def test_high_novelty_security_alone_does_not_force_external_competition(self) -> None:
+        result = competition.grabowski_agent_execution_route(
+            task_kind="code",
+            changed_file_estimate=1,
+            expected_duration_minutes=5,
+            novelty="high",
+            risk_flags=["security"],
+            available_external_agents=["claude", "agy"],
+        )
+        self.assertEqual(result["execution_mode"], "full_workspace")
+        self.assertEqual(result["external_candidates"], [])
+
+
+    def test_manifest_rejects_packet_schema_mismatch_and_tampered_context_hash(self) -> None:
+        started = self._start()
+        directory = self.state / started["competition_id"]
+        packet_path = directory / "packet.json"
+        manifest_path = directory / "manifest.json"
+        packet = json.loads(packet_path.read_text())
+        manifest = json.loads(manifest_path.read_text())
+        packet["context"][0]["sha256"] = "f" * 64
+        packet["packet_sha256"] = competition._sha256_json(
+            {key: value for key, value in packet.items() if key != "packet_sha256"}
+        )
+        manifest["packet_sha256"] = packet["packet_sha256"]
+        manifest["manifest_sha256"] = competition._sha256_json(
+            {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+        )
+        packet_path.unlink()
+        manifest_path.unlink()
+        competition._atomic_json(packet_path, packet)
+        competition._atomic_json(manifest_path, manifest)
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "hash-mismatched"):
+            competition._validated_manifest(started["competition_id"])
+
+    def test_v2_receipt_rejects_budget_tampering_and_excess_reported_cost(self) -> None:
+        started = self._start(provider="claude")
+        identifier = started["competition_id"]
+        receipt = self._write_receipt(
+            identifier,
+            changed_paths=["src/sample.py"],
+            risks=["budget drift"],
+            tests=["budget contract test"],
+        )
+        path = self.state / identifier / "receipt.json"
+        receipt["budget_contract"] = dict(receipt["budget_contract"])
+        receipt["budget_contract"]["requested_max_usd"] = 3.0
+        receipt["receipt_sha256"] = competition._sha256_json(
+            {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        )
+        path.unlink()
+        competition._atomic_json(path, receipt)
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "budget"):
+            competition._receipt(identifier)
+
+        path.unlink()
+        receipt["budget_contract"] = started["budget_contract"]
+        receipt["total_cost_usd"] = 3.0
+        receipt["receipt_sha256"] = competition._sha256_json(
+            {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        )
+        competition._atomic_json(path, receipt)
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "total_cost_usd"):
+            competition._receipt(identifier)
+
+    def test_reconciliation_rejects_wrong_host_and_pre_intent_task(self) -> None:
+        started = self._start()
+        identifier = started["competition_id"]
+        directory = self.state / identifier
+        intent = competition._validated_start_intent(identifier)
+        wrong = {
+            "task_id": "wrong-host",
+            "host": "other-host",
+            "unit": "u",
+            "attempt": 1,
+            "state": "running",
+            "resume_policy": "never",
+            "argv_sha256": intent["command_sha256"],
+            "cwd": str(directory),
+            "resource_keys": [f"path:{directory}"],
+            "created_at_unix": intent["created_at_unix"],
+        }
+        early = {**wrong, "task_id": "too-early", "host": "heim-pc", "created_at_unix": intent["created_at_unix"] - 1}
+        with mock.patch.object(
+            competition.tasks,
+            "grabowski_task_list",
+            return_value={
+                "tasks": [wrong, early],
+                "pagination": {"has_more": False, "next_cursor": None},
+            },
+        ):
+            result = competition._start_reconciliation(identifier, intent)
+        self.assertEqual(result["state"], "no_match")
+        self.assertEqual(result["matches"], [])
+
+
+    def test_existing_v1_manifest_remains_idempotently_readable(self) -> None:
+        started = self._start(provider="claude", mode="competitor", task="legacy task")
+        identifier = started["competition_id"]
+        directory = self.state / identifier
+        packet_path = directory / "packet.json"
+        intent_path = directory / "start-intent.json"
+        manifest_path = directory / "manifest.json"
+        packet = json.loads(packet_path.read_text())
+        intent = json.loads(intent_path.read_text())
+        manifest = json.loads(manifest_path.read_text())
+        legacy_contract = {
+            "request_id": packet["request_id"],
+            "provider": packet["provider"],
+            "mode": packet["mode"],
+            "repository": packet["repository"],
+            "expected_head": packet["expected_head"],
+            "task_sha256": packet["task_sha256"],
+            "runner_sha256": packet["runner_sha256"],
+            "task": packet["task"],
+            "allowed_paths": packet["allowed_paths"],
+            "forbidden_paths": packet["forbidden_paths"],
+            "context": [
+                {"path": item["path"], "sha256": item["sha256"]}
+                for item in packet["context"]
+            ],
+            "primary_summary": packet["primary_summary"],
+            "timeout_seconds": 120,
+            "max_budget_usd": 2.0,
+        }
+        legacy_fingerprint = competition._sha256_json(legacy_contract)
+        packet["schema_version"] = 1
+        packet.pop("budget_contract")
+        packet["request_fingerprint"] = legacy_fingerprint
+        packet["packet_sha256"] = competition._sha256_json(
+            {key: value for key, value in packet.items() if key != "packet_sha256"}
+        )
+        intent["schema_version"] = 1
+        intent.pop("created_at_unix")
+        intent["request_fingerprint"] = legacy_fingerprint
+        intent["packet_sha256"] = packet["packet_sha256"]
+        intent["start_intent_sha256"] = competition._sha256_json(
+            {key: value for key, value in intent.items() if key != "start_intent_sha256"}
+        )
+        manifest["schema_version"] = 1
+        manifest.pop("budget_contract")
+        manifest["request_fingerprint"] = legacy_fingerprint
+        manifest["packet_sha256"] = packet["packet_sha256"]
+        manifest["start_intent_sha256"] = intent["start_intent_sha256"]
+        manifest["manifest_sha256"] = competition._sha256_json(
+            {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+        )
+        for path, value in (
+            (packet_path, packet),
+            (intent_path, intent),
+            (manifest_path, manifest),
+        ):
+            path.unlink()
+            competition._atomic_json(path, value)
+        with mock.patch.object(competition.tasks, "grabowski_task_start") as start:
+            repeated = competition.grabowski_agent_competition_start(
+                request_id="test-claude-competitor",
+                provider="claude",
+                mode="competitor",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="legacy task",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py", "tests/test_sample.py"],
+                forbidden_paths=[],
+                timeout_seconds=120,
+            )
+        start.assert_not_called()
+        self.assertTrue(repeated["already_started"])
+        self.assertIsNone(repeated["budget_contract"])
+        self.assertEqual(competition._validated_manifest(identifier)["schema_version"], 1)
+
+
+    def test_read_only_status_does_not_cleanup_stale_state_temps(self) -> None:
+        started = self._start()
+        directory = self.state / started["competition_id"]
+        stale = directory / ".status.json.1234.aaaaaaaaaaaaaaaa.tmp"
+        stale.write_text("old", encoding="utf-8")
+        stale.chmod(0o600)
+        os.utime(stale, (0, 0))
+        with mock.patch.object(
+            competition.tasks,
+            "grabowski_task_status",
+            return_value={"task_id": started["task_id"], "state": "running", "unit": "u"},
+        ):
+            status = competition.grabowski_agent_competition_status(started["competition_id"])
+        self.assertEqual(status["phase"], "provider_execution")
+        self.assertTrue(stale.exists())
 
 
 if __name__ == "__main__":

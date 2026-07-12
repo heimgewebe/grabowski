@@ -39,19 +39,36 @@ RISK_FLAGS = {
     "security", "runtime", "deployment", "schema", "concurrency", "data_migration",
     "privilege", "external_api", "cross_repo", "destructive", "user_data",
 }
-SENSITIVE_PARTS = {
-    ".env", "secret", "secrets", "credential", "credentials", "token", "tokens",
-    "private_key", "id_rsa", "id_ed25519", "cookies", "login data", "web data",
-}
+DEFAULT_FORBIDDEN_COMPONENTS = frozenset({
+    ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox", "build", "dist", "target",
+})
+SENSITIVE_EXACT_COMPONENTS = frozenset({
+    "secret", "secrets", "credential", "credentials", "private_key", "cookies",
+    "login data", "web data", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+})
+SENSITIVE_NAME_TOKENS = frozenset({"secret", "secrets", "token", "tokens", "credential", "credentials"})
+SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".kdbx")
+SOURCE_CODE_SUFFIXES = frozenset({
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".kts", ".go",
+    ".rs", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".rb", ".php", ".swift",
+    ".scala", ".sh", ".bash", ".zsh", ".fish", ".sql", ".css", ".scss", ".html",
+})
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
+TEMP_STATE_RE = re.compile(r"^\.(?P<target>[A-Za-z0-9._-]{1,100})\.(?P<pid>[0-9]+)\.(?P<nonce>[0-9a-f]{16})\.tmp$")
 MAX_CONTEXT_BYTES = 500_000
 MAX_CONTEXT_FILE_BYTES = 120_000
 MAX_RECEIPT_BYTES = 2_000_000
 MAX_RUNNER_BYTES = 2_000_000
 REQUEST_LOCK_TIMEOUT_SECONDS = 10.0
 REQUEST_LOCK_POLL_SECONDS = 0.05
+START_RECONCILE_WINDOW_SECONDS = 300
+START_RECONCILE_PAGE_LIMIT = 100
+START_RECONCILE_MAX_PAGES = 5
+COMPETITION_TEMP_STALE_SECONDS = 300
+COMPETITION_TEMP_SWEEP_LIMIT = 64
 
 
 class AgentCompetitionError(ValueError):
@@ -73,6 +90,125 @@ def _sha256_json(value: Any) -> str:
 def _strict_bool(value: Any, label: str) -> bool:
     if type(value) is not bool:
         raise AgentCompetitionError(f"{label} must be boolean")
+    return value
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _cleanup_stale_competition_temps(
+    directory: Path,
+    *,
+    now_unix: int | None = None,
+) -> dict[str, int]:
+    current = int(time.time()) if now_unix is None else now_unix
+    inspected = 0
+    removed = 0
+    errors = 0
+    try:
+        metadata = directory.lstat()
+    except OSError:
+        return {"inspected": 0, "removed": 0, "errors": 1}
+    if directory.is_symlink() or not stat.S_ISDIR(metadata.st_mode) or metadata.st_mode & 0o077:
+        return {"inspected": 0, "removed": 0, "errors": 1}
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(directory, flags)
+    except OSError:
+        return {"inspected": 0, "removed": 0, "errors": 1}
+    changed = False
+    try:
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                if inspected >= COMPETITION_TEMP_SWEEP_LIMIT:
+                    break
+                match = TEMP_STATE_RE.fullmatch(entry.name)
+                if match is None:
+                    continue
+                inspected += 1
+                try:
+                    temp_status = entry.stat(follow_symlinks=False)
+                    if (
+                        not entry.is_file(follow_symlinks=False)
+                        or temp_status.st_uid != os.getuid()
+                        or stat.S_IMODE(temp_status.st_mode) != 0o600
+                        or current - int(temp_status.st_mtime) < COMPETITION_TEMP_STALE_SECONDS
+                    ):
+                        continue
+                    target_name = match.group("target")
+                    try:
+                        target_status = os.stat(target_name, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        target_status = None
+                    if target_status is not None and not stat.S_ISREG(target_status.st_mode):
+                        continue
+                    os.unlink(entry.name, dir_fd=directory_fd)
+                    removed += 1
+                    changed = True
+                except OSError:
+                    errors += 1
+        if changed:
+            os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return {"inspected": inspected, "removed": removed, "errors": errors}
+
+
+def _budget_contract(
+    provider: str,
+    max_budget_usd: float,
+    *,
+    hard_limit_required: bool,
+) -> dict[str, Any]:
+    hard_limit = provider == "claude"
+    if hard_limit_required and not hard_limit:
+        raise AgentCompetitionError(
+            f"provider {provider} cannot enforce a hard USD budget; choose Claude or disable hard budget enforcement"
+        )
+    return {
+        "requested_max_usd": float(max_budget_usd),
+        "enforcement": "provider_cli_hard_limit" if hard_limit else "not_supported_by_provider",
+        "hard_limit": hard_limit,
+        "hard_limit_required": hard_limit_required,
+        "timeout_is_not_budget": not hard_limit,
+    }
+
+
+def _validate_budget_contract(value: Any, *, provider: str) -> dict[str, Any]:
+    required = {
+        "requested_max_usd", "enforcement", "hard_limit",
+        "hard_limit_required", "timeout_is_not_budget",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise AgentCompetitionError("candidate budget contract shape is invalid")
+    requested = value["requested_max_usd"]
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, (int, float))
+        or not math.isfinite(float(requested))
+        or not 0 < float(requested) <= 10
+    ):
+        raise AgentCompetitionError("candidate budget contract amount is invalid")
+    expected_hard = provider == "claude"
+    expected_enforcement = "provider_cli_hard_limit" if expected_hard else "not_supported_by_provider"
+    if (
+        value["enforcement"] != expected_enforcement
+        or value["hard_limit"] is not expected_hard
+        or type(value["hard_limit_required"]) is not bool
+        or value["timeout_is_not_budget"] is not (not expected_hard)
+        or (value["hard_limit_required"] and not expected_hard)
+    ):
+        raise AgentCompetitionError("candidate budget contract semantics are invalid")
     return value
 
 
@@ -146,6 +282,7 @@ def _atomic_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     parent_metadata = path.parent.lstat()
     if path.parent.is_symlink() or not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_mode & 0o077:
         raise AgentCompetitionError("state parent must be a private non-symlink directory")
+    _cleanup_stale_competition_temps(path.parent)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
     descriptor = os.open(
         temporary,
@@ -153,6 +290,7 @@ def _atomic_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
         mode,
     )
     published = False
+    temporary_metadata: os.stat_result | None = None
     try:
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             descriptor = -1
@@ -165,8 +303,10 @@ def _atomic_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
         except FileExistsError as exc:
             raise AgentCompetitionError(f"state file already exists: {path.name}") from exc
         published = True
+        _fsync_directory(path.parent)
         try:
             os.unlink(temporary)
+            _fsync_directory(path.parent)
         except OSError:
             published_metadata = path.lstat()
             if (
@@ -175,6 +315,7 @@ def _atomic_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
             ):
                 os.unlink(path)
                 published = False
+                _fsync_directory(path.parent)
             raise
         metadata = path.lstat()
         if (
@@ -190,6 +331,7 @@ def _atomic_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
                 if current.st_dev == temporary_metadata.st_dev and current.st_ino == temporary_metadata.st_ino:
                     os.unlink(path)
                     published = False
+                    _fsync_directory(path.parent)
             except FileNotFoundError:
                 published = False
             raise AgentCompetitionError("published state file failed inode integrity validation")
@@ -198,6 +340,7 @@ def _atomic_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
             os.close(descriptor)
         try:
             os.unlink(temporary)
+            _fsync_directory(path.parent)
         except FileNotFoundError:
             pass
         if published:
@@ -207,10 +350,12 @@ def _atomic_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
                 raise AgentCompetitionError("published state file disappeared") from exc
             if metadata.st_nlink != 1:
                 if (
-                    metadata.st_dev == temporary_metadata.st_dev
+                    temporary_metadata is not None
+                    and metadata.st_dev == temporary_metadata.st_dev
                     and metadata.st_ino == temporary_metadata.st_ino
                 ):
                     os.unlink(path)
+                    _fsync_directory(path.parent)
                 raise AgentCompetitionError("published state file did not retain single-link integrity")
 
 
@@ -362,9 +507,23 @@ def _path_in_scope(path: str, roots: list[str]) -> bool:
     return any(item == PurePosixPath(root) or PurePosixPath(root) in item.parents for root in roots)
 
 
+def _path_has_default_forbidden_component(path: str) -> bool:
+    return any(part.casefold() in DEFAULT_FORBIDDEN_COMPONENTS for part in PurePosixPath(path).parts)
+
+
 def _path_is_sensitive(path: str) -> bool:
-    lower = path.lower()
-    return any(part in lower for part in SENSITIVE_PARTS)
+    for raw_part in PurePosixPath(path).parts:
+        part = raw_part.casefold()
+        if part == ".env" or part.startswith(".env."):
+            return True
+        if part in SENSITIVE_EXACT_COMPONENTS or part.endswith(SENSITIVE_SUFFIXES):
+            return True
+        suffix = PurePosixPath(part).suffix
+        stem = part.rsplit(".", 1)[0]
+        tokens = {token for token in re.split(r"[^a-z0-9]+", stem) if token}
+        if suffix not in SOURCE_CODE_SUFFIXES and tokens & SENSITIVE_NAME_TOKENS:
+            return True
+    return False
 
 
 def _repository(repository: str, expected_head: str) -> tuple[Path, str]:
@@ -403,6 +562,8 @@ def _context(
         seen.add(relative)
         if not _path_in_scope(relative, allowed) or _path_in_scope(relative, forbidden):
             raise AgentCompetitionError(f"context path is outside declared scope: {relative}")
+        if _path_has_default_forbidden_component(relative):
+            raise AgentCompetitionError(f"default-forbidden context path is not exportable: {relative}")
         if _path_is_sensitive(relative):
             raise AgentCompetitionError(f"sensitive-looking context path is not exportable: {relative}")
         raw_bytes = _commit_blob(repo, head, relative)
@@ -436,11 +597,13 @@ def _validated_start_intent(identifier: str) -> dict[str, Any]:
         _competition_dir(identifier) / "start-intent.json",
         label="competition start intent",
     )
-    required = {
+    common = {
         "schema_version", "kind", "competition_id", "request_id", "request_fingerprint",
         "packet_sha256", "command_sha256", "created_at", "state", "start_intent_sha256",
     }
-    if set(intent) != required:
+    version = intent.get("schema_version")
+    required = common if version == 1 else common | {"created_at_unix"}
+    if version not in {1, 2} or set(intent) != required:
         raise AgentCompetitionError("competition start intent shape is invalid")
     observed_hash = intent["start_intent_sha256"]
     unsigned = {key: value for key, value in intent.items() if key != "start_intent_sha256"}
@@ -448,7 +611,6 @@ def _validated_start_intent(identifier: str) -> dict[str, Any]:
         not isinstance(observed_hash, str)
         or SHA256_RE.fullmatch(observed_hash) is None
         or observed_hash != _sha256_json(unsigned)
-        or intent["schema_version"] != 1
         or intent["kind"] != "external_programming_competition_start_intent"
         or intent["competition_id"] != identifier
         or not isinstance(intent["request_id"], str)
@@ -458,6 +620,12 @@ def _validated_start_intent(identifier: str) -> dict[str, Any]:
         or not intent["created_at"].strip()
     ):
         raise AgentCompetitionError("competition start intent contract is invalid")
+    if version == 2 and (
+        isinstance(intent["created_at_unix"], bool)
+        or not isinstance(intent["created_at_unix"], int)
+        or intent["created_at_unix"] <= 0
+    ):
+        raise AgentCompetitionError("competition start intent created_at_unix is invalid")
     for field in ("request_fingerprint", "packet_sha256", "command_sha256"):
         value = intent[field]
         if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
@@ -540,21 +708,233 @@ def _validated_start_outcome(identifier: str, intent: dict[str, Any]) -> dict[st
     return outcome
 
 
+def _validated_packet(identifier: str) -> dict[str, Any]:
+    packet = _load_private_json(_competition_dir(identifier) / "packet.json", label="candidate packet")
+    common = {
+        "schema_version", "kind", "competition_id", "request_id", "request_fingerprint",
+        "provider", "mode", "repository", "expected_head", "task", "task_sha256",
+        "runner_sha256", "allowed_paths", "forbidden_paths", "context", "primary_summary",
+        "packet_nonce", "created_at", "packet_sha256",
+    }
+    version = packet.get("schema_version")
+    required = common if version == 1 else common | {"budget_contract"}
+    if version not in {1, 2} or set(packet) != required:
+        raise AgentCompetitionError("candidate packet shape is invalid")
+    packet_hash = packet["packet_sha256"]
+    unsigned_packet = {key: value for key, value in packet.items() if key != "packet_sha256"}
+    if (
+        not isinstance(packet_hash, str)
+        or SHA256_RE.fullmatch(packet_hash) is None
+        or packet_hash != _sha256_json(unsigned_packet)
+        or packet["kind"] != "external_programming_candidate_packet"
+        or packet["competition_id"] != identifier
+        or packet["provider"] not in PROVIDERS
+        or packet["mode"] not in MODES
+        or not isinstance(packet["request_id"], str)
+        or REQUEST_ID_RE.fullmatch(packet["request_id"]) is None
+        or not isinstance(packet["request_fingerprint"], str)
+        or SHA256_RE.fullmatch(packet["request_fingerprint"]) is None
+        or not isinstance(packet["expected_head"], str)
+        or SHA40_RE.fullmatch(packet["expected_head"]) is None
+        or not isinstance(packet["runner_sha256"], str)
+        or SHA256_RE.fullmatch(packet["runner_sha256"]) is None
+    ):
+        raise AgentCompetitionError("candidate packet contract is invalid")
+    task = packet["task"]
+    if (
+        not isinstance(task, str)
+        or not task.strip()
+        or len(task.encode("utf-8")) > 16_000
+        or not isinstance(packet["task_sha256"], str)
+        or SHA256_RE.fullmatch(packet["task_sha256"]) is None
+        or packet["task_sha256"] != _sha256_bytes(task.encode("utf-8"))
+    ):
+        raise AgentCompetitionError("candidate packet task binding is invalid")
+    repository = packet["repository"]
+    if (
+        not isinstance(repository, str)
+        or "\x00" in repository
+        or not Path(repository).is_absolute()
+    ):
+        raise AgentCompetitionError("candidate packet repository is invalid")
+    allowed = _scope(packet["allowed_paths"], label="candidate packet allowed_paths", nonempty=True)
+    forbidden = _scope(packet["forbidden_paths"], label="candidate packet forbidden_paths", nonempty=False)
+    rejected_allowed = [
+        path for path in allowed
+        if _path_has_default_forbidden_component(path) or _path_is_sensitive(path)
+    ]
+    if rejected_allowed:
+        raise AgentCompetitionError(f"candidate packet allowed paths are non-exportable: {rejected_allowed}")
+    context = packet["context"]
+    if not isinstance(context, list) or not 1 <= len(context) <= 40:
+        raise AgentCompetitionError("candidate packet context size is invalid")
+    total_context = 0
+    seen: set[str] = set()
+    for index, item in enumerate(context):
+        if not isinstance(item, dict) or set(item) != {"path", "sha256", "text"}:
+            raise AgentCompetitionError(f"candidate packet context item is invalid: {index}")
+        path = _normalize_relative(item["path"], label=f"candidate packet context[{index}].path")
+        if path in seen:
+            raise AgentCompetitionError("candidate packet context paths contain duplicates")
+        seen.add(path)
+        if not _path_in_scope(path, allowed) or _path_in_scope(path, forbidden):
+            raise AgentCompetitionError(f"candidate packet context path is outside scope: {path}")
+        if _path_has_default_forbidden_component(path) or _path_is_sensitive(path):
+            raise AgentCompetitionError(f"candidate packet context path is non-exportable: {path}")
+        text = item["text"]
+        digest = item["sha256"]
+        if (
+            not isinstance(text, str)
+            or not isinstance(digest, str)
+            or SHA256_RE.fullmatch(digest) is None
+        ):
+            raise AgentCompetitionError(f"candidate packet context content is invalid: {path}")
+        raw = text.encode("utf-8")
+        total_context += len(raw)
+        if (
+            len(raw) > MAX_CONTEXT_FILE_BYTES
+            or total_context > MAX_CONTEXT_BYTES
+            or digest != _sha256_bytes(raw)
+        ):
+            raise AgentCompetitionError("candidate packet context content is too large or hash-mismatched")
+    summary = packet["primary_summary"]
+    nonce = packet["packet_nonce"]
+    if (
+        not isinstance(summary, str)
+        or "\x00" in summary
+        or len(summary.encode("utf-8")) > 32_000
+        or not isinstance(nonce, str)
+        or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+        or not isinstance(packet["created_at"], str)
+        or not packet["created_at"].strip()
+    ):
+        raise AgentCompetitionError("candidate packet auxiliary fields are invalid")
+    if version == 2:
+        _validate_budget_contract(packet["budget_contract"], provider=packet["provider"])
+    return {**packet, "allowed_paths": allowed, "forbidden_paths": forbidden}
+
+
+def _start_reconciliation(identifier: str, intent: dict[str, Any]) -> dict[str, Any]:
+    if intent.get("schema_version") != 2:
+        return {"state": "legacy_intent_not_reconcilable", "matches": [], "task": None}
+    expected_created = intent["created_at_unix"]
+    directory = _competition_dir(identifier)
+    expected_resource = f"path:{directory}"
+    matches: list[dict[str, Any]] = []
+    cursor: str | None = None
+    scan_complete = False
+    for _page in range(START_RECONCILE_MAX_PAGES):
+        try:
+            listed = tasks.grabowski_task_list(
+                limit=START_RECONCILE_PAGE_LIMIT,
+                view="standard",
+                cursor=cursor,
+            )
+        except Exception:
+            return {"state": "task_registry_unavailable", "matches": [], "task": None}
+        records = listed.get("tasks") if isinstance(listed, dict) else None
+        pagination = listed.get("pagination") if isinstance(listed, dict) else None
+        if not isinstance(records, list) or not isinstance(pagination, dict):
+            return {"state": "task_registry_invalid", "matches": [], "task": None}
+        reached_lower_bound = False
+        for record in records:
+            if not isinstance(record, dict):
+                return {"state": "task_registry_invalid", "matches": [], "task": None}
+            created = record.get("created_at_unix")
+            if isinstance(created, bool) or not isinstance(created, int):
+                return {"state": "task_registry_invalid", "matches": [], "task": None}
+            if created < expected_created:
+                reached_lower_bound = True
+                continue
+            resources = record.get("resource_keys")
+            if (
+                record.get("host") == "heim-pc"
+                and record.get("resume_policy") == "never"
+                and record.get("argv_sha256") == intent["command_sha256"]
+                and record.get("cwd") == str(directory)
+                and resources == [expected_resource]
+                and created <= expected_created + START_RECONCILE_WINDOW_SECONDS
+                and isinstance(record.get("task_id"), str)
+                and record["task_id"]
+            ):
+                matches.append(record)
+        has_more = pagination.get("has_more")
+        next_cursor = pagination.get("next_cursor")
+        if type(has_more) is not bool:
+            return {"state": "task_registry_invalid", "matches": [], "task": None}
+        if reached_lower_bound or not has_more:
+            scan_complete = True
+            break
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            return {"state": "task_registry_invalid", "matches": [], "task": None}
+        cursor = next_cursor
+    if not scan_complete:
+        return {
+            "state": "scan_limit_exceeded",
+            "matches": [item["task_id"] for item in matches],
+            "task": None,
+        }
+    if len(matches) == 1:
+        return {"state": "unique_match", "matches": [matches[0]["task_id"]], "task": matches[0]}
+    return {
+        "state": "no_match" if not matches else "ambiguous_matches",
+        "matches": [item["task_id"] for item in matches],
+        "task": None,
+    }
+
+
+def _manifest_from_task(
+    identifier: str,
+    packet: dict[str, Any],
+    intent: dict[str, Any],
+    task_record: dict[str, Any],
+) -> dict[str, Any]:
+    task_id = task_record.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise AgentCompetitionError("reconciled durable task identity is invalid")
+    manifest: dict[str, Any] = {
+        "schema_version": 2 if packet["schema_version"] == 2 else 1,
+        "kind": "external_programming_competition_manifest",
+        "competition_id": identifier,
+        "request_id": packet["request_id"],
+        "request_fingerprint": packet["request_fingerprint"],
+        "provider": packet["provider"],
+        "mode": packet["mode"],
+        "repository": packet["repository"],
+        "expected_head": packet["expected_head"],
+        "task_sha256": packet["task_sha256"],
+        "packet_sha256": packet["packet_sha256"],
+        "runner_sha256": packet["runner_sha256"],
+        "start_intent_sha256": intent["start_intent_sha256"],
+        "task_id": task_id,
+        "task_unit": task_record.get("unit"),
+        "created_at": workspace._utc(),
+        "authority": "advisory_only",
+        "automatic_apply": False,
+    }
+    if packet["schema_version"] == 2:
+        manifest["budget_contract"] = packet["budget_contract"]
+    manifest["manifest_sha256"] = _sha256_json(manifest)
+    return manifest
+
+
 def _validated_manifest(identifier: str) -> dict[str, Any]:
     manifest = _load_private_json(_competition_dir(identifier) / "manifest.json", label="competition manifest")
-    required = {
+    common = {
         "schema_version", "kind", "competition_id", "request_id", "request_fingerprint",
         "provider", "mode", "repository", "expected_head", "task_sha256", "packet_sha256",
         "runner_sha256", "start_intent_sha256", "task_id", "task_unit", "created_at", "authority",
         "automatic_apply", "manifest_sha256",
     }
-    if set(manifest) != required:
+    version = manifest.get("schema_version")
+    required = common if version == 1 else common | {"budget_contract"}
+    if version not in {1, 2} or set(manifest) != required:
         raise AgentCompetitionError("competition manifest shape is invalid")
     observed_hash = manifest["manifest_sha256"]
     unsigned = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
     if not isinstance(observed_hash, str) or SHA256_RE.fullmatch(observed_hash) is None or observed_hash != _sha256_json(unsigned):
         raise AgentCompetitionError("competition manifest hash is invalid")
-    if manifest["schema_version"] != 1 or manifest["kind"] != "external_programming_competition_manifest":
+    if manifest["kind"] != "external_programming_competition_manifest":
         raise AgentCompetitionError("competition manifest contract is invalid")
     if (
         manifest["competition_id"] != identifier
@@ -574,11 +954,9 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
         value = manifest[field]
         if not isinstance(value, str) or pattern.fullmatch(value) is None:
             raise AgentCompetitionError(f"competition manifest {field} is invalid")
-    packet = _load_private_json(_competition_dir(identifier) / "packet.json", label="candidate packet")
-    packet_hash = packet.get("packet_sha256")
-    unsigned_packet = {key: value for key, value in packet.items() if key != "packet_sha256"}
-    if not isinstance(packet_hash, str) or packet_hash != _sha256_json(unsigned_packet):
-        raise AgentCompetitionError("candidate packet hash is invalid")
+    if version == 2:
+        _validate_budget_contract(manifest["budget_contract"], provider=manifest["provider"])
+    packet = _validated_packet(identifier)
     bindings = {
         "competition_id": identifier,
         "request_id": manifest["request_id"],
@@ -594,6 +972,10 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
     for field, expected in bindings.items():
         if packet.get(field) != expected:
             raise AgentCompetitionError(f"candidate packet binding mismatch: {field}")
+    if packet["schema_version"] != version:
+        raise AgentCompetitionError("candidate packet schema does not match manifest")
+    if version == 2 and packet.get("budget_contract") != manifest["budget_contract"]:
+        raise AgentCompetitionError("candidate packet budget binding mismatch")
     directory = _validate_competition_directory(_competition_dir(identifier))
     frozen_runner = _load_regular_bytes(
         directory / "runner.py",
@@ -613,7 +995,6 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
     ):
         raise AgentCompetitionError("competition start intent binding is invalid")
     return manifest
-
 
 
 def _receipt_patch_paths(patch: str) -> list[str]:
@@ -703,6 +1084,8 @@ def _validate_receipt_candidate(candidate: Any, packet: dict[str, Any]) -> dict[
     for path in changed_paths:
         if not _path_in_scope(path, allowed) or _path_in_scope(path, forbidden):
             raise AgentCompetitionError(f"candidate receipt changed path is outside scope: {path}")
+        if _path_has_default_forbidden_component(path) or _path_is_sensitive(path):
+            raise AgentCompetitionError(f"candidate receipt changed path is non-exportable: {path}")
     patch = candidate["patch"]
     patch_hash = candidate["patch_sha256"]
     if not isinstance(patch, str) or len(patch.encode("utf-8")) > 300_000:
@@ -721,6 +1104,9 @@ def _validate_receipt_candidate(candidate: Any, packet: dict[str, Any]) -> dict[
         raise AgentCompetitionError("candidate receipt patch_paths do not match patch headers")
     if not set(parsed_patch_paths).issubset(set(changed_paths)):
         raise AgentCompetitionError("candidate receipt patch paths are not declared in changed_paths")
+    for path in parsed_patch_paths:
+        if _path_has_default_forbidden_component(path) or _path_is_sensitive(path):
+            raise AgentCompetitionError(f"candidate receipt patch path is non-exportable: {path}")
     patch_check = candidate["patch_check"]
     if (
         not isinstance(patch_check, dict)
@@ -846,12 +1232,25 @@ def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any])
         or not required_nonclaims.issubset(set(does_not_establish))
     ):
         raise AgentCompetitionError("candidate receipt nonclaims are invalid")
+    budget_contract = None
+    if receipt.get("schema_version") == 2:
+        budget_contract = _validate_budget_contract(
+            receipt.get("budget_contract"),
+            provider=receipt["provider"],
+        )
+        if packet.get("budget_contract") != budget_contract:
+            raise AgentCompetitionError("candidate receipt budget binding mismatch")
     total_cost = receipt.get("total_cost_usd")
     if total_cost is not None and (
         isinstance(total_cost, bool)
         or not isinstance(total_cost, (int, float))
         or not math.isfinite(float(total_cost))
         or not 0 <= float(total_cost) <= 100
+        or (
+            budget_contract is not None
+            and budget_contract["hard_limit"]
+            and float(total_cost) > float(budget_contract["requested_max_usd"]) + 1e-9
+        )
     ):
         raise AgentCompetitionError("candidate receipt total_cost_usd is invalid")
 
@@ -866,7 +1265,7 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
     unsigned = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
     if not isinstance(observed_hash, str) or SHA256_RE.fullmatch(observed_hash) is None or observed_hash != _sha256_json(unsigned):
         raise AgentCompetitionError("candidate receipt hash is invalid")
-    required = {
+    common = {
         "schema_version", "kind", "competition_id", "request_id", "request_fingerprint",
         "provider", "mode", "repository", "expected_head", "task_sha256", "packet_sha256",
         "runner_sha256", "prompt_sha256", "provider_version", "command_shape",
@@ -875,12 +1274,16 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
         "automatic_apply", "automatic_commit", "automatic_merge", "automatic_deploy",
         "does_not_establish", "receipt_sha256",
     }
+    version = receipt.get("schema_version")
+    required = common if version == 1 else common | {"budget_contract"}
     allowed = required | {"total_cost_usd", "output_wrapper"}
     receipt_fields = set(receipt)
-    if not required <= receipt_fields <= allowed:
+    if version not in {1, 2} or not required <= receipt_fields <= allowed:
         raise AgentCompetitionError("candidate receipt shape is invalid")
-    if receipt["schema_version"] != 1 or receipt["kind"] != "external_programming_candidate_receipt":
+    if receipt["kind"] != "external_programming_candidate_receipt":
         raise AgentCompetitionError("candidate receipt contract is invalid")
+    if version != bound_manifest["schema_version"]:
+        raise AgentCompetitionError("candidate receipt schema does not match manifest")
     bindings = {
         "competition_id": identifier,
         "request_id": bound_manifest["request_id"],
@@ -896,6 +1299,8 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
     for field, expected in bindings.items():
         if receipt.get(field) != expected:
             raise AgentCompetitionError(f"candidate receipt binding mismatch: {field}")
+    if version == 2 and receipt["budget_contract"] != bound_manifest["budget_contract"]:
+        raise AgentCompetitionError("candidate receipt budget does not match manifest")
     if receipt["authority"] != "advisory_only" or any(
         receipt[field] is not False
         for field in ("automatic_apply", "automatic_commit", "automatic_merge", "automatic_deploy")
@@ -906,16 +1311,10 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
         if (
             not isinstance(wrapper, dict)
             or set(wrapper) != {
-                "kind",
-                "discarded_prefix_bytes",
-                "discarded_suffix_bytes",
-                "discarded_wrapper_sha256",
+                "kind", "discarded_prefix_bytes", "discarded_suffix_bytes", "discarded_wrapper_sha256",
             }
             or wrapper["kind"] not in {
-                "provider_envelope",
-                "none",
-                "exact_json_fence",
-                "single_json_fence_with_discarded_wrapper",
+                "provider_envelope", "none", "exact_json_fence", "single_json_fence_with_discarded_wrapper",
             }
             or isinstance(wrapper["discarded_prefix_bytes"], bool)
             or not isinstance(wrapper["discarded_prefix_bytes"], int)
@@ -928,10 +1327,7 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
         ):
             raise AgentCompetitionError("candidate receipt output wrapper is invalid")
     directory = _validate_competition_directory(_competition_dir(identifier))
-    packet = _load_private_json(
-        directory / "packet.json",
-        label="candidate packet",
-    )
+    packet = _validated_packet(identifier)
     provider_workspace = _validate_competition_directory(directory / "provider-workspace")
     entries = sorted(item.name for item in provider_workspace.iterdir())
     if entries != ["prompt.txt"]:
@@ -939,7 +1335,7 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
     prompt = _load_regular_bytes(
         provider_workspace / "prompt.txt",
         label="candidate provider prompt",
-        max_bytes=500_000,
+        max_bytes=750_000,
         required_mode=0o600,
     )
     if _sha256_bytes(prompt) != receipt["prompt_sha256"]:
@@ -947,7 +1343,6 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
     _validate_receipt_execution(receipt, packet)
     _validate_receipt_candidate(receipt["candidate"], packet)
     return receipt
-
 
 
 def _route_score(
@@ -1043,9 +1438,19 @@ def grabowski_agent_execution_route(
         mode = "isolated_worktree"
     elif score <= 6 and not external_requested:
         mode = "full_workspace"
-    elif (external_requested or design_space) and len(external_available) >= 2:
+    elif (
+        len(external_available) >= 2
+        and (external_requested or (design_space and score >= 9))
+    ):
         mode = "workspace_with_competition"
-    elif (external_requested or score >= 7) and external_available:
+    elif (
+        external_available
+        and (
+            external_requested
+            or (design_space and score >= 8)
+            or score >= 10
+        )
+    ):
         mode = "workspace_with_contrast"
     else:
         mode = "full_workspace"
@@ -1103,6 +1508,7 @@ def grabowski_agent_competition_start(
     primary_summary: str = "",
     timeout_seconds: int = 900,
     max_budget_usd: float = 2.0,
+    require_hard_budget: bool = False,
 ) -> dict[str, Any]:
     """Start one durable advisory-only external competitor or contrast programmer."""
     operator._require_operator_mutation("durable_job")
@@ -1118,6 +1524,12 @@ def grabowski_agent_competition_start(
         raise AgentCompetitionError("timeout_seconds must be between 30 and 3600")
     if isinstance(max_budget_usd, bool) or not isinstance(max_budget_usd, (int, float)) or not 0 < float(max_budget_usd) <= 10:
         raise AgentCompetitionError("max_budget_usd must be in (0, 10]")
+    hard_budget_required = _strict_bool(require_hard_budget, "require_hard_budget")
+    budget_contract = _budget_contract(
+        provider_value,
+        float(max_budget_usd),
+        hard_limit_required=hard_budget_required,
+    )
     repo, head = _repository(repository, expected_head)
     task_value = workspace._required_string(task, "task", max_length=16000)
     if not isinstance(primary_summary, str) or len(primary_summary.encode("utf-8")) > 32000 or "\x00" in primary_summary:
@@ -1125,6 +1537,11 @@ def grabowski_agent_competition_start(
     summary = primary_summary.strip()
     allowed = _scope(allowed_paths, label="allowed_paths", nonempty=True)
     forbidden = _scope([] if forbidden_paths is None else forbidden_paths, label="forbidden_paths", nonempty=False)
+    default_forbidden_allowed = [path for path in allowed if _path_has_default_forbidden_component(path)]
+    if default_forbidden_allowed:
+        raise AgentCompetitionError(
+            f"default-forbidden allowed paths are not exportable: {default_forbidden_allowed}"
+        )
     sensitive_allowed = [path for path in allowed if _path_is_sensitive(path)]
     if sensitive_allowed:
         raise AgentCompetitionError(f"sensitive-looking allowed paths are not exportable: {sensitive_allowed}")
@@ -1154,7 +1571,7 @@ def grabowski_agent_competition_start(
         "context": [{"path": item["path"], "sha256": item["sha256"]} for item in contexts],
         "primary_summary": summary,
         "timeout_seconds": timeout_seconds,
-        "max_budget_usd": float(max_budget_usd),
+        "budget_contract": budget_contract,
     }
     request_fingerprint = _sha256_json(request_contract)
     identifier = _competition_id(provider_value, mode_value, task_sha256, request_value)
@@ -1168,7 +1585,13 @@ def grabowski_agent_competition_start(
             intent_path = directory / "start-intent.json"
             if manifest_path.exists() or manifest_path.is_symlink():
                 existing = _validated_manifest(identifier)
-                if existing["request_fingerprint"] != request_fingerprint:
+                expected_existing_fingerprint = request_fingerprint
+                if existing["schema_version"] == 1:
+                    legacy_request_contract = dict(request_contract)
+                    legacy_request_contract.pop("budget_contract")
+                    legacy_request_contract["max_budget_usd"] = float(max_budget_usd)
+                    expected_existing_fingerprint = _sha256_json(legacy_request_contract)
+                if existing["request_fingerprint"] != expected_existing_fingerprint:
                     raise AgentCompetitionError("request_id already exists with a different competition contract")
                 return {
                     "competition_id": identifier,
@@ -1177,6 +1600,7 @@ def grabowski_agent_competition_start(
                     "mode": existing["mode"],
                     "task_id": existing["task_id"],
                     "packet_sha256": existing["packet_sha256"],
+                    "budget_contract": existing.get("budget_contract"),
                     "status_tool": "grabowski_agent_competition_status",
                     "already_started": True,
                     "automatic_apply": False,
@@ -1184,10 +1608,42 @@ def grabowski_agent_competition_start(
                 }
             if intent_path.exists() or intent_path.is_symlink():
                 intent = _validated_start_intent(identifier)
-                if intent["request_fingerprint"] != request_fingerprint:
+                expected_intent_fingerprint = request_fingerprint
+                if intent["schema_version"] == 1:
+                    legacy_request_contract = dict(request_contract)
+                    legacy_request_contract.pop("budget_contract")
+                    legacy_request_contract["max_budget_usd"] = float(max_budget_usd)
+                    expected_intent_fingerprint = _sha256_json(legacy_request_contract)
+                if intent["request_fingerprint"] != expected_intent_fingerprint:
                     raise AgentCompetitionError("request_id already exists with a different unresolved start intent")
+                reconciliation = _start_reconciliation(identifier, intent)
+                reconciled_task = reconciliation.get("task")
+                if isinstance(reconciled_task, dict):
+                    packet = _validated_packet(identifier)
+                    if (
+                        packet["request_fingerprint"] != request_fingerprint
+                        or packet.get("budget_contract") != budget_contract
+                    ):
+                        raise AgentCompetitionError("reconciled packet does not match the requested competition contract")
+                    manifest = _manifest_from_task(identifier, packet, intent, reconciled_task)
+                    _atomic_json(directory / "manifest.json", manifest)
+                    return {
+                        "competition_id": identifier,
+                        "request_id": request_value,
+                        "provider": packet["provider"],
+                        "mode": packet["mode"],
+                        "task_id": reconciled_task["task_id"],
+                        "packet_sha256": packet["packet_sha256"],
+                        "budget_contract": packet["budget_contract"],
+                        "status_tool": "grabowski_agent_competition_status",
+                        "already_started": True,
+                        "start_reconciled": True,
+                        "automatic_apply": False,
+                        "does_not_establish": ["candidate_success", "candidate_correctness", "preferred_candidate"],
+                    }
                 raise AgentCompetitionError(
-                    "competition start outcome is unresolved; inspect durable tasks before using a new request_id"
+                    "competition start outcome is unresolved; task reconciliation="
+                    + reconciliation["state"]
                 )
             raise AgentCompetitionError("competition directory already exists without a valid manifest or start intent")
         directory = _validate_competition_directory(directory)
@@ -1197,7 +1653,7 @@ def grabowski_agent_competition_start(
         os.mkdir(provider_workspace, 0o700)
         _validate_competition_directory(provider_workspace)
         packet: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "external_programming_candidate_packet",
             "competition_id": identifier,
             "request_id": request_value,
@@ -1213,6 +1669,7 @@ def grabowski_agent_competition_start(
             "forbidden_paths": forbidden,
             "context": contexts,
             "primary_summary": summary,
+            "budget_contract": budget_contract,
             "packet_nonce": secrets.token_hex(16),
             "created_at": workspace._utc(),
         }
@@ -1232,7 +1689,7 @@ def grabowski_agent_competition_start(
             "--max-budget-usd", format(float(max_budget_usd), "g"),
         ]
         start_intent = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "external_programming_competition_start_intent",
             "competition_id": identifier,
             "request_id": request_value,
@@ -1240,10 +1697,13 @@ def grabowski_agent_competition_start(
             "packet_sha256": packet["packet_sha256"],
             "command_sha256": _sha256_json(command),
             "created_at": workspace._utc(),
+            "created_at_unix": int(time.time()),
             "state": "prepared",
         }
         start_intent["start_intent_sha256"] = _sha256_json(start_intent)
         _atomic_json(directory / "start-intent.json", start_intent)
+        task_record: dict[str, Any] | None = None
+        start_reconciled = False
         try:
             task_start = tasks.grabowski_task_start(
                 host="heim-pc",
@@ -1257,44 +1717,67 @@ def grabowski_agent_competition_start(
                 resource_keys=[f"path:{directory}"],
             )
         except Exception:
-            _write_start_outcome(
-                identifier,
-                start_intent,
-                state="task_start_outcome_unknown",
-            )
-            raise
-        task_record = task_start.get("task") if isinstance(task_start, dict) else None
-        if not isinstance(task_record, dict) or not isinstance(task_record.get("task_id"), str):
-            _write_start_outcome(
-                identifier,
-                start_intent,
-                state="task_start_outcome_unknown",
-            )
-            raise AgentCompetitionError("durable task start outcome is unknown; retry is blocked")
-        manifest = {
-            "schema_version": 1,
-            "kind": "external_programming_competition_manifest",
-            "competition_id": identifier,
-            "request_id": request_value,
-            "request_fingerprint": request_fingerprint,
-            "provider": provider_value,
-            "mode": mode_value,
-            "repository": str(repo),
-            "expected_head": head,
-            "task_sha256": task_sha256,
-            "packet_sha256": packet["packet_sha256"],
-            "runner_sha256": runner_sha256,
-            "start_intent_sha256": start_intent["start_intent_sha256"],
-            "task_id": task_record["task_id"],
-            "task_unit": task_record.get("unit"),
-            "created_at": workspace._utc(),
-            "authority": "advisory_only",
-            "automatic_apply": False,
-        }
-        manifest["manifest_sha256"] = _sha256_json(manifest)
+            reconciliation = _start_reconciliation(identifier, start_intent)
+            candidate = reconciliation.get("task")
+            if isinstance(candidate, dict):
+                task_record = candidate
+                start_reconciled = True
+            else:
+                _write_start_outcome(
+                    identifier,
+                    start_intent,
+                    state="task_start_outcome_unknown",
+                )
+                raise
+        else:
+            candidate = task_start.get("task") if isinstance(task_start, dict) else None
+            if isinstance(candidate, dict) and isinstance(candidate.get("task_id"), str):
+                task_record = candidate
+            else:
+                reconciliation = _start_reconciliation(identifier, start_intent)
+                reconciled = reconciliation.get("task")
+                if isinstance(reconciled, dict):
+                    task_record = reconciled
+                    start_reconciled = True
+                else:
+                    _write_start_outcome(
+                        identifier,
+                        start_intent,
+                        state="task_start_outcome_unknown",
+                    )
+                    raise AgentCompetitionError(
+                        "durable task start outcome is unknown; reconciliation="
+                        + reconciliation["state"]
+                    )
+        assert task_record is not None
+        manifest = _manifest_from_task(identifier, packet, start_intent, task_record)
         try:
             _atomic_json(directory / "manifest.json", manifest)
         except Exception:
+            try:
+                published_manifest = _validated_manifest(identifier)
+            except Exception:
+                published_manifest = None
+            if (
+                isinstance(published_manifest, dict)
+                and published_manifest.get("manifest_sha256") == manifest["manifest_sha256"]
+                and published_manifest.get("task_id") == task_record["task_id"]
+            ):
+                return {
+                    "competition_id": identifier,
+                    "request_id": request_value,
+                    "provider": provider_value,
+                    "mode": mode_value,
+                    "task_id": task_record["task_id"],
+                    "packet_sha256": packet["packet_sha256"],
+                    "budget_contract": budget_contract,
+                    "status_tool": "grabowski_agent_competition_status",
+                    "already_started": False,
+                    "start_reconciled": start_reconciled,
+                    "manifest_publish_readback_recovered": True,
+                    "automatic_apply": False,
+                    "does_not_establish": ["candidate_success", "candidate_correctness", "preferred_candidate"],
+                }
             cancel_state = "unconfirmed"
             try:
                 cancel_result = tasks.grabowski_task_cancel(task_record["task_id"])
@@ -1325,8 +1808,10 @@ def grabowski_agent_competition_start(
             "mode": mode_value,
             "task_id": task_record["task_id"],
             "packet_sha256": packet["packet_sha256"],
+            "budget_contract": budget_contract,
             "status_tool": "grabowski_agent_competition_status",
             "already_started": False,
+            "start_reconciled": start_reconciled,
             "automatic_apply": False,
             "does_not_establish": ["candidate_success", "candidate_correctness", "preferred_candidate"],
         }
@@ -1334,39 +1819,54 @@ def grabowski_agent_competition_start(
 
 @mcp.tool(name="grabowski_agent_competition_status", annotations=READ_ONLY)
 def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
-    """Read one candidate lifecycle, including fail-closed pre-manifest start outcomes."""
+    """Read one candidate lifecycle with deterministic phases and fail-closed reconciliation evidence."""
     operator._require_operator_capability("durable_job")
     directory = _competition_dir(competition_id)
     manifest_path = directory / "manifest.json"
     if not manifest_path.exists() and not manifest_path.is_symlink():
         intent = _validated_start_intent(competition_id)
         outcome = _validated_start_outcome(competition_id, intent)
-        lifecycle_state = outcome["state"] if outcome is not None else "start_prepared_outcome_unresolved"
+        reconciliation = _start_reconciliation(competition_id, intent)
         bounded_task = None
-        if outcome is not None and isinstance(outcome["task_id"], str):
-            task_status = tasks.grabowski_task_status(outcome["task_id"])
+        task_id = outcome["task_id"] if outcome is not None else None
+        if task_id is None and isinstance(reconciliation.get("task"), dict):
+            task_id = reconciliation["task"].get("task_id")
+        if isinstance(task_id, str):
+            task_status = tasks.grabowski_task_status(task_id)
             bounded_task = {
                 key: task_status.get(key)
                 for key in ("task_id", "unit", "attempt", "state", "updated_at_unix", "resume_policy")
                 if key in task_status
             }
-        next_action = {
-            "start_prepared_outcome_unresolved": "inspect durable tasks before retrying with any request_id",
-            "task_start_outcome_unknown": "inspect durable tasks; duplicate start remains blocked",
-            "manifest_publish_failed": "verify the recorded task cancellation or terminal state",
-        }[lifecycle_state]
+        if outcome is not None:
+            lifecycle_state = outcome["state"]
+            next_action = {
+                "task_start_outcome_unknown": "retry the same request only after one exact task reconciliation match exists",
+                "manifest_publish_failed": "verify the recorded task cancellation or terminal state",
+            }[lifecycle_state]
+        elif reconciliation["state"] == "unique_match":
+            lifecycle_state = "task_start_reconciled_manifest_missing"
+            next_action = "retry the identical start request to publish the bound manifest"
+        else:
+            lifecycle_state = "start_prepared_outcome_unresolved"
+            next_action = "inspect task reconciliation evidence; duplicate start remains blocked"
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "competition_id": competition_id,
             "request_id": intent["request_id"],
             "lifecycle_state": lifecycle_state,
+            "phase": "start_reconciliation",
             "manifest_present": False,
             "task": bounded_task,
+            "start_reconciliation": {
+                "state": reconciliation["state"],
+                "matching_task_ids": reconciliation["matches"],
+            },
             "cancel_state": outcome["cancel_state"] if outcome is not None else "not_attempted",
             "receipt_present": False,
             "candidate": None,
             "candidate_ready": False,
-            "retry_blocked": True,
+            "retry_blocked": reconciliation["state"] != "unique_match",
             "next_action": next_action,
             "authority": "advisory_only",
             "automatic_apply": False,
@@ -1377,13 +1877,29 @@ def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
     manifest = _validated_manifest(competition_id)
     task_status = tasks.grabowski_task_status(manifest["task_id"])
     receipt = _receipt(competition_id, manifest)
+    task_state = task_status.get("state")
+    if receipt is not None:
+        lifecycle_state = "candidate_receipt_ready"
+        phase = "receipt_ready"
+    elif task_state in {"launching", "running"}:
+        lifecycle_state = "provider_running"
+        phase = "provider_execution"
+    elif task_state == "completed":
+        lifecycle_state = "candidate_output_missing_or_invalid"
+        phase = "candidate_validation"
+    elif task_state in {"failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}:
+        lifecycle_state = f"provider_{task_state}"
+        phase = "provider_terminal"
+    else:
+        lifecycle_state = "task_observed"
+        phase = "task_observation"
     bounded_task = {
         key: task_status.get(key)
         for key in ("task_id", "unit", "attempt", "state", "updated_at_unix", "resume_policy")
         if key in task_status
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "competition_id": competition_id,
         "request_id": manifest["request_id"],
         "provider": manifest["provider"],
@@ -1391,12 +1907,14 @@ def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
         "repository": manifest["repository"],
         "expected_head": manifest["expected_head"],
         "task_sha256": manifest["task_sha256"],
-        "lifecycle_state": "candidate_receipt_ready" if receipt is not None else "task_observed",
+        "budget_contract": manifest.get("budget_contract"),
+        "lifecycle_state": lifecycle_state,
+        "phase": phase,
         "manifest_present": True,
         "task": bounded_task,
         "receipt_present": receipt is not None,
         "candidate": _candidate_summary(receipt) if receipt is not None else None,
-        "candidate_ready": receipt is not None and task_status.get("state") == "completed",
+        "candidate_ready": receipt is not None and task_state == "completed",
         "retry_blocked": True,
         "authority": "advisory_only",
         "automatic_apply": False,
@@ -1452,6 +1970,7 @@ def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str,
     path_sets = [set(item["changed_paths"]) for item in candidates]
     risk_sets = [set(item["risks"]) for item in candidates]
     invariant_sets = [set(item["design_invariants"]) for item in candidates]
+    test_sets = [set(item["proposed_tests"]) for item in candidates]
     test_counter: Counter[str] = Counter(
         test
         for item in candidates
@@ -1466,6 +1985,10 @@ def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str,
         for right in candidates[left_index + 1 :]:
             left_paths = set(left["changed_paths"])
             right_paths = set(right["changed_paths"])
+            left_risks = set(left["risks"])
+            right_risks = set(right["risks"])
+            left_tests = set(left["proposed_tests"])
+            right_tests = set(right["proposed_tests"])
             union = left_paths | right_paths
             both_patches_available = bool(left["patch_available"] and right["patch_available"])
             pairwise.append({
@@ -1474,6 +1997,12 @@ def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str,
                 "shared_paths": sorted(left_paths & right_paths),
                 "unique_left_paths": sorted(left_paths - right_paths),
                 "unique_right_paths": sorted(right_paths - left_paths),
+                "shared_risks": sorted(left_risks & right_risks),
+                "unique_left_risks": sorted(left_risks - right_risks),
+                "unique_right_risks": sorted(right_risks - left_risks),
+                "shared_tests": sorted(left_tests & right_tests),
+                "unique_left_tests": sorted(left_tests - right_tests),
+                "unique_right_tests": sorted(right_tests - left_tests),
                 "path_jaccard": round(len(left_paths & right_paths) / len(union), 6) if union else None,
                 "both_patches_available": both_patches_available,
                 "same_patch": (
@@ -1536,7 +2065,7 @@ def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str,
             "interpretation": "use these candidates for reasoning only unless the operator reconstructs and validates their changes",
         })
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "external_programming_contrast_matrix",
         "repository": receipts[0]["repository"],
         "expected_head": receipts[0]["expected_head"],
@@ -1552,6 +2081,14 @@ def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str,
         },
         "divergence": {
             "changed_paths": divergent_paths,
+            "unique_risks_by_candidate": {
+                item["competition_id"]: sorted(risk_sets[index] - set(shared_risks))
+                for index, item in enumerate(candidates)
+            },
+            "unique_tests_by_candidate": {
+                item["competition_id"]: sorted(test_sets[index] - set(repeated_tests))
+                for index, item in enumerate(candidates)
+            },
             "assumptions_by_candidate": {item["competition_id"]: item["assumptions"] for item in candidates},
             "tradeoffs_by_candidate": {item["competition_id"]: item["tradeoffs"] for item in candidates},
             "contrast_observations_by_candidate": {item["competition_id"]: item["contrast_observations"] for item in candidates},
