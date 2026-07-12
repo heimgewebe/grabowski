@@ -1429,7 +1429,7 @@
         "external-model-call"
       ],
       "id": "grabowski_agent_competition_start",
-      "purpose": "Start one durable read-only external competitor or contrast programmer against a clean head-bound context packet.",
+      "purpose": "Start one durable advisory-only external competitor or contrast programmer against a commit-bound context packet with a frozen runner and isolated provider workspace.",
       "read_only": false,
       "reversibility": "task-cancel-and-state-retain",
       "risk_class": "medium",
@@ -1450,10 +1450,10 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Generate a deterministic contrast matrix and validation opportunities from two to four candidates.",
+      "description": "Generate a deterministic contrast matrix from exactly two bound candidates.",
       "effects": [],
       "id": "grabowski_agent_competition_compare",
-      "purpose": "Generate a deterministic contrast matrix, consensus signals and validation opportunities from two to four bound external candidates.",
+      "purpose": "Generate a deterministic contrast matrix, consensus signals and validation opportunities from exactly two bound external candidates.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -1871,7 +1871,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "70cbdb6a1a309ac93cb9b12223fe416b8b72c455a9fbd8bce460b863a2b70db7"
+      "sha256": "10337a53e31e6a4f0baf18f0d3af1b3f93b10624b8a3621d18585c93dd6f15c4"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1883,14 +1883,14 @@
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c413e520172f70296c42e18e4c0f1fcb95a1931afa0fda7b7c36dba4b2d52e56",
-      "src/grabowski_agent_competition.py": "a51774aee86b7e7a06a9936cdcc115d4a95d7a23e5fa1d243fbcb2a7685f315e",
+      "src/grabowski_agent_competition.py": "4ff745d1cc1859319a7ee4eb89a9cb8ca5f9d74c8f8bd9ba9041ccbb34684cad",
       "src/grabowski_agent_role.py": "abef0db4aa6fffcd52976e2c60deb5f68abfadf76528ec5ac79dfebeddafe8bf",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
       "src/grabowski_agent_workspace.py": "1a6495a53600c1022ab717cd2f79bc444031039a0c81bebbc5f0d13bab17cf97",
       "src/grabowski_agent_workspace_observer.py": "192a3602db277c5b19a9553095cfa8b37ca60f39ca47f16d526c8a50365c64ba",
       "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "70cbdb6a1a309ac93cb9b12223fe416b8b72c455a9fbd8bce460b863a2b70db7",
+      "src/grabowski_capabilities.py": "10337a53e31e6a4f0baf18f0d3af1b3f93b10624b8a3621d18585c93dd6f15c4",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",

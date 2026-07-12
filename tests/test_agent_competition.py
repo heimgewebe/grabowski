@@ -107,6 +107,7 @@ class AgentCompetitionTests(unittest.TestCase):
         call = start.call_args.kwargs
         self.assertEqual(call["resume_policy"], "never")
         self.assertEqual(call["resource_keys"], [f"path:{self.state / result['competition_id']}"])
+        self.assertEqual(call["cwd"], str(self.state / result["competition_id"]))
         return result
 
     def _write_receipt(
@@ -119,6 +120,11 @@ class AgentCompetitionTests(unittest.TestCase):
         patch: str = "",
     ) -> dict:
         manifest = competition._validated_manifest(identifier)
+        provider_workspace = self.state / identifier / "provider-workspace"
+        prompt = b"test provider prompt\n"
+        prompt_path = provider_workspace / "prompt.txt"
+        if not prompt_path.exists():
+            competition._atomic_bytes(prompt_path, prompt)
         candidate = {
             "approach_id": identifier,
             "approach_summary": f"Approach for {identifier}",
@@ -142,6 +148,16 @@ class AgentCompetitionTests(unittest.TestCase):
             },
             "patch_rejection": None,
         }
+        if manifest["provider"] == "claude":
+            command = ["claude", "-p", "--output-format", "json", "--tools="]
+        else:
+            command = ["agy", "--mode", "plan", "--sandbox"]
+        snapshot = {
+            "head": self.head,
+            "commit_bound": True,
+            "context_count": 2,
+            "worktree_clean_required": False,
+        }
         receipt = {
             "schema_version": 1,
             "kind": "external_programming_candidate_receipt",
@@ -154,25 +170,28 @@ class AgentCompetitionTests(unittest.TestCase):
             "expected_head": manifest["expected_head"],
             "task_sha256": manifest["task_sha256"],
             "packet_sha256": manifest["packet_sha256"],
-            "prompt_sha256": "1" * 64,
-            "provider_version": "test",
-            "command_shape": [manifest["provider"]],
-            "provider_cwd_kind": "isolated_candidate_directory",
-            "command_sha256": "2" * 64,
+            "runner_sha256": manifest["runner_sha256"],
+            "prompt_sha256": competition._sha256_bytes(prompt),
+            "provider_version": "test-provider 1.0",
+            "command_shape": command,
+            "provider_cwd_kind": "isolated_provider_workspace",
+            "command_sha256": competition._sha256_json(command),
             "prompt_in_argv": False,
             "returncode": 0,
             "runtime_seconds": 1.0,
             "stdout_sha256": "3" * 64,
             "stderr_sha256": "4" * 64,
-            "before": {"head": self.head, "clean": True, "context_count": 2},
-            "after": {"head": self.head, "clean": True, "context_count": 2},
+            "before": snapshot,
+            "after": dict(snapshot),
             "candidate": candidate,
             "authority": "advisory_only",
             "automatic_apply": False,
             "automatic_commit": False,
             "automatic_merge": False,
             "automatic_deploy": False,
-            "does_not_establish": ["correctness"],
+            "does_not_establish": [
+                "correctness", "test_pass", "review_pass", "merge_readiness", "preferred_candidate"
+            ],
         }
         receipt["receipt_sha256"] = competition._sha256_json(receipt)
         competition._atomic_json(self.state / identifier / "receipt.json", receipt)
@@ -262,9 +281,31 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(packet["packet_sha256"], manifest["packet_sha256"])
         self.assertEqual(packet["request_id"], "test-claude-competitor")
         self.assertEqual(packet["request_fingerprint"], manifest["request_fingerprint"])
+        self.assertEqual(packet["runner_sha256"], manifest["runner_sha256"])
+        self.assertEqual(
+            hashlib.sha256((directory / "runner.py").read_bytes()).hexdigest(),
+            manifest["runner_sha256"],
+        )
+        self.assertEqual((directory / "runner.py").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((directory / "provider-workspace").stat().st_mode & 0o777, 0o700)
         self.assertEqual((directory / "packet.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual((directory / "start-intent.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual((directory / "manifest.json").stat().st_mode & 0o777, 0o600)
+
+    def test_manifest_rejects_tampered_frozen_runner(self) -> None:
+        started = self._start()
+        runner = self.state / started["competition_id"] / "runner.py"
+        runner.write_bytes(runner.read_bytes() + b"\n# tampered\n")
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "runner hash"):
+            competition._validated_manifest(started["competition_id"])
+
+    def test_receipt_rejects_unexpected_provider_workspace_file(self) -> None:
+        started = self._start()
+        self._write_receipt(started["competition_id"], changed_paths=[], risks=[], tests=[])
+        workspace_path = self.state / started["competition_id"] / "provider-workspace"
+        (workspace_path / "unexpected.txt").write_text("mutation", encoding="utf-8")
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "workspace contents"):
+            competition._receipt(started["competition_id"])
 
     def test_start_is_idempotent_and_contract_bound(self) -> None:
         task_id = "task-stable"
@@ -315,6 +356,12 @@ class AgentCompetitionTests(unittest.TestCase):
             {"path": "src/sample.py", "sha256": competition._sha256_bytes((self.repo / "src/sample.py").read_bytes())},
             {"path": "tests/test_sample.py", "sha256": competition._sha256_bytes((self.repo / "tests/test_sample.py").read_bytes())},
         ]
+        runner_bytes = competition._load_regular_bytes(
+            competition.RUNNER,
+            label="test runner",
+            max_bytes=competition.MAX_RUNNER_BYTES,
+            required_mode=None,
+        )
         contract = {
             "request_id": request_id,
             "provider": "claude",
@@ -322,6 +369,7 @@ class AgentCompetitionTests(unittest.TestCase):
             "repository": str(self.repo),
             "expected_head": self.head,
             "task_sha256": task_sha256,
+            "runner_sha256": competition._sha256_bytes(runner_bytes),
             "task": task,
             "allowed_paths": ["src", "tests"],
             "forbidden_paths": [],
@@ -478,6 +526,27 @@ class AgentCompetitionTests(unittest.TestCase):
                 context_paths=["secrets/note.txt"],
             )
 
+    def test_private_json_reader_detects_in_place_mutation(self) -> None:
+        directory = self.state / "read-race"
+        directory.mkdir(mode=0o700)
+        path = directory / "state.json"
+        competition._atomic_json(path, {"value": "x" * 1000})
+        original_read = competition.os.read
+        mutated = False
+
+        def mutate_after_read(descriptor, size):
+            nonlocal mutated
+            chunk = original_read(descriptor, size)
+            if not mutated:
+                mutated = True
+                with path.open("ab") as handle:
+                    handle.write(b" ")
+            return chunk
+
+        with mock.patch.object(competition.os, "read", side_effect=mutate_after_read):
+            with self.assertRaisesRegex(competition.AgentCompetitionError, "changed while being read"):
+                competition._load_private_json(path, label="race state")
+
     def test_status_is_bounded_and_does_not_return_patch_body(self) -> None:
         started = self._start()
         self._write_receipt(started["competition_id"], changed_paths=["src/sample.py"], risks=["race"], tests=["unit test"])
@@ -500,7 +569,7 @@ class AgentCompetitionTests(unittest.TestCase):
         started = self._start()
         path = self.state / started["competition_id"] / "receipt.json"
         path.symlink_to(path.with_name("missing-receipt.json"))
-        with self.assertRaisesRegex(competition.AgentCompetitionError, "regular private file"):
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "cannot open candidate receipt|bounded regular file"):
             competition._receipt(started["competition_id"])
 
     def test_receipt_symlink_to_regular_file_fails_closed(self) -> None:
@@ -510,7 +579,7 @@ class AgentCompetitionTests(unittest.TestCase):
         target.write_text("{}\n", encoding="utf-8")
         target.chmod(0o600)
         (directory / "receipt.json").symlink_to(target)
-        with self.assertRaisesRegex(competition.AgentCompetitionError, "regular private file"):
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "cannot open candidate receipt|bounded regular file"):
             competition._receipt(started["competition_id"])
 
     def test_self_hashed_receipt_cannot_change_manifest_binding(self) -> None:
@@ -522,6 +591,21 @@ class AgentCompetitionTests(unittest.TestCase):
         receipt["receipt_sha256"] = competition._sha256_json({key: value for key, value in receipt.items() if key != "receipt_sha256"})
         competition._atomic_json(path, receipt)
         with self.assertRaisesRegex(competition.AgentCompetitionError, "binding mismatch"):
+            competition._receipt(started["competition_id"])
+
+    def test_self_hashed_receipt_cannot_weaken_provider_isolation(self) -> None:
+        started = self._start()
+        receipt = self._write_receipt(
+            started["competition_id"], changed_paths=["src/sample.py"], risks=[], tests=[]
+        )
+        path = self.state / started["competition_id"] / "receipt.json"
+        path.unlink()
+        receipt["provider_cwd_kind"] = "repository"
+        receipt["receipt_sha256"] = competition._sha256_json(
+            {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        )
+        competition._atomic_json(path, receipt)
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "provider isolation"):
             competition._receipt(started["competition_id"])
 
     def test_self_hashed_receipt_with_invalid_candidate_shape_fails_closed(self) -> None:
@@ -577,6 +661,10 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertFalse(pair["both_patches_available"])
         self.assertFalse(pair["same_patch"])
         self.assertIsNone(pair["path_jaccard"])
+
+    def test_compare_requires_exactly_two_candidates(self) -> None:
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "exactly 2"):
+            competition.grabowski_agent_competition_compare(["one", "two", "three"])
 
     def test_compare_emits_consensus_and_divergence_without_winner(self) -> None:
         first = self._start(provider="claude", mode="competitor", task="same task")

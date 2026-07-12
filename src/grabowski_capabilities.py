@@ -842,7 +842,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_agent_competition_start": {
             "category": "agent-workspace",
-            "purpose": "Start one durable read-only external competitor or contrast programmer against a clean head-bound context packet.",
+            "purpose": "Start one durable advisory-only external competitor or contrast programmer against a commit-bound context packet with a frozen runner and isolated provider workspace.",
             "risk_class": "medium",
             "effects": ["state-create", "durable-task-start", "external-model-call"],
             "reversibility": "task-cancel-and-state-retain",
@@ -856,7 +856,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_agent_competition_compare": {
             "category": "agent-workspace",
-            "purpose": "Generate a deterministic contrast matrix, consensus signals and validation opportunities from two to four bound external candidates.",
+            "purpose": "Generate a deterministic contrast matrix, consensus signals and validation opportunities from exactly two bound external candidates.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",

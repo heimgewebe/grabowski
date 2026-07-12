@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "70cbdb6a1a309ac93cb9b12223fe416b8b72c455a9fbd8bce460b863a2b70db7",
+  "capability_source_sha256": "10337a53e31e6a4f0baf18f0d3af1b3f93b10624b8a3621d18585c93dd6f15c4",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "f5b5aa65ec197281b4bec4b3eacf93f90d5f30cbf78d77b5ee2e726bd98b28e4",
   "integrity": {
@@ -1441,7 +1441,7 @@
         "external-model-call"
       ],
       "id": "grabowski_agent_competition_start",
-      "purpose": "Start one durable read-only external competitor or contrast programmer against a clean head-bound context packet.",
+      "purpose": "Start one durable advisory-only external competitor or contrast programmer against a commit-bound context packet with a frozen runner and isolated provider workspace.",
       "read_only": false,
       "reversibility": "task-cancel-and-state-retain",
       "risk_class": "medium",
@@ -1462,10 +1462,10 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Generate a deterministic contrast matrix and validation opportunities from two to four candidates.",
+      "description": "Generate a deterministic contrast matrix from exactly two bound candidates.",
       "effects": [],
       "id": "grabowski_agent_competition_compare",
-      "purpose": "Generate a deterministic contrast matrix, consensus signals and validation opportunities from two to four bound external candidates.",
+      "purpose": "Generate a deterministic contrast matrix, consensus signals and validation opportunities from exactly two bound external candidates.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",

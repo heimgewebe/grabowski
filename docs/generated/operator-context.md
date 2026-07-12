@@ -142,9 +142,9 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_workspace_observe` | agent-workspace | yes | low | Read one bounded immutable workspace event timeline and emit a facts/inferences/proposals process report. |
 | `grabowski_agent_workspace_optimize` | agent-workspace | yes | low | Derive advisory cross-workspace optimization proposals from at least two immutable reports. |
 | `grabowski_agent_execution_route` | agent-workspace | yes | low | Recommend direct, isolated, full-workspace, contrast or competition execution from typed risk and complexity inputs. |
-| `grabowski_agent_competition_start` | agent-workspace | no | medium | Start one durable read-only external competitor or contrast programmer against a clean head-bound context packet. |
+| `grabowski_agent_competition_start` | agent-workspace | no | medium | Start one durable advisory-only external competitor or contrast programmer against a commit-bound context packet with a frozen runner and isolated provider workspace. |
 | `grabowski_agent_competition_status` | agent-workspace | yes | low | Read one external candidate task and validate its immutable advisory receipt. |
-| `grabowski_agent_competition_compare` | agent-workspace | yes | low | Generate a deterministic contrast matrix, consensus signals and validation opportunities from two to four bound external candidates. |
+| `grabowski_agent_competition_compare` | agent-workspace | yes | low | Generate a deterministic contrast matrix, consensus signals and validation opportunities from exactly two bound external candidates. |
 | `grabowski_agent_bootstrap` | operations-observability | yes | low | Return a release-evidence-bound adaptive agent entry capsule without authorizing execution. |
 | `grabowski_call_shape_check` | operations-observability | yes | low | Deterministically lint one proposed tool-call shape before execution. |
 

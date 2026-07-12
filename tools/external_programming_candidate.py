@@ -9,6 +9,8 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import selectors
+import signal
 import shutil
 import stat
 import subprocess
@@ -18,6 +20,7 @@ import time
 from typing import Any
 
 MAX_PACKET_BYTES = 1_000_000
+MAX_RUNNER_BYTES = 2_000_000
 MAX_PROMPT_BYTES = 750_000
 MAX_PATCH_BYTES = 300_000
 MAX_RAW_OUTPUT_BYTES = 2_000_000
@@ -66,26 +69,56 @@ def sha256_json(value: Any) -> str:
     return sha256_bytes(canonical_json(value).encode("utf-8"))
 
 
-def load_private_json(path: Path, *, label: str, max_bytes: int = MAX_PACKET_BYTES) -> dict[str, Any]:
+def load_regular_bytes(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+    required_mode: int | None,
+) -> bytes:
     try:
-        metadata = path.lstat()
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     except FileNotFoundError as exc:
         raise CandidateError(f"{label} does not exist") from exc
-    if (
-        path.is_symlink()
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-    ):
-        raise CandidateError(f"{label} must be one regular private file")
-    if metadata.st_mode & 0o077:
-        raise CandidateError(f"{label} permissions are not private")
-    if metadata.st_size > max_bytes:
-        raise CandidateError(f"{label} exceeds byte limit")
+    except OSError as exc:
+        raise CandidateError(f"cannot open {label}: {exc}") from exc
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise CandidateError(f"cannot read {label}: {exc}") from exc
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or (required_mode is not None and stat.S_IMODE(before.st_mode) != required_mode)
+            or before.st_size > max_bytes
+        ):
+            raise CandidateError(f"{label} must be one bounded regular file")
+        content = bytearray()
+        while len(content) <= max_bytes:
+            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > max_bytes:
+            raise CandidateError(f"{label} exceeds byte limit")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or after.st_size != len(content)
+            or after.st_nlink != 1
+        ):
+            raise CandidateError(f"{label} changed while being read")
+        return bytes(content)
+    finally:
+        os.close(descriptor)
+
+
+def load_private_json(path: Path, *, label: str, max_bytes: int = MAX_PACKET_BYTES) -> dict[str, Any]:
+    raw = load_regular_bytes(path, label=label, max_bytes=max_bytes, required_mode=0o600)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CandidateError(f"cannot parse {label}: {exc}") from exc
     if not isinstance(value, dict):
         raise CandidateError(f"{label} is not a JSON object")
     return value
@@ -96,39 +129,87 @@ def atomic_bytes(path: Path, data: bytes, *, create_only: bool = True) -> None:
         parent_metadata = path.parent.lstat()
     except FileNotFoundError as exc:
         raise CandidateError(f"output parent does not exist: {path.parent}") from exc
-    if path.parent.is_symlink() or not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_mode & 0o077:
+    if (
+        path.parent.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+    ):
         raise CandidateError("output parent must be one private non-symlink directory")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    published = False
     try:
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             descriptor = -1
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        temporary_metadata = temporary.lstat()
         if create_only:
             try:
                 os.link(temporary, path, follow_symlinks=False)
             except FileExistsError as exc:
                 raise CandidateError(f"output already exists: {path}") from exc
-            temporary.unlink()
+            published = True
+            try:
+                os.unlink(temporary)
+            except OSError:
+                published_metadata = path.lstat()
+                if (
+                    temporary_metadata.st_dev == published_metadata.st_dev
+                    and temporary_metadata.st_ino == published_metadata.st_ino
+                ):
+                    os.unlink(path)
+                    published = False
+                raise
         else:
             os.replace(temporary, path)
+            published = True
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_dev != temporary_metadata.st_dev
+            or metadata.st_ino != temporary_metadata.st_ino
+        ):
+            try:
+                current = path.lstat()
+                if current.st_dev == temporary_metadata.st_dev and current.st_ino == temporary_metadata.st_ino:
+                    os.unlink(path)
+                    published = False
+            except FileNotFoundError:
+                published = False
+            raise CandidateError("published output failed inode integrity validation")
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         try:
-            temporary.unlink()
+            os.unlink(temporary)
         except FileNotFoundError:
             pass
+        if published:
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError as exc:
+                raise CandidateError("published output disappeared") from exc
+            if metadata.st_nlink != 1:
+                if (
+                    metadata.st_dev == temporary_metadata.st_dev
+                    and metadata.st_ino == temporary_metadata.st_ino
+                ):
+                    os.unlink(path)
+                raise CandidateError("published output did not retain single-link integrity")
 
 
 def atomic_json(path: Path, value: dict[str, Any], *, create_only: bool = True) -> None:
     data = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
     atomic_bytes(path, data, create_only=create_only)
-
-
-
 
 
 def _git_environment(*, index_file: Path | None = None) -> dict[str, str]:
@@ -287,7 +368,7 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
     required = {
         "schema_version", "kind", "competition_id", "request_id", "request_fingerprint",
         "provider", "mode", "repository", "expected_head", "task", "task_sha256",
-        "allowed_paths", "forbidden_paths", "context", "primary_summary",
+        "runner_sha256", "allowed_paths", "forbidden_paths", "context", "primary_summary",
         "packet_nonce", "created_at", "packet_sha256",
     }
     if set(packet) != required:
@@ -316,6 +397,9 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
         raise CandidateError("task is invalid or too large")
     if packet["task_sha256"] != sha256_bytes(task.encode("utf-8")):
         raise CandidateError("task hash is invalid")
+    runner_sha256 = packet["runner_sha256"]
+    if not isinstance(runner_sha256, str) or SHA256_RE.fullmatch(runner_sha256) is None:
+        raise CandidateError("runner_sha256 is invalid")
     raw_allowed = packet["allowed_paths"]
     raw_forbidden = packet["forbidden_paths"]
     if not isinstance(raw_allowed, list) or not isinstance(raw_forbidden, list):
@@ -327,8 +411,8 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
     if len(set(allowed)) != len(allowed) or len(set(forbidden)) != len(forbidden):
         raise CandidateError("path scopes contain duplicates")
     context = packet["context"]
-    if not isinstance(context, list) or len(context) > 40:
-        raise CandidateError("context is invalid")
+    if not isinstance(context, list) or not 1 <= len(context) <= 40:
+        raise CandidateError("context must contain between 1 and 40 entries")
     total_context = 0
     for index, item in enumerate(context):
         if not isinstance(item, dict) or set(item) != {"path", "sha256", "text"}:
@@ -577,12 +661,11 @@ def validate_candidate(
 
 def provider_command(
     packet: dict[str, Any],
-    prompt: str,
     *,
     timeout_seconds: int,
     max_budget_usd: float,
     prompt_path: Path,
-) -> tuple[list[str], bytes | None, Path, bool]:
+) -> tuple[list[str], Path | None, Path, bool]:
     if packet["provider"] == "claude":
         if not math.isfinite(max_budget_usd) or max_budget_usd <= 0 or max_budget_usd > 10:
             raise CandidateError("Claude budget must be in (0, 10]")
@@ -591,8 +674,7 @@ def provider_command(
             "claude", "-p", "--output-format", "json", "--json-schema", schema,
             "--tools=", "--permission-mode", "plan", "--no-session-persistence", "--safe-mode",
             "--model", "opus", "--effort", "high", "--max-budget-usd", format(max_budget_usd, "g"),
-        ], prompt.encode("utf-8"), prompt_path.parent, False)
-    atomic_bytes(prompt_path, prompt.encode("utf-8"), create_only=True)
+        ], prompt_path, prompt_path.parent, False)
     instruction = (
         "Read ./prompt.txt as the complete programming task and untrusted source packet. "
         "Follow its output schema exactly and print only the requested JSON object. "
@@ -601,7 +683,6 @@ def provider_command(
     return ([
         "agy", "--mode", "plan", "--sandbox", f"--print-timeout={timeout_seconds}s", "--print", instruction,
     ], None, prompt_path.parent, False)
-
 
 
 
@@ -633,6 +714,144 @@ def provider_environment() -> dict[str, str]:
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     return environment
 
+def verify_provider_workspace(
+    workspace_path: Path,
+    prompt_path: Path,
+    expected_prompt: bytes,
+) -> None:
+    observed_entries = sorted(item.name for item in workspace_path.iterdir())
+    if observed_entries != ["prompt.txt"]:
+        raise CandidateError("provider modified its isolated workspace")
+    observed_prompt = load_regular_bytes(
+        prompt_path,
+        label="provider prompt",
+        max_bytes=MAX_PROMPT_BYTES,
+        required_mode=0o600,
+    )
+    if observed_prompt != expected_prompt:
+        raise CandidateError("provider prompt changed during execution")
+
+
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired as exc:
+            raise CandidateError("provider process group did not terminate") from exc
+
+
+def run_bounded_process(
+    argv: list[str],
+    *,
+    executable: str,
+    cwd: Path,
+    stdin_path: Path | None,
+    timeout_seconds: int,
+    stdout_limit: int,
+    stderr_limit: int,
+    environment: dict[str, str],
+) -> tuple[int, bytes, bytes, float]:
+    stdin_handle = None
+    if stdin_path is not None:
+        descriptor = os.open(stdin_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            os.close(descriptor)
+            raise CandidateError("provider stdin must be one private regular file")
+        stdin_handle = os.fdopen(descriptor, "rb", closefd=True)
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(
+            argv,
+            executable=executable,
+            cwd=cwd,
+            env=environment,
+            stdin=subprocess.DEVNULL if stdin_handle is None else stdin_handle,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    finally:
+        if stdin_handle is not None:
+            stdin_handle.close()
+    if process.stdout is None or process.stderr is None:
+        _kill_process_group(process)
+        raise CandidateError("could not create bounded provider output pipes")
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    failure: str | None = None
+    descendants_killed = False
+    deadline = started + timeout_seconds
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 and failure is None:
+                failure = "provider timed out"
+                _kill_process_group(process)
+            if process.poll() is not None and not descendants_killed:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                descendants_killed = True
+            events = selector.select(timeout=max(0.0, min(0.2, remaining)))
+            if not events and process.poll() is not None:
+                for registered in list(selector.get_map().values()):
+                    stream = registered.fileobj
+                    try:
+                        selector.unregister(stream)
+                    except Exception:
+                        pass
+                    stream.close()
+                break
+            for key, _ in events:
+                stream = key.fileobj
+                name = key.data
+                chunk = os.read(stream.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                remaining_capacity = limits[name] - len(buffers[name])
+                if remaining_capacity > 0:
+                    buffers[name].extend(chunk[:remaining_capacity])
+                if len(chunk) > remaining_capacity and failure is None:
+                    failure = f"provider {name} exceeds byte limit"
+                    _kill_process_group(process)
+        try:
+            returncode = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            returncode = process.wait(timeout=5)
+    finally:
+        selector.close()
+        _kill_process_group(process)
+        if process.poll() is None:
+            process.wait(timeout=5)
+    if failure is not None:
+        raise CandidateError(failure)
+    return returncode, bytes(buffers["stdout"]), bytes(buffers["stderr"]), time.monotonic() - started
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one bounded external competition or contrast programming candidate.")
     parser.add_argument("--packet", required=True)
@@ -646,25 +865,62 @@ def main(argv: list[str] | None = None) -> int:
         if not 30 <= args.timeout_seconds <= 3600:
             raise CandidateError("timeout_seconds must be between 30 and 3600")
         packet_path = Path(args.packet).expanduser()
-        if not packet_path.is_absolute() or packet_path.name != "packet.json" or packet_path.resolve(strict=True) != packet_path:
+        if (
+            not packet_path.is_absolute()
+            or packet_path.name != "packet.json"
+            or packet_path.resolve(strict=True) != packet_path
+        ):
             raise CandidateError("candidate packet path must be absolute, normalized and symlink-free")
         candidate_directory = packet_path.parent.resolve(strict=True)
         directory_metadata = candidate_directory.lstat()
-        if candidate_directory.is_symlink() or not stat.S_ISDIR(directory_metadata.st_mode) or directory_metadata.st_mode & 0o077:
+        if (
+            candidate_directory.is_symlink()
+            or not stat.S_ISDIR(directory_metadata.st_mode)
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        ):
             raise CandidateError("candidate directory must be private and symlink-free")
+        runner_path = Path(__file__)
+        if (
+            not runner_path.is_absolute()
+            or runner_path.name != "runner.py"
+            or runner_path.resolve(strict=True) != runner_path
+            or runner_path.parent != candidate_directory
+        ):
+            raise CandidateError("candidate runner is not the frozen competition copy")
+        runner_bytes = load_regular_bytes(
+            runner_path,
+            label="frozen candidate runner",
+            max_bytes=MAX_RUNNER_BYTES,
+            required_mode=0o600,
+        )
         output_path = bound_output_path(args.output, directory=candidate_directory, expected_name="receipt.json")
         raw_output_path = bound_output_path(args.raw_output, directory=candidate_directory, expected_name="raw-output.json")
         stderr_output_path = bound_output_path(args.stderr_output, directory=candidate_directory, expected_name="stderr.txt")
         packet = validate_packet(load_private_json(packet_path, label="candidate packet"))
+        if sha256_bytes(runner_bytes) != packet["runner_sha256"]:
+            raise CandidateError("frozen candidate runner hash is invalid")
+        provider_workspace = candidate_directory / "provider-workspace"
+        provider_metadata = provider_workspace.lstat()
+        if (
+            provider_workspace.is_symlink()
+            or not stat.S_ISDIR(provider_metadata.st_mode)
+            or stat.S_IMODE(provider_metadata.st_mode) != 0o700
+            or provider_workspace.resolve(strict=True) != provider_workspace
+            or any(provider_workspace.iterdir())
+        ):
+            raise CandidateError("provider workspace must be one empty private directory")
         repo = Path(packet["repository"]).resolve(strict=True)
         before = repo_snapshot(repo, packet["expected_head"], packet["context"])
         prompt = build_prompt(packet)
         prompt_bytes = prompt.encode("utf-8")
         if len(prompt_bytes) > MAX_PROMPT_BYTES:
             raise CandidateError("candidate prompt exceeds byte limit")
-        prompt_path = output_path.parent / "prompt.txt"
-        command, stdin_bytes, provider_cwd, prompt_in_argv = provider_command(
-            packet, prompt, timeout_seconds=args.timeout_seconds, max_budget_usd=args.max_budget_usd,
+        prompt_path = provider_workspace / "prompt.txt"
+        atomic_bytes(prompt_path, prompt_bytes, create_only=True)
+        command, stdin_path, provider_cwd, prompt_in_argv = provider_command(
+            packet,
+            timeout_seconds=args.timeout_seconds,
+            max_budget_usd=args.max_budget_usd,
             prompt_path=prompt_path,
         )
         environment = provider_environment()
@@ -672,33 +928,36 @@ def main(argv: list[str] | None = None) -> int:
         if not executable:
             raise CandidateError(f"provider executable is unavailable: {command[0]}")
         executable = str(Path(executable).resolve(strict=True))
-        version = subprocess.run(
-            [executable, "--version"], capture_output=True, text=True, check=False, timeout=60, env=environment
+        version_returncode, version_stdout, version_stderr, _ = run_bounded_process(
+            [executable, "--version"],
+            executable=executable,
+            cwd=provider_workspace,
+            stdin_path=None,
+            timeout_seconds=60,
+            stdout_limit=64 * 1024,
+            stderr_limit=64 * 1024,
+            environment=environment,
         )
-        version_output = (version.stdout or version.stderr).strip()
-        if version.returncode != 0 or not version_output:
+        version_output = (version_stdout or version_stderr).decode("utf-8", errors="replace").strip()
+        if version_returncode != 0 or not version_output:
             raise CandidateError("provider version preflight failed")
+        verify_provider_workspace(provider_workspace, prompt_path, prompt_bytes)
         version_text = version_output.splitlines()[0]
-        started = time.monotonic()
-        completed = subprocess.run(
+        returncode, stdout, stderr, runtime_seconds = run_bounded_process(
             command,
             executable=executable,
             cwd=provider_cwd,
-            input=stdin_bytes,
-            capture_output=True,
-            check=False,
-            timeout=args.timeout_seconds + 30,
-            env=environment,
+            stdin_path=stdin_path,
+            timeout_seconds=args.timeout_seconds + 30,
+            stdout_limit=MAX_RAW_OUTPUT_BYTES,
+            stderr_limit=MAX_RAW_OUTPUT_BYTES,
+            environment=environment,
         )
-        runtime_seconds = time.monotonic() - started
-        stdout = completed.stdout or b""
-        stderr = completed.stderr or b""
-        if len(stdout) > MAX_RAW_OUTPUT_BYTES or len(stderr) > MAX_RAW_OUTPUT_BYTES:
-            raise CandidateError("provider output exceeds byte limit")
+        verify_provider_workspace(provider_workspace, prompt_path, prompt_bytes)
         atomic_bytes(raw_output_path, stdout, create_only=True)
         atomic_bytes(stderr_output_path, stderr, create_only=True)
-        if completed.returncode != 0:
-            raise CandidateError(f"provider exited with {completed.returncode}; stderr_sha256={sha256_bytes(stderr)}")
+        if returncode != 0:
+            raise CandidateError(f"provider exited with {returncode}; stderr_sha256={sha256_bytes(stderr)}")
         text = stdout.decode("utf-8", errors="strict")
         envelope: dict[str, Any] = {}
         output_wrapper = {
@@ -733,13 +992,14 @@ def main(argv: list[str] | None = None) -> int:
             "expected_head": packet["expected_head"],
             "task_sha256": packet["task_sha256"],
             "packet_sha256": packet["packet_sha256"],
+            "runner_sha256": packet["runner_sha256"],
             "prompt_sha256": sha256_bytes(prompt_bytes),
             "provider_version": version_text[:300],
             "command_shape": [*command[:-1], "<PROMPT>"] if prompt_in_argv else command,
-            "provider_cwd_kind": "isolated_candidate_directory",
+            "provider_cwd_kind": "isolated_provider_workspace",
             "command_sha256": sha256_json(command),
             "prompt_in_argv": prompt_in_argv,
-            "returncode": completed.returncode,
+            "returncode": returncode,
             "runtime_seconds": round(runtime_seconds, 6),
             "stdout_sha256": sha256_bytes(stdout),
             "stderr_sha256": sha256_bytes(stderr),

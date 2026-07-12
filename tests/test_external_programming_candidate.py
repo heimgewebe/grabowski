@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -25,8 +26,16 @@ candidate_tool = _load_tool()
 
 
 class ExternalProgrammingCandidateTests(unittest.TestCase):
-    def _packet(self, directory: Path, repo: Path, *, provider: str = "agy") -> Path:
+    def _packet(
+        self,
+        directory: Path,
+        repo: Path,
+        *,
+        provider: str = "agy",
+        runner_bytes: bytes | None = None,
+    ) -> Path:
         source = "VALUE = 1\n"
+        frozen_runner = Path(candidate_tool.__file__).read_bytes() if runner_bytes is None else runner_bytes
         packet = {
             "schema_version": 1,
             "kind": "external_programming_candidate_packet",
@@ -39,6 +48,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             "expected_head": "a" * 40,
             "task": "Improve the sample",
             "task_sha256": hashlib.sha256(b"Improve the sample").hexdigest(),
+            "runner_sha256": hashlib.sha256(frozen_runner).hexdigest(),
             "allowed_paths": ["src", "tests"],
             "forbidden_paths": [],
             "context": [{"path": "src/sample.py", "sha256": hashlib.sha256(source.encode()).hexdigest(), "text": source}],
@@ -51,6 +61,15 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
         path.write_text(json.dumps(packet), encoding="utf-8")
         os.chmod(path, 0o600)
         return path
+
+    def _prepare_frozen_runner(self, directory: Path) -> tuple[Path, bytes, Path]:
+        runner_bytes = Path(candidate_tool.__file__).read_bytes()
+        runner = directory / "runner.py"
+        runner.write_bytes(runner_bytes)
+        runner.chmod(0o600)
+        provider_workspace = directory / "provider-workspace"
+        provider_workspace.mkdir(mode=0o700)
+        return runner, runner_bytes, provider_workspace
 
     def _candidate(self) -> dict:
         return {
@@ -193,6 +212,29 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
         self.assertTrue(result["patch_rejection"]["rejected"])
         self.assertEqual(result["approach_summary"], value["approach_summary"])
 
+    def test_private_reader_detects_in_place_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            path = root / "state.json"
+            path.write_text(json.dumps({"value": "x" * 1000}), encoding="utf-8")
+            path.chmod(0o600)
+            original_read = candidate_tool.os.read
+            mutated = False
+
+            def mutate_after_read(descriptor, size):
+                nonlocal mutated
+                chunk = original_read(descriptor, size)
+                if not mutated:
+                    mutated = True
+                    with path.open("ab") as handle:
+                        handle.write(b" ")
+                return chunk
+
+            with mock.patch.object(candidate_tool.os, "read", side_effect=mutate_after_read):
+                with self.assertRaisesRegex(candidate_tool.CandidateError, "changed while being read"):
+                    candidate_tool.load_private_json(path, label="race state")
+
     def test_environment_does_not_forward_secret_variables(self) -> None:
         with mock.patch.dict(os.environ, {"SECRET_TOKEN": "do-not-forward", "PATH": "/usr/bin", "HOME": "/tmp/home"}, clear=True):
             environment = candidate_tool.provider_environment()
@@ -211,6 +253,53 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 candidate_tool.atomic_bytes(link, b"unsafe", create_only=True)
             self.assertEqual(target.read_text(), "safe")
 
+    def test_bounded_process_captures_stdout_and_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp)
+            result = candidate_tool.run_bounded_process(
+                ["python3", "-c", "import sys; print('out'); print('err', file=sys.stderr)"],
+                executable="/usr/bin/python3",
+                cwd=cwd,
+                stdin_path=None,
+                timeout_seconds=5,
+                stdout_limit=1024,
+                stderr_limit=1024,
+                environment={"PATH": "/usr/bin", "LANG": "C.UTF-8"},
+            )
+        self.assertEqual(result[0], 0)
+        self.assertEqual(result[1], b"out\n")
+        self.assertEqual(result[2], b"err\n")
+
+    def test_bounded_process_rejects_output_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(candidate_tool.CandidateError, "stdout exceeds byte limit"):
+                candidate_tool.run_bounded_process(
+                    ["python3", "-c", "print('x' * 5000)"],
+                    executable="/usr/bin/python3",
+                    cwd=Path(temp),
+                    stdin_path=None,
+                    timeout_seconds=5,
+                    stdout_limit=100,
+                    stderr_limit=1024,
+                    environment={"PATH": "/usr/bin", "LANG": "C.UTF-8"},
+                )
+
+    def test_bounded_process_times_out_and_terminates_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            started = time.monotonic()
+            with self.assertRaisesRegex(candidate_tool.CandidateError, "timed out"):
+                candidate_tool.run_bounded_process(
+                    ["python3", "-c", "import subprocess,time; subprocess.Popen(['sleep','30']); time.sleep(30)"],
+                    executable="/usr/bin/python3",
+                    cwd=Path(temp),
+                    stdin_path=None,
+                    timeout_seconds=1,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    environment={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                )
+            self.assertLess(time.monotonic() - started, 5)
+
     def test_main_writes_bound_receipt_without_mutating_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -221,7 +310,8 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             (repo / "src" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
             directory = root / "candidate"
             directory.mkdir(mode=0o700)
-            packet_path = self._packet(directory, repo)
+            runner, runner_bytes, provider_workspace = self._prepare_frozen_runner(directory)
+            packet_path = self._packet(directory, repo, runner_bytes=runner_bytes)
             output = directory / "receipt.json"
             raw = directory / "raw-output.json"
             stderr = directory / "stderr.txt"
@@ -243,21 +333,23 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, b"VALUE = 1\n", b"")
                 raise AssertionError(args)
 
-            calls = []
+            bounded_calls = []
 
-            def fake_run(argv, **kwargs):
-                calls.append((argv, kwargs))
+            def fake_bounded(argv, **kwargs):
+                bounded_calls.append((argv, kwargs))
+                self.assertEqual(kwargs["cwd"], provider_workspace)
+                self.assertNotIn("SECRET_TOKEN", kwargs["environment"])
                 if argv[1:] == ["--version"]:
-                    return subprocess.CompletedProcess(argv, 0, "agy 1.1.1\n", "")
+                    return 0, b"agy 1.1.1\n", b"", 0.01
                 self.assertEqual(argv[0], "agy")
-                self.assertEqual(kwargs["cwd"], directory)
-                self.assertNotIn("SECRET_TOKEN", kwargs["env"])
-                return subprocess.CompletedProcess(argv, 0, external, b"")
+                self.assertIsNone(kwargs["stdin_path"])
+                return 0, external, b"", 0.1
 
             with (
+                mock.patch.object(candidate_tool, "__file__", str(runner)),
                 mock.patch.object(candidate_tool, "run_git", side_effect=fake_git),
                 mock.patch.object(candidate_tool.shutil, "which", return_value="/usr/bin/true"),
-                mock.patch.object(candidate_tool.subprocess, "run", side_effect=fake_run),
+                mock.patch.object(candidate_tool, "run_bounded_process", side_effect=fake_bounded),
                 mock.patch.dict(os.environ, {"PATH": "/usr/bin", "HOME": str(root), "SECRET_TOKEN": "hidden"}, clear=True),
             ):
                 result = candidate_tool.main([
@@ -272,10 +364,86 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             self.assertEqual(receipt["expected_head"], "a" * 40)
             self.assertEqual(receipt["authority"], "advisory_only")
             self.assertFalse(receipt["automatic_apply"])
-            self.assertTrue((directory / "prompt.txt").is_file())
-            self.assertIn("Required JSON Schema", (directory / "prompt.txt").read_text())
+            self.assertTrue((provider_workspace / "prompt.txt").is_file())
+            self.assertIn("Required JSON Schema", (provider_workspace / "prompt.txt").read_text())
+            self.assertEqual(receipt["runner_sha256"], hashlib.sha256(runner_bytes).hexdigest())
+            self.assertEqual(receipt["provider_cwd_kind"], "isolated_provider_workspace")
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             self.assertGreaterEqual(len(git_calls), 6)
+
+    def test_main_rejects_tampered_frozen_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            directory = root / "candidate"
+            directory.mkdir(mode=0o700)
+            runner, runner_bytes, _ = self._prepare_frozen_runner(directory)
+            packet_path = self._packet(directory, repo, runner_bytes=runner_bytes)
+            runner.write_bytes(runner_bytes + b"\n# tampered\n")
+            runner.chmod(0o600)
+            with mock.patch.object(candidate_tool, "__file__", str(runner)):
+                result = candidate_tool.main([
+                    "--packet", str(packet_path),
+                    "--output", str(directory / "receipt.json"),
+                    "--raw-output", str(directory / "raw-output.json"),
+                    "--stderr-output", str(directory / "stderr.txt"),
+                    "--timeout-seconds", "60",
+                ])
+            self.assertEqual(result, 2)
+            self.assertFalse((directory / "receipt.json").exists())
+
+    def test_main_rejects_provider_workspace_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            (repo / "src").mkdir()
+            (repo / "src" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+            directory = root / "candidate"
+            directory.mkdir(mode=0o700)
+            runner, runner_bytes, provider_workspace = self._prepare_frozen_runner(directory)
+            packet_path = self._packet(directory, repo, runner_bytes=runner_bytes)
+            external = json.dumps(self._candidate()).encode()
+
+            def fake_git(_repo, args, **kwargs):
+                if args[:2] == ["rev-parse", "--verify"]:
+                    return subprocess.CompletedProcess(args, 0, b"a" * 40 + b"\n", b"")
+                if args and args[0] == "ls-tree":
+                    return subprocess.CompletedProcess(
+                        args, 0, b"100644 blob " + b"b" * 40 + b"\tsrc/sample.py\x00", b""
+                    )
+                if args[:2] == ["cat-file", "blob"]:
+                    return subprocess.CompletedProcess(args, 0, b"VALUE = 1\n", b"")
+                raise AssertionError(args)
+
+            call_count = 0
+
+            def fake_bounded(argv, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    return 0, b"agy 1.1.1\n", b"", 0.01
+                (provider_workspace / "unexpected.txt").write_text("mutation", encoding="utf-8")
+                return 0, external, b"", 0.1
+
+            with (
+                mock.patch.object(candidate_tool, "__file__", str(runner)),
+                mock.patch.object(candidate_tool, "run_git", side_effect=fake_git),
+                mock.patch.object(candidate_tool.shutil, "which", return_value="/usr/bin/true"),
+                mock.patch.object(candidate_tool, "run_bounded_process", side_effect=fake_bounded),
+            ):
+                result = candidate_tool.main([
+                    "--packet", str(packet_path),
+                    "--output", str(directory / "receipt.json"),
+                    "--raw-output", str(directory / "raw-output.json"),
+                    "--stderr-output", str(directory / "stderr.txt"),
+                    "--timeout-seconds", "60",
+                ])
+            self.assertEqual(result, 2)
+            self.assertFalse((directory / "receipt.json").exists())
 
     def test_main_rejects_output_escape_before_provider_call(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -285,14 +453,16 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             repo.mkdir(mode=0o700)
             directory = root / "candidate"
             directory.mkdir(mode=0o700)
-            packet_path = self._packet(directory, repo)
-            result = candidate_tool.main([
+            runner, runner_bytes, _ = self._prepare_frozen_runner(directory)
+            packet_path = self._packet(directory, repo, runner_bytes=runner_bytes)
+            with mock.patch.object(candidate_tool, "__file__", str(runner)):
+                result = candidate_tool.main([
                 "--packet", str(packet_path),
                 "--output", str(root / "receipt.json"),
                 "--raw-output", str(directory / "raw-output.json"),
                 "--stderr-output", str(directory / "stderr.txt"),
-                "--timeout-seconds", "60",
-            ])
+                    "--timeout-seconds", "60",
+                ])
             self.assertEqual(result, 2)
             self.assertFalse((root / "receipt.json").exists())
 

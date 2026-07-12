@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -48,6 +49,7 @@ REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
 MAX_CONTEXT_BYTES = 500_000
 MAX_CONTEXT_FILE_BYTES = 120_000
 MAX_RECEIPT_BYTES = 2_000_000
+MAX_RUNNER_BYTES = 2_000_000
 REQUEST_LOCK_TIMEOUT_SECONDS = 10.0
 REQUEST_LOCK_POLL_SECONDS = 0.05
 
@@ -140,20 +142,24 @@ def _competition_request_lock(identifier: str):
             os.close(descriptor)
 
 
-def _atomic_json(path: Path, value: dict[str, Any]) -> None:
+def _atomic_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     parent_metadata = path.parent.lstat()
     if path.parent.is_symlink() or not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_mode & 0o077:
         raise AgentCompetitionError("state parent must be a private non-symlink directory")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        mode,
+    )
     published = False
     try:
-        data = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             descriptor = -1
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        temporary_metadata = temporary.lstat()
         try:
             os.link(temporary, path, follow_symlinks=False)
         except FileExistsError as exc:
@@ -162,7 +168,6 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         try:
             os.unlink(temporary)
         except OSError:
-            temporary_metadata = temporary.lstat()
             published_metadata = path.lstat()
             if (
                 temporary_metadata.st_dev == published_metadata.st_dev
@@ -171,6 +176,23 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
                 os.unlink(path)
                 published = False
             raise
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != mode
+            or metadata.st_nlink != 1
+            or metadata.st_dev != temporary_metadata.st_dev
+            or metadata.st_ino != temporary_metadata.st_ino
+        ):
+            try:
+                current = path.lstat()
+                if current.st_dev == temporary_metadata.st_dev and current.st_ino == temporary_metadata.st_ino:
+                    os.unlink(path)
+                    published = False
+            except FileNotFoundError:
+                published = False
+            raise AgentCompetitionError("published state file failed inode integrity validation")
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -179,32 +201,91 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
         if published:
-            metadata = path.lstat()
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError as exc:
+                raise AgentCompetitionError("published state file disappeared") from exc
             if metadata.st_nlink != 1:
-                raise AgentCompetitionError("published state file did not reach single-link integrity")
+                if (
+                    metadata.st_dev == temporary_metadata.st_dev
+                    and metadata.st_ino == temporary_metadata.st_ino
+                ):
+                    os.unlink(path)
+                raise AgentCompetitionError("published state file did not retain single-link integrity")
+
+
+def _atomic_json(path: Path, value: dict[str, Any]) -> None:
+    data = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    _atomic_bytes(path, data)
+
+
+def _load_regular_bytes(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+    required_mode: int | None,
+) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError as exc:
+        raise AgentCompetitionError(f"{label} does not exist") from exc
+    except OSError as exc:
+        raise AgentCompetitionError(f"cannot open {label}: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or (required_mode is not None and stat.S_IMODE(before.st_mode) != required_mode)
+            or before.st_size > max_bytes
+        ):
+            raise AgentCompetitionError(f"{label} must be one bounded regular file")
+        chunks = bytearray()
+        while len(chunks) <= max_bytes:
+            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - len(chunks)))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        if len(chunks) > max_bytes:
+            raise AgentCompetitionError(f"{label} exceeds byte limit")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or after.st_size != len(chunks)
+            or after.st_nlink != 1
+        ):
+            raise AgentCompetitionError(f"{label} changed while being read")
+        return bytes(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def _load_private_json(path: Path, *, label: str, max_bytes: int = MAX_RECEIPT_BYTES) -> dict[str, Any]:
+    raw = _load_regular_bytes(path, label=label, max_bytes=max_bytes, required_mode=0o600)
     try:
-        metadata = path.lstat()
-    except FileNotFoundError as exc:
-        raise AgentCompetitionError(f"{label} does not exist") from exc
-    if (
-        path.is_symlink()
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-    ):
-        raise AgentCompetitionError(f"{label} must be one regular private file")
-    if metadata.st_size > max_bytes:
-        raise AgentCompetitionError(f"{label} exceeds byte limit")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AgentCompetitionError(f"cannot read {label}: {exc}") from exc
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentCompetitionError(f"cannot parse {label}: {exc}") from exc
     if not isinstance(value, dict):
         raise AgentCompetitionError(f"{label} is not a JSON object")
     return value
+
+
+def _validate_competition_directory(path: Path) -> Path:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise AgentCompetitionError("competition directory does not exist") from exc
+    if (
+        path.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise AgentCompetitionError("competition directory must be private and symlink-free")
+    return path.resolve(strict=True)
 
 
 def _git_environment() -> dict[str, str]:
@@ -464,7 +545,7 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
     required = {
         "schema_version", "kind", "competition_id", "request_id", "request_fingerprint",
         "provider", "mode", "repository", "expected_head", "task_sha256", "packet_sha256",
-        "start_intent_sha256", "task_id", "task_unit", "created_at", "authority",
+        "runner_sha256", "start_intent_sha256", "task_id", "task_unit", "created_at", "authority",
         "automatic_apply", "manifest_sha256",
     }
     if set(manifest) != required:
@@ -485,7 +566,10 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
         raise AgentCompetitionError("competition manifest identity is invalid")
     if manifest["authority"] != "advisory_only" or manifest["automatic_apply"] is not False:
         raise AgentCompetitionError("competition manifest authority is invalid")
-    for field in ("expected_head", "task_sha256", "packet_sha256", "request_fingerprint", "start_intent_sha256"):
+    for field in (
+        "expected_head", "task_sha256", "packet_sha256", "runner_sha256",
+        "request_fingerprint", "start_intent_sha256",
+    ):
         pattern = SHA40_RE if field == "expected_head" else SHA256_RE
         value = manifest[field]
         if not isinstance(value, str) or pattern.fullmatch(value) is None:
@@ -505,10 +589,21 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
         "expected_head": manifest["expected_head"],
         "task_sha256": manifest["task_sha256"],
         "packet_sha256": manifest["packet_sha256"],
+        "runner_sha256": manifest["runner_sha256"],
     }
     for field, expected in bindings.items():
         if packet.get(field) != expected:
             raise AgentCompetitionError(f"candidate packet binding mismatch: {field}")
+    directory = _validate_competition_directory(_competition_dir(identifier))
+    frozen_runner = _load_regular_bytes(
+        directory / "runner.py",
+        label="frozen candidate runner",
+        max_bytes=MAX_RUNNER_BYTES,
+        required_mode=0o600,
+    )
+    if _sha256_bytes(frozen_runner) != manifest["runner_sha256"]:
+        raise AgentCompetitionError("frozen candidate runner hash is invalid")
+    _validate_competition_directory(directory / "provider-workspace")
     intent = _validated_start_intent(identifier)
     if (
         intent["start_intent_sha256"] != manifest["start_intent_sha256"]
@@ -672,6 +767,95 @@ def _validate_receipt_candidate(candidate: Any, packet: dict[str, Any]) -> dict[
         raise AgentCompetitionError("candidate receipt patch syntax state is invalid")
     return candidate
 
+def _validate_receipt_snapshot(
+    value: Any,
+    *,
+    label: str,
+    expected_head: str,
+    expected_context_count: int,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"head", "commit_bound", "context_count", "worktree_clean_required"}
+        or value["head"] != expected_head
+        or value["commit_bound"] is not True
+        or isinstance(value["context_count"], bool)
+        or value["context_count"] != expected_context_count
+        or value["worktree_clean_required"] is not False
+    ):
+        raise AgentCompetitionError(f"candidate receipt {label} snapshot is invalid")
+    return value
+
+
+def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any]) -> None:
+    for field in ("prompt_sha256", "command_sha256", "stdout_sha256", "stderr_sha256"):
+        value = receipt[field]
+        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+            raise AgentCompetitionError(f"candidate receipt {field} is invalid")
+    version = receipt["provider_version"]
+    if not isinstance(version, str) or not version.strip() or len(version) > 300 or "\x00" in version:
+        raise AgentCompetitionError("candidate receipt provider_version is invalid")
+    command = receipt["command_shape"]
+    if (
+        not isinstance(command, list)
+        or not 1 <= len(command) <= 40
+        or any(not isinstance(item, str) or not item or len(item) > 20000 or "\x00" in item for item in command)
+        or command[0] != receipt["provider"]
+        or receipt["command_sha256"] != _sha256_json(command)
+    ):
+        raise AgentCompetitionError("candidate receipt command_shape is invalid")
+    if receipt["provider"] == "claude":
+        if len(command) < 4 or command[1:4] != ["-p", "--output-format", "json"] or "--tools=" not in command:
+            raise AgentCompetitionError("candidate receipt Claude command shape is invalid")
+    elif command[:4] != ["agy", "--mode", "plan", "--sandbox"]:
+        raise AgentCompetitionError("candidate receipt agy command shape is invalid")
+    if receipt["provider_cwd_kind"] != "isolated_provider_workspace" or receipt["prompt_in_argv"] is not False:
+        raise AgentCompetitionError("candidate receipt provider isolation fields are invalid")
+    returncode = receipt["returncode"]
+    runtime_seconds = receipt["runtime_seconds"]
+    if (
+        isinstance(returncode, bool)
+        or returncode != 0
+        or isinstance(runtime_seconds, bool)
+        or not isinstance(runtime_seconds, (int, float))
+        or not math.isfinite(float(runtime_seconds))
+        or not 0 <= float(runtime_seconds) <= 4000
+    ):
+        raise AgentCompetitionError("candidate receipt execution outcome is invalid")
+    expected_context_count = len(packet.get("context", []))
+    before = _validate_receipt_snapshot(
+        receipt["before"],
+        label="before",
+        expected_head=packet["expected_head"],
+        expected_context_count=expected_context_count,
+    )
+    after = _validate_receipt_snapshot(
+        receipt["after"],
+        label="after",
+        expected_head=packet["expected_head"],
+        expected_context_count=expected_context_count,
+    )
+    if before != after:
+        raise AgentCompetitionError("candidate receipt snapshots disagree")
+    does_not_establish = receipt["does_not_establish"]
+    required_nonclaims = {"correctness", "test_pass", "review_pass", "merge_readiness", "preferred_candidate"}
+    if (
+        not isinstance(does_not_establish, list)
+        or len(set(does_not_establish)) != len(does_not_establish)
+        or any(not isinstance(item, str) or not item or len(item) > 100 for item in does_not_establish)
+        or not required_nonclaims.issubset(set(does_not_establish))
+    ):
+        raise AgentCompetitionError("candidate receipt nonclaims are invalid")
+    total_cost = receipt.get("total_cost_usd")
+    if total_cost is not None and (
+        isinstance(total_cost, bool)
+        or not isinstance(total_cost, (int, float))
+        or not math.isfinite(float(total_cost))
+        or not 0 <= float(total_cost) <= 100
+    ):
+        raise AgentCompetitionError("candidate receipt total_cost_usd is invalid")
+
+
 def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[str, Any] | None:
     path = _competition_dir(identifier) / "receipt.json"
     if not path.exists() and not path.is_symlink():
@@ -685,7 +869,7 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
     required = {
         "schema_version", "kind", "competition_id", "request_id", "request_fingerprint",
         "provider", "mode", "repository", "expected_head", "task_sha256", "packet_sha256",
-        "prompt_sha256", "provider_version", "command_shape",
+        "runner_sha256", "prompt_sha256", "provider_version", "command_shape",
         "provider_cwd_kind", "command_sha256", "prompt_in_argv", "returncode", "runtime_seconds",
         "stdout_sha256", "stderr_sha256", "before", "after", "candidate", "authority",
         "automatic_apply", "automatic_commit", "automatic_merge", "automatic_deploy",
@@ -706,6 +890,7 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
         "expected_head": bound_manifest["expected_head"],
         "task_sha256": bound_manifest["task_sha256"],
         "packet_sha256": bound_manifest["packet_sha256"],
+        "runner_sha256": bound_manifest["runner_sha256"],
     }
     for field, expected in bindings.items():
         if receipt.get(field) != expected:
@@ -741,10 +926,24 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
             or SHA256_RE.fullmatch(wrapper["discarded_wrapper_sha256"]) is None
         ):
             raise AgentCompetitionError("candidate receipt output wrapper is invalid")
+    directory = _validate_competition_directory(_competition_dir(identifier))
     packet = _load_private_json(
-        _competition_dir(identifier) / "packet.json",
+        directory / "packet.json",
         label="candidate packet",
     )
+    provider_workspace = _validate_competition_directory(directory / "provider-workspace")
+    entries = sorted(item.name for item in provider_workspace.iterdir())
+    if entries != ["prompt.txt"]:
+        raise AgentCompetitionError("candidate provider workspace contents are invalid")
+    prompt = _load_regular_bytes(
+        provider_workspace / "prompt.txt",
+        label="candidate provider prompt",
+        max_bytes=500_000,
+        required_mode=0o600,
+    )
+    if _sha256_bytes(prompt) != receipt["prompt_sha256"]:
+        raise AgentCompetitionError("candidate provider prompt hash is invalid")
+    _validate_receipt_execution(receipt, packet)
     _validate_receipt_candidate(receipt["candidate"], packet)
     return receipt
 
@@ -881,7 +1080,7 @@ def grabowski_agent_execution_route(
         },
         "stop_conditions": [
             "external candidate exceeds scope or context limits",
-            "repository head or cleanliness drifts",
+            "bound commit or exported context becomes unavailable or mismatched",
             "candidate attempts mutation or returns unstructured output",
             "additional candidate would repeat an already represented approach",
         ],
@@ -932,9 +1131,13 @@ def grabowski_agent_competition_start(
     executable = shutil.which(provider_value)
     if not executable:
         raise AgentCompetitionError(f"provider executable is unavailable: {provider_value}")
-    runner_metadata = RUNNER.lstat()
-    if RUNNER.is_symlink() or not stat.S_ISREG(runner_metadata.st_mode) or runner_metadata.st_nlink != 1:
-        raise AgentCompetitionError("external candidate runner is unavailable or unsafe")
+    runner_bytes = _load_regular_bytes(
+        RUNNER,
+        label="external candidate runner source",
+        max_bytes=MAX_RUNNER_BYTES,
+        required_mode=None,
+    )
+    runner_sha256 = _sha256_bytes(runner_bytes)
     task_sha256 = _sha256_bytes(task_value.encode("utf-8"))
     request_contract = {
         "request_id": request_value,
@@ -943,6 +1146,7 @@ def grabowski_agent_competition_start(
         "repository": str(repo),
         "expected_head": head,
         "task_sha256": task_sha256,
+        "runner_sha256": runner_sha256,
         "task": task_value,
         "allowed_paths": allowed,
         "forbidden_paths": forbidden,
@@ -958,9 +1162,10 @@ def grabowski_agent_competition_start(
         try:
             os.mkdir(directory, 0o700)
         except FileExistsError:
+            _validate_competition_directory(directory)
             manifest_path = directory / "manifest.json"
             intent_path = directory / "start-intent.json"
-            if manifest_path.exists():
+            if manifest_path.exists() or manifest_path.is_symlink():
                 existing = _validated_manifest(identifier)
                 if existing["request_fingerprint"] != request_fingerprint:
                     raise AgentCompetitionError("request_id already exists with a different competition contract")
@@ -984,6 +1189,12 @@ def grabowski_agent_competition_start(
                     "competition start outcome is unresolved; inspect durable tasks before using a new request_id"
                 )
             raise AgentCompetitionError("competition directory already exists without a valid manifest or start intent")
+        directory = _validate_competition_directory(directory)
+        frozen_runner_path = directory / "runner.py"
+        _atomic_bytes(frozen_runner_path, runner_bytes)
+        provider_workspace = directory / "provider-workspace"
+        os.mkdir(provider_workspace, 0o700)
+        _validate_competition_directory(provider_workspace)
         packet: dict[str, Any] = {
             "schema_version": 1,
             "kind": "external_programming_candidate_packet",
@@ -996,6 +1207,7 @@ def grabowski_agent_competition_start(
             "expected_head": head,
             "task": task_value,
             "task_sha256": task_sha256,
+            "runner_sha256": runner_sha256,
             "allowed_paths": allowed,
             "forbidden_paths": forbidden,
             "context": contexts,
@@ -1010,7 +1222,7 @@ def grabowski_agent_competition_start(
         stderr_path = directory / "stderr.txt"
         _atomic_json(packet_path, packet)
         command = [
-            "/usr/bin/python3", str(RUNNER),
+            "/usr/bin/python3", str(frozen_runner_path),
             "--packet", str(packet_path),
             "--output", str(receipt_path),
             "--raw-output", str(raw_path),
@@ -1035,7 +1247,7 @@ def grabowski_agent_competition_start(
             task_start = tasks.grabowski_task_start(
                 host="heim-pc",
                 argv=command,
-                cwd=str(repo),
+                cwd=str(directory),
                 runtime_seconds=timeout_seconds + 180,
                 resume_policy="never",
                 cpu_weight=80,
@@ -1070,6 +1282,7 @@ def grabowski_agent_competition_start(
             "expected_head": head,
             "task_sha256": task_sha256,
             "packet_sha256": packet["packet_sha256"],
+            "runner_sha256": runner_sha256,
             "start_intent_sha256": start_intent["start_intent_sha256"],
             "task_id": task_record["task_id"],
             "task_unit": task_record.get("unit"),
@@ -1218,10 +1431,10 @@ def _candidate_summary(receipt: dict[str, Any]) -> dict[str, Any]:
 
 @mcp.tool(name="grabowski_agent_competition_compare", annotations=READ_ONLY)
 def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str, Any]:
-    """Generate a deterministic contrast matrix and validation opportunities from two to four candidates."""
+    """Generate a deterministic contrast matrix from exactly two bound candidates."""
     operator._require_operator_capability("durable_job")
-    if not isinstance(competition_ids, list) or not 2 <= len(competition_ids) <= 4:
-        raise AgentCompetitionError("competition_ids must contain between 2 and 4 entries")
+    if not isinstance(competition_ids, list) or len(competition_ids) != 2:
+        raise AgentCompetitionError("competition_ids must contain exactly 2 entries")
     if len(set(competition_ids)) != len(competition_ids):
         raise AgentCompetitionError("competition_ids must be unique")
     receipts: list[dict[str, Any]] = []
@@ -1272,7 +1485,7 @@ def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str,
         insights.append({
             "kind": "implementation_consensus",
             "evidence": shared_paths,
-            "interpretation": "independent candidates converge on these code surfaces; inspect them first but do not treat convergence as correctness",
+            "interpretation": "both candidates converge on these code surfaces; inspect them first but do not treat convergence as correctness",
         })
     divergent_paths = sorted(set(all_paths) - set(shared_paths))
     if divergent_paths:
@@ -1300,8 +1513,21 @@ def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str,
             "evidence": repeated_tests,
             "interpretation": "multiple candidates independently request these checks; prioritize them in the deterministic test role",
         })
-    applying = [item["competition_id"] for item in candidates if item["patch_applies"]]
-    nonapplying = [item["competition_id"] for item in candidates if not item["patch_applies"]]
+    applying = [
+        item["competition_id"]
+        for item in candidates
+        if item["patch_available"] and item["patch_applies"]
+    ]
+    nonapplying = [
+        item["competition_id"]
+        for item in candidates
+        if item["patch_available"] and not item["patch_applies"]
+    ]
+    not_proposed = [
+        item["competition_id"]
+        for item in candidates
+        if not item["patch_available"]
+    ]
     if nonapplying:
         insights.append({
             "kind": "patch_applicability_gap",
@@ -1329,7 +1555,11 @@ def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str,
             "tradeoffs_by_candidate": {item["competition_id"]: item["tradeoffs"] for item in candidates},
             "contrast_observations_by_candidate": {item["competition_id"]: item["contrast_observations"] for item in candidates},
         },
-        "patch_applicability": {"applying": applying, "nonapplying": nonapplying},
+        "patch_applicability": {
+            "applying": applying,
+            "nonapplying": nonapplying,
+            "not_proposed": not_proposed,
+        },
         "insights": insights,
         "integration_rule": "operator selects explicit insights; normal isolated Writer reimplements or imports them, then deterministic Tests and independent Review validate the resulting frozen diff",
         "winner_selected": False,
