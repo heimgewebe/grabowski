@@ -62,30 +62,35 @@ Die kleinste Handlung muss beantworten:
 
 Danach wird nach Aufgabenklasse geroutet.
 
-4. **Codex exec/review**
-   - Standard fuer komplexe Code- und Repo-Slices.
-   - Auftrag endet nach Diff, Test oder Stop-Bericht.
+4. **ChatGPT Operator**
+   - Standard fuer Aufgabenzerlegung, begrenzte Codeaenderungen, Integration, kritischen Selbstreview und Recovery.
+   - Der Operator delegiert nur, wenn ein Helfer mehr Skalierung oder einen nuetzlichen unabhaengigen Kontrast liefert.
+   - Der Operator bleibt fuer Scope, Receipts, Tests, Commit, Push, Merge und Deploy verantwortlich.
+
+5. **Delegierte Coding-Agenten**
+   - Prioritaet: **Claude -> Codex -> agy -> Cline**.
+   - Groessere Implementierungspakete enden nach Diff, Test oder Stop-Bericht.
    - Default: kein Commit, kein Push, kein Merge.
 
-5. **agy print / Ollama API**
-   - `agy --print` ist Standard fuer schnelle leichte Denk-, Sortier- und Klassifikationsgriffe.
+6. **agy print / Ollama API**
+   - `agy --print` ist nach dem Operator ein Helfer fuer schnelle leichte Denk-, Sortier- und Klassifikationsgriffe.
    - Ollama API mit qwen coder ist Standard fuer lokale Mikro-Reasoning- und Shell-Vorschlagsgriffe ohne Cloud.
    - Beide erzeugen kurze Receipts; sie treffen keine Merge-, Push- oder Deploy-Entscheidungen.
 
-6. **Claude Review**
-   - Beste Wahl fuer Architektur-, Sicherheits- oder Review-Fragen.
+7. **Claude Review**
+   - Claude liefert nach dem Operator unabhaengigen Kontrast fuer Architektur-, Sicherheits- oder Review-Fragen.
    - Default: lesen, bewerten, Risiken benennen; keine Mutation.
 
-7. **tmux / agy Session**
+8. **tmux / agy Session**
    - tmux ist Standard fuer vorhandene Sessions, Capture und Resume-Kontexte.
    - agy ist fuer Session/Resume nur dann besser, wenn der Ruecknahmebeleg klarer ist.
 
-8. **Patch file relay**
+9. **Patch file relay**
    - Lokale Patchdateien werden mit `tools/operator_patch_relay.py` geprueft und bei expliziter Entscheidung angewendet.
    - Der Relay schreibt ein JSON-Receipt; manueller Patchdownload durch den Nutzer ist nur der letzte Notausgang.
    - Der Relay merged, pusht und deployt nicht.
 
-9. **Goose / Qwen / Aider**
+10. **Goose / Qwen / Aider**
    - Goose und Qwen sind optionale lokale Agent-Alternativen, nicht der Standardpfad.
    - Aider bleibt ein bounded Patch-Fallback mit deaktiviertem Auto-Commit.
 
@@ -96,7 +101,7 @@ Danach wird nach Aufgabenklasse geroutet.
 | Status/Health blockiert | engeres Typed Tool oder Micro-Task | geringes Risiko, sofort pruefbar | Status JSON oder Logtail |
 | Repo-/Branch-Lage fuer Zielrepo unklar | Steuerboard operator report | leichtes read-only Lagebild ohne Freigabe | operator-report JSON, nur zielrelevante Felder |
 | kurzer Shell-Griff blockiert | Grabowski Micro-Task | bleibt unter Grabowski-Audit | task_id, status, logs |
-| komplexer Code-/Repo-Slice | Codex exec/review | Standard fuer anspruchsvolle Repo-Arbeit | diff, changed files, Tests |
+| komplexer Code-/Repo-Slice | ChatGPT Operator; delegiert Claude -> Codex -> agy -> Cline | Operator haelt Scope und Integration, Helfer liefern Skalierung oder Kontrast | diff, changed files, Tests |
 | lokaler Patch aus Chat/Artefakt | operator_patch_relay.py | prueft und wendet lokal mit Head- und Dirty-Gates an | JSON-Receipt plus Git-Diff |
 | Review-/Architekturunsicherheit | Claude Review | bessere Kontrastpruefung | Review mit konkreten Befunden |
 | interaktive Sessionfrage | tmux capture, agy bei besserem Resume | Resume-naehe | Capture-Auszug, naechste Eingabe |
@@ -187,17 +192,25 @@ Freie Fantasietypen sind ungueltig. Ein fehlgeschlagener Resource-Key ist kein P
 
 ## Agentenwahl
 
-### Codex
+### ChatGPT Operator
 
-Codex ist der primaere Helfer fuer komplexe Code- und Repo-Slices. Der richtige Modus ist `exec` oder `review`: begrenzter Scope, kein Commit, kein Push, Stop nach Diff oder Test.
+ChatGPT ist nicht eine weitere Workspace-Rolle, sondern der uebergeordnete Operator. Der Operator bearbeitet begrenzte Codeaenderungen, Integration, kritischen Selbstreview und Recovery selbst und delegiert groessere Pakete nur mit engem Scope und Receipt-Pflicht.
 
 ### Claude
 
-Claude ist Review- und Architekturhelfer. Claude soll schwierige Invarianten, Sicherheitslogik und Alternativen pruefen. Claude ist nicht der Standardgriff fuer schnelle Shell-Aktionen.
+Claude ist der primaere delegierte Coding-Agent und zugleich ein unabhaengiger Review- und Architekturhelfer. Claude soll schwierige Invarianten, Sicherheitslogik und Alternativen pruefen. Claude ist nicht der Standardgriff fuer schnelle Shell-Aktionen.
+
+### Codex
+
+Codex ist der zweite delegierte Helfer fuer komplexe Code- und Repo-Slices. Der richtige Modus ist `exec` oder `review`: begrenzter Scope, kein Commit, kein Push, Stop nach Diff oder Test.
 
 ### agy
 
-agy ist Standard fuer schnelle leichte One-Shots per `agy --print`. Fuer interaktive Arbeitsraeume und Resume ist agy nur dann besser als tmux, wenn der Ruecknahmebeleg klarer ist.
+agy ist der dritte delegierte Coding-Agent und nach dem Operator ein Helfer fuer schnelle leichte One-Shots per `agy --print`. Fuer interaktive Arbeitsraeume und Resume ist agy nur dann besser als tmux, wenn der Ruecknahmebeleg klarer ist.
+
+### Cline
+
+Cline ist der vierte delegierte Coding-Agent und wird nur genutzt, wenn Claude, Codex und agy nicht geeignet oder nicht verfuegbar sind. Auch Cline erhaelt begrenzten Scope und keine automatische Commit-, Push-, Merge- oder Deploy-Autoritaet.
 
 ### Lokale KI / Goose / Ollama
 
@@ -249,4 +262,4 @@ Dieses Protokoll etabliert nicht:
 
 ## Kurzform
 
-Grabowski bleibt die Hand. Codex wird das Skalpell fuer Code. Claude wird der zweite Blick. agy bleibt ein moeglicher Arbeitsraum. Lokale KI bleibt Hilfslicht. ChatGPT bleibt Operator.
+Grabowski bleibt die Hand. ChatGPT bleibt Operator und erster Ausfuehrer fuer begrenzte Arbeit. Delegierte Coding-Agenten folgen Claude, Codex, agy und Cline. Lokale KI bleibt Hilfslicht.

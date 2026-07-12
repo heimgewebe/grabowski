@@ -91,6 +91,18 @@ class OperatorContextTests(unittest.TestCase):
                 "receipt_before_next_step",
             ],
         )
+        self.assertEqual(
+            protocol["execution_priority"],
+            ["chatgpt_operator", "claude", "codex", "agy", "cline"],
+        )
+        self.assertEqual(
+            protocol["coding_agent_priority"],
+            ["claude", "codex", "agy", "cline"],
+        )
+        self.assertEqual(
+            protocol["routing_roles"]["complex_code_task"],
+            "chatgpt_operator_then_claude_codex_agy_cline",
+        )
         self.assertIn(
             "blocked_action_protocol",
             context["sources"],

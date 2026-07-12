@@ -203,20 +203,40 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
             "name": "Operator Relay v0",
             "doc_path": "docs/blocked-action-protocol-v0.md",
             "rule": (
-                "Keep ChatGPT as operator. Run the Grabowski control loop first, "
-                "then route bounded helper work by task class."
+                "Keep ChatGPT as operator and execute bounded work first. "
+                "Delegate only when a helper adds useful scale or independent contrast."
             ),
             "control_loop": [
                 "typed_grabowski_tool",
                 "grabowski_micro_task",
                 "receipt_before_next_step",
             ],
+            "execution_priority": [
+                "chatgpt_operator",
+                "claude",
+                "codex",
+                "agy",
+                "cline",
+            ],
+            "coding_agent_priority": [
+                "claude",
+                "codex",
+                "agy",
+                "cline",
+            ],
+            "operator_first_for": [
+                "task_decomposition",
+                "bounded_code_change",
+                "integration",
+                "critical_self_review",
+                "recovery",
+            ],
             "routing_roles": {
-                "complex_code_task": "codex_exec_or_codex_review",
-                "quick_light_reasoning": "agy_print",
+                "complex_code_task": "chatgpt_operator_then_claude_codex_agy_cline",
+                "quick_light_reasoning": "chatgpt_operator_then_agy_print",
                 "local_micro_reasoning": "ollama_api_qwen_coder",
                 "shell_or_git_grip": "grabowski_task",
-                "security_or_architecture_review": "claude",
+                "security_or_architecture_review": "chatgpt_operator_then_claude",
                 "session_resume": "tmux_first_agy_when_useful",
                 "memory_prioritization": "bureau",
                 "patch_file_relay": "operator_patch_relay",
@@ -269,11 +289,13 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
         "- Name: `Operator Relay v0`",
         "- Source: `docs/blocked-action-protocol-v0.md`",
         "- Control loop: typed Grabowski tool first; if blocked, one bounded Grabowski Micro-Task; then read a receipt before deciding the next step.",
-        "- Complex code task: Codex exec/review by default, bounded and stopped at diff or test evidence.",
-        "- Quick light reasoning: agy `--print`.",
+        "- Execution priority: ChatGPT operator first; delegated coding agents follow Claude, Codex, agy, then Cline.",
+        "- Operator-first work: task decomposition, bounded code changes, integration, critical self-review and recovery.",
+        "- Complex code task: the operator executes when bounded; larger delegated packages follow the coding-agent priority and stop at diff or test evidence.",
+        "- Quick light reasoning: operator first, then agy `--print` when delegation adds value.",
         "- Local micro reasoning: Ollama API with qwen coder.",
         "- Patch file relay: local patch files use `tools/operator_patch_relay.py` for check/apply receipts before user manual execution.",
-        "- Review: Claude for architecture and safety review.",
+        "- Review: operator first; Claude provides independent architecture and safety contrast.",
         "- Session: tmux first; agy only when available and better for resume.",
         "- Steuerboard: `operator report` is a lightweight read-only repo-state context signal; no separate trial/noise logging; never an approval gate.",
         "",

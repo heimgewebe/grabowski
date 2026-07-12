@@ -120,6 +120,36 @@ def signed_role_receipt(
     return signed_receipt(payload)
 
 
+def passing_toolchain_preflight(manifest: dict, role_name: str, command: list[str]) -> dict:
+    del manifest
+    return {
+        "role": role_name,
+        "command_sha256": workspace._sha256_json(command),
+        "checked_at": "test",
+        "sandbox": role.SANDBOX_LABEL,
+        "executable": command[0],
+        "declared_python_module": role.declared_python_module(command),
+        "passed": True,
+        "missing_executable": False,
+        "missing_python_module": False,
+        "probe_error": None,
+        "probe_returncode": 0,
+        "failure_classification": "passed",
+    }
+
+
+def missing_module_preflight(manifest: dict, role_name: str, command: list[str]) -> dict:
+    result = passing_toolchain_preflight(manifest, role_name, command)
+    result.update(
+        {
+            "passed": False,
+            "missing_python_module": True,
+            "failure_classification": "environment_toolchain_failure",
+        }
+    )
+    return result
+
+
 class GitFixture:
     def __init__(self, root: Path) -> None:
         self.repo = root / "repo"
@@ -163,6 +193,14 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.root_patch = mock.patch.object(workspace, "WORKSPACE_ROOT", self.state)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
+        self.real_role_toolchain_preflight = workspace._role_toolchain_preflight
+        self.preflight_patch = mock.patch.object(
+            workspace,
+            "_role_toolchain_preflight",
+            side_effect=passing_toolchain_preflight,
+        )
+        self.preflight_patch.start()
+        self.addCleanup(self.preflight_patch.stop)
         self.addCleanup(self.temp.cleanup)
 
     def manifest(self, *, with_writer: bool = True) -> dict:
@@ -2414,6 +2452,11 @@ class AgentWorkspaceTests(unittest.TestCase):
         manifest["commands"]["tests"] = ["python3", "-m", "pytest"]
         workspace._write_manifest(manifest)
         with (
+            mock.patch.object(
+                workspace,
+                "_role_toolchain_preflight",
+                side_effect=missing_module_preflight,
+            ),
             mock.patch.object(workspace, "_task_public", return_value={"task_id": "writer-task", "state": "completed", "terminal": True}),
             mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
@@ -2439,6 +2482,11 @@ class AgentWorkspaceTests(unittest.TestCase):
         manifest["commands"]["tests"] = ["python3", "-m", "pytest"]
         workspace._write_manifest(manifest)
         with (
+            mock.patch.object(
+                workspace,
+                "_role_toolchain_preflight",
+                side_effect=missing_module_preflight,
+            ),
             mock.patch.object(workspace, "_task_public", return_value={"task_id": "writer-task", "state": "completed", "terminal": True}),
             mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
@@ -2501,6 +2549,11 @@ class AgentWorkspaceTests(unittest.TestCase):
         manifest["commands"]["tests"] = ["python3", "-m", "pytest"]
         workspace._write_manifest(manifest)
         with (
+            mock.patch.object(
+                workspace,
+                "_role_toolchain_preflight",
+                side_effect=missing_module_preflight,
+            ),
             mock.patch.object(workspace, "_task_public", return_value={"task_id": "writer-task", "state": "completed", "terminal": True}),
             mock.patch.object(workspace.tasks, "grabowski_task_start"),
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
@@ -2937,8 +2990,11 @@ class AgentWorkspaceTests(unittest.TestCase):
 
     def test_preflight_probe_error_is_not_reported_as_missing_prerequisites(self) -> None:
         manifest = self.manifest()
-        with mock.patch.object(role, "run_bounded_capture", side_effect=OSError("probe unavailable")):
-            result = workspace._role_toolchain_preflight(
+        with (
+            mock.patch.object(role, "runtime_sandbox_argv", side_effect=lambda argv: argv),
+            mock.patch.object(role, "run_bounded_capture", side_effect=OSError("probe unavailable")),
+        ):
+            result = self.real_role_toolchain_preflight(
                 manifest, "tests", ["python3", "-m", "unittest"]
             )
         self.assertFalse(result["passed"])
@@ -2949,9 +3005,26 @@ class AgentWorkspaceTests(unittest.TestCase):
 
     def test_preflight_checks_exact_executable_path(self) -> None:
         manifest = self.manifest()
-        result = workspace._role_toolchain_preflight(
-            manifest, "tests", ["/definitely/missing/python3", "-m", "unittest"]
+        capture = sandbox.BoundedCapture(
+            returncode=0,
+            stdout_bytes=52,
+            stderr_bytes=0,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            stdout_tail='{"executable_found": false, "module_found": true}',
+            stderr_tail="",
+            stdout_content=b'{"executable_found": false, "module_found": true}',
+            stdout_content_exceeded=False,
+            stdout_limit_exceeded=False,
+            stderr_limit_exceeded=False,
         )
+        with (
+            mock.patch.object(role, "runtime_sandbox_argv", side_effect=lambda argv: argv),
+            mock.patch.object(role, "run_bounded_capture", return_value=capture),
+        ):
+            result = self.real_role_toolchain_preflight(
+                manifest, "tests", ["/definitely/missing/python3", "-m", "unittest"]
+            )
         self.assertEqual(result["executable"], "/definitely/missing/python3")
         self.assertTrue(result["missing_executable"])
         self.assertFalse(result["missing_python_module"])

@@ -9,11 +9,13 @@ This document describes the repository contract. Current runtime state must be r
 - Name: `Operator Relay v0`
 - Source: `docs/blocked-action-protocol-v0.md`
 - Control loop: typed Grabowski tool first; if blocked, one bounded Grabowski Micro-Task; then read a receipt before deciding the next step.
-- Complex code task: Codex exec/review by default, bounded and stopped at diff or test evidence.
-- Quick light reasoning: agy `--print`.
+- Execution priority: ChatGPT operator first; delegated coding agents follow Claude, Codex, agy, then Cline.
+- Operator-first work: task decomposition, bounded code changes, integration, critical self-review and recovery.
+- Complex code task: the operator executes when bounded; larger delegated packages follow the coding-agent priority and stop at diff or test evidence.
+- Quick light reasoning: operator first, then agy `--print` when delegation adds value.
 - Local micro reasoning: Ollama API with qwen coder.
 - Patch file relay: local patch files use `tools/operator_patch_relay.py` for check/apply receipts before user manual execution.
-- Review: Claude for architecture and safety review.
+- Review: operator first; Claude provides independent architecture and safety contrast.
 - Session: tmux first; agy only when available and better for resume.
 - Steuerboard: `operator report` is a lightweight read-only repo-state context signal; no separate trial/noise logging; never an approval gate.
 
