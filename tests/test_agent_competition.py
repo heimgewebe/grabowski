@@ -171,6 +171,27 @@ class AgentCompetitionTests(unittest.TestCase):
         competition._atomic_json(self.state / identifier / "receipt.json", receipt)
         return receipt
 
+    def test_atomic_publish_cleanup_failure_rolls_back_visible_target(self) -> None:
+        directory = self.state / "atomic-test"
+        directory.mkdir(mode=0o700)
+        target = directory / "state.json"
+        original_unlink = competition.os.unlink
+        failed_once = False
+
+        def fail_first_temporary_unlink(path):
+            nonlocal failed_once
+            candidate = Path(path)
+            if candidate.name.startswith(".state.json.") and not failed_once:
+                failed_once = True
+                raise PermissionError("temporary cleanup denied")
+            return original_unlink(path)
+
+        with mock.patch.object(competition.os, "unlink", side_effect=fail_first_temporary_unlink):
+            with self.assertRaisesRegex(PermissionError, "temporary cleanup denied"):
+                competition._atomic_json(target, {"value": 1})
+        self.assertFalse(target.exists())
+        self.assertEqual(list(directory.iterdir()), [])
+
     def test_git_environment_discards_rebinding_and_replace_objects(self) -> None:
         with mock.patch.dict(
             os.environ,
@@ -264,6 +285,18 @@ class AgentCompetitionTests(unittest.TestCase):
         with self.assertRaisesRegex(competition.AgentCompetitionError, "different competition contract"):
             competition.grabowski_agent_competition_start(**changed)
 
+    def test_request_lock_blocks_overlapping_identical_start_window(self) -> None:
+        identifier = "gac-claude-competitor-1111111111-2222222222"
+        with competition._competition_request_lock(identifier):
+            with mock.patch.object(competition, "REQUEST_LOCK_TIMEOUT_SECONDS", 0.0):
+                with self.assertRaisesRegex(competition.AgentCompetitionError, "lock timed out"):
+                    with competition._competition_request_lock(identifier):
+                        self.fail("overlapping request lock must not be acquired")
+        lock_path = self.state / f".{identifier}.lock"
+        self.assertTrue(lock_path.is_file())
+        self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+
+
     def test_unresolved_start_intent_blocks_duplicate_start(self) -> None:
         request_id = "unresolved-request"
         task = "Improve sample"
@@ -303,6 +336,11 @@ class AgentCompetitionTests(unittest.TestCase):
         }
         intent["start_intent_sha256"] = competition._sha256_json(intent)
         competition._atomic_json(directory / "start-intent.json", intent)
+        status = competition.grabowski_agent_competition_status(identifier)
+        self.assertEqual(status["lifecycle_state"], "start_prepared_outcome_unresolved")
+        self.assertFalse(status["manifest_present"])
+        self.assertTrue(status["retry_blocked"])
+        self.assertIsNone(status["task"])
         with mock.patch.object(competition.tasks, "grabowski_task_start") as start:
             with self.assertRaisesRegex(competition.AgentCompetitionError, "outcome is unresolved"):
                 competition.grabowski_agent_competition_start(
@@ -312,6 +350,103 @@ class AgentCompetitionTests(unittest.TestCase):
                     repository=str(self.repo),
                     expected_head=self.head,
                     task=task,
+                    allowed_paths=["src", "tests"],
+                    context_paths=["src/sample.py", "tests/test_sample.py"],
+                    timeout_seconds=120,
+                )
+        start.assert_not_called()
+
+    def test_task_start_exception_is_projected_as_unknown_not_failed(self) -> None:
+        request_id = "unknown-start-request"
+        task = "Improve sample"
+        task_sha256 = competition._sha256_bytes(task.encode("utf-8"))
+        identifier = competition._competition_id("claude", "competitor", task_sha256, request_id)
+        with mock.patch.object(competition.tasks, "grabowski_task_start", side_effect=RuntimeError("transport lost")):
+            with self.assertRaisesRegex(RuntimeError, "transport lost"):
+                competition.grabowski_agent_competition_start(
+                    request_id=request_id,
+                    provider="claude",
+                    mode="competitor",
+                    repository=str(self.repo),
+                    expected_head=self.head,
+                    task=task,
+                    allowed_paths=["src", "tests"],
+                    context_paths=["src/sample.py", "tests/test_sample.py"],
+                    timeout_seconds=120,
+                )
+        status = competition.grabowski_agent_competition_status(identifier)
+        self.assertEqual(status["lifecycle_state"], "task_start_outcome_unknown")
+        self.assertEqual(status["cancel_state"], "not_attempted")
+        self.assertIsNone(status["task"])
+        self.assertTrue(status["retry_blocked"])
+
+    def test_manifest_publish_failure_always_records_cancel_projection(self) -> None:
+        request_id = "manifest-failure-request"
+        task = "Improve sample"
+        task_sha256 = competition._sha256_bytes(task.encode("utf-8"))
+        identifier = competition._competition_id("claude", "competitor", task_sha256, request_id)
+        original_atomic = competition._atomic_json
+
+        def fail_manifest(path, value):
+            if path.name == "manifest.json":
+                raise competition.AgentCompetitionError("manifest publish failed")
+            return original_atomic(path, value)
+
+        cancel_result = {
+            "task": {"task_id": "task-manifest", "unit": "u", "state": "cancelled"},
+            "result": {"returncode": 0},
+        }
+        with (
+            mock.patch.object(competition, "_atomic_json", side_effect=fail_manifest),
+            mock.patch.object(
+                competition.tasks,
+                "grabowski_task_start",
+                return_value=self._task_start("task-manifest"),
+            ),
+            mock.patch.object(competition.tasks, "grabowski_task_cancel", return_value=cancel_result) as cancel,
+        ):
+            with self.assertRaisesRegex(competition.AgentCompetitionError, "manifest publish failed"):
+                competition.grabowski_agent_competition_start(
+                    request_id=request_id,
+                    provider="claude",
+                    mode="competitor",
+                    repository=str(self.repo),
+                    expected_head=self.head,
+                    task=task,
+                    allowed_paths=["src", "tests"],
+                    context_paths=["src/sample.py", "tests/test_sample.py"],
+                    timeout_seconds=120,
+                )
+        cancel.assert_called_once_with("task-manifest")
+        with mock.patch.object(
+            competition.tasks,
+            "grabowski_task_status",
+            return_value={"task_id": "task-manifest", "unit": "u", "state": "cancelled"},
+        ):
+            status = competition.grabowski_agent_competition_status(identifier)
+        self.assertEqual(status["lifecycle_state"], "manifest_publish_failed")
+        self.assertEqual(status["cancel_state"], "confirmed")
+        self.assertEqual(status["task"]["state"], "cancelled")
+        self.assertFalse(status["manifest_present"])
+
+    def test_tampered_start_intent_is_not_accepted_as_idempotent_state(self) -> None:
+        started = self._start()
+        directory = self.state / started["competition_id"]
+        (directory / "manifest.json").unlink()
+        intent_path = directory / "start-intent.json"
+        intent = json.loads(intent_path.read_text())
+        intent_path.unlink()
+        intent["packet_sha256"] = "f" * 64
+        competition._atomic_json(intent_path, intent)
+        with mock.patch.object(competition.tasks, "grabowski_task_start") as start:
+            with self.assertRaisesRegex(competition.AgentCompetitionError, "start intent contract is invalid"):
+                competition.grabowski_agent_competition_start(
+                    request_id="test-claude-competitor",
+                    provider="claude",
+                    mode="competitor",
+                    repository=str(self.repo),
+                    expected_head=self.head,
+                    task="Improve sample",
                     allowed_paths=["src", "tests"],
                     context_paths=["src/sample.py", "tests/test_sample.py"],
                     timeout_seconds=120,
@@ -360,6 +495,19 @@ class AgentCompetitionTests(unittest.TestCase):
         competition._atomic_json(path, receipt)
         with self.assertRaisesRegex(competition.AgentCompetitionError, "binding mismatch"):
             competition._receipt(started["competition_id"])
+
+    def test_compare_does_not_claim_identical_empty_patches_or_perfect_empty_paths(self) -> None:
+        first = self._start(provider="claude", mode="competitor", task="empty comparison")
+        second = self._start(provider="agy", mode="contrast", task="empty comparison")
+        self._write_receipt(first["competition_id"], changed_paths=[], risks=[], tests=[])
+        self._write_receipt(second["competition_id"], changed_paths=[], risks=[], tests=[])
+        result = competition.grabowski_agent_competition_compare(
+            [first["competition_id"], second["competition_id"]]
+        )
+        pair = result["pairwise_contrasts"][0]
+        self.assertFalse(pair["both_patches_available"])
+        self.assertFalse(pair["same_patch"])
+        self.assertIsNone(pair["path_jaccard"])
 
     def test_compare_emits_consensus_and_divergence_without_winner(self) -> None:
         first = self._start(provider="claude", mode="competitor", task="same task")

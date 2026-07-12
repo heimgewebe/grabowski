@@ -393,20 +393,79 @@ def build_prompt(packet: dict[str, Any]) -> str:
     )
 
 
-def parse_plain_json(stdout: str) -> dict[str, Any]:
+def parse_plain_json(
+    stdout: str,
+    *,
+    allow_wrapped_fence: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     stripped = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stdout).strip()
-    candidates = [stripped]
-    fenced = re.fullmatch(r"```(?:json)?[ \t]*\n(?P<body>.*)\n```", stripped, flags=re.IGNORECASE | re.DOTALL)
-    if fenced is not None:
-        candidates.append(fenced.group("body").strip())
-    for candidate in candidates:
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed, {
+            "kind": "none",
+            "discarded_prefix_bytes": 0,
+            "discarded_suffix_bytes": 0,
+            "discarded_wrapper_sha256": sha256_bytes(b""),
+        }
+    exact = re.fullmatch(
+        r"```(?:json)?[ \t]*\n(?P<body>.*)\n```",
+        stripped,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if exact is not None:
         try:
-            parsed = json.loads(candidate)
+            parsed = json.loads(exact.group("body").strip())
         except json.JSONDecodeError:
-            continue
+            parsed = None
         if isinstance(parsed, dict):
-            return parsed
-    raise CandidateError("external agent output must be one JSON object, optionally in one exact JSON code fence")
+            return parsed, {
+                "kind": "exact_json_fence",
+                "discarded_prefix_bytes": 0,
+                "discarded_suffix_bytes": 0,
+                "discarded_wrapper_sha256": sha256_bytes(b""),
+            }
+    if allow_wrapped_fence:
+        matches = list(
+            re.finditer(
+                r"```(?:json)?[ \t]*\n(?P<body>.*?)\n```",
+                stripped,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        )
+        if len(matches) == 1:
+            match = matches[0]
+            prefix = stripped[: match.start()]
+            suffix = stripped[match.end() :]
+            prefix_bytes = prefix.encode("utf-8")
+            suffix_bytes = suffix.encode("utf-8")
+            wrapper = prefix_bytes + b"\x00" + suffix_bytes
+            if (
+                len(prefix_bytes) <= 4096
+                and len(suffix_bytes) <= 4096
+                and "```" not in prefix
+                and "```" not in suffix
+                and "{" not in prefix
+                and "}" not in prefix
+                and "{" not in suffix
+                and "}" not in suffix
+            ):
+                try:
+                    parsed = json.loads(match.group("body").strip())
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    return parsed, {
+                        "kind": "single_json_fence_with_discarded_wrapper",
+                        "discarded_prefix_bytes": len(prefix_bytes),
+                        "discarded_suffix_bytes": len(suffix_bytes),
+                        "discarded_wrapper_sha256": sha256_bytes(wrapper),
+                    }
+    raise CandidateError(
+        "external agent output must be one JSON object or one bounded JSON fence"
+    )
 
 
 def parse_claude_json(stdout: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -642,10 +701,19 @@ def main(argv: list[str] | None = None) -> int:
             raise CandidateError(f"provider exited with {completed.returncode}; stderr_sha256={sha256_bytes(stderr)}")
         text = stdout.decode("utf-8", errors="strict")
         envelope: dict[str, Any] = {}
+        output_wrapper = {
+            "kind": "provider_envelope",
+            "discarded_prefix_bytes": 0,
+            "discarded_suffix_bytes": 0,
+            "discarded_wrapper_sha256": sha256_bytes(b""),
+        }
         if packet["provider"] == "claude":
             envelope, candidate_raw = parse_claude_json(text)
         else:
-            candidate_raw = parse_plain_json(text)
+            candidate_raw, output_wrapper = parse_plain_json(
+                text,
+                allow_wrapped_fence=True,
+            )
         candidate = validate_candidate(
             candidate_raw,
             packet,
@@ -675,6 +743,7 @@ def main(argv: list[str] | None = None) -> int:
             "runtime_seconds": round(runtime_seconds, 6),
             "stdout_sha256": sha256_bytes(stdout),
             "stderr_sha256": sha256_bytes(stderr),
+            "output_wrapper": output_wrapper,
             "before": before,
             "after": after,
             "candidate": candidate,

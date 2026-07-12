@@ -84,11 +84,28 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
     def test_plain_json_accepts_one_exact_fence_and_rejects_prose(self) -> None:
         value = self._candidate()
         fenced = "```json\n" + json.dumps(value) + "\n```"
-        self.assertEqual(candidate_tool.parse_plain_json(fenced), value)
-        with self.assertRaisesRegex(candidate_tool.CandidateError, "one JSON object"):
+        parsed, wrapper = candidate_tool.parse_plain_json(fenced)
+        self.assertEqual(parsed, value)
+        self.assertEqual(wrapper["kind"], "exact_json_fence")
+        with self.assertRaisesRegex(candidate_tool.CandidateError, "one JSON object|bounded JSON fence"):
             candidate_tool.parse_plain_json("Here is the result:\n" + json.dumps(value))
-        with self.assertRaisesRegex(candidate_tool.CandidateError, "one JSON object"):
+        with self.assertRaisesRegex(candidate_tool.CandidateError, "one JSON object|bounded JSON fence"):
             candidate_tool.parse_plain_json(fenced + "\n" + fenced)
+
+        wrapped = "Provider progress message\n" + fenced
+        parsed, wrapper = candidate_tool.parse_plain_json(
+            wrapped,
+            allow_wrapped_fence=True,
+        )
+        self.assertEqual(parsed, value)
+        self.assertEqual(wrapper["kind"], "single_json_fence_with_discarded_wrapper")
+        self.assertGreater(wrapper["discarded_prefix_bytes"], 0)
+        with self.assertRaises(candidate_tool.CandidateError):
+            candidate_tool.parse_plain_json(
+                "Untrusted {outside}\n" + fenced,
+                allow_wrapped_fence=True,
+            )
+
 
     def test_git_environment_discards_repository_rebinding(self) -> None:
         with mock.patch.dict(

@@ -1449,7 +1449,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Read one external candidate task and validate its immutable receipt when present.",
+      "description": "Read one candidate lifecycle, including fail-closed pre-manifest start outcomes.",
       "effects": [
         "task-state-refresh"
       ],

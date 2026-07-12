@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -10,6 +12,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import time
 from typing import Any
 
 import grabowski_agent_workspace as workspace
@@ -45,6 +48,8 @@ REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
 MAX_CONTEXT_BYTES = 500_000
 MAX_CONTEXT_FILE_BYTES = 120_000
 MAX_RECEIPT_BYTES = 2_000_000
+REQUEST_LOCK_TIMEOUT_SECONDS = 10.0
+REQUEST_LOCK_POLL_SECONDS = 0.05
 
 
 class AgentCompetitionError(ValueError):
@@ -90,12 +95,58 @@ def _competition_dir(identifier: str) -> Path:
     return _competition_root() / clean
 
 
+@contextmanager
+def _competition_request_lock(identifier: str):
+    clean = workspace._required_string(identifier, "competition_id", max_length=100)
+    path = _competition_root() / f".{clean}.lock"
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and (
+        path.is_symlink()
+        or not stat.S_ISREG(existing.st_mode)
+        or existing.st_nlink != 1
+        or stat.S_IMODE(existing.st_mode) != 0o600
+    ):
+        raise AgentCompetitionError("competition request lock is unsafe")
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise AgentCompetitionError("competition request lock descriptor is unsafe")
+        deadline = time.monotonic() + REQUEST_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise AgentCompetitionError("competition request lock timed out") from exc
+                time.sleep(REQUEST_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     parent_metadata = path.parent.lstat()
     if path.parent.is_symlink() or not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_mode & 0o077:
         raise AgentCompetitionError("state parent must be a private non-symlink directory")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    published = False
     try:
         data = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
@@ -107,14 +158,30 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
             os.link(temporary, path, follow_symlinks=False)
         except FileExistsError as exc:
             raise AgentCompetitionError(f"state file already exists: {path.name}") from exc
-        temporary.unlink()
+        published = True
+        try:
+            os.unlink(temporary)
+        except OSError:
+            temporary_metadata = temporary.lstat()
+            published_metadata = path.lstat()
+            if (
+                temporary_metadata.st_dev == published_metadata.st_dev
+                and temporary_metadata.st_ino == published_metadata.st_ino
+            ):
+                os.unlink(path)
+                published = False
+            raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         try:
-            temporary.unlink()
+            os.unlink(temporary)
         except FileNotFoundError:
             pass
+        if published:
+            metadata = path.lstat()
+            if metadata.st_nlink != 1:
+                raise AgentCompetitionError("published state file did not reach single-link integrity")
 
 
 def _load_private_json(path: Path, *, label: str, max_bytes: int = MAX_RECEIPT_BYTES) -> dict[str, Any]:
@@ -283,6 +350,115 @@ def _scope(values: list[str] | None, *, label: str, nonempty: bool) -> list[str]
     return normalized
 
 
+def _validated_start_intent(identifier: str) -> dict[str, Any]:
+    intent = _load_private_json(
+        _competition_dir(identifier) / "start-intent.json",
+        label="competition start intent",
+    )
+    required = {
+        "schema_version", "kind", "competition_id", "request_id", "request_fingerprint",
+        "packet_sha256", "command_sha256", "created_at", "state", "start_intent_sha256",
+    }
+    if set(intent) != required:
+        raise AgentCompetitionError("competition start intent shape is invalid")
+    observed_hash = intent["start_intent_sha256"]
+    unsigned = {key: value for key, value in intent.items() if key != "start_intent_sha256"}
+    if (
+        not isinstance(observed_hash, str)
+        or SHA256_RE.fullmatch(observed_hash) is None
+        or observed_hash != _sha256_json(unsigned)
+        or intent["schema_version"] != 1
+        or intent["kind"] != "external_programming_competition_start_intent"
+        or intent["competition_id"] != identifier
+        or not isinstance(intent["request_id"], str)
+        or REQUEST_ID_RE.fullmatch(intent["request_id"]) is None
+        or intent["state"] != "prepared"
+        or not isinstance(intent["created_at"], str)
+        or not intent["created_at"].strip()
+    ):
+        raise AgentCompetitionError("competition start intent contract is invalid")
+    for field in ("request_fingerprint", "packet_sha256", "command_sha256"):
+        value = intent[field]
+        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+            raise AgentCompetitionError(f"competition start intent {field} is invalid")
+    return intent
+
+
+def _write_start_outcome(
+    identifier: str,
+    intent: dict[str, Any],
+    *,
+    state: str,
+    task_id: str | None = None,
+    task_unit: str | None = None,
+    cancel_state: str = "not_attempted",
+) -> dict[str, Any]:
+    if state not in {"task_start_outcome_unknown", "manifest_publish_failed"}:
+        raise AgentCompetitionError("competition start outcome state is invalid")
+    if cancel_state not in {"not_attempted", "confirmed", "unconfirmed"}:
+        raise AgentCompetitionError("competition start outcome cancel_state is invalid")
+    if state == "manifest_publish_failed" and (not isinstance(task_id, str) or not task_id):
+        raise AgentCompetitionError("manifest publish failure requires a task_id")
+    if state == "task_start_outcome_unknown" and (task_id is not None or task_unit is not None):
+        raise AgentCompetitionError("unknown task start outcome may not claim task identity")
+    outcome = {
+        "schema_version": 1,
+        "kind": "external_programming_competition_start_outcome",
+        "competition_id": identifier,
+        "request_id": intent["request_id"],
+        "request_fingerprint": intent["request_fingerprint"],
+        "packet_sha256": intent["packet_sha256"],
+        "start_intent_sha256": intent["start_intent_sha256"],
+        "state": state,
+        "task_id": task_id,
+        "task_unit": task_unit,
+        "cancel_state": cancel_state,
+        "recorded_at": workspace._utc(),
+    }
+    outcome["start_outcome_sha256"] = _sha256_json(outcome)
+    _atomic_json(_competition_dir(identifier) / "start-outcome.json", outcome)
+    return outcome
+
+
+def _validated_start_outcome(identifier: str, intent: dict[str, Any]) -> dict[str, Any] | None:
+    path = _competition_dir(identifier) / "start-outcome.json"
+    if not path.exists() and not path.is_symlink():
+        return None
+    outcome = _load_private_json(path, label="competition start outcome")
+    required = {
+        "schema_version", "kind", "competition_id", "request_id", "request_fingerprint",
+        "packet_sha256", "start_intent_sha256", "state", "task_id", "task_unit",
+        "cancel_state", "recorded_at", "start_outcome_sha256",
+    }
+    if set(outcome) != required:
+        raise AgentCompetitionError("competition start outcome shape is invalid")
+    observed_hash = outcome["start_outcome_sha256"]
+    unsigned = {key: value for key, value in outcome.items() if key != "start_outcome_sha256"}
+    if (
+        not isinstance(observed_hash, str)
+        or SHA256_RE.fullmatch(observed_hash) is None
+        or observed_hash != _sha256_json(unsigned)
+        or outcome["schema_version"] != 1
+        or outcome["kind"] != "external_programming_competition_start_outcome"
+        or outcome["competition_id"] != identifier
+        or outcome["request_id"] != intent["request_id"]
+        or outcome["request_fingerprint"] != intent["request_fingerprint"]
+        or outcome["packet_sha256"] != intent["packet_sha256"]
+        or outcome["start_intent_sha256"] != intent["start_intent_sha256"]
+        or outcome["state"] not in {"task_start_outcome_unknown", "manifest_publish_failed"}
+        or outcome["cancel_state"] not in {"not_attempted", "confirmed", "unconfirmed"}
+        or not isinstance(outcome["recorded_at"], str)
+        or not outcome["recorded_at"].strip()
+    ):
+        raise AgentCompetitionError("competition start outcome contract is invalid")
+    if outcome["state"] == "task_start_outcome_unknown":
+        if outcome["task_id"] is not None or outcome["task_unit"] is not None or outcome["cancel_state"] != "not_attempted":
+            raise AgentCompetitionError("unknown task start outcome overclaims task identity")
+    elif not isinstance(outcome["task_id"], str) or not outcome["task_id"]:
+        raise AgentCompetitionError("manifest publish failure task identity is invalid")
+    return outcome
+
+
 def _validated_manifest(identifier: str) -> dict[str, Any]:
     manifest = _load_private_json(_competition_dir(identifier) / "manifest.json", label="competition manifest")
     required = {
@@ -333,21 +509,12 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
     for field, expected in bindings.items():
         if packet.get(field) != expected:
             raise AgentCompetitionError(f"candidate packet binding mismatch: {field}")
-    intent = _load_private_json(
-        _competition_dir(identifier) / "start-intent.json",
-        label="competition start intent",
-    )
-    observed_intent_hash = intent.get("start_intent_sha256")
-    unsigned_intent = {key: value for key, value in intent.items() if key != "start_intent_sha256"}
+    intent = _validated_start_intent(identifier)
     if (
-        not isinstance(observed_intent_hash, str)
-        or observed_intent_hash != _sha256_json(unsigned_intent)
-        or observed_intent_hash != manifest["start_intent_sha256"]
-        or intent.get("competition_id") != identifier
-        or intent.get("request_id") != manifest["request_id"]
-        or intent.get("request_fingerprint") != manifest["request_fingerprint"]
-        or intent.get("packet_sha256") != manifest["packet_sha256"]
-        or intent.get("state") != "prepared"
+        intent["start_intent_sha256"] != manifest["start_intent_sha256"]
+        or intent["request_id"] != manifest["request_id"]
+        or intent["request_fingerprint"] != manifest["request_fingerprint"]
+        or intent["packet_sha256"] != manifest["packet_sha256"]
     ):
         raise AgentCompetitionError("competition start intent binding is invalid")
     return manifest
@@ -372,7 +539,7 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
         "automatic_apply", "automatic_commit", "automatic_merge", "automatic_deploy",
         "does_not_establish", "receipt_sha256",
     }
-    allowed = required | {"total_cost_usd"}
+    allowed = required | {"total_cost_usd", "output_wrapper"}
     if set(receipt) < required or not set(receipt) <= allowed:
         raise AgentCompetitionError("candidate receipt shape is invalid")
     if receipt["schema_version"] != 1 or receipt["kind"] != "external_programming_candidate_receipt":
@@ -396,6 +563,32 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
         for field in ("automatic_apply", "automatic_commit", "automatic_merge", "automatic_deploy")
     ):
         raise AgentCompetitionError("candidate receipt authority is invalid")
+    wrapper = receipt.get("output_wrapper")
+    if wrapper is not None:
+        if (
+            not isinstance(wrapper, dict)
+            or set(wrapper) != {
+                "kind",
+                "discarded_prefix_bytes",
+                "discarded_suffix_bytes",
+                "discarded_wrapper_sha256",
+            }
+            or wrapper["kind"] not in {
+                "provider_envelope",
+                "none",
+                "exact_json_fence",
+                "single_json_fence_with_discarded_wrapper",
+            }
+            or isinstance(wrapper["discarded_prefix_bytes"], bool)
+            or not isinstance(wrapper["discarded_prefix_bytes"], int)
+            or not 0 <= wrapper["discarded_prefix_bytes"] <= 4096
+            or isinstance(wrapper["discarded_suffix_bytes"], bool)
+            or not isinstance(wrapper["discarded_suffix_bytes"], int)
+            or not 0 <= wrapper["discarded_suffix_bytes"] <= 4096
+            or not isinstance(wrapper["discarded_wrapper_sha256"], str)
+            or SHA256_RE.fullmatch(wrapper["discarded_wrapper_sha256"]) is None
+        ):
+            raise AgentCompetitionError("candidate receipt output wrapper is invalid")
     candidate = receipt["candidate"]
     if not isinstance(candidate, dict):
         raise AgentCompetitionError("candidate receipt candidate is invalid")
@@ -612,175 +805,213 @@ def grabowski_agent_competition_start(
     }
     request_fingerprint = _sha256_json(request_contract)
     identifier = _competition_id(provider_value, mode_value, task_sha256, request_value)
-    directory = _competition_dir(identifier)
-    try:
-        os.mkdir(directory, 0o700)
-    except FileExistsError:
-        manifest_path = directory / "manifest.json"
-        intent_path = directory / "start-intent.json"
-        if manifest_path.exists():
-            existing = _validated_manifest(identifier)
-            if existing["request_fingerprint"] != request_fingerprint:
-                raise AgentCompetitionError("request_id already exists with a different competition contract")
-            return {
-                "competition_id": identifier,
-                "request_id": request_value,
-                "provider": existing["provider"],
-                "mode": existing["mode"],
-                "task_id": existing["task_id"],
-                "packet_sha256": existing["packet_sha256"],
-                "status_tool": "grabowski_agent_competition_status",
-                "already_started": True,
-                "automatic_apply": False,
-                "does_not_establish": ["candidate_success", "candidate_correctness", "preferred_candidate"],
-            }
-        if intent_path.exists():
-            intent = _load_private_json(intent_path, label="competition start intent")
-            if intent.get("request_fingerprint") != request_fingerprint:
-                raise AgentCompetitionError("request_id already exists with a different unresolved start intent")
-            raise AgentCompetitionError(
-                "competition start outcome is unresolved; inspect durable tasks before using a new request_id"
-            )
-        raise AgentCompetitionError("competition directory already exists without a valid manifest or start intent")
-    packet: dict[str, Any] = {
-        "schema_version": 1,
-        "kind": "external_programming_candidate_packet",
-        "competition_id": identifier,
-        "request_id": request_value,
-        "request_fingerprint": request_fingerprint,
-        "provider": provider_value,
-        "mode": mode_value,
-        "repository": str(repo),
-        "expected_head": head,
-        "task": task_value,
-        "task_sha256": task_sha256,
-        "allowed_paths": allowed,
-        "forbidden_paths": forbidden,
-        "context": contexts,
-        "primary_summary": summary,
-        "packet_nonce": secrets.token_hex(16),
-        "created_at": workspace._utc(),
-    }
-    packet["packet_sha256"] = _sha256_json(packet)
-    packet_path = directory / "packet.json"
-    receipt_path = directory / "receipt.json"
-    raw_path = directory / "raw-output.json"
-    stderr_path = directory / "stderr.txt"
-    _atomic_json(packet_path, packet)
-    command = [
-        "/usr/bin/python3", str(RUNNER),
-        "--packet", str(packet_path),
-        "--output", str(receipt_path),
-        "--raw-output", str(raw_path),
-        "--stderr-output", str(stderr_path),
-        "--timeout-seconds", str(timeout_seconds),
-        "--max-budget-usd", format(float(max_budget_usd), "g"),
-    ]
-    start_intent = {
-        "schema_version": 1,
-        "kind": "external_programming_competition_start_intent",
-        "competition_id": identifier,
-        "request_id": request_value,
-        "request_fingerprint": request_fingerprint,
-        "packet_sha256": packet["packet_sha256"],
-        "command_sha256": _sha256_json(command),
-        "created_at": workspace._utc(),
-        "state": "prepared",
-    }
-    start_intent["start_intent_sha256"] = _sha256_json(start_intent)
-    _atomic_json(directory / "start-intent.json", start_intent)
-    try:
-        task_start = tasks.grabowski_task_start(
-            host="heim-pc",
-            argv=command,
-            cwd=str(repo),
-            runtime_seconds=timeout_seconds + 180,
-            resume_policy="never",
-            cpu_weight=80,
-            io_weight=80,
-            memory_max_bytes=2 * 1024 * 1024 * 1024,
-            resource_keys=[f"path:{directory}"],
-        )
-    except Exception:
-        failure = {
+    with _competition_request_lock(identifier):
+        directory = _competition_dir(identifier)
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            manifest_path = directory / "manifest.json"
+            intent_path = directory / "start-intent.json"
+            if manifest_path.exists():
+                existing = _validated_manifest(identifier)
+                if existing["request_fingerprint"] != request_fingerprint:
+                    raise AgentCompetitionError("request_id already exists with a different competition contract")
+                return {
+                    "competition_id": identifier,
+                    "request_id": request_value,
+                    "provider": existing["provider"],
+                    "mode": existing["mode"],
+                    "task_id": existing["task_id"],
+                    "packet_sha256": existing["packet_sha256"],
+                    "status_tool": "grabowski_agent_competition_status",
+                    "already_started": True,
+                    "automatic_apply": False,
+                    "does_not_establish": ["candidate_success", "candidate_correctness", "preferred_candidate"],
+                }
+            if intent_path.exists() or intent_path.is_symlink():
+                intent = _validated_start_intent(identifier)
+                if intent["request_fingerprint"] != request_fingerprint:
+                    raise AgentCompetitionError("request_id already exists with a different unresolved start intent")
+                raise AgentCompetitionError(
+                    "competition start outcome is unresolved; inspect durable tasks before using a new request_id"
+                )
+            raise AgentCompetitionError("competition directory already exists without a valid manifest or start intent")
+        packet: dict[str, Any] = {
             "schema_version": 1,
+            "kind": "external_programming_candidate_packet",
+            "competition_id": identifier,
+            "request_id": request_value,
+            "request_fingerprint": request_fingerprint,
+            "provider": provider_value,
+            "mode": mode_value,
+            "repository": str(repo),
+            "expected_head": head,
+            "task": task_value,
+            "task_sha256": task_sha256,
+            "allowed_paths": allowed,
+            "forbidden_paths": forbidden,
+            "context": contexts,
+            "primary_summary": summary,
+            "packet_nonce": secrets.token_hex(16),
+            "created_at": workspace._utc(),
+        }
+        packet["packet_sha256"] = _sha256_json(packet)
+        packet_path = directory / "packet.json"
+        receipt_path = directory / "receipt.json"
+        raw_path = directory / "raw-output.json"
+        stderr_path = directory / "stderr.txt"
+        _atomic_json(packet_path, packet)
+        command = [
+            "/usr/bin/python3", str(RUNNER),
+            "--packet", str(packet_path),
+            "--output", str(receipt_path),
+            "--raw-output", str(raw_path),
+            "--stderr-output", str(stderr_path),
+            "--timeout-seconds", str(timeout_seconds),
+            "--max-budget-usd", format(float(max_budget_usd), "g"),
+        ]
+        start_intent = {
+            "schema_version": 1,
+            "kind": "external_programming_competition_start_intent",
             "competition_id": identifier,
             "request_id": request_value,
             "request_fingerprint": request_fingerprint,
             "packet_sha256": packet["packet_sha256"],
-            "start_intent_sha256": start_intent["start_intent_sha256"],
-            "state": "task_start_failed",
-            "recorded_at": workspace._utc(),
+            "command_sha256": _sha256_json(command),
+            "created_at": workspace._utc(),
+            "state": "prepared",
         }
-        _atomic_json(directory / "start-failure.json", failure)
-        raise
-    task_record = task_start.get("task") if isinstance(task_start, dict) else None
-    if not isinstance(task_record, dict) or not isinstance(task_record.get("task_id"), str):
-        unknown = {
+        start_intent["start_intent_sha256"] = _sha256_json(start_intent)
+        _atomic_json(directory / "start-intent.json", start_intent)
+        try:
+            task_start = tasks.grabowski_task_start(
+                host="heim-pc",
+                argv=command,
+                cwd=str(repo),
+                runtime_seconds=timeout_seconds + 180,
+                resume_policy="never",
+                cpu_weight=80,
+                io_weight=80,
+                memory_max_bytes=2 * 1024 * 1024 * 1024,
+                resource_keys=[f"path:{directory}"],
+            )
+        except Exception:
+            _write_start_outcome(
+                identifier,
+                start_intent,
+                state="task_start_outcome_unknown",
+            )
+            raise
+        task_record = task_start.get("task") if isinstance(task_start, dict) else None
+        if not isinstance(task_record, dict) or not isinstance(task_record.get("task_id"), str):
+            _write_start_outcome(
+                identifier,
+                start_intent,
+                state="task_start_outcome_unknown",
+            )
+            raise AgentCompetitionError("durable task start outcome is unknown; retry is blocked")
+        manifest = {
             "schema_version": 1,
+            "kind": "external_programming_competition_manifest",
             "competition_id": identifier,
             "request_id": request_value,
             "request_fingerprint": request_fingerprint,
+            "provider": provider_value,
+            "mode": mode_value,
+            "repository": str(repo),
+            "expected_head": head,
+            "task_sha256": task_sha256,
+            "packet_sha256": packet["packet_sha256"],
             "start_intent_sha256": start_intent["start_intent_sha256"],
-            "state": "task_start_outcome_unknown",
-            "recorded_at": workspace._utc(),
+            "task_id": task_record["task_id"],
+            "task_unit": task_record.get("unit"),
+            "created_at": workspace._utc(),
+            "authority": "advisory_only",
+            "automatic_apply": False,
         }
-        _atomic_json(directory / "start-unknown.json", unknown)
-        raise AgentCompetitionError("durable task start outcome is unknown; retry is blocked")
-    manifest = {
-        "schema_version": 1,
-        "kind": "external_programming_competition_manifest",
-        "competition_id": identifier,
-        "request_id": request_value,
-        "request_fingerprint": request_fingerprint,
-        "provider": provider_value,
-        "mode": mode_value,
-        "repository": str(repo),
-        "expected_head": head,
-        "task_sha256": task_sha256,
-        "packet_sha256": packet["packet_sha256"],
-        "start_intent_sha256": start_intent["start_intent_sha256"],
-        "task_id": task_record["task_id"],
-        "task_unit": task_record.get("unit"),
-        "created_at": workspace._utc(),
-        "authority": "advisory_only",
-        "automatic_apply": False,
-    }
-    manifest["manifest_sha256"] = _sha256_json(manifest)
-    try:
-        _atomic_json(directory / "manifest.json", manifest)
-    except Exception:
+        manifest["manifest_sha256"] = _sha256_json(manifest)
         try:
-            tasks.grabowski_task_cancel(task_record["task_id"])
-        except Exception as cancel_exc:
-            failure = {
-                "schema_version": 1,
-                "competition_id": identifier,
-                "task_id": task_record["task_id"],
-                "state": "manifest_publish_failed_cancel_unconfirmed",
-                "cancel_error": workspace._error_summary(cancel_exc),
-                "recorded_at": workspace._utc(),
-            }
-            _atomic_json(directory / "manifest-failure.json", failure)
-        raise
-    return {
-        "competition_id": identifier,
-        "request_id": request_value,
-        "provider": provider_value,
-        "mode": mode_value,
-        "task_id": task_record["task_id"],
-        "packet_sha256": packet["packet_sha256"],
-        "status_tool": "grabowski_agent_competition_status",
-        "already_started": False,
-        "automatic_apply": False,
-        "does_not_establish": ["candidate_success", "candidate_correctness", "preferred_candidate"],
-    }
+            _atomic_json(directory / "manifest.json", manifest)
+        except Exception:
+            cancel_state = "unconfirmed"
+            try:
+                cancel_result = tasks.grabowski_task_cancel(task_record["task_id"])
+                cancelled_task = cancel_result.get("task") if isinstance(cancel_result, dict) else None
+                cancel_probe = cancel_result.get("result") if isinstance(cancel_result, dict) else None
+                if (
+                    isinstance(cancelled_task, dict)
+                    and cancelled_task.get("state") == "cancelled"
+                    and isinstance(cancel_probe, dict)
+                    and cancel_probe.get("returncode") == 0
+                ):
+                    cancel_state = "confirmed"
+            except Exception:
+                pass
+            _write_start_outcome(
+                identifier,
+                start_intent,
+                state="manifest_publish_failed",
+                task_id=task_record["task_id"],
+                task_unit=task_record.get("unit"),
+                cancel_state=cancel_state,
+            )
+            raise
+        return {
+            "competition_id": identifier,
+            "request_id": request_value,
+            "provider": provider_value,
+            "mode": mode_value,
+            "task_id": task_record["task_id"],
+            "packet_sha256": packet["packet_sha256"],
+            "status_tool": "grabowski_agent_competition_status",
+            "already_started": False,
+            "automatic_apply": False,
+            "does_not_establish": ["candidate_success", "candidate_correctness", "preferred_candidate"],
+        }
 
 
 @mcp.tool(name="grabowski_agent_competition_status", annotations=READ_ONLY)
 def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
-    """Read one external candidate task and validate its immutable receipt when present."""
+    """Read one candidate lifecycle, including fail-closed pre-manifest start outcomes."""
     operator._require_operator_capability("durable_job")
+    directory = _competition_dir(competition_id)
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        intent = _validated_start_intent(competition_id)
+        outcome = _validated_start_outcome(competition_id, intent)
+        lifecycle_state = outcome["state"] if outcome is not None else "start_prepared_outcome_unresolved"
+        bounded_task = None
+        if outcome is not None and isinstance(outcome["task_id"], str):
+            task_status = tasks.grabowski_task_status(outcome["task_id"])
+            bounded_task = {
+                key: task_status.get(key)
+                for key in ("task_id", "unit", "attempt", "state", "updated_at_unix", "resume_policy")
+                if key in task_status
+            }
+        next_action = {
+            "start_prepared_outcome_unresolved": "inspect durable tasks before retrying with any request_id",
+            "task_start_outcome_unknown": "inspect durable tasks; duplicate start remains blocked",
+            "manifest_publish_failed": "verify the recorded task cancellation or terminal state",
+        }[lifecycle_state]
+        return {
+            "schema_version": 1,
+            "competition_id": competition_id,
+            "request_id": intent["request_id"],
+            "lifecycle_state": lifecycle_state,
+            "manifest_present": False,
+            "task": bounded_task,
+            "cancel_state": outcome["cancel_state"] if outcome is not None else "not_attempted",
+            "receipt_present": False,
+            "candidate": None,
+            "candidate_ready": False,
+            "retry_blocked": True,
+            "next_action": next_action,
+            "authority": "advisory_only",
+            "automatic_apply": False,
+            "does_not_establish": [
+                "task_not_started", "task_terminal", "correctness", "test_pass", "review_pass", "preferred_candidate",
+            ],
+        }
     manifest = _validated_manifest(competition_id)
     task_status = tasks.grabowski_task_status(manifest["task_id"])
     receipt = _receipt(competition_id, manifest)
@@ -798,10 +1029,13 @@ def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
         "repository": manifest["repository"],
         "expected_head": manifest["expected_head"],
         "task_sha256": manifest["task_sha256"],
+        "lifecycle_state": "candidate_receipt_ready" if receipt is not None else "task_observed",
+        "manifest_present": True,
         "task": bounded_task,
         "receipt_present": receipt is not None,
         "candidate": _candidate_summary(receipt) if receipt is not None else None,
         "candidate_ready": receipt is not None and task_status.get("state") == "completed",
+        "retry_blocked": True,
         "authority": "advisory_only",
         "automatic_apply": False,
         "does_not_establish": ["correctness", "test_pass", "review_pass", "preferred_candidate"],
@@ -867,14 +1101,19 @@ def grabowski_agent_competition_compare(competition_ids: list[str]) -> dict[str,
             left_paths = set(left["changed_paths"])
             right_paths = set(right["changed_paths"])
             union = left_paths | right_paths
+            both_patches_available = bool(left["patch_available"] and right["patch_available"])
             pairwise.append({
                 "left": left["competition_id"],
                 "right": right["competition_id"],
                 "shared_paths": sorted(left_paths & right_paths),
                 "unique_left_paths": sorted(left_paths - right_paths),
                 "unique_right_paths": sorted(right_paths - left_paths),
-                "path_jaccard": round(len(left_paths & right_paths) / len(union), 6) if union else 1.0,
-                "same_patch": left["patch_sha256"] == right["patch_sha256"],
+                "path_jaccard": round(len(left_paths & right_paths) / len(union), 6) if union else None,
+                "both_patches_available": both_patches_available,
+                "same_patch": (
+                    both_patches_available
+                    and left["patch_sha256"] == right["patch_sha256"]
+                ),
             })
     insights: list[dict[str, Any]] = []
     if shared_paths:
