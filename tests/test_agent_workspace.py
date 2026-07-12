@@ -2515,7 +2515,12 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(retried["state"], "retry_started")
         self.assertEqual(retried["attempt"], 1)
         self.assertEqual(retried["task"]["task_id"], "tests-retry-task")
-        self.assertEqual(retried["attempt_record"]["failure_classification"], "toolchain_preflight_blocked")
+        self.assertEqual(retried["attempt_record"]["retry_reason"], "toolchain_preflight_blocked")
+        self.assertEqual(
+            retried["attempt_record"]["previous_failure_classification"],
+            "toolchain_preflight_blocked",
+        )
+        self.assertEqual(retried["attempt_record"]["selected_final_attempt"], 1)
         self.assertEqual(retried["attempt_record"]["new_task_id"], "tests-retry-task")
         self.assertIsNone(retried["attempt_record"]["previous_task_id"])
         self.assertIsNone(retried["attempt_record"]["previous_receipt_sha256"])
@@ -2611,6 +2616,112 @@ class AgentWorkspaceTests(unittest.TestCase):
             },
         )
         self.assertTrue(all(item["status"] == "unknown" for item in result["external_closeout_checklist"]))
+
+    def test_role_retry_blocks_unresolved_retry_start_intent_before_second_start(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": workspace._materialize_writer_patch(
+                manifest, snapshot, workspace._run
+            ),
+        }
+        manifest["tasks"]["tests"] = "tests-task-1"
+        manifest["role_preflight_blocks"] = {
+            "tests": [
+                {
+                    "failure_classification": "environment_toolchain_failure",
+                    "attempt": None,
+                    "attempt_consumed": False,
+                }
+            ]
+        }
+        intent = {
+            "role": "tests",
+            "kind": "retry",
+            "attempt": 1,
+            "task_argv_sha256": "a" * 64,
+        }
+        manifest["task_start_intents"] = {"tests": intent}
+        workspace._write_manifest(manifest)
+        with (
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "tests", ["python3", "-m", "unittest"]
+            )
+        self.assertEqual(result["state"], "role_start_outcome_unknown")
+        self.assertTrue(result["reconcile_required"])
+        self.assertEqual(result["task_start_intent"], intent)
+        start.assert_not_called()
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual(persisted["task_start_intents"]["tests"], intent)
+
+        with (
+            mock.patch.object(workspace, "_task_public", return_value={"state": "completed", "terminal": True}),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+        ):
+            status = workspace._status_data(persisted)
+        self.assertEqual(
+            status["role_retry"]["tests"]["classification"],
+            "role_start_outcome_unknown",
+        )
+        self.assertFalse(status["role_retry"]["tests"]["eligible"])
+        self.assertEqual(status["recommended_next_action"], "reconcile_role_start_outcome")
+
+        with (
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={"state": "completed", "terminal": True},
+            ),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            collection = workspace.grabowski_agent_workspace_collect(
+                manifest["workspace_id"]
+            )
+        self.assertEqual(collection["state"], "role_start_outcome_unknown")
+        self.assertEqual(collection["task_start_intents"], {"tests": intent})
+        self.assertTrue(collection["reconcile_required"])
+
+    def test_role_retry_blocks_existing_attempt_receipt_before_task_start(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+        }
+        manifest["role_preflight_blocks"] = {
+            "tests": [
+                {
+                    "failure_classification": "environment_toolchain_failure",
+                    "attempt": None,
+                    "attempt_consumed": False,
+                }
+            ]
+        }
+        workspace._write_manifest(manifest)
+        receipt_path = workspace._role_receipt_path(manifest, "tests", attempt=1)
+        receipt_path.write_text("orphan receipt\n", encoding="utf-8")
+        receipt_path.chmod(0o600)
+        before = receipt_path.read_bytes()
+        with (
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "tests", ["python3", "-m", "unittest"]
+            )
+        self.assertEqual(result["state"], "attempt_receipt_already_exists")
+        self.assertEqual(result["attempt"], 1)
+        self.assertEqual(receipt_path.read_bytes(), before)
+        start.assert_not_called()
 
     def test_role_retry_blocks_on_semantic_test_failure(self) -> None:
         manifest = self.manifest()
@@ -2709,6 +2820,55 @@ class AgentWorkspaceTests(unittest.TestCase):
             workspace.grabowski_agent_workspace_role_retry(
                 manifest["workspace_id"], "writer", ["true"]
             )
+
+    def test_malformed_retry_state_blocks_status_and_retry_fail_closed(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+        }
+        manifest["tasks"]["tests"] = None
+        manifest["role_preflight_blocks"] = {
+            "tests": [
+                {
+                    "failure_classification": "environment_toolchain_failure",
+                    "attempt": None,
+                    "attempt_consumed": False,
+                }
+            ]
+        }
+        manifest["role_retries"] = {
+            "tests": {"count": "one", "attempts": []}
+        }
+        workspace._write_manifest(manifest)
+        with (
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "tests", ["python3", "-m", "unittest"]
+            )
+        self.assertEqual(result["state"], "retry_state_invalid")
+        start.assert_not_called()
+
+        with (
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={"state": "completed", "terminal": True},
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+        ):
+            status = workspace._status_data(workspace._manifest(manifest["workspace_id"]))
+        self.assertEqual(
+            status["role_retry"]["tests"]["classification"],
+            "retry_state_invalid",
+        )
+        self.assertFalse(status["role_retry"]["tests"]["eligible"])
+        self.assertIsNone(status["role_retry"]["tests"]["retries_used"])
 
     def test_role_retry_enforces_max_one_retry_budget(self) -> None:
         manifest = self.manifest()
@@ -2841,6 +3001,33 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(status["closure_outcome"], "would_abandon_failed_roles")
         self.assertEqual(status["recommended_next_action"], "close_with_abandon_failed_roles")
 
+    def test_expected_role_command_hash_is_bound_to_selected_attempt(self) -> None:
+        manifest = self.manifest()
+        original = workspace._sha256_json(manifest["commands"]["tests"])
+        second = "2" * 64
+        third = "3" * 64
+        manifest["role_retries"] = {
+            "tests": {
+                "count": 2,
+                "attempts": [
+                    {"attempt": 2, "new_command_sha256": second},
+                    {"attempt": 3, "new_command_sha256": third},
+                ],
+            }
+        }
+        manifest["role_final_attempt"] = {"tests": 2}
+        self.assertEqual(workspace._expected_role_argv_sha256(manifest, "tests"), second)
+        self.assertEqual(
+            workspace._expected_role_argv_sha256(manifest, "tests", attempt=3), third
+        )
+        self.assertEqual(
+            workspace._expected_role_argv_sha256(manifest, "tests", attempt=1), original
+        )
+        manifest["role_retries"]["tests"]["attempts"].append(
+            {"attempt": 2, "new_command_sha256": "4" * 64}
+        )
+        self.assertIsNone(workspace._expected_role_argv_sha256(manifest, "tests"))
+
     def test_role_receipt_paths_are_attempt_specific_and_never_collide(self) -> None:
         manifest = self.manifest()
         first = workspace._role_receipt_path(manifest, "tests", attempt=1)
@@ -2853,6 +3040,25 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(workspace._role_final_attempt(manifest, "tests"), 2)
         with self.assertRaises(workspace.AgentWorkspaceError):
             workspace._role_receipt_path(manifest, "tests", attempt=0)
+
+    def test_status_always_exposes_external_closeout_checklist(self) -> None:
+        manifest = self.manifest()
+        with (
+            mock.patch.object(workspace, "_task_public", return_value={"state": "running", "terminal": False}),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+        ):
+            status = workspace._status_data(manifest)
+        items = {item["item"] for item in status["external_closeout_checklist"]}
+        self.assertEqual(
+            items,
+            {
+                "pr_integration_truth",
+                "bureau_task_reconciliation",
+                "workspace_lease_release",
+                "writer_worktree_archive_or_cleanup",
+                "operator_final_summary",
+            },
+        )
 
     def test_close_expose_unresolved_external_closeout_checklist(self) -> None:
         manifest = self.manifest()
@@ -2943,6 +3149,15 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["attempt"], 2)
         self.assertEqual(result["attempt_record"]["previous_task_id"], "tests-task-1")
         self.assertEqual(
+            result["attempt_record"]["retry_reason"],
+            "terminal_environment_toolchain_failure",
+        )
+        self.assertEqual(
+            result["attempt_record"]["previous_failure_classification"],
+            "environment_toolchain_failure",
+        )
+        self.assertEqual(result["attempt_record"]["selected_final_attempt"], 2)
+        self.assertEqual(
             result["attempt_record"]["previous_receipt_sha256"],
             first_receipt["receipt_sha256"],
         )
@@ -2988,6 +3203,99 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["state"], "semantic_test_failure")
         start.assert_not_called()
 
+    def test_toolchain_probe_source_does_not_execute_sitecustomize_or_target_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            site_marker = root / "sitecustomize-ran"
+            module_marker = root / "module-ran"
+            (root / "sitecustomize.py").write_text(
+                f"from pathlib import Path\nPath({str(site_marker)!r}).write_text('ran')\n",
+                encoding="utf-8",
+            )
+            (root / "probe_target.py").write_text(
+                f"from pathlib import Path\nPath({str(module_marker)!r}).write_text('ran')\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-c",
+                    role._MODULE_PROBE_SOURCE,
+                    "probe_target",
+                    sys.executable,
+                ],
+                cwd=root,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(json.loads(completed.stdout)["module_found"])
+        self.assertFalse(site_marker.exists())
+        self.assertFalse(module_marker.exists())
+
+    def test_toolchain_probe_uses_exact_resolved_interpreter_without_site_initialization(self) -> None:
+        manifest = self.manifest()
+        resolved = "/custom/venv/bin/python3"
+
+        def capture(payload: bytes) -> sandbox.BoundedCapture:
+            return sandbox.BoundedCapture(
+                returncode=0,
+                stdout_bytes=len(payload),
+                stderr_bytes=0,
+                stdout_sha256="a" * 64,
+                stderr_sha256="b" * 64,
+                stdout_tail=payload.decode("utf-8"),
+                stderr_tail="",
+                stdout_content=payload,
+                stdout_content_exceeded=False,
+                stdout_limit_exceeded=False,
+                stderr_limit_exceeded=False,
+            )
+
+        captures = [
+            capture(
+                json.dumps(
+                    {
+                        "executable_found": True,
+                        "resolved_executable": resolved,
+                    }
+                ).encode("utf-8")
+            ),
+            capture(b'{"module_found": true}'),
+        ]
+        with (
+            mock.patch.object(role, "runtime_sandbox_argv", side_effect=lambda argv: argv),
+            mock.patch.object(
+                role,
+                "run_bounded_capture",
+                side_effect=captures,
+            ) as run_capture,
+        ):
+            result = self.real_role_toolchain_preflight(
+                manifest, "tests", ["python3", "-m", "unittest"]
+            )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["resolved_executable"], resolved)
+        self.assertEqual(run_capture.call_count, 2)
+        executable_probe = run_capture.call_args_list[0].args[0]
+        module_probe = run_capture.call_args_list[1].args[0]
+        executable_index = executable_probe.index(sys.executable)
+        self.assertEqual(
+            executable_probe[executable_index + 1 : executable_index + 4],
+            ["-I", "-S", "-c"],
+        )
+        module_index = module_probe.index(resolved)
+        self.assertEqual(
+            module_probe[module_index + 1 : module_index + 4],
+            ["-I", "-S", "-c"],
+        )
+        self.assertEqual(module_probe[-2:], ["unittest", resolved])
+
+
     def test_preflight_probe_error_is_not_reported_as_missing_prerequisites(self) -> None:
         manifest = self.manifest()
         with (
@@ -3011,9 +3319,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             stderr_bytes=0,
             stdout_sha256="a" * 64,
             stderr_sha256="b" * 64,
-            stdout_tail='{"executable_found": false, "module_found": true}',
+            stdout_tail='{"executable_found": false, "resolved_executable": null}',
             stderr_tail="",
-            stdout_content=b'{"executable_found": false, "module_found": true}',
+            stdout_content=b'{"executable_found": false, "resolved_executable": null}',
             stdout_content_exceeded=False,
             stdout_limit_exceeded=False,
             stderr_limit_exceeded=False,
@@ -3088,6 +3396,34 @@ class AgentWorkspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(FileExistsError, "already exists"):
             role.write_receipt(target, {"schema_version": 1}, create_only=True)
         self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(list(target.parent.glob(f".{target.name}.*.tmp")), [])
+
+    def test_role_attempt_receipt_create_only_publish_race_preserves_winner(self) -> None:
+        target = self.root / "raced-attempt.json"
+        winner = b'{"winner": true}\n'
+
+        def competing_publish(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            target.write_bytes(winner)
+            target.chmod(0o600)
+            raise FileExistsError("competing publisher won")
+
+        with mock.patch.object(role.os, "link", side_effect=competing_publish):
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                role.write_receipt(
+                    target,
+                    {"schema_version": 1, "winner": False},
+                    create_only=True,
+                )
+        self.assertEqual(target.read_bytes(), winner)
+        self.assertEqual(list(target.parent.glob(f".{target.name}.*.tmp")), [])
+
+    def test_role_attempt_receipt_rejects_broken_symlink_target(self) -> None:
+        target = self.root / "broken-attempt.json"
+        target.symlink_to(self.root / "missing-receipt.json")
+        with self.assertRaisesRegex(PermissionError, "owner-controlled regular file"):
+            role.write_receipt(target, {"schema_version": 1}, create_only=True)
+        self.assertTrue(target.is_symlink())
         self.assertEqual(list(target.parent.glob(f".{target.name}.*.tmp")), [])
 
 

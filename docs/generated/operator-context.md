@@ -10,6 +10,7 @@ This document describes the repository contract. Current runtime state must be r
 - Source: `docs/blocked-action-protocol-v0.md`
 - Control loop: typed Grabowski tool first; if blocked, one bounded Grabowski Micro-Task; then read a receipt before deciding the next step.
 - Execution priority: ChatGPT operator first; delegated coding agents follow Claude, Codex, agy, then Cline.
+- Workspace default: the ChatGPT operator self-serves captain, writer, tests and review sequentially with one shared context; external coding agents are opt-in only.
 - Operator-first work: task decomposition, bounded code changes, integration, critical self-review and recovery.
 - Complex code task: the operator executes when bounded; larger delegated packages follow the coding-agent priority and stop at diff or test evidence.
 - Quick light reasoning: operator first, then agy `--print` when delegation adds value.

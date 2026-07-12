@@ -23,20 +23,40 @@ TOOLCHAIN_PROBE_OUTPUT_LIMIT = 64 * 1024
 PYTHON_EXECUTABLE_NAMES = frozenset(
     {"python", "python3"} | {f"python3.{minor}" for minor in range(0, 20)}
 )
-_TOOLCHAIN_PROBE_SOURCE = (
-    "import importlib.util, json, shutil, sys\n"
+_EXECUTABLE_PROBE_SOURCE = (
+    "import json, shutil, sys\n"
     "executable = sys.argv[1]\n"
-    "module = sys.argv[2] if len(sys.argv) > 2 else ''\n"
-    "result = {'executable_found': shutil.which(executable) is not None}\n"
-    "if module:\n"
-    "    try:\n"
-    "        spec = importlib.util.find_spec(module)\n"
-    "    except (ImportError, ValueError, ModuleNotFoundError, TypeError):\n"
-    "        spec = None\n"
-    "    result['module_found'] = spec is not None\n"
-    "else:\n"
-    "    result['module_found'] = True\n"
-    "sys.stdout.write(json.dumps(result))\n"
+    "resolved = shutil.which(executable)\n"
+    "sys.stdout.write(json.dumps({\n"
+    "    'executable_found': resolved is not None,\n"
+    "    'resolved_executable': resolved,\n"
+    "}))\n"
+)
+_MODULE_PROBE_SOURCE = (
+    "import importlib.machinery, json, os, pathlib, sys, sysconfig\n"
+    "module = sys.argv[1]\n"
+    "invoked_executable = pathlib.Path(sys.argv[2])\n"
+    "version = f'python{sys.version_info.major}.{sys.version_info.minor}'\n"
+    "environment_root = invoked_executable.parent.parent\n"
+    "search_paths = [os.getcwd(), *sys.path]\n"
+    "for key in ('purelib', 'platlib'):\n"
+    "    candidate = sysconfig.get_paths().get(key)\n"
+    "    if candidate:\n"
+    "        search_paths.append(candidate)\n"
+    "search_paths.extend([\n"
+    "    str(environment_root / 'lib' / version / 'site-packages'),\n"
+    "    str(environment_root / 'lib64' / version / 'site-packages'),\n"
+    "])\n"
+    "search_paths = list(dict.fromkeys(path for path in search_paths if path))\n"
+    "try:\n"
+    "    spec = importlib.machinery.BuiltinImporter.find_spec(module)\n"
+    "    if spec is None:\n"
+    "        spec = importlib.machinery.FrozenImporter.find_spec(module)\n"
+    "    if spec is None:\n"
+    "        spec = importlib.machinery.PathFinder.find_spec(module, search_paths)\n"
+    "except (ImportError, ValueError, ModuleNotFoundError, TypeError):\n"
+    "    spec = None\n"
+    "sys.stdout.write(json.dumps({'module_found': spec is not None}))\n"
 )
 
 
@@ -119,8 +139,11 @@ def current_binding(repo: Path, base: str) -> tuple[str, str, bool]:
 
 def write_receipt(path: Path, payload: dict[str, Any], *, create_only: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.exists():
+    try:
         metadata = path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None:
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
@@ -146,7 +169,14 @@ def write_receipt(path: Path, payload: dict[str, Any], *, create_only: bool = Fa
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        if create_only:
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise FileExistsError("role attempt receipt already exists") from exc
+            temporary.unlink()
+        else:
+            os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             os.fsync(directory_fd)
@@ -182,60 +212,98 @@ def declared_python_module(command: list[str]) -> str | None:
     return module.split(".", 1)[0]
 
 
-def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
-    """Resolve declared prerequisites inside the exact read-only role sandbox."""
-    executable = command[0]
-    module = declared_python_module(command)
-    result: dict[str, Any] = {
-        "executable": executable,
-        "declared_python_module": module,
-        "passed": False,
-        "missing_executable": False,
-        "missing_python_module": False,
-        "probe_error": None,
-    }
-    probe_command = [sys.executable, "-c", _TOOLCHAIN_PROBE_SOURCE, executable, *([module] if module else [])]
+def _probe_json(repo: Path, command: list[str]) -> tuple[dict[str, Any] | None, str | None, int | None]:
     try:
         completed = run_bounded_capture(
-            runtime_sandbox_argv(sandbox_argv(repo, probe_command)),
+            runtime_sandbox_argv(sandbox_argv(repo, command)),
             stdout_limit=TOOLCHAIN_PROBE_OUTPUT_LIMIT,
             stderr_limit=TOOLCHAIN_PROBE_OUTPUT_LIMIT,
             stdout_content_limit=TOOLCHAIN_PROBE_OUTPUT_LIMIT,
         )
     except Exception as exc:
-        result["probe_error"] = f"{type(exc).__name__}: {exc}"[:4000]
-        result["failure_classification"] = "toolchain_probe_error"
-        return result
+        return None, f"{type(exc).__name__}: {exc}"[:4000], None
     if (
         completed.returncode != 0
         or completed.output_limit_exceeded
         or completed.stdout_content is None
         or completed.stdout_content_exceeded
     ):
-        result["probe_error"] = "toolchain probe did not complete cleanly"
-        result["probe_returncode"] = completed.returncode
-        result["failure_classification"] = "toolchain_probe_error"
-        return result
+        return None, "toolchain probe did not complete cleanly", completed.returncode
     try:
         payload = json.loads(completed.stdout_content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        result["probe_error"] = f"toolchain probe returned invalid JSON: {exc}"
-        result["failure_classification"] = "toolchain_probe_error"
-        return result
+        return None, f"toolchain probe returned invalid JSON: {exc}", completed.returncode
     if not isinstance(payload, dict):
-        result["probe_error"] = "toolchain probe returned a non-object payload"
+        return None, "toolchain probe returned a non-object payload", completed.returncode
+    return payload, None, completed.returncode
+
+
+def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
+    """Resolve declared prerequisites inside the exact read-only role sandbox."""
+    executable = command[0]
+    module = declared_python_module(command)
+    result: dict[str, Any] = {
+        "executable": executable,
+        "resolved_executable": None,
+        "declared_python_module": module,
+        "passed": False,
+        "missing_executable": False,
+        "missing_python_module": False,
+        "probe_error": None,
+    }
+    executable_payload, error, returncode = _probe_json(
+        repo,
+        [sys.executable, "-I", "-S", "-c", _EXECUTABLE_PROBE_SOURCE, executable],
+    )
+    if error is not None or executable_payload is None:
+        result["probe_error"] = error
+        result["probe_returncode"] = returncode
         result["failure_classification"] = "toolchain_probe_error"
         return result
-    executable_found = payload.get("executable_found") is True
-    module_found = module is None or payload.get("module_found") is True
+    resolved = executable_payload.get("resolved_executable")
+    executable_found = (
+        executable_payload.get("executable_found") is True
+        and isinstance(resolved, str)
+        and bool(resolved)
+    )
+    result["resolved_executable"] = resolved if executable_found else None
+    if not executable_found:
+        result.update(
+            {
+                "missing_executable": True,
+                "probe_returncode": returncode,
+                "failure_classification": "environment_toolchain_failure",
+            }
+        )
+        return result
+    module_found = True
+    if module is not None:
+        module_payload, module_error, module_returncode = _probe_json(
+            repo,
+            [
+                resolved,
+                "-I",
+                "-S",
+                "-c",
+                _MODULE_PROBE_SOURCE,
+                module,
+                resolved,
+            ],
+        )
+        if module_error is not None or module_payload is None:
+            result["probe_error"] = module_error
+            result["probe_returncode"] = module_returncode
+            result["failure_classification"] = "toolchain_probe_error"
+            return result
+        module_found = module_payload.get("module_found") is True
+        returncode = module_returncode
     result.update(
         {
-            "passed": executable_found and module_found,
-            "missing_executable": not executable_found,
+            "passed": module_found,
             "missing_python_module": module is not None and not module_found,
-            "probe_returncode": completed.returncode,
+            "probe_returncode": returncode,
             "failure_classification": (
-                "passed" if executable_found and module_found else "environment_toolchain_failure"
+                "passed" if module_found else "environment_toolchain_failure"
             ),
         }
     )

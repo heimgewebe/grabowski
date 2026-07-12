@@ -36,6 +36,9 @@ class BlockedActionProtocolDocTests(unittest.TestCase):
     def test_routing_roles_match_live_operator_protocol(self) -> None:
         for phrase in (
             "ChatGPT Operator",
+            "Standard fuer alle Lanes",
+            "standardmaessig aus",
+            "keine Kopien dieses ChatGPT-Kontexts",
             "Claude -> Codex -> agy -> Cline",
             "Cline",
             "agy --print",

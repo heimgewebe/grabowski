@@ -1453,18 +1453,34 @@
     ],
     "routing_roles": {
       "audit": "grabowski_git",
-      "complex_code_task": "chatgpt_operator_then_claude_codex_agy_cline",
+      "complex_code_task": "chatgpt_operator_external_opt_in_claude_codex_agy_cline",
       "local_micro_reasoning": "ollama_api_qwen_coder",
       "memory_prioritization": "bureau",
       "patch_fallback": "aider_no_auto_commit",
       "patch_file_relay": "operator_patch_relay",
-      "quick_light_reasoning": "chatgpt_operator_then_agy_print",
+      "quick_light_reasoning": "chatgpt_operator_external_opt_in_agy_print",
       "repo_state_context": "steuerboard_operator_report",
-      "security_or_architecture_review": "chatgpt_operator_then_claude",
+      "security_or_architecture_review": "chatgpt_operator_external_opt_in_claude",
       "session_resume": "tmux_first_agy_when_useful",
       "shell_or_git_grip": "grabowski_task"
     },
-    "rule": "Keep ChatGPT as operator and execute bounded work first. Delegate only when a helper adds useful scale or independent contrast."
+    "rule": "Keep ChatGPT as operator and execute bounded work first. Delegate only when a helper adds useful scale or independent contrast.",
+    "workspace_execution_model": {
+      "default": "chatgpt_operator_native",
+      "delegation_triggers": [
+        "bounded_large_implementation",
+        "independent_contrast",
+        "capacity_fallback"
+      ],
+      "external_agent_delegation": "opt_in_only",
+      "lane_owner": "chatgpt_operator",
+      "operator_self_serves_lanes": [
+        "captain",
+        "writer",
+        "tests",
+        "review"
+      ]
+    }
   },
   "policy_contract": {
     "access_profiles": [
@@ -1738,7 +1754,7 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "9ef6a1e8cf1aeaea2ee2530772c88cf339e1ce4c1a1a4f13ef3eaeb88d422b51"
+      "sha256": "2eff269804f2bae21634f5c6929db36c7a165722812659b28df777f16340cafa"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
@@ -1754,9 +1770,9 @@
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c413e520172f70296c42e18e4c0f1fcb95a1931afa0fda7b7c36dba4b2d52e56",
-      "src/grabowski_agent_role.py": "bd0aff0f9bcc42cad9a146a0acba28eaa2392f7896c13ec0cbc5394cd645008c",
+      "src/grabowski_agent_role.py": "abef0db4aa6fffcd52976e2c60deb5f68abfadf76528ec5ac79dfebeddafe8bf",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
-      "src/grabowski_agent_workspace.py": "c41666bf1f7399e16c2dd4950cfa4265a31c7c9429c4c695a293e631d37224f5",
+      "src/grabowski_agent_workspace.py": "87babe15b210f38d09b8fab8a9b4977eeff901493534bb870be270e0a60f1474",
       "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
       "src/grabowski_capabilities.py": "0ff044ebc93bfdaeb8371b0cbe6be706bfd1c3e3e1ccc13b666efaff71c57a3b",
@@ -1766,7 +1782,7 @@
       "src/grabowski_friction.py": "15f4de8cacfaacfb6d5e1bc95bb82064d800bdbb46fd8ce67901f0bdf8a2ee8c",
       "src/grabowski_grip_orchestration.py": "2c1d594433f92edbae23adc43a303b212bfff89d298121c516974d790259051d",
       "src/grabowski_grips.py": "f7fee83b8424d40ff1f3785a771a685c1ce2bb73e3029d38de1b7e2da073968a",
-      "src/grabowski_mcp.py": "cc9f2e0750e76181e07152bbbb4eb973bb788801952bb4237a39049ad5934fc4",
+      "src/grabowski_mcp.py": "6a21f97db4be4dbe58d9d0d01e7f3d39e02bc9e001320a3e9ea299f7337998bf",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "7aaaca985ccf404934fd1dd07d7a718d69cb0b23826691da9096f6f3d4f20e54",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",

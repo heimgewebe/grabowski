@@ -63,12 +63,14 @@ Die kleinste Handlung muss beantworten:
 Danach wird nach Aufgabenklasse geroutet.
 
 4. **ChatGPT Operator**
-   - Standard fuer Aufgabenzerlegung, begrenzte Codeaenderungen, Integration, kritischen Selbstreview und Recovery.
-   - Der Operator delegiert nur, wenn ein Helfer mehr Skalierung oder einen nuetzlichen unabhaengigen Kontrast liefert.
+   - Standard fuer alle Lanes: Captain, Writer, Tests, kritischen Review, Integration und Recovery.
+   - Ein gemeinsamer Operator-Kontext ist der Normalfall; der Workspace erzeugt keine Kopien dieses ChatGPT-Kontexts.
+   - Der Operator delegiert nur opt-in, wenn ein Helfer mehr Skalierung, unabhaengigen Kontrast oder einen Kapazitaets-Fallback liefert.
    - Der Operator bleibt fuer Scope, Receipts, Tests, Commit, Push, Merge und Deploy verantwortlich.
 
 5. **Delegierte Coding-Agenten**
-   - Prioritaet: **Claude -> Codex -> agy -> Cline**.
+   - Externe Coding-Agenten sind standardmaessig aus; Delegation ist opt-in.
+   - Prioritaet bei belegtem Delegationsnutzen: **Claude -> Codex -> agy -> Cline**.
    - Groessere Implementierungspakete enden nach Diff, Test oder Stop-Bericht.
    - Default: kein Commit, kein Push, kein Merge.
 
@@ -194,7 +196,7 @@ Freie Fantasietypen sind ungueltig. Ein fehlgeschlagener Resource-Key ist kein P
 
 ### ChatGPT Operator
 
-ChatGPT ist nicht eine weitere Workspace-Rolle, sondern der uebergeordnete Operator. Der Operator bearbeitet begrenzte Codeaenderungen, Integration, kritischen Selbstreview und Recovery selbst und delegiert groessere Pakete nur mit engem Scope und Receipt-Pflicht.
+ChatGPT ist nicht eine weitere Workspace-Rolle, sondern der uebergeordnete und standardmaessige Ausfuehrer aller Lanes. Der Operator bearbeitet Codeaenderungen, Tests, Integration, kritischen Selbstreview und Recovery mit einem gemeinsamen Gesamtkontext selbst. Agent Workspace ist ein optionales Isolations- und Delegationsinstrument, kein Pflichtpfad und keine Vervielfaeltigung des aktuellen ChatGPT-Modells.
 
 ### Claude
 
@@ -262,4 +264,4 @@ Dieses Protokoll etabliert nicht:
 
 ## Kurzform
 
-Grabowski bleibt die Hand. ChatGPT bleibt Operator und erster Ausfuehrer fuer begrenzte Arbeit. Delegierte Coding-Agenten folgen Claude, Codex, agy und Cline. Lokale KI bleibt Hilfslicht.
+Grabowski bleibt die Hand. ChatGPT bedient standardmaessig alle Lanes mit einem gemeinsamen Kontext. Externe Coding-Agenten sind opt-in und folgen bei belegtem Nutzen Claude, Codex, agy und Cline. Lokale KI bleibt Hilfslicht.
