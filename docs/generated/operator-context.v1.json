@@ -1461,7 +1461,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Read one candidate lifecycle, including fail-closed pre-manifest start outcomes.",
+      "description": "Read one candidate lifecycle with deterministic phases and fail-closed reconciliation evidence.",
       "effects": [
         "task-state-refresh"
       ],
@@ -1913,7 +1913,7 @@
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c413e520172f70296c42e18e4c0f1fcb95a1931afa0fda7b7c36dba4b2d52e56",
-      "src/grabowski_agent_competition.py": "1729d7fcf12bb4d92c2a5931345784a862d5de9dd938432f6a9aa1f1c498cb03",
+      "src/grabowski_agent_competition.py": "c07bf7b790a832c3e581e6384ab2da2e77da96daff7e57fe66ea4c1bb8857359",
       "src/grabowski_agent_role.py": "abef0db4aa6fffcd52976e2c60deb5f68abfadf76528ec5ac79dfebeddafe8bf",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
       "src/grabowski_agent_workspace.py": "1a6495a53600c1022ab717cd2f79bc444031039a0c81bebbc5f0d13bab17cf97",
