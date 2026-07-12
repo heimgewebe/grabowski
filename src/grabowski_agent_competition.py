@@ -140,15 +140,65 @@ def _load_private_json(path: Path, *, label: str, max_bytes: int = MAX_RECEIPT_B
     return value
 
 
+def _git_environment() -> dict[str, str]:
+    allowed = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+    environment = {key: value for key, value in os.environ.items() if key in allowed}
+    environment.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    environment.setdefault("LANG", "C.UTF-8")
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "/bin/false",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        }
+    )
+    return environment
+
+
 def _git(repo: Path, args: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.external=", *args],
+        [
+            "git",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false",
+            "-c", "diff.external=",
+            "-c", "diff.trustExitCode=false",
+            "-c", "protocol.file.allow=never",
+            *args,
+        ],
         cwd=repo,
         capture_output=True,
         check=False,
         timeout=timeout,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", "GIT_CONFIG_NOSYSTEM": "1"},
+        env=_git_environment(),
     )
+
+
+def _commit_blob(repo: Path, head: str, relative: str) -> bytes:
+    listing = _git(repo, ["ls-tree", "-z", head, "--", relative])
+    if listing.returncode != 0:
+        raise AgentCompetitionError(f"cannot resolve context path at expected_head: {relative}")
+    records = [record for record in listing.stdout.split(b"\x00") if record]
+    if len(records) != 1 or b"\t" not in records[0]:
+        raise AgentCompetitionError(f"context path is not one tracked blob at expected_head: {relative}")
+    metadata, raw_path = records[0].split(b"\t", 1)
+    fields = metadata.split()
+    if len(fields) != 3 or fields[1] != b"blob" or re.fullmatch(rb"[0-9a-f]{40,64}", fields[2]) is None:
+        raise AgentCompetitionError(f"context path metadata is invalid at expected_head: {relative}")
+    try:
+        observed_path = raw_path.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AgentCompetitionError(f"context path is not UTF-8 at expected_head: {relative}") from exc
+    if observed_path != relative:
+        raise AgentCompetitionError(f"context path identity mismatch at expected_head: {relative}")
+    blob = _git(repo, ["cat-file", "blob", fields[2].decode("ascii")])
+    if blob.returncode != 0:
+        raise AgentCompetitionError(f"cannot read context blob at expected_head: {relative}")
+    return blob.stdout
 
 
 def _normalize_relative(value: Any, *, label: str) -> str:
@@ -186,7 +236,13 @@ def _repository(repository: str, expected_head: str) -> tuple[Path, str]:
     return repo, head
 
 
-def _context(repo: Path, context_paths: list[str], allowed: list[str], forbidden: list[str]) -> list[dict[str, Any]]:
+def _context(
+    repo: Path,
+    head: str,
+    context_paths: list[str],
+    allowed: list[str],
+    forbidden: list[str],
+) -> list[dict[str, Any]]:
     if not isinstance(context_paths, list) or not context_paths or len(context_paths) > 40:
         raise AgentCompetitionError("context_paths must contain between 1 and 40 entries")
     result: list[dict[str, Any]] = []
@@ -201,16 +257,9 @@ def _context(repo: Path, context_paths: list[str], allowed: list[str], forbidden
             raise AgentCompetitionError(f"context path is outside declared scope: {relative}")
         if _path_is_sensitive(relative):
             raise AgentCompetitionError(f"sensitive-looking context path is not exportable: {relative}")
-        target = repo.joinpath(*PurePosixPath(relative).parts)
-        try:
-            metadata = target.lstat()
-        except FileNotFoundError as exc:
-            raise AgentCompetitionError(f"context path does not exist: {relative}") from exc
-        if target.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise AgentCompetitionError(f"context path must be one regular non-symlink file: {relative}")
-        if metadata.st_size > MAX_CONTEXT_FILE_BYTES:
+        raw_bytes = _commit_blob(repo, head, relative)
+        if len(raw_bytes) > MAX_CONTEXT_FILE_BYTES:
             raise AgentCompetitionError(f"context file exceeds per-file byte limit: {relative}")
-        raw_bytes = target.read_bytes()
         try:
             text = raw_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -538,7 +587,7 @@ def grabowski_agent_competition_start(
     sensitive_allowed = [path for path in allowed if _path_is_sensitive(path)]
     if sensitive_allowed:
         raise AgentCompetitionError(f"sensitive-looking allowed paths are not exportable: {sensitive_allowed}")
-    contexts = _context(repo, context_paths, allowed, forbidden)
+    contexts = _context(repo, head, context_paths, allowed, forbidden)
     executable = shutil.which(provider_value)
     if not executable:
         raise AgentCompetitionError(f"provider executable is unavailable: {provider_value}")

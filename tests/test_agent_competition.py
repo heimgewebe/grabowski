@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -169,6 +170,31 @@ class AgentCompetitionTests(unittest.TestCase):
         receipt["receipt_sha256"] = competition._sha256_json(receipt)
         competition._atomic_json(self.state / identifier / "receipt.json", receipt)
         return receipt
+
+    def test_git_environment_discards_rebinding_and_replace_objects(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"PATH": "/usr/bin", "HOME": "/tmp/home", "GIT_DIR": "/tmp/evil", "GIT_CONFIG_COUNT": "1"},
+            clear=True,
+        ):
+            environment = competition._git_environment()
+        self.assertNotIn("GIT_DIR", environment)
+        self.assertNotIn("GIT_CONFIG_COUNT", environment)
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
+
+    def test_context_reads_bound_commit_not_later_worktree_bytes(self) -> None:
+        original = (self.repo / "src/sample.py").read_bytes()
+        (self.repo / "src/sample.py").write_text("DIRTY = True\n", encoding="utf-8")
+        context = competition._context(
+            self.repo,
+            self.head,
+            ["src/sample.py"],
+            ["src"],
+            [],
+        )
+        self.assertEqual(context[0]["text"].encode("utf-8"), original)
+        self.assertEqual(context[0]["sha256"], competition._sha256_bytes(original))
 
     def test_route_is_adaptive_and_external_is_not_default_for_small_work(self) -> None:
         direct = competition.grabowski_agent_execution_route(
