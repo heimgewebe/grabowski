@@ -31,6 +31,7 @@ Recovery and irreversibility records are preconditions for any later mutation. R
 
 - `repo-orient`
 - `worktree-orient`
+- `worktree-ensure`
 - `situation`
 - `scout`
 - `runtime-deploy-check`

@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import grabowski_repobrief
 import grabowski_grip_orchestration
+import grabowski_worktree_ensure
 
 Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -88,6 +89,28 @@ GRIP_SPECS: dict[str, GripSpec] = {
         required_parameters=("repo",),
         acceptance_ids=("worktree-orient-grip", "dirty-and-stale-visible", "next-safe-grip", "focused-tests"),
         runner="worktree_orient",
+    ),
+    "worktree-ensure": GripSpec(
+        name="worktree-ensure",
+        version="1.0",
+        summary="Ensure one exact lease-bound Git worktree with durable idempotent recovery.",
+        effect=MUTATING,
+        required_parameters=(
+            "repo",
+            "base_head",
+            "branch",
+            "target_path",
+            "lease_owner_id",
+            "idempotency_key",
+        ),
+        acceptance_ids=(
+            "typed-inputs",
+            "lease-bound",
+            "idempotent-replay",
+            "post-state-readback",
+            "durable-receipt",
+        ),
+        runner="worktree_ensure",
     ),
     "post-merge-sync": GripSpec(
         name="post-merge-sync",
@@ -182,6 +205,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
     {
         "repo-orient",
         "worktree-orient",
+        "worktree-ensure",
         "situation",
         "scout",
         "runtime-deploy-check",
@@ -199,6 +223,7 @@ GRIP_SURFACE_MUTATING_PROFILES = {"operator", "captain"}
 GRIP_SURFACE_TARGETS = {
     "repo-orient": "repository checkout",
     "worktree-orient": "repository worktree inventory",
+    "worktree-ensure": "one exact repository worktree",
     "situation": "repository and PR situation snapshot",
     "scout": "change-only repository, PR and runtime drift signal",
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
@@ -218,6 +243,7 @@ MECHANIC_NORMAL_GRIPS = frozenset(
     {
         "repo-orient",
         "worktree-orient",
+        "worktree-ensure",
         "situation",
         "scout",
         "runtime-deploy-check",
@@ -1800,6 +1826,47 @@ def _short_branch_name(parameters: dict[str, Any], name: str) -> str:
         raise GripPreflightError(f"{name} parameter must be a safe short branch name")
     return branch
 
+
+
+def _run_worktree_ensure(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec
+    import grabowski_friction
+    import grabowski_resources
+
+    try:
+        output = grabowski_worktree_ensure.ensure_worktree(
+            parameters,
+            runner,
+            grabowski_resources.inspect_resource,
+            record_friction=grabowski_friction.record_friction_event,
+            resolve_friction=grabowski_friction.resolve_friction,
+        )
+    except grabowski_worktree_ensure.WorktreeEnsurePreflight as exc:
+        _check(receipt, "worktree_ensure_preflight", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except grabowski_worktree_ensure.WorktreeEnsureAction as exc:
+        _check(receipt, "worktree_ensure_action", "fail", str(exc))
+        raise GripActionError(str(exc)) from exc
+
+    result_state = str(output.get("result_state") or "UNKNOWN")
+    _check(
+        receipt,
+        "worktree_ensure_result",
+        "pass" if result_state in {"CREATED", "ALREADY_CORRECT"} else "fail",
+        result_state,
+    )
+    _check(
+        receipt,
+        "durable_receipt",
+        "pass" if output.get("durable_receipt_sha256") else "fail",
+        str(output.get("durable_receipt_path") or "missing"),
+    )
+    return output
 
 def _run_post_merge_sync(
     spec: GripSpec,
@@ -4245,6 +4312,7 @@ _RUNNERS = {
     "repo_orient": _run_repo_orient,
     "pr_check_readiness": _run_pr_check_readiness,
     "worktree_orient": _run_worktree_orient,
+    "worktree_ensure": _run_worktree_ensure,
     "post_merge_sync": _run_post_merge_sync,
     "situation": _run_situation,
     "scout": _run_scout,

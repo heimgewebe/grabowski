@@ -223,6 +223,7 @@
       "allowed_grips": [
         "repo-orient",
         "worktree-orient",
+        "worktree-ensure",
         "situation",
         "scout",
         "pr-check-readiness",
