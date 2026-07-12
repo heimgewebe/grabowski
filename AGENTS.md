@@ -55,3 +55,11 @@ Dieses Repo verantwortet:
 Die Heimgewebe-Fleet-Zugehörigkeit wird nicht lokal erfunden. Eine spätere
 Registrierung muss über die kanonische Fleet-Source-of-Truth im Metarepo
 erfolgen.
+## Agent Workspace role ownership
+
+- One operator may coordinate the Captain, Writer, Tests, Review and optional Observer workflow.
+- Coordination does not collapse role evidence: the Writer remains the only mutating role; Tests and Review remain separately started, read-only and bound to the frozen writer head and diff.
+- A single unisolated agent response may not substitute for Writer, Tests and Review evidence. This prevents self-confirming success.
+- Prefer deterministic commands for Tests. Review must consume the frozen diff and emit a structured receipt; use a separate model or process when available, but technical read-only isolation is mandatory either way.
+- The Observer is optional and read-only. It reports facts, inferences and proposals separately and cannot retry, close, merge, deploy or mutate Bureau.
+- Cross-workspace optimization requires at least two immutable reports and remains proposal-only. Accepted changes follow the normal task, review, test and rollback path.

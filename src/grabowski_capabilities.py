@@ -819,6 +819,20 @@ TOOL_PROFILES.update(
             "effects": ["possible-task-stop", "tmux-session-remove", "lease-release", "receipt-create"],
             "reversibility": "preserved-worktree-and-branch",
         },
+        "grabowski_agent_workspace_observe": {
+            "category": "agent-workspace",
+            "purpose": "Read one bounded immutable workspace event timeline and emit a facts/inferences/proposals process report.",
+            "risk_class": "low",
+            "effects": ["task-state-refresh"],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_agent_workspace_optimize": {
+            "category": "agent-workspace",
+            "purpose": "Derive advisory cross-workspace optimization proposals from at least two immutable reports.",
+            "risk_class": "low",
+            "effects": ["task-state-refresh"],
+            "reversibility": "not-applicable",
+        },
     }
 )
 
