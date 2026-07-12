@@ -69,7 +69,9 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('"grabowski_micro_task"', source)
         self.assertIn('"routing_roles"', source)
         self.assertIn('"execution_priority"', source)
-        self.assertIn('"chatgpt_operator_external_opt_in_claude_codex_agy_cline"', source)
+        self.assertIn('"chatgpt_operator_adaptive_workspace_external_competition_when_high_value"', source)
+        self.assertIn('"external_programming_modes": ["competitor", "contrast"]', source)
+        self.assertIn('"automatic_winner_selection": False', source)
         self.assertIn('"chatgpt_operator_external_opt_in_agy_print"', source)
         self.assertIn('"cline"', source)
         self.assertIn('"ollama_api_qwen_coder"', source)
@@ -124,7 +126,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 114)
+        self.assertEqual(len(tools), 118)
         legacy_tools = {
             "grabowski_status",
             "grabowski_context",

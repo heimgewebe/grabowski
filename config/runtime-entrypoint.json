@@ -112,6 +112,10 @@
     "grabowski_agent_workspace_close",
     "grabowski_agent_workspace_observe",
     "grabowski_agent_workspace_optimize",
+    "grabowski_agent_execution_route",
+    "grabowski_agent_competition_start",
+    "grabowski_agent_competition_status",
+    "grabowski_agent_competition_compare",
     "grabowski_agent_bootstrap",
     "grabowski_call_shape_check"
   ],
@@ -143,6 +147,10 @@
     {
       "module": "grabowski_agent_workspace_observer",
       "source": "src/grabowski_agent_workspace_observer.py"
+    },
+    {
+      "module": "grabowski_agent_competition",
+      "source": "src/grabowski_agent_competition.py"
     },
     {
       "module": "grabowski_capabilities",

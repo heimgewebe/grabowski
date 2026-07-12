@@ -833,6 +833,34 @@ TOOL_PROFILES.update(
             "effects": ["task-state-refresh"],
             "reversibility": "not-applicable",
         },
+        "grabowski_agent_execution_route": {
+            "category": "agent-workspace",
+            "purpose": "Recommend direct, isolated, full-workspace, contrast or competition execution from typed risk and complexity inputs.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_agent_competition_start": {
+            "category": "agent-workspace",
+            "purpose": "Start one durable advisory-only external competitor or contrast programmer against a commit-bound context packet with a frozen runner and isolated provider workspace.",
+            "risk_class": "medium",
+            "effects": ["state-create", "durable-task-start", "external-model-call"],
+            "reversibility": "task-cancel-and-state-retain",
+        },
+        "grabowski_agent_competition_status": {
+            "category": "agent-workspace",
+            "purpose": "Read one external candidate task and validate its immutable advisory receipt.",
+            "risk_class": "low",
+            "effects": ["task-state-refresh"],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_agent_competition_compare": {
+            "category": "agent-workspace",
+            "purpose": "Generate a deterministic contrast matrix, consensus signals and validation opportunities from exactly two bound external candidates.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
     }
 )
 
