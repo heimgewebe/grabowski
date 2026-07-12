@@ -102,20 +102,40 @@ class OperatorContextTests(unittest.TestCase):
         self.assertEqual(
             protocol["workspace_execution_model"],
             {
-                "default": "chatgpt_operator_native",
+                "default": "adaptive_operator_routing",
                 "lane_owner": "chatgpt_operator",
                 "operator_self_serves_lanes": ["captain", "writer", "tests", "review"],
-                "external_agent_delegation": "opt_in_only",
+                "role_evidence_isolated": True,
+                "workspace_not_universal": True,
+                "direct_operator_for": [
+                    "small_low_risk_fix",
+                    "simple_document_change",
+                    "bounded_deterministic_edit",
+                ],
+                "full_workspace_for": [
+                    "runtime_or_security_change",
+                    "long_or_multi_file_implementation",
+                    "parallel_or_foreign_state",
+                    "connector_or_execution_state_uncertainty",
+                ],
+                "external_agent_delegation": "adaptive_opt_in",
                 "delegation_triggers": [
-                    "bounded_large_implementation",
+                    "high_novelty_design_space",
                     "independent_contrast",
+                    "multiple_plausible_implementations",
+                    "security_schema_or_concurrency_risk",
                     "capacity_fallback",
                 ],
+                "external_programming_modes": ["competitor", "contrast"],
+                "max_external_candidates": 2,
+                "external_candidate_authority": "advisory_only",
+                "automatic_patch_apply": False,
+                "automatic_winner_selection": False,
             },
         )
         self.assertEqual(
             protocol["routing_roles"]["complex_code_task"],
-            "chatgpt_operator_external_opt_in_claude_codex_agy_cline",
+            "chatgpt_operator_adaptive_workspace_external_competition_when_high_value",
         )
         self.assertIn(
             "blocked_action_protocol",

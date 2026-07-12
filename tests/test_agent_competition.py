@@ -1,0 +1,353 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+import sys
+import types
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+
+class _FakeFastMCP:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def tool(self, *args, **kwargs):
+        return lambda function: function
+
+
+class _FakeToolAnnotations:
+    def __init__(self, **kwargs):
+        self.values = kwargs
+
+
+if "mcp" not in sys.modules:
+    fake_mcp = types.ModuleType("mcp")
+    fake_server = types.ModuleType("mcp.server")
+    fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+    fake_types = types.ModuleType("mcp.types")
+    fake_fastmcp.FastMCP = _FakeFastMCP
+    fake_types.ToolAnnotations = _FakeToolAnnotations
+    sys.modules["mcp"] = fake_mcp
+    sys.modules["mcp.server"] = fake_server
+    sys.modules["mcp.server.fastmcp"] = fake_fastmcp
+    sys.modules["mcp.types"] = fake_types
+
+import grabowski_agent_competition as competition
+
+
+class AgentCompetitionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
+        (self.repo / "src").mkdir()
+        (self.repo / "tests").mkdir()
+        (self.repo / "src" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (self.repo / "tests" / "test_sample.py").write_text("def test_value():\n    assert True\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=self.repo, check=True)
+        self.head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        self.state = self.root / "state"
+        self.state.mkdir(mode=0o700)
+        self.patchers = [
+            mock.patch.object(competition, "COMPETITION_ROOT", self.state),
+            mock.patch.object(competition.operator, "_require_operator_mutation"),
+            mock.patch.object(competition.operator, "_require_operator_capability"),
+            mock.patch.object(competition.shutil, "which", side_effect=lambda provider: f"/usr/bin/{provider}"),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+
+    def tearDown(self) -> None:
+        for patcher in reversed(self.patchers):
+            patcher.stop()
+        self.temporary.cleanup()
+
+    def _task_start(self, task_id: str):
+        return {
+            "task": {
+                "task_id": task_id,
+                "unit": f"grabowski-task-{task_id}.service",
+                "attempt": 1,
+                "state": "running",
+                "resume_policy": "never",
+            },
+            "audit": {},
+        }
+
+    def _start(self, *, provider: str = "claude", mode: str = "competitor", task: str = "Improve sample") -> dict:
+        task_id = f"task-{provider}-{mode}"
+        with mock.patch.object(competition.tasks, "grabowski_task_start", return_value=self._task_start(task_id)) as start:
+            result = competition.grabowski_agent_competition_start(
+                request_id=f"test-{provider}-{mode}",
+                provider=provider,
+                mode=mode,
+                repository=str(self.repo),
+                expected_head=self.head,
+                task=task,
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py", "tests/test_sample.py"],
+                forbidden_paths=[],
+                timeout_seconds=120,
+            )
+        call = start.call_args.kwargs
+        self.assertEqual(call["resume_policy"], "never")
+        self.assertEqual(call["resource_keys"], [f"path:{self.state / result['competition_id']}"])
+        return result
+
+    def _write_receipt(
+        self,
+        identifier: str,
+        *,
+        changed_paths: list[str],
+        risks: list[str],
+        tests: list[str],
+        patch: str = "",
+    ) -> dict:
+        manifest = competition._validated_manifest(identifier)
+        candidate = {
+            "approach_id": identifier,
+            "approach_summary": f"Approach for {identifier}",
+            "assumptions": ["base is clean"],
+            "design_invariants": ["no automatic merge"],
+            "tradeoffs": ["more evidence"],
+            "risks": risks,
+            "proposed_tests": tests,
+            "changed_paths": changed_paths,
+            "patch": patch,
+            "contrast_observations": ["compare boundaries"],
+            "confidence": "medium",
+            "patch_paths": [],
+            "patch_sha256": hashlib.sha256(patch.encode()).hexdigest(),
+            "patch_check": {"attempted": bool(patch), "applies": False, "returncode": None, "stderr_sha256": None},
+        }
+        receipt = {
+            "schema_version": 1,
+            "kind": "external_programming_candidate_receipt",
+            "competition_id": identifier,
+            "request_id": manifest["request_id"],
+            "request_fingerprint": manifest["request_fingerprint"],
+            "provider": manifest["provider"],
+            "mode": manifest["mode"],
+            "repository": manifest["repository"],
+            "expected_head": manifest["expected_head"],
+            "task_sha256": manifest["task_sha256"],
+            "packet_sha256": manifest["packet_sha256"],
+            "prompt_sha256": "1" * 64,
+            "provider_version": "test",
+            "command_shape": [manifest["provider"]],
+            "provider_cwd_kind": "isolated_candidate_directory",
+            "command_sha256": "2" * 64,
+            "prompt_in_argv": False,
+            "returncode": 0,
+            "runtime_seconds": 1.0,
+            "stdout_sha256": "3" * 64,
+            "stderr_sha256": "4" * 64,
+            "before": {"head": self.head, "clean": True, "context_count": 2},
+            "after": {"head": self.head, "clean": True, "context_count": 2},
+            "candidate": candidate,
+            "authority": "advisory_only",
+            "automatic_apply": False,
+            "automatic_commit": False,
+            "automatic_merge": False,
+            "automatic_deploy": False,
+            "does_not_establish": ["correctness"],
+        }
+        receipt["receipt_sha256"] = competition._sha256_json(receipt)
+        competition._atomic_json(self.state / identifier / "receipt.json", receipt)
+        return receipt
+
+    def test_route_is_adaptive_and_external_is_not_default_for_small_work(self) -> None:
+        direct = competition.grabowski_agent_execution_route(
+            task_kind="docs",
+            changed_file_estimate=1,
+            expected_duration_minutes=5,
+            novelty="low",
+            available_external_agents=["claude", "agy"],
+        )
+        self.assertEqual(direct["execution_mode"], "direct_operator")
+        competitive = competition.grabowski_agent_execution_route(
+            task_kind="code",
+            changed_file_estimate=12,
+            expected_duration_minutes=180,
+            novelty="high",
+            risk_flags=["security", "concurrency"],
+            user_requested_external=True,
+            available_external_agents=["claude", "agy"],
+        )
+        self.assertEqual(competitive["execution_mode"], "workspace_with_competition")
+        self.assertFalse(competitive["automatic_winner_selection"])
+        self.assertEqual(len(competitive["external_candidates"]), 2)
+
+    def test_route_rejects_coercive_bools_and_unknown_agents(self) -> None:
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "must be boolean"):
+            competition.grabowski_agent_execution_route("code", 1, 1, "low", connector_instability="false")  # type: ignore[arg-type]
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "unsupported external agents"):
+            competition.grabowski_agent_execution_route("code", 1, 1, "low", available_external_agents=["unknown"])
+
+    def test_start_uses_nested_durable_task_contract_and_writes_private_bound_state(self) -> None:
+        result = self._start()
+        directory = self.state / result["competition_id"]
+        packet = json.loads((directory / "packet.json").read_text())
+        manifest = json.loads((directory / "manifest.json").read_text())
+        self.assertEqual(manifest["task_id"], "task-claude-competitor")
+        self.assertEqual(packet["expected_head"], self.head)
+        self.assertEqual(packet["packet_sha256"], manifest["packet_sha256"])
+        self.assertEqual(packet["request_id"], "test-claude-competitor")
+        self.assertEqual(packet["request_fingerprint"], manifest["request_fingerprint"])
+        self.assertEqual((directory / "packet.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((directory / "start-intent.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((directory / "manifest.json").stat().st_mode & 0o777, 0o600)
+
+    def test_start_is_idempotent_and_contract_bound(self) -> None:
+        task_id = "task-stable"
+        kwargs = {
+            "request_id": "stable-request",
+            "provider": "claude",
+            "mode": "competitor",
+            "repository": str(self.repo),
+            "expected_head": self.head,
+            "task": "Improve sample",
+            "allowed_paths": ["src", "tests"],
+            "context_paths": ["src/sample.py", "tests/test_sample.py"],
+            "forbidden_paths": [],
+            "timeout_seconds": 120,
+        }
+        with mock.patch.object(competition.tasks, "grabowski_task_start", return_value=self._task_start(task_id)) as start:
+            first = competition.grabowski_agent_competition_start(**kwargs)
+            second = competition.grabowski_agent_competition_start(**kwargs)
+        self.assertFalse(first["already_started"])
+        self.assertTrue(second["already_started"])
+        self.assertEqual(first["competition_id"], second["competition_id"])
+        self.assertEqual(start.call_count, 1)
+        changed = dict(kwargs)
+        changed["primary_summary"] = "different"
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "different competition contract"):
+            competition.grabowski_agent_competition_start(**changed)
+
+    def test_unresolved_start_intent_blocks_duplicate_start(self) -> None:
+        request_id = "unresolved-request"
+        task = "Improve sample"
+        task_sha256 = competition._sha256_bytes(task.encode("utf-8"))
+        identifier = competition._competition_id("claude", "competitor", task_sha256, request_id)
+        directory = self.state / identifier
+        directory.mkdir(mode=0o700)
+        context = [
+            {"path": "src/sample.py", "sha256": competition._sha256_bytes((self.repo / "src/sample.py").read_bytes())},
+            {"path": "tests/test_sample.py", "sha256": competition._sha256_bytes((self.repo / "tests/test_sample.py").read_bytes())},
+        ]
+        contract = {
+            "request_id": request_id,
+            "provider": "claude",
+            "mode": "competitor",
+            "repository": str(self.repo),
+            "expected_head": self.head,
+            "task_sha256": task_sha256,
+            "task": task,
+            "allowed_paths": ["src", "tests"],
+            "forbidden_paths": [],
+            "context": context,
+            "primary_summary": "",
+            "timeout_seconds": 120,
+            "max_budget_usd": 2.0,
+        }
+        intent = {
+            "schema_version": 1,
+            "kind": "external_programming_competition_start_intent",
+            "competition_id": identifier,
+            "request_id": request_id,
+            "request_fingerprint": competition._sha256_json(contract),
+            "packet_sha256": "a" * 64,
+            "command_sha256": "b" * 64,
+            "created_at": "2026-07-12T00:00:00Z",
+            "state": "prepared",
+        }
+        intent["start_intent_sha256"] = competition._sha256_json(intent)
+        competition._atomic_json(directory / "start-intent.json", intent)
+        with mock.patch.object(competition.tasks, "grabowski_task_start") as start:
+            with self.assertRaisesRegex(competition.AgentCompetitionError, "outcome is unresolved"):
+                competition.grabowski_agent_competition_start(
+                    request_id=request_id,
+                    provider="claude",
+                    mode="competitor",
+                    repository=str(self.repo),
+                    expected_head=self.head,
+                    task=task,
+                    allowed_paths=["src", "tests"],
+                    context_paths=["src/sample.py", "tests/test_sample.py"],
+                    timeout_seconds=120,
+                )
+        start.assert_not_called()
+
+    def test_start_rejects_sensitive_allowed_scope(self) -> None:
+        (self.repo / "secrets").mkdir()
+        (self.repo / "secrets" / "note.txt").write_text("x", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "add secret-looking path"], cwd=self.repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "sensitive-looking allowed"):
+            competition.grabowski_agent_competition_start(
+                request_id="test-sensitive-scope",
+                provider="claude",
+                mode="competitor",
+                repository=str(self.repo),
+                expected_head=head,
+                task="task",
+                allowed_paths=["secrets"],
+                context_paths=["secrets/note.txt"],
+            )
+
+    def test_status_is_bounded_and_does_not_return_patch_body(self) -> None:
+        started = self._start()
+        self._write_receipt(started["competition_id"], changed_paths=["src/sample.py"], risks=["race"], tests=["unit test"])
+        with mock.patch.object(
+            competition.tasks,
+            "grabowski_task_status",
+            return_value={"task_id": started["task_id"], "unit": "u", "attempt": 1, "state": "completed", "updated_at_unix": 1},
+        ):
+            status = competition.grabowski_agent_competition_status(started["competition_id"])
+        self.assertTrue(status["candidate_ready"])
+        self.assertNotIn("receipt", status)
+        self.assertNotIn("patch", status["candidate"])
+        self.assertEqual(status["candidate"]["patch_size_bytes"], 0)
+
+    def test_self_hashed_receipt_cannot_change_manifest_binding(self) -> None:
+        started = self._start()
+        receipt = self._write_receipt(started["competition_id"], changed_paths=["src/sample.py"], risks=[], tests=[])
+        path = self.state / started["competition_id"] / "receipt.json"
+        path.unlink()
+        receipt["expected_head"] = "f" * 40
+        receipt["receipt_sha256"] = competition._sha256_json({key: value for key, value in receipt.items() if key != "receipt_sha256"})
+        competition._atomic_json(path, receipt)
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "binding mismatch"):
+            competition._receipt(started["competition_id"])
+
+    def test_compare_emits_consensus_and_divergence_without_winner(self) -> None:
+        first = self._start(provider="claude", mode="competitor", task="same task")
+        second = self._start(provider="agy", mode="contrast", task="same task")
+        self._write_receipt(first["competition_id"], changed_paths=["src/sample.py", "tests/test_sample.py"], risks=["race"], tests=["unit test"])
+        self._write_receipt(second["competition_id"], changed_paths=["src/sample.py"], risks=["race"], tests=["unit test"])
+        result = competition.grabowski_agent_competition_compare([first["competition_id"], second["competition_id"]])
+        self.assertEqual(result["consensus"]["changed_paths"], ["src/sample.py"])
+        self.assertEqual(result["divergence"]["changed_paths"], ["tests/test_sample.py"])
+        self.assertFalse(result["winner_selected"])
+        self.assertFalse(result["automatic_apply"])
+        self.assertIn("unit test", result["consensus"]["proposed_tests"])
+
+
+if __name__ == "__main__":
+    unittest.main()

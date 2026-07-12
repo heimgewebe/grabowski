@@ -1410,6 +1410,56 @@
       "tool": "grabowski_agent_workspace_optimize"
     },
     {
+      "category": "agent-workspace",
+      "description": "Recommend direct, workspace, contrast or competition execution without authorizing it.",
+      "effects": [],
+      "id": "grabowski_agent_execution_route",
+      "purpose": "Recommend direct, isolated, full-workspace, contrast or competition execution from typed risk and complexity inputs.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_execution_route"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Start one durable read-only external competitor or contrast programmer.",
+      "effects": [
+        "state-create",
+        "durable-task-start",
+        "external-model-call"
+      ],
+      "id": "grabowski_agent_competition_start",
+      "purpose": "Start one durable read-only external competitor or contrast programmer against a clean head-bound context packet.",
+      "read_only": false,
+      "reversibility": "task-cancel-and-state-retain",
+      "risk_class": "medium",
+      "tool": "grabowski_agent_competition_start"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Read one external candidate task and validate its immutable receipt when present.",
+      "effects": [
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_competition_status",
+      "purpose": "Read one external candidate task and validate its immutable advisory receipt.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_competition_status"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Generate a deterministic contrast matrix and validation opportunities from two to four candidates.",
+      "effects": [],
+      "id": "grabowski_agent_competition_compare",
+      "purpose": "Generate a deterministic contrast matrix, consensus signals and validation opportunities from two to four bound external candidates.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_competition_compare"
+    },
+    {
       "category": "operations-observability",
       "description": "Return a bounded adaptive agent entry capsule for the current runtime evidence.",
       "effects": [],
@@ -1479,7 +1529,7 @@
     ],
     "routing_roles": {
       "audit": "grabowski_git",
-      "complex_code_task": "chatgpt_operator_external_opt_in_claude_codex_agy_cline",
+      "complex_code_task": "chatgpt_operator_adaptive_workspace_external_competition_when_high_value",
       "local_micro_reasoning": "ollama_api_qwen_coder",
       "memory_prioritization": "bureau",
       "patch_fallback": "aider_no_auto_commit",
@@ -1492,20 +1542,43 @@
     },
     "rule": "Keep ChatGPT as operator and execute bounded work first. Delegate only when a helper adds useful scale or independent contrast.",
     "workspace_execution_model": {
-      "default": "chatgpt_operator_native",
+      "automatic_patch_apply": false,
+      "automatic_winner_selection": false,
+      "default": "adaptive_operator_routing",
       "delegation_triggers": [
-        "bounded_large_implementation",
+        "high_novelty_design_space",
         "independent_contrast",
+        "multiple_plausible_implementations",
+        "security_schema_or_concurrency_risk",
         "capacity_fallback"
       ],
-      "external_agent_delegation": "opt_in_only",
+      "direct_operator_for": [
+        "small_low_risk_fix",
+        "simple_document_change",
+        "bounded_deterministic_edit"
+      ],
+      "external_agent_delegation": "adaptive_opt_in",
+      "external_candidate_authority": "advisory_only",
+      "external_programming_modes": [
+        "competitor",
+        "contrast"
+      ],
+      "full_workspace_for": [
+        "runtime_or_security_change",
+        "long_or_multi_file_implementation",
+        "parallel_or_foreign_state",
+        "connector_or_execution_state_uncertainty"
+      ],
       "lane_owner": "chatgpt_operator",
+      "max_external_candidates": 2,
       "operator_self_serves_lanes": [
         "captain",
         "writer",
         "tests",
         "review"
-      ]
+      ],
+      "role_evidence_isolated": true,
+      "workspace_not_universal": true
     }
   },
   "policy_contract": {
@@ -1654,6 +1727,10 @@
       "grabowski_agent_workspace_close",
       "grabowski_agent_workspace_observe",
       "grabowski_agent_workspace_optimize",
+      "grabowski_agent_execution_route",
+      "grabowski_agent_competition_start",
+      "grabowski_agent_competition_status",
+      "grabowski_agent_competition_compare",
       "grabowski_agent_bootstrap",
       "grabowski_call_shape_check"
     ],
@@ -1683,6 +1760,10 @@
       {
         "module": "grabowski_agent_workspace_observer",
         "source": "src/grabowski_agent_workspace_observer.py"
+      },
+      {
+        "module": "grabowski_agent_competition",
+        "source": "src/grabowski_agent_competition.py"
       },
       {
         "module": "grabowski_capabilities",
@@ -1790,7 +1871,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "18318278e3c30d4adc432ee8b1af67f19a5f6443629f6f86840253b7e44a063a"
+      "sha256": "70cbdb6a1a309ac93cb9b12223fe416b8b72c455a9fbd8bce460b863a2b70db7"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1798,24 +1879,25 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "58b8d0c09335be64f10d13b687260f4b42f75517d5b776cba87bfc98fb1faabe"
+      "sha256": "f5b5aa65ec197281b4bec4b3eacf93f90d5f30cbf78d77b5ee2e726bd98b28e4"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c413e520172f70296c42e18e4c0f1fcb95a1931afa0fda7b7c36dba4b2d52e56",
+      "src/grabowski_agent_competition.py": "6bd64f200df7e4bea5c76c57e3466c724be1183c29249c797c5693134a48842f",
       "src/grabowski_agent_role.py": "abef0db4aa6fffcd52976e2c60deb5f68abfadf76528ec5ac79dfebeddafe8bf",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
       "src/grabowski_agent_workspace.py": "1a6495a53600c1022ab717cd2f79bc444031039a0c81bebbc5f0d13bab17cf97",
       "src/grabowski_agent_workspace_observer.py": "192a3602db277c5b19a9553095cfa8b37ca60f39ca47f16d526c8a50365c64ba",
       "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
-      "src/grabowski_capabilities.py": "18318278e3c30d4adc432ee8b1af67f19a5f6443629f6f86840253b7e44a063a",
+      "src/grabowski_capabilities.py": "70cbdb6a1a309ac93cb9b12223fe416b8b72c455a9fbd8bce460b863a2b70db7",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
       "src/grabowski_friction.py": "15f4de8cacfaacfb6d5e1bc95bb82064d800bdbb46fd8ce67901f0bdf8a2ee8c",
       "src/grabowski_grip_orchestration.py": "2c1d594433f92edbae23adc43a303b212bfff89d298121c516974d790259051d",
       "src/grabowski_grips.py": "f7fee83b8424d40ff1f3785a771a685c1ce2bb73e3029d38de1b7e2da073968a",
-      "src/grabowski_mcp.py": "531030669506c70ebf1bb98dac620860efad8ef1b85cbf1eb6d2741e6e7fcd79",
+      "src/grabowski_mcp.py": "4d3d8363c2603132a833d3c8d583bf1e2d00552bf61ad702adaa537620b4bc59",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "7aaaca985ccf404934fd1dd07d7a718d69cb0b23826691da9096f6f3d4f20e54",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",
@@ -1824,7 +1906,7 @@
       "src/grabowski_recovery.py": "b0c5124271498639f6c16614ccb51f7b3b696ebfd88011ad2291d353e56d0fe6",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
       "src/grabowski_resources.py": "2d2e0a4afe7d810c4cc9b1aa77bf8ef5c0354dc48fadfe113eac15dc9732a8aa",
-      "src/grabowski_runtime.py": "4d73adda5943adceeebb5eaf25385dd22711a2146193806d44d0146c1253ba58",
+      "src/grabowski_runtime.py": "e7eca914dcdda0233d844c2e99cc008ff4ea0239cafe28511c08d93a7dd9a1e0",
       "src/grabowski_runtime_extensions.py": "8b73b1d98d0aaa35f3c2c5efecf1198b90344600cfd73ebd188a6a175142d574",
       "src/grabowski_self_deploy.py": "1c4a9517564c2b17c39a87a076e397f0bcb2f428467be782b1b48007b063a49a",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",

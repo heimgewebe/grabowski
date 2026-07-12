@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "18318278e3c30d4adc432ee8b1af67f19a5f6443629f6f86840253b7e44a063a",
+  "capability_source_sha256": "70cbdb6a1a309ac93cb9b12223fe416b8b72c455a9fbd8bce460b863a2b70db7",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "58b8d0c09335be64f10d13b687260f4b42f75517d5b776cba87bfc98fb1faabe",
+  "contract_sha256": "f5b5aa65ec197281b4bec4b3eacf93f90d5f30cbf78d77b5ee2e726bd98b28e4",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1420,6 +1420,56 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_agent_workspace_optimize"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Recommend direct, workspace, contrast or competition execution without authorizing it.",
+      "effects": [],
+      "id": "grabowski_agent_execution_route",
+      "purpose": "Recommend direct, isolated, full-workspace, contrast or competition execution from typed risk and complexity inputs.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_execution_route"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Start one durable read-only external competitor or contrast programmer.",
+      "effects": [
+        "state-create",
+        "durable-task-start",
+        "external-model-call"
+      ],
+      "id": "grabowski_agent_competition_start",
+      "purpose": "Start one durable read-only external competitor or contrast programmer against a clean head-bound context packet.",
+      "read_only": false,
+      "reversibility": "task-cancel-and-state-retain",
+      "risk_class": "medium",
+      "tool": "grabowski_agent_competition_start"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Read one external candidate task and validate its immutable receipt when present.",
+      "effects": [
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_competition_status",
+      "purpose": "Read one external candidate task and validate its immutable advisory receipt.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_competition_status"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Generate a deterministic contrast matrix and validation opportunities from two to four candidates.",
+      "effects": [],
+      "id": "grabowski_agent_competition_compare",
+      "purpose": "Generate a deterministic contrast matrix, consensus signals and validation opportunities from two to four bound external candidates.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_competition_compare"
     },
     {
       "category": "operations-observability",

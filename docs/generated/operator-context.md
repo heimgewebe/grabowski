@@ -10,9 +10,10 @@ This document describes the repository contract. Current runtime state must be r
 - Source: `docs/blocked-action-protocol-v0.md`
 - Control loop: typed Grabowski tool first; if blocked, one bounded Grabowski Micro-Task; then read a receipt before deciding the next step.
 - Execution priority: ChatGPT operator first; delegated coding agents follow Claude, Codex, agy, then Cline.
-- Workspace default: the ChatGPT operator self-serves captain, writer, tests and review sequentially with one shared context; external coding agents are opt-in only.
+- Workspace routing: use direct operator execution for small low-risk edits; use isolated role evidence for long, risky, parallel or state-uncertain work.
+- External programming: at most two opt-in competitor/contrast candidates may challenge the primary approach; their patches remain advisory and are never applied or selected automatically.
 - Operator-first work: task decomposition, bounded code changes, integration, critical self-review and recovery.
-- Complex code task: the operator executes when bounded; larger delegated packages follow the coding-agent priority and stop at diff or test evidence.
+- Complex code task: the operator remains integrator; high-value design spaces may add bounded Claude/agy competition or contrast before the normal Writer, Tests and Review path.
 - Quick light reasoning: operator first, then agy `--print` when delegation adds value.
 - Local micro reasoning: Ollama API with qwen coder.
 - Patch file relay: local patch files use `tools/operator_patch_relay.py` for check/apply receipts before user manual execution.
@@ -140,6 +141,10 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_workspace_close` | agent-workspace | no | high | Close one collected workspace while preserving its branch and writer worktree. |
 | `grabowski_agent_workspace_observe` | agent-workspace | yes | low | Read one bounded immutable workspace event timeline and emit a facts/inferences/proposals process report. |
 | `grabowski_agent_workspace_optimize` | agent-workspace | yes | low | Derive advisory cross-workspace optimization proposals from at least two immutable reports. |
+| `grabowski_agent_execution_route` | agent-workspace | yes | low | Recommend direct, isolated, full-workspace, contrast or competition execution from typed risk and complexity inputs. |
+| `grabowski_agent_competition_start` | agent-workspace | no | medium | Start one durable read-only external competitor or contrast programmer against a clean head-bound context packet. |
+| `grabowski_agent_competition_status` | agent-workspace | yes | low | Read one external candidate task and validate its immutable advisory receipt. |
+| `grabowski_agent_competition_compare` | agent-workspace | yes | low | Generate a deterministic contrast matrix, consensus signals and validation opportunities from two to four bound external candidates. |
 | `grabowski_agent_bootstrap` | operations-observability | yes | low | Return a release-evidence-bound adaptive agent entry capsule without authorizing execution. |
 | `grabowski_call_shape_check` | operations-observability | yes | low | Deterministically lint one proposed tool-call shape before execution. |
 

@@ -17,6 +17,7 @@ import grabowski_agent_bootstrap
 import grabowski_recall
 import grabowski_resources
 import grabowski_tasks
+import grabowski_agent_competition
 import grabowski_workers
 
 
