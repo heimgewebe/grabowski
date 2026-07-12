@@ -130,6 +130,10 @@
       "source": "src/grabowski_grips.py"
     },
     {
+      "module": "grabowski_worktree_ensure",
+      "source": "src/grabowski_worktree_ensure.py"
+    },
+    {
       "module": "grabowski_grip_orchestration",
       "source": "src/grabowski_grip_orchestration.py"
     },
