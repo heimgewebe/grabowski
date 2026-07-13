@@ -394,6 +394,7 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
                     "snapshot_preparation_ms",
                     "freshness_check_ms",
                     "agent_execution_ms",
+                    "runner_execution_ms",
                     "total_time_to_answer_ms",
                 },
             )

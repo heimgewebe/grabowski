@@ -38,6 +38,7 @@ MAX_TOTAL_COST_USD = Decimal("2.00")
 MAX_REQUEST_FILES = 128
 MAX_MCP_LINE_BYTES = 4 * 1024 * 1024
 MAX_VALIDATOR_OUTPUT_BYTES = 256 * 1024
+MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 REPOBRIEF_ABSTRACT_TOOLS = {
     "ask_context",
     "grounding_verify",
@@ -224,9 +225,12 @@ def prepare_snapshot(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]
         raise PreflightError("treatment request has no RepoBrief binding")
     manifest = Path(str(binding.get("manifest", ""))).expanduser().resolve()
     try:
-        data = manifest.read_bytes()
+        with manifest.open("rb") as handle:
+            data = handle.read(MAX_MANIFEST_BYTES + 1)
     except OSError as exc:
         raise PreflightError("bound RepoBrief manifest is unavailable") from exc
+    if not data or len(data) > MAX_MANIFEST_BYTES:
+        raise PreflightError("bound RepoBrief manifest is empty or oversized")
     expected = str(binding.get("manifest_sha256", ""))
     actual = _sha256_bytes(data)
     if actual != expected:
@@ -272,6 +276,11 @@ def _rpc(process: subprocess.Popen, message: Mapping[str, Any], *, timeout_secon
     return result
 
 
+def _mcp_environment() -> dict[str, str]:
+    allowed = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}
+    return {key: value for key, value in os.environ.items() if key in allowed}
+
+
 def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
     binding = treatment.get("repobrief")
     if not isinstance(binding, Mapping):
@@ -281,7 +290,7 @@ def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
         isinstance(item, str) and item for item in command
     ):
         raise PreflightError("treatment MCP command is invalid")
-    environment = runner._provider_environment()
+    environment = _mcp_environment()
     started = time.monotonic()
     try:
         process = subprocess.Popen(
@@ -515,6 +524,7 @@ def execute_preflight(
     receipt_paths: dict[str, Path] = {}
     observed_costs: dict[str, Decimal] = {}
     agent_execution_ms = 0
+    runner_execution_ms = 0
     for request in ordered:
         condition = str(request["condition"])
         run_started = time.monotonic()
@@ -528,7 +538,7 @@ def execute_preflight(
             max_cost_usd=max_cost_usd,
             stream_fixture=fixture_by_condition[condition],
         )
-        agent_execution_ms += max(int((time.monotonic() - run_started) * 1000), 0)
+        runner_execution_ms += max(int((time.monotonic() - run_started) * 1000), 0)
         if synthetic:
             if output.get("kind") != runner.FIXTURE_REPORT_KIND:
                 raise PreflightError("fixture run did not return fixture report")
@@ -540,6 +550,7 @@ def execute_preflight(
             if output.get("kind") != runner.RECEIPT_KIND:
                 raise PreflightError("live run did not return real receipt")
             receipt = output
+        agent_execution_ms += int(receipt.get("duration_ms") or 0)
         _tool_requirement(receipt, treatment=condition == "treatment")
         receipt_path = _receipt_path(evidence_root, request)
         _write_private_exclusive(receipt_path, receipt)
@@ -555,7 +566,8 @@ def execute_preflight(
             observed_costs[condition] = _observed_cost(receipt, transcript_root)
 
     total_observed = sum(observed_costs.values(), Decimal("0"))
-    if not synthetic and total_observed > MAX_TOTAL_COST_USD:
+    total_authorized = max_cost_usd * 2
+    if not synthetic and total_observed > total_authorized:
         raise PreflightError("total observed provider cost exceeds preflight ceiling")
     after = source_state(source)
     _assert_source_unchanged(before, after)
@@ -577,7 +589,7 @@ def execute_preflight(
         },
         "cost": {
             "per_run_authorized_usd": format(max_cost_usd, "f"),
-            "total_authorized_usd": format(MAX_TOTAL_COST_USD, "f"),
+            "total_authorized_usd": format(total_authorized, "f"),
             "baseline_observed_usd": None if synthetic else format(observed_costs["baseline"], "f"),
             "treatment_observed_usd": None if synthetic else format(observed_costs["treatment"], "f"),
             "total_observed_usd": None if synthetic else format(total_observed, "f"),
@@ -586,6 +598,7 @@ def execute_preflight(
             "snapshot_preparation_ms": snapshot_preparation_ms,
             "freshness_check_ms": freshness_check_ms,
             "agent_execution_ms": agent_execution_ms,
+            "runner_execution_ms": runner_execution_ms,
             "total_time_to_answer_ms": total_time_to_answer_ms,
         },
         "snapshot": {**snapshot, **freshness},
