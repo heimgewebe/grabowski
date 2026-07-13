@@ -343,6 +343,82 @@ class NonConflictResourceTests(unittest.TestCase):
                 invalid_duration, now=invalid_duration["issued_at_unix"]
             )
 
+    def test_boolean_proof_ttl_is_rejected(self) -> None:
+        scope_a = self.scope("a")
+        scope_b = self.scope("b")
+        lease = {
+            "resource_key": f"repo:{self.repo}",
+            "owner_id": "owner-a",
+            "acquired_at_unix": self.now,
+            "updated_at_unix": self.now,
+            "expires_at_unix": self.now + 180,
+            "metadata_sha256": "c" * 64,
+        }
+        with self.assertRaisesRegex(ValueError, "proof_ttl_seconds"):
+            nonconflict.create_nonconflict_proof(
+                blocked_lease=lease,
+                existing_scope=scope_a,
+                requesting_owner="owner-b",
+                resource_keys=[f"path:{self.repo / 'src' / 'b.py'}"],
+                purpose="secondary exact work",
+                requested_scope=scope_b,
+                requested_scope_complete=True,
+                proof_ttl_seconds=True,
+                now=self.now,
+            )
+
+    def test_public_proof_rejects_false_disjoint_axis_hash(self) -> None:
+        self.acquire_blocker()
+        proof = deepcopy(self.assess()["proof"])
+        proof["axis_results"][0]["overlap_sha256"] = "d" * 64
+        core = {key: value for key, value in proof.items() if key != "proof_sha256"}
+        proof["proof_sha256"] = nonconflict._sha256(core)
+        with self.assertRaisesRegex(ValueError, "empty overlap"):
+            nonconflict.validate_public_proof(proof)
+
+    def test_live_revalidation_rejects_axis_evidence_drift_and_boolean_ttl(self) -> None:
+        self.acquire_blocker()
+        assessment = self.assess()
+        proof = assessment["proof"]
+        requested_scope = self.scope("b")
+        with resources._database() as connection:
+            live_lease = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?",
+                (f"repo:{self.repo}",),
+            ).fetchone()
+        live_existing_scope = self.scope("a")
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            nonconflict.validate_proof_against_live_lease(
+                proof,
+                live_lease=live_lease,
+                live_existing_scope=live_existing_scope,
+                requesting_owner="owner-b",
+                resource_keys=[f"path:{self.repo / 'src' / 'b.py'}"],
+                purpose="secondary exact work",
+                requested_scope=requested_scope,
+                requested_ttl_seconds=True,
+            )
+        original_evaluation = nonconflict.evaluate_scope_manifests(
+            live_existing_scope, requested_scope
+        )
+        drifted_evaluation = deepcopy(original_evaluation)
+        drifted_evaluation["axis_results"][0]["overlap_sha256"] = "e" * 64
+        with patch.object(
+            nonconflict,
+            "evaluate_scope_manifests",
+            return_value=drifted_evaluation,
+        ), self.assertRaisesRegex(nonconflict.NonConflictDenied, "axis evidence"):
+            nonconflict.validate_proof_against_live_lease(
+                proof,
+                live_lease=live_lease,
+                live_existing_scope=live_existing_scope,
+                requesting_owner="owner-b",
+                resource_keys=[f"path:{self.repo / 'src' / 'b.py'}"],
+                purpose="secondary exact work",
+                requested_scope=requested_scope,
+                requested_ttl_seconds=30,
+            )
+
     def test_changed_blocking_lease_invalidates_proof(self) -> None:
         self.acquire_blocker()
         assessment = self.assess()
@@ -549,6 +625,14 @@ class NonConflictResourceTests(unittest.TestCase):
                 ttl_seconds=60,
                 metadata={"scope_manifest": self.scope("a")},
             )
+
+    def test_nested_worktree_roots_conflict(self) -> None:
+        existing = self.scope("a")
+        requested = self.scope("b")
+        requested["worktree"] = str(Path(existing["worktree"]) / "nested")
+        result = nonconflict.evaluate_scope_manifests(existing, requested)
+        self.assertEqual(result["decision"], "deny")
+        self.assertIn("worktree", result["blocker_axes"])
 
     def test_cross_axis_paths_and_worktree_paths_conflict(self) -> None:
         existing = self.scope(
