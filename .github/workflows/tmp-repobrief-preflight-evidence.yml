@@ -1,0 +1,215 @@
+name: temporary RepoBrief preflight evidence hardening
+
+on:
+  push:
+    branches:
+      - feat/repobrief-live-preflight-v1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/repobrief-live-preflight-v1
+          fetch-depth: 0
+      - name: Apply exact evidence hardening
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('tools/repobrief_agent_benchmark_preflight.py')
+          text = path.read_text(encoding='utf-8')
+          replacements = [
+              (
+                  'import select\nimport subprocess\n',
+                  'import select\nimport shutil\nimport subprocess\n',
+              ),
+              (
+                  'MAX_MANIFEST_BYTES = 16 * 1024 * 1024\n',
+                  'MAX_MANIFEST_BYTES = 16 * 1024 * 1024\nMAX_EXECUTABLE_BYTES = 64 * 1024 * 1024\n',
+              ),
+              (
+                  'def _mcp_environment() -> dict[str, str]:\n'
+                  '    allowed = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}\n'
+                  '    return {key: value for key, value in os.environ.items() if key in allowed}\n',
+                  'def _mcp_environment() -> dict[str, str]:\n'
+                  '    allowed = {"PATH", "LANG", "LC_ALL", "TMPDIR"}\n'
+                  '    environment = {key: value for key, value in os.environ.items() if key in allowed}\n'
+                  '    environment["HOME"] = "/nonexistent/repobrief-preflight"\n'
+                  '    return environment\n',
+              ),
+              (
+                  'def _claude_version(claude: str) -> str:\n'
+                  '    try:\n'
+                  '        completed = subprocess.run(\n'
+                  '            [claude, "--version"],\n'
+                  '            check=True,\n'
+                  '            capture_output=True,\n'
+                  '            text=True,\n'
+                  '            timeout=30,\n'
+                  '            shell=False,\n'
+                  '            env=runner._provider_environment(),\n'
+                  '        )\n'
+                  '    except (OSError, subprocess.SubprocessError) as exc:\n'
+                  '        raise PreflightError("Claude version probe failed") from exc\n'
+                  '    version = completed.stdout.strip()\n'
+                  '    if not version or len(version) > 500 or completed.stderr:\n'
+                  '        raise PreflightError("Claude version probe returned invalid output")\n'
+                  '    return version\n',
+                  'def _claude_identity(claude: str) -> dict[str, Any]:\n'
+                  '    executable = shutil.which(claude)\n'
+                  '    if executable is None:\n'
+                  '        raise PreflightError("Claude executable cannot be resolved")\n'
+                  '    resolved = Path(executable).expanduser().resolve()\n'
+                  '    try:\n'
+                  '        with resolved.open("rb") as handle:\n'
+                  '            data = handle.read(MAX_EXECUTABLE_BYTES + 1)\n'
+                  '    except OSError as exc:\n'
+                  '        raise PreflightError("Claude executable cannot be read") from exc\n'
+                  '    if not data or len(data) > MAX_EXECUTABLE_BYTES:\n'
+                  '        raise PreflightError("Claude executable is empty or oversized")\n'
+                  '    try:\n'
+                  '        completed = subprocess.run(\n'
+                  '            [str(resolved), "--version"],\n'
+                  '            check=True,\n'
+                  '            capture_output=True,\n'
+                  '            text=True,\n'
+                  '            timeout=30,\n'
+                  '            shell=False,\n'
+                  '            env=runner._provider_environment(),\n'
+                  '        )\n'
+                  '    except (OSError, subprocess.SubprocessError) as exc:\n'
+                  '        raise PreflightError("Claude version probe failed") from exc\n'
+                  '    version = completed.stdout.strip()\n'
+                  '    if not version or len(version) > 500 or completed.stderr:\n'
+                  '        raise PreflightError("Claude version probe returned invalid output")\n'
+                  '    return {\n'
+                  '        "command": claude,\n'
+                  '        "resolved_path": str(resolved),\n'
+                  '        "bytes": len(data),\n'
+                  '        "sha256": _sha256_bytes(data),\n'
+                  '        "version": version,\n'
+                  '    }\n',
+              ),
+              (
+                  '    version = "synthetic-fixture" if synthetic else _claude_version(claude)\n',
+                  '    claude_identity = (\n'
+                  '        {\n'
+                  '            "command": claude,\n'
+                  '            "resolved_path": None,\n'
+                  '            "bytes": None,\n'
+                  '            "sha256": None,\n'
+                  '            "version": "synthetic-fixture",\n'
+                  '        }\n'
+                  '        if synthetic\n'
+                  '        else _claude_identity(claude)\n'
+                  '    )\n',
+              ),
+              (
+                  '    observed_costs: dict[str, Decimal] = {}\n'
+                  '    agent_execution_ms = 0\n',
+                  '    observed_costs: dict[str, Decimal] = {}\n'
+                  '    validations: dict[str, dict[str, Any]] = {}\n'
+                  '    agent_execution_ms = 0\n',
+              ),
+              (
+                  '            _validate_receipt_external(\n'
+                  '                validator_command,\n'
+                  '                request_path=_request_path(request_root, request),\n'
+                  '                receipt_path=receipt_path,\n'
+                  '                transcript_root=transcript_root,\n'
+                  '            )\n'
+                  '            observed_costs[condition] = _observed_cost(receipt, transcript_root)\n',
+                  '            validations[condition] = _validate_receipt_external(\n'
+                  '                validator_command,\n'
+                  '                request_path=_request_path(request_root, request),\n'
+                  '                receipt_path=receipt_path,\n'
+                  '                transcript_root=transcript_root,\n'
+                  '            )\n'
+                  '            observed_costs[condition] = _observed_cost(receipt, transcript_root)\n',
+              ),
+              (
+                  '            "claude_version": version,\n'
+                  '        },\n',
+                  '            "claude": claude_identity,\n'
+                  '            "validator_command_sha256": _sha256_json(list(validator_command)),\n'
+                  '        },\n',
+              ),
+              (
+                  '                "transcript": receipts[condition]["transcript"],\n'
+                  '            }\n',
+                  '                "transcript": receipts[condition]["transcript"],\n'
+                  '                "lenskit_validation_sha256": (\n'
+                  '                    None if synthetic else _sha256_json(validations[condition])\n'
+                  '                ),\n'
+                  '            }\n',
+              ),
+              (
+                  '        _write_private_exclusive(args.report_out.expanduser().resolve(), report)\n',
+                  '        report_path = args.report_out.expanduser().resolve()\n'
+                  '        _write_private_exclusive(report_path, report)\n'
+                  '        report_bytes = report_path.read_bytes()\n'
+                  '        digest_path = Path(str(report_path) + ".sha256")\n'
+                  '        digest = f"{_sha256_bytes(report_bytes)}  {report_path.name}\\n".encode("ascii")\n'
+                  '        digest_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)\n'
+                  '        descriptor = os.open(\n'
+                  '            digest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600\n'
+                  '        )\n'
+                  '        with os.fdopen(descriptor, "wb") as handle:\n'
+                  '            handle.write(digest)\n'
+                  '            handle.flush()\n'
+                  '            os.fsync(handle.fileno())\n',
+              ),
+          ]
+          for old, new in replacements:
+              if new in text:
+                  continue
+              if old not in text:
+                  raise SystemExit(f'missing evidence patch anchor: {old[:120]!r}')
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+
+          tests = Path('tests/test_repobrief_agent_benchmark_preflight.py')
+          text = tests.read_text(encoding='utf-8')
+          old = '            self.assertEqual(report["kind"], preflight.REPORT_KIND)\n            self.assertEqual(report["status"], "valid")\n'
+          new = '            self.assertEqual(report["kind"], preflight.REPORT_KIND)\n            self.assertEqual(report["status"], "valid")\n            self.assertIsNotNone(report["environment"]["claude"]["sha256"])\n            self.assertIsNotNone(report["runs"]["baseline"]["lenskit_validation_sha256"])\n'
+          if new not in text:
+              if old not in text:
+                  raise SystemExit('missing live report test anchor')
+              text = text.replace(old, new, 1)
+          addition = '''\n    def test_mcp_environment_excludes_provider_credentials(self) -> None:\n        previous_key = os.environ.get("ANTHROPIC_API_KEY")\n        previous_home = os.environ.get("HOME")\n        try:\n            os.environ["ANTHROPIC_API_KEY"] = "secret"\n            os.environ["HOME"] = "/home/operator"\n            environment = preflight._mcp_environment()\n        finally:\n            if previous_key is None:\n                os.environ.pop("ANTHROPIC_API_KEY", None)\n            else:\n                os.environ["ANTHROPIC_API_KEY"] = previous_key\n            if previous_home is None:\n                os.environ.pop("HOME", None)\n            else:\n                os.environ["HOME"] = previous_home\n        self.assertNotIn("ANTHROPIC_API_KEY", environment)\n        self.assertEqual(environment["HOME"], "/nonexistent/repobrief-preflight")\n'''
+          marker = '\n\nif __name__ == "__main__":\n'
+          if addition not in text:
+              if marker not in text:
+                  raise SystemExit('missing preflight test end marker')
+              text = text.replace(marker, addition + marker, 1)
+          if 'import os\n' not in text:
+              text = text.replace('import json\n', 'import json\nimport os\n', 1)
+          tests.write_text(text, encoding='utf-8')
+
+          docs = Path('docs/contracts/repobrief-agent-benchmark-live-preflight-v1.md')
+          text = docs.read_text(encoding='utf-8')
+          text = text.replace(
+              '- Claude-Version und Laufzeitumgebung;\n',
+              '- Claude-Version sowie Pfad, Größe und SHA-256 des gestarteten Programms;\n',
+          )
+          text = text.replace(
+              'SHA-256 gebunden.\n',
+              'SHA-256 gebunden. Neben dem Bericht wird automatisch eine gleichnamige `.sha256`-Datei erzeugt.\n',
+              1,
+          )
+          docs.write_text(text, encoding='utf-8')
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tools/repobrief_agent_benchmark_preflight.py tests/test_repobrief_agent_benchmark_preflight.py docs/contracts/repobrief-agent-benchmark-live-preflight-v1.md
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "fix: bind RepoBrief preflight execution evidence"
+          git push origin HEAD:feat/repobrief-live-preflight-v1
