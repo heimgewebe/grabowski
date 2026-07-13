@@ -15,6 +15,8 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -31,7 +33,9 @@ MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 MAX_TOOL_CALLS = 1000
 MAX_PLANNED_REQUESTS = 128
-MAX_PROVIDER_BUDGET_USD = Decimal("100.00")
+MAX_PROVIDER_BUDGET_USD = Decimal("1.00")
+MAX_CREDENTIAL_BYTES = 64 * 1024
+MAX_PROVIDER_EXECUTABLE_BYTES = 512 * 1024 * 1024
 READ_ONLY_BUILTINS = ("Read", "Glob", "Grep")
 TREATMENT_RESOURCE_TOOLS = ("ListMcpResources", "ReadMcpResource")
 TREATMENT_MCP_TOOLS = (
@@ -77,6 +81,17 @@ CLAIM_VOCABULARY = (
     "test_sufficiency_established",
     "test_sufficiency_not_established",
 )
+ISOLATED_CLAUDE_SETTINGS = {
+    "claudeMdExcludes": ["**/*"],
+    "disableAgentView": True,
+    "disableAllHooks": True,
+    "disableArtifact": True,
+    "disableBundledSkills": True,
+    "disableClaudeAiConnectors": True,
+    "disableRemoteControl": True,
+    "disableWorkflows": True,
+}
+
 DOES_NOT_ESTABLISH = (
     "real_agent_usefulness",
     "answer_correctness_outside_fixed_expectations",
@@ -272,6 +287,22 @@ def _validated_execution_budget(
     return _parse_max_budget_usd(max_budget_usd)
 
 
+def _validated_credential_data(
+    *,
+    stream_fixture: Path | None,
+    credential_file: Path | None,
+) -> bytes | None:
+    if stream_fixture is not None:
+        if credential_file is not None:
+            raise RunnerError(
+                "synthetic fixture execution must not carry live provider credentials"
+            )
+        return None
+    if credential_file is None:
+        raise RunnerError("live execution requires claude_credential_file")
+    return _read_credential_file(credential_file)
+
+
 def _safe_identifier(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -281,6 +312,64 @@ def _validate_hex(value: Any, label: str, *, length: int) -> str:
     if len(text) != length or any(char not in "0123456789abcdef" for char in text):
         raise RunnerError(f"{label} must be {length} lowercase hex characters")
     return text
+
+
+def _validate_provider_executable(
+    *,
+    stream_fixture: Path | None,
+    executable: str,
+    expected_sha256: str | None,
+) -> str:
+    if stream_fixture is not None:
+        if expected_sha256 is not None:
+            raise RunnerError(
+                "synthetic fixture execution must not carry live executable binding"
+            )
+        return executable
+    if expected_sha256 is None:
+        raise RunnerError("live execution requires claude_command_sha256")
+    expected = _validate_hex(
+        expected_sha256, "claude_command_sha256", length=64
+    )
+    path = Path(executable)
+    if not path.is_absolute():
+        raise RunnerError("live Claude executable path must be absolute")
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise RunnerError("live Claude executable is unavailable") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RunnerError("live Claude executable must be a regular non-symlink file")
+    if metadata.st_size <= 0 or metadata.st_size > MAX_PROVIDER_EXECUTABLE_BYTES:
+        raise RunnerError("live Claude executable size is invalid")
+    if metadata.st_mode & 0o111 == 0:
+        raise RunnerError("live Claude executable is not executable")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RunnerError("live Claude executable could not be opened safely") from exc
+    digest = hashlib.sha256()
+    try:
+        current = os.fstat(descriptor)
+        if not stat.S_ISREG(current.st_mode) or current.st_ino != metadata.st_ino:
+            raise RunnerError("live Claude executable changed during validation")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        final = path.lstat()
+    except OSError as exc:
+        raise RunnerError("live Claude executable disappeared during validation") from exc
+    if final.st_ino != metadata.st_ino or final.st_size != metadata.st_size:
+        raise RunnerError("live Claude executable changed during validation")
+    if digest.hexdigest() != expected:
+        raise RunnerError("live Claude executable SHA-256 mismatch")
+    return str(path)
 
 
 def validate_request(request: Mapping[str, Any]) -> None:
@@ -534,18 +623,68 @@ def _write_private_exclusive(path: Path, data: bytes) -> None:
         raise
 
 
+def _read_credential_file(path: Path) -> bytes:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise RunnerError("Claude credential file is unavailable") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RunnerError("Claude credential file must be a regular non-symlink file")
+    if metadata.st_mode & 0o077:
+        raise RunnerError("Claude credential file must not be group- or world-accessible")
+    if metadata.st_size <= 0 or metadata.st_size > MAX_CREDENTIAL_BYTES:
+        raise RunnerError("Claude credential file size is invalid")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RunnerError("Claude credential file could not be opened safely") from exc
+    try:
+        current = os.fstat(descriptor)
+        if not stat.S_ISREG(current.st_mode) or current.st_ino != metadata.st_ino:
+            raise RunnerError("Claude credential file changed during validation")
+        data = os.read(descriptor, MAX_CREDENTIAL_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) != metadata.st_size or len(data) > MAX_CREDENTIAL_BYTES:
+        raise RunnerError("Claude credential file changed or exceeds its bound")
+    return data
+
+
+def stage_auth_only_config(workspace: Path, credential_data: bytes) -> Path:
+    path = workspace.parent / "claude-auth"
+    try:
+        path.mkdir(mode=0o700)
+    except OSError as exc:
+        raise RunnerError("private Claude auth directory could not be created") from exc
+    try:
+        _write_private_exclusive(path / ".credentials.json", credential_data)
+    except Exception:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
+    return path
+
+
+def remove_auth_only_config(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        raise RunnerError("private Claude auth directory could not be removed") from exc
+    if path.exists():
+        raise RunnerError("private Claude auth directory still exists after cleanup")
+
+
 def write_mcp_config(request: Mapping[str, Any], workspace: Path) -> Path:
-    binding = _mapping(request.get("repobrief"))
-    command = [str(item) for item in _list(binding.get("mcp_command"))]
-    document = {
-        "mcpServers": {
-            "repobrief": {
-                "type": "stdio",
-                "command": command[0],
-                "args": command[1:],
-            }
+    servers: dict[str, Any] = {}
+    if request.get("condition") == "treatment":
+        binding = _mapping(request.get("repobrief"))
+        command = [str(item) for item in _list(binding.get("mcp_command"))]
+        servers["repobrief"] = {
+            "type": "stdio",
+            "command": command[0],
+            "args": command[1:],
         }
-    }
+    document = {"mcpServers": servers}
     path = workspace.parent / "repobrief-mcp.json"
     _write_private_exclusive(
         path, (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -564,23 +703,37 @@ def _prompt(request: Mapping[str, Any]) -> str:
     )
 
 
+def build_provider_input(request: Mapping[str, Any]) -> bytes:
+    message = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": _prompt(request)}],
+        },
+    }
+    return _canonical_json(message).encode("utf-8") + b"\n"
+
+
 def build_claude_command(
     request: Mapping[str, Any],
     *,
     claude: str,
-    mcp_config: Path | None,
+    mcp_config: Path,
     max_budget_usd: str,
 ) -> list[str]:
     condition = str(request.get("condition"))
     tools = list(READ_ONLY_BUILTINS)
-    allowed = list(READ_ONLY_BUILTINS)
+    allowed: list[str] = []
     command = [
         claude,
-        "--safe-mode",
         "--no-chrome",
         "--disable-slash-commands",
+        "--setting-sources=",
+        "--settings",
+        _canonical_json(ISOLATED_CLAUDE_SETTINGS),
         "-p",
-        _prompt(request),
+        "--input-format",
+        "stream-json",
         "--model",
         str(_mapping(request.get("runner")).get("model")),
         "--output-format",
@@ -594,34 +747,34 @@ def build_claude_command(
         _canonical_json(ANSWER_SCHEMA),
         "--max-budget-usd",
         _parse_max_budget_usd(max_budget_usd),
+        "--strict-mcp-config",
+        "--mcp-config",
+        str(mcp_config),
     ]
     if condition == "treatment":
-        if mcp_config is None:
-            raise RunnerError("treatment command requires MCP config")
         tools.extend(TREATMENT_RESOURCE_TOOLS)
+        tools.extend(TREATMENT_MCP_TOOLS)
         allowed.extend(TREATMENT_RESOURCE_TOOLS)
         allowed.extend(TREATMENT_MCP_TOOLS)
-        command.extend(
-            [
-                "--strict-mcp-config",
-                "--mcp-config",
-                str(mcp_config),
-            ]
-        )
-    command.extend(["--tools", ",".join(tools), "--allowedTools", ",".join(allowed)])
+    else:
+        command.extend(["--disallowedTools", "mcp__*"])
+    command.extend(["--tools", ",".join(tools)])
+    if allowed:
+        command.extend(["--allowedTools", ",".join(allowed)])
     return command
 
 
-def _provider_environment() -> dict[str, str]:
-    allowed = {
-        "PATH",
-        "HOME",
-        "LANG",
-        "LC_ALL",
-        "TMPDIR",
-        "ANTHROPIC_API_KEY",
-    }
-    return {key: value for key, value in os.environ.items() if key in allowed}
+def _provider_environment(auth_config: Path) -> dict[str, str]:
+    allowed = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}
+    environment = {key: value for key, value in os.environ.items() if key in allowed}
+    environment.update(
+        {
+            "CLAUDE_CONFIG_DIR": str(auth_config),
+            "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1",
+            "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+        }
+    )
+    return environment
 
 
 def run_bounded(
@@ -629,6 +782,8 @@ def run_bounded(
     *,
     cwd: Path,
     timeout_seconds: int,
+    auth_config: Path,
+    stdin_data: bytes,
     stdout_limit: int = MAX_TRANSCRIPT_BYTES,
     stderr_limit: int = MAX_STDERR_BYTES,
 ) -> tuple[int, bytes, bytes]:
@@ -636,17 +791,24 @@ def run_bounded(
         process = subprocess.Popen(
             list(command),
             cwd=cwd,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
-            env=_provider_environment(),
+            env=_provider_environment(auth_config),
         )
     except OSError as exc:
         raise RunnerError("Claude process could not be started") from exc
-    if process.stdout is None or process.stderr is None:
+    if process.stdin is None or process.stdout is None or process.stderr is None:
         process.kill()
         raise RunnerError("Claude process pipes are unavailable")
+    try:
+        process.stdin.write(stdin_data)
+        process.stdin.close()
+    except OSError as exc:
+        process.kill()
+        process.wait()
+        raise RunnerError("Claude process rejected provider input") from exc
     selector = selectors.DefaultSelector()
     for stream, label in ((process.stdout, "stdout"), (process.stderr, "stderr")):
         os.set_blocking(stream.fileno(), False)
@@ -1008,6 +1170,8 @@ def execute(
     stream_fixture: Path | None = None,
     allow_live_provider: bool = False,
     max_budget_usd: str | None = None,
+    claude_credential_file: Path | None = None,
+    claude_command_sha256: str | None = None,
 ) -> dict[str, Any]:
     validate_request(request)
     validated_budget = _validated_execution_budget(
@@ -1015,27 +1179,46 @@ def execute(
         allow_live_provider=allow_live_provider,
         max_budget_usd=max_budget_usd,
     )
+    credential_data = _validated_credential_data(
+        stream_fixture=stream_fixture,
+        credential_file=claude_credential_file,
+    )
+    validated_claude = _validate_provider_executable(
+        stream_fixture=stream_fixture,
+        executable=claude,
+        expected_sha256=claude_command_sha256,
+    )
     load_planned_request(request, request_root)
     source = load_repository_root(request, repository_map)
     checkout = create_isolated_checkout(request, source, state_root)
-    mcp_config = (
-        write_mcp_config(request, checkout)
-        if request.get("condition") == "treatment"
-        else None
-    )
+    mcp_config = write_mcp_config(request, checkout)
     started = _utc_now()
     if stream_fixture is None:
-        assert validated_budget is not None
-        command = build_claude_command(
-            request,
-            claude=claude,
-            mcp_config=mcp_config,
-            max_budget_usd=validated_budget,
-        )
-        returncode, stdout, stderr = run_bounded(
-            command,
-            cwd=checkout,
-            timeout_seconds=int(_mapping(request.get("budgets")).get("wall_seconds")),
+        if validated_budget is None or credential_data is None:
+            raise RunnerError("live execution prerequisites are unavailable")
+        auth_config = stage_auth_only_config(checkout, credential_data)
+        try:
+            command = build_claude_command(
+                request,
+                claude=validated_claude,
+                mcp_config=mcp_config,
+                max_budget_usd=validated_budget,
+            )
+            returncode, stdout, stderr = run_bounded(
+                command,
+                cwd=checkout,
+                timeout_seconds=int(
+                    _mapping(request.get("budgets")).get("wall_seconds")
+                ),
+                auth_config=auth_config,
+                stdin_data=build_provider_input(request),
+            )
+        finally:
+            remove_auth_only_config(auth_config)
+        _validate_provider_executable(
+            stream_fixture=None,
+            executable=validated_claude,
+            expected_sha256=claude_command_sha256,
         )
         if stderr:
             raise RunnerError(
@@ -1071,6 +1254,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcript-root", required=True, type=Path)
     parser.add_argument("--claude-command", default="claude")
     parser.add_argument(
+        "--claude-command-sha256",
+        help="Required live SHA-256 binding for the absolute Claude executable.",
+    )
+    parser.add_argument(
         "--allow-live-provider",
         action="store_true",
         help="Explicitly authorize one live provider invocation; invalid with fixtures.",
@@ -1079,6 +1266,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-budget-usd",
         type=_parse_max_budget_usd,
         help="Provider-enforced maximum spend for this single live Claude invocation.",
+    )
+    parser.add_argument(
+        "--claude-credential-file",
+        type=Path,
+        help="OAuth credential file copied into an ephemeral auth-only config for live runs.",
     )
     parser.add_argument(
         "--stream-fixture",
@@ -1102,6 +1294,8 @@ def main(argv: list[str] | None = None) -> int:
             stream_fixture=args.stream_fixture,
             allow_live_provider=args.allow_live_provider,
             max_budget_usd=args.max_budget_usd,
+            claude_credential_file=args.claude_credential_file,
+            claude_command_sha256=args.claude_command_sha256,
         )
     except RunnerError as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True), file=sys.stderr)

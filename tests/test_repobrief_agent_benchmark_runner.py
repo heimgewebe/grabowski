@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timedelta, timezone
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "tools" / "repobrief_agent_benchmark_runner.py"
@@ -298,24 +301,49 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             ):
                 runner.load_planned_request(mutated, request_root)
 
+    def test_provider_input_contains_exactly_one_frozen_task_turn(self) -> None:
+        value = request()
+        lines = runner.build_provider_input(value).decode("utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        message = json.loads(lines[0])
+        text = message["message"]["content"][0]["text"]
+        self.assertIn(value["prompt"], text)
+        self.assertNotIn("Initialization turn", text)
+
     def test_build_baseline_command_exposes_only_read_tools(self) -> None:
-        command = runner.build_claude_command(
-            request(),
-            claude="claude",
-            mcp_config=None,
-            max_budget_usd="0.05",
-        )
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "mcp.json"
+            config.write_text('{"mcpServers": {}}\n', encoding="utf-8")
+            command = runner.build_claude_command(
+                request(),
+                claude="/opt/claude",
+                mcp_config=config,
+                max_budget_usd="0.05",
+            )
         joined = " ".join(command)
-        self.assertIn("--safe-mode", command)
+        self.assertNotIn("--safe-mode", command)
         self.assertIn("--no-chrome", command)
         self.assertIn("--disable-slash-commands", command)
+        self.assertIn("--setting-sources=", command)
+        settings_index = command.index("--settings")
+        self.assertEqual(
+            json.loads(command[settings_index + 1]),
+            runner.ISOLATED_CLAUDE_SETTINGS,
+        )
+        self.assertIn("--strict-mcp-config", command)
+        self.assertIn("--disallowedTools", command)
+        self.assertIn("mcp__*", command)
         self.assertNotIn("--bare", command)
         self.assertIn("stream-json", command)
+        input_index = command.index("--input-format")
+        self.assertEqual(command[input_index + 1], "stream-json")
+        self.assertNotIn(request()["prompt"], command)
         self.assertIn("--no-session-persistence", command)
         budget_index = command.index("--max-budget-usd")
         self.assertEqual(command[budget_index + 1], "0.05")
         self.assertIn("Read,Glob,Grep", command)
-        self.assertNotIn("mcp__", joined)
+        self.assertNotIn("--allowedTools", command)
+        self.assertNotIn("mcp__repobrief", joined)
         self.assertNotIn("Bash", joined)
         self.assertNotIn("Write", joined)
         self.assertNotIn("Edit", joined)
@@ -333,15 +361,35 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         joined = " ".join(command)
         self.assertIn("--strict-mcp-config", command)
         self.assertIn(str(config), command)
+        self.assertNotIn("--safe-mode", command)
+        self.assertNotIn("mcp__*", command)
         self.assertIn("ListMcpResources", joined)
         self.assertIn("ReadMcpResource", joined)
         self.assertIn("mcp__repobrief__ask_context", joined)
         self.assertIn("mcp__repobrief__grounding_verify", joined)
         self.assertIn("mcp__repobrief__live_freshness", joined)
+        tools_index = command.index("--tools")
+        exposed = command[tools_index + 1].split(",")
+        self.assertEqual(
+            set(exposed),
+            set(runner.READ_ONLY_BUILTINS)
+            | set(runner.TREATMENT_RESOURCE_TOOLS)
+            | set(runner.TREATMENT_MCP_TOOLS),
+        )
+        allowed_index = command.index("--allowedTools")
+        allowed = command[allowed_index + 1].split(",")
+        self.assertNotIn("Read", allowed)
+        self.assertNotIn("Glob", allowed)
+        self.assertNotIn("Grep", allowed)
+        self.assertEqual(
+            set(allowed),
+            set(runner.TREATMENT_RESOURCE_TOOLS) | set(runner.TREATMENT_MCP_TOOLS),
+        )
 
     def test_provider_budget_is_positive_bounded_and_enforced(self) -> None:
         self.assertEqual(runner._parse_max_budget_usd("0.0500"), "0.05")
-        for invalid in ("0", "-1", "NaN", "Infinity", "100.01", "not-a-number"):
+        self.assertEqual(runner._parse_max_budget_usd("1.00"), "1")
+        for invalid in ("0", "-1", "NaN", "Infinity", "1.01", "not-a-number"):
             with self.subTest(invalid=invalid):
                 with self.assertRaisesRegex(runner.RunnerError, "positive bounded"):
                     runner._parse_max_budget_usd(invalid)
@@ -583,6 +631,28 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 runner.RunnerError, "live execution requires max_budget_usd"
             ):
                 runner.execute(request(), allow_live_provider=True, **common)
+            with self.assertRaisesRegex(
+                runner.RunnerError, "requires claude_credential_file"
+            ):
+                runner.execute(
+                    request(),
+                    allow_live_provider=True,
+                    max_budget_usd="0.05",
+                    **common,
+                )
+            credential = root / "credentials.json"
+            credential.write_bytes(b"{}")
+            credential.chmod(0o600)
+            with self.assertRaisesRegex(
+                runner.RunnerError, "requires claude_command_sha256"
+            ):
+                runner.execute(
+                    request(),
+                    allow_live_provider=True,
+                    max_budget_usd="0.05",
+                    claude_credential_file=credential,
+                    **common,
+                )
             self.assertFalse((root / "state").exists())
             self.assertFalse((root / "transcripts").exists())
 
@@ -663,6 +733,104 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             )
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_write_baseline_mcp_config_is_explicitly_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace" / "repo"
+            workspace.mkdir(parents=True)
+            path = runner.write_mcp_config(request(), workspace)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                {"mcpServers": {}},
+            )
+
+    def test_auth_only_config_is_private_scrubbed_and_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            credential = root / "credentials.json"
+            credential.write_bytes(b'{"oauth": "test-only"}')
+            credential.chmod(0o600)
+            data = runner._read_credential_file(credential)
+            workspace = root / "workspace" / "repo"
+            workspace.mkdir(parents=True)
+            auth_config = runner.stage_auth_only_config(workspace, data)
+            copied = auth_config / ".credentials.json"
+            self.assertEqual(copied.read_bytes(), data)
+            self.assertEqual(auth_config.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(copied.stat().st_mode & 0o777, 0o600)
+            self.assertEqual([item.name for item in auth_config.iterdir()], [".credentials.json"])
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": "/usr/bin",
+                    "HOME": "/home/test",
+                    "ANTHROPIC_API_KEY": "must-not-leak",
+                },
+                clear=True,
+            ):
+                environment = runner._provider_environment(auth_config)
+            self.assertNotIn("ANTHROPIC_API_KEY", environment)
+            self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(auth_config))
+            self.assertEqual(environment["ENABLE_CLAUDEAI_MCP_SERVERS"], "false")
+            self.assertEqual(environment["CLAUDE_CODE_SKIP_PROMPT_HISTORY"], "1")
+            runner.remove_auth_only_config(auth_config)
+            self.assertFalse(auth_config.exists())
+
+    def test_live_provider_executable_is_absolute_hash_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "claude"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+            digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            self.assertEqual(
+                runner._validate_provider_executable(
+                    stream_fixture=None,
+                    executable=str(executable),
+                    expected_sha256=digest,
+                ),
+                str(executable),
+            )
+            with self.assertRaisesRegex(runner.RunnerError, "SHA-256 mismatch"):
+                runner._validate_provider_executable(
+                    stream_fixture=None,
+                    executable=str(executable),
+                    expected_sha256="0" * 64,
+                )
+            with self.assertRaisesRegex(runner.RunnerError, "path must be absolute"):
+                runner._validate_provider_executable(
+                    stream_fixture=None,
+                    executable="claude",
+                    expected_sha256=digest,
+                )
+            link = root / "claude-link"
+            link.symlink_to(executable)
+            with self.assertRaisesRegex(runner.RunnerError, "non-symlink"):
+                runner._validate_provider_executable(
+                    stream_fixture=None,
+                    executable=str(link),
+                    expected_sha256=digest,
+                )
+
+    def test_credential_reader_rejects_symlink_and_oversize(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target.json"
+            target.write_bytes(b"{}")
+            link = root / "link.json"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(runner.RunnerError, "non-symlink"):
+                runner._read_credential_file(link)
+            public = root / "public.json"
+            public.write_bytes(b"{}")
+            public.chmod(0o644)
+            with self.assertRaisesRegex(runner.RunnerError, "group- or world-accessible"):
+                runner._read_credential_file(public)
+            oversized = root / "oversized.json"
+            oversized.write_bytes(b"x" * (runner.MAX_CREDENTIAL_BYTES + 1))
+            oversized.chmod(0o600)
+            with self.assertRaisesRegex(runner.RunnerError, "size is invalid"):
+                runner._read_credential_file(oversized)
+
     def test_run_bounded_rejects_timeout_and_output_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -673,11 +841,15 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 "else: print('x' * 1000)\n",
                 encoding="utf-8",
             )
+            auth_config = root / "auth"
+            auth_config.mkdir()
             with self.assertRaisesRegex(runner.RunnerError, "timed out"):
                 runner.run_bounded(
                     [sys.executable, str(script), "sleep"],
                     cwd=root,
                     timeout_seconds=1,
+                    auth_config=auth_config,
+                    stdin_data=b"",
                     stdout_limit=1024,
                 )
             with self.assertRaisesRegex(runner.RunnerError, "stdout exceeds"):
@@ -685,6 +857,8 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     [sys.executable, str(script), "output"],
                     cwd=root,
                     timeout_seconds=5,
+                    auth_config=auth_config,
+                    stdin_data=b"",
                     stdout_limit=32,
                 )
 
