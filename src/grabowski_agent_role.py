@@ -238,6 +238,31 @@ def _probe_json(repo: Path, command: list[str]) -> tuple[dict[str, Any] | None, 
     return payload, None, completed.returncode
 
 
+def _sandbox_probe_python() -> str:
+    """Return a Python interpreter present in the minimal ``/usr`` sandbox.
+
+    The MCP service may itself run from a private virtualenv below ``$HOME``.
+    That path is intentionally absent from role sandboxes and therefore may not
+    be used as the probe runner.
+    """
+    usr_root = Path("/usr")
+    candidates = [Path(sys.executable), Path("/usr/bin/python3")]
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not resolved.is_relative_to(usr_root):
+            continue
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return str(candidate)
+    raise RuntimeError("no Python interpreter is available inside the minimal role sandbox")
+
+
 def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
     """Resolve declared prerequisites inside the exact read-only role sandbox."""
     executable = command[0]
@@ -253,7 +278,7 @@ def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
     }
     executable_payload, error, returncode = _probe_json(
         repo,
-        [sys.executable, "-I", "-S", "-c", _EXECUTABLE_PROBE_SOURCE, executable],
+        [_sandbox_probe_python(), "-I", "-S", "-c", _EXECUTABLE_PROBE_SOURCE, executable],
     )
     if error is not None or executable_payload is None:
         result["probe_error"] = error

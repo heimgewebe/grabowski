@@ -3283,7 +3283,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(run_capture.call_count, 2)
         executable_probe = run_capture.call_args_list[0].args[0]
         module_probe = run_capture.call_args_list[1].args[0]
-        executable_index = executable_probe.index(sys.executable)
+        executable_index = executable_probe.index(role._sandbox_probe_python())
         self.assertEqual(
             executable_probe[executable_index + 1 : executable_index + 4],
             ["-I", "-S", "-c"],
@@ -3462,6 +3462,37 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
         self.assertEqual(result["state"], "semantic_test_failure")
         start.assert_not_called()
+
+    def test_private_runtime_venv_falls_back_to_usr_interpreter(self) -> None:
+        calls: list[list[str]] = []
+
+        def probe(repo: Path, command: list[str]):
+            del repo
+            calls.append(command)
+            if len(calls) == 1:
+                return ({"executable_found": True, "resolved_executable": "/usr/bin/python3"}, None, 0)
+            return ({"module_found": True}, None, 0)
+
+        with (
+            mock.patch.object(role.sys, "executable", "/home/alex/private-venv/bin/python"),
+            mock.patch.object(role, "_probe_json", side_effect=probe),
+        ):
+            result = role.toolchain_probe(
+                Path("/tmp/repository"),
+                ["/usr/bin/python3", "-m", "unittest"],
+            )
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(calls[0][0], "/usr/bin/python3")
+        self.assertEqual(calls[1][0], "/usr/bin/python3")
+
+    def test_probe_runner_fails_closed_without_usr_python(self) -> None:
+        with (
+            mock.patch.object(role.sys, "executable", "/home/alex/private-venv/bin/python"),
+            mock.patch.object(Path, "resolve", side_effect=FileNotFoundError("missing")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no Python interpreter"):
+                role._sandbox_probe_python()
 
     def test_forged_close_outcome_is_not_projected_without_valid_receipt(self) -> None:
         manifest = self.manifest()
