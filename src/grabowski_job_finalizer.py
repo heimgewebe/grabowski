@@ -8,6 +8,7 @@ import re
 import resource
 import stat
 import sys
+import time
 from typing import Any
 
 import grabowski_job_origin as job_origin
@@ -15,12 +16,18 @@ import grabowski_private_io as private_io
 
 MAX_METADATA_BYTES = 256 * 1024
 NOTIFICATION_NAME = "notification.json"
+FINALIZATION_NAME = "finalization.json"
 JOBS_ROOT = Path.home() / ".local" / "state" / "grabowski" / "jobs"
 UNIT_RE = re.compile(r"grabowski-job-([0-9a-f]{12})")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 ORIGIN_BINDING = "systemd_unit_environment_sha256_precondition"
 TRUST_BOUNDARY = "same_uid_authorized_job"
 FINALIZER_NOFILE_SOFT_LIMIT = 65_536
+RUNTIME_DEPLOY_FINALIZATION_KIND = "grabowski_runtime_deploy_finalization"
+GENERIC_JOB_FINALIZATION_KIND = "grabowski_job_finalization"
+GENERIC_TERMINAL_FINAL_STATUSES = frozenset(
+    {"succeeded", "failed", "timed_out", "signalled", "terminated_unclear"}
+)
 FINALIZER_ENV_KEYS = frozenset({
     "SERVICE_RESULT",
     "EXIT_CODE",
@@ -239,6 +246,167 @@ def _origin_identity(
     }
 
 
+def _job_receipt_paths(directory: Path) -> dict[str, str]:
+    return {
+        "metadata": str(directory / "metadata.json"),
+        "stdout": str(directory / "stdout.log"),
+        "stderr": str(directory / "stderr.log"),
+        "finalization": str(directory / FINALIZATION_NAME),
+    }
+
+
+def _validate_generic_contract(
+    contract: dict[str, Any],
+    *,
+    unit: str,
+    directory: Path,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    material = {
+        "schema_version": 1,
+        "kind": GENERIC_JOB_FINALIZATION_KIND,
+        "unit": unit,
+        "job_id": identity["job_id"],
+        "argv_sha256": identity["argv_sha256"],
+        "receipt_paths": _job_receipt_paths(directory),
+    }
+    expected_hash = hashlib.sha256(_canonical(material)).hexdigest()
+    expected = {**material, "contract_sha256": expected_hash}
+    if not isinstance(contract, dict) or set(contract) != set(expected):
+        raise RuntimeError("job finalization contract shape is invalid")
+    for key, value in expected.items():
+        if contract.get(key) != value:
+            raise RuntimeError(f"job finalization contract binding mismatch: {key}")
+    return expected
+
+
+def _validate_runtime_deploy_contract(
+    contract: dict[str, Any],
+    *,
+    unit: str,
+    directory: Path,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    expected_head = contract.get("expected_head")
+    if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40,64}", expected_head) is None:
+        raise RuntimeError("runtime deploy expected head is invalid")
+    material = {
+        "schema_version": 1,
+        "kind": RUNTIME_DEPLOY_FINALIZATION_KIND,
+        "unit": unit,
+        "job_id": identity["job_id"],
+        "argv_sha256": identity["argv_sha256"],
+        "expected_head": expected_head,
+        "receipt_paths": _job_receipt_paths(directory),
+    }
+    expected = {
+        **material,
+        "contract_sha256": hashlib.sha256(_canonical(material)).hexdigest(),
+    }
+    if not isinstance(contract, dict) or set(contract) != set(expected):
+        raise RuntimeError("runtime deploy finalization contract shape is invalid")
+    for key, value in expected.items():
+        if contract.get(key) != value:
+            raise RuntimeError(f"runtime deploy finalization contract binding mismatch: {key}")
+    return expected
+
+
+def _validate_generic_receipt(
+    receipt: dict[str, Any],
+    *,
+    contract: dict[str, Any],
+    terminal_status: str,
+) -> dict[str, Any]:
+    if terminal_status not in GENERIC_TERMINAL_FINAL_STATUSES:
+        raise RuntimeError("job terminal status is not a recognized generic terminal status")
+    expected_keys = set(contract) | {
+        "final_status",
+        "completion_status",
+        "failure_type",
+        "timestamp_unix",
+        "payload_sha256",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != expected_keys:
+        raise RuntimeError("job finalization receipt shape is invalid")
+    for key, value in contract.items():
+        if receipt.get(key) != value:
+            raise RuntimeError(f"job finalization receipt binding mismatch: {key}")
+    if receipt.get("final_status") != terminal_status:
+        raise RuntimeError("existing job finalization receipt terminal status conflicts")
+    if terminal_status == "succeeded":
+        if receipt.get("completion_status") != "complete" or receipt.get("failure_type") is not None:
+            raise RuntimeError("successful job finalization receipt semantics are invalid")
+    elif (
+        receipt.get("completion_status") != "failed"
+        or receipt.get("failure_type") != terminal_status
+    ):
+        raise RuntimeError("failed job finalization receipt semantics are invalid")
+    timestamp = receipt.get("timestamp_unix")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+        raise RuntimeError("job finalization receipt timestamp is invalid")
+    material = {key: value for key, value in receipt.items() if key != "payload_sha256"}
+    expected_hash = hashlib.sha256(_canonical(material)).hexdigest()
+    if receipt.get("payload_sha256") != expected_hash:
+        raise RuntimeError("job finalization receipt hash is invalid")
+    return receipt
+
+
+def _publish_finalization_receipt(
+    directory: Path,
+    target: Path,
+    payload: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    created = private_io.publish_private_create_only_json(
+        directory,
+        target,
+        payload,
+        max_bytes=MAX_METADATA_BYTES,
+        label="job finalization receipt",
+    )
+    if created:
+        return True, payload
+    return False, _read_private_json(target, max_bytes=MAX_METADATA_BYTES)
+
+
+def _finalize_generic_contract(
+    contract: dict[str, Any],
+    *,
+    unit: str,
+    directory: Path,
+    identity: dict[str, Any],
+    terminal_status: str,
+) -> dict[str, Any]:
+    validated_contract = _validate_generic_contract(
+        contract,
+        unit=unit,
+        directory=directory,
+        identity=identity,
+    )
+    material = {
+        **validated_contract,
+        "final_status": terminal_status,
+        "completion_status": "complete" if terminal_status == "succeeded" else "failed",
+        "failure_type": None if terminal_status == "succeeded" else terminal_status,
+        "timestamp_unix": int(time.time()),
+    }
+    payload = {
+        **material,
+        "payload_sha256": hashlib.sha256(_canonical(material)).hexdigest(),
+    }
+    _validate_generic_receipt(
+        payload,
+        contract=validated_contract,
+        terminal_status=terminal_status,
+    )
+    target = directory / FINALIZATION_NAME
+    created, receipt = _publish_finalization_receipt(directory, target, payload)
+    _validate_generic_receipt(
+        receipt,
+        contract=validated_contract,
+        terminal_status=terminal_status,
+    )
+    return {"created": created, "receipt": receipt}
+
 def _harden_process() -> None:
     """Apply limits to the finalizer process without changing job semantics."""
     os.umask(0o077)
@@ -262,11 +430,52 @@ def finalize(directory: Path, environment: dict[str, str] | None = None) -> dict
     directory = _validate_job_directory(directory)
     metadata = _read_metadata(directory)
     identity = _origin_identity(metadata, directory, env)
+    terminal_status = _terminal_status(env)
+
+    finalization_result: dict[str, Any] | None = None
+    contract = metadata.get("finalization_contract")
+    expected_receipt = metadata.get("expected_receipt")
+    finalization_expected = (
+        isinstance(expected_receipt, dict)
+        and isinstance(expected_receipt.get("finalization_path"), str)
+    )
+    legacy_without_contract = contract is None and not finalization_expected
+    if legacy_without_contract:
+        pass
+    elif not isinstance(contract, dict):
+        raise RuntimeError("job finalization contract is missing or invalid")
+    elif contract.get("kind") == GENERIC_JOB_FINALIZATION_KIND:
+        finalization_result = _finalize_generic_contract(
+            contract,
+            unit=directory.name,
+            directory=directory,
+            identity=identity,
+            terminal_status=terminal_status,
+        )
+    elif contract.get("kind") == RUNTIME_DEPLOY_FINALIZATION_KIND:
+        _validate_runtime_deploy_contract(
+            contract,
+            unit=directory.name,
+            directory=directory,
+            identity=identity,
+        )
+        finalization_result = {
+            "created": False,
+            "reason": "runtime_deploy_runner_owned",
+        }
+    else:
+        raise RuntimeError("job finalization contract kind is unsupported")
+
     notify = identity["notify_on_done"]
     if not isinstance(notify, dict) or notify.get("requested") is not True:
-        return {"created": False, "reason": "notification_not_requested"}
+        result: dict[str, Any] = {
+            "created": False,
+            "reason": "notification_not_requested",
+        }
+        if finalization_result is not None:
+            result["finalization"] = finalization_result
+        return result
 
-    terminal_status = _terminal_status(env)
     notification_seed = (
         f"{identity['unit']}:{identity['argv_sha256']}:"
         f"{identity.get('origin_sha256') or 'legacy'}"
@@ -308,11 +517,14 @@ def finalize(directory: Path, environment: dict[str, str] | None = None) -> dict
     created, receipt = _publish_create_only_json(
         directory, directory / NOTIFICATION_NAME, payload
     )
-    return {
+    result = {
         "created": created,
         "reason": "queued" if created else "already_exists",
         "receipt": receipt,
     }
+    if finalization_result is not None:
+        result["finalization"] = finalization_result
+    return result
 
 
 def _log_failure(stage: str, error: str) -> None:

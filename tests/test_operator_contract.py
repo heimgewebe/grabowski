@@ -497,6 +497,18 @@ class OperatorContractTests(unittest.TestCase):
             persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
             self.assertEqual(persisted["final_status"], "launch_submitted")
             self.assertEqual(persisted["terminalization_evidence"]["source"], "systemd-run-launch")
+            contract = persisted["finalization_contract"]
+            self.assertEqual(contract["kind"], operator.GENERIC_JOB_FINALIZATION_KIND)
+            self.assertEqual(
+                persisted["expected_receipt"]["finalization_path"],
+                str(jobs / job["unit"] / "finalization.json"),
+            )
+            self.assertEqual(
+                contract["contract_sha256"],
+                operator._json_sha256(
+                    {key: value for key, value in contract.items() if key != "contract_sha256"}
+                ),
+            )
             invoked = run.call_args_list[0].args[0]
             self.assertIn("systemd-run", invoked)
             self.assertEqual(invoked.count("--property=LimitCORE=0"), 1)
@@ -1888,6 +1900,166 @@ class DurableJobFinalizationReceiptTests(unittest.TestCase):
             operator, "JOBS_DIR", jobs
         ), patch.object(operator, "_run", return_value=result):
             return operator.grabowski_job_status(unit)
+
+    def _generic_fixture(
+        self,
+        operator,
+        root: Path,
+        *,
+        final_status: str = "succeeded",
+        write_receipt: bool = True,
+        mutate_contract=None,
+        mutate_payload=None,
+        launch_failed: bool = False,
+    ) -> tuple[Path, Path, str]:
+        state = root / "state"
+        jobs = state / "jobs"
+        unit = "grabowski-job-cafebabefeed"
+        directory = jobs / unit
+        directory.mkdir(parents=True)
+        argv = ["python3", "-c", "print(1)"]
+        argv_sha256 = operator._argv_hash(argv)
+        contract = operator._generic_job_finalization_contract(
+            unit=unit, directory=directory, argv_sha256=argv_sha256
+        )
+        if mutate_contract is not None:
+            mutate_contract(contract)
+        terminalization = {
+            "source": "systemd-run-launch",
+            "query_valid": False,
+            "systemd_visible": False,
+            "final_status": "launch_submitted",
+        }
+        metadata = {
+            "schema_version": 2,
+            "unit": unit,
+            "job_id": "cafebabefeed",
+            "owner": "uid:1000",
+            "argv": argv,
+            "argv_sha256": argv_sha256,
+            "command": "python3 -c print(1)",
+            "cwd": str(root),
+            "runtime_seconds": 60,
+            "created_at_unix": 1000,
+            "started_at": "1970-01-01T00:16:40Z",
+            "started_at_unix": 1000,
+            "stdout_path": str(directory / "stdout.log"),
+            "stderr_path": str(directory / "stderr.log"),
+            "scope": {"cwd": str(root), "argv_sha256": argv_sha256, "runtime_seconds": 60},
+            "expected_receipt": {"finalization_path": str(directory / "finalization.json")},
+            "finalization_contract": contract,
+            "final_status": "launch_submitted",
+            "terminalization_evidence": terminalization,
+            "notify_on_done": {
+                "requested": False,
+                "channels": [],
+                "delivery_mode": "metadata_only",
+                "delivery_enabled": False,
+                "does_not_establish": ["notification_sent", "notification_delivery", "job_success"],
+            },
+        }
+        if launch_failed:
+            metadata["final_status"] = "launch_failed"
+            metadata["terminalization_evidence"] = {
+                **terminalization,
+                "source": "systemd-run-launch-failure",
+                "final_status": "launch_failed",
+            }
+        (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        if write_receipt:
+            material = {
+                **contract,
+                "final_status": final_status,
+                "completion_status": "complete" if final_status == "succeeded" else "failed",
+                "failure_type": None if final_status == "succeeded" else final_status,
+                "timestamp_unix": 1001,
+            }
+            if mutate_payload is not None:
+                mutate_payload(material)
+            payload = {**material, "payload_sha256": operator._json_sha256(material)}
+            (directory / "finalization.json").write_text(json.dumps(payload), encoding="utf-8")
+        return state, jobs, unit
+
+    def test_generic_collected_success_and_delayed_read_are_stable(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit = self._generic_fixture(operator, root)
+            first = self._status(operator, state, jobs, unit, self._systemd_not_found(root))
+            second = self._status(operator, state, jobs, unit, self._systemd_not_found(root))
+        self.assertEqual(first["final_status"], "succeeded")
+        self.assertEqual(second["final_status"], "succeeded")
+        self.assertTrue(first["finalization_receipt"]["valid"])
+        self.assertTrue(first["terminalization_evidence"]["fallback_used"])
+
+    def test_generic_collected_failure_preserves_failure_type(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit = self._generic_fixture(
+                operator, root, final_status="failed"
+            )
+            status = self._status(operator, state, jobs, unit, self._systemd_not_found(root))
+        self.assertEqual(status["final_status"], "failed")
+        self.assertEqual(status["finalization_receipt"]["failure_type"], "failed")
+
+    def test_generic_missing_or_invalid_contract_receipt_fails_closed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit = self._generic_fixture(
+                operator, root, write_receipt=False
+            )
+            missing = self._status(operator, state, jobs, unit, self._systemd_not_found(root))
+        self.assertEqual(missing["final_status"], "missing_finalization_evidence")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit = self._generic_fixture(
+                operator,
+                root,
+                mutate_contract=lambda contract: contract.__setitem__("contract_sha256", "0" * 64),
+            )
+            invalid = self._status(operator, state, jobs, unit, self._systemd_not_found(root))
+        self.assertEqual(invalid["final_status"], "missing_finalization_evidence")
+        self.assertEqual(invalid["finalization_receipt"]["reason"], "contract_sha256_mismatch")
+
+    def test_generic_receipt_binding_and_primary_status_rules(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def mutate(material):
+                material["contract_sha256"] = "1" * 64
+            state, jobs, unit = self._generic_fixture(
+                operator, root, mutate_payload=mutate
+            )
+            invalid = self._status(operator, state, jobs, unit, self._systemd_not_found(root))
+        self.assertEqual(invalid["final_status"], "missing_finalization_evidence")
+        self.assertEqual(
+            invalid["finalization_receipt"]["reason"],
+            "receipt_binding_mismatch:contract_sha256",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit = self._generic_fixture(
+                operator, root, final_status="failed"
+            )
+            visible = self._status(operator, state, jobs, unit, self._systemd_visible_success(root))
+        self.assertEqual(visible["final_status"], "succeeded")
+        self.assertEqual(visible["terminalization_evidence"]["source"], "systemd-show")
+
+    def test_launch_failure_metadata_precedes_generic_receipt_fallback(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, unit = self._generic_fixture(
+                operator, root, launch_failed=True
+            )
+            status = self._status(operator, state, jobs, unit, self._systemd_not_found(root))
+        self.assertEqual(status["final_status"], "launch_failed")
+        self.assertEqual(
+            status["terminalization_evidence"]["source"],
+            "systemd-run-launch-failure",
+        )
 
     def test_collected_unit_with_valid_bound_complete_receipt_is_completed(self) -> None:
         operator = _load_operator_module()

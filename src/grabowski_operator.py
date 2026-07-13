@@ -73,6 +73,10 @@ JOB_METADATA_TEMP_SWEEP_LIMIT = 64
 JOB_METADATA_TEMP_RE = re.compile(r"metadata\.json\.[0-9a-f]{32}\.tmp")
 FINALIZATION_RECEIPT_NAME = "finalization.json"
 RUNTIME_DEPLOY_FINALIZATION_KIND = "grabowski_runtime_deploy_finalization"
+GENERIC_JOB_FINALIZATION_KIND = "grabowski_job_finalization"
+GENERIC_JOB_FINAL_STATUSES = frozenset({
+    "succeeded", "failed", "timed_out", "signalled", "terminated_unclear",
+})
 RESERVED_RUNTIME_DEPLOY_RUNNER = (HOME / "repos" / "grabowski" / "tools" / "run_scheduled_deploy.py").resolve()
 JOB_EXPECTED_HEAD_RE = re.compile(r"[0-9a-f]{40,64}")
 JOB_FINAL_STATUS_NON_CLAIMS = (
@@ -891,6 +895,28 @@ def _job_finalization_contract(
     return {**material, "contract_sha256": _json_sha256(material)}
 
 
+def _generic_job_finalization_contract(
+    *,
+    unit: str,
+    directory: Path,
+    argv_sha256: str,
+) -> dict[str, Any]:
+    """Integrity-bound finalization contract for every accepted ad-hoc job.
+
+    Unlike ``_job_finalization_contract`` this carries no expected-head claim;
+    the ExecStopPost finalizer records the observed terminal status itself.
+    """
+    material = {
+        "schema_version": 1,
+        "kind": GENERIC_JOB_FINALIZATION_KIND,
+        "unit": unit,
+        "job_id": unit.removeprefix(JOB_PREFIX),
+        "argv_sha256": argv_sha256,
+        "receipt_paths": _job_receipt_paths(directory),
+    }
+    return {**material, "contract_sha256": _json_sha256(material)}
+
+
 def _read_finalization_receipt_file(path: Path) -> dict[str, Any]:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
@@ -980,7 +1006,25 @@ def _finalization_receipt_result(
             "reason": "contract_not_object",
             "does_not_establish": ["job_success"],
         }
+    kind = contract.get("kind")
+    if kind == GENERIC_JOB_FINALIZATION_KIND:
+        return _generic_finalization_receipt_result(unit, metadata, contract)
+    if kind != RUNTIME_DEPLOY_FINALIZATION_KIND:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "contract_kind_unsupported",
+            "does_not_establish": ["job_success"],
+        }
+    return _runtime_deploy_finalization_receipt_result(unit, metadata, contract)
 
+
+def _runtime_deploy_finalization_receipt_result(
+    unit: str,
+    metadata: dict[str, Any],
+    contract: dict[str, Any],
+) -> dict[str, Any]:
     directory = _job_directory(unit)
     expected_paths = _job_receipt_paths(directory)
     expected_material = {
@@ -1236,6 +1280,211 @@ def _finalization_receipt_result(
         "does_not_establish": ["notification_delivery", "root_cause"],
     }
 
+
+def _generic_finalization_receipt_result(
+    unit: str,
+    metadata: dict[str, Any],
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    directory = _job_directory(unit)
+    expected_paths = _job_receipt_paths(directory)
+    expected_material = {
+        "schema_version": 1,
+        "kind": GENERIC_JOB_FINALIZATION_KIND,
+        "unit": unit,
+        "job_id": unit.removeprefix(JOB_PREFIX),
+        "argv_sha256": metadata.get("argv_sha256"),
+        "receipt_paths": expected_paths,
+    }
+    allowed_contract_keys = set(expected_material) | {"contract_sha256"}
+    if set(contract) != allowed_contract_keys:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "contract_shape_mismatch",
+            "does_not_establish": ["job_success"],
+        }
+    argv_sha256 = expected_material["argv_sha256"]
+    if not isinstance(argv_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", argv_sha256) is None:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "metadata_argv_sha256_invalid",
+            "does_not_establish": ["job_success"],
+        }
+    for key, expected in expected_material.items():
+        if contract.get(key) != expected:
+            return {
+                "configured": True,
+                "valid": False,
+                "state": "invalid_contract",
+                "reason": f"contract_binding_mismatch:{key}",
+                "does_not_establish": ["job_success"],
+            }
+    expected_contract_sha256 = _json_sha256(expected_material)
+    if contract.get("contract_sha256") != expected_contract_sha256:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "contract_sha256_mismatch",
+            "does_not_establish": ["job_success"],
+        }
+
+    path = directory / FINALIZATION_RECEIPT_NAME
+    file_result = _read_finalization_receipt_file(path)
+    if file_result.get("ok") is not True:
+        return {
+            "configured": True,
+            "valid": False,
+            **file_result,
+            "does_not_establish": ["job_success"],
+        }
+    raw = file_result["raw"]
+    size = file_result["bytes"]
+    receipt_sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "receipt_json_invalid",
+            "path": str(path),
+            "bytes": size,
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+    if not isinstance(payload, dict):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "receipt_not_object",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+
+    allowed_payload_keys = set(allowed_contract_keys) | {
+        "final_status",
+        "completion_status",
+        "failure_type",
+        "timestamp_unix",
+        "payload_sha256",
+    }
+    if set(payload) != allowed_payload_keys:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "receipt_shape_mismatch",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+    payload_material = {
+        key: value for key, value in payload.items() if key != "payload_sha256"
+    }
+    if payload.get("payload_sha256") != _json_sha256(payload_material):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "payload_sha256_mismatch",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+    bindings = {
+        **expected_material,
+        "contract_sha256": expected_contract_sha256,
+    }
+    for key, expected in bindings.items():
+        if payload.get(key) != expected:
+            return {
+                "configured": True,
+                "valid": False,
+                "state": "invalid_receipt",
+                "reason": f"receipt_binding_mismatch:{key}",
+                "path": str(path),
+                "receipt_sha256": receipt_sha256,
+                "does_not_establish": ["job_success"],
+            }
+    timestamp = payload.get("timestamp_unix")
+    created_at = metadata.get("created_at_unix")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "timestamp_invalid",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+    if isinstance(created_at, int) and not isinstance(created_at, bool) and timestamp < created_at:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "timestamp_precedes_job",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+
+    final_status = payload.get("final_status")
+    if final_status not in GENERIC_JOB_FINAL_STATUSES:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "final_status_invalid",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+    failure_type = payload.get("failure_type")
+    if final_status == "succeeded":
+        semantics_valid = (
+            payload.get("completion_status") == "complete"
+            and failure_type is None
+        )
+        reason = "succeeded_receipt_semantics_invalid"
+    else:
+        semantics_valid = (
+            payload.get("completion_status") == "failed"
+            and failure_type == final_status
+        )
+        reason = "failed_receipt_semantics_invalid"
+    if not semantics_valid:
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": reason,
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+
+    return {
+        "configured": True,
+        "valid": True,
+        "state": "valid",
+        "path": str(path),
+        "bytes": size,
+        "receipt_sha256": receipt_sha256,
+        "payload_sha256": payload["payload_sha256"],
+        "final_status": final_status,
+        "failure_type": failure_type,
+        "timestamp_unix": timestamp,
+        "does_not_establish": ["notification_delivery", "root_cause"],
+    }
 
 def _systemd_job_query_valid(result: dict[str, Any], properties: dict[str, str]) -> bool:
     load_state = properties.get("LoadState")
@@ -1782,10 +2031,11 @@ def _job_status_record(
                 "receipt_valid": True,
                 "receipt_sha256": finalization_receipt["receipt_sha256"],
                 "payload_sha256": finalization_receipt["payload_sha256"],
-                "expected_head": finalization_receipt["expected_head"],
                 "timestamp_unix": finalization_receipt["timestamp_unix"],
                 "does_not_establish": ["notification_delivery", "root_cause", "live_process_status"],
             }
+            if "expected_head" in finalization_receipt:
+                terminalization["expected_head"] = finalization_receipt["expected_head"]
         else:
             terminalization = {
                 **terminalization,
@@ -2515,13 +2765,18 @@ def _start_job(
         started_at=now_iso,
         invoker_tool=invoker_tool,
     )
-    finalization_contract = None
     if finalization_expected_head is not None:
         finalization_contract = _job_finalization_contract(
             unit=unit,
             directory=directory,
             argv_sha256=argv_sha256,
             expected_head=finalization_expected_head,
+        )
+    else:
+        finalization_contract = _generic_job_finalization_contract(
+            unit=unit,
+            directory=directory,
+            argv_sha256=argv_sha256,
         )
     terminalization = {
         "source": "prelaunch-metadata",
@@ -2587,18 +2842,18 @@ def _start_job(
         f"--property=StandardOutput=append:{stdout_path}",
         f"--property=StandardError=append:{stderr_path}",
     ]
-    if finalization_contract is not None:
-        environment = {
-            "GRABOWSKI_JOB_ID": finalization_contract["job_id"],
-            "GRABOWSKI_JOB_UNIT": finalization_contract["unit"],
-            "GRABOWSKI_JOB_ARGV_SHA256": finalization_contract["argv_sha256"],
-            "GRABOWSKI_JOB_EXPECTED_HEAD": finalization_contract["expected_head"],
-            "GRABOWSKI_JOB_METADATA_PATH": finalization_contract["receipt_paths"]["metadata"],
-            "GRABOWSKI_JOB_STDOUT_PATH": finalization_contract["receipt_paths"]["stdout"],
-            "GRABOWSKI_JOB_STDERR_PATH": finalization_contract["receipt_paths"]["stderr"],
-            "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
-        }
-        systemd_argv.extend(f"--setenv={key}={value}" for key, value in environment.items())
+    environment = {
+        "GRABOWSKI_JOB_ID": finalization_contract["job_id"],
+        "GRABOWSKI_JOB_UNIT": finalization_contract["unit"],
+        "GRABOWSKI_JOB_ARGV_SHA256": finalization_contract["argv_sha256"],
+        "GRABOWSKI_JOB_METADATA_PATH": finalization_contract["receipt_paths"]["metadata"],
+        "GRABOWSKI_JOB_STDOUT_PATH": finalization_contract["receipt_paths"]["stdout"],
+        "GRABOWSKI_JOB_STDERR_PATH": finalization_contract["receipt_paths"]["stderr"],
+        "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
+    }
+    if "expected_head" in finalization_contract:
+        environment["GRABOWSKI_JOB_EXPECTED_HEAD"] = finalization_contract["expected_head"]
+    systemd_argv.extend(f"--setenv={key}={value}" for key, value in environment.items())
     systemd_argv.extend(["--", *command])
     result = _run(
         systemd_argv,

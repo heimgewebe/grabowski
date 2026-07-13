@@ -86,6 +86,26 @@ class JobFinalizerTests(unittest.TestCase):
         })
         return origin, environment
 
+    def _install_generic_contract(self) -> dict:
+        material = {
+            "schema_version": 1,
+            "kind": finalizer.GENERIC_JOB_FINALIZATION_KIND,
+            "unit": self.unit,
+            "job_id": self.job_id,
+            "argv_sha256": self.metadata["argv_sha256"],
+            "receipt_paths": finalizer._job_receipt_paths(self.directory),
+        }
+        contract = {
+            **material,
+            "contract_sha256": hashlib.sha256(finalizer._canonical(material)).hexdigest(),
+        }
+        self.metadata["finalization_contract"] = contract
+        self.metadata["expected_receipt"] = {
+            "finalization_path": str(self.directory / "finalization.json")
+        }
+        self._write_metadata(self.metadata)
+        return contract
+
     def test_finalize_creates_private_hash_bound_receipt_and_is_idempotent(self) -> None:
         first = finalizer.finalize(self.directory, self._environment())
         second = finalizer.finalize(self.directory, self._environment())
@@ -115,6 +135,80 @@ class JobFinalizerTests(unittest.TestCase):
         result = finalizer.finalize(self.directory, self._environment())
         self.assertEqual(result, {"created": False, "reason": "notification_not_requested"})
         self.assertFalse((self.directory / "notification.json").exists())
+
+    def test_generic_success_without_notification_writes_finalization(self) -> None:
+        self.metadata["notify_on_done"]["requested"] = False
+        contract = self._install_generic_contract()
+        result = finalizer.finalize(self.directory, self._environment())
+        self.assertEqual(result["reason"], "notification_not_requested")
+        receipt = result["finalization"]["receipt"]
+        self.assertEqual(receipt["final_status"], "succeeded")
+        self.assertEqual(receipt["completion_status"], "complete")
+        self.assertIsNone(receipt["failure_type"])
+        self.assertEqual(receipt["contract_sha256"], contract["contract_sha256"])
+        self.assertTrue((self.directory / "finalization.json").is_file())
+
+    def test_generic_failed_command_writes_failed_receipt(self) -> None:
+        self.metadata["notify_on_done"]["requested"] = False
+        self._install_generic_contract()
+        result = finalizer.finalize(
+            self.directory, self._environment("exit-code", "7")
+        )
+        receipt = result["finalization"]["receipt"]
+        self.assertEqual(receipt["final_status"], "failed")
+        self.assertEqual(receipt["completion_status"], "failed")
+        self.assertEqual(receipt["failure_type"], "failed")
+
+    def test_expected_or_unsupported_contract_fails_closed(self) -> None:
+        self.metadata["expected_receipt"] = {
+            "finalization_path": str(self.directory / "finalization.json")
+        }
+        self._write_metadata(self.metadata)
+        with self.assertRaisesRegex(RuntimeError, "missing or invalid"):
+            finalizer.finalize(self.directory, self._environment())
+        self.metadata["finalization_contract"] = {"kind": "unsupported"}
+        self._write_metadata(self.metadata)
+        with self.assertRaisesRegex(RuntimeError, "unsupported"):
+            finalizer.finalize(self.directory, self._environment())
+
+    def test_generic_create_only_winner_conflict_is_preserved(self) -> None:
+        self.metadata["notify_on_done"]["requested"] = False
+        self._install_generic_contract()
+        finalizer.finalize(self.directory, self._environment())
+        target = self.directory / "finalization.json"
+        before = target.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "terminal status conflicts"):
+            finalizer.finalize(
+                self.directory, self._environment("exit-code", "1")
+            )
+        self.assertEqual(target.read_bytes(), before)
+
+    def test_runtime_deploy_contract_is_runner_owned_and_not_overwritten(self) -> None:
+        expected_head = "b" * 40
+        material = {
+            "schema_version": 1,
+            "kind": finalizer.RUNTIME_DEPLOY_FINALIZATION_KIND,
+            "unit": self.unit,
+            "job_id": self.job_id,
+            "argv_sha256": self.metadata["argv_sha256"],
+            "expected_head": expected_head,
+            "receipt_paths": finalizer._job_receipt_paths(self.directory),
+        }
+        self.metadata["finalization_contract"] = {
+            **material,
+            "contract_sha256": hashlib.sha256(finalizer._canonical(material)).hexdigest(),
+        }
+        self.metadata["notify_on_done"]["requested"] = False
+        self._write_metadata(self.metadata)
+        target = self.directory / "finalization.json"
+        target.write_text('{"runner":"owned"}\n', encoding="utf-8")
+        target.chmod(0o600)
+        before = target.read_bytes()
+        result = finalizer.finalize(self.directory, self._environment())
+        self.assertEqual(
+            result["finalization"]["reason"], "runtime_deploy_runner_owned"
+        )
+        self.assertEqual(target.read_bytes(), before)
 
     def test_service_result_mapping(self) -> None:
         cases = {
