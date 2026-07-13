@@ -57,9 +57,10 @@ gespeichert. Der Abfrageparameter muss ein begrenzter Katalogbezeichner sein.
 Direkt belegt sind:
 
 - die ausgeführte Query-Form;
-- der gelesene Systemkatalog-Commit;
+- ein vor und nach der Query stabiler Systemkatalog-`HEAD`;
+- ein sauberer getrackter Systemkatalog-Working-Tree;
+- die Bytegleichheit aller gemeldeten Quellpfade mit `git show HEAD:<Pfad>`;
 - der Hash des vollständigen Query-Ergebnisses;
-- die vom Query-Ergebnis genannten kanonischen Quellpfade;
 - die Integrität des Belegs über `receipt_sha256`.
 
 Nur vom Operator deklariert sind:
@@ -78,6 +79,8 @@ Der Beleg beweist deshalb ausdrücklich nicht:
 ## Sicherheitsgrenzen
 
 - ausschließlich read-only Systemkatalog-Query;
+- fail-closed bei lokal veränderten Katalogdateien oder HEAD-Wechsel;
+- Commitvergleich der tatsächlich gelesenen Quellpfade;
 - 15 Sekunden Zeitlimit;
 - minimierte Prozessumgebung;
 - keine Python-Bytecode-Reste;

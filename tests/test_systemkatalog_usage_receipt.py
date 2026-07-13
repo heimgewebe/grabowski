@@ -36,7 +36,16 @@ def query_result(*, command: str = "truth-owner") -> dict[str, object]:
 class SystemkatalogUsageReceiptTests(unittest.TestCase):
     def test_build_receipt_binds_real_query_result_and_operator_declaration(self) -> None:
         result = query_result()
-        with patch.object(MODULE, "_query", return_value=result):
+        state = {
+            "root": Path("/unused"),
+            "head": "a" * 40,
+            "tracked_worktree_clean": True,
+        }
+        with (
+            patch.object(MODULE, "_catalog_state", side_effect=[state, state]),
+            patch.object(MODULE, "_query", return_value=result),
+            patch.object(MODULE, "_verify_sources_match_head") as verify_sources,
+        ):
             receipt = MODULE.build_receipt(
                 systemkatalog_root=Path("/unused"),
                 command="truth-owner",
@@ -45,10 +54,21 @@ class SystemkatalogUsageReceiptTests(unittest.TestCase):
                 result_use="used",
                 decision_effect="confirmed",
             )
+        verify_sources.assert_called_once_with(
+            Path("/unused"), "a" * 40, result["sourcePaths"]
+        )
 
         self.assertEqual(receipt["kind"], "grabowski.systemkatalog_usage_receipt")
         self.assertEqual(receipt["schema_version"], 1)
         self.assertEqual(receipt["systemkatalog"]["commit"], "a" * 40)
+        self.assertEqual(
+            receipt["systemkatalog"]["catalog_state"],
+            {
+                "head_stable": True,
+                "tracked_worktree_clean": True,
+                "source_paths_match_head": True,
+            },
+        )
         self.assertEqual(
             receipt["systemkatalog"]["query"],
             {"command": "truth-owner", "argument": "agent_routing"},
@@ -65,6 +85,88 @@ class SystemkatalogUsageReceiptTests(unittest.TestCase):
             {key: value for key, value in receipt.items() if key != "receipt_sha256"}
         )
         self.assertEqual(receipt["receipt_sha256"], expected_hash)
+
+    def test_dirty_catalog_is_rejected_before_query(self) -> None:
+        dirty = {
+            "root": Path("/catalog"),
+            "head": "a" * 40,
+            "tracked_worktree_clean": False,
+        }
+        with (
+            patch.object(MODULE, "_catalog_state", return_value=dirty),
+            patch.object(MODULE, "_query") as query,
+        ):
+            with self.assertRaisesRegex(MODULE.UsageReceiptError, "not clean"):
+                MODULE.build_receipt(
+                    systemkatalog_root=Path("/catalog"),
+                    command="truth-owner",
+                    argument="agent_routing",
+                    reason="truth_owner",
+                    result_use="used",
+                    decision_effect="confirmed",
+                )
+        query.assert_not_called()
+
+    def test_catalog_head_change_during_query_is_rejected(self) -> None:
+        before = {
+            "root": Path("/catalog"),
+            "head": "a" * 40,
+            "tracked_worktree_clean": True,
+        }
+        after = {**before, "head": "b" * 40}
+        with (
+            patch.object(MODULE, "_catalog_state", side_effect=[before, after]),
+            patch.object(MODULE, "_query", return_value=query_result()),
+        ):
+            with self.assertRaisesRegex(MODULE.UsageReceiptError, "HEAD changed"):
+                MODULE.build_receipt(
+                    systemkatalog_root=Path("/catalog"),
+                    command="truth-owner",
+                    argument="agent_routing",
+                    reason="truth_owner",
+                    result_use="used",
+                    decision_effect="confirmed",
+                )
+
+    def test_query_commit_must_match_verified_head(self) -> None:
+        state = {
+            "root": Path("/catalog"),
+            "head": "b" * 40,
+            "tracked_worktree_clean": True,
+        }
+        with (
+            patch.object(MODULE, "_catalog_state", side_effect=[state, state]),
+            patch.object(MODULE, "_query", return_value=query_result()),
+        ):
+            with self.assertRaisesRegex(MODULE.UsageReceiptError, "does not match"):
+                MODULE.build_receipt(
+                    systemkatalog_root=Path("/catalog"),
+                    command="truth-owner",
+                    argument="agent_routing",
+                    reason="truth_owner",
+                    result_use="used",
+                    decision_effect="confirmed",
+                )
+
+    def test_catalog_state_and_source_bytes_are_git_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            source = root / "registry.json"
+            source.write_text('{"value":1}\n', encoding="utf-8")
+            subprocess.run(["git", "add", "registry.json"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+
+            state = MODULE._catalog_state(root)
+            self.assertTrue(state["tracked_worktree_clean"])
+            MODULE._verify_sources_match_head(root, state["head"], ["registry.json"])
+
+            source.write_text('{"value":2}\n', encoding="utf-8")
+            self.assertFalse(MODULE._catalog_state(root)["tracked_worktree_clean"])
+            with self.assertRaisesRegex(MODULE.UsageReceiptError, "do not match"):
+                MODULE._verify_sources_match_head(root, state["head"], ["registry.json"])
 
     def test_reason_must_match_query_shape(self) -> None:
         with self.assertRaisesRegex(MODULE.UsageReceiptError, "incompatible"):

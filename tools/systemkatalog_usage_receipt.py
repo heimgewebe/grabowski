@@ -52,6 +52,90 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+def _git_text(root: Path, argv: list[str]) -> str:
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    try:
+        completed = subprocess.run(
+            ["git", *argv],
+            cwd=root,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise UsageReceiptError("Systemkatalog Git verification timed out") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "git verification failed").strip()
+        raise UsageReceiptError(f"Systemkatalog Git verification failed: {detail[:500]}")
+    return completed.stdout
+
+
+def _catalog_state(root: Path) -> dict[str, Any]:
+    resolved = root.expanduser().resolve()
+    top = Path(_git_text(resolved, ["rev-parse", "--show-toplevel"]).strip()).resolve()
+    if top != resolved:
+        raise UsageReceiptError("configured Systemkatalog root is not the Git toplevel")
+    head = _git_text(resolved, ["rev-parse", "HEAD"]).strip().lower()
+    if SHA40_RE.fullmatch(head) is None:
+        raise UsageReceiptError("Systemkatalog Git HEAD is invalid")
+    tracked_status = _git_text(
+        resolved, ["status", "--porcelain=v1", "--untracked-files=no"]
+    )
+    return {
+        "root": resolved,
+        "head": head,
+        "tracked_worktree_clean": not bool(tracked_status.strip()),
+    }
+
+
+def _verify_sources_match_head(root: Path, head: str, source_paths: list[str]) -> None:
+    for relative in source_paths:
+        candidate = root / relative
+        if candidate.is_symlink() or not candidate.is_file():
+            raise UsageReceiptError(f"Systemkatalog source path is not a regular file: {relative}")
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+        try:
+            completed = subprocess.run(
+                ["git", "show", f"{head}:{relative}"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise UsageReceiptError(
+                f"Systemkatalog source verification timed out: {relative}"
+            ) from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or b"git show failed").decode(
+                "utf-8", errors="replace"
+            ).strip()
+            raise UsageReceiptError(
+                f"Systemkatalog source is absent from bound commit: {relative}: {detail[:300]}"
+            )
+        if candidate.read_bytes() != completed.stdout:
+            raise UsageReceiptError(
+                f"Systemkatalog source bytes do not match bound commit: {relative}"
+            )
+
+
 def _validate_inputs(command: str, argument: str, reason: str, result_use: str, decision_effect: str) -> None:
     if command not in QUERY_COMMANDS:
         raise UsageReceiptError(f"unsupported query command: {command}")
@@ -138,7 +222,20 @@ def build_receipt(
     decision_effect: str,
 ) -> dict[str, Any]:
     _validate_inputs(command, argument, reason, result_use, decision_effect)
-    query_result = _query(systemkatalog_root, command, argument)
+    root = systemkatalog_root.expanduser().resolve()
+    before = _catalog_state(root)
+    if not before["tracked_worktree_clean"]:
+        raise UsageReceiptError("Systemkatalog tracked working tree is not clean")
+    query_result = _query(root, command, argument)
+    after = _catalog_state(root)
+    if not after["tracked_worktree_clean"]:
+        raise UsageReceiptError("Systemkatalog tracked working tree changed during query")
+    if before["head"] != after["head"]:
+        raise UsageReceiptError("Systemkatalog HEAD changed during query")
+    if query_result["catalogCommit"] != before["head"]:
+        raise UsageReceiptError("Systemkatalog query commit does not match verified HEAD")
+    source_paths = query_result["sourcePaths"]
+    _verify_sources_match_head(root, before["head"], source_paths)
     receipt: dict[str, Any] = {
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "kind": RECEIPT_KIND,
@@ -148,7 +245,12 @@ def build_receipt(
             "commit": query_result["catalogCommit"],
             "query": {"command": command, "argument": argument},
             "query_result_sha256": _sha256_json(query_result),
-            "source_paths": query_result["sourcePaths"],
+            "source_paths": source_paths,
+            "catalog_state": {
+                "head_stable": True,
+                "tracked_worktree_clean": True,
+                "source_paths_match_head": True,
+            },
         },
         "usage": {
             "consulted": True,
