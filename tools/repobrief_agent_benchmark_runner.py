@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 MAX_TOOL_CALLS = 1000
 MAX_PLANNED_REQUESTS = 128
+MAX_LIVE_COST_USD = Decimal("10.00")
 READ_ONLY_BUILTINS = ("Read", "Glob", "Grep")
 TREATMENT_RESOURCE_TOOLS = ("ListMcpResources", "ReadMcpResource")
 TREATMENT_MCP_TOOLS = (
@@ -234,6 +236,16 @@ def _require_int(value: Any, label: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise RunnerError(f"{label} must be an integer >= {minimum}")
     return value
+
+
+def _require_cost(value: Any, label: str, *, maximum: Decimal = MAX_LIVE_COST_USD) -> Decimal:
+    try:
+        cost = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise RunnerError(f"{label} must be a finite decimal amount") from exc
+    if not cost.is_finite() or cost <= 0 or cost > maximum:
+        raise RunnerError(f"{label} must be > 0 and <= {maximum}")
+    return cost
 
 
 def _safe_identifier(value: str) -> str:
@@ -529,7 +541,11 @@ def _prompt(request: Mapping[str, Any]) -> str:
 
 
 def build_claude_command(
-    request: Mapping[str, Any], *, claude: str, mcp_config: Path | None
+    request: Mapping[str, Any],
+    *,
+    claude: str,
+    mcp_config: Path | None,
+    max_cost_usd: Decimal,
 ) -> list[str]:
     condition = str(request.get("condition"))
     tools = list(READ_ONLY_BUILTINS)
@@ -550,6 +566,8 @@ def build_claude_command(
         "dontAsk",
         "--json-schema",
         _canonical_json(ANSWER_SCHEMA),
+        "--max-budget-usd",
+        format(max_cost_usd, "f"),
     ]
     if condition == "treatment":
         if mcp_config is None:
@@ -712,6 +730,19 @@ def _validate_provider_session(
         raise RunnerError("provider result session does not match init session")
 
 
+def _provider_cost(result: Mapping[str, Any], max_cost_usd: Decimal) -> Decimal:
+    value = result.get("total_cost_usd")
+    try:
+        cost = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise RunnerError("provider total_cost_usd is missing or invalid") from exc
+    if not cost.is_finite() or cost < 0:
+        raise RunnerError("provider total_cost_usd is missing or invalid")
+    if cost > max_cost_usd:
+        raise RunnerError("provider total_cost_usd exceeds operator cost ceiling")
+    return cost
+
+
 def _usage(request: Mapping[str, Any], result: Mapping[str, Any]) -> tuple[int, int]:
     usage = _mapping(result.get("usage"))
     input_tokens = _require_int(usage.get("input_tokens"), "usage.input_tokens")
@@ -861,6 +892,7 @@ def build_receipt(
     returncode: int,
     started_at: datetime,
     ended_at: datetime,
+    max_cost_usd: Decimal,
 ) -> dict[str, Any]:
     messages = parse_jsonl(transcript)
     init = _single_message(messages, message_type="system", subtype="init")
@@ -868,6 +900,7 @@ def build_receipt(
     model = _validate_init(request, init)
     _validate_provider_session(init, result)
     input_tokens, output_tokens = _usage(request, result)
+    _provider_cost(result, max_cost_usd)
     if returncode != 0 or result.get("is_error") is True or result.get("subtype") != "success":
         raise RunnerError("provider did not produce a successful result")
     answer = validate_answer(result.get("structured_output"))
@@ -941,6 +974,7 @@ def execute(
     state_root: Path,
     transcript_root: Path,
     claude: str,
+    max_cost_usd: Decimal,
     stream_fixture: Path | None = None,
 ) -> dict[str, Any]:
     validate_request(request)
@@ -954,7 +988,12 @@ def execute(
     )
     started = _utc_now()
     if stream_fixture is None:
-        command = build_claude_command(request, claude=claude, mcp_config=mcp_config)
+        command = build_claude_command(
+            request,
+            claude=claude,
+            mcp_config=mcp_config,
+            max_cost_usd=max_cost_usd,
+        )
         returncode, stdout, stderr = run_bounded(
             command,
             cwd=checkout,
@@ -977,6 +1016,7 @@ def execute(
         returncode=returncode,
         started_at=started,
         ended_at=ended,
+        max_cost_usd=max_cost_usd,
     )
     if stream_fixture is not None:
         return build_fixture_report(request, receipt)
@@ -993,6 +1033,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcript-root", required=True, type=Path)
     parser.add_argument("--claude-command", default="claude")
     parser.add_argument(
+        "--max-cost-usd",
+        required=True,
+        help="Hard per-process Claude API spend ceiling; maximum 10.00 USD.",
+    )
+    parser.add_argument(
         "--stream-fixture",
         type=Path,
         help="Synthetic JSONL provider stream for contract tests; never proves live availability.",
@@ -1004,6 +1049,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         request = _load_object_bytes(_bounded_stdin(), label="stdin request")
+        max_cost_usd = _require_cost(args.max_cost_usd, "max_cost_usd")
         receipt = execute(
             request,
             request_root=args.request_root,
@@ -1011,6 +1057,7 @@ def main(argv: list[str] | None = None) -> int:
             state_root=args.state_root,
             transcript_root=args.transcript_root,
             claude=args.claude_command,
+            max_cost_usd=max_cost_usd,
             stream_fixture=args.stream_fixture,
         )
     except RunnerError as exc:

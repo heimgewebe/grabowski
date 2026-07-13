@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import importlib.util
 import json
 from pathlib import Path
@@ -299,7 +300,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
 
     def test_build_baseline_command_exposes_only_read_tools(self) -> None:
         command = runner.build_claude_command(
-            request(), claude="claude", mcp_config=None
+            request(), claude="claude", mcp_config=None, max_cost_usd=Decimal("1.00")
         )
         joined = " ".join(command)
         self.assertIn("--bare", command)
@@ -319,6 +320,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 request(condition="treatment"),
                 claude="claude",
                 mcp_config=config,
+                max_cost_usd=Decimal("1.00"),
             )
         joined = " ".join(command)
         self.assertIn("--strict-mcp-config", command)
@@ -328,6 +330,41 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         self.assertIn("mcp__repobrief__ask_context", joined)
         self.assertIn("mcp__repobrief__grounding_verify", joined)
         self.assertIn("mcp__repobrief__live_freshness", joined)
+
+    def test_cost_ceiling_is_required_and_forwarded(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "max_cost_usd"):
+            runner._require_cost("0", "max_cost_usd")
+        with self.assertRaisesRegex(runner.RunnerError, "max_cost_usd"):
+            runner._require_cost("10.01", "max_cost_usd")
+        command = runner.build_claude_command(
+            request(),
+            claude="claude",
+            mcp_config=None,
+            max_cost_usd=Decimal("1.00"),
+        )
+        index = command.index("--max-budget-usd")
+        self.assertEqual(command[index + 1], "1.00")
+
+    def test_provider_cost_above_ceiling_is_rejected(self) -> None:
+        value = request()
+        messages = runner.parse_jsonl(stream(value))
+        result = next(item for item in messages if item["type"] == "result")
+        result["total_cost_usd"] = 1.01
+        raw = b"".join(
+            json.dumps(message, sort_keys=True).encode("utf-8") + b"\n"
+            for message in messages
+        )
+        started = datetime.now(timezone.utc)
+        with self.assertRaisesRegex(runner.RunnerError, "cost ceiling"):
+            runner.build_receipt(
+                value,
+                raw,
+                transcript_artifact="transcript.jsonl",
+                returncode=0,
+                started_at=started,
+                ended_at=started,
+                max_cost_usd=Decimal("1.00"),
+            )
 
     def test_build_receipt_normalizes_provider_evidence(self) -> None:
         value = request()
@@ -340,6 +377,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             returncode=0,
             started_at=started,
             ended_at=started + timedelta(seconds=1),
+            max_cost_usd=Decimal("1.00"),
         )
         self.assertEqual(receipt["kind"], runner.RECEIPT_KIND)
         self.assertEqual(receipt["request_sha256"], runner._sha256_json(value))
@@ -392,6 +430,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             returncode=0,
             started_at=started,
             ended_at=started,
+            max_cost_usd=Decimal("1.00"),
         )
         self.assertEqual(receipt["tool_calls"][0]["name"], "ask_context")
 
@@ -431,6 +470,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                         returncode=0,
                         started_at=started,
                         ended_at=started,
+                        max_cost_usd=Decimal("1.00"),
                     )
 
     def test_treatment_requires_all_repobrief_tools_in_init(self) -> None:
@@ -447,6 +487,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 returncode=0,
                 started_at=started,
                 ended_at=started,
+                max_cost_usd=Decimal("1.00"),
             )
 
     def test_duplicate_tool_use_and_orphan_result_are_rejected(self) -> None:
@@ -562,6 +603,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 state_root=root / "state",
                 transcript_root=root / "transcripts",
                 claude="claude",
+                max_cost_usd=Decimal("1.00"),
                 stream_fixture=fixture,
             )
             candidate = report["normalized_candidate"]
