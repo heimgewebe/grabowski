@@ -19,6 +19,7 @@ import grabowski_agent_role as agent_role
 import grabowski_mcp as base
 import grabowski_resources as resources
 import grabowski_tasks as tasks
+import grabowski_command_identity as command_identity
 from grabowski_agent_sandbox import safe_git_environment
 try:
     import grabowski_operator_core as operator
@@ -125,6 +126,42 @@ def _canonical_json(value: Any) -> str:
 
 def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _task_argv_sha256(value: Any) -> str:
+    """Use the task store's versioned argv identity contract."""
+    try:
+        return command_identity.argv_sha256(value)
+    except ValueError as exc:
+        raise AgentWorkspaceError(f"invalid task argv identity: {exc}") from exc
+
+
+def _bureau_result_payload(stdout: Any, label: str) -> dict[str, Any]:
+    """Accept legacy direct JSON and the current Bureau result envelope, fail closed otherwise."""
+    try:
+        payload = json.loads(str(stdout or ""))
+    except json.JSONDecodeError as exc:
+        raise AgentWorkspaceError(f"{label} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise AgentWorkspaceError(f"{label} returned a non-object payload")
+    has_envelope_keys = "result" in payload or "runtime_identity" in payload
+    if has_envelope_keys:
+        result = payload.get("result")
+        identity = payload.get("runtime_identity")
+        if not isinstance(result, dict) or not isinstance(identity, dict):
+            raise AgentWorkspaceError(f"{label} returned an invalid result envelope")
+        compatibility = identity.get("compatibility")
+        if not isinstance(compatibility, dict):
+            raise AgentWorkspaceError(f"{label} omitted Bureau runtime compatibility")
+        status = compatibility.get("status")
+        if status not in {"compatible", "canonical-read-only"}:
+            reasons = compatibility.get("reason_codes")
+            reason_text = ",".join(str(item) for item in reasons) if isinstance(reasons, list) else "unknown"
+            raise AgentWorkspaceError(
+                f"{label} Bureau runtime is not read-compatible: {status} ({reason_text})"
+            )
+        return result
+    return payload
 
 
 def _required_string(value: Any, field: str, *, max_length: int = 4096) -> str:
@@ -930,10 +967,7 @@ def _verify_bureau_binding(
             ],
             label="Bureau thread focus lookup",
         )
-        try:
-            payload = json.loads(str(result.get("stdout", "")))
-        except json.JSONDecodeError as exc:
-            raise AgentWorkspaceError("Bureau thread focus lookup returned invalid JSON") from exc
+        payload = _bureau_result_payload(result.get("stdout"), "Bureau thread focus lookup")
         records = payload.get("records") if isinstance(payload, dict) else None
         if not isinstance(records, list):
             raise AgentWorkspaceError("Bureau thread focus lookup omitted records")
@@ -977,10 +1011,7 @@ def _verify_bureau_binding(
             ],
             label="Bureau registry truth",
         )
-        try:
-            truth_payload = json.loads(str(truth.get("stdout", "")))
-        except json.JSONDecodeError as exc:
-            raise AgentWorkspaceError("Bureau registry truth returned invalid JSON") from exc
+        truth_payload = _bureau_result_payload(truth.get("stdout"), "Bureau registry truth")
         if not isinstance(truth_payload, dict) or truth_payload.get("healthy") is not True:
             raise AgentWorkspaceError("Bureau registry truth is not healthy")
         task_path = root / "registry" / "tasks" / f"{binding_id}.json"
@@ -2601,7 +2632,7 @@ def _validate_started_task(
     errors: list[str] = []
     if public.get("host") != expected_host:
         errors.append("host_mismatch")
-    if public.get("argv_sha256") != _sha256_json(expected_argv):
+    if public.get("argv_sha256") != _task_argv_sha256(expected_argv):
         errors.append("argv_sha256_mismatch")
     if public.get("cwd") != expected_cwd:
         errors.append("cwd_mismatch")
@@ -2833,7 +2864,7 @@ def _existing_workspace_response(
         runtime_errors.append("writer_task_id_mismatch")
     if writer_task.get("host") != AGENT_WORKSPACE_TASK_HOST:
         runtime_errors.append("writer_task_host_mismatch")
-    if writer_task.get("argv_sha256") != _sha256_json(_writer_task_argv(manifest)):
+    if writer_task.get("argv_sha256") != _task_argv_sha256(_writer_task_argv(manifest)):
         runtime_errors.append("writer_task_argv_mismatch")
     if writer_task.get("cwd") != manifest["writer_worktree"]:
         runtime_errors.append("writer_task_cwd_mismatch")
@@ -2963,7 +2994,7 @@ def grabowski_agent_workspace_create(
     )
     _write_manifest(manifest)
     writer_task_argv = _writer_task_argv(manifest)
-    writer_task_argv_sha256 = _sha256_json(writer_task_argv)
+    writer_task_argv_sha256 = _task_argv_sha256(writer_task_argv)
     try:
         lease = resources.acquire_resources(
             str(plan["resources"]["owner_id"]),
@@ -2995,6 +3026,27 @@ def grabowski_agent_workspace_create(
             label="writer worktree creation",
         )
         worktree_created = True
+        writer_preflight = _role_toolchain_preflight(
+            manifest, "writer", list(plan["commands"]["writer"])
+        )
+        manifest["writer_toolchain_preflight"] = writer_preflight
+        _append_workspace_event(
+            manifest,
+            "role_preflight",
+            role="writer",
+            outcome="passed" if writer_preflight.get("passed") is True else "blocked",
+            evidence={
+                "command_sha256": writer_preflight.get("command_sha256"),
+                "external_agent_profile": writer_preflight.get("external_agent_profile"),
+                "failure_classification": writer_preflight.get("failure_classification"),
+            },
+        )
+        _write_manifest(manifest)
+        if writer_preflight.get("passed") is not True:
+            classification = writer_preflight.get("failure_classification") or "toolchain_probe_error"
+            raise AgentWorkspaceActionError(
+                f"writer toolchain preflight failed: {classification}"
+            )
         writer_intents = dict(manifest.get("task_start_intents", {}))
         writer_intents["writer"] = {
             "role": "writer",
@@ -3415,7 +3467,7 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                     "diff_sha256": snapshot["diff_sha256"],
                     "dirty": snapshot["dirty"],
                     "command_sha256": _sha256_json(manifest["commands"][role]),
-                    "task_argv_sha256": _sha256_json(role_task_argv),
+                    "task_argv_sha256": _task_argv_sha256(role_task_argv),
                     "task_host": _bound_task_host(manifest),
                     "task_cwd": manifest["writer_worktree"],
                 }
@@ -3768,7 +3820,7 @@ def grabowski_agent_workspace_role_retry(
             "diff_sha256": frozen["diff_sha256"],
             "dirty": frozen["dirty"],
             "command_sha256": new_command_sha256,
-            "task_argv_sha256": _sha256_json(task_argv),
+            "task_argv_sha256": _task_argv_sha256(task_argv),
             "task_host": host,
             "task_cwd": cwd,
         }

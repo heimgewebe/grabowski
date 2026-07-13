@@ -10,7 +10,7 @@ import stat
 import sys
 from typing import Any
 
-from grabowski_agent_sandbox import minimal_sandbox_argv, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
+from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
@@ -128,14 +128,17 @@ def main(argv: list[str] | None = None) -> int:
     common = Path(common_raw)
     if not common.is_absolute():
         common = (repo / common).resolve(strict=True)
+    prepared = prepare_external_agent_command(command)
     completed = run_bounded_capture(
         runtime_sandbox_argv(
             minimal_sandbox_argv(
                 workspace=repo,
-                command=command,
+                command=list(prepared.command),
                 workspace_writable=True,
                 writable_paths=writable_paths,
                 git_common_dir=common,
+                extra_read_only=prepared.extra_read_only,
+                extra_directories=prepared.extra_directories,
             )
         ),
         stdout_limit=MAX_OUTPUT_BYTES,
@@ -159,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         "stdout_tail": completed.stdout_tail,
         "stderr_tail": completed.stderr_tail,
         "sandbox": "bubblewrap-minimal-root-bounded-writable-paths-v1",
+        "external_agent_profile": prepared.profile,
         "worktree_scope": str(repo),
         "git_common_dir_mode": "read_only",
         "output_limit_bytes": MAX_OUTPUT_BYTES,

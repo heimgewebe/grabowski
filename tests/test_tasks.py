@@ -43,6 +43,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.types"] = fake_types
 
 
+import grabowski_command_identity as command_identity
 import grabowski_tasks as tasks
 import grabowski_task_reconcile as task_reconcile_cli
 
@@ -143,6 +144,18 @@ class TaskTests(unittest.TestCase):
         listed = tasks.grabowski_task_list()
         self.assertEqual(listed["count"], 1)
         self.assertEqual(listed["tasks"][0]["task_id"], task["task_id"])
+
+    def test_start_uses_shared_unicode_argv_identity(self) -> None:
+        argv = ["/bin/echo", "Grüße"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 139}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        self.assertEqual(result["task"]["argv_sha256"], command_identity.argv_sha256(argv))
 
     def test_start_chronik_outbox_opt_in_writes_without_global_env(self) -> None:
         outbox_root = self.root / "chronik-state"
