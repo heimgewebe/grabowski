@@ -2,7 +2,21 @@
 
 Status: Implementierungskandidat; kein Live-Providerbeleg  
 Bureau: `RAB-V1-T002B`  
-Pull Request: `heimgewebe/grabowski#183`
+Pull Request: `heimgewebe/grabowski#186`
+
+## Integrationsstand
+
+Der Runner-, Authentifizierungs- und Livefreigabevertrag stammt unverändert aus
+dem gemergten PR `heimgewebe/grabowski#182`. Der kanonische Preflight-Starter
+ist ein kleiner Adapter vor dem unveränderten Orchestrator-Core:
+
+- Fixture: `allow_live_provider=false`, kein Providerbudget;
+- echter Lauf: `allow_live_provider=true`, operatorgebundenes
+  `max_budget_usd`;
+- Preflightobergrenze: höchstens `1.00 USD` je Prozess.
+
+Dadurch existiert keine zweite Runnerimplementierung und keine Umgehung der in
+PR #182 eingeführten Livefreigabe.
 
 ## Gelieferte Fläche
 
@@ -40,7 +54,8 @@ Lokale Ersatzprozesse prüfen:
 - Kosten-, Tool- und Transcriptgrenzen;
 - Lenskit-Validatorverkabelung;
 - Quellintegrität;
-- gemeinsame Veröffentlichung von Bericht und SHA-256-Begleitdatei.
+- gemeinsame Veröffentlichung von Bericht und SHA-256-Begleitdatei;
+- Autorisierungsadapter zwischen Preflight-Core und gehärtetem Runner.
 
 Diese Fixtures tragen `synthetic_only` und belegen keine Providerverfügbarkeit.
 
@@ -57,8 +72,8 @@ Quellintegrität enthalten.
 Dieser Implementierungsnachweis belegt nicht:
 
 - RepoBrief-Nutzen;
-- Claude-Liveverfügbarkeit;
-- reale Token- oder Kostenwerte;
+- Claude-Liveverfügbarkeit des eingefrorenen Paars;
+- reale Token- oder Kostenwerte des eingefrorenen Paars;
 - Abschluss von `RAB-V1-T002B`;
 - Erlaubnis für `RAB-V1-T002`;
 - Standardbeförderung.
