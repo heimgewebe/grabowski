@@ -128,7 +128,9 @@ Projekt-, Nutzer- oder Plugin-Server.
 
 Der Livepfad startet Claude nicht interaktiv und ohne Sitzungsfortsetzung:
 
-- `--bare`;
+- `--safe-mode` zum Deaktivieren von Projekt- und Nutzeranpassungen bei erhaltener Authentisierung;
+- `--no-chrome` zum Ausschalten der Browserintegration;
+- `--disable-slash-commands` zum Ausschalten von Skills und Slash-Kommandos;
 - Print-Modus `-p`;
 - exakte `--model`-Bindung;
 - `--output-format stream-json`;
@@ -137,14 +139,34 @@ Der Livepfad startet Claude nicht interaktiv und ohne Sitzungsfortsetzung:
 - `--no-session-persistence`;
 - `--permission-mode dontAsk`;
 - strukturierte Ausgabe über den fest eingebauten JSON-Schema-Vertrag;
-- explizite Tool- und Allowed-Tool-Listen.
+- explizite Tool- und Allowed-Tool-Listen;
+- eine ausdrückliche Live-Freigabe über `--allow-live-provider`;
+- eine pro Einzelaufruf verpflichtende Provider-Kostenschwelle über
+  `--max-budget-usd`.
+
+Fixture-Ausführung und Live-Freigabe schließen sich gegenseitig aus. Der Runner
+prüft diese Grenze vor Request-Root, Repository-Map, Checkout und Transcript,
+damit eine fehlende Freigabe keine einmalige Workspace-Identität verbraucht.
 
 Die Umgebung wird auf eine kleine Allowlist reduziert. Der Runner übernimmt
 nur Pfad-, Home-, Sprach-, Temp- und explizite Anthropic-API-Umgebungswerte.
 
+Der Safe-Mode erhält die vom Claude-Client verwaltete Authentisierung, aktiviert
+aber keine Projekt-Hooks, Skills, Plugins, MCP-Server oder Memory-Flächen. Die
+weiterhin mögliche Auflistung installierter Katalogmetadaten im `system/init`
+belegt keine Aktivierung; maßgeblich ist die streng validierte Tool-Liste.
+
 Prozesszeit, Standardausgabe und Standardfehler sind begrenzt. Überschreitung,
 Timeout, Startfehler oder nichtleerer Standardfehler führen zum Abbruch. Es
 gibt keinen automatischen Retry.
+
+Die Kostenschwelle wird an Claude weitergereicht und der gemeldete
+`total_cost_usd`-Wert nach dem Lauf erneut gegen dieselbe Schwelle geprüft. Ein
+Provider-Budgetfehler erzeugt keinen Erfolgsreceipt. Da eine bereits laufende
+Provideranfrage die Schwelle technisch geringfügig überschreiten kann, ist die
+Schwelle kein mathematisch harter Ausgabenstopp; der Live-Preflight muss deshalb
+ein günstiges exaktes Modell, kleine Aufgaben und einen zusätzlichen
+Gesamtbudget-Abbruch verwenden.
 
 ## Provider-Streamingprotokoll
 
@@ -235,6 +257,11 @@ Behandlungslauf ausführen und belegen:
 - begrenzte Kosten;
 - unveränderten Quellcheckout.
 
+Der Dispatch muss die Kostenschwelle pro Lauf vorab festlegen, die im Transcript
+gemeldeten tatsächlichen Kosten summieren und vor jedem weiteren Lauf prüfen.
+Ein Lauf mit Budgetfehler oder gemeldeten Kosten oberhalb der Schwelle zählt
+nicht als erfolgreicher Preflight.
+
 Der Preflight und der vollständige 96-Lauf-Benchmark gehören nicht zu T002A.
 Sie benötigen eine separate Dispatch-Entscheidung und ein explizites
 Kostenlimit.
@@ -255,7 +282,10 @@ aufgenommen:
   "--state-root",
   "/private/path/to/benchmark-state",
   "--transcript-root",
-  "/private/path/to/benchmark-transcripts"
+  "/private/path/to/benchmark-transcripts",
+  "--allow-live-provider",
+  "--max-budget-usd",
+  "0.05"
 ]
 ```
 
