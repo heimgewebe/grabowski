@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -416,6 +417,8 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
             )
             self.assertEqual(report["kind"], preflight.REPORT_KIND)
             self.assertEqual(report["status"], "valid")
+            self.assertIsNotNone(report["environment"]["claude"]["sha256"])
+            self.assertIsNotNone(report["runs"]["baseline"]["lenskit_validation_sha256"])
             self.assertEqual(report["cost"]["total_observed_usd"], "0.02")
             self.assertEqual(report["source_before"], report["source_after"])
             self.assertFalse(report["default_promoted"])
@@ -459,6 +462,25 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
                     max_cost_usd=Decimal("1.01"),
                     validator_command=[sys.executable, str(root / "validator.py")],
                 )
+
+    def test_mcp_environment_excludes_provider_credentials(self) -> None:
+        previous_key = os.environ.get("ANTHROPIC_API_KEY")
+        previous_home = os.environ.get("HOME")
+        try:
+            os.environ["ANTHROPIC_API_KEY"] = "secret"
+            os.environ["HOME"] = "/home/operator"
+            environment = preflight._mcp_environment()
+        finally:
+            if previous_key is None:
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+            else:
+                os.environ["ANTHROPIC_API_KEY"] = previous_key
+            if previous_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous_home
+        self.assertNotIn("ANTHROPIC_API_KEY", environment)
+        self.assertEqual(environment["HOME"], "/nonexistent/repobrief-preflight")
 
 
 if __name__ == "__main__":

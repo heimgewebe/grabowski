@@ -99,7 +99,7 @@ Der Bericht bindet:
 
 - beide Auftrag- und Receipt-SHA-256;
 - beide Transcriptpfade, -größen und -SHA-256;
-- Claude-Version und Laufzeitumgebung;
+- Claude-Version sowie Pfad, Größe und SHA-256 des gestarteten Programms;
 - exakte Modell- und Tokenbelege in den Receipts;
 - beobachtete und autorisierte Kosten;
 - Snapshot- und Freshnessstatus;
@@ -108,7 +108,7 @@ Der Bericht bindet:
 
 Der endgültige Bericht wird zusammen mit Receipts und Transkripten als
 reviewbares Artefakt veröffentlicht und außerhalb des Berichts erneut per
-SHA-256 gebunden.
+SHA-256 gebunden. Neben dem Bericht wird automatisch eine gleichnamige `.sha256`-Datei erzeugt.
 
 ## Stopregeln
 

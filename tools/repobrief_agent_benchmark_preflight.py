@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import platform
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -39,6 +40,7 @@ MAX_REQUEST_FILES = 128
 MAX_MCP_LINE_BYTES = 4 * 1024 * 1024
 MAX_VALIDATOR_OUTPUT_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_EXECUTABLE_BYTES = 64 * 1024 * 1024
 REPOBRIEF_ABSTRACT_TOOLS = {
     "ask_context",
     "grounding_verify",
@@ -277,8 +279,10 @@ def _rpc(process: subprocess.Popen, message: Mapping[str, Any], *, timeout_secon
 
 
 def _mcp_environment() -> dict[str, str]:
-    allowed = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}
-    return {key: value for key, value in os.environ.items() if key in allowed}
+    allowed = {"PATH", "LANG", "LC_ALL", "TMPDIR"}
+    environment = {key: value for key, value in os.environ.items() if key in allowed}
+    environment["HOME"] = "/nonexistent/repobrief-preflight"
+    return environment
 
 
 def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
@@ -465,10 +469,21 @@ def _receipt_path(evidence_root: Path, request: Mapping[str, Any]) -> Path:
     return evidence_root.resolve() / "receipts" / filename
 
 
-def _claude_version(claude: str) -> str:
+def _claude_identity(claude: str) -> dict[str, Any]:
+    executable = shutil.which(claude)
+    if executable is None:
+        raise PreflightError("Claude executable cannot be resolved")
+    resolved = Path(executable).expanduser().resolve()
+    try:
+        with resolved.open("rb") as handle:
+            data = handle.read(MAX_EXECUTABLE_BYTES + 1)
+    except OSError as exc:
+        raise PreflightError("Claude executable cannot be read") from exc
+    if not data or len(data) > MAX_EXECUTABLE_BYTES:
+        raise PreflightError("Claude executable is empty or oversized")
     try:
         completed = subprocess.run(
-            [claude, "--version"],
+            [str(resolved), "--version"],
             check=True,
             capture_output=True,
             text=True,
@@ -481,7 +496,13 @@ def _claude_version(claude: str) -> str:
     version = completed.stdout.strip()
     if not version or len(version) > 500 or completed.stderr:
         raise PreflightError("Claude version probe returned invalid output")
-    return version
+    return {
+        "command": claude,
+        "resolved_path": str(resolved),
+        "bytes": len(data),
+        "sha256": _sha256_bytes(data),
+        "version": version,
+    }
 
 
 def execute_preflight(
@@ -513,7 +534,17 @@ def execute_preflight(
     freshness, freshness_check_ms = probe_freshness(treatment)
     if freshness["status"] != "fresh":
         raise PreflightError(f"treatment snapshot is not fresh: {freshness['status']}")
-    version = "synthetic-fixture" if synthetic else _claude_version(claude)
+    claude_identity = (
+        {
+            "command": claude,
+            "resolved_path": None,
+            "bytes": None,
+            "sha256": None,
+            "version": "synthetic-fixture",
+        }
+        if synthetic
+        else _claude_identity(claude)
+    )
 
     ordered = sorted([baseline, treatment], key=lambda item: int(item["order"]))
     fixture_by_condition = {
@@ -523,6 +554,7 @@ def execute_preflight(
     receipts: dict[str, dict[str, Any]] = {}
     receipt_paths: dict[str, Path] = {}
     observed_costs: dict[str, Decimal] = {}
+    validations: dict[str, dict[str, Any]] = {}
     agent_execution_ms = 0
     runner_execution_ms = 0
     for request in ordered:
@@ -557,7 +589,7 @@ def execute_preflight(
         receipt_paths[condition] = receipt_path
         receipts[condition] = receipt
         if not synthetic:
-            _validate_receipt_external(
+            validations[condition] = _validate_receipt_external(
                 validator_command,
                 request_path=_request_path(request_root, request),
                 receipt_path=receipt_path,
@@ -585,7 +617,8 @@ def execute_preflight(
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),
-            "claude_version": version,
+            "claude": claude_identity,
+            "validator_command_sha256": _sha256_json(list(validator_command)),
         },
         "cost": {
             "per_run_authorized_usd": format(max_cost_usd, "f"),
@@ -611,6 +644,9 @@ def execute_preflight(
                 "receipt": str(receipt_paths[condition]),
                 "receipt_sha256": _sha256_json(receipts[condition]),
                 "transcript": receipts[condition]["transcript"],
+                "lenskit_validation_sha256": (
+                    None if synthetic else _sha256_json(validations[condition])
+                ),
             }
             for condition, request in (("baseline", baseline), ("treatment", treatment))
         },
@@ -671,7 +707,19 @@ def main(argv: list[str] | None = None) -> int:
             baseline_fixture=args.baseline_stream_fixture,
             treatment_fixture=args.treatment_stream_fixture,
         )
-        _write_private_exclusive(args.report_out.expanduser().resolve(), report)
+        report_path = args.report_out.expanduser().resolve()
+        _write_private_exclusive(report_path, report)
+        report_bytes = report_path.read_bytes()
+        digest_path = Path(str(report_path) + ".sha256")
+        digest = f"{_sha256_bytes(report_bytes)}  {report_path.name}\n".encode("ascii")
+        digest_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(
+            digest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(digest)
+            handle.flush()
+            os.fsync(handle.fileno())
     except (PreflightError, runner.RunnerError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True), file=sys.stderr)
         return 2
