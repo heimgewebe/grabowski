@@ -2,22 +2,23 @@
   "acceptance": {
     "context_evidence_additional_reduction_percent": 34.83,
     "context_evidence_v1_bytes": 49247,
-    "context_evidence_v2_bytes": 32092,
+    "context_evidence_v2_bytes": 32093,
     "criterion": "standard response median JSON bytes remain reduced by at least 50 percent on all five measured large surfaces and context evidence is further reduced without dropping bound evidence categories",
     "passed": true,
     "standard_reduction_percent": {
       "checkout": 58.27,
       "context": 85.49,
-      "friction": 53.75,
+      "friction": 53.78,
       "status": 63.31,
-      "tasks": 54.31
+      "tasks": 53.95
     }
   },
   "base_head": "0f5473e117ddc7f6e830b961a49e73fcf3ebb657",
   "branch": "fix/consumer-surface-optimization-v2",
-  "captured_at": "2026-07-13T04:49:20.589320+00:00",
+  "captured_at": "2026-07-13T04:53:33.274117+00:00",
   "command": "PYTHONPATH=src <runtime-python> tools/consumer_surface_benchmark.py --samples 5",
   "contract_evidence": {
+    "cleanup_errors_do_not_mask_primary_failure": true,
     "common_consumer_module": true,
     "create_only_unlink_failure_rolls_back_visible_target": true,
     "cursor_snapshot_error_code_is_stable": true,
@@ -27,6 +28,7 @@
     "legacy_job_receipts_readable": true,
     "origin_bound_job_receipts": true,
     "post_publish_directory_binding_rechecked": true,
+    "primary_job_status_separated_from_postflight_failure": true,
     "rollback_preserves_attacker_replacement_inode": true,
     "same_uid_full_control_non_authenticity_tested": true,
     "same_uid_non_isolation_explicit": true,
@@ -62,13 +64,13 @@
       "has_more": true,
       "limit": 50,
       "returned": 50,
-      "snapshot_sha256": "53a512ddb65368410170f7d8462b694db7cae4b49231de44a2a029e2beda8156",
+      "snapshot_sha256": "53b13a6b8d219da65f67dd39cbaf6ca5cd538b38b947fbda08bab26fc45c2253",
       "view": "standard"
     },
     "tasks": {
       "limit": 20,
       "returned": 20,
-      "total_matching": 1377,
+      "total_matching": 1381,
       "view": "standard"
     }
   },
@@ -108,9 +110,9 @@
           "reduction_percent": 95.86
         },
         "friction": {
-          "after_bytes": 11219,
+          "after_bytes": 11225,
           "before_bytes": 60842,
-          "reduction_percent": 81.56
+          "reduction_percent": 81.55
         },
         "status": {
           "after_bytes": 1507,
@@ -118,9 +120,9 @@
           "reduction_percent": 80.12
         },
         "tasks": {
-          "after_bytes": 10461,
+          "after_bytes": 9390,
           "before_bytes": 113239,
-          "reduction_percent": 90.76
+          "reduction_percent": 91.71
         }
       },
       "standard": {
@@ -135,9 +137,9 @@
           "reduction_percent": 85.49
         },
         "friction": {
-          "after_bytes": 28142,
+          "after_bytes": 28119,
           "before_bytes": 60842,
-          "reduction_percent": 53.75
+          "reduction_percent": 53.78
         },
         "status": {
           "after_bytes": 2781,
@@ -145,9 +147,9 @@
           "reduction_percent": 63.31
         },
         "tasks": {
-          "after_bytes": 51744,
+          "after_bytes": 52145,
           "before_bytes": 113239,
-          "reduction_percent": 54.31
+          "reduction_percent": 53.95
         }
       }
     },
@@ -165,108 +167,108 @@
     },
     "results": {
       "checkout_evidence": {
-        "bytes_median": 12733,
-        "bytes_p90": 12733,
-        "elapsed_ms_median": 12.437,
-        "elapsed_ms_p90": 12.569,
+        "bytes_median": 12531,
+        "bytes_p90": 12531,
+        "elapsed_ms_median": 12.251,
+        "elapsed_ms_p90": 12.464,
         "samples": 5
       },
       "checkout_minimal": {
         "bytes_median": 4763,
         "bytes_p90": 4763,
-        "elapsed_ms_median": 12.584,
-        "elapsed_ms_p90": 12.711,
+        "elapsed_ms_median": 12.713,
+        "elapsed_ms_p90": 12.78,
         "samples": 5
       },
       "checkout_standard": {
         "bytes_median": 4781,
         "bytes_p90": 4781,
-        "elapsed_ms_median": 12.064,
-        "elapsed_ms_p90": 12.338,
+        "elapsed_ms_median": 12.434,
+        "elapsed_ms_p90": 12.447,
         "samples": 5
       },
       "context_evidence": {
-        "bytes_median": 32092,
-        "bytes_p90": 32092,
-        "elapsed_ms_median": 94.401,
-        "elapsed_ms_p90": 96.067,
+        "bytes_median": 32093,
+        "bytes_p90": 32093,
+        "elapsed_ms_median": 94.067,
+        "elapsed_ms_p90": 94.574,
         "samples": 5
       },
       "context_minimal": {
         "bytes_median": 1555,
         "bytes_p90": 1555,
-        "elapsed_ms_median": 16.328,
-        "elapsed_ms_p90": 16.511,
+        "elapsed_ms_median": 16.839,
+        "elapsed_ms_p90": 16.883,
         "samples": 5
       },
       "context_standard": {
         "bytes_median": 5455,
         "bytes_p90": 5455,
-        "elapsed_ms_median": 20.39,
-        "elapsed_ms_p90": 21.772,
+        "elapsed_ms_median": 21.153,
+        "elapsed_ms_p90": 21.225,
         "samples": 5
       },
       "friction_evidence": {
-        "bytes_median": 58928,
-        "bytes_p90": 58928,
-        "elapsed_ms_median": 36.379,
-        "elapsed_ms_p90": 36.646,
+        "bytes_median": 58960,
+        "bytes_p90": 58960,
+        "elapsed_ms_median": 37.747,
+        "elapsed_ms_p90": 37.966,
         "samples": 5
       },
       "friction_minimal": {
-        "bytes_median": 11219,
-        "bytes_p90": 11219,
-        "elapsed_ms_median": 11.842,
-        "elapsed_ms_p90": 12.095,
+        "bytes_median": 11225,
+        "bytes_p90": 11225,
+        "elapsed_ms_median": 11.731,
+        "elapsed_ms_p90": 12.239,
         "samples": 5
       },
       "friction_standard": {
-        "bytes_median": 28142,
-        "bytes_p90": 28142,
-        "elapsed_ms_median": 34.68,
-        "elapsed_ms_p90": 34.75,
+        "bytes_median": 28119,
+        "bytes_p90": 28119,
+        "elapsed_ms_median": 35.153,
+        "elapsed_ms_p90": 35.515,
         "samples": 5
       },
       "status_evidence": {
         "bytes_median": 14507,
         "bytes_p90": 14507,
-        "elapsed_ms_median": 78.024,
-        "elapsed_ms_p90": 78.255,
+        "elapsed_ms_median": 77.787,
+        "elapsed_ms_p90": 77.81,
         "samples": 5
       },
       "status_minimal": {
         "bytes_median": 1507,
         "bytes_p90": 1507,
-        "elapsed_ms_median": 77.206,
-        "elapsed_ms_p90": 78.533,
+        "elapsed_ms_median": 76.77,
+        "elapsed_ms_p90": 77.837,
         "samples": 5
       },
       "status_standard": {
         "bytes_median": 2781,
         "bytes_p90": 2781,
-        "elapsed_ms_median": 78.15,
-        "elapsed_ms_p90": 78.882,
+        "elapsed_ms_median": 75.987,
+        "elapsed_ms_p90": 76.139,
         "samples": 5
       },
       "tasks_evidence": {
-        "bytes_median": 114188,
-        "bytes_p90": 114188,
-        "elapsed_ms_median": 8.139,
-        "elapsed_ms_p90": 8.147,
+        "bytes_median": 120094,
+        "bytes_p90": 120094,
+        "elapsed_ms_median": 7.883,
+        "elapsed_ms_p90": 8.17,
         "samples": 5
       },
       "tasks_minimal": {
-        "bytes_median": 10461,
-        "bytes_p90": 10461,
-        "elapsed_ms_median": 8.194,
-        "elapsed_ms_p90": 8.319,
+        "bytes_median": 9390,
+        "bytes_p90": 9390,
+        "elapsed_ms_median": 8.509,
+        "elapsed_ms_p90": 8.845,
         "samples": 5
       },
       "tasks_standard": {
-        "bytes_median": 51744,
-        "bytes_p90": 51744,
-        "elapsed_ms_median": 8.276,
-        "elapsed_ms_p90": 8.32,
+        "bytes_median": 52145,
+        "bytes_p90": 52145,
+        "elapsed_ms_median": 8.221,
+        "elapsed_ms_p90": 8.235,
         "samples": 5
       }
     },
