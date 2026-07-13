@@ -7,8 +7,8 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-
-import pytest
+import tempfile
+import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "tools" / "repobrief_agent_benchmark_runner.py"
@@ -105,21 +105,27 @@ def stream(
     input_tokens: int = 120,
     output_tokens: int = 30,
     tool_error: bool = False,
+    init_tools: list[str] | None = None,
+    init_session: str = "provider-session",
+    result_session: str = "provider-session",
 ) -> bytes:
     tools = list(runner.READ_ONLY_BUILTINS)
     if request_value["condition"] == "treatment":
         tools.extend(runner.TREATMENT_RESOURCE_TOOLS)
         tools.extend(runner.TREATMENT_MCP_TOOLS)
+    if init_tools is not None:
+        tools = init_tools
     messages = [
         {
             "type": "system",
             "subtype": "init",
-            "session_id": "provider-session",
+            "session_id": init_session,
             "model": model,
             "tools": tools,
         },
         {
             "type": "assistant",
+            "session_id": init_session,
             "message": {
                 "id": "message-1",
                 "content": [
@@ -135,6 +141,7 @@ def stream(
         },
         {
             "type": "user",
+            "session_id": init_session,
             "message": {
                 "content": [
                     {
@@ -153,7 +160,7 @@ def stream(
                 "type": "result",
                 "subtype": "success",
                 "is_error": False,
-                "session_id": "provider-session",
+                "session_id": result_session,
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -177,319 +184,384 @@ def git(command: list[str], cwd: Path) -> str:
     return completed.stdout.strip()
 
 
-def repository(tmp_path: Path) -> tuple[Path, str]:
-    root = tmp_path / "source"
-    root.mkdir()
-    git(["init"], root)
-    git(["config", "user.email", "test@example.invalid"], root)
-    git(["config", "user.name", "Test"], root)
-    (root / "src").mkdir()
-    (root / "src" / "example.py").write_text(
+def repository(root: Path) -> tuple[Path, str]:
+    source = root / "source"
+    source.mkdir()
+    git(["init"], source)
+    git(["config", "user.email", "test@example.invalid"], source)
+    git(["config", "user.name", "Test"], source)
+    (source / "src").mkdir()
+    (source / "src" / "example.py").write_text(
         "def example():\n    return True\n", encoding="utf-8"
     )
-    git(["add", "."], root)
-    git(["commit", "-m", "fixture"], root)
-    return root, git(["rev-parse", "HEAD"], root)
+    git(["add", "."], source)
+    git(["commit", "-m", "fixture"], source)
+    return source, git(["rev-parse", "HEAD"], source)
 
 
-def test_validate_request_accepts_both_conditions() -> None:
-    runner.validate_request(request())
-    runner.validate_request(request(condition="treatment"))
+class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
+    def test_validate_request_accepts_both_conditions(self) -> None:
+        runner.validate_request(request())
+        runner.validate_request(request(condition="treatment"))
 
-
-@pytest.mark.parametrize(
-    ("mutate", "message"),
-    [
-        (lambda value: value.update({"unknown": True}), "unknown fields"),
-        (
-            lambda value: value["runner"].update({"provider": "other"}),
-            "runner.provider",
-        ),
-        (
-            lambda value: value["runner"].update({"model": "opus"}),
-            "exact Claude model id",
-        ),
-        (
-            lambda value: value["runner"].update({"sampling": {"temperature": 0}}),
-            "sampling",
-        ),
-        (
-            lambda value: value["isolation"].update({"fresh_session": False}),
-            "isolation",
-        ),
-        (
-            lambda value: value["allowed_tools"].append("write"),
-            "allowed_tools",
-        ),
-        (
-            lambda value: value.update({"repobrief": {}}),
-            "baseline request",
-        ),
-    ],
-)
-def test_validate_request_rejects_contract_drift(mutate, message: str) -> None:
-    value = request()
-    mutate(value)
-    with pytest.raises(runner.RunnerError, match=message):
-        runner.validate_request(value)
-
-
-def test_treatment_requires_strict_repobrief_binding() -> None:
-    value = request(condition="treatment")
-    value["repobrief"]["manifest_sha256"] = "bad"
-    with pytest.raises(runner.RunnerError, match="manifest_sha256"):
-        runner.validate_request(value)
-
-
-def test_build_baseline_command_exposes_only_read_tools() -> None:
-    command = runner.build_claude_command(request(), claude="claude", mcp_config=None)
-    joined = " ".join(command)
-    assert "--bare" in command
-    assert "stream-json" in command
-    assert "--no-session-persistence" in command
-    assert "Read,Glob,Grep" in command
-    assert "mcp__" not in joined
-    assert "Bash" not in joined
-    assert "Write" not in joined
-    assert "Edit" not in joined
-
-
-def test_build_treatment_command_binds_only_repobrief_mcp(tmp_path: Path) -> None:
-    config = tmp_path / "mcp.json"
-    config.write_text("{}", encoding="utf-8")
-    command = runner.build_claude_command(
-        request(condition="treatment"), claude="claude", mcp_config=config
-    )
-    joined = " ".join(command)
-    assert "--strict-mcp-config" in command
-    assert str(config) in command
-    assert "ListMcpResources" in joined
-    assert "ReadMcpResource" in joined
-    assert "mcp__repobrief__ask_context" in joined
-    assert "mcp__repobrief__grounding_verify" in joined
-    assert "mcp__repobrief__live_freshness" in joined
-
-
-def test_build_receipt_normalizes_provider_evidence() -> None:
-    value = request()
-    raw = stream(value)
-    started = datetime(2026, 7, 13, 10, 0, tzinfo=timezone.utc)
-    receipt = runner.build_receipt(
-        value,
-        raw,
-        transcript_artifact="transcript.jsonl",
-        returncode=0,
-        started_at=started,
-        ended_at=started + timedelta(seconds=1),
-    )
-    assert receipt["kind"] == runner.RECEIPT_KIND
-    assert receipt["request_sha256"] == runner._sha256_json(value)
-    assert receipt["provider"] == {
-        "name": runner.PROVIDER,
-        "model": MODEL,
-        "sampling": {},
-        "input_tokens": 120,
-        "output_tokens": 30,
-        "token_source": "provider_reported",
-    }
-    assert receipt["tool_calls"] == [
-        {
-            "sequence": 1,
-            "name": "read_file",
-            "status": "success",
-            "duration_ms": 0,
-            "input_bytes": len(
-                runner._canonical_json({"file_path": "src/example.py"}).encode("utf-8")
+    def test_validate_request_rejects_contract_drift(self) -> None:
+        mutations = [
+            (lambda value: value.update({"unknown": True}), "unknown fields"),
+            (
+                lambda value: value["runner"].update({"provider": "other"}),
+                "runner.provider",
             ),
-            "output_bytes": len(
-                runner._canonical_json("def example():\n    return True\n").encode("utf-8")
+            (
+                lambda value: value["runner"].update({"model": "opus"}),
+                "exact Claude model id",
             ),
-        }
-    ]
-    assert receipt["answer"] == answer()
-    assert receipt["transcript"]["sha256"] == runner._sha256_bytes(raw)
-    assert receipt["transcript"]["bytes"] == len(raw)
+            (
+                lambda value: value["runner"].update(
+                    {"sampling": {"temperature": 0}}
+                ),
+                "sampling",
+            ),
+            (
+                lambda value: value["isolation"].update(
+                    {"fresh_session": False}
+                ),
+                "isolation",
+            ),
+            (
+                lambda value: value["allowed_tools"].append("write"),
+                "allowed_tools",
+            ),
+            (
+                lambda value: value.update({"repobrief": {}}),
+                "baseline request",
+            ),
+        ]
+        for mutate, message in mutations:
+            with self.subTest(message=message):
+                value = request()
+                mutate(value)
+                with self.assertRaisesRegex(runner.RunnerError, message):
+                    runner.validate_request(value)
 
+    def test_treatment_requires_strict_repobrief_binding(self) -> None:
+        value = request(condition="treatment")
+        value["repobrief"]["manifest_sha256"] = "bad"
+        with self.assertRaisesRegex(runner.RunnerError, "manifest_sha256"):
+            runner.validate_request(value)
 
-def test_treatment_maps_repobrief_tool() -> None:
-    value = request(condition="treatment")
-    raw = stream(value, tool_name="mcp__repobrief__ask_context")
-    started = datetime.now(timezone.utc)
-    receipt = runner.build_receipt(
-        value,
-        raw,
-        transcript_artifact="transcript.jsonl",
-        returncode=0,
-        started_at=started,
-        ended_at=started,
-    )
-    assert receipt["tool_calls"][0]["name"] == "ask_context"
+    def test_build_baseline_command_exposes_only_read_tools(self) -> None:
+        command = runner.build_claude_command(
+            request(), claude="claude", mcp_config=None
+        )
+        joined = " ".join(command)
+        self.assertIn("--bare", command)
+        self.assertIn("stream-json", command)
+        self.assertIn("--no-session-persistence", command)
+        self.assertIn("Read,Glob,Grep", command)
+        self.assertNotIn("mcp__", joined)
+        self.assertNotIn("Bash", joined)
+        self.assertNotIn("Write", joined)
+        self.assertNotIn("Edit", joined)
 
+    def test_build_treatment_command_binds_only_repobrief_mcp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "mcp.json"
+            config.write_text("{}", encoding="utf-8")
+            command = runner.build_claude_command(
+                request(condition="treatment"),
+                claude="claude",
+                mcp_config=config,
+            )
+        joined = " ".join(command)
+        self.assertIn("--strict-mcp-config", command)
+        self.assertIn(str(config), command)
+        self.assertIn("ListMcpResources", joined)
+        self.assertIn("ReadMcpResource", joined)
+        self.assertIn("mcp__repobrief__ask_context", joined)
+        self.assertIn("mcp__repobrief__grounding_verify", joined)
+        self.assertIn("mcp__repobrief__live_freshness", joined)
 
-@pytest.mark.parametrize(
-    ("raw_builder", "message"),
-    [
-        (lambda value: stream(value, include_result=False), "requires one result"),
-        (lambda value: stream(value, model="claude-other"), "model does not match"),
-        (
-            lambda value: stream(value, input_tokens=999999),
-            "input token budget exceeded",
-        ),
-        (
-            lambda value: stream(value, tool_name="Write"),
-            "unapproved tool",
-        ),
-    ],
-)
-def test_provider_evidence_fails_closed(raw_builder, message: str) -> None:
-    value = request()
-    started = datetime.now(timezone.utc)
-    with pytest.raises(runner.RunnerError, match=message):
-        runner.build_receipt(
+    def test_build_receipt_normalizes_provider_evidence(self) -> None:
+        value = request()
+        raw = stream(value)
+        started = datetime(2026, 7, 13, 10, 0, tzinfo=timezone.utc)
+        receipt = runner.build_receipt(
             value,
-            raw_builder(value),
+            raw,
+            transcript_artifact="transcript.jsonl",
+            returncode=0,
+            started_at=started,
+            ended_at=started + timedelta(seconds=1),
+        )
+        self.assertEqual(receipt["kind"], runner.RECEIPT_KIND)
+        self.assertEqual(receipt["request_sha256"], runner._sha256_json(value))
+        self.assertEqual(
+            receipt["provider"],
+            {
+                "name": runner.PROVIDER,
+                "model": MODEL,
+                "sampling": {},
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "token_source": "provider_reported",
+            },
+        )
+        self.assertEqual(
+            receipt["tool_calls"],
+            [
+                {
+                    "sequence": 1,
+                    "name": "read_file",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": len(
+                        runner._canonical_json(
+                            {"file_path": "src/example.py"}
+                        ).encode("utf-8")
+                    ),
+                    "output_bytes": len(
+                        runner._canonical_json(
+                            "def example():\n    return True\n"
+                        ).encode("utf-8")
+                    ),
+                }
+            ],
+        )
+        self.assertEqual(receipt["answer"], answer())
+        self.assertEqual(
+            receipt["transcript"]["sha256"], runner._sha256_bytes(raw)
+        )
+        self.assertEqual(receipt["transcript"]["bytes"], len(raw))
+
+    def test_treatment_maps_repobrief_tool(self) -> None:
+        value = request(condition="treatment")
+        raw = stream(value, tool_name="mcp__repobrief__ask_context")
+        started = datetime.now(timezone.utc)
+        receipt = runner.build_receipt(
+            value,
+            raw,
             transcript_artifact="transcript.jsonl",
             returncode=0,
             started_at=started,
             ended_at=started,
         )
+        self.assertEqual(receipt["tool_calls"][0]["name"], "ask_context")
 
+    def test_provider_evidence_fails_closed(self) -> None:
+        cases = [
+            (lambda value: stream(value, include_result=False), "requires one result"),
+            (
+                lambda value: stream(value, model="claude-other"),
+                "model does not match",
+            ),
+            (
+                lambda value: stream(value, input_tokens=999999),
+                "input token budget exceeded",
+            ),
+            (
+                lambda value: stream(value, tool_name="Write"),
+                "unapproved tool",
+            ),
+            (
+                lambda value: stream(
+                    value,
+                    init_session="session-a",
+                    result_session="session-b",
+                ),
+                "session does not match",
+            ),
+        ]
+        for raw_builder, message in cases:
+            with self.subTest(message=message):
+                value = request()
+                started = datetime.now(timezone.utc)
+                with self.assertRaisesRegex(runner.RunnerError, message):
+                    runner.build_receipt(
+                        value,
+                        raw_builder(value),
+                        transcript_artifact="transcript.jsonl",
+                        returncode=0,
+                        started_at=started,
+                        ended_at=started,
+                    )
 
-def test_duplicate_tool_use_and_orphan_result_are_rejected() -> None:
-    value = request()
-    messages = runner.parse_jsonl(stream(value))
-    assistant = next(item for item in messages if item["type"] == "assistant")
-    assistant["message"]["content"].append(
-        copy.deepcopy(assistant["message"]["content"][0])
-    )
-    with pytest.raises(runner.RunnerError, match="duplicate provider tool-use id"):
-        runner.normalize_tool_calls(value, messages)
+    def test_treatment_requires_all_repobrief_tools_in_init(self) -> None:
+        value = request(condition="treatment")
+        incomplete = list(runner.READ_ONLY_BUILTINS)
+        started = datetime.now(timezone.utc)
+        with self.assertRaisesRegex(
+            runner.RunnerError, "did not expose all required tools"
+        ):
+            runner.build_receipt(
+                value,
+                stream(value, init_tools=incomplete),
+                transcript_artifact="transcript.jsonl",
+                returncode=0,
+                started_at=started,
+                ended_at=started,
+            )
 
-    messages = runner.parse_jsonl(stream(value))
-    user = next(item for item in messages if item["type"] == "user")
-    user["message"]["content"][0]["tool_use_id"] = "orphan"
-    with pytest.raises(runner.RunnerError, match="no matching result"):
-        runner.normalize_tool_calls(value, messages)
-
-
-def test_failed_tool_is_retained_as_failed_call() -> None:
-    value = request()
-    messages = runner.parse_jsonl(stream(value, tool_error=True))
-    calls = runner.normalize_tool_calls(value, messages)
-    assert calls[0]["status"] == "failed"
-
-
-def test_answer_rejects_unknown_claim_and_unsafe_citation() -> None:
-    invalid = answer()
-    invalid["claims"] = ["invented_claim"]
-    with pytest.raises(runner.RunnerError, match="unknown labels"):
-        runner.validate_answer(invalid)
-
-    invalid = answer()
-    invalid["citations"] = [{"path": "../secret", "start_line": 1, "end_line": 1}]
-    with pytest.raises(runner.RunnerError, match="repository-relative"):
-        runner.validate_answer(invalid)
-
-
-def test_jsonl_rejects_empty_invalid_and_oversized_transcripts() -> None:
-    with pytest.raises(runner.RunnerError, match="empty or oversized"):
-        runner.parse_jsonl(b"")
-    with pytest.raises(runner.RunnerError, match="invalid JSON"):
-        runner.parse_jsonl(b"not-json\n")
-    with pytest.raises(runner.RunnerError, match="empty or oversized"):
-        runner.parse_jsonl(b"x" * (runner.MAX_TRANSCRIPT_BYTES + 1))
-
-
-def test_create_isolated_checkout_is_exact_clean_and_create_only(tmp_path: Path) -> None:
-    source, commit = repository(tmp_path)
-    value = request(commit=commit)
-    checkout = runner.create_isolated_checkout(value, source, tmp_path / "state")
-    assert git(["rev-parse", "HEAD"], checkout) == commit
-    assert git(["status", "--porcelain"], checkout) == ""
-    with pytest.raises(runner.RunnerError, match="already used"):
-        runner.create_isolated_checkout(value, source, tmp_path / "state")
-
-
-def test_load_repository_root_binds_owner_name(tmp_path: Path) -> None:
-    source, commit = repository(tmp_path)
-    value = request(commit=commit)
-    map_path = tmp_path / "repositories.json"
-    map_path.write_text(
-        json.dumps(
-            {"repo": {"repository": "heimgewebe/repo", "root": str(source)}}
-        ),
-        encoding="utf-8",
-    )
-    assert runner.load_repository_root(value, map_path) == source.resolve()
-    document = json.loads(map_path.read_text(encoding="utf-8"))
-    document["repo"]["repository"] = "other/repo"
-    map_path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(runner.RunnerError, match="owner/name mismatch"):
-        runner.load_repository_root(value, map_path)
-
-
-def test_execute_with_synthetic_stream_is_end_to_end(tmp_path: Path) -> None:
-    source, commit = repository(tmp_path)
-    value = request(commit=commit)
-    map_path = tmp_path / "repositories.json"
-    map_path.write_text(
-        json.dumps(
-            {"repo": {"repository": "heimgewebe/repo", "root": str(source)}}
-        ),
-        encoding="utf-8",
-    )
-    fixture = tmp_path / "stream.jsonl"
-    fixture.write_bytes(stream(value))
-    receipt = runner.execute(
-        value,
-        repository_map=map_path,
-        state_root=tmp_path / "state",
-        transcript_root=tmp_path / "transcripts",
-        claude="claude",
-        stream_fixture=fixture,
-    )
-    artifact = tmp_path / "transcripts" / receipt["transcript"]["artifact"]
-    assert artifact.read_bytes() == fixture.read_bytes()
-    assert receipt["status"] == "success"
-    assert receipt["does_not_establish"] == list(runner.DOES_NOT_ESTABLISH)
-
-
-def test_write_mcp_config_uses_request_argv(tmp_path: Path) -> None:
-    value = request(condition="treatment")
-    workspace = tmp_path / "workspace" / "repo"
-    workspace.mkdir(parents=True)
-    path = runner.write_mcp_config(value, workspace)
-    document = json.loads(path.read_text(encoding="utf-8"))
-    server = document["mcpServers"]["repobrief"]
-    assert server["type"] == "stdio"
-    assert server["command"] == "python"
-    assert server["args"] == [
-        "repobrief-mcp-stdio.py",
-        "--bundle-root",
-        "/bundles",
-    ]
-    assert path.stat().st_mode & 0o777 == 0o600
-
-
-def test_run_bounded_rejects_timeout_and_output_limit(tmp_path: Path) -> None:
-    script = tmp_path / "runner.py"
-    script.write_text(
-        "import sys, time\n"
-        "if sys.argv[1] == 'sleep': time.sleep(2)\n"
-        "else: print('x' * 1000)\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(runner.RunnerError, match="timed out"):
-        runner.run_bounded(
-            [sys.executable, str(script), "sleep"],
-            cwd=tmp_path,
-            timeout_seconds=1,
-            stdout_limit=1024,
+    def test_duplicate_tool_use_and_orphan_result_are_rejected(self) -> None:
+        value = request()
+        messages = runner.parse_jsonl(stream(value))
+        assistant = next(item for item in messages if item["type"] == "assistant")
+        assistant["message"]["content"].append(
+            copy.deepcopy(assistant["message"]["content"][0])
         )
-    with pytest.raises(runner.RunnerError, match="stdout exceeds"):
-        runner.run_bounded(
-            [sys.executable, str(script), "output"],
-            cwd=tmp_path,
-            timeout_seconds=5,
-            stdout_limit=32,
-        )
+        with self.assertRaisesRegex(
+            runner.RunnerError, "duplicate provider tool-use id"
+        ):
+            runner.normalize_tool_calls(value, messages)
+
+        messages = runner.parse_jsonl(stream(value))
+        user = next(item for item in messages if item["type"] == "user")
+        user["message"]["content"][0]["tool_use_id"] = "orphan"
+        with self.assertRaisesRegex(runner.RunnerError, "no matching result"):
+            runner.normalize_tool_calls(value, messages)
+
+    def test_failed_tool_is_retained_as_failed_call(self) -> None:
+        value = request()
+        messages = runner.parse_jsonl(stream(value, tool_error=True))
+        calls = runner.normalize_tool_calls(value, messages)
+        self.assertEqual(calls[0]["status"], "failed")
+
+    def test_answer_rejects_unknown_claim_and_unsafe_citation(self) -> None:
+        invalid = answer()
+        invalid["claims"] = ["invented_claim"]
+        with self.assertRaisesRegex(runner.RunnerError, "unknown labels"):
+            runner.validate_answer(invalid)
+
+        invalid = answer()
+        invalid["citations"] = [
+            {"path": "../secret", "start_line": 1, "end_line": 1}
+        ]
+        with self.assertRaisesRegex(runner.RunnerError, "repository-relative"):
+            runner.validate_answer(invalid)
+
+    def test_jsonl_rejects_empty_invalid_and_oversized_transcripts(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "empty or oversized"):
+            runner.parse_jsonl(b"")
+        with self.assertRaisesRegex(runner.RunnerError, "invalid JSON"):
+            runner.parse_jsonl(b"not-json\n")
+        with self.assertRaisesRegex(runner.RunnerError, "empty or oversized"):
+            runner.parse_jsonl(b"x" * (runner.MAX_TRANSCRIPT_BYTES + 1))
+
+    def test_create_isolated_checkout_is_exact_clean_and_create_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            value = request(commit=commit)
+            checkout = runner.create_isolated_checkout(
+                value, source, root / "state"
+            )
+            self.assertEqual(git(["rev-parse", "HEAD"], checkout), commit)
+            self.assertEqual(git(["status", "--porcelain"], checkout), "")
+            with self.assertRaisesRegex(runner.RunnerError, "already used"):
+                runner.create_isolated_checkout(value, source, root / "state")
+
+    def test_load_repository_root_binds_owner_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            value = request(commit=commit)
+            map_path = root / "repositories.json"
+            map_path.write_text(
+                json.dumps(
+                    {
+                        "repo": {
+                            "repository": "heimgewebe/repo",
+                            "root": str(source),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                runner.load_repository_root(value, map_path), source.resolve()
+            )
+            document = json.loads(map_path.read_text(encoding="utf-8"))
+            document["repo"]["repository"] = "other/repo"
+            map_path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(
+                runner.RunnerError, "owner/name mismatch"
+            ):
+                runner.load_repository_root(value, map_path)
+
+    def test_execute_with_synthetic_stream_is_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            value = request(commit=commit)
+            map_path = root / "repositories.json"
+            map_path.write_text(
+                json.dumps(
+                    {
+                        "repo": {
+                            "repository": "heimgewebe/repo",
+                            "root": str(source),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fixture = root / "stream.jsonl"
+            fixture.write_bytes(stream(value))
+            receipt = runner.execute(
+                value,
+                repository_map=map_path,
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                claude="claude",
+                stream_fixture=fixture,
+            )
+            artifact = root / "transcripts" / receipt["transcript"]["artifact"]
+            self.assertEqual(artifact.read_bytes(), fixture.read_bytes())
+            self.assertEqual(receipt["status"], "success")
+            self.assertEqual(
+                receipt["does_not_establish"], list(runner.DOES_NOT_ESTABLISH)
+            )
+
+    def test_write_mcp_config_uses_request_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            value = request(condition="treatment")
+            workspace = Path(temporary) / "workspace" / "repo"
+            workspace.mkdir(parents=True)
+            path = runner.write_mcp_config(value, workspace)
+            document = json.loads(path.read_text(encoding="utf-8"))
+            server = document["mcpServers"]["repobrief"]
+            self.assertEqual(server["type"], "stdio")
+            self.assertEqual(server["command"], "python")
+            self.assertEqual(
+                server["args"],
+                ["repobrief-mcp-stdio.py", "--bundle-root", "/bundles"],
+            )
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_run_bounded_rejects_timeout_and_output_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "runner.py"
+            script.write_text(
+                "import sys, time\n"
+                "if sys.argv[1] == 'sleep': time.sleep(2)\n"
+                "else: print('x' * 1000)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(runner.RunnerError, "timed out"):
+                runner.run_bounded(
+                    [sys.executable, str(script), "sleep"],
+                    cwd=root,
+                    timeout_seconds=1,
+                    stdout_limit=1024,
+                )
+            with self.assertRaisesRegex(runner.RunnerError, "stdout exceeds"):
+                runner.run_bounded(
+                    [sys.executable, str(script), "output"],
+                    cwd=root,
+                    timeout_seconds=5,
+                    stdout_limit=32,
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()
