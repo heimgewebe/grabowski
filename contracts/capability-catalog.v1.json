@@ -1448,7 +1448,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Derive advisory cross-workspace proposals from at least two immutable reports.",
+      "description": "Derive advisory cross-workspace proposals from repeated actionable failures.",
       "effects": [
         "task-state-refresh"
       ],

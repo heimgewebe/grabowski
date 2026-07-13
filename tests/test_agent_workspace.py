@@ -61,6 +61,37 @@ def binding_evidence(kind: str, identifier: str) -> dict:
     }
 
 
+def complete_route_evidence() -> dict:
+    facts = {
+        "task_kind": "code",
+        "changed_file_estimate": 7,
+        "expected_duration_minutes": 120,
+        "novelty": "high",
+        "risk_flags": ["concurrency", "schema"],
+        "connector_instability": True,
+        "parallel_work": True,
+        "user_requested_external": False,
+        "available_external_agents": [],
+    }
+    recommendation = {
+        "schema_version": 1,
+        "score": 14,
+        "execution_mode": "full_workspace",
+        "input_facts": facts,
+        "external_candidates": [],
+    }
+    return {
+        "schema_version": 1,
+        "recommendation_id": workspace._sha256_json(recommendation),
+        "score": recommendation["score"],
+        "recommended_route": recommendation["execution_mode"],
+        "actual_route": "full_workspace",
+        "input_facts": facts,
+        "external_candidates": [],
+        "deviation_reason": None,
+    }
+
+
 def signed_receipt(payload: dict) -> dict:
     result = dict(payload)
     result["receipt_sha256"] = workspace._sha256_json(result)
@@ -302,6 +333,63 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(any(key.startswith("service:repo-writer-") for key in plan["resources"]["lease_keys"]))
         self.assertEqual(plan["resources"]["task_host"], workspace.AGENT_WORKSPACE_TASK_HOST)
         self.assertEqual(set(plan), set(workspace.PLAN_FIELDS))
+
+    def test_route_evidence_is_hash_bound_and_missing_evidence_fails_closed(self) -> None:
+        normalized = workspace._normalize_route_evidence(complete_route_evidence())
+        self.assertTrue(normalized["evidence_complete"])
+        self.assertEqual(normalized["status"], "verified")
+        missing = workspace._normalize_route_evidence(None)
+        self.assertFalse(missing["evidence_complete"])
+        tampered = complete_route_evidence()
+        tampered["score"] += 1
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "policy replay"):
+            workspace._normalize_route_evidence(tampered)
+        forged = complete_route_evidence()
+        forged["score"] = 0
+        forged["recommended_route"] = "direct_operator"
+        forged["recommendation_id"] = workspace._sha256_json({
+            "schema_version": 1,
+            "score": forged["score"],
+            "execution_mode": forged["recommended_route"],
+            "input_facts": forged["input_facts"],
+            "external_candidates": forged["external_candidates"],
+        })
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "policy replay"):
+            workspace._normalize_route_evidence(forged)
+        deviated = complete_route_evidence()
+        deviated["actual_route"] = "workspace_with_contrast"
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "deviation_reason"):
+            workspace._normalize_route_evidence(deviated)
+
+    def test_close_blocks_new_workspace_without_route_evidence(self) -> None:
+        manifest = self.manifest()
+        manifest["route_evidence"] = workspace._normalize_route_evidence(None)
+        collection = persist_collection(
+            manifest,
+            {
+                "workspace_id": manifest["workspace_id"],
+                "writer_head": manifest["expected_base_head"],
+                "diff_sha256": "d" * 64,
+                "expected_base_head": manifest["expected_base_head"],
+                "writer_result": {"type": "patch", "sha256": "e" * 64},
+            },
+        )
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace, "_collection_integrity_status", return_value={"valid": True}),
+            mock.patch.object(workspace, "_append_workspace_event"),
+            mock.patch.object(workspace, "_write_manifest"),
+            mock.patch.object(workspace, "_git_snapshot") as snapshot,
+        ):
+            result = workspace.grabowski_agent_workspace_close(
+                manifest["workspace_id"],
+                manifest["expected_base_head"],
+                "d" * 64,
+                collection["result_sha256"],
+            )
+        self.assertEqual(result["state"], "route_evidence_incomplete")
+        self.assertEqual(result["recommended_next_action"], "recreate_with_route_evidence")
+        snapshot.assert_not_called()
 
     def test_scope_overlap_is_rejected(self) -> None:
         with self.assertRaisesRegex(workspace.AgentWorkspaceError, "overlap"):
@@ -3510,6 +3598,117 @@ class AgentWorkspaceTests(unittest.TestCase):
         workspace._write_manifest(manifest)
         self.assertEqual(workspace._prospective_closure_outcome(manifest, None), "unknown")
 
+
+
+
+    def test_workspace_outcome_receipt_is_phase_bound_and_idempotent(self) -> None:
+        manifest = self.manifest()
+        collection = persist_collection(
+            manifest,
+            {
+                "workspace_id": manifest["workspace_id"],
+                "binding": manifest["binding"],
+                "expected_base_head": manifest["expected_base_head"],
+                "writer_head": manifest["expected_base_head"],
+                "diff_sha256": "d" * 64,
+                "writer_result": {
+                    "type": "patch",
+                    "path": str(self.state / manifest["workspace_id"] / "writer.patch"),
+                    "sha256": "e" * 64,
+                    "bytes": 10,
+                    "applies_to": manifest["expected_base_head"],
+                },
+                "changed_paths": ["src/app.py"],
+                "scope_passed": True,
+                "scope_violations": [],
+                "dirty": True,
+                "base_drift": False,
+                "integration_probe": None,
+                "task_ids": {"writer": "writer-task", "tests": "tests-task", "review": "review-task"},
+                "writer_task": {"state": "completed"},
+                "writer_receipt_sha256": "f" * 64,
+                "collected_at": "2026-07-13T05:30:00+00:00",
+            },
+        )
+        manifest["collection"] = collection
+        manifest["created_at"] = "2026-07-13T05:20:00+00:00"
+        first = workspace._publish_workspace_outcome(manifest, "collection")
+        second = workspace._publish_workspace_outcome(manifest, "collection")
+        self.assertEqual(first, second)
+        self.assertEqual(first["phase"], "collection")
+        self.assertEqual(first["elapsed_seconds"], 600)
+        self.assertEqual(first["route_evidence"]["actual_route"], "full_workspace")
+        self.assertFalse(first["route_evidence"]["evidence_complete"])
+        self.assertEqual(
+            first["frozen_result_identity"]["result_sha256"],
+            collection["result_sha256"],
+        )
+        self.assertTrue(workspace._outcome_receipt_path(manifest, "collection").is_file())
+        self.assertEqual(
+            manifest["outcome_receipts"]["collection"]["outcome_sha256"],
+            first["outcome_sha256"],
+        )
+        self.assertFalse(first["evidence_complete"])
+        self.assertTrue(first["route_legacy_compatibility"])
+        self.assertNotIn("route_evidence", first["missing_fields"])
+        self.assertIn(
+            "first_pass_role_results.tests.receipt_sha256",
+            first["missing_fields"],
+        )
+
+    def test_workspace_outcome_with_route_and_role_receipts_is_complete_and_versioned(self) -> None:
+        manifest = self.manifest()
+        manifest["route_evidence"] = workspace._normalize_route_evidence(complete_route_evidence())
+        manifest["created_at"] = "2026-07-13T05:20:00+00:00"
+        for role_name in ("tests", "review"):
+            payload = {"role": role_name, "returncode": 0}
+            if role_name == "review":
+                payload.update({"verdict": "PASS", "findings": []})
+            workspace._atomic_json(
+                workspace._role_receipt_path(manifest, role_name, attempt=1),
+                signed_receipt(payload),
+            )
+        base = {
+            "workspace_id": manifest["workspace_id"],
+            "binding": manifest["binding"],
+            "expected_base_head": manifest["expected_base_head"],
+            "writer_head": manifest["expected_base_head"],
+            "diff_sha256": "d" * 64,
+            "writer_result": {
+                "type": "patch",
+                "path": str(self.state / manifest["workspace_id"] / "writer.patch"),
+                "sha256": "e" * 64,
+                "bytes": 10,
+                "applies_to": manifest["expected_base_head"],
+            },
+            "writer_task": {"state": "completed"},
+            "writer_receipt_sha256": "f" * 64,
+            "collected_at": "2026-07-13T05:30:00+00:00",
+        }
+        first_collection = persist_collection(manifest, base)
+        manifest["collection"] = first_collection
+        workspace._append_workspace_event(manifest, "plan_created", outcome="planned")
+        workspace._append_workspace_event(manifest, "collection_requested", outcome="observing")
+        workspace._append_workspace_event(manifest, "collection_requested", outcome="observing")
+        first = workspace._publish_workspace_outcome(manifest, "collection")
+        self.assertTrue(first["tool_calls"]["event_log_integrity_bound"])
+        self.assertEqual(first["tool_calls"]["known_mutating_calls"]["collect"], 2)
+        self.assertTrue(first["evidence_complete"])
+        self.assertEqual(first["missing_fields"], [])
+        self.assertEqual(first["route_evidence"]["status"], "verified")
+        first_path = workspace._outcome_receipt_path(manifest, "collection")
+        updated = dict(base)
+        updated["collected_at"] = "2026-07-13T05:31:00+00:00"
+        updated["tests"] = {"status": "passed", "returncode": 0, "receipt_sha256": "1" * 64}
+        second_collection = persist_collection(manifest, updated)
+        manifest["collection"] = second_collection
+        second = workspace._publish_workspace_outcome(manifest, "collection")
+        second_path = workspace._outcome_receipt_path(manifest, "collection")
+        self.assertNotEqual(first["outcome_identity"], second["outcome_identity"])
+        self.assertNotEqual(first_path, second_path)
+        self.assertTrue(first_path.is_file())
+        self.assertTrue(second_path.is_file())
+        self.assertEqual(len(manifest["outcome_receipts"]["collection"]["history"]), 2)
 
 
 if __name__ == "__main__":

@@ -1193,5 +1193,37 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertTrue(stale.exists())
 
 
+
+    def test_route_recommendation_id_is_stable_and_trivial_boundary_is_explicit(self) -> None:
+        kwargs = {
+            "task_kind": "code",
+            "changed_file_estimate": 8,
+            "expected_duration_minutes": 90,
+            "novelty": "high",
+            "risk_flags": ["schema", "concurrency"],
+            "connector_instability": True,
+            "parallel_work": True,
+            "available_external_agents": [],
+        }
+        first = competition.grabowski_agent_execution_route(**kwargs)
+        second = competition.grabowski_agent_execution_route(**kwargs)
+        self.assertEqual(first["recommendation_id"], second["recommendation_id"])
+        self.assertRegex(first["recommendation_id"], r"^[0-9a-f]{64}$")
+        self.assertEqual(first["input_facts"]["changed_file_estimate"], 8)
+        self.assertFalse(first["trivial_work"])
+        self.assertTrue(first["deviation_requires_reason"])
+        trivial = competition.grabowski_agent_execution_route(
+            task_kind="docs",
+            changed_file_estimate=1,
+            expected_duration_minutes=15,
+            novelty="low",
+            risk_flags=[],
+            connector_instability=False,
+            parallel_work=False,
+            available_external_agents=[],
+        )
+        self.assertTrue(trivial["trivial_work"])
+
+
 if __name__ == "__main__":
     unittest.main()
