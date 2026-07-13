@@ -73,7 +73,6 @@ EXPECTED_AXIS_NAMES = (
     "paths",
     "generated_artifacts",
     "path_generated_cross",
-    "worktree_paths_cross",
     "components",
     "runtime_resources",
     "processes",
@@ -200,9 +199,13 @@ def normalize_scope_manifest(value: Any) -> dict[str, Any]:
     worktree = _absolute_path(value["worktree"], label="worktree")
     repo_parent = os.path.dirname(repository)
     if worktree != repository and (
-        worktree == repo_parent or not _path_within(worktree, repo_parent)
+        worktree == repo_parent
+        or not _path_within(worktree, repo_parent)
+        or _path_within(worktree, repository)
     ):
-        raise ValueError("worktree must be the repository root or a distinct path below its parent")
+        raise ValueError(
+            "worktree must be the repository root or a distinct sibling path below its parent"
+        )
     effects = _list(value["effects"], label="effects")
     unknown_effects = sorted(set(effects) - EFFECTS)
     if unknown_effects:
@@ -224,8 +227,10 @@ def normalize_scope_manifest(value: Any) -> dict[str, Any]:
 
     for axis in ("paths", "generated_artifacts"):
         for path in result[axis]:
-            if not (_path_within(path, repository) or _path_within(path, worktree)):
-                raise ValueError(f"{axis} entry must be inside repository or declared worktree")
+            if not _path_within(path, repository):
+                raise ValueError(
+                    f"{axis} entry must be a canonical logical path inside repository"
+                )
 
     mutating = bool(set(effects) - {"read"})
     if mutating and not (result["paths"] or result["components"] or result["runtime_resources"]):
@@ -348,11 +353,6 @@ def evaluate_scope_manifests(existing: Any, requested: Any) -> dict[str, Any]:
             "path_generated_cross",
             _path_pairs(left["paths"], right["generated_artifacts"])
             + _path_pairs(left["generated_artifacts"], right["paths"]),
-        ),
-        _axis_result(
-            "worktree_paths_cross",
-            _path_pairs([left["worktree"]], right["paths"] + right["generated_artifacts"])
-            + _path_pairs(left["paths"] + left["generated_artifacts"], [right["worktree"]]),
         ),
     ]
     for axis in (

@@ -14,16 +14,16 @@ The governor may validate the public proof and recommend a bounded route. It rem
 
 ## Required scope manifest
 
-Schema version 1 declares repository, task ID, common base commit, current head, branch, isolated worktree, effects and all conflict axes. Both executions must declare the same base commit; otherwise the audit cannot establish disjointness.
+Schema version 1 declares repository, task ID, common base commit, current head, branch, physical worktree, effects and all conflict axes. Both executions must declare the same base commit; otherwise the audit cannot establish disjointness. A secondary worktree must be a distinct sibling below the repository parent, never a nested directory of the main checkout.
 
 - exact paths and generated artifacts;
 - components and runtime resources;
 - processes, deployments and migration domains;
 - shared gates for repository-wide operations.
 
-Resource keys and manifest axes must match exactly in both directions. Normal and generated files both use canonical `path:` resources so the same filesystem object cannot be hidden behind separate key kinds. `component`, `process`, `deployment`, `migration` and `gate` map to their corresponding axes. `service`, `port`, `display` and `browser-profile` map to `runtime_resources`.
+Resource keys and manifest axes must match exactly in both directions. Normal and generated files both use canonical `path:` resources in the logical repository namespace so the same target cannot be hidden behind separate worktree locations or key kinds. `component`, `process`, `deployment`, `migration` and `gate` map to their corresponding axes. `service`, `port`, `display` and `browser-profile` map to `runtime_resources`.
 
-Filesystem checks cover ancestor and descendant overlap across paths, generated artifacts and foreign worktree roots. Symlink aliases, wildcards, unknown fields, omitted axes, out-of-scope paths and contradictory effects are rejected.
+Filesystem checks cover ancestor and descendant overlap across logical paths and generated artifacts. Physical worktree equality is checked separately. Symlink aliases, nested secondary worktrees, wildcards, unknown fields, omitted axes, out-of-repository paths and contradictory effects are rejected.
 
 Repository-wide effects require canonical shared gates:
 

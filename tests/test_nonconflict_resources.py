@@ -431,7 +431,7 @@ class NonConflictResourceTests(unittest.TestCase):
         )
         self.assertEqual(result["decision"], "allow")
 
-    def test_paths_outside_repository_and_worktree_are_rejected(self) -> None:
+    def test_paths_outside_repository_are_rejected(self) -> None:
         requested = self.scope("b")
         requested["paths"] = [str(self.root.parent / "foreign.py")]
         with self.assertRaisesRegex(ValueError, "inside repository"):
@@ -550,7 +550,37 @@ class NonConflictResourceTests(unittest.TestCase):
                 metadata={"scope_manifest": self.scope("a")},
             )
 
-    def test_cross_axis_paths_and_worktree_paths_conflict(self) -> None:
+    def test_main_checkout_blocker_can_allow_disjoint_sibling_worktree(self) -> None:
+        existing = self.scope("a")
+        existing["worktree"] = str(self.repo)
+        resources.acquire_resources(
+            "owner-a",
+            [f"repo:{self.repo}"],
+            purpose="primary work in main checkout",
+            ttl_seconds=180,
+            metadata={
+                "scope_manifest": existing,
+                "scope_manifest_complete": True,
+            },
+        )
+        assessment = self.assess()
+        self.assertEqual(assessment["decision"], "allow")
+        result = resources.acquire_resources(
+            "owner-b",
+            [f"path:{self.repo / 'src' / 'b.py'}"],
+            purpose="secondary exact work",
+            ttl_seconds=30,
+            metadata={
+                "scope_manifest": self.scope("b"),
+                "scope_manifest_complete": True,
+            },
+            nonconflict_proof=assessment["proof"],
+        )
+        self.assertEqual(result["nonconflict_exception"]["decision"], "allow")
+        blocker = resources.inspect_resource(f"repo:{self.repo}")
+        self.assertEqual(blocker["owner_id"], "owner-a")
+
+    def test_cross_axis_paths_conflict(self) -> None:
         existing = self.scope(
             "a",
             path=str(self.repo / "src" / "a.py"),
@@ -567,16 +597,6 @@ class NonConflictResourceTests(unittest.TestCase):
         self.assertEqual(cross["decision"], "deny")
         self.assertIn("path_generated_cross", cross["blocker_axes"])
 
-        existing["worktree"] = str(self.repo / ".worktrees" / "a")
-        inside_foreign_worktree = self.scope(
-            "b", path=str(Path(existing["worktree"]) / "src" / "b.py")
-        )
-        worktree_cross = nonconflict.evaluate_scope_manifests(
-            existing, inside_foreign_worktree
-        )
-        self.assertEqual(worktree_cross["decision"], "deny")
-        self.assertIn("worktree_paths_cross", worktree_cross["blocker_axes"])
-
     def test_different_baselines_and_noncanonical_paths_fail_closed(self) -> None:
         existing = self.scope("a")
         requested = self.scope("b")
@@ -587,8 +607,12 @@ class NonConflictResourceTests(unittest.TestCase):
 
         invalid_worktree = self.scope("b")
         invalid_worktree["worktree"] = str(self.repo.parent)
-        with self.assertRaisesRegex(ValueError, "distinct path"):
+        with self.assertRaisesRegex(ValueError, "distinct sibling path"):
             nonconflict.normalize_scope_manifest(invalid_worktree)
+        nested_worktree = self.scope("b")
+        nested_worktree["worktree"] = str(self.repo / ".worktrees" / "b")
+        with self.assertRaisesRegex(ValueError, "distinct sibling path"):
+            nonconflict.normalize_scope_manifest(nested_worktree)
 
         self.acquire_blocker()
         alias = self.root / "repo-alias"
