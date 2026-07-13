@@ -3,14 +3,13 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-SUPPORT_PATH = ROOT / "support" / "repobrief_agent_benchmark_preflight_cases.py"
+SUPPORT_PATH = Path(__file__).resolve().parent / "support" / "repobrief_agent_benchmark_preflight_cases.py"
 SPEC = importlib.util.spec_from_file_location(
     "repobrief_agent_benchmark_preflight_cases", SUPPORT_PATH
 )
