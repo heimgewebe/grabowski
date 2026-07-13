@@ -674,10 +674,15 @@ def _verify_workspace_terminal_source(
                 "terminal-evidence-mismatch",
                 "workspace lease metadata does not bind the canonical workspace plan",
             )
-        if snapshot["updated_at_unix"] > terminal_at_unix:
+        if snapshot["acquired_at_unix"] >= terminal_at_unix:
             raise nonconflict.NonConflictDenied(
                 "terminal-evidence-drift",
-                "workspace lease was updated after the terminal closeout began",
+                "workspace lease was acquired at or after the terminal closeout",
+            )
+        if snapshot["updated_at_unix"] >= terminal_at_unix:
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-drift",
+                "workspace lease was updated at or after the terminal closeout",
             )
     return {
         "kind": "agent_workspace_close",
@@ -795,10 +800,15 @@ def _verify_task_terminal_source(
                 "terminal-evidence-mismatch",
                 "task lease metadata does not bind the canonical task attempt",
             )
-        if snapshot["updated_at_unix"] > observed_at_unix:
+        if snapshot["acquired_at_unix"] >= observed_at_unix:
             raise nonconflict.NonConflictDenied(
                 "terminal-evidence-drift",
-                "task lease was updated after the authoritative terminal observation",
+                "task lease was acquired at or after the authoritative terminal observation",
+            )
+        if snapshot["updated_at_unix"] >= observed_at_unix:
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-drift",
+                "task lease was updated at or after the authoritative terminal observation",
             )
     return {
         "kind": "durable_task_outcome",
