@@ -32,6 +32,7 @@ import grabowski_consumer_surface as consumer_surface
 import grabowski_grips
 
 APP_NAME = "Grabowski"
+DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 5
 AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
 AGENT_INSTRUCTIONS_VERSION = "grabowski-agent-facing-contract-v1"
 AGENT_INSTRUCTIONS_MAX_BYTES = 4_096
@@ -2435,7 +2436,7 @@ def _path_inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-def _is_hex(value: Any, length: int) -> bool:
+def _is_lower_hex(value: Any, length: int) -> bool:
     return (
         isinstance(value, str)
         and len(value) == length
@@ -2462,7 +2463,7 @@ def _valid_agent_instructions_identity(value: Any) -> bool:
         }
         and value.get("schema_version") == AGENT_INSTRUCTIONS_SCHEMA_VERSION
         and value.get("version") == AGENT_INSTRUCTIONS_VERSION
-        and _is_hex(value.get("sha256"), 64)
+        and _is_lower_hex(value.get("sha256"), 64)
         and isinstance(value.get("bytes"), int)
         and not isinstance(value.get("bytes"), bool)
         and 0 < value["bytes"] <= AGENT_INSTRUCTIONS_MAX_BYTES
@@ -2501,9 +2502,12 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         value = raw.get(key)
         if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
             return False
-    if raw.get("schema_version") != 5 or raw.get("completion_status") != "complete":
+    if (
+        raw.get("schema_version") != DEPLOYMENT_MANIFEST_SCHEMA_VERSION
+        or raw.get("completion_status") != "complete"
+    ):
         return False
-    if not _is_hex(raw.get("repo_head"), 40):
+    if not _is_lower_hex(raw.get("repo_head"), 40):
         return False
     for key in (
         "entrypoint_contract_sha256",
@@ -2511,7 +2515,7 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         "runtime_input_sha256",
         "runtime_lock_sha256",
     ):
-        if not _is_hex(raw.get(key), 64):
+        if not _is_lower_hex(raw.get(key), 64):
             return False
     if not _valid_agent_instructions_identity(raw.get("agent_instructions")):
         return False
@@ -2567,7 +2571,7 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
     if (
         not isinstance(hashes, dict)
         or set(hashes) != modules
-        or not all(_is_hex(value, 64) for value in hashes.values())
+        or not all(_is_lower_hex(value, 64) for value in hashes.values())
         or hashes.get(module) != raw.get("source_sha256")
     ):
         return False
@@ -2711,7 +2715,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
     except (OSError, RuntimeError):
         release_path_valid = False
     release_id_valid = isinstance(raw.get("release_id"), str) and raw.get("release_id") == release_root.name
-    repo_head_valid = _is_hex(raw.get("repo_head"), 40)
+    repo_head_valid = _is_lower_hex(raw.get("repo_head"), 40)
     runtime_pointer_valid = False
     try:
         runtime_pointer_valid = (
