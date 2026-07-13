@@ -2,6 +2,7 @@ from pathlib import Path
 import ast
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import stat
@@ -226,6 +227,115 @@ class OperatorContractTests(unittest.TestCase):
                 assignments[target.id] = node.value.value
         self.assertEqual(60, assignments.get("DEFAULT_TIMEOUT"))
         self.assertEqual(120, assignments.get("MAX_TIMEOUT"))
+
+    def test_synchronous_call_shape_allows_bounded_direct_argv(self) -> None:
+        operator = _load_operator_module()
+        receipt = operator._synchronous_call_shape_receipt(
+            ["printf", "ok"],
+            timeout_seconds=30,
+            max_output_bytes=64 * 1024,
+            surface="test",
+        )
+        self.assertTrue(receipt["allowed"])
+        self.assertIsNone(receipt["required_route"])
+        self.assertFalse(receipt["process_started"])
+
+    def test_synchronous_call_shape_denies_shell_composition_before_start(self) -> None:
+        operator = _load_operator_module()
+        with self.assertRaises(operator.SynchronousCallShapeDenied) as raised:
+            operator._enforce_synchronous_call_shape(
+                ["env", "MODE=test", "bash", "-lc", "printf ok"],
+                timeout_seconds=30,
+                max_output_bytes=64 * 1024,
+                surface="grabowski_terminal_run",
+            )
+        receipt = raised.exception.receipt
+        self.assertEqual(receipt["required_route"], "durable_task")
+        self.assertIn("shell_composition_requires_durable_task", receipt["reason_codes"])
+        self.assertFalse(receipt["process_started"])
+        self.assertIn('"required_route":"durable_task"', str(raised.exception))
+
+    def test_synchronous_call_shape_denies_known_shell_launchers(self) -> None:
+        operator = _load_operator_module()
+        examples = [
+            ["busybox", "sh", "-c", "printf ok"],
+            ["docker", "exec", "container", "sh", "-c", "printf ok"],
+            ["ssh", "host", "bash", "-lc", "printf ok"],
+            ["ssh", "host", "bash -lc 'printf ok'"],
+            ["docker", "exec", "container", "sh -c 'printf ok'"],
+            ["systemd-run", "--user", "bash", "-lc", "printf ok"],
+        ]
+        for command in examples:
+            with self.subTest(command=command):
+                receipt = operator._synchronous_call_shape_receipt(
+                    command,
+                    timeout_seconds=30,
+                    max_output_bytes=1024,
+                    surface="test",
+                )
+                self.assertFalse(receipt["allowed"])
+                self.assertEqual(receipt["required_route"], "durable_task")
+
+    def test_synchronous_call_shape_does_not_treat_shell_name_as_plain_data(self) -> None:
+        operator = _load_operator_module()
+        receipt = operator._synchronous_call_shape_receipt(
+            ["printf", "%s", "bash"],
+            timeout_seconds=30,
+            max_output_bytes=1024,
+            surface="test",
+        )
+        self.assertTrue(receipt["allowed"])
+
+    def test_synchronous_call_shape_denies_long_timeout(self) -> None:
+        operator = _load_operator_module()
+        with self.assertRaises(operator.SynchronousCallShapeDenied) as raised:
+            operator._enforce_synchronous_call_shape(
+                ["sleep", "1"],
+                timeout_seconds=31,
+                max_output_bytes=1024,
+                surface="grabowski_fleet_run",
+            )
+        self.assertEqual(raised.exception.receipt["required_route"], "durable_task")
+        self.assertIn(
+            "timeout_exceeds_synchronous_transport_ceiling",
+            raised.exception.receipt["reason_codes"],
+        )
+
+    def test_synchronous_call_shape_denies_large_output_as_split_read(self) -> None:
+        operator = _load_operator_module()
+        with self.assertRaises(operator.SynchronousCallShapeDenied) as raised:
+            operator._enforce_synchronous_call_shape(
+                ["cat", "large.txt"],
+                timeout_seconds=30,
+                max_output_bytes=64 * 1024 + 1,
+                surface="grabowski_terminal_run",
+            )
+        self.assertEqual(raised.exception.receipt["required_route"], "split_read")
+        self.assertIn(
+            "output_exceeds_synchronous_transport_ceiling",
+            raised.exception.receipt["reason_codes"],
+        )
+
+    def test_terminal_run_uses_server_owned_limits(self) -> None:
+        operator = _load_operator_module()
+        parameters = inspect.signature(operator.grabowski_terminal_run).parameters
+        self.assertEqual(list(parameters), ["argv", "cwd"])
+        self.assertEqual(operator.grabowski_terminal_run.__defaults__, (None,))
+        with patch.object(operator, "_run", return_value={"returncode": 0}) as run:
+            result = operator.grabowski_terminal_run(["printf", "ok"])
+        self.assertEqual(run.call_args.kwargs["timeout_seconds"], 30)
+        self.assertEqual(run.call_args.kwargs["max_output_bytes"], 64 * 1024)
+        contract = result["synchronous_contract"]
+        self.assertTrue(contract["server_owned_limits"])
+        self.assertFalse(contract["client_selected_timeout_supported"])
+        self.assertFalse(contract["client_selected_output_limit_supported"])
+
+    def test_terminal_run_gate_prevents_process_start(self) -> None:
+        operator = _load_operator_module()
+        with patch.object(operator, "_run") as run:
+            with self.assertRaises(operator.SynchronousCallShapeDenied):
+                operator.grabowski_terminal_run(["bash", "-lc", "printf ok"])
+        run.assert_not_called()
 
     def test_timeout_kills_the_full_process_group(self) -> None:
         source = SOURCE.read_text(encoding="utf-8")

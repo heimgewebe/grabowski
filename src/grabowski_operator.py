@@ -45,6 +45,16 @@ TRUSTED_MAX_JOB_RUNTIME = 2_592_000
 DEFAULT_OUTPUT_BYTES = 250_000
 MAX_OUTPUT_BYTES = 2_000_000
 TRUSTED_MAX_OUTPUT_BYTES = 33_554_432
+SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS = 30
+SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES = 64 * 1024
+SYNCHRONOUS_SHELL_EXECUTABLES = frozenset({
+    "bash", "dash", "fish", "ksh", "sh", "zsh",
+})
+SYNCHRONOUS_SHELL_WRAPPERS = frozenset({
+    "busybox", "chroot", "command", "docker", "env", "machinectl", "nice",
+    "nohup", "nsenter", "podman", "setsid", "ssh", "stdbuf", "systemd-run",
+    "timeout", "toybox", "unshare", "xargs",
+})
 MAX_NOTIFY_ON_DONE_CHANNELS = 5
 MAX_NOTIFY_ON_DONE_TEXT = 200
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
@@ -485,6 +495,143 @@ def _output_limit(value: int) -> int:
             f"max_output_bytes must be between 1 and {maximum}"
         )
     return value
+
+
+class SynchronousCallShapeDenied(PermissionError):
+    """Fail-closed receipt for a generic synchronous call rejected before start."""
+
+    def __init__(self, receipt: dict[str, Any]) -> None:
+        self.receipt = receipt
+        super().__init__(
+            json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        )
+
+
+def _argument_starts_shell(value: str) -> bool:
+    try:
+        tokens = shlex.split(value, posix=True)
+    except ValueError:
+        return False
+    return bool(tokens) and Path(tokens[0]).name in SYNCHRONOUS_SHELL_EXECUTABLES
+
+
+def _uses_shell_composition(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    first = Path(argv[0]).name
+    for index, item in enumerate(argv):
+        if Path(item).name in SYNCHRONOUS_SHELL_EXECUTABLES:
+            if index == 0 or first in SYNCHRONOUS_SHELL_WRAPPERS:
+                return True
+            if index > 0 and argv[index - 1] in {"-exec", "-execdir"}:
+                return True
+        if (
+            index > 0
+            and first in SYNCHRONOUS_SHELL_WRAPPERS
+            and _argument_starts_shell(item)
+        ):
+            return True
+    return False
+
+
+def _synchronous_call_shape_receipt(
+    argv: list[str],
+    *,
+    timeout_seconds: int,
+    max_output_bytes: int,
+    surface: str,
+) -> dict[str, Any]:
+    if not isinstance(surface, str) or not surface:
+        raise ValueError("surface must be a non-empty string")
+    reason_codes: list[str] = []
+    if _uses_shell_composition(argv):
+        reason_codes.append("shell_composition_requires_durable_task")
+    if timeout_seconds > SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS:
+        reason_codes.append("timeout_exceeds_synchronous_transport_ceiling")
+    if max_output_bytes > SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES:
+        reason_codes.append("output_exceeds_synchronous_transport_ceiling")
+
+    allowed = not reason_codes
+    durable = any(
+        reason in reason_codes
+        for reason in (
+            "shell_composition_requires_durable_task",
+            "timeout_exceeds_synchronous_transport_ceiling",
+        )
+    )
+    required_route = None if allowed else "durable_task" if durable else "split_read"
+    return {
+        "schema_version": 1,
+        "kind": "synchronous_call_shape_gate",
+        "surface": surface,
+        "allowed": allowed,
+        "process_started": False,
+        "required_route": required_route,
+        "reason_codes": reason_codes,
+        "argv_sha256": _argv_hash(argv),
+        "requested": {
+            "timeout_seconds": timeout_seconds,
+            "max_output_bytes": max_output_bytes,
+        },
+        "limits": {
+            "timeout_seconds": SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS,
+            "max_output_bytes": SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES,
+            "shell_composition_allowed": False,
+        },
+        "recommended_tools": (
+            ["grabowski_job_start", "grabowski_task_start"]
+            if required_route == "durable_task"
+            else ["typed_read_tool", "grabowski_call_shape_check"]
+            if required_route == "split_read"
+            else []
+        ),
+        "does_not_establish": [
+            "connector_or_ui_hang_root_cause",
+            "command_would_fail",
+            "durable_task_success",
+            "permission_to_execute",
+        ],
+    }
+
+
+def _enforce_synchronous_call_shape(
+    argv: list[str],
+    *,
+    timeout_seconds: int,
+    max_output_bytes: int,
+    surface: str,
+) -> dict[str, Any]:
+    receipt = _synchronous_call_shape_receipt(
+        argv,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=max_output_bytes,
+        surface=surface,
+    )
+    if receipt["allowed"] is not True:
+        raise SynchronousCallShapeDenied(receipt)
+    return receipt
+
+
+def _synchronous_public_contract(*, surface: str) -> dict[str, Any]:
+    if not isinstance(surface, str) or not surface:
+        raise ValueError("surface must be a non-empty string")
+    return {
+        "schema_version": 1,
+        "surface": surface,
+        "server_owned_limits": True,
+        "client_selected_timeout_supported": False,
+        "client_selected_output_limit_supported": False,
+        "timeout_seconds": SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS,
+        "max_output_bytes": SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES,
+        "shell_composition_allowed": False,
+        "long_running_route": "grabowski_task_start",
+        "large_read_route": "typed_read_or_split_read",
+        "does_not_establish": [
+            "connector_or_ui_hang_root_cause",
+            "absence_of_future_transport_failures",
+            "durable_task_success",
+        ],
+    }
 
 
 def _terminate_process_group(
@@ -2250,18 +2397,29 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
 def grabowski_terminal_run(
     argv: list[str],
     cwd: str | None = None,
-    timeout_seconds: int = DEFAULT_TIMEOUT,
-    max_output_bytes: int = DEFAULT_OUTPUT_BYTES,
 ) -> dict[str, Any]:
-    """Run one non-interactive command and return redacted output."""
+    """Run one direct command with fixed server-owned synchronous limits."""
     _require_operator_mutation("terminal_execute")
     working_directory = _resolve_cwd(cwd)
-    return _run(
-        _validate_argv(argv, cwd=working_directory),
-        cwd=working_directory,
-        timeout_seconds=_timeout(timeout_seconds),
-        max_output_bytes=_output_limit(max_output_bytes),
+    command = _validate_argv(argv, cwd=working_directory)
+    timeout = SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS
+    output_limit = SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES
+    _enforce_synchronous_call_shape(
+        command,
+        timeout_seconds=timeout,
+        max_output_bytes=output_limit,
+        surface="grabowski_terminal_run",
     )
+    result = _run(
+        command,
+        cwd=working_directory,
+        timeout_seconds=timeout,
+        max_output_bytes=output_limit,
+    )
+    result["synchronous_contract"] = _synchronous_public_contract(
+        surface="grabowski_terminal_run"
+    )
+    return result
 
 
 def _reserved_runtime_deploy_command(

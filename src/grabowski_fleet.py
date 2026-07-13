@@ -218,14 +218,46 @@ def grabowski_fleet_list() -> dict[str, Any]:
             "hosts": fleet["hosts"], "count": len(fleet["hosts"])}
 
 
+def run_public_fleet_host(
+    host: str,
+    argv: list[str],
+    *,
+    surface: str,
+) -> dict[str, Any]:
+    """Gate one generic fleet call with fixed server-owned sync limits."""
+    command = _safe_argv(argv)
+    timeout = operator.SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS
+    output_limit = operator.SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES
+    operator._enforce_synchronous_call_shape(
+        command,
+        timeout_seconds=timeout,
+        max_output_bytes=output_limit,
+        surface=surface,
+    )
+    result = run_fleet_host(
+        host,
+        command,
+        timeout_seconds=timeout,
+        max_output_bytes=output_limit,
+    )
+    result["synchronous_contract"] = operator._synchronous_public_contract(
+        surface=surface
+    )
+    return result
+
+
 @mcp.tool(name="grabowski_fleet_run", annotations=MUTATING)
-def grabowski_fleet_run(host: str, argv: list[str],
-                        timeout_seconds: int = operator.DEFAULT_TIMEOUT,
-                        max_output_bytes: int = operator.DEFAULT_OUTPUT_BYTES) -> dict[str, Any]:
-    """Run one argv command on one registered local or SSH host."""
+def grabowski_fleet_run(
+    host: str,
+    argv: list[str],
+) -> dict[str, Any]:
+    """Run one fleet command with fixed server-owned synchronous limits."""
     operator._require_operator_mutation("terminal_execute")
-    return run_fleet_host(host, argv, timeout_seconds=timeout_seconds,
-                          max_output_bytes=max_output_bytes)
+    return run_public_fleet_host(
+        host,
+        argv,
+        surface="grabowski_fleet_run",
+    )
 
 
 def main() -> int:
@@ -236,7 +268,6 @@ def main() -> int:
     run = sub.add_parser("run")
     run.add_argument("host")
     run.add_argument("argv", nargs=argparse.REMAINDER)
-    run.add_argument("--timeout", type=int, default=operator.DEFAULT_TIMEOUT)
     args = parser.parse_args()
     try:
         if args.command == "list":
@@ -245,9 +276,11 @@ def main() -> int:
             if not args.argv:
                 raise ValueError("run requires an argv after the host")
             operator._require_operator_mutation("terminal_execute")
-            result = run_fleet_host(args.host, args.argv,
-                                    timeout_seconds=args.timeout,
-                                    max_output_bytes=operator.DEFAULT_OUTPUT_BYTES)
+            result = run_public_fleet_host(
+                args.host,
+                args.argv,
+                surface="grabowski_fleet_cli",
+            )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except Exception as exc:
