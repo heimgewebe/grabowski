@@ -636,16 +636,34 @@ def _validate_init(request: Mapping[str, Any], init: Mapping[str, Any]) -> str:
     if model != expected:
         raise RunnerError("provider model does not match request")
     available = set(_list(init.get("tools")))
-    allowed = set(READ_ONLY_BUILTINS)
+    required = set(READ_ONLY_BUILTINS)
+    allowed = set(required)
     if request.get("condition") == "treatment":
-        allowed.update(TREATMENT_RESOURCE_TOOLS)
-        allowed.update(TREATMENT_MCP_TOOLS)
+        treatment_tools = set(TREATMENT_RESOURCE_TOOLS) | set(TREATMENT_MCP_TOOLS)
+        required.update(treatment_tools)
+        allowed.update(treatment_tools)
     unknown = available.difference(allowed)
     if unknown:
         raise RunnerError(f"provider exposed unapproved tools: {sorted(unknown)!r}")
-    if not set(READ_ONLY_BUILTINS).issubset(available):
-        raise RunnerError("provider did not expose all read-only baseline tools")
+    missing = required.difference(available)
+    if missing:
+        raise RunnerError(
+            f"provider did not expose all required tools: {sorted(missing)!r}"
+        )
     return model
+
+
+def _validate_provider_session(
+    init: Mapping[str, Any], result: Mapping[str, Any]
+) -> None:
+    init_session = _require_string(
+        init.get("session_id"), "provider init session", maximum=300
+    )
+    result_session = _require_string(
+        result.get("session_id"), "provider result session", maximum=300
+    )
+    if init_session != result_session:
+        raise RunnerError("provider result session does not match init session")
 
 
 def _usage(request: Mapping[str, Any], result: Mapping[str, Any]) -> tuple[int, int]:
@@ -802,6 +820,7 @@ def build_receipt(
     init = _single_message(messages, message_type="system", subtype="init")
     result = _single_message(messages, message_type="result")
     model = _validate_init(request, init)
+    _validate_provider_session(init, result)
     input_tokens, output_tokens = _usage(request, result)
     if returncode != 0 or result.get("is_error") is True or result.get("subtype") != "success":
         raise RunnerError("provider did not produce a successful result")
