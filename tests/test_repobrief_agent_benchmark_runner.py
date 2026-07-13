@@ -41,11 +41,13 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
             "manifest_sha256": MANIFEST_SHA,
             "mcp_command": ["python", "repobrief-mcp-stdio.py", "--bundle-root", "/bundles"],
         }
+    pair_id = "taskset:case:r1"
+    request_id = f"{pair_id}:{condition}"
     return {
         "kind": runner.REQUEST_KIND,
         "version": runner.VERSION,
-        "request_id": f"task:case:r1:{condition}",
-        "pair_id": "task:case:r1",
+        "request_id": request_id,
+        "pair_id": pair_id,
         "case_id": "case",
         "condition": condition,
         "order": 1 if condition == "baseline" else 2,
@@ -57,8 +59,8 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
             "repository": "heimgewebe/repo",
             "commit": commit,
         },
-        "session_id": f"session:{condition}",
-        "workspace_id": f"workspace:{condition}",
+        "session_id": f"session:{request_id}",
+        "workspace_id": f"workspace:{request_id}",
         "prompt": "Find the implementation and cite it.",
         "allowed_tools": sorted(allowed),
         "budgets": {
@@ -199,6 +201,16 @@ def repository(root: Path) -> tuple[Path, str]:
     return source, git(["rev-parse", "HEAD"], source)
 
 
+def planned_request_root(root: Path, value: dict) -> Path:
+    request_root = root / "requests"
+    request_root.mkdir()
+    filename = value["request_id"].replace(":", "__") + ".json"
+    (request_root / filename).write_text(
+        json.dumps(value, sort_keys=True), encoding="utf-8"
+    )
+    return request_root
+
+
 class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
     def test_validate_request_accepts_both_conditions(self) -> None:
         runner.validate_request(request())
@@ -248,6 +260,42 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         value["repobrief"]["manifest_sha256"] = "bad"
         with self.assertRaisesRegex(runner.RunnerError, "manifest_sha256"):
             runner.validate_request(value)
+
+    def test_request_identity_is_derived_and_bounded(self) -> None:
+        cases = [
+            ("repetition", 3, "repetition must be 1 or 2"),
+            ("order", 3, "order must be 1 or 2"),
+            ("pair_id", "wrong", "pair_id does not match"),
+            ("request_id", "wrong", "request_id does not match"),
+            ("session_id", "wrong", "session_id does not match"),
+            ("workspace_id", "wrong", "workspace_id does not match"),
+        ]
+        for field, replacement, message in cases:
+            with self.subTest(field=field):
+                value = request()
+                value[field] = replacement
+                with self.assertRaisesRegex(runner.RunnerError, message):
+                    runner.validate_request(value)
+
+        value = request()
+        value["does_not_establish"] = []
+        with self.assertRaisesRegex(runner.RunnerError, "does_not_establish"):
+            runner.validate_request(value)
+
+    def test_load_planned_request_requires_exact_frozen_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request()
+            request_root = planned_request_root(root, value)
+            self.assertEqual(
+                runner.load_planned_request(value, request_root), value
+            )
+            mutated = copy.deepcopy(value)
+            mutated["prompt"] = "post-hoc prompt"
+            with self.assertRaisesRegex(
+                runner.RunnerError, "does not match the frozen plan request"
+            ):
+                runner.load_planned_request(mutated, request_root)
 
     def test_build_baseline_command_exposes_only_read_tools(self) -> None:
         command = runner.build_claude_command(
@@ -506,19 +554,25 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             )
             fixture = root / "stream.jsonl"
             fixture.write_bytes(stream(value))
-            receipt = runner.execute(
+            request_root = planned_request_root(root, value)
+            report = runner.execute(
                 value,
+                request_root=request_root,
                 repository_map=map_path,
                 state_root=root / "state",
                 transcript_root=root / "transcripts",
                 claude="claude",
                 stream_fixture=fixture,
             )
-            artifact = root / "transcripts" / receipt["transcript"]["artifact"]
+            candidate = report["normalized_candidate"]
+            artifact = root / "transcripts" / candidate["transcript"]["artifact"]
             self.assertEqual(artifact.read_bytes(), fixture.read_bytes())
-            self.assertEqual(receipt["status"], "success")
+            self.assertEqual(report["kind"], runner.FIXTURE_REPORT_KIND)
+            self.assertTrue(report["synthetic_fixture"])
+            self.assertEqual(candidate["provider"]["name"], "synthetic-fixture")
+            self.assertEqual(candidate["provider"]["token_source"], "synthetic")
             self.assertEqual(
-                receipt["does_not_establish"], list(runner.DOES_NOT_ESTABLISH)
+                report["does_not_establish"], list(runner.DOES_NOT_ESTABLISH)
             )
 
     def test_write_mcp_config_uses_request_argv(self) -> None:

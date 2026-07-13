@@ -14,22 +14,22 @@ import json
 import os
 from pathlib import Path
 import selectors
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 REQUEST_KIND = "repobrief.agent_benchmark_run_request"
 RECEIPT_KIND = "repobrief.agent_benchmark_run_receipt"
+FIXTURE_REPORT_KIND = "repobrief.agent_benchmark_fixture_report"
 VERSION = "1.0"
 PROVIDER = "anthropic-claude-code"
 MAX_REQUEST_BYTES = 1 * 1024 * 1024
 MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 MAX_TOOL_CALLS = 1000
+MAX_PLANNED_REQUESTS = 128
 READ_ONLY_BUILTINS = ("Read", "Glob", "Grep")
 TREATMENT_RESOURCE_TOOLS = ("ListMcpResources", "ReadMcpResource")
 TREATMENT_MCP_TOOLS = (
@@ -259,15 +259,32 @@ def validate_request(request: Mapping[str, Any]) -> None:
     condition = request.get("condition")
     if condition not in {"baseline", "treatment"}:
         raise RunnerError("request condition is invalid")
-    _require_string(request.get("request_id"), "request_id")
-    _require_string(request.get("pair_id"), "pair_id")
-    _require_string(request.get("case_id"), "case_id")
-    _require_string(request.get("session_id"), "session_id")
-    _require_string(request.get("workspace_id"), "workspace_id")
+    taskset_id = _require_string(request.get("taskset_id"), "taskset_id")
+    case_id = _require_string(request.get("case_id"), "case_id")
+    repetition = _require_int(request.get("repetition"), "repetition", minimum=1)
+    if repetition not in {1, 2}:
+        raise RunnerError("request repetition must be 1 or 2")
+    order = _require_int(request.get("order"), "order", minimum=1)
+    if order not in {1, 2}:
+        raise RunnerError("request order must be 1 or 2")
+    pair_id = _require_string(request.get("pair_id"), "pair_id")
+    expected_pair_id = f"{taskset_id}:{case_id}:r{repetition}"
+    if pair_id != expected_pair_id:
+        raise RunnerError("request pair_id does not match benchmark identity")
+    request_id = _require_string(request.get("request_id"), "request_id")
+    expected_request_id = f"{pair_id}:{condition}"
+    if request_id != expected_request_id:
+        raise RunnerError("request request_id does not match benchmark identity")
+    session_id = _require_string(request.get("session_id"), "session_id")
+    workspace_id = _require_string(request.get("workspace_id"), "workspace_id")
+    if session_id != f"session:{request_id}":
+        raise RunnerError("request session_id does not match request_id")
+    if workspace_id != f"workspace:{request_id}":
+        raise RunnerError("request workspace_id does not match request_id")
     _require_string(request.get("prompt"), "prompt", maximum=4000)
     _validate_hex(request.get("taskset_sha256"), "taskset_sha256", length=64)
-    _require_int(request.get("order"), "order", minimum=1)
-    _require_int(request.get("repetition"), "repetition", minimum=1)
+    if _list(request.get("does_not_establish")) != list(DOES_NOT_ESTABLISH):
+        raise RunnerError("request does_not_establish contract mismatch")
     _validate_repository(request)
     _validate_runner(request)
     _validate_budgets(request)
@@ -356,6 +373,33 @@ def _validate_repobrief(request: Mapping[str, Any]) -> None:
     command = _list(binding.get("mcp_command"))
     if not command or any(not isinstance(item, str) or not item for item in command):
         raise RunnerError("repobrief.mcp_command must be a non-empty argv array")
+
+
+def load_planned_request(
+    request: Mapping[str, Any], request_root: Path
+) -> Mapping[str, Any]:
+    if request_root.is_symlink():
+        raise RunnerError("request root must not be a symlink")
+    root = request_root.expanduser().resolve()
+    if not root.is_dir():
+        raise RunnerError("request root is not a directory")
+    matches: list[Mapping[str, Any]] = []
+    count = 0
+    for path in sorted(root.glob("*.json")):
+        count += 1
+        if count > MAX_PLANNED_REQUESTS:
+            raise RunnerError("request root exceeds planned request limit")
+        if path.is_symlink() or not path.is_file():
+            raise RunnerError("request root contains an unsafe JSON entry")
+        candidate = _load_object(path)
+        if candidate.get("request_id") == request.get("request_id"):
+            matches.append(candidate)
+    if len(matches) != 1:
+        raise RunnerError("request root must contain exactly one matching request")
+    planned = matches[0]
+    if _canonical_json(planned) != _canonical_json(request):
+        raise RunnerError("stdin request does not match the frozen plan request")
+    return planned
 
 
 def load_repository_root(request: Mapping[str, Any], map_path: Path) -> Path:
@@ -592,6 +636,8 @@ def run_bounded(
         if process.poll() is None:
             process.kill()
             process.wait()
+        process.stdout.close()
+        process.stderr.close()
     return returncode, bytes(buffers["stdout"]), bytes(buffers["stderr"])
 
 
@@ -862,6 +908,26 @@ def build_receipt(
     }
 
 
+def build_fixture_report(
+    request: Mapping[str, Any], receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    candidate = json.loads(json.dumps(receipt))
+    provider = _mapping(candidate.get("provider"))
+    candidate["provider"] = {
+        **provider,
+        "name": "synthetic-fixture",
+        "token_source": "synthetic",
+    }
+    return {
+        "kind": FIXTURE_REPORT_KIND,
+        "version": VERSION,
+        "request_id": request["request_id"],
+        "synthetic_fixture": True,
+        "normalized_candidate": candidate,
+        "does_not_establish": list(DOES_NOT_ESTABLISH),
+    }
+
+
 def _transcript_path(request: Mapping[str, Any], transcript_root: Path) -> tuple[Path, str]:
     filename = f"{_safe_identifier(str(request['request_id']))}.jsonl"
     return transcript_root.resolve() / filename, filename
@@ -870,6 +936,7 @@ def _transcript_path(request: Mapping[str, Any], transcript_root: Path) -> tuple
 def execute(
     request: Mapping[str, Any],
     *,
+    request_root: Path,
     repository_map: Path,
     state_root: Path,
     transcript_root: Path,
@@ -877,6 +944,7 @@ def execute(
     stream_fixture: Path | None = None,
 ) -> dict[str, Any]:
     validate_request(request)
+    load_planned_request(request, request_root)
     source = load_repository_root(request, repository_map)
     checkout = create_isolated_checkout(request, source, state_root)
     mcp_config = (
@@ -902,7 +970,7 @@ def execute(
     ended = _utc_now()
     transcript_path, artifact = _transcript_path(request, transcript_root)
     _write_private_exclusive(transcript_path, stdout)
-    return build_receipt(
+    receipt = build_receipt(
         request,
         stdout,
         transcript_artifact=artifact,
@@ -910,12 +978,16 @@ def execute(
         started_at=started,
         ended_at=ended,
     )
+    if stream_fixture is not None:
+        return build_fixture_report(request, receipt)
+    return receipt
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run one isolated read-only RepoBrief agent benchmark request."
     )
+    parser.add_argument("--request-root", required=True, type=Path)
     parser.add_argument("--repository-map", required=True, type=Path)
     parser.add_argument("--state-root", required=True, type=Path)
     parser.add_argument("--transcript-root", required=True, type=Path)
@@ -934,6 +1006,7 @@ def main(argv: list[str] | None = None) -> int:
         request = _load_object_bytes(_bounded_stdin(), label="stdin request")
         receipt = execute(
             request,
+            request_root=args.request_root,
             repository_map=args.repository_map,
             state_root=args.state_root,
             transcript_root=args.transcript_root,

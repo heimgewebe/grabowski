@@ -44,6 +44,13 @@ Zusätzlich prüft der Runner streng:
 
 Unbekannte oder nachträglich ergänzte Felder werden nicht ignoriert.
 
+Zusätzlich ist `--request-root` verpflichtend. Dieses Verzeichnis enthält die
+von Lenskit erzeugten JSON-Aufträge. Der Runner sucht genau eine Datei mit
+derselben `request_id` und verlangt kanonische Inhaltsgleichheit mit dem
+Standard-Input. Das Planverzeichnis ist damit die lokale Vertrauensquelle für
+Taskset-Hash, Modell, Budget, Repository-Commit und MCP-Argumentliste. Es muss
+operatorverwaltet, unverändert und nicht symbolisch verlinkt sein.
+
 ## Lokale Repository-Zuordnung
 
 Der Runner nimmt keine frei gewählten Checkoutpfade aus dem Modellauftrag an.
@@ -191,6 +198,12 @@ Erfolgsreceipt.
 JSONL-Datei. Repositoryprüfung, isolierter Checkout, Transcript-Publikation und
 Receipt-Normalisierung bleiben aktiv.
 
+Dieser Modus gibt keinen Lenskit-Erfolgsreceipt aus. Er erzeugt einen
+`repobrief.agent_benchmark_fixture_report`; dessen eingebetteter Kandidat trägt
+absichtlich `provider.name=synthetic-fixture` und
+`token_source=synthetic` und ist dadurch mit dem Real-Receipt-Vertrag
+unvereinbar.
+
 Dieser Modus belegt:
 
 - Parser- und Vertragsverhalten;
@@ -235,6 +248,8 @@ aufgenommen:
 [
   "python3",
   "/absolute/path/to/tools/repobrief_agent_benchmark_runner.py",
+  "--request-root",
+  "/absolute/path/to/benchmark-plan/requests",
   "--repository-map",
   "/absolute/path/to/repositories.json",
   "--state-root",
