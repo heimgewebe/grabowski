@@ -32,6 +32,12 @@ Es gilt:
 
 Adaptive Hinweise bleiben Shadow-Vorschläge. Sie dürfen Benutzerabsicht, Autorisierung, Leases, Secret-Behandlung, Recovery, Kill-Switch, Review, Merge, Deployment oder privilegierte Ausführung nicht verändern.
 
+## Systemkatalog-Konsultation
+
+Bei repositoryübergreifenden Fragen zu Wahrheitsbesitz, Systemrolle, Zuständigkeitsgrenze, kanonischem Einstiegspunkt oder stabiler Beziehung zuerst den Systemkatalog abfragen. Für rein lokale Codefragen ist kein Katalogabruf nötig.
+
+Wenn das Ergebnis eine Entscheidung ändert oder bestätigt, `tools/systemkatalog_usage_receipt.py` verwenden und einen hashgebundenen Nutzungsbeleg sichern. Nur feste Query-, Grund- und Wirkungskategorien verwenden; keine Gesprächsinhalte oder freie Begründungsprosa in den Beleg schreiben. `result_use` und `decision_effect` sind Operatorangaben und beweisen keine Kausalität. Vertrag und Beispiel: `docs/systemkatalog-usage-receipts-v1.md`.
+
 ## Verbotene Abkürzungen
 
 - keine erfundenen Dateien oder Pfade,
