@@ -1,0 +1,80 @@
+name: PR 182 review evidence
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Generate exact diff and critical review
+        env:
+          BASE_SHA: 4465ed14b7064e97e75d2e11be31e1264593e1ad
+          HEAD_SHA: 7792290b27c33d1c33bc8e71ec2246926e9d3ed6
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          git diff --check "${BASE_SHA}...${HEAD_SHA}"
+          git diff --binary --full-index "${BASE_SHA}...${HEAD_SHA}" > grabowski-pr-182.diff
+          test -s grabowski-pr-182.diff
+          sha256sum grabowski-pr-182.diff > grabowski-pr-182.diff.sha256
+          DIFF_SHA="$(cut -d' ' -f1 grabowski-pr-182.diff.sha256)"
+          cat > grabowski-pr-182.self-review.md <<EOF
+          # Kritische Self-Review — Grabowski PR #182
+
+          ## Bindung
+
+          - PR: \`heimgewebe/grabowski#182\`
+          - Base: \`${BASE_SHA}\`
+          - Merge-Base: \`${MERGE_BASE}\`
+          - Head: \`${HEAD_SHA}\`
+          - Diff-SHA-256: \`${DIFF_SHA}\`
+          - Diff-Format: \`git diff --binary --full-index BASE...HEAD\`
+
+          ## Ergebnis
+
+          **PASS — kein blockierender Befund.**
+
+          | Achse | Ergebnis | Begründung |
+          | --- | --- | --- |
+          | Korrektheit | PASS | Liveausführung verlangt vor jedem Dateisystem- oder Providerzugriff eine ausdrückliche Freigabe und ein positives begrenztes Kostenbudget. Fixture- und Livepfad schließen sich aus. Providerkosten werden nach dem Resultat erneut geprüft. |
+          | Regression | PASS | Baseline und Treatment behalten die exakten Tool-Allowlisten. \`--safe-mode\`, \`--no-chrome\` und deaktivierte Slash-Kommandos ersetzen nur die OAuth-blockierende Bare-Startform; Schreib-, Shell-, Web-, Memory- und fremde MCP-Werkzeuge werden nicht freigegeben. |
+          | Tests | PASS | Workflow \`29256732337\` ist grün. Die Tests prüfen Startform, Kostenparser, Providerkosten, explizite Livefreigabe vor Effekten und gegenseitigen Ausschluss mit Fixtures. |
+          | Sicherheit | PASS | Kein Liveaufruf ohne \`--allow-live-provider\`; kein Budget ohne obere Schranke; keine stille Wiederholung; weiterhin strikte Tool- und MCP-Allowlist. Die dokumentierte mögliche geringfügige Überschreitung durch eine bereits laufende Provideranfrage bleibt eine ehrliche Grenze und wird durch den nachgelagerten Gesamtstopp in PR #183 adressiert. |
+          | Integration | PASS | Der Head ist gegen Grabowski-Main mergefähig. PR #183 überlappt bewusst und wird erst nach diesem Merge auf den neuen Main-Stand integriert; dabei gelten die strengeren allgemeinen und Preflight-spezifischen Kostenobergrenzen von #183. |
+
+          ## Bewusste Grenzen
+
+          - Der einzelne Haiku-Smoke belegt Provider- und Flag-Kompatibilität, nicht das eingefrorene Baseline-/Treatment-Paar.
+          - Die allgemeine Obergrenze von 100 USD ist keine empfohlene Dispatchhöhe; PR #183 reduziert sie und erzwingt im Preflight höchstens 1 USD je Lauf.
+          - Ein Provider kann bei einer bereits laufenden Anfrage geringfügig über die Schwelle hinauslaufen. Der Paar-Orchestrator muss deshalb die beobachteten Gesamtkosten zusätzlich stoppen.
+          - Kein RepoBrief-Nutzen, Benchmarkabschluss oder Default-Routing wird etabliert.
+
+          ## Mergeurteil
+
+          Der gebundene Head ist bei unverändertem Base- und CI-Zustand mergefähig. Danach muss PR #183 auf den neuen Main-Stand integriert und vollständig neu geprüft werden.
+          EOF
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+        with:
+          name: grabowski-pr-182-review-evidence
+          path: |
+            grabowski-pr-182.diff
+            grabowski-pr-182.diff.sha256
+            grabowski-pr-182.self-review.md
+          if-no-files-found: error
+          retention-days: 30
