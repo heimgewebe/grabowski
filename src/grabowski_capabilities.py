@@ -562,6 +562,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["state-refresh", "lease-release"],
         "reversibility": "conditional",
     },
+    "grabowski_resource_nonconflict_assess": {
+        "category": "resource",
+        "purpose": "Assess and audit complete, attested same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint.",
+        "risk_class": "medium",
+        "effects": ["audit-append", "proof-issue"],
+        "reversibility": "proof-expiry",
+    },
     "grabowski_resource_acquire": {
         "category": "resource",
         "purpose": "Atomically acquire typed resource leases for one owner.",

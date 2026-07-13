@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 import grabowski_mcp as base
 import grabowski_bureau_leases as bureau_leases
+import grabowski_nonconflict as nonconflict
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -33,6 +34,11 @@ RESOURCE_KINDS = {
     "service",
     "browser-profile",
     "display",
+    "component",
+    "process",
+    "deployment",
+    "migration",
+    "gate",
 }
 OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 SERVICE_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,255}\Z")
@@ -182,7 +188,7 @@ def normalize_resource_key(raw: str) -> str:
             raise ValueError("display resource must be between 1 and 4095")
         value = str(display)
     elif SERVICE_RE.fullmatch(value) is None:
-        raise ValueError("service resource contains unsupported characters")
+        raise ValueError(f"{kind} resource contains unsupported characters")
     return f"{kind}:{value}"
 
 
@@ -208,6 +214,232 @@ def _public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "expires_at_unix": record["expires_at_unix"],
         "metadata_sha256": record["metadata_sha256"],
         "reclaimed_from_owner": record.get("reclaimed_from_owner"),
+    }
+
+
+def _row_metadata(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        value = json.loads(row["metadata_json"])
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("resource lease metadata is invalid") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("resource lease metadata must be an object")
+    return value
+
+
+def _scope_manifest_from_metadata(metadata: dict[str, Any], *, required: bool) -> dict[str, Any] | None:
+    value = metadata.get("scope_manifest")
+    if value is None and not required:
+        return None
+    if value is None:
+        raise nonconflict.NonConflictDenied(
+            "scope-manifest-missing",
+            "blocking repository lease has no exact scope manifest",
+        )
+    if required and metadata.get("scope_manifest_complete") is not True:
+        raise nonconflict.NonConflictDenied(
+            "scope-manifest-unattested",
+            "blocking repository owner did not attest that the scope manifest is complete",
+        )
+    return nonconflict.normalize_scope_manifest(value)
+
+
+def _path_is_within_repository(resource_key: str, repository: str) -> bool:
+    if not resource_key.startswith("path:"):
+        return False
+    path = resource_key.split(":", 1)[1]
+    try:
+        return os.path.commonpath([path, repository]) == repository
+    except ValueError:
+        return False
+
+
+def _blocking_repository_rows(
+    connection: sqlite3.Connection,
+    *,
+    keys: list[str],
+    requested_scope: dict[str, Any] | None,
+    owner: str,
+    now: int,
+) -> list[sqlite3.Row]:
+    rows = connection.execute(
+        "SELECT * FROM leases WHERE resource_key LIKE 'repo:%' "
+        "AND owner_id<>? AND expires_at_unix>? ORDER BY resource_key",
+        (owner, now),
+    ).fetchall()
+    matches: list[sqlite3.Row] = []
+    requested_repository = None if requested_scope is None else requested_scope["repository"]
+    for row in rows:
+        repository = row["resource_key"].split(":", 1)[1]
+        if requested_repository == repository or any(
+            _path_is_within_repository(key, repository) for key in keys
+        ):
+            matches.append(row)
+    return matches
+
+
+def _check_repository_semantic_conflicts(
+    connection: sqlite3.Connection,
+    *,
+    keys: list[str],
+    owner: str,
+    purpose: str,
+    ttl_seconds: int,
+    metadata: dict[str, Any],
+    nonconflict_proof: dict[str, Any] | None,
+    now: int,
+) -> dict[str, Any] | None:
+    # Bureau has its own stricter always-open contract. Applying the generic
+    # broad-repository rule here would reintroduce the deprecated global blocker.
+    bureau_keys = bureau_leases.bureau_resource_keys(keys)
+    if bureau_keys and len(bureau_keys) != len(keys):
+        raise ValueError("Bureau and non-Bureau resources must be acquired separately")
+    if bureau_keys:
+        if nonconflict_proof is not None:
+            raise nonconflict.NonConflictDenied(
+                "bureau-contract-is-authoritative",
+                "Bureau resources use the dedicated always-open lease contract",
+            )
+        return None
+    requested_scope = _scope_manifest_from_metadata(metadata, required=False)
+    repo_keys = [key for key in keys if key.startswith("repo:")]
+    if requested_scope is not None and not repo_keys:
+        requested_scope = nonconflict.validate_resource_scope_binding(keys, requested_scope)
+    if repo_keys:
+        if len(repo_keys) != 1:
+            raise ValueError("repository leases must be acquired one repository at a time")
+        repository = repo_keys[0].split(":", 1)[1]
+        if requested_scope is not None and requested_scope["repository"] != repository:
+            raise ValueError("scope_manifest repository must match repository resource key")
+        rows = connection.execute(
+            "SELECT * FROM leases WHERE owner_id<>? AND expires_at_unix>? ORDER BY resource_key",
+            (owner, now),
+        ).fetchall()
+        for row in rows:
+            row_scope = _scope_manifest_from_metadata(_row_metadata(row), required=False)
+            same_repository = (
+                _path_is_within_repository(row["resource_key"], repository)
+                or (row_scope is not None and row_scope["repository"] == repository)
+            )
+            if same_repository:
+                raise ResourceConflict(row["resource_key"], row["owner_id"], row["expires_at_unix"])
+        return None
+
+    blockers = _blocking_repository_rows(
+        connection, keys=keys, requested_scope=requested_scope, owner=owner, now=now
+    )
+    if not blockers:
+        if nonconflict_proof is not None:
+            raise nonconflict.NonConflictDenied(
+                "no-live-blocker",
+                "non-conflict proof supplied without a live blocking repository lease",
+            )
+        return None
+    if len(blockers) != 1:
+        raise nonconflict.NonConflictDenied(
+            "ambiguous-blocker",
+            "more than one repository lease could block the requested resources",
+        )
+    blocker = blockers[0]
+    if nonconflict_proof is None:
+        raise ResourceConflict(
+            blocker["resource_key"], blocker["owner_id"], blocker["expires_at_unix"]
+        )
+    if requested_scope is None:
+        raise nonconflict.NonConflictDenied(
+            "requested-scope-missing",
+            "non-conflict exception requires metadata.scope_manifest",
+        )
+    requested_scope = nonconflict.validate_resource_scope_binding(keys, requested_scope)
+    if metadata.get("scope_manifest_complete") is not True:
+        raise nonconflict.NonConflictDenied(
+            "requested-scope-unattested",
+            "requesting owner did not attest that the scope manifest is complete",
+        )
+    blocker_metadata = _row_metadata(blocker)
+    if blocker_metadata.get("lease_mode") == "emergency-recovery":
+        raise nonconflict.NonConflictDenied(
+            "emergency-recovery",
+            "emergency recovery repository leases cannot be bypassed",
+        )
+    existing_scope = _scope_manifest_from_metadata(blocker_metadata, required=True)
+    if existing_scope["repository"] != blocker["resource_key"].split(":", 1)[1]:
+        raise nonconflict.NonConflictDenied(
+            "blocking-scope-repository-mismatch",
+            "blocking repository lease scope does not match its resource key",
+        )
+    return nonconflict.validate_proof_against_live_lease(
+        nonconflict_proof,
+        live_lease=blocker,
+        live_existing_scope=existing_scope,
+        requesting_owner=owner,
+        resource_keys=keys,
+        purpose=purpose,
+        requested_scope=requested_scope,
+        requested_ttl_seconds=ttl_seconds,
+        now=now,
+    )
+
+
+def assess_nonconflict(
+    *,
+    blocked_resource_key: str,
+    requesting_owner: str,
+    resource_keys: Iterable[str],
+    purpose: str,
+    requested_scope: dict[str, Any],
+    requested_scope_complete: bool,
+    proof_ttl_seconds: int = nonconflict.MAX_PROOF_TTL_SECONDS,
+) -> dict[str, Any]:
+    blocked_key = normalize_resource_key(blocked_resource_key)
+    if not blocked_key.startswith("repo:"):
+        raise ValueError("blocked_resource_key must be a repository lease")
+    owner = _owner(requesting_owner)
+    keys = normalize_resource_keys(resource_keys)
+    lease_purpose = _purpose(purpose)
+    if requested_scope_complete is not True:
+        raise nonconflict.NonConflictDenied(
+            "requested-scope-unattested",
+            "requesting owner did not attest that the scope manifest is complete",
+        )
+    normalized_scope = nonconflict.normalize_scope_manifest(requested_scope)
+    now = _now()
+    with _database() as connection:
+        row = connection.execute(
+            "SELECT * FROM leases WHERE resource_key=?", (blocked_key,)
+        ).fetchone()
+        if row is None or row["expires_at_unix"] <= now:
+            raise ValueError("blocking repository lease is absent or expired")
+        blocker_metadata = _row_metadata(row)
+        if blocker_metadata.get("lease_mode") == "emergency-recovery":
+            raise nonconflict.NonConflictDenied(
+                "emergency-recovery",
+                "emergency recovery repository leases cannot be bypassed",
+            )
+        existing_scope = _scope_manifest_from_metadata(blocker_metadata, required=True)
+        if existing_scope["repository"] != blocked_key.split(":", 1)[1]:
+            raise nonconflict.NonConflictDenied(
+                "blocking-scope-repository-mismatch",
+                "blocking repository lease scope does not match its resource key",
+            )
+        normalized_scope = nonconflict.validate_resource_scope_binding(keys, normalized_scope)
+        proof = nonconflict.create_nonconflict_proof(
+            blocked_lease=row,
+            existing_scope=existing_scope,
+            requesting_owner=owner,
+            resource_keys=keys,
+            purpose=lease_purpose,
+            requested_scope=normalized_scope,
+            requested_scope_complete=True,
+            proof_ttl_seconds=proof_ttl_seconds,
+            now=now,
+        )
+    return {
+        "blocked_resource_key": blocked_key,
+        "requesting_owner": owner,
+        "proof": proof,
+        "decision": "allow",
+        "requires_atomic_revalidation": True,
     }
 
 
@@ -280,15 +512,28 @@ def acquire_resources(
     purpose: str,
     ttl_seconds: int = 3600,
     metadata: dict[str, Any] | None = None,
+    nonconflict_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     owner = _owner(owner_id)
     keys = normalize_resource_keys(resource_keys)
     lease_purpose = _purpose(purpose)
     ttl = _ttl(ttl_seconds)
-    sanitized_metadata = bureau_leases.sanitize_bureau_metadata(keys, metadata)
-    metadata_json, metadata_sha256 = _metadata(sanitized_metadata)
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    normalized_metadata: dict[str, Any] = {} if metadata is None else dict(metadata)
+    if "scope_manifest" in normalized_metadata:
+        normalized_metadata["scope_manifest"] = nonconflict.normalize_scope_manifest(
+            normalized_metadata["scope_manifest"]
+        )
+    lease_mode = normalized_metadata.get("lease_mode", "normal")
+    if lease_mode not in {"normal", "emergency-recovery"}:
+        raise ValueError("metadata.lease_mode must be normal or emergency-recovery")
+    if lease_mode == "emergency-recovery" and not any(key.startswith("repo:") for key in keys):
+        raise ValueError("emergency-recovery mode requires a repository lease")
+    sanitized_value = bureau_leases.sanitize_bureau_metadata(keys, normalized_metadata)
+    sanitized_metadata: dict[str, Any] = {} if sanitized_value is None else sanitized_value
     bureau_contract = bureau_leases.enforce_bureau_lease_contract(
-        keys, ttl_seconds=ttl, metadata=metadata
+        keys, ttl_seconds=ttl, metadata=normalized_metadata
     )
     now = _now()
     expires = now + ttl
@@ -314,6 +559,20 @@ def acquire_resources(
                         raise ResourceConflict(
                             key, row["owner_id"], row["expires_at_unix"]
                         )
+            nonconflict_exception = _check_repository_semantic_conflicts(
+                connection,
+                keys=keys,
+                owner=owner,
+                purpose=lease_purpose,
+                ttl_seconds=ttl,
+                metadata=sanitized_metadata,
+                nonconflict_proof=nonconflict_proof,
+                now=now,
+            )
+            persisted_metadata = dict(sanitized_metadata)
+            if nonconflict_exception is not None:
+                persisted_metadata["nonconflict_exception"] = nonconflict_exception
+            metadata_json, metadata_sha256 = _metadata(persisted_metadata)
             for key in keys:
                 row = existing.get(key)
                 acquired = now if row is None or row["owner_id"] != owner else row["acquired_at_unix"]
@@ -372,6 +631,7 @@ def acquire_resources(
         "leases": [_public(row) for row in rows],
         "reclaimed": reclaimed,
         "bureau_contract": bureau_contract,
+        "nonconflict_exception": nonconflict_exception,
     }
 
 
@@ -401,7 +661,7 @@ def renew_resources(
             )
             for key in keys:
                 row = connection.execute(
-                    "SELECT owner_id, expires_at_unix FROM leases WHERE resource_key=?",
+                    "SELECT * FROM leases WHERE resource_key=?",
                     (key,),
                 ).fetchone()
                 if row is None:
@@ -410,6 +670,10 @@ def renew_resources(
                     raise PermissionError(f"Resource lease is owned by another owner: {key}")
                 if row["expires_at_unix"] <= now:
                     raise RuntimeError(f"Resource lease has expired: {key}")
+                if "nonconflict_exception" in _row_metadata(row):
+                    raise RuntimeError(
+                        "non-conflict exception leases are non-renewable; reassess and reacquire"
+                    )
             connection.executemany(
                 "UPDATE leases SET updated_at_unix=?, expires_at_unix=? "
                 "WHERE resource_key=? AND owner_id=?",
@@ -499,6 +763,44 @@ def list_resources(
     return [_public(row) for row in rows]
 
 
+@mcp.tool(name="grabowski_resource_nonconflict_assess", annotations=MUTATING)
+def grabowski_resource_nonconflict_assess(
+    blocked_resource_key: str,
+    requesting_owner: str,
+    resource_keys: list[str],
+    purpose: str,
+    requested_scope: dict[str, Any],
+    requested_scope_complete: bool,
+    proof_ttl_seconds: int = nonconflict.MAX_PROOF_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Assess attested same-repository work; issue a short proof only when disjoint."""
+    operator._require_operator_mutation("resource_lease")
+    result = assess_nonconflict(
+        blocked_resource_key=blocked_resource_key,
+        requesting_owner=requesting_owner,
+        resource_keys=resource_keys,
+        purpose=purpose,
+        requested_scope=requested_scope,
+        requested_scope_complete=requested_scope_complete,
+        proof_ttl_seconds=proof_ttl_seconds,
+    )
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "resource-nonconflict-assess",
+            "blocked_resource_key": result["blocked_resource_key"],
+            "requesting_owner": result["requesting_owner"],
+            "decision": result["decision"],
+            "requested_scope_complete": True,
+            "proof_sha256": result["proof"]["proof_sha256"],
+            "requested_scope_sha256": result["proof"]["requested_scope_sha256"],
+            "existing_scope_sha256": result["proof"]["existing_scope_sha256"],
+            "expires_at_unix": result["proof"]["expires_at_unix"],
+        }
+    )
+    return result
+
+
 @mcp.tool(name="grabowski_resource_acquire", annotations=MUTATING)
 def grabowski_resource_acquire(
     owner_id: str,
@@ -506,6 +808,7 @@ def grabowski_resource_acquire(
     purpose: str,
     ttl_seconds: int = 3600,
     metadata: dict[str, Any] | None = None,
+    nonconflict_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Atomically acquire typed resource leases for one owner."""
     operator._require_operator_mutation("resource_lease")
@@ -515,6 +818,7 @@ def grabowski_resource_acquire(
         purpose=purpose,
         ttl_seconds=ttl_seconds,
         metadata=metadata,
+        nonconflict_proof=nonconflict_proof,
     )
     base._append_audit(
         {
@@ -525,6 +829,7 @@ def grabowski_resource_acquire(
             "expires_at_unix": result["expires_at_unix"],
             "reclaimed_count": len(result["reclaimed"]),
             "bureau_contract": result.get("bureau_contract"),
+            "nonconflict_exception": result.get("nonconflict_exception"),
         }
     )
     return result

@@ -16,6 +16,7 @@ from typing import Any
 
 import grabowski_mcp as base
 import grabowski_consumer_surface as consumer_surface
+import grabowski_nonconflict as nonconflict
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -2263,6 +2264,7 @@ def execution_shape_recommendation(
     transport_sensitive: bool = False,
     post_state_read_available: bool = True,
     friction_limit: int = 100,
+    nonconflict_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     operation_class = _execution_enum(
         operation_class,
@@ -2333,6 +2335,14 @@ def execution_shape_recommendation(
     if operation_class in {"read", "broad_read"} and may_mutate:
         raise ValueError("read operation_class requires may_mutate=false")
 
+    nonconflict_evidence: dict[str, Any] | None = None
+    nonconflict_error: str | None = None
+    if nonconflict_proof is not None:
+        try:
+            nonconflict_evidence = nonconflict.validate_governor_proof(nonconflict_proof)
+        except (ValueError, nonconflict.NonConflictDenied) as exc:
+            nonconflict_error = getattr(exc, "code", "invalid-nonconflict-proof")
+
     friction = _execution_friction_evidence(
         limit=friction_limit,
         prior_failure_class=prior_failure_class,
@@ -2364,10 +2374,12 @@ def execution_shape_recommendation(
         route_feasible = False
         reasons.append("friction_evidence_integrity_invalid")
         preflight.append("repair or isolate the friction evidence before routing")
-    elif may_mutate and lease_state == "conflict":
+    elif may_mutate and lease_state == "conflict" and nonconflict_evidence is None:
         route = "stop_resource_conflict"
         route_feasible = False
         reasons.append("resource_lease_conflict")
+        if nonconflict_error is not None:
+            reasons.append("resource_lease_nonconflict_proof_invalid")
         preflight.append("wait for or deliberately resolve the current resource owner")
     elif may_mutate and not post_state_read_available:
         route = "stop_missing_readback"
@@ -2430,6 +2442,12 @@ def execution_shape_recommendation(
         route = "split_read"
         reasons.append("fallback_to_bounded_single_purpose_reads")
 
+    if lease_state == "conflict" and nonconflict_evidence is not None:
+        reasons.append("resource_lease_nonconflict_proof_valid")
+        preflight.append(
+            "atomically revalidate the live repository lease and acquire only the exact proven resource keys"
+        )
+
     if prior_failure_class == "platform_filter" and recurring_filter:
         reasons.append("recurring_platform_filter_evidence")
     if (prior_failure_class == "connector_transport" or transport_sensitive) and recurring_transport:
@@ -2456,6 +2474,9 @@ def execution_shape_recommendation(
         "transport_sensitive": transport_sensitive,
         "post_state_read_available": post_state_read_available,
         "friction_fingerprint_sha256": friction["fingerprint_sha256"],
+        "nonconflict_proof_sha256": (
+            None if nonconflict_evidence is None else nonconflict_evidence["proof_sha256"]
+        ),
     }
     recommendation_id = _execution_sha256(typed_input)
 
@@ -2494,6 +2515,23 @@ def execution_shape_recommendation(
             ),
         },
         "friction_evidence": friction,
+        "nonconflict_evidence": {
+            "provided": nonconflict_proof is not None,
+            "valid": nonconflict_evidence is not None,
+            "error_code": nonconflict_error,
+            "proof_sha256": (
+                None if nonconflict_evidence is None else nonconflict_evidence["proof_sha256"]
+            ),
+            "blocked_lease_resource_key": (
+                None
+                if nonconflict_evidence is None
+                else nonconflict_evidence["blocked_lease_resource_key"]
+            ),
+            "expires_at_unix": (
+                None if nonconflict_evidence is None else nonconflict_evidence["expires_at_unix"]
+            ),
+            "requires_atomic_resource_revalidation": nonconflict_evidence is not None,
+        },
         "promotion": {
             "applied": False,
             "authority": "none_in_shadow_mode",
@@ -2969,6 +3007,7 @@ def grabowski_execution_shape(
     transport_sensitive: bool = False,
     post_state_read_available: bool = True,
     friction_limit: int = 100,
+    nonconflict_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Recommend one bounded execution shape from typed inputs and friction evidence."""
     return execution_shape_recommendation(
@@ -2986,6 +3025,7 @@ def grabowski_execution_shape(
         transport_sensitive=transport_sensitive,
         post_state_read_available=post_state_read_available,
         friction_limit=friction_limit,
+        nonconflict_proof=nonconflict_proof,
     )
 
 
