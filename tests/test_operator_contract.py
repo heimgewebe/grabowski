@@ -1594,6 +1594,84 @@ class OperatorContractTests(unittest.TestCase):
                 operator.grabowski_git(str(repo), ["status"])
         self.assertEqual(run.call_args.kwargs["environment"], environment)
 
+    def test_grabowski_git_retries_explicit_fixed_string_grep_without_pcre2_jit(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            environment = {"PATH": "/usr/bin", "GIT_TERMINAL_PROMPT": "0"}
+            initial = {
+                "returncode": 128,
+                "timed_out": False,
+                "stderr": "fatal: Couldn't JIT the PCRE2 pattern 'needle', got '-48'\n",
+            }
+            success = {
+                "returncode": 0,
+                "stdout": "README.md:1:needle\\Eend\n",
+                "stderr": "",
+            }
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_guard_git", return_value=None),
+                patch.object(operator, "_validate_argv", side_effect=lambda argv, cwd: argv),
+                patch.object(operator, "_git_environment", return_value=environment),
+                patch.object(operator, "_run", side_effect=[initial, success]) as run,
+            ):
+                result = operator.grabowski_git(
+                    str(repo),
+                    ["grep", "-F", "-n", "needle\\Eend", "--", "-F"],
+                )
+        self.assertEqual(run.call_count, 2)
+        retry = run.call_args_list[1].args[0]
+        self.assertIn("-P", retry)
+        self.assertEqual(retry[-2:], ["--", "-F"])
+        self.assertNotIn("-F", retry[:-1])
+        self.assertIn("(*NO_JIT)\\Qneedle\\E\\\\E\\Qend\\E", retry)
+        self.assertEqual(
+            result["fallback"]["kind"],
+            "git-grep-fixed-strings-pcre2-no-jit",
+        )
+        self.assertEqual(
+            result["fallback"]["semantic_boundary"],
+            "explicit-fixed-strings-single-positional-pattern",
+        )
+
+    def test_grabowski_git_does_not_retry_ambiguous_grep_shapes(self) -> None:
+        operator = _load_operator_module()
+        initial = {
+            "returncode": 128,
+            "timed_out": False,
+            "stderr": "fatal: Couldn't JIT the PCRE2 pattern 'needle', got '-48'\n",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            for arguments in (
+                ["grep", "-n", "needle"],
+                ["grep", "-F", "-e", "needle"],
+                ["grep", "-F", "-C", "2", "needle"],
+                ["grep", "needle", "--", "-F"],
+            ):
+                with self.subTest(arguments=arguments):
+                    with (
+                        patch.object(
+                            operator, "_require_operator_mutation", return_value=None
+                        ),
+                        patch.object(operator, "_guard_git", return_value=None),
+                        patch.object(
+                            operator,
+                            "_validate_argv",
+                            side_effect=lambda argv, cwd: argv,
+                        ),
+                        patch.object(
+                            operator,
+                            "_git_environment",
+                            return_value={"PATH": "/usr/bin"},
+                        ),
+                        patch.object(operator, "_run", return_value=initial) as run,
+                    ):
+                        result = operator.grabowski_git(str(repo), list(arguments))
+                    self.assertEqual(run.call_count, 1)
+                    self.assertNotIn("fallback", result)
+
     def test_grabowski_git_push_disables_hooks_helpers_and_unsafe_protocols(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:

@@ -2376,6 +2376,119 @@ def _reject_push_configuration(repo: Path, remote: str) -> None:
         )
 
 
+GIT_GREP_PCRE2_JIT_ERROR = "Couldn't JIT the PCRE2 pattern"
+GIT_GREP_FIXED_STRING_OPTIONS = frozenset({"-F", "--fixed-strings"})
+GIT_GREP_NO_VALUE_OPTIONS = frozenset(
+    {
+        "-v",
+        "--invert-match",
+        "-i",
+        "--ignore-case",
+        "-w",
+        "--word-regexp",
+        "-a",
+        "--text",
+        "-I",
+        "--textconv",
+        "--no-textconv",
+        "-r",
+        "--recursive",
+        "--recurse-submodules",
+        "--cached",
+        "--no-index",
+        "--untracked",
+        "--exclude-standard",
+        "-n",
+        "--line-number",
+        "--column",
+        "-h",
+        "-H",
+        "--full-name",
+        "-l",
+        "--files-with-matches",
+        "--name-only",
+        "-L",
+        "--files-without-match",
+        "-z",
+        "--null",
+        "-o",
+        "--only-matching",
+        "-c",
+        "--count",
+        "--break",
+        "--heading",
+        "-p",
+        "--show-function",
+        "-W",
+        "--function-context",
+        "-q",
+        "--quiet",
+        "--all-match",
+        "--ext-grep",
+    }
+)
+GIT_GREP_PATTERN_LANGUAGE_OPTIONS = frozenset(
+    {
+        "-e",
+        "--regexp",
+        "-f",
+        "--file",
+        "-P",
+        "--perl-regexp",
+        "-G",
+        "--basic-regexp",
+        "-E",
+        "--extended-regexp",
+        "--and",
+        "--or",
+        "--not",
+        "(",
+        ")",
+    }
+)
+
+
+def _git_grep_fixed_string_no_jit_retry(arguments: list[str]) -> list[str] | None:
+    subcommand, command_arguments, _configurations = _split_git_invocation(arguments)
+    if subcommand != "grep":
+        return None
+    fixed_strings = False
+    pattern_index: int | None = None
+    for index, item in enumerate(command_arguments):
+        if item == "--":
+            return None
+        if item in GIT_GREP_PATTERN_LANGUAGE_OPTIONS:
+            return None
+        if item in GIT_GREP_FIXED_STRING_OPTIONS:
+            fixed_strings = True
+            continue
+        if item in GIT_GREP_NO_VALUE_OPTIONS:
+            continue
+        if item.startswith(("--color=", "--max-depth=", "--threads=")):
+            continue
+        if item.startswith("-"):
+            return None
+        pattern_index = index
+        break
+    if not fixed_strings or pattern_index is None:
+        return None
+    pattern = command_arguments[pattern_index]
+    if any(character in pattern for character in ("\x00", "\n", "\r")):
+        return None
+    quoted_pattern = "\\Q" + pattern.replace("\\E", "\\E\\\\E\\Q") + "\\E"
+    transformed: list[str] = []
+    for index, item in enumerate(command_arguments):
+        if index < pattern_index and item in GIT_GREP_FIXED_STRING_OPTIONS:
+            if "-P" not in transformed:
+                transformed.append("-P")
+            continue
+        transformed.append(
+            f"(*NO_JIT){quoted_pattern}" if index == pattern_index else item
+        )
+    subcommand_index = arguments.index(subcommand)
+    return [*arguments[: subcommand_index + 1], *transformed]
+
+
 def _guard_git(arguments: list[str], repo: Path) -> None:
     if not arguments:
         raise ValueError("Git arguments must not be empty")
@@ -2961,13 +3074,39 @@ def grabowski_git(
         command_prefix = ["git", "-C", str(path)]
         environment = _git_environment()
     command = _validate_argv([*command_prefix, *arguments], cwd=path)
-    return _run(
+    result = _run(
         command,
         cwd=path,
         timeout_seconds=_timeout(timeout_seconds),
         max_output_bytes=MAX_OUTPUT_BYTES,
         environment=environment,
     )
+    retry_arguments = _git_grep_fixed_string_no_jit_retry(arguments)
+    if (
+        result.get("returncode") == 128
+        and not result.get("timed_out", False)
+        and GIT_GREP_PCRE2_JIT_ERROR in str(result.get("stderr", ""))
+        and retry_arguments is not None
+    ):
+        retry_command = _validate_argv([*command_prefix, *retry_arguments], cwd=path)
+        retried = _run(
+            retry_command,
+            cwd=path,
+            timeout_seconds=_timeout(timeout_seconds),
+            max_output_bytes=MAX_OUTPUT_BYTES,
+            environment=environment,
+        )
+        retried["fallback"] = {
+            "kind": "git-grep-fixed-strings-pcre2-no-jit",
+            "triggered": True,
+            "initial_returncode": result.get("returncode"),
+            "initial_stderr_sha256": hashlib.sha256(
+                str(result.get("stderr", "")).encode("utf-8")
+            ).hexdigest(),
+            "semantic_boundary": "explicit-fixed-strings-single-positional-pattern",
+        }
+        return retried
+    return result
 
 
 @mcp.tool(name="grabowski_github", annotations=MUTATING)
