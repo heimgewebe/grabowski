@@ -55,6 +55,10 @@ SYNCHRONOUS_SHELL_WRAPPERS = frozenset({
     "nohup", "nsenter", "podman", "setsid", "ssh", "stdbuf", "systemd-run",
     "timeout", "toybox", "unshare", "xargs",
 })
+SYNCHRONOUS_INDIRECT_EXECUTABLES = frozenset({
+    "busybox", "chroot", "docker", "machinectl", "nohup", "nsenter",
+    "podman", "setsid", "ssh", "systemd-run", "toybox", "unshare", "xargs",
+})
 MAX_NOTIFY_ON_DONE_CHANNELS = 5
 MAX_NOTIFY_ON_DONE_TEXT = 200
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
@@ -544,6 +548,9 @@ def _synchronous_call_shape_receipt(
     if not isinstance(surface, str) or not surface:
         raise ValueError("surface must be a non-empty string")
     reason_codes: list[str] = []
+    executable = Path(argv[0]).name if argv else ""
+    if executable in SYNCHRONOUS_INDIRECT_EXECUTABLES:
+        reason_codes.append("indirect_execution_requires_durable_task")
     if _uses_shell_composition(argv):
         reason_codes.append("shell_composition_requires_durable_task")
     if timeout_seconds > SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS:
@@ -555,6 +562,7 @@ def _synchronous_call_shape_receipt(
     durable = any(
         reason in reason_codes
         for reason in (
+            "indirect_execution_requires_durable_task",
             "shell_composition_requires_durable_task",
             "timeout_exceeds_synchronous_transport_ceiling",
         )
@@ -624,6 +632,7 @@ def _synchronous_public_contract(*, surface: str) -> dict[str, Any]:
         "timeout_seconds": SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS,
         "max_output_bytes": SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES,
         "shell_composition_allowed": False,
+        "indirect_execution_allowed": False,
         "long_running_route": "grabowski_task_start",
         "large_read_route": "typed_read_or_split_read",
         "does_not_establish": [

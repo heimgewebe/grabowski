@@ -113,6 +113,7 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertTrue(result["call_rules"]["one_independent_intent_per_call"])
         self.assertFalse(result["call_rules"]["unchanged_mutation_retry_allowed"])
         self.assertFalse(result["call_rules"]["generic_sync_shell_composition_allowed"])
+        self.assertFalse(result["call_rules"]["generic_sync_indirect_execution_allowed"])
         self.assertEqual(result["call_rules"]["generic_sync_timeout_ceiling_seconds"], 30)
         self.assertEqual(result["call_rules"]["generic_sync_output_ceiling_bytes"], 64 * 1024)
         self.assertFalse(result["call_rules"]["client_selected_sync_timeout_allowed"])

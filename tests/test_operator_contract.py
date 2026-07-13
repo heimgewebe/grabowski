@@ -276,6 +276,41 @@ class OperatorContractTests(unittest.TestCase):
                 self.assertFalse(receipt["allowed"])
                 self.assertEqual(receipt["required_route"], "durable_task")
 
+    def test_synchronous_call_shape_denies_indirect_or_detaching_launchers(self) -> None:
+        operator = _load_operator_module()
+        examples = [
+            ["ssh", "host", "uptime"],
+            ["systemd-run", "--user", "sleep", "60"],
+            ["setsid", "-f", "sleep", "60"],
+            ["docker", "run", "-d", "image"],
+            ["xargs", "-n1", "printf"],
+        ]
+        for command in examples:
+            with self.subTest(command=command):
+                receipt = operator._synchronous_call_shape_receipt(
+                    command,
+                    timeout_seconds=30,
+                    max_output_bytes=1024,
+                    surface="test",
+                )
+                self.assertFalse(receipt["allowed"])
+                self.assertEqual(receipt["required_route"], "durable_task")
+                self.assertIn(
+                    "indirect_execution_requires_durable_task",
+                    receipt["reason_codes"],
+                )
+                self.assertFalse(receipt["process_started"])
+
+    def test_synchronous_call_shape_allows_non_detaching_safe_wrapper(self) -> None:
+        operator = _load_operator_module()
+        receipt = operator._synchronous_call_shape_receipt(
+            ["env", "MODE=test", "printf", "ok"],
+            timeout_seconds=30,
+            max_output_bytes=1024,
+            surface="test",
+        )
+        self.assertTrue(receipt["allowed"])
+
     def test_synchronous_call_shape_does_not_treat_shell_name_as_plain_data(self) -> None:
         operator = _load_operator_module()
         receipt = operator._synchronous_call_shape_receipt(
