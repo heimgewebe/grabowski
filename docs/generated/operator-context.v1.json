@@ -1110,6 +1110,21 @@
     },
     {
       "category": "resource",
+      "description": "Release only unchanged owner path leases after authoritative current terminal evidence.",
+      "effects": [
+        "lease-remove",
+        "audit-append",
+        "terminal-evidence-verify"
+      ],
+      "id": "grabowski_resource_reconcile_obsolete_path_leases",
+      "purpose": "Release only unchanged exact path leases after an authoritative workspace-close or current successful durable-task outcome proves terminal owner work.",
+      "read_only": false,
+      "reversibility": "resource-reacquire",
+      "risk_class": "high",
+      "tool": "grabowski_resource_reconcile_obsolete_path_leases"
+    },
+    {
+      "category": "resource",
       "description": "Atomically acquire typed resource leases for one owner.",
       "effects": [
         "lease-create",
@@ -1743,6 +1758,7 @@
       "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
       "grabowski_resource_nonconflict_assess",
+      "grabowski_resource_reconcile_obsolete_path_leases",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",
       "grabowski_resource_release",
@@ -1936,7 +1952,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "3235ce8b5f7e2af6defe853dae1741cc1ebd7b5554e50adf86665b9b3f3ca7a7"
+      "sha256": "8720755da0f19f397d1f9bfc80a48e7117b9d104a0fe10740032d1492e0ff7d5"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1944,7 +1960,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "22f31ec746bff24f794fc2bfb52fa134c119ca593c741d75b70edb7236823f73"
+      "sha256": "32d81838b121e59f2bf0bda8cdc7fa1dbca9f52c7533fff7cc47902dbf3665f2"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c8c47bda693fbf40df69344aa527bf94ff1820cc5be86ea48b14f452100f9b54",
@@ -1956,7 +1972,7 @@
       "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "3235ce8b5f7e2af6defe853dae1741cc1ebd7b5554e50adf86665b9b3f3ca7a7",
+      "src/grabowski_capabilities.py": "8720755da0f19f397d1f9bfc80a48e7117b9d104a0fe10740032d1492e0ff7d5",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
@@ -1966,7 +1982,7 @@
       "src/grabowski_grips.py": "f7fee83b8424d40ff1f3785a771a685c1ce2bb73e3029d38de1b7e2da073968a",
       "src/grabowski_job_finalizer.py": "bc87ed9312af1a7000d91dc0f3b3a320b742286ef68176c74f868268aebe061e",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
-      "src/grabowski_mcp.py": "4311464e0a5fa4c148e6d088e7017e599a8d0e716e4a7e834aed5b8c20069675",
+      "src/grabowski_mcp.py": "cd8e90ea1b4de3871f2d3ada985e25f528595b51a3fc8f26828fde2b6946562f",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "c8e0d1572012857db7689e2c0e353619031df7542e0a90cf7a72cda791400b53",
@@ -1976,7 +1992,7 @@
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
       "src/grabowski_recovery.py": "b0c5124271498639f6c16614ccb51f7b3b696ebfd88011ad2291d353e56d0fe6",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
-      "src/grabowski_resources.py": "53eaaa245ffc69b18821b1b3f48d3daa49ecef92c1d812d6cbf24dadca544f06",
+      "src/grabowski_resources.py": "c74e8cc4a60affb7aaf18bd6fad007af738a4931c38482efe9e0c200a63c6273",
       "src/grabowski_runtime.py": "e7eca914dcdda0233d844c2e99cc008ff4ea0239cafe28511c08d93a7dd9a1e0",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "1c4a9517564c2b17c39a87a076e397f0bcb2f428467be782b1b48007b063a49a",
