@@ -55,10 +55,7 @@ SYNCHRONOUS_SHELL_WRAPPERS = frozenset({
     "nohup", "nsenter", "podman", "setsid", "ssh", "stdbuf", "systemd-run",
     "timeout", "toybox", "unshare", "xargs",
 })
-SYNCHRONOUS_INDIRECT_EXECUTABLES = frozenset({
-    "busybox", "chroot", "docker", "machinectl", "nohup", "nsenter",
-    "podman", "setsid", "ssh", "systemd-run", "toybox", "unshare", "xargs",
-})
+SYNCHRONOUS_INDIRECT_EXECUTABLES = SYNCHRONOUS_SHELL_WRAPPERS
 MAX_NOTIFY_ON_DONE_CHANNELS = 5
 MAX_NOTIFY_ON_DONE_TEXT = 200
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024

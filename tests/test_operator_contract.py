@@ -284,6 +284,9 @@ class OperatorContractTests(unittest.TestCase):
             ["setsid", "-f", "sleep", "60"],
             ["docker", "run", "-d", "image"],
             ["xargs", "-n1", "printf"],
+            ["env", "MODE=test", "ssh", "host", "uptime"],
+            ["timeout", "10", "systemd-run", "--user", "sleep", "60"],
+            ["stdbuf", "-oL", "printf", "ok"],
         ]
         for command in examples:
             with self.subTest(command=command):
@@ -301,10 +304,20 @@ class OperatorContractTests(unittest.TestCase):
                 )
                 self.assertFalse(receipt["process_started"])
 
-    def test_synchronous_call_shape_allows_non_detaching_safe_wrapper(self) -> None:
+    def test_synchronous_call_shape_allows_bounded_find_without_exec(self) -> None:
         operator = _load_operator_module()
         receipt = operator._synchronous_call_shape_receipt(
-            ["env", "MODE=test", "printf", "ok"],
+            ["find", ".", "-maxdepth", "1"],
+            timeout_seconds=30,
+            max_output_bytes=1024,
+            surface="test",
+        )
+        self.assertTrue(receipt["allowed"])
+
+    def test_synchronous_call_shape_allows_indirect_names_as_plain_data(self) -> None:
+        operator = _load_operator_module()
+        receipt = operator._synchronous_call_shape_receipt(
+            ["printf", "%s %s", "env", "ssh"],
             timeout_seconds=30,
             max_output_bytes=1024,
             surface="test",
