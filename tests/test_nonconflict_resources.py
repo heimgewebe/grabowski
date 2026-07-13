@@ -83,6 +83,7 @@ class NonConflictResourceTests(unittest.TestCase):
             "schema_version": 1,
             "repository": str(self.repo),
             "task_id": f"TASK-{name.upper()}",
+            "base_head": "0" * 40,
             "head": ("a" if name == "a" else "b") * 40,
             "branch": f"feat/{name}",
             "worktree": str(worktree),
@@ -121,6 +122,7 @@ class NonConflictResourceTests(unittest.TestCase):
             resource_keys=[f"path:{self.repo / 'src' / 'b.py'}"],
             purpose="secondary exact work",
             requested_scope=requested_scope,
+            requested_scope_complete=True,
             proof_ttl_seconds=90,
         )
 
@@ -137,6 +139,32 @@ class NonConflictResourceTests(unittest.TestCase):
             nonconflict.NonConflictDenied, "did not attest"
         ):
             self.assess()
+
+    def test_unattested_requested_scope_cannot_receive_or_consume_proof(self) -> None:
+        self.acquire_blocker()
+        with self.assertRaisesRegex(
+            nonconflict.NonConflictDenied, "requesting owner did not attest"
+        ):
+            resources.assess_nonconflict(
+                blocked_resource_key=f"repo:{self.repo}",
+                requesting_owner="owner-b",
+                resource_keys=[f"path:{self.repo / 'src' / 'b.py'}"],
+                purpose="unattested requested work",
+                requested_scope=self.scope("b"),
+                requested_scope_complete=False,
+            )
+        assessment = self.assess()
+        with self.assertRaisesRegex(
+            nonconflict.NonConflictDenied, "requesting owner did not attest"
+        ):
+            resources.acquire_resources(
+                "owner-b",
+                [f"path:{self.repo / 'src' / 'b.py'}"],
+                purpose="secondary exact work",
+                ttl_seconds=30,
+                metadata={"scope_manifest": self.scope("b")},
+                nonconflict_proof=assessment["proof"],
+            )
 
     def test_exact_work_is_blocked_without_proof(self) -> None:
         self.acquire_blocker()
@@ -157,7 +185,10 @@ class NonConflictResourceTests(unittest.TestCase):
             [f"path:{self.repo / 'src' / 'b.py'}"],
             purpose="secondary exact work",
             ttl_seconds=30,
-            metadata={"scope_manifest": self.scope("b")},
+            metadata={
+                "scope_manifest": self.scope("b"),
+                "scope_manifest_complete": True,
+            },
             nonconflict_proof=assessment["proof"],
         )
         self.assertEqual(result["nonconflict_exception"]["decision"], "allow")
@@ -241,14 +272,25 @@ class NonConflictResourceTests(unittest.TestCase):
                 [f"path:{self.repo / 'src' / 'b.py'}"],
                 purpose="secondary exact work",
                 ttl_seconds=30,
-                metadata={"scope_manifest": self.scope("b")},
+                metadata={
+                    "scope_manifest": self.scope("b"),
+                    "scope_manifest_complete": True,
+                },
                 nonconflict_proof=proof,
             )
         for label, kwargs in (
             ("owner", {"owner_id": "owner-c"}),
             ("purpose", {"purpose": "changed purpose"}),
             ("resource", {"resource_keys": [f"path:{self.repo / 'docs' / 'b.md'}"]}),
-            ("scope", {"metadata": {"scope_manifest": self.scope("c")}}),
+            (
+                "scope",
+                {
+                    "metadata": {
+                        "scope_manifest": self.scope("c"),
+                        "scope_manifest_complete": True,
+                    }
+                },
+            ),
         ):
             with self.subTest(drift=label), self.assertRaises(nonconflict.NonConflictDenied):
                 resources.acquire_resources(
@@ -256,9 +298,50 @@ class NonConflictResourceTests(unittest.TestCase):
                     kwargs.get("resource_keys", [f"path:{self.repo / 'src' / 'b.py'}"]),
                     purpose=kwargs.get("purpose", "secondary exact work"),
                     ttl_seconds=30,
-                    metadata=kwargs.get("metadata", {"scope_manifest": self.scope("b")}),
+                    metadata=kwargs.get(
+                        "metadata",
+                        {
+                            "scope_manifest": self.scope("b"),
+                            "scope_manifest_complete": True,
+                        },
+                    ),
                     nonconflict_proof=assessment["proof"],
                 )
+
+    def test_public_proof_schema_is_strict(self) -> None:
+        self.acquire_blocker()
+        original = self.assess()["proof"]
+
+        missing = deepcopy(original)
+        missing.pop("does_not_establish")
+        missing_core = {key: value for key, value in missing.items() if key != "proof_sha256"}
+        missing["proof_sha256"] = nonconflict._sha256(missing_core)
+        with self.assertRaisesRegex(ValueError, "proof keys invalid"):
+            nonconflict.validate_public_proof(missing)
+
+        incomplete_axes = deepcopy(original)
+        incomplete_axes["axis_results"] = incomplete_axes["axis_results"][:-1]
+        core = {
+            key: value
+            for key, value in incomplete_axes.items()
+            if key != "proof_sha256"
+        }
+        incomplete_axes["proof_sha256"] = nonconflict._sha256(core)
+        with self.assertRaisesRegex(ValueError, "axis results are incomplete"):
+            nonconflict.validate_public_proof(incomplete_axes)
+
+        invalid_duration = deepcopy(original)
+        invalid_duration["expires_at_unix"] = invalid_duration["issued_at_unix"] + 1
+        core = {
+            key: value
+            for key, value in invalid_duration.items()
+            if key != "proof_sha256"
+        }
+        invalid_duration["proof_sha256"] = nonconflict._sha256(core)
+        with self.assertRaisesRegex(nonconflict.NonConflictDenied, "invalid duration"):
+            nonconflict.validate_public_proof(
+                invalid_duration, now=invalid_duration["issued_at_unix"]
+            )
 
     def test_changed_blocking_lease_invalidates_proof(self) -> None:
         self.acquire_blocker()
@@ -270,7 +353,10 @@ class NonConflictResourceTests(unittest.TestCase):
                 [f"path:{self.repo / 'src' / 'b.py'}"],
                 purpose="secondary exact work",
                 ttl_seconds=30,
-                metadata={"scope_manifest": self.scope("b")},
+                metadata={
+                    "scope_manifest": self.scope("b"),
+                    "scope_manifest_complete": True,
+                },
                 nonconflict_proof=assessment["proof"],
             )
 
@@ -293,6 +379,7 @@ class NonConflictResourceTests(unittest.TestCase):
                 resource_keys=[f"path:{self.repo / 'src' / 'b.py'}"],
                 purpose="secondary exact work",
                 requested_scope=scope_b,
+                requested_scope_complete=True,
                 proof_ttl_seconds=30,
                 now=self.now,
             )
@@ -304,6 +391,7 @@ class NonConflictResourceTests(unittest.TestCase):
             resource_keys=[f"path:{self.repo / 'src' / 'b.py'}"],
             purpose="secondary exact work",
             requested_scope=scope_b,
+            requested_scope_complete=True,
             proof_ttl_seconds=30,
             now=self.now,
         )
@@ -322,6 +410,7 @@ class NonConflictResourceTests(unittest.TestCase):
                 resource_keys=[path_key],
                 purpose="missing component lease",
                 requested_scope=requested,
+                requested_scope_complete=True,
             )
         with self.assertRaisesRegex(nonconflict.NonConflictDenied, "scope axis components"):
             resources.assess_nonconflict(
@@ -330,6 +419,7 @@ class NonConflictResourceTests(unittest.TestCase):
                 resource_keys=[path_key, "component:unexpected"],
                 purpose="wrong component lease",
                 requested_scope=requested,
+                requested_scope_complete=True,
             )
         result = resources.assess_nonconflict(
             blocked_resource_key=f"repo:{self.repo}",
@@ -337,6 +427,7 @@ class NonConflictResourceTests(unittest.TestCase):
             resource_keys=[path_key, "component:component-b"],
             purpose="complete exact scope",
             requested_scope=requested,
+            requested_scope_complete=True,
         )
         self.assertEqual(result["decision"], "allow")
 
@@ -355,6 +446,7 @@ class NonConflictResourceTests(unittest.TestCase):
                 resource_keys=[f"path:{self.repo / 'src' / 'b.py'}"],
                 purpose="same owner",
                 requested_scope=self.scope("b"),
+                requested_scope_complete=True,
             )
         with self.assertRaisesRegex(nonconflict.NonConflictDenied, "must not include repository"):
             resources.assess_nonconflict(
@@ -363,6 +455,7 @@ class NonConflictResourceTests(unittest.TestCase):
                 resource_keys=[f"repo:{self.repo}"],
                 purpose="broad request",
                 requested_scope=self.scope("b"),
+                requested_scope_complete=True,
             )
 
     def test_exact_conflict_cannot_be_bypassed(self) -> None:
@@ -386,7 +479,10 @@ class NonConflictResourceTests(unittest.TestCase):
                 [exact_key],
                 purpose="secondary exact work",
                 ttl_seconds=30,
-                metadata={"scope_manifest": self.scope("b")},
+                metadata={
+                    "scope_manifest": self.scope("b"),
+                    "scope_manifest_complete": True,
+                },
                 nonconflict_proof=assessment["proof"],
             )
 
@@ -399,7 +495,10 @@ class NonConflictResourceTests(unittest.TestCase):
             [exact_key],
             purpose="secondary exact work",
             ttl_seconds=30,
-            metadata={"scope_manifest": self.scope("b")},
+            metadata={
+                "scope_manifest": self.scope("b"),
+                "scope_manifest_complete": True,
+            },
             nonconflict_proof=assessment["proof"],
         )
         with self.assertRaisesRegex(RuntimeError, "non-renewable"):
@@ -415,7 +514,10 @@ class NonConflictResourceTests(unittest.TestCase):
             [f"repo:{self.repo}"],
             purpose="replacement repository work",
             ttl_seconds=180,
-            metadata={"scope_manifest": replacement},
+            metadata={
+                "scope_manifest": replacement,
+                "scope_manifest_complete": True,
+            },
         )
         with self.assertRaises(nonconflict.NonConflictDenied):
             resources.acquire_resources(
@@ -423,7 +525,10 @@ class NonConflictResourceTests(unittest.TestCase):
                 [f"path:{self.repo / 'src' / 'b.py'}"],
                 purpose="secondary exact work",
                 ttl_seconds=30,
-                metadata={"scope_manifest": self.scope("b")},
+                metadata={
+                    "scope_manifest": self.scope("b"),
+                    "scope_manifest_complete": True,
+                },
                 nonconflict_proof=assessment["proof"],
             )
 
@@ -472,10 +577,39 @@ class NonConflictResourceTests(unittest.TestCase):
         self.assertEqual(worktree_cross["decision"], "deny")
         self.assertIn("worktree_paths_cross", worktree_cross["blocker_axes"])
 
+    def test_different_baselines_and_noncanonical_paths_fail_closed(self) -> None:
+        existing = self.scope("a")
+        requested = self.scope("b")
+        requested["base_head"] = "f" * 40
+        result = nonconflict.evaluate_scope_manifests(existing, requested)
+        self.assertEqual(result["decision"], "deny")
+        self.assertIn("base_head", result["blocker_axes"])
+
+        invalid_worktree = self.scope("b")
+        invalid_worktree["worktree"] = str(self.repo.parent)
+        with self.assertRaisesRegex(ValueError, "distinct path"):
+            nonconflict.normalize_scope_manifest(invalid_worktree)
+
+        self.acquire_blocker()
+        alias = self.root / "repo-alias"
+        alias.symlink_to(self.repo, target_is_directory=True)
+        requested = self.scope("b", path=str(alias / "src" / "b.py"))
+        with self.assertRaisesRegex(
+            nonconflict.NonConflictDenied, "canonical paths"
+        ):
+            resources.assess_nonconflict(
+                blocked_resource_key=f"repo:{self.repo}",
+                requesting_owner="owner-b",
+                resource_keys=[f"path:{alias / 'src' / 'b.py'}"],
+                purpose="symlink alias attempt",
+                requested_scope=requested,
+                requested_scope_complete=True,
+            )
+
     def test_resource_keys_must_match_scope_exactly(self) -> None:
         scope = self.scope("b")
         with self.assertRaisesRegex(
-            nonconflict.NonConflictDenied, "scope axis paths differ"
+            nonconflict.NonConflictDenied, "scope filesystem entries differ"
         ):
             resources.acquire_resources(
                 "owner-b",
@@ -493,6 +627,44 @@ class NonConflictResourceTests(unittest.TestCase):
             metadata={"scope_manifest": runtime_scope},
         )
         self.assertIn("service:test", [item["resource_key"] for item in result["leases"]])
+
+    def test_generated_artifacts_use_path_resources_without_aliases(self) -> None:
+        self.acquire_blocker()
+        generated = str(self.repo / "generated" / "api.json")
+        requested = self.scope(
+            "b", generated_artifact=generated, effects=["write", "generate"]
+        )
+        keys = [f"path:{self.repo / 'src' / 'b.py'}", f"path:{generated}"]
+        result = resources.assess_nonconflict(
+            blocked_resource_key=f"repo:{self.repo}",
+            requesting_owner="owner-b",
+            resource_keys=keys,
+            purpose="generate disjoint artifact",
+            requested_scope=requested,
+            requested_scope_complete=True,
+        )
+        self.assertEqual(result["decision"], "allow")
+        with self.assertRaisesRegex(ValueError, "resource kind"):
+            resources.normalize_resource_key(f"artifact:{generated}")
+
+    def test_mixed_bureau_and_non_bureau_keys_are_rejected(self) -> None:
+        with patch.object(
+            resources.bureau_leases,
+            "bureau_resource_keys",
+            return_value=["path:/home/alex/repos/bureau/registry/tasks/T.json"],
+        ), patch.object(
+            resources.bureau_leases, "enforce_bureau_lease_contract", return_value=None
+        ):
+            with self.assertRaisesRegex(ValueError, "must be acquired separately"):
+                resources.acquire_resources(
+                    "owner-a",
+                    [
+                        "path:/home/alex/repos/bureau/registry/tasks/T.json",
+                        f"path:{self.repo / 'src' / 'a.py'}",
+                    ],
+                    purpose="mixed contract attempt",
+                    ttl_seconds=60,
+                )
 
     def test_emergency_recovery_repository_lease_cannot_be_bypassed(self) -> None:
         resources.acquire_resources(

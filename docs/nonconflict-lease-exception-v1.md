@@ -4,8 +4,8 @@ Grabowski may continue a second execution in the same repository only after a sh
 
 ## Two-step protocol
 
-1. The broad repository owner acquires `repo:/absolute/repository` with a strict `metadata.scope_manifest`.
-2. The second owner calls `grabowski_resource_nonconflict_assess` with its exact resource keys, purpose and scope manifest. The assessment appends a hash-only audit record.
+1. The broad repository owner acquires `repo:/absolute/repository` with a strict `metadata.scope_manifest` and `scope_manifest_complete=true`.
+2. The second owner calls `grabowski_resource_nonconflict_assess` with exact resource keys, purpose, scope manifest and `requested_scope_complete=true`. The assessment appends a hash-only audit record.
 3. Only when every conflict axis is disjoint does the assessor return a SHA-256-bound proof valid for 30 to 300 seconds and never longer than the blocking lease.
 4. The second owner passes that unchanged proof to `grabowski_resource_acquire`, requests only exact non-repository keys and chooses a lease TTL no longer than the proof.
 5. The broker starts `BEGIN IMMEDIATE`, re-reads the blocker and exact keys, revalidates the full proof against the live lease and scopes, then acquires all exact keys atomically or none.
@@ -14,16 +14,16 @@ The governor may validate the public proof and recommend a bounded route. It rem
 
 ## Required scope manifest
 
-Schema version 1 declares repository, task ID, head, branch, isolated worktree, effects and all conflict axes:
+Schema version 1 declares repository, task ID, common base commit, current head, branch, isolated worktree, effects and all conflict axes. Both executions must declare the same base commit; otherwise the audit cannot establish disjointness.
 
 - exact paths and generated artifacts;
 - components and runtime resources;
 - processes, deployments and migration domains;
 - shared gates for repository-wide operations.
 
-Resource keys and manifest axes must match exactly in both directions. `path`, `artifact`, `component`, `process`, `deployment`, `migration` and `gate` map to their corresponding axes. `service`, `port`, `display` and `browser-profile` map to `runtime_resources`.
+Resource keys and manifest axes must match exactly in both directions. Normal and generated files both use canonical `path:` resources so the same filesystem object cannot be hidden behind separate key kinds. `component`, `process`, `deployment`, `migration` and `gate` map to their corresponding axes. `service`, `port`, `display` and `browser-profile` map to `runtime_resources`.
 
-Filesystem checks cover ancestor and descendant overlap across paths, generated artifacts and foreign worktree roots. Wildcards, unknown fields, omitted axes, out-of-scope paths and contradictory effects are rejected.
+Filesystem checks cover ancestor and descendant overlap across paths, generated artifacts and foreign worktree roots. Symlink aliases, wildcards, unknown fields, omitted axes, out-of-scope paths and contradictory effects are rejected.
 
 Repository-wide effects require canonical shared gates:
 
@@ -37,14 +37,14 @@ Repository-wide effects require canonical shared gates:
 The exception is denied when:
 
 - task, branch, worktree, path, component, runtime resource, process, deployment, migration, generated artifact or shared gate overlaps;
-- either manifest is missing, malformed, broad, incomplete or inconsistent with its resource keys;
+- either manifest is missing, malformed, broad, unattested, based on another commit, incomplete or inconsistent with its resource keys;
 - the blocking lease lacks a scope manifest, belongs to the requester, changed, expired or has less than 30 seconds remaining;
 - the blocker is marked `lease_mode=emergency-recovery`;
 - owner, purpose, exact resources or requested scope changed after assessment;
 - the proof is stale, future-dated, tampered with, ambiguous or shorter than the requested lease;
 - an exact resource key is already held by another owner;
 - no live blocker or more than one plausible blocker exists;
-- the dedicated Bureau always-open contract applies instead.
+- Bureau and non-Bureau keys are mixed, or the dedicated Bureau always-open contract applies instead.
 
 Exception leases are non-renewable. Continuing work requires a fresh assessment and atomic reacquisition.
 

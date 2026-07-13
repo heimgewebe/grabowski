@@ -38,7 +38,6 @@ RESOURCE_KINDS = {
     "process",
     "deployment",
     "migration",
-    "artifact",
     "gate",
 }
 OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
@@ -167,7 +166,7 @@ def normalize_resource_key(raw: str) -> str:
     value = value.strip()
     if not value:
         raise ValueError("resource value may not be empty")
-    if kind in {"path", "repo", "browser-profile", "artifact"}:
+    if kind in {"path", "repo", "browser-profile"}:
         candidate = Path(value).expanduser()
         if not candidate.is_absolute():
             raise ValueError(f"{kind} resource must be an absolute path")
@@ -292,7 +291,10 @@ def _check_repository_semantic_conflicts(
 ) -> dict[str, Any] | None:
     # Bureau has its own stricter always-open contract. Applying the generic
     # broad-repository rule here would reintroduce the deprecated global blocker.
-    if bureau_leases.bureau_resource_keys(keys):
+    bureau_keys = bureau_leases.bureau_resource_keys(keys)
+    if bureau_keys and len(bureau_keys) != len(keys):
+        raise ValueError("Bureau and non-Bureau resources must be acquired separately")
+    if bureau_keys:
         if nonconflict_proof is not None:
             raise nonconflict.NonConflictDenied(
                 "bureau-contract-is-authoritative",
@@ -349,6 +351,11 @@ def _check_repository_semantic_conflicts(
             "non-conflict exception requires metadata.scope_manifest",
         )
     requested_scope = nonconflict.validate_resource_scope_binding(keys, requested_scope)
+    if metadata.get("scope_manifest_complete") is not True:
+        raise nonconflict.NonConflictDenied(
+            "requested-scope-unattested",
+            "requesting owner did not attest that the scope manifest is complete",
+        )
     blocker_metadata = _row_metadata(blocker)
     if blocker_metadata.get("lease_mode") == "emergency-recovery":
         raise nonconflict.NonConflictDenied(
@@ -381,6 +388,7 @@ def assess_nonconflict(
     resource_keys: Iterable[str],
     purpose: str,
     requested_scope: dict[str, Any],
+    requested_scope_complete: bool,
     proof_ttl_seconds: int = nonconflict.MAX_PROOF_TTL_SECONDS,
 ) -> dict[str, Any]:
     blocked_key = normalize_resource_key(blocked_resource_key)
@@ -389,6 +397,11 @@ def assess_nonconflict(
     owner = _owner(requesting_owner)
     keys = normalize_resource_keys(resource_keys)
     lease_purpose = _purpose(purpose)
+    if requested_scope_complete is not True:
+        raise nonconflict.NonConflictDenied(
+            "requested-scope-unattested",
+            "requesting owner did not attest that the scope manifest is complete",
+        )
     normalized_scope = nonconflict.normalize_scope_manifest(requested_scope)
     now = _now()
     with _database() as connection:
@@ -417,6 +430,7 @@ def assess_nonconflict(
             resource_keys=keys,
             purpose=lease_purpose,
             requested_scope=normalized_scope,
+            requested_scope_complete=True,
             proof_ttl_seconds=proof_ttl_seconds,
             now=now,
         )
@@ -756,9 +770,10 @@ def grabowski_resource_nonconflict_assess(
     resource_keys: list[str],
     purpose: str,
     requested_scope: dict[str, Any],
+    requested_scope_complete: bool,
     proof_ttl_seconds: int = nonconflict.MAX_PROOF_TTL_SECONDS,
 ) -> dict[str, Any]:
-    """Assess and audit same-repository work; issue a short proof only when disjoint."""
+    """Assess attested same-repository work; issue a short proof only when disjoint."""
     operator._require_operator_mutation("resource_lease")
     result = assess_nonconflict(
         blocked_resource_key=blocked_resource_key,
@@ -766,6 +781,7 @@ def grabowski_resource_nonconflict_assess(
         resource_keys=resource_keys,
         purpose=purpose,
         requested_scope=requested_scope,
+        requested_scope_complete=requested_scope_complete,
         proof_ttl_seconds=proof_ttl_seconds,
     )
     base._append_audit(
@@ -775,6 +791,7 @@ def grabowski_resource_nonconflict_assess(
             "blocked_resource_key": result["blocked_resource_key"],
             "requesting_owner": result["requesting_owner"],
             "decision": result["decision"],
+            "requested_scope_complete": True,
             "proof_sha256": result["proof"]["proof_sha256"],
             "requested_scope_sha256": result["proof"]["requested_scope_sha256"],
             "existing_scope_sha256": result["proof"]["existing_scope_sha256"],

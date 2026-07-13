@@ -564,7 +564,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_resource_nonconflict_assess": {
         "category": "resource",
-        "purpose": "Assess and audit exact same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint.",
+        "purpose": "Assess and audit complete, attested same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint.",
         "risk_class": "medium",
         "effects": ["audit-append", "proof-issue"],
         "reversibility": "proof-expiry",

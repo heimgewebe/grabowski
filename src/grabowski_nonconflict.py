@@ -49,6 +49,7 @@ REQUIRED_KEYS = frozenset(
         "schema_version",
         "repository",
         "task_id",
+        "base_head",
         "head",
         "branch",
         "worktree",
@@ -57,8 +58,6 @@ REQUIRED_KEYS = frozenset(
     }
 )
 RESOURCE_AXIS_BY_KIND = {
-    "path": "paths",
-    "artifact": "generated_artifacts",
     "component": "components",
     "process": "processes",
     "deployment": "deployments",
@@ -66,6 +65,62 @@ RESOURCE_AXIS_BY_KIND = {
     "gate": "shared_gates",
 }
 RUNTIME_RESOURCE_KINDS = frozenset({"service", "port", "display", "browser-profile"})
+EXPECTED_AXIS_NAMES = (
+    "task",
+    "branch",
+    "worktree",
+    "base_head",
+    "paths",
+    "generated_artifacts",
+    "path_generated_cross",
+    "worktree_paths_cross",
+    "components",
+    "runtime_resources",
+    "processes",
+    "deployments",
+    "migrations",
+    "shared_gates",
+)
+LEASE_SNAPSHOT_KEYS = frozenset(
+    {
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    }
+)
+DOES_NOT_ESTABLISH = [
+    "merge_authority",
+    "deploy_authority",
+    "migration_authority",
+    "permission_to_release_foreign_lease",
+    "permission_to_modify_foreign_worktree",
+]
+PROOF_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "decision",
+        "issued_at_unix",
+        "expires_at_unix",
+        "blocked_lease",
+        "requesting_owner",
+        "resource_keys",
+        "resource_keys_sha256",
+        "purpose_sha256",
+        "existing_scope_sha256",
+        "requested_scope",
+        "requested_scope_complete",
+        "requested_scope_sha256",
+        "axis_results",
+        "blocker_axes",
+        "does_not_establish",
+        "proof_sha256",
+    }
+)
+AXIS_RESULT_KEYS = frozenset({"axis", "status", "overlap_sha256", "overlap_count"})
 
 
 class NonConflictDenied(RuntimeError):
@@ -105,7 +160,7 @@ def _absolute_path(value: Any, *, label: str) -> str:
     path = Path(text).expanduser()
     if not path.is_absolute():
         raise ValueError(f"{label} must be an absolute path")
-    return os.path.normpath(str(path))
+    return os.path.realpath(os.path.normpath(str(path)))
 
 
 def _head(value: Any) -> str:
@@ -144,8 +199,10 @@ def normalize_scope_manifest(value: Any) -> dict[str, Any]:
     repository = _absolute_path(value["repository"], label="repository")
     worktree = _absolute_path(value["worktree"], label="worktree")
     repo_parent = os.path.dirname(repository)
-    if not (_path_within(worktree, repository) or _path_within(worktree, repo_parent)):
-        raise ValueError("worktree must be inside the repository root or its parent")
+    if worktree != repository and (
+        worktree == repo_parent or not _path_within(worktree, repo_parent)
+    ):
+        raise ValueError("worktree must be the repository root or a distinct path below its parent")
     effects = _list(value["effects"], label="effects")
     unknown_effects = sorted(set(effects) - EFFECTS)
     if unknown_effects:
@@ -156,6 +213,7 @@ def normalize_scope_manifest(value: Any) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "repository": repository,
         "task_id": _token(value["task_id"], label="task_id"),
+        "base_head": _head(value["base_head"]),
         "head": _head(value["head"]),
         "branch": _token(value["branch"], label="branch"),
         "worktree": worktree,
@@ -189,12 +247,17 @@ def normalize_scope_manifest(value: Any) -> dict[str, Any]:
 
 def validate_resource_scope_binding(resource_keys: Sequence[str], scope: Any) -> dict[str, Any]:
     normalized = normalize_scope_manifest(scope)
+    if isinstance(resource_keys, (str, bytes)) or not isinstance(resource_keys, Sequence):
+        raise ValueError("resource_keys must be a sequence")
+    if any(not isinstance(key, str) for key in resource_keys):
+        raise ValueError("resource keys must be text")
     keys = sorted(set(resource_keys))
     if not keys:
         raise NonConflictDenied("exact-scopes-required", "at least one exact resource key is required")
     represented: dict[str, set[str]] = {axis: set() for axis in LIST_AXES}
+    filesystem_resources: set[str] = set()
     for key in keys:
-        if not isinstance(key, str) or ":" not in key:
+        if ":" not in key:
             raise ValueError("resource key must use kind:value syntax")
         kind, resource_value = key.split(":", 1)
         if kind == "repo":
@@ -202,16 +265,32 @@ def validate_resource_scope_binding(resource_keys: Sequence[str], scope: Any) ->
                 "exact-scopes-required",
                 "non-conflict exception requests must not include repository leases",
             )
+        if kind == "path":
+            canonical = os.path.realpath(os.path.normpath(resource_value))
+            if canonical != resource_value:
+                raise NonConflictDenied(
+                    "noncanonical-resource",
+                    "path resource keys must use canonical paths without symlink aliases",
+                )
+            filesystem_resources.add(canonical)
+            continue
         if kind in RUNTIME_RESOURCE_KINDS:
-            axis = "runtime_resources"
-            represented[axis].add(key)
+            represented["runtime_resources"].add(key)
             continue
         axis = RESOURCE_AXIS_BY_KIND.get(kind)
         if axis is None:
             raise ValueError(f"unsupported non-conflict resource kind: {kind}")
         represented[axis].add(resource_value)
 
+    expected_filesystem = set(normalized["paths"]) | set(normalized["generated_artifacts"])
+    if filesystem_resources != expected_filesystem:
+        raise NonConflictDenied(
+            "resource-scope-mismatch",
+            "path resource keys and scope filesystem entries differ",
+        )
     for axis in LIST_AXES:
+        if axis in {"paths", "generated_artifacts"}:
+            continue
         expected = set(normalized[axis])
         actual = represented[axis]
         if actual != expected:
@@ -254,6 +333,12 @@ def evaluate_scope_manifests(existing: Any, requested: Any) -> dict[str, Any]:
         _axis_result("task", [left["task_id"]] if left["task_id"] == right["task_id"] else []),
         _axis_result("branch", [left["branch"]] if left["branch"] == right["branch"] else []),
         _axis_result("worktree", [left["worktree"]] if left["worktree"] == right["worktree"] else []),
+        _axis_result(
+            "base_head",
+            [] if left["base_head"] == right["base_head"] else [
+                f"{left['base_head']}\n{right['base_head']}"
+            ],
+        ),
         _axis_result("paths", _path_pairs(left["paths"], right["paths"])),
         _axis_result(
             "generated_artifacts",
@@ -313,12 +398,18 @@ def create_nonconflict_proof(
     resource_keys: Sequence[str],
     purpose: str,
     requested_scope: Any,
+    requested_scope_complete: bool,
     proof_ttl_seconds: int = MAX_PROOF_TTL_SECONDS,
     now: int | None = None,
 ) -> dict[str, Any]:
     issued = int(time.time()) if now is None else int(now)
     if not isinstance(proof_ttl_seconds, int) or not 30 <= proof_ttl_seconds <= MAX_PROOF_TTL_SECONDS:
         raise ValueError(f"proof_ttl_seconds must be between 30 and {MAX_PROOF_TTL_SECONDS}")
+    if requested_scope_complete is not True:
+        raise NonConflictDenied(
+            "requested-scope-unattested",
+            "requesting owner did not attest that the scope manifest is complete",
+        )
     snapshot = _lease_snapshot(blocked_lease)
     if snapshot["owner_id"] == requesting_owner:
         raise NonConflictDenied("same-owner", "non-conflict exception requires a different owner")
@@ -351,54 +442,95 @@ def create_nonconflict_proof(
         "purpose_sha256": hashlib.sha256(purpose.encode("utf-8")).hexdigest(),
         "existing_scope_sha256": evaluation["existing_scope_sha256"],
         "requested_scope": evaluation["normalized_requested_scope"],
+        "requested_scope_complete": True,
         "requested_scope_sha256": evaluation["requested_scope_sha256"],
         "axis_results": evaluation["axis_results"],
         "blocker_axes": [],
-        "does_not_establish": [
-            "merge_authority",
-            "deploy_authority",
-            "migration_authority",
-            "permission_to_release_foreign_lease",
-            "permission_to_modify_foreign_worktree",
-        ],
+        "does_not_establish": DOES_NOT_ESTABLISH,
     }
     return {**core, "proof_sha256": _sha256(core)}
 
 
 def validate_public_proof(proof: Any, *, now: int | None = None) -> dict[str, Any]:
     current = int(time.time()) if now is None else int(now)
-    if not isinstance(proof, dict):
-        raise ValueError("nonconflict_proof must be an object")
-    proof_sha = proof.get("proof_sha256")
+    if not isinstance(proof, dict) or set(proof) != PROOF_KEYS:
+        missing = sorted(PROOF_KEYS - set(proof) if isinstance(proof, dict) else PROOF_KEYS)
+        extra = sorted(set(proof) - PROOF_KEYS) if isinstance(proof, dict) else []
+        raise ValueError(f"nonconflict proof keys invalid; missing={missing} extra={extra}")
+    proof_sha = proof["proof_sha256"]
     if not isinstance(proof_sha, str) or re.fullmatch(r"[0-9a-f]{64}", proof_sha) is None:
         raise ValueError("nonconflict proof SHA-256 is invalid")
     core = {key: value for key, value in proof.items() if key != "proof_sha256"}
     if _sha256(core) != proof_sha:
         raise ValueError("nonconflict proof SHA-256 mismatch")
-    if proof.get("schema_version") != SCHEMA_VERSION or proof.get("kind") != PROOF_KIND:
+    if proof["schema_version"] != SCHEMA_VERSION or proof["kind"] != PROOF_KIND:
         raise ValueError("nonconflict proof schema or kind is unsupported")
-    if proof.get("decision") != "allow" or proof.get("blocker_axes") != []:
+    if proof["decision"] != "allow" or proof["blocker_axes"] != []:
         raise NonConflictDenied("proof-denied", "nonconflict proof does not allow execution")
-    issued = proof.get("issued_at_unix")
-    expires = proof.get("expires_at_unix")
-    if not isinstance(issued, int) or not isinstance(expires, int):
+    if proof["requested_scope_complete"] is not True:
+        raise NonConflictDenied("requested-scope-unattested", "requested scope is not attested complete")
+    issued = proof["issued_at_unix"]
+    expires = proof["expires_at_unix"]
+    if type(issued) is not int or type(expires) is not int:
         raise ValueError("nonconflict proof timestamps are invalid")
+    duration = expires - issued
     if issued > current + MAX_CLOCK_SKEW_SECONDS:
         raise NonConflictDenied("proof-from-future", "nonconflict proof is from the future")
-    if expires <= current or expires - issued > MAX_PROOF_TTL_SECONDS:
-        raise NonConflictDenied("proof-expired", "nonconflict proof is expired or overlong")
-    normalized_requested = validate_resource_scope_binding(
-        proof.get("resource_keys", []), proof.get("requested_scope")
-    )
-    if _sha256(normalized_requested) != proof.get("requested_scope_sha256"):
+    if expires <= current or not 30 <= duration <= MAX_PROOF_TTL_SECONDS:
+        raise NonConflictDenied("proof-expired", "nonconflict proof is expired or has invalid duration")
+
+    blocked = proof["blocked_lease"]
+    if not isinstance(blocked, dict) or set(blocked) != LEASE_SNAPSHOT_KEYS:
+        raise ValueError("blocked lease snapshot is malformed")
+    if not isinstance(blocked["resource_key"], str) or not blocked["resource_key"].startswith("repo:/"):
+        raise ValueError("blocked lease snapshot must identify an absolute repository resource")
+    _token(blocked["owner_id"], label="blocked lease owner")
+    for field in ("acquired_at_unix", "updated_at_unix", "expires_at_unix"):
+        if type(blocked[field]) is not int:
+            raise ValueError(f"blocked lease {field} is invalid")
+    if not (blocked["acquired_at_unix"] <= blocked["updated_at_unix"] < blocked["expires_at_unix"]):
+        raise ValueError("blocked lease timestamps are inconsistent")
+    if not isinstance(blocked["metadata_sha256"], str) or re.fullmatch(
+        r"[0-9a-f]{64}", blocked["metadata_sha256"]
+    ) is None:
+        raise ValueError("blocked lease metadata SHA-256 is invalid")
+    if expires > blocked["expires_at_unix"]:
+        raise NonConflictDenied("proof-outlives-blocker", "proof outlives its blocking lease")
+
+    _token(proof["requesting_owner"], label="requesting_owner")
+    keys = proof["resource_keys"]
+    if not isinstance(keys, list) or any(not isinstance(key, str) for key in keys):
+        raise ValueError("proof resource_keys must be a list of text values")
+    if keys != sorted(set(keys)):
+        raise ValueError("proof resource_keys must be sorted and unique")
+    normalized_requested = validate_resource_scope_binding(keys, proof["requested_scope"])
+    if _sha256(normalized_requested) != proof["requested_scope_sha256"]:
         raise ValueError("requested scope hash mismatch")
-    if _sha256(sorted(set(proof.get("resource_keys", [])))) != proof.get("resource_keys_sha256"):
+    if _sha256(keys) != proof["resource_keys_sha256"]:
         raise ValueError("resource key hash mismatch")
-    axis_results = proof.get("axis_results")
-    if not isinstance(axis_results, list) or not axis_results:
-        raise ValueError("nonconflict proof axis results are missing")
-    if any(not isinstance(item, dict) or item.get("status") != "disjoint" for item in axis_results):
-        raise NonConflictDenied("proof-axis-conflict", "nonconflict proof contains a conflicting axis")
+    for field in ("resource_keys_sha256", "purpose_sha256", "existing_scope_sha256", "requested_scope_sha256"):
+        value = proof[field]
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"{field} is invalid")
+
+    axis_results = proof["axis_results"]
+    if not isinstance(axis_results, list) or len(axis_results) != len(EXPECTED_AXIS_NAMES):
+        raise ValueError("nonconflict proof axis results are incomplete")
+    observed_axes: list[str] = []
+    for item in axis_results:
+        if not isinstance(item, dict) or set(item) != AXIS_RESULT_KEYS:
+            raise ValueError("nonconflict proof axis result is malformed")
+        observed_axes.append(item["axis"] if isinstance(item["axis"], str) else "")
+        if item["status"] != "disjoint" or item["overlap_count"] != 0:
+            raise NonConflictDenied("proof-axis-conflict", "nonconflict proof contains a conflicting axis")
+        if not isinstance(item["overlap_sha256"], str) or re.fullmatch(
+            r"[0-9a-f]{64}", item["overlap_sha256"]
+        ) is None:
+            raise ValueError("nonconflict proof axis hash is invalid")
+    if tuple(observed_axes) != EXPECTED_AXIS_NAMES:
+        raise ValueError("nonconflict proof axis order or membership is invalid")
+    if proof["does_not_establish"] != DOES_NOT_ESTABLISH:
+        raise ValueError("nonconflict proof boundary claims are invalid")
     return proof
 
 

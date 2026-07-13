@@ -254,6 +254,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
             "schema_version": 1,
             "repository": repository,
             "task_id": "TASK-A",
+            "base_head": "0" * 40,
             "head": "a" * 40,
             "branch": "feat/a",
             "worktree": str(proof_root / "worktrees" / "a"),
@@ -291,6 +292,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
             resource_keys=[f"path:{repository}/src/b.py"],
             purpose="secondary exact work",
             requested_scope=requested,
+            requested_scope_complete=True,
             proof_ttl_seconds=ttl,
             now=now,
         )
