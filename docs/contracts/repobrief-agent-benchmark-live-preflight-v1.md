@@ -6,54 +6,53 @@ Standardaktivierung: `false`
 
 ## Zweck
 
-Der Preflight prüft, ob der separat qualifizierte Grabowski-Runner mit dem
-tatsächlichen Claude-Provider und dem gebundenen RepoBrief-MCP funktioniert.
-Er führt genau ein bereits von Lenskit geplantes Paar aus:
+Der Preflight prüft, ob der qualifizierte Grabowski-Runner mit dem tatsächlichen
+Claude-Provider und dem gebundenen RepoBrief-MCP funktioniert. Er verarbeitet
+genau ein bereits durch Lenskit geplantes Paar:
 
-- eine Baseline ohne RepoBrief;
-- eine Behandlung mit denselben read-only Werkzeugen plus RepoBrief.
+- eine Baseline mit `Read`, `Glob` und `Grep` sowie leerer MCP-Konfiguration;
+- ein Treatment mit denselben read-only Werkzeugen und ausschließlich dem
+  gebundenen RepoBrief-MCP.
 
-Der Preflight ist kein verkleinerter Nutzenbenchmark. Zwei Läufe können weder
-einen allgemeinen Vorteil noch eine Aufgabenklassenwirkung belegen.
+Zwei Läufe können keinen allgemeinen RepoBrief-Nutzen belegen.
 
-## Feste Begrenzung
+## Feste Grenzen
 
-- genau eine `pair_id` aus dem unveränderten Lenskit-Planverzeichnis;
+- genau eine unveränderte `pair_id` aus dem Lenskit-Planverzeichnis;
 - genau ein Baseline- und ein Treatment-Auftrag;
 - keine Änderung von Prompt, Modell, Sampling, Budgets, Commit oder Toolpolicy;
 - maximal `1.00 USD` je Providerprozess;
-- maximal `2.00 USD` autorisierte Gesamtkosten;
-- kein Retry, keine Sitzungsfortsetzung und keine automatische Fortsetzung mit
-  weiteren Fällen;
+- maximal zwei Providerprozesse und `2.00 USD` autorisierte Gesamtkosten;
+- kein Retry, keine Sitzungsfortsetzung und kein automatischer Vollbenchmark;
 - jeder Fehler beendet den Preflight.
 
-Der Runner übergibt die Operatorgrenze vor dem Prozessstart als
-`--max-budget-usd` an Claude. Zusätzlich muss das Providerresultat ein
-endliches, nichtnegatives `total_cost_usd` liefern, das dieselbe Grenze nicht
-überschreitet.
+Die Kostenobergrenze wird vor dem Prozessstart als `--max-budget-usd` an
+Claude übergeben. Danach muss das Providerresultat ein endliches,
+nichtnegatives `total_cost_usd` liefern, das dieselbe Grenze nicht
+überschreitet. Eine bereits laufende Provideranfrage kann geringfügig über die
+Grenze hinauslaufen; deshalb prüft der Orchestrator zusätzlich die beobachteten
+Paar-Gesamtkosten und wiederholt den Lauf nicht.
 
-## Vorbereitung und Freshness
+## Live-Providerbindung
 
-Der Preflight erzeugt keinen Snapshot. Er prüft den bereits gebundenen
-Manifestpfad und dessen SHA-256 und kennzeichnet den Stand deshalb als:
+Ein echter Preflight benötigt zusätzlich:
 
-- `snapshot_reused=true`;
-- `snapshot_rebuilt=false`.
+- `--claude-command` als absoluten Pfad zu einer regulären, ausführbaren und
+  nicht symbolisch verlinkten Datei;
+- `--claude-command-sha256` als erwarteten SHA-256 dieses Programms;
+- `--claude-credential-file` als reguläre, nicht symbolisch verlinkte und nur
+  für den Eigentümer lesbare OAuth-Datei.
 
-Vor dem Treatment wird derselbe request-gebundene MCP-Befehl direkt gestartet.
-Der Preflight führt `initialize` und anschließend `live_freshness` aus. Nur
-`status=fresh` erlaubt den Providerstart. `stale`, `unknown`,
-`not_comparable`, MCP-Fehler oder Timeout beenden den Lauf ohne Retry.
+Der Runner prüft Programm und Credentialdatei vor jedem Liveaufruf gegen
+Größe, Typ, Änderungsrennen und Digest. Die Credentialdatei wird in ein
+frisches privates auth-only `CLAUDE_CONFIG_DIR` kopiert und nach dem Lauf
+entfernt. Nutzer-, Projekt- und lokale Claude-Einstellungen, Hooks, Skills,
+Workflows, Browserintegration und Claude.ai-Connectoren werden deaktiviert.
 
-Die Zeiten werden getrennt erfasst:
-
-- `snapshot_preparation_ms` — Manifest- und Digestprüfung;
-- `freshness_check_ms` — MCP-Start und Freshness-Aufruf;
-- `agent_execution_ms` — beide Providerprozesse zusammen;
-- `total_time_to_answer_ms` — gesamter Preflight.
-
-Dadurch wird Snapshot- oder Freshnessaufwand nicht als vermeintlich schnelle
-Agentenzeit verborgen.
+Fixtureläufe dürfen weder Credentialdatei noch Programm-SHA erhalten. Ihr
+Ergebnis trägt den eigenen Typ
+`repobrief.agent_benchmark_preflight_fixture_report` und den Zustand
+`synthetic_only`.
 
 ## Paar- und Isolationsvertrag
 
@@ -66,9 +65,8 @@ Baseline und Treatment müssen übereinstimmen bei:
 - Budgets.
 
 Sie müssen unterschiedliche Session- und Workspace-Identitäten besitzen.
-Jeder Runnerlauf erzeugt einen frischen, create-only Checkout des gebundenen
-Commits. Der Quellcheckout wird vor und nach dem Paar über folgende Werte
-gebunden:
+Jeder Runnerlauf erzeugt einen frischen create-only Checkout des gebundenen
+Commits. Der Quellcheckout wird vor und nach dem Paar gebunden über:
 
 - `HEAD`;
 - Clean-Status;
@@ -77,21 +75,51 @@ gebunden:
 
 Jede Abweichung macht den Preflight ungültig.
 
-## Lenskit-Validierung
+## Snapshot und Freshness
+
+Der Preflight erzeugt keinen Snapshot. Er prüft den gebundenen Manifestpfad,
+die Größenbegrenzung und dessen SHA-256. Der Bericht trägt deshalb:
+
+- `snapshot_reused=true`;
+- `snapshot_rebuilt=false`.
+
+Vor dem Treatment wird der request-gebundene MCP-Befehl direkt gestartet. Der
+Preflight führt `initialize` und `live_freshness` aus. Nur `status=fresh`
+erlaubt den Providerstart. `stale`, `unknown`, `not_comparable`, MCP-Fehler oder
+Timeout beenden den Lauf ohne Retry.
+
+Freshness- und Lenskit-Prüfprozesse erhalten keine Anthropic-Zugangsdaten und
+ein nicht reales `HOME`.
+
+## Zeitmessung
+
+Der Bericht trennt:
+
+- `snapshot_preparation_ms` — Manifest- und Digestprüfung;
+- `freshness_check_ms` — MCP-Start und Freshness-Aufruf;
+- `agent_execution_ms` — Providerlaufzeiten aus den Receipts;
+- `runner_execution_ms` — vollständige Runneraufrufe einschließlich Checkout
+  und Evidenzpublikation;
+- `total_time_to_answer_ms` — gesamter Preflight.
+
+Damit werden Snapshot-, Freshness- und Isolationskosten nicht als vermeintlich
+schnelle Agentenzeit verborgen.
+
+## Lenskit-Validierung und Werkzeuge
 
 Jeder reale Receipt wird über den gemergten Lenskit-Befehl
 `agent_benchmark validate-receipt` gegen den exakten Auftrag und das
-Transcript-Verzeichnis geprüft. Ein formal ähnlicher Grabowski-Receipt reicht
-nicht aus.
+Transcript-Verzeichnis geprüft. Der Validator läuft ohne Providergeheimnisse.
 
-Die Behandlung muss mindestens einen normalisierten RepoBrief-Aufruf enthalten:
+Das Treatment muss mindestens einen normalisierten RepoBrief-Aufruf enthalten:
 
 - `ask_context`;
 - `grounding_verify`;
 - `live_freshness`;
 - oder `repobrief_resource_read`.
 
-Die Baseline darf keinen dieser Aufrufe enthalten.
+Die Baseline darf keinen dieser Aufrufe enthalten. Ihre MCP-Konfiguration ist
+leer und `mcp__*` ist ausdrücklich untersagt.
 
 ## Evidenz
 
@@ -100,39 +128,31 @@ Der Bericht bindet:
 - beide Auftrag- und Receipt-SHA-256;
 - beide Transcriptpfade, -größen und -SHA-256;
 - Claude-Version sowie Pfad, Größe und SHA-256 des gestarteten Programms;
-- exakte Modell- und Tokenbelege in den Receipts;
-- beobachtete und autorisierte Kosten;
+- Digest des Lenskit-Validatorbefehls und der Validatorergebnisse;
+- Provider-gemeldete Modell-, Token-, Tool- und Kostenwerte;
 - Snapshot- und Freshnessstatus;
 - getrennte Zeitwerte;
 - Quellzustand vor und nach dem Paar.
 
-Der endgültige Bericht wird zusammen mit Receipts und Transkripten als
-reviewbares Artefakt veröffentlicht und außerhalb des Berichts erneut per
-SHA-256 gebunden. Neben dem Bericht wird automatisch eine gleichnamige `.sha256`-Datei erzeugt.
+Bericht und gleichnamige `.sha256`-Datei werden gemeinsam create-only
+veröffentlicht. Bei einem Fehler werden beide entfernt.
 
 ## Stopregeln
 
 Der Preflight endet ohne Retry bei:
 
-- Provider- oder Claude-CLI-Ausfall;
+- Provider-, Claude-CLI- oder Authentifizierungsfehler;
 - Kosten-, Zeit-, Token-, Tool- oder Bytegrenze;
-- fehlendem oder widersprüchlichem Modell-/Session-/Usage-Beleg;
+- fehlendem oder widersprüchlichem Modell-, Session- oder Usage-Beleg;
 - ungültigem Lenskit-Receipt;
 - fehlendem RepoBrief-Aufruf im Treatment;
 - RepoBrief-Aufruf in der Baseline;
 - nicht frischem Snapshot;
 - Quellmutation;
-- unvollständigem Transcript.
+- unvollständigem Transcript;
+- Programm-, Credential- oder Digestabweichung.
 
 In jedem dieser Fälle bleibt `RAB-V1-T002` geplant und gesperrt.
-
-## Synthetische Prüfung
-
-Für Unit-Tests dürfen zwei lokale Streaming-Fixtures verwendet werden. Das
-Ergebnis trägt den eigenen Typ
-`repobrief.agent_benchmark_preflight_fixture_report` und den Zustand
-`synthetic_only`. Es enthält keine beobachteten Providerkosten und kann den
-Live-Preflight nicht erfüllen.
 
 ## Nichtaussagen
 

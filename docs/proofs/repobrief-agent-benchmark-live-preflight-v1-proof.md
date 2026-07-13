@@ -1,36 +1,44 @@
 # RepoBrief Agent Benchmark Live Preflight v1 — Implementierungsnachweis
 
-Status: Implementierungskandidat; kein Live-Providerbeleg  
+Status: Implementierungskandidat; kein eingefrorenes Live-Paar  
 Bureau: `RAB-V1-T002B`  
 Pull Request: `heimgewebe/grabowski#186`
 
 ## Integrationsstand
 
-Der Runner-, Authentifizierungs- und Livefreigabevertrag stammt unverändert aus
-dem gemergten PR `heimgewebe/grabowski#182`. Der kanonische Preflight-Starter
-ist ein kleiner Adapter vor dem unveränderten Orchestrator-Core:
+Die Runner-, Authentifizierungs- und Providergrenze stammt unverändert aus den
+gemergten PRs `#182` und `#185`. PR #186 ergänzt keine zweite
+Runnerimplementierung. Er liefert:
 
-- Fixture: `allow_live_provider=false`, kein Providerbudget;
+- einen kanonischen Autorisierungsadapter;
+- einen davon getrennten, umfangreich getesteten Preflight-Core;
+- Preflighttests, Betriebsvertrag und diesen Nachweis.
+
+Der Adapter übersetzt ausschließlich die Orchestratorgrenze in den finalen
+Runnervertrag:
+
+- Fixture: keine Livefreigabe, kein Providerbudget, keine Credentials und kein
+  Programm-SHA;
 - echter Lauf: `allow_live_provider=true`, operatorgebundenes
-  `max_budget_usd`;
+  `max_budget_usd`, private OAuth-Datei und SHA-256-gebundenes absolutes
+  Claude-Programm;
 - Preflightobergrenze: höchstens `1.00 USD` je Prozess.
 
-Dadurch existiert keine zweite Runnerimplementierung und keine Umgehung der in
-PR #182 eingeführten Livefreigabe.
+Ein direkter Start der Core-Datei bleibt fail-closed, weil dort die
+providerbezogenen Adapterbindungen fehlen.
 
 ## Gelieferte Fläche
 
-- hartes operatorseitiges Kostenlimit je Claude-Prozess;
-- Weitergabe als `--max-budget-usd` vor Prozessstart;
-- nachträgliche Prüfung von `total_cost_usd`;
 - genau ein eingefrorenes Baseline-/Treatment-Paar;
-- Manifest- und Digestprüfung ohne impliziten Snapshot-Rebuild;
+- Manifest-, Größen- und Digestprüfung ohne impliziten Snapshot-Rebuild;
 - direkte MCP-Freshness-Prüfung vor dem Treatment;
 - getrennte Snapshot-, Freshness-, Provider-, Runner- und Gesamtzeiten;
-- verpflichtende RepoBrief-Nutzung im Treatment;
-- externe Lenskit-Receipt-Prüfung;
+- verpflichtende RepoBrief-Nutzung im Treatment und Verbot in der Baseline;
+- externe Lenskit-Receipt-Prüfung ohne Providergeheimnisse;
 - Quellcheckout-Readback vor und nach dem Paar;
-- hashgebundene Programm-, Auftrags-, Receipt- und Transcript-Evidenz;
+- hashgebundene Programm-, Auftrags-, Receipt-, Validator- und
+  Transcript-Evidenz;
+- gemeinsame create-only Veröffentlichung von Bericht und SHA-256-Datei;
 - synthetischer Fixturebericht, der keinen Realreceipt darstellt.
 
 ## Sicherheitsgrenzen
@@ -40,7 +48,12 @@ PR #182 eingeführten Livefreigabe.
 - kein Retry und keine Sitzungsfortsetzung;
 - kein automatischer Vollbenchmark;
 - kein Schreiben, Committen, Pushen, Mergen oder Deployen;
-- Anthropic-Zugangsdaten werden nur dem Claude-Prozess zugänglich gemacht;
+- OAuth-Daten werden nur in ein frisches privates auth-only
+  `CLAUDE_CONFIG_DIR` kopiert und danach entfernt;
+- Claude-Programm und Credentialdatei werden gegen Typ, Rechte, Größe,
+  Änderungsrennen und SHA-256 geprüft;
+- Baseline erhält eine leere MCP-Konfiguration; Treatment ausschließlich den
+  request-gebundenen RepoBrief-Server;
 - Freshness- und Lenskit-Prüfprozesse laufen ohne Providergeheimnisse und mit
   nicht realem `HOME`;
 - jeder widersprüchliche oder unvollständige Beleg beendet den Preflight.
@@ -49,23 +62,35 @@ PR #182 eingeführten Livefreigabe.
 
 Lokale Ersatzprozesse prüfen:
 
-- JSON-RPC-Freshness;
+- JSON-RPC-Freshness und Stale-Stop;
 - Baseline-/Treatment-Trennung;
-- Kosten-, Tool- und Transcriptgrenzen;
+- Kosten-, Tool-, Credential-, Programm- und Transcriptgrenzen;
 - Lenskit-Validatorverkabelung;
 - Quellintegrität;
-- gemeinsame Veröffentlichung von Bericht und SHA-256-Begleitdatei;
-- Autorisierungsadapter zwischen Preflight-Core und gehärtetem Runner.
+- gemeinsame Bericht-/Digestpublikation;
+- Adapterbindung an den finalen Runnervertrag.
 
 Diese Fixtures tragen `synthetic_only` und belegen keine Providerverfügbarkeit.
+
+## Repositoryprüfung
+
+Der integrierte Kandidat bestand auf Python 3.10 und 3.12:
+
+- vollständige Grabowski-Repositoryvalidierung;
+- sämtliche Runner- und Preflighttests;
+- Policy-, Secret- und generierte-Kontextprüfungen;
+- reproduzierbares Deployment-Staging.
+
+Der endgültige Head, Diff-SHA-256 und die kritische Self-Review werden als
+PR-Metadaten nach dem letzten Main-Sync gebunden.
 
 ## Offener Livebeleg
 
 Nach Merge ist genau ein realer Preflight auf einem Operatorrechner mit bereits
 vorhandener Claude-Anmeldung zulässig. Er darf den 96-Lauf-Benchmark nicht
 automatisch starten. Der Livebeleg muss beide gültigen Receipts, beide
-Transkripte, beobachtete Kosten, Freshnessstatus, Zeitzerlegung und
-Quellintegrität enthalten.
+Transkripte, beobachtete Kosten, Freshnessstatus, Zeitzerlegung,
+Programm-/Credentialbindung und Quellintegrität enthalten.
 
 ## Nichtaussagen
 
