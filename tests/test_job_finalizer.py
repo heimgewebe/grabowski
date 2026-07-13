@@ -61,6 +61,31 @@ class JobFinalizerTests(unittest.TestCase):
             "EXIT_STATUS": status,
         }
 
+    def _bind_origin(self) -> tuple[dict, dict[str, str]]:
+        notify = self.metadata["notify_on_done"]
+        origin, digest = finalizer.job_origin.build_origin(
+            unit=self.unit,
+            owner=self.metadata["owner"],
+            argv_sha256=self.metadata["argv_sha256"],
+            scope=self.metadata["scope"],
+            notify_on_done=notify,
+            created_at_unix=100,
+            started_at="1970-01-01T00:01:40Z",
+            invoker_tool="grabowski_job_start",
+        )
+        self.metadata.update({
+            "schema_version": 2,
+            "origin": origin,
+            "origin_sha256": digest,
+        })
+        self._write_metadata(self.metadata)
+        environment = self._environment()
+        environment.update({
+            "GRABOWSKI_JOB_ORIGIN_SHA256": digest,
+            "GRABOWSKI_JOB_INVOKER_TOOL": "grabowski_job_start",
+        })
+        return origin, environment
+
     def test_finalize_creates_private_hash_bound_receipt_and_is_idempotent(self) -> None:
         first = finalizer.finalize(self.directory, self._environment())
         second = finalizer.finalize(self.directory, self._environment())
@@ -188,22 +213,176 @@ class JobFinalizerTests(unittest.TestCase):
         target.unlink()
         real_link = os.link
 
-        def competing_link(source, destination, *, follow_symlinks=True):
-            destination = Path(destination)
-            destination.write_text(
+        def competing_link(
+            source,
+            destination,
+            *,
+            src_dir_fd=None,
+            dst_dir_fd=None,
+            follow_symlinks=True,
+        ):
+            self.assertIsNotNone(src_dir_fd)
+            self.assertIsNotNone(dst_dir_fd)
+            target.write_text(
                 json.dumps(expected, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                 encoding="utf-8",
             )
-            destination.chmod(0o600)
+            target.chmod(0o600)
             raise FileExistsError(destination)
 
-        with mock.patch.object(finalizer.os, "link", side_effect=competing_link):
+        with mock.patch.object(finalizer.private_io.os, "link", side_effect=competing_link):
             result = finalizer.finalize(self.directory, self._environment())
         self.assertFalse(result["created"])
         self.assertEqual(result["receipt"], expected)
         self.assertEqual(list(self.directory.glob(".notification.json.*.tmp")), [])
         self.assertEqual(target.lstat().st_nlink, 1)
         self.assertIsNotNone(real_link)
+
+    def test_origin_bound_receipt_is_schema_two_and_launcher_bound(self) -> None:
+        origin, environment = self._bind_origin()
+        environment["UNRELATED_SECRET"] = "must-not-appear"
+        result = finalizer.finalize(self.directory, environment)
+        receipt = result["receipt"]
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["origin_sha256"], self.metadata["origin_sha256"])
+        self.assertEqual(receipt["invoker_tool"], origin["invoker_tool"])
+        self.assertEqual(receipt["origin_binding"], finalizer.ORIGIN_BINDING)
+        self.assertEqual(receipt["trust_boundary"], finalizer.TRUST_BOUNDARY)
+        self.assertIn("untrusted_same_uid_job_authenticity", receipt["does_not_establish"])
+        self.assertNotIn("must-not-appear", json.dumps(receipt))
+
+    def test_origin_bound_finalizer_rejects_metadata_request_tampering(self) -> None:
+        _origin, environment = self._bind_origin()
+        self.metadata["notify_on_done"]["note"] = "changed"
+        self._write_metadata(self.metadata)
+        with self.assertRaisesRegex(RuntimeError, "notification request changed"):
+            finalizer.finalize(self.directory, environment)
+        self.assertFalse((self.directory / "notification.json").exists())
+
+    def test_origin_rehash_does_not_bypass_launcher_precondition(self) -> None:
+        _origin, environment = self._bind_origin()
+        modified_origin = dict(self.metadata["origin"])
+        modified_origin["notify_on_done"] = {
+            **modified_origin["notify_on_done"],
+            "note": "attacker-rewritten",
+        }
+        modified_hash = hashlib.sha256(
+            finalizer.job_origin.canonical_json_bytes(modified_origin)
+        ).hexdigest()
+        self.metadata["origin"] = modified_origin
+        self.metadata["origin_sha256"] = modified_hash
+        self.metadata["notify_on_done"]["note"] = "attacker-rewritten"
+        self._write_metadata(self.metadata)
+        with self.assertRaisesRegex(RuntimeError, "launcher precondition"):
+            finalizer.finalize(self.directory, environment)
+        self.assertFalse((self.directory / "notification.json").exists())
+
+    def test_partial_origin_contract_fails_closed(self) -> None:
+        _origin, environment = self._bind_origin()
+        environment.pop("GRABOWSKI_JOB_INVOKER_TOOL")
+        with self.assertRaisesRegex(RuntimeError, "origin contract is incomplete"):
+            finalizer.finalize(self.directory, environment)
+
+    def test_complete_same_uid_control_is_explicitly_not_authenticated(self) -> None:
+        _origin, environment = self._bind_origin()
+        forged_origin = dict(self.metadata["origin"])
+        forged_origin["notify_on_done"] = {
+            **forged_origin["notify_on_done"],
+            "note": "same-uid-forged",
+        }
+        forged_hash = hashlib.sha256(
+            finalizer.job_origin.canonical_json_bytes(forged_origin)
+        ).hexdigest()
+        self.metadata["origin"] = forged_origin
+        self.metadata["origin_sha256"] = forged_hash
+        self.metadata["notify_on_done"]["note"] = "same-uid-forged"
+        self._write_metadata(self.metadata)
+        environment["GRABOWSKI_JOB_ORIGIN_SHA256"] = forged_hash
+
+        receipt = finalizer.finalize(self.directory, environment)["receipt"]
+        self.assertEqual(receipt["note"], "same-uid-forged")
+        self.assertEqual(receipt["trust_boundary"], "same_uid_authorized_job")
+        self.assertIn(
+            "untrusted_same_uid_job_authenticity",
+            receipt["does_not_establish"],
+        )
+
+    def test_origin_contract_rejects_noncanonical_identity_fields(self) -> None:
+        values = dict(
+            unit=self.unit,
+            owner="uid:1000",
+            argv_sha256="a" * 64,
+            scope={"cwd": "/tmp"},
+            notify_on_done=self.metadata["notify_on_done"],
+            created_at_unix=100,
+            started_at="1970-01-01T00:01:40Z",
+            invoker_tool="grabowski_job_start",
+        )
+        for key, invalid, message in (
+            ("unit", "grabowski-job-not-hex", "origin unit"),
+            ("owner", "uid:root", "origin owner"),
+            ("started_at", "1970-01-01Z", "origin start time"),
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, message):
+                finalizer.job_origin.build_origin(**{**values, key: invalid})
+
+    def test_filtered_environment_includes_directory_and_excludes_unrelated_values(self) -> None:
+        source = {
+            "GRABOWSKI_JOB_DIRECTORY": str(self.directory),
+            "SERVICE_RESULT": "success",
+            "UNRELATED_SECRET": "hidden",
+        }
+        filtered = finalizer._filtered_environment(source)
+        self.assertEqual(filtered["GRABOWSKI_JOB_DIRECTORY"], str(self.directory))
+        self.assertEqual(filtered["SERVICE_RESULT"], "success")
+        self.assertNotIn("UNRELATED_SECRET", filtered)
+
+    def test_process_hardening_is_finalizer_local(self) -> None:
+        with mock.patch.object(finalizer.os, "umask") as umask, mock.patch.object(
+            finalizer.resource,
+            "getrlimit",
+            return_value=(1_048_576, 1_048_576),
+        ), mock.patch.object(finalizer.resource, "setrlimit") as setrlimit:
+            finalizer._harden_process()
+        umask.assert_called_once_with(0o077)
+        self.assertEqual(
+            setrlimit.call_args_list,
+            [
+                mock.call(finalizer.resource.RLIMIT_CORE, (0, 0)),
+                mock.call(
+                    finalizer.resource.RLIMIT_NOFILE,
+                    (finalizer.FINALIZER_NOFILE_SOFT_LIMIT, 1_048_576),
+                ),
+            ],
+        )
+
+    def test_main_parses_filtered_environment_before_hardening(self) -> None:
+        filtered = {key: "" for key in finalizer.FINALIZER_ENV_KEYS}
+        with mock.patch.object(
+            finalizer,
+            "_filtered_environment",
+            return_value=filtered,
+        ), mock.patch.object(finalizer, "_harden_process") as harden, mock.patch.object(
+            finalizer.sys,
+            "stderr",
+        ):
+            self.assertEqual(finalizer.main(), 2)
+        harden.assert_not_called()
+
+    def test_main_fails_closed_when_process_hardening_fails(self) -> None:
+        filtered = {key: "" for key in finalizer.FINALIZER_ENV_KEYS}
+        filtered["GRABOWSKI_JOB_DIRECTORY"] = str(self.directory)
+        with mock.patch.object(
+            finalizer,
+            "_filtered_environment",
+            return_value=filtered,
+        ), mock.patch.object(
+            finalizer,
+            "_harden_process",
+            side_effect=OSError("limit denied"),
+        ), mock.patch.object(finalizer.sys, "stderr") as stderr:
+            self.assertEqual(finalizer.main(), 1)
+        self.assertIn("process_hardening", "".join(call.args[0] for call in stderr.write.call_args_list))
 
     def test_detects_metadata_identity_drift(self) -> None:
         path = self.directory / "metadata.json"

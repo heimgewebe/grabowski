@@ -27,6 +27,8 @@ import uuid
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+import grabowski_consumer_surface as consumer_surface
+
 import grabowski_grips
 
 APP_NAME = "Grabowski"
@@ -3011,52 +3013,30 @@ def _operator_relay_protocol() -> dict[str, Any]:
     }
 
 
-STATUS_VIEWS = frozenset({"minimal", "standard", "evidence"})
-STATUS_VIEW_ALIASES = {"concise": "minimal", "full": "evidence"}
+STATUS_VIEWS = consumer_surface.CONSUMER_VIEWS
+STATUS_VIEW_ALIASES = consumer_surface.CONSUMER_VIEW_ALIASES
 
 
 def _normalize_status_view(value: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError("view must be a string")
-    selected = STATUS_VIEW_ALIASES.get(value, value)
-    if selected not in STATUS_VIEWS:
-        raise ValueError(f"view must be one of {sorted(STATUS_VIEWS)}")
-    return selected
+    return consumer_surface.normalize_view(value)
 
 
 def _project_status_fields(
     payload: dict[str, Any],
     fields: list[str] | None,
 ) -> dict[str, Any]:
-    if fields is None:
-        return payload
-    if not isinstance(fields, list) or len(fields) > 40:
-        raise ValueError("fields must be a list with at most 40 entries")
-    normalized: list[str] = []
-    for field in fields:
-        if not isinstance(field, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", field):
-            raise ValueError("fields entries must be bounded lower-case identifiers")
-        if field not in normalized:
-            normalized.append(field)
-    unknown = sorted(set(normalized) - set(payload))
-    if unknown:
-        raise ValueError(f"Unknown response field(s): {', '.join(unknown)}")
-    required = {
-        "schema_version",
-        "view",
-        "healthy",
-        "warnings",
-        "recommended_next_action",
-        "does_not_establish",
-    }
-    keep = set(normalized) | (required & set(payload))
-    projected = {key: value for key, value in payload.items() if key in keep}
-    projected["projection"] = {
-        "selected_fields": sorted(keep),
-        "omitted_fields": sorted(set(payload) - keep),
-        "required_fields_preserved": sorted(required & set(payload)),
-    }
-    return projected
+    return consumer_surface.project_fields(
+        payload,
+        fields=fields,
+        required=(
+            "schema_version",
+            "view",
+            "healthy",
+            "warnings",
+            "recommended_next_action",
+            "does_not_establish",
+        ),
+    )
 
 
 @mcp.tool(name="grabowski_status", annotations=READ_ANNOTATIONS)

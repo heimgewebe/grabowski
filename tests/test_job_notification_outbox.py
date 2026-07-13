@@ -105,6 +105,61 @@ class JobNotificationOutboxTests(unittest.TestCase):
         self.assertIn("external_push_delivery", result["does_not_establish"])
         self.assertNotIn("delivered", json.dumps(result).lower())
 
+    def test_list_preserves_valid_legacy_nonhex_job_names_after_prefilter(self) -> None:
+        legacy_job_id = "legacy000001"
+        legacy_unit = f"grabowski-job-{legacy_job_id}"
+        legacy_directory = self.jobs / legacy_unit
+        legacy_directory.mkdir(mode=0o700)
+        legacy_receipt = {
+            **self.receipt,
+            "job_id": legacy_job_id,
+            "unit": legacy_unit,
+            "notification_id": "e" * 32,
+        }
+        legacy_receipt.pop("receipt_sha256", None)
+        legacy_receipt["receipt_sha256"] = hashlib.sha256(
+            self.operator._canonical_json_bytes(legacy_receipt)
+        ).hexdigest()
+        self._write_json(legacy_directory / "notification.json", legacy_receipt)
+
+        invalid = self.jobs / "not-a-grabowski-job"
+        invalid.mkdir(mode=0o700)
+        (self.jobs / "grabowski-job-file000000").write_text("not a directory")
+
+        result = self.operator.grabowski_job_notification_list(state="queued")
+        self.assertEqual(result["returned"], 2)
+        self.assertEqual(
+            {row["unit"] for row in result["notifications"]},
+            {self.unit, legacy_unit},
+        )
+
+    def test_schema_two_receipt_rejects_noncanonical_legacy_unit_name(self) -> None:
+        legacy_job_id = "legacy000001"
+        legacy_unit = f"grabowski-job-{legacy_job_id}"
+        legacy_directory = self.jobs / legacy_unit
+        legacy_directory.mkdir(mode=0o700)
+        receipt = {
+            **self.receipt,
+            "schema_version": 2,
+            "job_id": legacy_job_id,
+            "unit": legacy_unit,
+            "origin_sha256": "b" * 64,
+            "invoker_tool": "grabowski_job_start",
+            "origin_binding": self.operator.JOB_NOTIFICATION_ORIGIN_BINDING,
+            "trust_boundary": self.operator.JOB_NOTIFICATION_TRUST_BOUNDARY,
+        }
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = hashlib.sha256(
+            self.operator._canonical_json_bytes(receipt)
+        ).hexdigest()
+        self._write_json(legacy_directory / "notification.json", receipt)
+
+        result = self.operator.grabowski_job_notification_list(state="all")
+        self.assertTrue(any(
+            "canonical job unit" in row["error"]
+            for row in result["invalid_receipts"]
+        ))
+
     def test_ack_is_private_audited_and_idempotent(self) -> None:
         audit = mock.Mock()
         self.operator.base._append_audit = audit
@@ -260,6 +315,118 @@ class JobNotificationOutboxTests(unittest.TestCase):
                     self.receipt["receipt_sha256"],
                 )
         audit.assert_not_called()
+
+    def _install_origin_bound_receipt(self) -> tuple[dict, dict]:
+        metadata = {
+            "schema_version": 2,
+            "unit": self.unit,
+            "job_id": self.job_id,
+            "owner": "uid:1000",
+            "scope": {"cwd": "/tmp"},
+            "argv_sha256": "a" * 64,
+            "notify_on_done": {
+                "requested": True,
+                "channels": ["operator_outbox"],
+                "note": "done",
+            },
+            "created_at_unix": 100,
+            "started_at": "1970-01-01T00:01:40Z",
+        }
+        origin, origin_sha256 = self.operator.job_origin.build_origin(
+            unit=self.unit,
+            owner=metadata["owner"],
+            argv_sha256=metadata["argv_sha256"],
+            scope=metadata["scope"],
+            notify_on_done=metadata["notify_on_done"],
+            created_at_unix=metadata["created_at_unix"],
+            started_at=metadata["started_at"],
+            invoker_tool="grabowski_job_start",
+        )
+        metadata["origin"] = origin
+        metadata["origin_sha256"] = origin_sha256
+        receipt = {
+            **self._receipt(),
+            "schema_version": 2,
+            "origin_sha256": origin_sha256,
+            "invoker_tool": "grabowski_job_start",
+            "origin_binding": self.operator.JOB_NOTIFICATION_ORIGIN_BINDING,
+            "trust_boundary": self.operator.JOB_NOTIFICATION_TRUST_BOUNDARY,
+            "does_not_establish": [
+                "external_push_delivery",
+                "user_has_seen_notification",
+                "job_success_beyond_terminalization_evidence",
+                "untrusted_same_uid_job_authenticity",
+            ],
+        }
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = hashlib.sha256(
+            self.operator._canonical_json_bytes(receipt)
+        ).hexdigest()
+        self._write_json(self.directory / "metadata.json", metadata)
+        self._write_json(self.directory / "notification.json", receipt)
+        self.receipt = receipt
+        return metadata, receipt
+
+    def test_schema_two_receipt_and_ack_preserve_origin_binding(self) -> None:
+        _metadata, receipt = self._install_origin_bound_receipt()
+        listed = self.operator.grabowski_job_notification_list(state="queued")
+        self.assertEqual(listed["schema_version"], 2)
+        row = listed["notifications"][0]
+        self.assertEqual(row["receipt_schema_version"], 2)
+        self.assertEqual(row["origin_sha256"], receipt["origin_sha256"])
+        self.assertEqual(row["invoker_tool"], "grabowski_job_start")
+        self.assertEqual(row["trust_boundary"], "same_uid_authorized_job")
+
+        self.operator.base._append_audit = mock.Mock()
+        with mock.patch.object(
+            self.operator,
+            "_job_timestamp",
+            return_value=(100, "1970-01-01T00:01:40Z"),
+        ):
+            result = self.operator.grabowski_job_notification_ack(
+                self.unit,
+                receipt["receipt_sha256"],
+            )
+        acknowledgement = result["acknowledgement"]
+        self.assertEqual(acknowledgement["schema_version"], 2)
+        self.assertEqual(acknowledgement["origin_sha256"], receipt["origin_sha256"])
+        self.assertEqual(acknowledgement["invoker_tool"], "grabowski_job_start")
+
+    def test_schema_two_receipt_fails_closed_on_metadata_origin_drift(self) -> None:
+        metadata, _receipt = self._install_origin_bound_receipt()
+        metadata["scope"] = {"cwd": "/attacker"}
+        self._write_json(self.directory / "metadata.json", metadata)
+        result = self.operator.grabowski_job_notification_list(state="all")
+        self.assertEqual(result["returned"], 0)
+        self.assertIn("scope binding mismatch", result["invalid_receipts"][0]["error"])
+
+    def test_schema_two_ack_rejects_unknown_rehashed_claims(self) -> None:
+        _metadata, receipt = self._install_origin_bound_receipt()
+        acknowledgement = {
+            "schema_version": 2,
+            "kind": "grabowski_job_notification_ack",
+            "unit": self.unit,
+            "job_id": self.job_id,
+            "notification_id": receipt["notification_id"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "origin_sha256": receipt["origin_sha256"],
+            "invoker_tool": receipt["invoker_tool"],
+            "acknowledged_at": "1970-01-01T00:01:40Z",
+            "acknowledged_at_unix": 100,
+            "does_not_establish": [
+                "external_push_delivery",
+                "job_success",
+                "untrusted_same_uid_job_authenticity",
+            ],
+            "fabricated_delivery_claim": True,
+        }
+        acknowledgement["ack_sha256"] = hashlib.sha256(
+            self.operator._canonical_json_bytes(acknowledgement)
+        ).hexdigest()
+        self._write_json(self.directory / "notification-ack.json", acknowledgement)
+        result = self.operator.grabowski_job_notification_list(state="all")
+        self.assertEqual(result["returned"], 0)
+        self.assertIn("schema is invalid", result["invalid_receipts"][0]["error"])
 
     def test_ack_input_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "SHA-256"):

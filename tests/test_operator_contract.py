@@ -306,14 +306,22 @@ class OperatorContractTests(unittest.TestCase):
             self.assertIn("job_success", job["expected_receipt"]["does_not_establish"])
             self.assertFalse(job["notify_on_done"]["requested"])
             self.assertFalse(job["notify_on_done"]["delivery_enabled"])
-            self.assertEqual(job["notify_on_done"]["delivery_mode"], "metadata_only")
-            self.assertEqual(job["notification_evidence"]["delivery_state"], "not_sent")
+            self.assertEqual(job["notify_on_done"]["delivery_mode"], "none")
+            self.assertEqual(job["notification_evidence"]["delivery_state"], "not_requested")
             persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
             self.assertEqual(persisted["final_status"], "launch_submitted")
             self.assertEqual(persisted["terminalization_evidence"]["source"], "systemd-run-launch")
             invoked = run.call_args_list[0].args[0]
             self.assertIn("systemd-run", invoked)
             self.assertEqual(invoked.count("--property=LimitCORE=0"), 1)
+            self.assertNotIn("--property=LimitNOFILE=65536", invoked)
+            self.assertNotIn("--property=UMask=0077", invoked)
+            self.assertTrue(any(item.startswith("--setenv=GRABOWSKI_JOB_ORIGIN_SHA256=") for item in invoked))
+            self.assertIn("--setenv=GRABOWSKI_JOB_INVOKER_TOOL=grabowski_job_start", invoked)
+            self.assertTrue(any(" -I -m grabowski_job_finalizer" in item for item in invoked))
+            self.assertEqual(job["schema_version"], 2)
+            self.assertEqual(job["origin"]["invoker_tool"], "grabowski_job_start")
+            self.assertEqual(job["origin_sha256"], persisted["origin_sha256"])
             self.assertNotIn("mail", invoked)
             self.assertNotIn("notify-send", invoked)
 
@@ -334,6 +342,27 @@ class OperatorContractTests(unittest.TestCase):
             "failed",
         )
         self.assertEqual(
+            operator._job_final_status(True, {"ActiveState": "failed", "Result": "exit-code", "ExecMainStatus": "0"}),
+            "succeeded",
+        )
+        postflight = operator._job_terminalization_evidence(
+            True,
+            {
+                "LoadState": "loaded",
+                "ActiveState": "failed",
+                "SubState": "failed",
+                "Result": "exit-code",
+                "ExecMainCode": "1",
+                "ExecMainStatus": "0",
+            },
+        )
+        self.assertEqual(postflight["final_status"], "succeeded")
+        self.assertEqual(postflight["postflight_evidence"]["state"], "failed")
+        self.assertEqual(
+            postflight["postflight_evidence"]["primary_job_status_preserved"],
+            "succeeded",
+        )
+        self.assertEqual(
             operator._job_final_status(True, {"ActiveState": "inactive", "Result": "", "ExecMainStatus": ""}),
             "terminated_unclear",
         )
@@ -346,7 +375,7 @@ class OperatorContractTests(unittest.TestCase):
             jobs = state / "jobs"
             cwd = root / "cwd"
             cwd.mkdir(parents=True)
-            fake_uuid = types.SimpleNamespace(hex="badlaunch0000ffff")
+            fake_uuid = types.SimpleNamespace(hex="bad1a0c00000ffffffffffffffffffff")
             launcher = {
                 "returncode": 1,
                 "stdout": "",
@@ -368,7 +397,7 @@ class OperatorContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "systemd refused launch"):
                     operator.grabowski_job_start(["python3", "-c", "print(1)"], cwd=str(cwd))
 
-            metadata_path = jobs / "grabowski-job-badlaunch000" / "metadata.json"
+            metadata_path = jobs / "grabowski-job-bad1a0c00000" / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             self.assertEqual(metadata["final_status"], "launch_failed")
             self.assertEqual(metadata["terminalization_evidence"]["source"], "systemd-run-launch")
@@ -393,7 +422,7 @@ class OperatorContractTests(unittest.TestCase):
             with patch.object(operator, "STATE_DIR", state), patch.object(
                 operator, "JOBS_DIR", jobs
             ), patch.object(operator, "_run", return_value=systemctl):
-                status = operator.grabowski_job_status("grabowski-job-badlaunch000")
+                status = operator.grabowski_job_status("grabowski-job-bad1a0c00000")
 
             self.assertFalse(status["systemd_visible"])
             self.assertEqual(status["final_status"], "launch_failed")
@@ -420,7 +449,7 @@ class OperatorContractTests(unittest.TestCase):
             jobs = state / "jobs"
             cwd = root / "cwd"
             cwd.mkdir(parents=True)
-            fake_uuid = types.SimpleNamespace(hex="emptyshow0000ffff")
+            fake_uuid = types.SimpleNamespace(hex="e0005a0c0000ffffffffffffffffffff")
             launcher = {
                 "returncode": 0,
                 "stdout": "started",
@@ -519,7 +548,7 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(status["job_record"]["final_status"], "failed")
             self.assertTrue(status["job_record"]["notify_on_done"]["requested"])
             self.assertEqual(status["job_record"]["notify_on_done"]["channels"], ["chat"])
-            self.assertFalse(status["notification_evidence"]["delivery_enabled"])
+            self.assertTrue(status["notification_evidence"]["delivery_enabled"])
             self.assertEqual(status["notification_evidence"]["delivery_state"], "missing_receipt")
             self.assertEqual(status["notification_evidence"]["final_status_preserved"], "failed")
             self.assertIn("hidden_finalization_failure", status["terminalization_evidence"]["does_not_establish"])
@@ -631,7 +660,7 @@ class OperatorContractTests(unittest.TestCase):
             self.assertFalse(notify["requested"])
             self.assertTrue(notify["metadata_invalid"])
             self.assertFalse(status["notification_evidence"]["delivery_enabled"])
-            self.assertEqual(status["notification_evidence"]["delivery_state"], "not_sent")
+            self.assertEqual(status["notification_evidence"]["delivery_state"], "not_requested")
 
             metadata["notify_on_done"] = {"requested": True, "send": True}
             (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
@@ -647,8 +676,8 @@ class OperatorContractTests(unittest.TestCase):
             self.assertFalse(status["notification_evidence"]["delivery_enabled"])
 
             for invalid_notify, expected_error in (
-                ({"requested": True, "delivery_enabled": True}, "delivery_enabled must be false"),
-                ({"requested": True, "delivery_mode": "real_delivery"}, "delivery_mode must be metadata_only"),
+                ({"requested": True, "delivery_enabled": False}, "delivery_enabled is invalid"),
+                ({"requested": True, "delivery_mode": "real_delivery"}, "delivery_mode is invalid"),
                 ({"requested": True, "does_not_establish": ["job_success"]}, "does_not_establish is invalid"),
             ):
                 metadata["notify_on_done"] = invalid_notify

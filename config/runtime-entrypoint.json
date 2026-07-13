@@ -251,6 +251,18 @@
       "source": "src/grabowski_agent_bootstrap.py"
     },
     {
+      "module": "grabowski_consumer_surface",
+      "source": "src/grabowski_consumer_surface.py"
+    },
+    {
+      "module": "grabowski_private_io",
+      "source": "src/grabowski_private_io.py"
+    },
+    {
+      "module": "grabowski_job_origin",
+      "source": "src/grabowski_job_origin.py"
+    },
+    {
       "module": "grabowski_job_finalizer",
       "source": "src/grabowski_job_finalizer.py"
     }

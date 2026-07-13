@@ -72,16 +72,16 @@ Status: live in the deployed runtime; follow-up work is typed agent/fleet integr
 
 ## GRABOWSKI-CONSUMER-SURFACE-V1
 
-Status: implementation and local validation complete; live status follows the merge and controlled runtime deployment.
+Status: v1 live; v2 maintainability and origin-bound outbox hardening implemented for controlled merge and deployment.
 
 - shared `minimal`, `standard` and `evidence` response contract;
 - field projection that preserves warnings, next action and epistemic limits;
 - view-, filter- and snapshot-bound pagination for large read surfaces;
 - `observe`, `maintain` and authority-preserving `trusted-owner` profiles;
-- private hash-bound durable job notification outbox with idempotent acknowledgement;
+- private origin- and hash-bound durable job notification outbox with idempotent acknowledgement and explicit Same-UID trust boundary;
 - `LimitCORE=0` for operator, jobs, tasks and workers;
 - versioned effect evidence under `docs/proofs/consumer-surface-v1-benchmark-20260712.md`;
-- operating contract under `docs/consumer-surface-v1.md`.
+- operating contract under `docs/consumer-surface-v1.md` and migration contract under `docs/consumer-surface-migration-v2.md`.
 
 Future ideas are parked in `docs/visionsboard.md`. That document grants no priority, task, lease or implementation authority.
 

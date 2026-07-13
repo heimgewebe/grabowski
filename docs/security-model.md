@@ -70,6 +70,18 @@ kurzlebige Single-Use-Referenzen für den root-eigenen Socket-Broker. Der Broker
 führt ausschließlich konfigurierte argv-Templates aus; sein Host-Bootstrap ist
 eine explizite Systemoperation.
 
+## Durable Jobs und Same-UID-Vertrauensgrenze
+
+Durable Jobs werden als bereits autorisierte lokale Kommandos im Benutzerkontext gestartet. Sie sind keine allgemeine Ausführungsfläche für vollständig untrusted Code.
+
+Neue Job-Metadaten enthalten einen normalisierten Origin-Vertrag. Dessen SHA-256 wird vor dem Unit-Start berechnet und als systemd-Umgebungs-Precondition an den Stop-Finalizer übergeben. Der Finalizer akzeptiert ein neues Outbox-Receipt nur, wenn Unit, Job-ID, Besitzer, argv-Hash, Scope, Notification-Anforderung, Origin-Hash und Startwerkzeug zusammenpassen. Teilweise vorhandene oder nachträglich neu gehashte Origin-Verträge scheitern geschlossen.
+
+Diese Bindung schützt gegen stille Metadatendrift und versehentliche Änderungen, solange die beim Unit-Start gesetzte Precondition nicht ebenfalls kontrolliert wird. **Sie ist keine Isolation.** Ein kompromittierter Job-Prozess, der vor dem Stop-Finalizer im selben Benutzerkontext läuft und sowohl Metadaten als auch die beim Finalizer verwendete Precondition kontrollieren kann, kann einen in sich konsistenten gefälschten Origin-Vertrag herstellen. Der Finalizer kann diesen Fall nicht von einem legitimen Start unterscheiden. Dafür wäre eine getrennte Sicherheitsdomäne nötig, etwa eigener Benutzer, root-eigener Broker, Container oder MicroVM.
+
+Der Finalizer liest zunächst nur seine feste Environment-Allowlist, verlangt darin `GRABOWSKI_JOB_DIRECTORY` und setzt anschließend vor jedem Dateizugriff im eigenen kurzlebigen Prozess `UMask=0077`, `RLIMIT_CORE=0` sowie ein hohes, aber endliches `RLIMIT_NOFILE`. Fehler werden strukturiert auf stderr geschrieben und durch den Unit-Vertrag im langlebigen Job-Stderr erfasst; systemd hält zusätzlich den fehlgeschlagenen `ExecStopPost`-Status fest. Ein Finalizerfehler ändert nicht den bereits ermittelten Jobausgang, verhindert aber das Notification-Receipt. Der eigentliche Durable Job behält seine bisherige Umask- und Dateideskriptor-Semantik.
+
+Das Dateipublishing ist absichtlich create-only und ersetzt niemals ein vorhandenes Ziel. Alle Dateioperationen sind an einen geöffneten privaten Verzeichnis-FD gebunden; der sichtbare Verzeichnispfad wird vor und nach der Publikation gegen denselben Inode geprüft. Modus, Inode, Linkzahl und Directory-Fsync werden validiert. Ein Same-UID-Angreifer kann eine Datei nach Abschluss dennoch löschen oder ersetzen; dieser Primitive behauptet keine Untrusted-Isolation.
+
 ## Staged Capability Profiles
 
 `config/access.example.json` now uses `observe` as its repository-default

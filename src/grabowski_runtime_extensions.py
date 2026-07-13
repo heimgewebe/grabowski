@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -8,6 +9,7 @@ from typing import Any
 
 import grabowski_capabilities as capabilities
 import grabowski_mcp as base
+import grabowski_consumer_surface as consumer_surface
 import grabowski_operator_core as operator
 
 mcp = operator.mcp
@@ -143,7 +145,7 @@ def grabowski_context(
 ) -> dict[str, Any]:
     """Return compact operator context; full evidence is explicitly opt-in."""
     default_view = "minimal" if profile == "concise" else "standard"
-    selected_view = operator._normalize_consumer_view(view, default=default_view)
+    selected_view = consumer_surface.normalize_view(view, default=default_view)
     if profile not in capabilities.PROFILE_CATEGORIES:
         raise ValueError(f"profile must be one of {sorted(capabilities.PROFILE_CATEGORIES)}")
     snapshot = _runtime_contract_snapshot()
@@ -172,9 +174,6 @@ def grabowski_context(
             known_gaps.append(f"{key}: {', '.join(values[:20])}")
     if not expected_tools:
         known_gaps.append("runtime entrypoint contract is unavailable")
-    known_gaps.append(
-        "the connector's frozen client-side tool snapshot is not observable from the local runtime"
-    )
     warnings: list[dict[str, Any]] = []
     if not canonical_matches_runtime:
         warnings.append({
@@ -241,9 +240,14 @@ def grabowski_context(
         payload["capability_summary"] = {
             "selected_count": len(selected_records),
             "by_category": dict(sorted(category_counts.items())),
-            "sample": selected_records[:20],
-            "sample_truncated": len(selected_records) > 20,
         }
+        if selected_view == "standard":
+            payload["capability_summary"].update({
+                "sample": selected_records[:20],
+                "sample_truncated": len(selected_records) > 20,
+            })
+        else:
+            payload["capability_summary"]["records_ref"] = "capabilities"
         payload["checkout"].update({
             "worktree_count": len(worktrees.get("worktrees", [])),
             "runtime_matching_worktree_count": len(
@@ -253,10 +257,22 @@ def grabowski_context(
     if selected_view == "evidence":
         records = capabilities.capability_records(expected_tools)
         worktrees = _worktree_context(runtime_head if isinstance(runtime_head, str) else None)
+        expected_tools_sha256 = hashlib.sha256(
+            consumer_surface.canonical_json_bytes(expected_tools)
+        ).hexdigest()
+        compact_capabilities = [
+            {
+                key: record.get(key)
+                for key in ("tool", "category", "risk_class")
+                if key in record
+            }
+            for record in capabilities.filter_capabilities(records, profile)
+        ]
         payload.update({
             "runtime_evidence": {
                 "contract_source": snapshot["source"],
-                "expected_tools": expected_tools,
+                "expected_tool_count": len(expected_tools),
+                "expected_tools_sha256": expected_tools_sha256,
                 "deployment": deployment,
             },
             "policy_evidence": {
@@ -273,9 +289,11 @@ def grabowski_context(
                 "kill_switch": base._kill_switch_state(),
                 "audit": base._verify_audit_log(base.AUDIT_LOG),
             },
-            "capabilities": capabilities.filter_capabilities(records, profile),
-            "classification": classification,
-            "checkout_evidence": worktrees,
+            "capabilities": compact_capabilities,
+            "checkout_evidence": {
+                "command_returncode": worktrees.get("command_returncode"),
+                "worktrees": worktrees.get("worktrees", []),
+            },
             "drift": {
                 "catalog_matches_contract": not any(classification.values()),
                 "canonical_checkout_matches_runtime": worktrees.get(
@@ -287,7 +305,7 @@ def grabowski_context(
                 "connector_snapshot_observable": False,
             },
         })
-    return operator._project_consumer_fields(
+    return consumer_surface.project_fields(
         payload,
         fields=fields,
         required=(

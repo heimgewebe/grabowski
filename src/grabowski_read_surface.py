@@ -14,6 +14,7 @@ from pydantic import Field
 
 import grabowski_capabilities as capabilities
 import grabowski_mcp as base
+import grabowski_consumer_surface as consumer_surface
 import grabowski_operator_core as operator
 import grabowski_runtime_extensions as runtime_extensions
 
@@ -397,7 +398,7 @@ def grabowski_checkout_summary(
     fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return a paginated consumer-shaped summary of Grabowski worktrees."""
-    selected_view = operator._normalize_consumer_view(view)
+    selected_view = consumer_surface.normalize_view(view)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_WORKTREES:
         raise ValueError(f"limit must be between 1 and {MAX_WORKTREES}")
     deployment = base._deployment_metadata()
@@ -413,7 +414,7 @@ def grabowski_checkout_summary(
         key=lambda item: str(item.get("path", "")),
     )
     snapshot_digest = hashlib.sha256(
-        operator._canonical_json_bytes([
+        consumer_surface.canonical_json_bytes([
             {
                 "path": item.get("path"),
                 "head": item.get("head"),
@@ -424,7 +425,11 @@ def grabowski_checkout_summary(
         ])
     ).hexdigest()
     scope = f"checkout-summary:{selected_view}:{snapshot_digest}"
-    position = operator._decode_consumer_cursor(cursor, scope)
+    position = consumer_surface.decode_cursor(
+        cursor,
+        scope,
+        snapshot_scope=f"checkout-summary:{selected_view}",
+    )
     offset = 0 if position is None else position.get("offset")
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
         raise ValueError("cursor offset is invalid")
@@ -452,7 +457,7 @@ def grabowski_checkout_summary(
     ]
     next_offset = offset + len(page)
     next_cursor = (
-        operator._encode_consumer_cursor(scope, {"offset": next_offset})
+        consumer_surface.encode_cursor(scope, {"offset": next_offset})
         if next_offset < len(worktrees)
         else None
     )
@@ -497,7 +502,7 @@ def grabowski_checkout_summary(
         payload["runtime_matching_worktrees"] = context.get(
             "runtime_matching_worktrees", []
         )
-    return operator._project_consumer_fields(
+    return consumer_surface.project_fields(
         payload,
         fields=fields,
         required=(

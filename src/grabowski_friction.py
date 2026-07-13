@@ -15,6 +15,7 @@ import uuid
 from typing import Any
 
 import grabowski_mcp as base
+import grabowski_consumer_surface as consumer_surface
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -58,36 +59,24 @@ MAX_FRICTION_CLOSEOUT_BATCH = 100
 
 
 def _consumer_view(value: str, *, default: str = "minimal") -> str:
-    helper = getattr(operator, "_normalize_consumer_view", None)
-    if callable(helper):
-        return helper(value, default=default)
-    selected = default if value is None else value
-    selected = {"concise": "minimal", "full": "evidence"}.get(selected, selected)
-    if selected not in {"minimal", "standard", "evidence"}:
-        raise ValueError("view must be minimal, standard or evidence")
-    return selected
+    return consumer_surface.normalize_view(value, default=default)
 
 
-def _consumer_decode_cursor(cursor: str | None, scope: str) -> dict[str, Any] | None:
-    helper = getattr(operator, "_decode_consumer_cursor", None)
-    if callable(helper):
-        return helper(cursor, scope)
-    if cursor in (None, ""):
-        return None
-    raise ValueError("cursor support is unavailable in this runtime seam")
+def _consumer_decode_cursor(
+    cursor: str | None,
+    scope: str,
+    *,
+    snapshot_scope: str | None = None,
+) -> dict[str, Any] | None:
+    return consumer_surface.decode_cursor(
+        cursor,
+        scope,
+        snapshot_scope=snapshot_scope,
+    )
 
 
 def _consumer_encode_cursor(scope: str, position: dict[str, Any]) -> str:
-    helper = getattr(operator, "_encode_consumer_cursor", None)
-    if callable(helper):
-        return helper(scope, position)
-    material = json.dumps(
-        {"scope": scope, "position": position},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return "fallback-" + hashlib.sha256(material).hexdigest()
+    return consumer_surface.encode_cursor(scope, position)
 
 
 def _consumer_project(
@@ -96,18 +85,11 @@ def _consumer_project(
     fields: list[str] | None,
     required: tuple[str, ...],
 ) -> dict[str, Any]:
-    helper = getattr(operator, "_project_consumer_fields", None)
-    if callable(helper):
-        return helper(payload, fields=fields, required=required)
-    if fields is None:
-        return payload
-    if not isinstance(fields, list) or not all(isinstance(item, str) for item in fields):
-        raise ValueError("fields must be a list of strings")
-    unknown = sorted(set(fields) - set(payload))
-    if unknown:
-        raise ValueError(f"Unknown response field(s): {', '.join(unknown)}")
-    keep = set(fields) | {key for key in required if key in payload}
-    return {key: value for key, value in payload.items() if key in keep}
+    return consumer_surface.project_fields(
+        payload,
+        fields=fields,
+        required=required,
+    )
 
 FRICTION_KINDS = {
     "platform_filter",
@@ -1853,7 +1835,11 @@ def friction_summary(
         raise ValueError(f"limit must be between 1 and {max_limit} for view={selected_view}")
     snapshot_sha256 = _friction_snapshot_sha256()
     scope = f"friction-summary:{selected_view}:{snapshot_sha256}"
-    position = _consumer_decode_cursor(cursor, scope)
+    position = _consumer_decode_cursor(
+        cursor,
+        scope,
+        snapshot_scope=f"friction-summary:{selected_view}",
+    )
     offset = 0 if position is None else position.get("offset")
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
         raise ValueError("cursor offset is invalid")
