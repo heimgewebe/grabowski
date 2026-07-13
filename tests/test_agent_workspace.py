@@ -3483,8 +3483,18 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
 
         self.assertTrue(result["passed"])
-        self.assertEqual(calls[0][0], "/usr/bin/python3")
+        self.assertEqual(calls[0][0], str(Path("/usr/bin/python3").resolve(strict=True)))
         self.assertEqual(calls[1][0], "/usr/bin/python3")
+
+    def test_probe_runner_returns_resolved_usr_path_for_private_symlink(self) -> None:
+        resolved = Path("/usr/bin/python3.10")
+        with (
+            mock.patch.object(role.sys, "executable", "/home/alex/private-venv/bin/python"),
+            mock.patch.object(Path, "resolve", return_value=resolved),
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(role.os, "access", return_value=True),
+        ):
+            self.assertEqual(role._sandbox_probe_python(), str(resolved))
 
     def test_probe_runner_fails_closed_without_usr_python(self) -> None:
         with (
