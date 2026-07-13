@@ -444,6 +444,47 @@ class ObsoletePathLeaseReconcileTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.code, "terminal-evidence-drift")
 
+    def test_task_lease_updated_in_terminal_second_is_rejected(self) -> None:
+        fake_tasks, terminal_source, owner, key, snapshots = self._task_source_fixture(
+            receipt_state="completed"
+        )
+        receipt = json.loads(
+            (fake_tasks.TASK_OUTCOMES_DIR / f"{terminal_source['task_id']}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        snapshots[0]["updated_at_unix"] = receipt["observed_at_unix"]
+        with patch.dict(sys.modules, {"grabowski_tasks": fake_tasks}):
+            with self.assertRaises(nonconflict.NonConflictDenied) as raised:
+                resources._verify_task_terminal_source(
+                    terminal_source,
+                    owner_id=owner,
+                    resource_keys=[key],
+                    expected_leases=snapshots,
+                )
+        self.assertEqual(raised.exception.code, "terminal-evidence-drift")
+
+    def test_task_lease_acquired_in_terminal_second_is_rejected(self) -> None:
+        fake_tasks, terminal_source, owner, key, snapshots = self._task_source_fixture(
+            receipt_state="completed"
+        )
+        receipt = json.loads(
+            (fake_tasks.TASK_OUTCOMES_DIR / f"{terminal_source['task_id']}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        snapshots[0]["acquired_at_unix"] = receipt["observed_at_unix"]
+        snapshots[0]["updated_at_unix"] = receipt["observed_at_unix"]
+        with patch.dict(sys.modules, {"grabowski_tasks": fake_tasks}):
+            with self.assertRaises(nonconflict.NonConflictDenied) as raised:
+                resources._verify_task_terminal_source(
+                    terminal_source,
+                    owner_id=owner,
+                    resource_keys=[key],
+                    expected_leases=snapshots,
+                )
+        self.assertEqual(raised.exception.code, "terminal-evidence-drift")
+
     def test_stale_task_attempt_receipt_remains_blocked(self) -> None:
         fake_tasks, terminal_source, owner, key, snapshots = self._task_source_fixture(
             receipt_state="completed",
@@ -638,6 +679,39 @@ class ObsoletePathLeaseReconcileTests(unittest.TestCase):
             )
         self.assertEqual(evidence["state"], "resource_release_incomplete")
         self.assertEqual(evidence["resource_keys"], [key])
+
+        same_second_leases = [dict(expected_leases[0])]
+        same_second_leases[0]["acquired_at_unix"] = 1
+        same_second_leases[0]["updated_at_unix"] = 1
+        with patch.dict(sys.modules, {"grabowski_agent_workspace": fake_workspace}):
+            with self.assertRaises(nonconflict.NonConflictDenied) as raised:
+                resources._verify_workspace_terminal_source(
+                    {
+                        "kind": "agent_workspace_close",
+                        "workspace_id": workspace_id,
+                        "close_receipt_sha256": receipt_sha,
+                    },
+                    owner_id=self.owner,
+                    resource_keys=[key],
+                    expected_leases=same_second_leases,
+                )
+        self.assertEqual(raised.exception.code, "terminal-evidence-drift")
+
+        same_update_leases = [dict(expected_leases[0])]
+        same_update_leases[0]["updated_at_unix"] = 1
+        with patch.dict(sys.modules, {"grabowski_agent_workspace": fake_workspace}):
+            with self.assertRaises(nonconflict.NonConflictDenied) as raised:
+                resources._verify_workspace_terminal_source(
+                    {
+                        "kind": "agent_workspace_close",
+                        "workspace_id": workspace_id,
+                        "close_receipt_sha256": receipt_sha,
+                    },
+                    owner_id=self.owner,
+                    resource_keys=[key],
+                    expected_leases=same_update_leases,
+                )
+        self.assertEqual(raised.exception.code, "terminal-evidence-drift")
 
         naive_core = {**core, "closed_at": "1970-01-01T00:00:01"}
         naive_sha = hashlib.sha256(
