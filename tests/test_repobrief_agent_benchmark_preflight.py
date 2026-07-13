@@ -470,6 +470,7 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
             os.environ["ANTHROPIC_API_KEY"] = "secret"
             os.environ["HOME"] = "/home/operator"
             environment = preflight._mcp_environment()
+            validator_environment = preflight._unprivileged_environment()
         finally:
             if previous_key is None:
                 os.environ.pop("ANTHROPIC_API_KEY", None)
@@ -481,6 +482,21 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
                 os.environ["HOME"] = previous_home
         self.assertNotIn("ANTHROPIC_API_KEY", environment)
         self.assertEqual(environment["HOME"], "/nonexistent/repobrief-preflight")
+        self.assertNotIn("ANTHROPIC_API_KEY", validator_environment)
+        self.assertEqual(validator_environment["HOME"], "/nonexistent/repobrief-preflight")
+
+    def test_report_and_digest_are_published_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "preflight.json"
+            preflight._write_report_artifacts(report_path, {"status": "fixture"})
+            digest_path = Path(str(report_path) + ".sha256")
+            self.assertTrue(report_path.is_file())
+            self.assertTrue(digest_path.is_file())
+            expected = preflight._sha256_bytes(report_path.read_bytes())
+            self.assertTrue(digest_path.read_text(encoding="ascii").startswith(expected))
+            with self.assertRaisesRegex(preflight.PreflightError, "already exists"):
+                preflight._write_report_artifacts(report_path, {"status": "second"})
 
 
 if __name__ == "__main__":

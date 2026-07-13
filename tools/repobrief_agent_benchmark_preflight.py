@@ -113,6 +113,30 @@ def _write_private_exclusive(path: Path, value: Mapping[str, Any]) -> None:
         raise
 
 
+def _write_report_artifacts(report_path: Path, value: Mapping[str, Any]) -> None:
+    report_path = report_path.expanduser().resolve()
+    digest_path = Path(str(report_path) + ".sha256")
+    if report_path.exists() or digest_path.exists():
+        raise PreflightError("report or digest path already exists")
+    try:
+        _write_private_exclusive(report_path, value)
+        report_bytes = report_path.read_bytes()
+        digest = (
+            f"{_sha256_bytes(report_bytes)}  {report_path.name}\n"
+        ).encode("ascii")
+        descriptor = os.open(
+            digest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(digest)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        report_path.unlink(missing_ok=True)
+        digest_path.unlink(missing_ok=True)
+        raise
+
+
 def _request_files(request_root: Path) -> list[Path]:
     if request_root.is_symlink():
         raise PreflightError("request root must not be a symlink")
@@ -278,11 +302,15 @@ def _rpc(process: subprocess.Popen, message: Mapping[str, Any], *, timeout_secon
     return result
 
 
-def _mcp_environment() -> dict[str, str]:
+def _unprivileged_environment() -> dict[str, str]:
     allowed = {"PATH", "LANG", "LC_ALL", "TMPDIR"}
     environment = {key: value for key, value in os.environ.items() if key in allowed}
     environment["HOME"] = "/nonexistent/repobrief-preflight"
     return environment
+
+
+def _mcp_environment() -> dict[str, str]:
+    return _unprivileged_environment()
 
 
 def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
@@ -425,7 +453,7 @@ def _validate_receipt_external(
             capture_output=True,
             timeout=120,
             shell=False,
-            env=runner._provider_environment(),
+            env=_unprivileged_environment(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PreflightError("Lenskit receipt validator could not run") from exc
@@ -707,19 +735,7 @@ def main(argv: list[str] | None = None) -> int:
             baseline_fixture=args.baseline_stream_fixture,
             treatment_fixture=args.treatment_stream_fixture,
         )
-        report_path = args.report_out.expanduser().resolve()
-        _write_private_exclusive(report_path, report)
-        report_bytes = report_path.read_bytes()
-        digest_path = Path(str(report_path) + ".sha256")
-        digest = f"{_sha256_bytes(report_bytes)}  {report_path.name}\n".encode("ascii")
-        digest_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        descriptor = os.open(
-            digest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(digest)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _write_report_artifacts(args.report_out, report)
     except (PreflightError, runner.RunnerError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True), file=sys.stderr)
         return 2
