@@ -1,0 +1,129 @@
+name: temporary RepoBrief preflight review fixes
+
+on:
+  push:
+    branches:
+      - feat/repobrief-live-preflight-v1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/repobrief-live-preflight-v1
+          fetch-depth: 0
+      - name: Apply exact review fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          tests = Path('tests/test_repobrief_agent_benchmark_runner.py')
+          text = tests.read_text(encoding='utf-8')
+          text = re.sub(
+              r'(\n\s+max_cost_usd=Decimal\("1\.00"\),){2,}',
+              lambda match: match.group(1),
+              text,
+          )
+          tests.write_text(text, encoding='utf-8')
+
+          preflight = Path('tools/repobrief_agent_benchmark_preflight.py')
+          text = preflight.read_text(encoding='utf-8')
+          replacements = [
+              (
+                  'MAX_VALIDATOR_OUTPUT_BYTES = 256 * 1024\n',
+                  'MAX_VALIDATOR_OUTPUT_BYTES = 256 * 1024\nMAX_MANIFEST_BYTES = 16 * 1024 * 1024\n',
+              ),
+              (
+                  '    try:\n'
+                  '        data = manifest.read_bytes()\n'
+                  '    except OSError as exc:\n'
+                  '        raise PreflightError("bound RepoBrief manifest is unavailable") from exc\n',
+                  '    try:\n'
+                  '        with manifest.open("rb") as handle:\n'
+                  '            data = handle.read(MAX_MANIFEST_BYTES + 1)\n'
+                  '    except OSError as exc:\n'
+                  '        raise PreflightError("bound RepoBrief manifest is unavailable") from exc\n'
+                  '    if not data or len(data) > MAX_MANIFEST_BYTES:\n'
+                  '        raise PreflightError("bound RepoBrief manifest is empty or oversized")\n',
+              ),
+              (
+                  'def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:\n',
+                  'def _mcp_environment() -> dict[str, str]:\n'
+                  '    allowed = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}\n'
+                  '    return {key: value for key, value in os.environ.items() if key in allowed}\n\n\n'
+                  'def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:\n',
+              ),
+              (
+                  '    environment = runner._provider_environment()\n'
+                  '    started = time.monotonic()\n'
+                  '    try:\n'
+                  '        process = subprocess.Popen(\n'
+                  '            command,\n',
+                  '    environment = _mcp_environment()\n'
+                  '    started = time.monotonic()\n'
+                  '    try:\n'
+                  '        process = subprocess.Popen(\n'
+                  '            command,\n',
+              ),
+              (
+                  '    agent_execution_ms = 0\n',
+                  '    agent_execution_ms = 0\n    runner_execution_ms = 0\n',
+              ),
+              (
+                  '        agent_execution_ms += max(int((time.monotonic() - run_started) * 1000), 0)\n',
+                  '        runner_execution_ms += max(int((time.monotonic() - run_started) * 1000), 0)\n',
+              ),
+              (
+                  '        _tool_requirement(receipt, treatment=condition == "treatment")\n',
+                  '        agent_execution_ms += int(receipt.get("duration_ms") or 0)\n'
+                  '        _tool_requirement(receipt, treatment=condition == "treatment")\n',
+              ),
+              (
+                  '    if not synthetic and total_observed > MAX_TOTAL_COST_USD:\n',
+                  '    total_authorized = max_cost_usd * 2\n'
+                  '    if not synthetic and total_observed > total_authorized:\n',
+              ),
+              (
+                  '            "total_authorized_usd": format(MAX_TOTAL_COST_USD, "f"),\n',
+                  '            "total_authorized_usd": format(total_authorized, "f"),\n',
+              ),
+              (
+                  '            "agent_execution_ms": agent_execution_ms,\n'
+                  '            "total_time_to_answer_ms": total_time_to_answer_ms,\n',
+                  '            "agent_execution_ms": agent_execution_ms,\n'
+                  '            "runner_execution_ms": runner_execution_ms,\n'
+                  '            "total_time_to_answer_ms": total_time_to_answer_ms,\n',
+              ),
+          ]
+          for old, new in replacements:
+              if new in text:
+                  continue
+              if old not in text:
+                  raise SystemExit(f'missing preflight patch anchor: {old[:120]!r}')
+              text = text.replace(old, new, 1)
+          preflight.write_text(text, encoding='utf-8')
+
+          preflight_tests = Path('tests/test_repobrief_agent_benchmark_preflight.py')
+          text = preflight_tests.read_text(encoding='utf-8')
+          old = '                    "agent_execution_ms",\n                    "total_time_to_answer_ms",\n'
+          new = '                    "agent_execution_ms",\n                    "runner_execution_ms",\n                    "total_time_to_answer_ms",\n'
+          if new not in text:
+              if old not in text:
+                  raise SystemExit('missing preflight timing test anchor')
+              text = text.replace(old, new, 1)
+          preflight_tests.write_text(text, encoding='utf-8')
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tools/repobrief_agent_benchmark_preflight.py tests/test_repobrief_agent_benchmark_runner.py tests/test_repobrief_agent_benchmark_preflight.py
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "fix: harden RepoBrief live preflight evidence"
+          git push origin HEAD:feat/repobrief-live-preflight-v1
