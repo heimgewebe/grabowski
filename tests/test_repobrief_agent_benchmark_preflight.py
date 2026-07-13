@@ -42,6 +42,9 @@ def _fake_claude(
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
+        f"log_path = {str(root / 'claude-invocations.jsonl')!r}\n"
+        "with open(log_path, 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
         "if '--version' in sys.argv:\n"
         "    print('claude-code fixture 1.0')\n"
         "    raise SystemExit(0)\n"
@@ -168,6 +171,29 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
 
     def test_main_rejects_missing_live_bindings_before_core(self) -> None:
         self.assertEqual(support.preflight.main([]), 2)
+
+    def test_live_preflight_starts_exactly_two_claude_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            report = _execute_with_test_provider_binding(
+                **_preflight_kwargs(root, environment)
+            )
+            invocations = [
+                json.loads(line)
+                for line in (root / "claude-invocations.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(invocations), 2)
+            self.assertTrue(all("--version" not in item for item in invocations))
+            self.assertEqual(
+                report["dispatch_ledger"]["provider_process_intents"], 2
+            )
+            self.assertIsNone(report["environment"]["claude"]["version"])
+            self.assertFalse(
+                report["environment"]["claude"]["version_probed"]
+            )
 
 
 class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):

@@ -1116,27 +1116,13 @@ def _claude_identity(claude: str) -> dict[str, Any]:
         raise PreflightError("Claude executable cannot be read") from exc
     if not data or len(data) > MAX_EXECUTABLE_BYTES:
         raise PreflightError("Claude executable is empty or oversized")
-    try:
-        completed = subprocess.run(
-            [str(resolved), "--version"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            shell=False,
-            env=runner._provider_environment(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise PreflightError("Claude version probe failed") from exc
-    version = completed.stdout.strip()
-    if not version or len(version) > 500 or completed.stderr:
-        raise PreflightError("Claude version probe returned invalid output")
     return {
         "command": claude,
         "resolved_path": str(resolved),
         "bytes": len(data),
         "sha256": _sha256_bytes(data),
-        "version": version,
+        "version": None,
+        "version_probed": False,
     }
 
 

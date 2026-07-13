@@ -23,6 +23,7 @@ Zwei Läufe können keinen allgemeinen RepoBrief-Nutzen belegen.
 - keine Änderung von Prompt, Modell, Sampling, Budgets, Commit oder Toolpolicy;
 - maximal `1.00 USD` je Providerprozess;
 - maximal zwei Providerprozesse und `2.00 USD` autorisierte Gesamtkosten;
+- die Claude-Binärdatei wird ausschließlich dateibasiert gebunden; es gibt keinen zusätzlichen Versionsprobe-Prozess;
 - kein Retry, keine Sitzungsfortsetzung und kein automatischer Vollbenchmark;
 - jeder Fehler beendet den Preflight.
 
@@ -161,7 +162,7 @@ Der Bericht bindet:
 
 - beide Auftrag- und Receipt-SHA-256;
 - beide Transcriptpfade, -größen und -SHA-256;
-- Claude-Version sowie Pfad, Größe und SHA-256 des gestarteten Programms;
+- Pfad, Größe und SHA-256 des gestarteten Programms sowie `version_probed=false`;
 - Digest des Lenskit-Validatorbefehls und der Validatorergebnisse;
 - Provider-gemeldete Modell-, Token-, Tool- und Kostenwerte;
 - Snapshot- und Freshnessstatus;
