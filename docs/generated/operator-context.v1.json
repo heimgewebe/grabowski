@@ -1949,7 +1949,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_mcp.py": "48f603f5638eea1320250e0bea14f765f88db5d233493668f9b4a15ea47f5952",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
-      "src/grabowski_operator.py": "346bb655b9ba1930b2942c5816a9532ac3a2544eb5bca4af1ae94ba67435ac0d",
+      "src/grabowski_operator.py": "d8d8f17b2db58701e88c760928ca6e005ac92f37fabd6520b1cfc4b527a9e912",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",
       "src/grabowski_read_surface.py": "c4f633a3303d08ac4916c034dc6d5c86d872daa7628704f3e1ba5b4d070917ac",
