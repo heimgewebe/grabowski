@@ -1,0 +1,31 @@
+name: temporary PR 180 failed-log capture
+
+on:
+  pull_request:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download failed hardening job log
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl --fail --location \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/heimgewebe/grabowski/actions/jobs/86806943369/logs \
+            --output pr180-hardening-failure.log
+      - name: Upload failed job log
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+        with:
+          name: pr180-hardening-failure-${{ github.run_id }}
+          path: pr180-hardening-failure.log
+          if-no-files-found: error
+          retention-days: 7
