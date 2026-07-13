@@ -14,6 +14,11 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "tools" / "deploy_runtime.py"
+TEST_AGENT_INSTRUCTIONS = (
+    "Grabowski agent-facing contract grabowski-agent-facing-contract-v1 "
+    "(schema 1).\n"
+    "1. [truth-hierarchy] Runtime truth first."
+)
 
 
 def load_module():
@@ -27,6 +32,17 @@ def load_module():
 
 
 deploy_runtime = load_module()
+TEST_AGENT_INSTRUCTIONS_IDENTITY = deploy_runtime.agent_instructions_identity(
+    TEST_AGENT_INSTRUCTIONS
+)
+
+
+def _build_result(*args, **kwargs):
+    kwargs.setdefault(
+        "agent_instructions",
+        TEST_AGENT_INSTRUCTIONS_IDENTITY,
+    )
+    return deploy_runtime.BuildResult(*args, **kwargs)
 
 
 class DeployRuntimeTests(unittest.TestCase):
@@ -102,6 +118,25 @@ class DeployRuntimeTests(unittest.TestCase):
             release_path=release_path if release_path is not None else runtime.parent / "new",
             previous=previous,
         )
+
+    def test_agent_instructions_identity_is_versioned_hash_bound_and_bounded(self) -> None:
+        identity = deploy_runtime.agent_instructions_identity(TEST_AGENT_INSTRUCTIONS)
+        self.assertEqual(identity["schema_version"], 1)
+        self.assertEqual(identity["version"], "grabowski-agent-facing-contract-v1")
+        self.assertEqual(identity["bytes"], len(TEST_AGENT_INSTRUCTIONS.encode("utf-8")))
+        self.assertEqual(identity["max_bytes"], 4_096)
+        self.assertEqual(len(identity["sha256"]), 64)
+
+    def test_agent_instructions_identity_rejects_missing_header_and_oversize(self) -> None:
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "Vertragskopf"):
+            deploy_runtime.agent_instructions_identity("not versioned")
+        oversized = (
+            "Grabowski agent-facing contract grabowski-agent-facing-contract-v1 "
+            "(schema 1).\n"
+            + "x" * 4_096
+        )
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "Größenbegrenzung"):
+            deploy_runtime.agent_instructions_identity(oversized)
 
     def test_sha256_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -406,7 +441,16 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "site_packages_path", side_effect=lambda python: python.parents[1] / "lib/python3.10/site-packages"),
                 patch.object(deploy_runtime, "verify_installed_distributions"),
                 patch.object(deploy_runtime, "import_module_path", side_effect=lambda python, module: python.parents[1] / "lib/python3.10/site-packages/grabowski_mcp.py"),
-                patch.object(deploy_runtime, "probe_mcp", return_value="2025-06-18"),
+                patch.object(
+                    deploy_runtime,
+                    "probe_mcp",
+                    return_value=deploy_runtime.MCPProbeResult(
+                        protocol_version="2025-06-18",
+                        agent_instructions=deploy_runtime.agent_instructions_identity(
+                            TEST_AGENT_INSTRUCTIONS
+                        ),
+                    ),
+                ),
                 patch.object(deploy_runtime, "python_provenance", return_value={"python_version": "3.10.12", "python_implementation": "CPython", "platform": "linux", "executable": "python", "pip_version": "pip 25"}),
             ):
                 result = deploy_runtime.build_release(
@@ -506,6 +550,9 @@ class DeployRuntimeTests(unittest.TestCase):
                 snapshot.contract.module: release / ".venv/lib/python3.10/site-packages/grabowski_mcp.py"
             },
             protocol_version="2025-06-18",
+            agent_instructions=deploy_runtime.agent_instructions_identity(
+                TEST_AGENT_INSTRUCTIONS
+            ),
             provenance={
                 "python_version": "3.10.12",
                 "python_implementation": "CPython",
@@ -556,6 +603,84 @@ class DeployRuntimeTests(unittest.TestCase):
                 manifest=manifest,
                 process={"exe": str(python)},
             )
+
+    def test_verify_manifest_rejects_agent_instructions_handshake_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self._snapshot()
+            self._write_complete_release(release, snapshot, runtime)
+            expected = deploy_runtime.agent_instructions_identity(
+                TEST_AGENT_INSTRUCTIONS
+            )
+            manifest_path = release / deploy_runtime.MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["agent_instructions"]["sha256"] = "f" * 64
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                deploy_runtime.DeployError,
+                "agent_instructions",
+            ):
+                deploy_runtime.verify_manifest(
+                    release,
+                    snapshot=snapshot,
+                    stable_runtime=runtime,
+                    expected_agent_instructions=expected,
+                )
+
+    def test_deploy_rejects_agent_instructions_drift_before_pointer_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old_release = root / "old"
+            old_release.mkdir()
+            runtime.symlink_to(old_release)
+            new_release = root / "new"
+            (new_release / "inputs/src").mkdir(parents=True)
+            snapshot = self._snapshot()
+            build = _build_result(
+                release_id="new",
+                release_path=new_release,
+                python_exe=new_release / ".venv/bin/python",
+                entrypoint_path=new_release / "module.py",
+                protocol_version="2025-06-18",
+                provenance={},
+            )
+            self._write_manifest(new_release, snapshot, runtime)
+            manifest_path = new_release / deploy_runtime.MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["agent_instructions"]["sha256"] = "f" * 64
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
+                patch.object(deploy_runtime, "require_profile_matches_contract"),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "build_release", return_value=build),
+                patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
+                patch.object(deploy_runtime, "capture_pointer") as capture_pointer,
+            ):
+                with self.assertRaisesRegex(
+                    deploy_runtime.DeployError,
+                    "agent_instructions",
+                ):
+                    deploy_runtime.deploy(
+                        ROOT,
+                        runtime,
+                        root / "profile.yaml",
+                        timeout_seconds=1,
+                    )
+            capture_pointer.assert_not_called()
 
     def test_final_identity_accepts_complete_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -699,7 +824,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult(
+            build = _build_result(
                 release_id="new",
                 release_path=new_release,
                 python_exe=new_release / ".venv/bin/python",
@@ -825,7 +950,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            build = _build_result("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
 
             def fake_run(argv, **kwargs):
@@ -858,7 +983,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            build = _build_result("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
 
             with (
@@ -885,7 +1010,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            build = _build_result("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
             live_entrypoint = deploy_runtime.EntryPoint(
                 mode="module",
@@ -922,7 +1047,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            build = _build_result("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
 
             def fake_run(argv, **kwargs):
@@ -955,7 +1080,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            build = _build_result("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
 
             with (
@@ -1512,7 +1637,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult(
+            build = _build_result(
                 "new", new_release, new_release / ".venv/bin/python",
                 new_release / "module.py", "2025-06-18", {}
             )
@@ -1555,7 +1680,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult(
+            build = _build_result(
                 "new", new_release, new_release / ".venv/bin/python",
                 new_release / "module.py", "2025-06-18", {}
             )
