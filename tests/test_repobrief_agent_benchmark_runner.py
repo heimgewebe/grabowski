@@ -110,6 +110,7 @@ def stream(
     init_tools: list[str] | None = None,
     init_session: str = "provider-session",
     result_session: str = "provider-session",
+    total_cost_usd: float = 0.01,
 ) -> bytes:
     tools = list(runner.READ_ONLY_BUILTINS)
     if request_value["condition"] == "treatment":
@@ -170,7 +171,7 @@ def stream(
                     "cache_read_input_tokens": 0,
                 },
                 "structured_output": answer(),
-                "total_cost_usd": 0.01,
+                "total_cost_usd": total_cost_usd,
             }
         )
     return b"".join(
@@ -299,12 +300,20 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
 
     def test_build_baseline_command_exposes_only_read_tools(self) -> None:
         command = runner.build_claude_command(
-            request(), claude="claude", mcp_config=None
+            request(),
+            claude="claude",
+            mcp_config=None,
+            max_budget_usd="0.05",
         )
         joined = " ".join(command)
-        self.assertIn("--bare", command)
+        self.assertIn("--safe-mode", command)
+        self.assertIn("--no-chrome", command)
+        self.assertIn("--disable-slash-commands", command)
+        self.assertNotIn("--bare", command)
         self.assertIn("stream-json", command)
         self.assertIn("--no-session-persistence", command)
+        budget_index = command.index("--max-budget-usd")
+        self.assertEqual(command[budget_index + 1], "0.05")
         self.assertIn("Read,Glob,Grep", command)
         self.assertNotIn("mcp__", joined)
         self.assertNotIn("Bash", joined)
@@ -319,6 +328,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 request(condition="treatment"),
                 claude="claude",
                 mcp_config=config,
+                max_budget_usd="0.05",
             )
         joined = " ".join(command)
         self.assertIn("--strict-mcp-config", command)
@@ -328,6 +338,26 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         self.assertIn("mcp__repobrief__ask_context", joined)
         self.assertIn("mcp__repobrief__grounding_verify", joined)
         self.assertIn("mcp__repobrief__live_freshness", joined)
+
+    def test_provider_budget_is_positive_bounded_and_enforced(self) -> None:
+        self.assertEqual(runner._parse_max_budget_usd("0.0500"), "0.05")
+        for invalid in ("0", "-1", "NaN", "Infinity", "100.01", "not-a-number"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(runner.RunnerError, "positive bounded"):
+                    runner._parse_max_budget_usd(invalid)
+
+        value = request()
+        started = datetime.now(timezone.utc)
+        with self.assertRaisesRegex(runner.RunnerError, "cost exceeds"):
+            runner.build_receipt(
+                value,
+                stream(value, total_cost_usd=0.051),
+                transcript_artifact="transcript.jsonl",
+                returncode=0,
+                started_at=started,
+                ended_at=started,
+                max_budget_usd="0.05",
+            )
 
     def test_build_receipt_normalizes_provider_evidence(self) -> None:
         value = request()
@@ -534,6 +564,48 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 runner.RunnerError, "owner/name mismatch"
             ):
                 runner.load_repository_root(value, map_path)
+
+    def test_live_execute_requires_explicit_authorization_before_filesystem_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            common = {
+                "request_root": root / "missing-requests",
+                "repository_map": root / "missing-repositories.json",
+                "state_root": root / "state",
+                "transcript_root": root / "transcripts",
+                "claude": "claude",
+            }
+            with self.assertRaisesRegex(
+                runner.RunnerError, "explicit allow_live_provider"
+            ):
+                runner.execute(request(), **common)
+            with self.assertRaisesRegex(
+                runner.RunnerError, "live execution requires max_budget_usd"
+            ):
+                runner.execute(request(), allow_live_provider=True, **common)
+            self.assertFalse((root / "state").exists())
+            self.assertFalse((root / "transcripts").exists())
+
+    def test_fixture_rejects_live_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "fixture.jsonl"
+            fixture.write_bytes(b"{}\n")
+            with self.assertRaisesRegex(
+                runner.RunnerError, "must not carry live-provider authorization"
+            ):
+                runner.execute(
+                    request(),
+                    request_root=root / "missing-requests",
+                    repository_map=root / "missing-repositories.json",
+                    state_root=root / "state",
+                    transcript_root=root / "transcripts",
+                    claude="claude",
+                    stream_fixture=fixture,
+                    allow_live_provider=True,
+                    max_budget_usd="0.05",
+                )
+            self.assertFalse((root / "state").exists())
 
     def test_execute_with_synthetic_stream_is_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 MAX_TOOL_CALLS = 1000
 MAX_PLANNED_REQUESTS = 128
+MAX_PROVIDER_BUDGET_USD = Decimal("100.00")
 READ_ONLY_BUILTINS = ("Read", "Glob", "Grep")
 TREATMENT_RESOURCE_TOOLS = ("ListMcpResources", "ReadMcpResource")
 TREATMENT_MCP_TOOLS = (
@@ -234,6 +236,40 @@ def _require_int(value: Any, label: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise RunnerError(f"{label} must be an integer >= {minimum}")
     return value
+
+
+def _parse_max_budget_usd(value: Any) -> str:
+    if isinstance(value, bool):
+        raise RunnerError("max_budget_usd must be a positive bounded decimal")
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise RunnerError("max_budget_usd must be a positive bounded decimal") from None
+    if not amount.is_finite() or amount <= 0 or amount > MAX_PROVIDER_BUDGET_USD:
+        raise RunnerError("max_budget_usd must be a positive bounded decimal")
+    normalized = format(amount, "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized
+
+
+def _validated_execution_budget(
+    *,
+    stream_fixture: Path | None,
+    allow_live_provider: bool,
+    max_budget_usd: str | None,
+) -> str | None:
+    if stream_fixture is not None:
+        if allow_live_provider or max_budget_usd is not None:
+            raise RunnerError(
+                "synthetic fixture execution must not carry live-provider authorization"
+            )
+        return None
+    if not allow_live_provider:
+        raise RunnerError("live execution requires explicit allow_live_provider")
+    if max_budget_usd is None:
+        raise RunnerError("live execution requires max_budget_usd")
+    return _parse_max_budget_usd(max_budget_usd)
 
 
 def _safe_identifier(value: str) -> str:
@@ -529,14 +565,20 @@ def _prompt(request: Mapping[str, Any]) -> str:
 
 
 def build_claude_command(
-    request: Mapping[str, Any], *, claude: str, mcp_config: Path | None
+    request: Mapping[str, Any],
+    *,
+    claude: str,
+    mcp_config: Path | None,
+    max_budget_usd: str,
 ) -> list[str]:
     condition = str(request.get("condition"))
     tools = list(READ_ONLY_BUILTINS)
     allowed = list(READ_ONLY_BUILTINS)
     command = [
         claude,
-        "--bare",
+        "--safe-mode",
+        "--no-chrome",
+        "--disable-slash-commands",
         "-p",
         _prompt(request),
         "--model",
@@ -550,6 +592,8 @@ def build_claude_command(
         "dontAsk",
         "--json-schema",
         _canonical_json(ANSWER_SCHEMA),
+        "--max-budget-usd",
+        _parse_max_budget_usd(max_budget_usd),
     ]
     if condition == "treatment":
         if mcp_config is None:
@@ -724,6 +768,23 @@ def _usage(request: Mapping[str, Any], result: Mapping[str, Any]) -> tuple[int, 
     return input_tokens, output_tokens
 
 
+def _validate_provider_cost(result: Mapping[str, Any], max_budget_usd: str) -> None:
+    value = result.get("total_cost_usd")
+    if isinstance(value, bool):
+        raise RunnerError("provider total_cost_usd is invalid")
+    try:
+        actual = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise RunnerError("provider total_cost_usd is invalid") from None
+    if not actual.is_finite() or actual < 0:
+        raise RunnerError("provider total_cost_usd is invalid")
+    maximum = Decimal(_parse_max_budget_usd(max_budget_usd))
+    if actual > maximum:
+        raise RunnerError(
+            f"provider cost exceeds max_budget_usd: {actual} > {maximum}"
+        )
+
+
 def _tool_blocks(messages: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     uses: list[dict[str, Any]] = []
     results: dict[str, dict[str, Any]] = {}
@@ -861,6 +922,7 @@ def build_receipt(
     returncode: int,
     started_at: datetime,
     ended_at: datetime,
+    max_budget_usd: str | None = None,
 ) -> dict[str, Any]:
     messages = parse_jsonl(transcript)
     init = _single_message(messages, message_type="system", subtype="init")
@@ -868,6 +930,8 @@ def build_receipt(
     model = _validate_init(request, init)
     _validate_provider_session(init, result)
     input_tokens, output_tokens = _usage(request, result)
+    if max_budget_usd is not None:
+        _validate_provider_cost(result, max_budget_usd)
     if returncode != 0 or result.get("is_error") is True or result.get("subtype") != "success":
         raise RunnerError("provider did not produce a successful result")
     answer = validate_answer(result.get("structured_output"))
@@ -942,8 +1006,15 @@ def execute(
     transcript_root: Path,
     claude: str,
     stream_fixture: Path | None = None,
+    allow_live_provider: bool = False,
+    max_budget_usd: str | None = None,
 ) -> dict[str, Any]:
     validate_request(request)
+    validated_budget = _validated_execution_budget(
+        stream_fixture=stream_fixture,
+        allow_live_provider=allow_live_provider,
+        max_budget_usd=max_budget_usd,
+    )
     load_planned_request(request, request_root)
     source = load_repository_root(request, repository_map)
     checkout = create_isolated_checkout(request, source, state_root)
@@ -954,7 +1025,13 @@ def execute(
     )
     started = _utc_now()
     if stream_fixture is None:
-        command = build_claude_command(request, claude=claude, mcp_config=mcp_config)
+        assert validated_budget is not None
+        command = build_claude_command(
+            request,
+            claude=claude,
+            mcp_config=mcp_config,
+            max_budget_usd=validated_budget,
+        )
         returncode, stdout, stderr = run_bounded(
             command,
             cwd=checkout,
@@ -977,6 +1054,7 @@ def execute(
         returncode=returncode,
         started_at=started,
         ended_at=ended,
+        max_budget_usd=validated_budget if stream_fixture is None else None,
     )
     if stream_fixture is not None:
         return build_fixture_report(request, receipt)
@@ -992,6 +1070,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-root", required=True, type=Path)
     parser.add_argument("--transcript-root", required=True, type=Path)
     parser.add_argument("--claude-command", default="claude")
+    parser.add_argument(
+        "--allow-live-provider",
+        action="store_true",
+        help="Explicitly authorize one live provider invocation; invalid with fixtures.",
+    )
+    parser.add_argument(
+        "--max-budget-usd",
+        type=_parse_max_budget_usd,
+        help="Provider-enforced maximum spend for this single live Claude invocation.",
+    )
     parser.add_argument(
         "--stream-fixture",
         type=Path,
@@ -1012,6 +1100,8 @@ def main(argv: list[str] | None = None) -> int:
             transcript_root=args.transcript_root,
             claude=args.claude_command,
             stream_fixture=args.stream_fixture,
+            allow_live_provider=args.allow_live_provider,
+            max_budget_usd=args.max_budget_usd,
         )
     except RunnerError as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True), file=sys.stderr)
