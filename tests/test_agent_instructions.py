@@ -66,6 +66,7 @@ class AgentInstructionsTests(unittest.TestCase):
         encoded = grabowski_mcp.AGENT_INSTRUCTIONS.encode("utf-8")
         metadata = grabowski_mcp._agent_instructions_metadata()
         self.assertEqual(metadata["schema_version"], 1)
+        self.assertEqual(grabowski_mcp.DEPLOYMENT_MANIFEST_SCHEMA_VERSION, 5)
         self.assertEqual(
             metadata["version"],
             "grabowski-agent-facing-contract-v1",
@@ -101,6 +102,24 @@ class AgentInstructionsTests(unittest.TestCase):
         authority = rules["no-authority-escalation"].lower()
         for phrase in ("action", "merge", "deploy", "secret", "retry"):
             self.assertIn(phrase, authority)
+
+    def test_contract_documentation_states_integrity_and_observability_boundaries(self) -> None:
+        documentation = (ROOT / "docs/agent-facing-contract.md").read_text(
+            encoding="utf-8"
+        )
+        for phrase in (
+            "immutable deployment identity",
+            "client_compliance_observable: false",
+            "client_instruction_compliance",
+            "no inference about private reasoning",
+            "breaking contract change",
+        ):
+            self.assertIn(phrase, documentation)
+
+    def test_lower_hex_validation_is_explicit(self) -> None:
+        self.assertTrue(grabowski_mcp._is_lower_hex("a" * 64, 64))
+        self.assertFalse(grabowski_mcp._is_lower_hex("A" * 64, 64))
+        self.assertFalse(grabowski_mcp._is_lower_hex("a" * 63, 64))
 
 
 if __name__ == "__main__":

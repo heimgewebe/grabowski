@@ -79,6 +79,10 @@ danach nur diese Snapshots. Er:
 - erzeugt und validiert ein Deployment-Manifest,
 - verändert weder produktive Runtime noch Profil noch Dienst.
 
+Der versionierte Agentenanweisungsvertrag, seine Manifestbindung und seine
+Beweisgrenzen sind in [`agent-facing-contract.md`](agent-facing-contract.md)
+dokumentiert.
+
 ## Produktives Deployment
 
 ```bash
