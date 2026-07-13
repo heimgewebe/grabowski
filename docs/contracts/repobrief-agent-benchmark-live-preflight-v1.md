@@ -81,7 +81,8 @@ Ein echter Preflight benötigt zusätzlich:
 Der Runner prüft Programm und Credentialdatei vor jedem Liveaufruf gegen
 Größe, Typ, Änderungsrennen und Digest. Die tatsächlich für den auth-only
 Konfigurationsraum verwendeten Credentialbytes müssen exakt dem im
-Autorisierungsledger gebundenen Digest entsprechen. Die Credentialdatei wird in ein
+Autorisierungsledger gebundenen Digest entsprechen. Die Credentialdatei wird
+in ein
 frisches privates auth-only `CLAUDE_CONFIG_DIR` kopiert und nach dem Lauf
 entfernt. Nutzer-, Projekt- und lokale Claude-Einstellungen, Hooks, Skills,
 Workflows, Browserintegration und Claude.ai-Connectoren werden deaktiviert.

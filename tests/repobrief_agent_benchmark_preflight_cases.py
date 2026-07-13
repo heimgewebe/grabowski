@@ -523,4 +523,3 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
             self.assertTrue(digest_path.read_text(encoding="ascii").startswith(expected))
             with self.assertRaisesRegex(preflight.PreflightError, "already exists"):
                 preflight._write_report_artifacts(report_path, {"status": "second"})
-
