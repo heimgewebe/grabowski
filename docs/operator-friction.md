@@ -114,3 +114,7 @@ A periodic review should classify failed task records without resuming them. Min
 ```
 
 Classification is a read-only signal operation. It does not authorize resume, cleanup, commit, push, merge, deploy or policy elevation.
+
+### Grenze der indirekten Starterkennung
+
+Die generischen synchronen Oberflächen verweigern direkte Shells sowie eine explizite, getestete Menge bekannter Wrapper und Launcher vor dem Prozessstart. Dazu gehören unter anderem `env`, `ssh`, Container- und Namespace-Wrapper, `sudo`, `doas`, `pkexec`, `su`, `watch` und `script`. Diese Grenze behauptet keine vollständige statische Erkennung beliebiger indirekter Ausführung innerhalb eines ansonsten erlaubten Programms. Längere, abgekoppelte oder wrapperbasierte Ausführung gehört in einen langlebigen Task.

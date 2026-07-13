@@ -51,9 +51,10 @@ SYNCHRONOUS_SHELL_EXECUTABLES = frozenset({
     "bash", "dash", "fish", "ksh", "sh", "zsh",
 })
 SYNCHRONOUS_SHELL_WRAPPERS = frozenset({
-    "busybox", "chroot", "command", "docker", "env", "machinectl", "nice",
-    "nohup", "nsenter", "podman", "setsid", "ssh", "stdbuf", "systemd-run",
-    "timeout", "toybox", "unshare", "xargs",
+    "busybox", "chroot", "command", "doas", "docker", "env", "machinectl",
+    "nice", "nohup", "nsenter", "pkexec", "podman", "script", "setsid",
+    "ssh", "stdbuf", "su", "sudo", "systemd-run", "timeout", "toybox",
+    "unshare", "watch", "xargs",
 })
 SYNCHRONOUS_INDIRECT_EXECUTABLES = SYNCHRONOUS_SHELL_WRAPPERS
 MAX_NOTIFY_ON_DONE_CHANNELS = 5
@@ -243,7 +244,7 @@ def _redact_dynamic_secret(text: str, secret: str) -> str:
     result = re.sub(rf"(?m)^{escaped}$", "<REDACTED>", text)
     result = re.sub(
         rf"(?i)(\b[A-Z0-9_-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|COOKIE|CREDENTIAL|AUTHORIZATION|API_KEY|APIKEY)[A-Z0-9_-]*\s*[:=]\s*){escaped}(?=$|[\s,;])",
-        rf"\1<REDACTED>",
+        r"\1<REDACTED>",
         result,
     )
     if (
@@ -629,12 +630,15 @@ def _synchronous_public_contract(*, surface: str) -> dict[str, Any]:
         "timeout_seconds": SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS,
         "max_output_bytes": SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES,
         "shell_composition_allowed": False,
-        "indirect_execution_allowed": False,
+        "known_wrapper_execution_allowed": False,
+        "indirect_execution_detection_complete": False,
+        "indirect_execution_policy": "known_wrapper_executables_denied_before_start",
         "long_running_route": "grabowski_task_start",
         "large_read_route": "typed_read_or_split_read",
         "does_not_establish": [
             "connector_or_ui_hang_root_cause",
             "absence_of_future_transport_failures",
+            "complete_detection_of_arbitrary_indirect_execution",
             "durable_task_success",
         ],
     }

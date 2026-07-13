@@ -264,6 +264,12 @@ class OperatorContractTests(unittest.TestCase):
             ["ssh", "host", "bash -lc 'printf ok'"],
             ["docker", "exec", "container", "sh -c 'printf ok'"],
             ["systemd-run", "--user", "bash", "-lc", "printf ok"],
+            ["sudo", "bash", "-lc", "printf ok"],
+            ["doas", "sh", "-c", "printf ok"],
+            ["pkexec", "bash", "-lc", "printf ok"],
+            ["su", "-c", "sh -c 'printf ok'"],
+            ["watch", "bash", "-lc", "printf ok"],
+            ["script", "-c", "bash -lc 'printf ok'", "/dev/null"],
         ]
         for command in examples:
             with self.subTest(command=command):
@@ -287,6 +293,12 @@ class OperatorContractTests(unittest.TestCase):
             ["env", "MODE=test", "ssh", "host", "uptime"],
             ["timeout", "10", "systemd-run", "--user", "sleep", "60"],
             ["stdbuf", "-oL", "printf", "ok"],
+            ["sudo", "printf", "ok"],
+            ["doas", "printf", "ok"],
+            ["pkexec", "printf", "ok"],
+            ["su", "root"],
+            ["watch", "printf", "ok"],
+            ["script", "-c", "printf ok", "/dev/null"],
         ]
         for command in examples:
             with self.subTest(command=command):
@@ -303,6 +315,22 @@ class OperatorContractTests(unittest.TestCase):
                     receipt["reason_codes"],
                 )
                 self.assertFalse(receipt["process_started"])
+
+
+    def test_synchronous_contract_scopes_indirect_execution_claim(self) -> None:
+        operator = _load_operator_module()
+        contract = operator._synchronous_public_contract(surface="test")
+        self.assertFalse(contract["known_wrapper_execution_allowed"])
+        self.assertFalse(contract["indirect_execution_detection_complete"])
+        self.assertEqual(
+            contract["indirect_execution_policy"],
+            "known_wrapper_executables_denied_before_start",
+        )
+        self.assertNotIn("indirect_execution_allowed", contract)
+        self.assertIn(
+            "complete_detection_of_arbitrary_indirect_execution",
+            contract["does_not_establish"],
+        )
 
     def test_synchronous_call_shape_allows_bounded_find_without_exec(self) -> None:
         operator = _load_operator_module()
