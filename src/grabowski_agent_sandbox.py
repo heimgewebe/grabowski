@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import selectors
+import shutil
 import signal
 import stat
 import subprocess
@@ -17,6 +18,74 @@ MAX_WRITABLE_SCOPE_ENTRIES = 100_000
 
 class AgentSandboxError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class PreparedSandboxCommand:
+    command: tuple[str, ...]
+    extra_read_only: tuple[tuple[Path, Path], ...] = ()
+    extra_directories: tuple[Path, ...] = ()
+    profile: str | None = None
+
+
+CLAUDE_PROFILE = "claude-cli-readonly-auth-v1"
+CLAUDE_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/claude")
+CLAUDE_SANDBOX_CONFIG_DIR = Path("/tmp/.claude")
+
+
+def _private_regular_file(path: Path, field: str) -> Path:
+    resolved = _safe_existing_path(path, field, directory=False)
+    metadata = resolved.stat()
+    if metadata.st_uid != os.getuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise AgentSandboxError(f"{field} must be one owner-private regular file")
+    return resolved
+
+
+def _resolved_executable(value: str, field: str) -> Path:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        located = shutil.which(value)
+        if located is None:
+            raise AgentSandboxError(f"{field} is unavailable: {value}")
+        candidate = Path(located)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise AgentSandboxError(f"{field} is not safely resolvable: {value}") from exc
+    metadata = resolved.stat()
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
+        raise AgentSandboxError(f"{field} must resolve to an executable regular file")
+    return resolved
+
+
+def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand:
+    """Resolve supported external agents into explicit, read-only sandbox bindings."""
+    if not command:
+        raise AgentSandboxError("sandbox command must be non-empty")
+    if Path(command[0]).name != "claude":
+        return PreparedSandboxCommand(tuple(command))
+    executable_override = os.environ.get("GRABOWSKI_CLAUDE_BIN")
+    executable = _resolved_executable(executable_override or command[0], "Claude executable")
+    auth_root = Path(
+        os.environ.get("GRABOWSKI_CLAUDE_AUTH_ROOT", str(Path.home() / ".claude"))
+    ).expanduser()
+    credentials = _private_regular_file(auth_root / ".credentials.json", "Claude credentials")
+    bindings: list[tuple[Path, Path]] = [
+        (executable, CLAUDE_SANDBOX_EXECUTABLE),
+        (credentials, CLAUDE_SANDBOX_CONFIG_DIR / ".credentials.json"),
+    ]
+    for source, target, field in (
+        (auth_root / "settings.json", CLAUDE_SANDBOX_CONFIG_DIR / "settings.json", "Claude settings"),
+        (Path(os.environ.get("GRABOWSKI_CLAUDE_ROOT_CONFIG", str(Path.home() / ".claude.json"))).expanduser(), Path("/tmp/.claude.json"), "Claude root config"),
+    ):
+        if source.exists():
+            bindings.append((_private_regular_file(source, field), target))
+    return PreparedSandboxCommand(
+        command=(str(CLAUDE_SANDBOX_EXECUTABLE), *command[1:]),
+        extra_read_only=tuple(bindings),
+        extra_directories=(Path("/opt"), Path("/opt/grabowski-external"), CLAUDE_SANDBOX_CONFIG_DIR),
+        profile=CLAUDE_PROFILE,
+    )
 
 
 def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
@@ -187,6 +256,7 @@ def minimal_sandbox_argv(
     writable_paths: Iterable[Path] = (),
     git_common_dir: Path | None = None,
     extra_read_only: Iterable[tuple[Path, Path]] = (),
+    extra_directories: Iterable[Path] = (),
 ) -> list[str]:
     """Build the sandbox argv without requiring bubblewrap on the build host.
 
@@ -228,6 +298,15 @@ def minimal_sandbox_argv(
     if Path("/usr/lib64").exists():
         arguments.extend(["--symlink", "usr/lib64", "/lib64"])
     arguments.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/etc"])
+    normalized_directories: list[str] = []
+    for value in extra_directories:
+        raw = str(value)
+        path = Path(raw)
+        if not path.is_absolute() or raw in {"/", "/proc", "/dev", "/usr", "/etc"} or "\x00" in raw or ".." in path.parts:
+            raise AgentSandboxError("extra sandbox directory must be a safe absolute path")
+        normalized_directories.append(raw.rstrip("/"))
+    for directory in sorted(set(normalized_directories), key=lambda item: (len(Path(item).parts), item)):
+        arguments.extend(["--dir", directory])
     for path in (
         "/etc/ld.so.cache",
         "/etc/passwd",

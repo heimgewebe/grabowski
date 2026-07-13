@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
-from grabowski_agent_sandbox import minimal_sandbox_argv, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
+from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
@@ -189,16 +189,20 @@ def write_receipt(path: Path, payload: dict[str, Any], *, create_only: bool = Fa
             pass
 
 
-def sandbox_argv(repo: Path, command: list[str]) -> list[str]:
+def sandbox_argv(repo: Path, command: list[str], *, declared_command: list[str] | None = None) -> list[str]:
     common_raw = git_text(repo, "rev-parse", "--git-common-dir")
     common = Path(common_raw)
     if not common.is_absolute():
         common = (repo / common).resolve(strict=True)
+    prepared = prepare_external_agent_command(command if declared_command is None else declared_command)
+    actual_command = list(prepared.command) if declared_command is None else command
     return minimal_sandbox_argv(
         workspace=repo,
-        command=command,
+        command=actual_command,
         workspace_writable=False,
         git_common_dir=common,
+        extra_read_only=prepared.extra_read_only,
+        extra_directories=prepared.extra_directories,
     )
 
 
@@ -212,10 +216,12 @@ def declared_python_module(command: list[str]) -> str | None:
     return module.split(".", 1)[0]
 
 
-def _probe_json(repo: Path, command: list[str]) -> tuple[dict[str, Any] | None, str | None, int | None]:
+def _probe_json_from_argv(
+    sandbox_arguments: list[str],
+) -> tuple[dict[str, Any] | None, str | None, int | None]:
     try:
         completed = run_bounded_capture(
-            runtime_sandbox_argv(sandbox_argv(repo, command)),
+            runtime_sandbox_argv(sandbox_arguments),
             stdout_limit=TOOLCHAIN_PROBE_OUTPUT_LIMIT,
             stderr_limit=TOOLCHAIN_PROBE_OUTPUT_LIMIT,
             stdout_content_limit=TOOLCHAIN_PROBE_OUTPUT_LIMIT,
@@ -236,6 +242,18 @@ def _probe_json(repo: Path, command: list[str]) -> tuple[dict[str, Any] | None, 
     if not isinstance(payload, dict):
         return None, "toolchain probe returned a non-object payload", completed.returncode
     return payload, None, completed.returncode
+
+
+def _probe_json(repo: Path, command: list[str]) -> tuple[dict[str, Any] | None, str | None, int | None]:
+    return _probe_json_from_argv(sandbox_argv(repo, command))
+
+
+def _probe_json_for_declared_command(
+    repo: Path, command: list[str], declared_command: list[str]
+) -> tuple[dict[str, Any] | None, str | None, int | None]:
+    return _probe_json_from_argv(
+        sandbox_argv(repo, command, declared_command=declared_command)
+    )
 
 
 def _sandbox_probe_python() -> str:
@@ -265,7 +283,8 @@ def _sandbox_probe_python() -> str:
 
 def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
     """Resolve declared prerequisites inside the exact read-only role sandbox."""
-    executable = command[0]
+    prepared = prepare_external_agent_command(command)
+    executable = prepared.command[0]
     module = declared_python_module(command)
     result: dict[str, Any] = {
         "executable": executable,
@@ -275,11 +294,22 @@ def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
         "missing_executable": False,
         "missing_python_module": False,
         "probe_error": None,
+        "external_agent_profile": prepared.profile,
     }
-    executable_payload, error, returncode = _probe_json(
-        repo,
-        [_sandbox_probe_python(), "-I", "-S", "-c", _EXECUTABLE_PROBE_SOURCE, executable],
-    )
+    executable_probe = [
+        _sandbox_probe_python(),
+        "-I",
+        "-S",
+        "-c",
+        _EXECUTABLE_PROBE_SOURCE,
+        executable,
+    ]
+    if prepared.profile is None:
+        executable_payload, error, returncode = _probe_json(repo, executable_probe)
+    else:
+        executable_payload, error, returncode = _probe_json_for_declared_command(
+            repo, executable_probe, command
+        )
     if error is not None or executable_payload is None:
         result["probe_error"] = error
         result["probe_returncode"] = returncode

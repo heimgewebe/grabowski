@@ -17,6 +17,7 @@ import grabowski_chronik as chronik
 import grabowski_recovery as recovery
 import grabowski_resources as resources
 import grabowski_consumer_surface as consumer_surface
+import grabowski_command_identity as command_identity
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -632,7 +633,7 @@ def grabowski_task_start(
         "state": "launching",
         "resume_policy": policy,
         "argv_json": _canonical_json(command),
-        "argv_sha256": _sha256_json(command),
+        "argv_sha256": command_identity.argv_sha256(command),
         "cwd": working_directory,
         "runtime_seconds": runtime,
         "cpu_weight": cpu,

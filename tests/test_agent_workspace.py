@@ -46,6 +46,7 @@ import grabowski_agent_role as role
 import grabowski_agent_sandbox as sandbox
 import grabowski_agent_workspace as workspace
 import grabowski_agent_writer as writer
+import grabowski_command_identity as command_identity
 
 
 def run(cwd: Path, *argv: str) -> str:
@@ -905,6 +906,60 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertIn("--cap-drop", argv)
         self.assertNotIn("--unshare-net", argv)
 
+    def test_claude_profile_binds_binary_and_private_auth_without_home(self) -> None:
+        auth_root = self.root / "claude-auth"
+        auth_root.mkdir(mode=0o700)
+        credentials = auth_root / ".credentials.json"
+        credentials.write_text("{}\n", encoding="utf-8")
+        credentials.chmod(0o600)
+        executable = self.root / "claude-bin"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CLAUDE_BIN": str(executable),
+                "GRABOWSKI_CLAUDE_AUTH_ROOT": str(auth_root),
+                "GRABOWSKI_CLAUDE_ROOT_CONFIG": str(self.root / "missing-root-config"),
+            },
+            clear=False,
+        ):
+            prepared = sandbox.prepare_external_agent_command(["claude", "--version"])
+            argv = sandbox.minimal_sandbox_argv(
+                workspace=self.git.repo,
+                command=list(prepared.command),
+                workspace_writable=False,
+                extra_read_only=prepared.extra_read_only,
+                extra_directories=prepared.extra_directories,
+            )
+        self.assertEqual(prepared.profile, sandbox.CLAUDE_PROFILE)
+        self.assertEqual(prepared.command[0], str(sandbox.CLAUDE_SANDBOX_EXECUTABLE))
+        self.assertIn(str(executable.resolve()), argv)
+        self.assertIn(str(sandbox.CLAUDE_SANDBOX_EXECUTABLE), argv)
+        self.assertIn(str(credentials.resolve()), argv)
+        self.assertIn(str(sandbox.CLAUDE_SANDBOX_CONFIG_DIR / ".credentials.json"), argv)
+        self.assertNotIn(str(Path.home()), argv)
+
+    def test_claude_profile_rejects_non_private_credentials(self) -> None:
+        auth_root = self.root / "claude-auth-public"
+        auth_root.mkdir()
+        credentials = auth_root / ".credentials.json"
+        credentials.write_text("{}\n", encoding="utf-8")
+        credentials.chmod(0o644)
+        executable = self.root / "claude-bin-public"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CLAUDE_BIN": str(executable),
+                "GRABOWSKI_CLAUDE_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(sandbox.AgentSandboxError, "owner-private"):
+                sandbox.prepare_external_agent_command(["claude", "--version"])
+
     def test_partial_creation_blocks_status_success_collect_and_close(self) -> None:
         manifest = self.manifest()
         manifest["creation_state"] = "creating"
@@ -937,6 +992,43 @@ class AgentWorkspaceTests(unittest.TestCase):
                     "0" * 64,
                     "1" * 64,
                 )
+
+    def test_create_blocks_writer_when_exact_sandbox_preflight_fails(self) -> None:
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace, "_verify_bureau_binding", side_effect=binding_evidence),
+            mock.patch.object(workspace.resources, "acquire_resources", return_value={"leases": []}),
+            mock.patch.object(workspace.resources, "release_resources", return_value={"released": []}),
+            mock.patch.object(
+                workspace,
+                "_role_toolchain_preflight",
+                return_value={
+                    "role": "writer",
+                    "command_sha256": "a" * 64,
+                    "passed": False,
+                    "failure_classification": "environment_toolchain_failure",
+                    "external_agent_profile": sandbox.CLAUDE_PROFILE,
+                },
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+        ):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError, "writer toolchain preflight failed"
+            ):
+                workspace.grabowski_agent_workspace_create(
+                    binding_kind="thread_focus",
+                    binding_id="thread-writer-preflight",
+                    repository=str(self.git.repo),
+                    expected_base_head=self.git.base,
+                    writer_branch="feat/writer-preflight",
+                    writer_worktree=str(self.root / "writer-preflight"),
+                    allowed_paths=["src"],
+                    writer_argv=["claude", "--version"],
+                    test_argv=["true"],
+                    review_argv=["true"],
+                    runtime_seconds=600,
+                )
+        start.assert_not_called()
 
     def test_create_rollback_preserves_dirty_writer_worktree(self) -> None:
         plan_id, _ = workspace._workspace_identity("thread_focus", "thread-rollback", self.git.repo, self.git.base)
@@ -1524,6 +1616,39 @@ class AgentWorkspaceTests(unittest.TestCase):
                 binding_verifier=binding_evidence,
             )
 
+    def test_bureau_result_envelope_is_unwrapped_for_live_bindings(self) -> None:
+        direct = {"records": [{"record": {"kind": "thread_focus"}}]}
+        envelope = {
+            "schema_version": 1,
+            "result": direct,
+            "runtime_identity": {"compatibility": {"status": "compatible"}},
+        }
+        self.assertEqual(
+            workspace._bureau_result_payload(json.dumps(envelope), "test lookup"), direct
+        )
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "invalid result envelope"):
+            workspace._bureau_result_payload(
+                json.dumps({"schema_version": 1, "result": []}), "test lookup"
+            )
+        stale = {
+            "schema_version": 1,
+            "result": direct,
+            "runtime_identity": {
+                "compatibility": {
+                    "status": "stale",
+                    "mutation_allowed": False,
+                    "reason_codes": ["release-registry-identity-mismatch"],
+                }
+            },
+        }
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "not read-compatible"):
+            workspace._bureau_result_payload(json.dumps(stale), "test lookup")
+
+    def test_task_argv_identity_matches_task_store_for_unicode(self) -> None:
+        argv = ["python3", "-c", "print('Grüße')"]
+        self.assertEqual(workspace._task_argv_sha256(argv), command_identity.argv_sha256(argv))
+        self.assertNotEqual(workspace._task_argv_sha256(argv), workspace._sha256_json(argv))
+
     def test_live_thread_focus_binding_requires_one_active_record(self) -> None:
         bureau_root = self.root / "bureau"
         bureau_root.mkdir()
@@ -1545,7 +1670,19 @@ class AgentWorkspaceTests(unittest.TestCase):
                 }
             ]
         }
-        runner = mock.Mock(return_value={"returncode": 0, "stdout": json.dumps(payload), "stderr": ""})
+        runner = mock.Mock(
+            return_value={
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "schema_version": 1,
+                        "result": payload,
+                        "runtime_identity": {"compatibility": {"status": "compatible"}},
+                    }
+                ),
+                "stderr": "",
+            }
+        )
         with (
             mock.patch.object(workspace, "BUREAU", bureau_bin),
             mock.patch.object(workspace, "BUREAU_ROOT", bureau_root),
@@ -1569,7 +1706,19 @@ class AgentWorkspaceTests(unittest.TestCase):
             json.dumps({"schema_version": 1, "id": task_id, "title": "Test", "state": "ready"}),
             encoding="utf-8",
         )
-        runner = mock.Mock(return_value={"returncode": 0, "stdout": json.dumps({"healthy": True}), "stderr": ""})
+        runner = mock.Mock(
+            return_value={
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "schema_version": 1,
+                        "result": {"healthy": True},
+                        "runtime_identity": {"compatibility": {"status": "compatible"}},
+                    }
+                ),
+                "stderr": "",
+            }
+        )
         with (
             mock.patch.object(workspace, "BUREAU", bureau_bin),
             mock.patch.object(workspace, "BUREAU_ROOT", bureau_root),
