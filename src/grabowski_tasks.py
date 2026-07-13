@@ -16,6 +16,7 @@ import grabowski_mcp as base
 import grabowski_chronik as chronik
 import grabowski_recovery as recovery
 import grabowski_resources as resources
+import grabowski_consumer_surface as consumer_surface
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -1162,13 +1163,13 @@ def grabowski_task_list(
 ) -> dict[str, Any]:
     """List persistent tasks with keyset pagination and compact default records."""
     operator._require_operator_capability("durable_job")
-    selected_view = operator._normalize_consumer_view(view)
+    selected_view = consumer_surface.normalize_view(view)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
     if state is not None and state not in TASK_STATES:
         raise ValueError(f"state must be one of {sorted(TASK_STATES)}")
     scope = f"task-list:{selected_view}:{state or 'all'}"
-    position = operator._decode_consumer_cursor(cursor, scope)
+    position = consumer_surface.decode_cursor(cursor, scope)
     cursor_created_at: int | None = None
     cursor_task_id: str | None = None
     if position is not None:
@@ -1211,7 +1212,7 @@ def grabowski_task_list(
     next_cursor = None
     if has_more and page_rows:
         last = dict(page_rows[-1])
-        next_cursor = operator._encode_consumer_cursor(
+        next_cursor = consumer_surface.encode_cursor(
             scope,
             {
                 "created_at_unix": int(last["created_at_unix"]),
@@ -1254,7 +1255,7 @@ def grabowski_task_list(
     }
     if selected_view == "evidence":
         payload["database"] = str(TASK_DB)
-    return operator._project_consumer_fields(
+    return consumer_surface.project_fields(
         payload,
         fields=fields,
         required=(

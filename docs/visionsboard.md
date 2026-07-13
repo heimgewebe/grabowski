@@ -1,6 +1,6 @@
 # Grabowski Visionsboard
 
-Stand: 2026-07-12
+Stand: 2026-07-13
 
 ## Status und Semantik
 
@@ -52,6 +52,13 @@ Vor Aktivierung nötig:
 - belastbare Fehlerraten und Recovery-Evidenz;
 - kein selbst erteilter Privilegienaufstieg.
 
+Bedrohungsmodell vor Aktivierung:
+
+- schützenswerte Werte: Repositoryzustand, Secrets, Auditkette, Deploy-Autorität und fremde Leases;
+- ein sicherer Verlauf darf nur die Beaufsichtigungsdichte reduzieren, niemals Capabilities selbst erweitern;
+- Vertrauensentzug muss bei Policyänderung, Integritätsfehler, Reviewfehler oder Recovery-Abweichung sofort wirksam sein;
+- Erfolgsmetriken dürfen nicht vom ausführenden Agenten allein erzeugt oder bewertet werden.
+
 ### Untrusted Isolation
 
 Zielhypothese: Stärkere Isolation könnte riskantere fremde Programme sicherer ausführbar machen.
@@ -67,6 +74,14 @@ Vor Aktivierung nötig:
 - konkreter Workload, den Bubblewrap und bestehende Grenzen nicht sicher tragen;
 - Betriebs- und Ressourcenmessung;
 - Recovery- und Updatekonzept.
+
+Bedrohungsmodell vor Aktivierung:
+
+- Same-UID-Ausführung gilt nicht als Isolation gegen vollständig feindlichen Code;
+- Angreifer dürfen Dateisystem, Prozessumgebung, Netzwerk und Ressourcenlimits aktiv missbrauchen;
+- schützenswerte Werte sind Host-Secrets, andere Worktrees, systemd-Userzustand, Runtime-Releases und Audit-Evidence;
+- die Grenze muss Escape, Persistenz, Ressourcenerschöpfung, Seiteneffekte über Netzwerk und Manipulation von Receipts abdecken;
+- ein konkreter Referenz-Workload und ein kontrollierter Escape-/Recovery-Test sind Pflicht, bevor gVisor, Container oder MicroVM produktiv werden.
 
 ### Begrenzter Procedure Mode
 

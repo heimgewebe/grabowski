@@ -1,0 +1,273 @@
+{
+  "acceptance": {
+    "context_evidence_additional_reduction_percent": 34.83,
+    "context_evidence_v1_bytes": 49247,
+    "context_evidence_v2_bytes": 32092,
+    "criterion": "standard response median JSON bytes remain reduced by at least 50 percent on all five measured large surfaces and context evidence is further reduced without dropping bound evidence categories",
+    "passed": true,
+    "standard_reduction_percent": {
+      "checkout": 58.27,
+      "context": 85.49,
+      "friction": 53.75,
+      "status": 63.31,
+      "tasks": 51.22
+    }
+  },
+  "base_head": "0f5473e117ddc7f6e830b961a49e73fcf3ebb657",
+  "branch": "fix/consumer-surface-optimization-v2",
+  "captured_at": "2026-07-13T03:54:25.979229+00:00",
+  "command": "PYTHONPATH=src <runtime-python> tools/consumer_surface_benchmark.py --samples 5",
+  "contract_evidence": {
+    "common_consumer_module": true,
+    "create_only_unlink_failure_rolls_back_visible_target": true,
+    "evidence_capabilities_remain_complete_by_tool_category_and_risk": true,
+    "evidence_expected_tools_bound_by_count_and_sha256": true,
+    "finalizer_limits_are_process_local": true,
+    "legacy_job_receipts_readable": true,
+    "origin_bound_job_receipts": true,
+    "same_uid_non_isolation_explicit": true,
+    "snapshot_change_error_is_explicit": true,
+    "tests": [
+      "tests.test_consumer_surface",
+      "tests.test_private_io",
+      "tests.test_job_finalizer",
+      "tests.test_job_notification_outbox",
+      "make validate"
+    ],
+    "warnings_and_required_safety_fields_preserved": true
+  },
+  "dataset": {
+    "checkout": {
+      "limit": 20,
+      "returned": 20,
+      "snapshot_sha256": "d290f736ed04032d236215dcc0ca534a94426c171de36a89050d4ebd063abe0c",
+      "total_worktrees": 61,
+      "view": "standard"
+    },
+    "context": {
+      "capability_record_count": 120,
+      "expected_tool_count": 120,
+      "expected_tools_sha256": "f31cbc4c51aeb49e5d6ab1e385999cd0671f3e014828530271a79a8160e5ad22",
+      "profile": "concise",
+      "view": "evidence",
+      "worktree_record_count": 61
+    },
+    "friction": {
+      "has_more": true,
+      "limit": 50,
+      "returned": 50,
+      "snapshot_sha256": "53a512ddb65368410170f7d8462b694db7cae4b49231de44a2a029e2beda8156",
+      "view": "standard"
+    },
+    "tasks": {
+      "limit": 20,
+      "returned": 20,
+      "total_matching": 1375,
+      "view": "standard"
+    }
+  },
+  "kind": "grabowski_consumer_surface_v2_benchmark_evidence",
+  "limitations": [
+    "pre-change byte baselines are previously captured static values, not a simultaneous A/B snapshot",
+    "the live task, friction and worktree datasets can change between measurements",
+    "JSON bytes are not model token counts",
+    "local call latency is not connector transport reliability",
+    "origin binding does not establish authenticity against complete same-UID compromise",
+    "size and latency measurements do not independently establish workflow correctness"
+  ],
+  "measured_source_sha256": {
+    "src/grabowski_consumer_surface.py": "6e01b6d4f8d6fd378b97d1ff40b1f219cd277ab7f536c11e1ca1ecf603b88dd7",
+    "src/grabowski_friction.py": "3bd5e876e4a5e274eddcd60668c553b956553465164f7e1e9217c80b35012602",
+    "src/grabowski_job_finalizer.py": "38e0501e9b09bb3bd5e4c236162f662b26423f160719a2ea22933e66caea517e",
+    "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
+    "src/grabowski_mcp.py": "48f603f5638eea1320250e0bea14f765f88db5d233493668f9b4a15ea47f5952",
+    "src/grabowski_operator.py": "5864f57c4b9944c360e54971419506590570232e88dac4d6ea785d2ff5f4482c",
+    "src/grabowski_private_io.py": "53510d9aebaedaf0d27bcefa9858d4208eb2f8a3b57acf5f198ba3440a6d2ef0",
+    "src/grabowski_read_surface.py": "c4f633a3303d08ac4916c034dc6d5c86d872daa7628704f3e1ba5b4d070917ac",
+    "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
+    "src/grabowski_tasks.py": "456ba252472b34a3c5ad0280ea27929f21a556f200d04ae64b2a7c303b535837",
+    "tools/consumer_surface_benchmark.py": "54331df64c1af4859748f421078723d764eb7ded3ba397a17c3658dc55718fe4"
+  },
+  "measurement": {
+    "comparisons": {
+      "minimal": {
+        "checkout": {
+          "after_bytes": 4763,
+          "before_bytes": 11458,
+          "reduction_percent": 58.43
+        },
+        "context": {
+          "after_bytes": 1555,
+          "before_bytes": 37597,
+          "reduction_percent": 95.86
+        },
+        "friction": {
+          "after_bytes": 11219,
+          "before_bytes": 60842,
+          "reduction_percent": 81.56
+        },
+        "status": {
+          "after_bytes": 1507,
+          "before_bytes": 7579,
+          "reduction_percent": 80.12
+        },
+        "tasks": {
+          "after_bytes": 9465,
+          "before_bytes": 113239,
+          "reduction_percent": 91.64
+        }
+      },
+      "standard": {
+        "checkout": {
+          "after_bytes": 4781,
+          "before_bytes": 11458,
+          "reduction_percent": 58.27
+        },
+        "context": {
+          "after_bytes": 5455,
+          "before_bytes": 37597,
+          "reduction_percent": 85.49
+        },
+        "friction": {
+          "after_bytes": 28142,
+          "before_bytes": 60842,
+          "reduction_percent": 53.75
+        },
+        "status": {
+          "after_bytes": 2781,
+          "before_bytes": 7579,
+          "reduction_percent": 63.31
+        },
+        "tasks": {
+          "after_bytes": 55243,
+          "before_bytes": 113239,
+          "reduction_percent": 51.22
+        }
+      }
+    },
+    "does_not_establish": [
+      "model_token_count",
+      "connector_transport_reliability",
+      "workflow_correctness"
+    ],
+    "pre_change_bytes": {
+      "checkout_summary": 11458,
+      "context_concise": 37597,
+      "friction_summary_50": 60842,
+      "status": 7579,
+      "task_list_20": 113239
+    },
+    "results": {
+      "checkout_evidence": {
+        "bytes_median": 12733,
+        "bytes_p90": 12733,
+        "elapsed_ms_median": 12.695,
+        "elapsed_ms_p90": 12.713,
+        "samples": 5
+      },
+      "checkout_minimal": {
+        "bytes_median": 4763,
+        "bytes_p90": 4763,
+        "elapsed_ms_median": 12.495,
+        "elapsed_ms_p90": 12.811,
+        "samples": 5
+      },
+      "checkout_standard": {
+        "bytes_median": 4781,
+        "bytes_p90": 4781,
+        "elapsed_ms_median": 12.378,
+        "elapsed_ms_p90": 12.534,
+        "samples": 5
+      },
+      "context_evidence": {
+        "bytes_median": 32092,
+        "bytes_p90": 32092,
+        "elapsed_ms_median": 94.316,
+        "elapsed_ms_p90": 97.036,
+        "samples": 5
+      },
+      "context_minimal": {
+        "bytes_median": 1555,
+        "bytes_p90": 1555,
+        "elapsed_ms_median": 16.487,
+        "elapsed_ms_p90": 16.805,
+        "samples": 5
+      },
+      "context_standard": {
+        "bytes_median": 5455,
+        "bytes_p90": 5455,
+        "elapsed_ms_median": 21.286,
+        "elapsed_ms_p90": 21.553,
+        "samples": 5
+      },
+      "friction_evidence": {
+        "bytes_median": 58928,
+        "bytes_p90": 58928,
+        "elapsed_ms_median": 37.418,
+        "elapsed_ms_p90": 37.569,
+        "samples": 5
+      },
+      "friction_minimal": {
+        "bytes_median": 11219,
+        "bytes_p90": 11219,
+        "elapsed_ms_median": 12.29,
+        "elapsed_ms_p90": 12.604,
+        "samples": 5
+      },
+      "friction_standard": {
+        "bytes_median": 28142,
+        "bytes_p90": 28142,
+        "elapsed_ms_median": 34.488,
+        "elapsed_ms_p90": 34.577,
+        "samples": 5
+      },
+      "status_evidence": {
+        "bytes_median": 14507,
+        "bytes_p90": 14507,
+        "elapsed_ms_median": 76.169,
+        "elapsed_ms_p90": 76.287,
+        "samples": 5
+      },
+      "status_minimal": {
+        "bytes_median": 1507,
+        "bytes_p90": 1507,
+        "elapsed_ms_median": 75.6,
+        "elapsed_ms_p90": 77.066,
+        "samples": 5
+      },
+      "status_standard": {
+        "bytes_median": 2781,
+        "bytes_p90": 2781,
+        "elapsed_ms_median": 74.559,
+        "elapsed_ms_p90": 74.76,
+        "samples": 5
+      },
+      "tasks_evidence": {
+        "bytes_median": 129261,
+        "bytes_p90": 129261,
+        "elapsed_ms_median": 8.087,
+        "elapsed_ms_p90": 8.099,
+        "samples": 5
+      },
+      "tasks_minimal": {
+        "bytes_median": 9465,
+        "bytes_p90": 9465,
+        "elapsed_ms_median": 8.142,
+        "elapsed_ms_p90": 8.159,
+        "samples": 5
+      },
+      "tasks_standard": {
+        "bytes_median": 55243,
+        "bytes_p90": 55243,
+        "elapsed_ms_median": 8.125,
+        "elapsed_ms_p90": 8.182,
+        "samples": 5
+      }
+    },
+    "schema_version": 1
+  },
+  "python_version": "3.10.12",
+  "repository": "grabowski",
+  "runtime_python": "/home/alex/.local/share/grabowski-mcp/.venv/bin/python",
+  "schema_version": 1
+}

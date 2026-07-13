@@ -1,6 +1,6 @@
 # Grabowski Consumer Surface v1
 
-Stand: 2026-07-12
+Stand: 2026-07-13
 
 ## Zweck
 
@@ -37,7 +37,7 @@ Task-, Friction- und Checkout-Antworten unterstützen begrenzte Cursor-Paginatio
 - Filter;
 - Snapshot, sofern die Oberfläche einen Snapshot bildet.
 
-Ein Cursor aus einer anderen Sicht oder Filterkombination wird abgewiesen. Mehrseitenläufe ohne Duplikate oder Lücken sind regressionsgetestet.
+Ein Cursor aus einer anderen Sicht oder Filterkombination wird abgewiesen. Ändert sich ein gebundener Snapshot, fordert die Fehlermeldung ausdrücklich zum Neustart ab Seite eins auf. Cursor besitzen keine Ablaufzeit, weil sie keine Autorisierung darstellen. Mehrseitenläufe ohne Duplikate oder Lücken sind regressionsgetestet.
 
 ## Capability Profiles v2
 
@@ -57,14 +57,16 @@ Nicht daraus ableitbar:
 
 ## Durable Job Notification Outbox
 
-Ein Job mit `notify_on_done.requested=true` erzeugt nach Terminalisierung ein privates, selbsthashgebundenes `notification.json`.
+Ein Job mit `notify_on_done.requested=true` erzeugt nach Terminalisierung ein privates, selbsthashgebundenes `notification.json`. Neue Jobs binden das Receipt zusätzlich an einen vor dem Unit-Start berechneten Origin-Hash und das typisierte Startwerkzeug.
 
 Die Outbox kennt nur:
 
 - `queued`;
 - `acknowledged`.
 
-Ack ist create-only, receipt-hashgebunden, idempotent und auditiert. Manipulierte, falsch gebundene, verlinkte oder unsichere Receipts werden nicht als gültig behandelt.
+Ack ist create-only, receipt-hashgebunden, idempotent und auditiert. Schema 2 verlangt exakte Receipt- und Ack-Felder sowie die Origin-Bindung; unbekannte neu gehashte Claims werden abgewiesen. Schema-1-Receipts bleiben lesbar und quittierbar. Manipulierte, falsch gebundene, verlinkte oder unsichere Receipts werden nicht als gültig behandelt.
+
+Die Trust Boundary lautet `same_uid_authorized_job`: Die Bindung erkennt Metadatendrift gegenüber der systemd-Startprecondition, behauptet aber keine vollständige Isolation gegen kompromittierten Same-UID-Code.
 
 Die Outbox behauptet ausdrücklich nicht:
 
@@ -90,7 +92,9 @@ Der versionierte Nachweis liegt unter:
 - `docs/proofs/consumer-surface-v1-benchmark-20260712.md`;
 - `docs/proofs/consumer-surface-v1-benchmark-20260712.json`.
 
-Der Standardmodus reduziert die gemessenen Median-JSON-Bytes auf allen fünf großen Oberflächen um mindestens 50 Prozent. Der Evidence-Modus bleibt bewusst vollständig.
+Der Standardmodus reduziert die gemessenen Median-JSON-Bytes auf allen fünf großen Oberflächen um mindestens 50 Prozent. Der Evidence-Modus bleibt prüfbar, vermeidet aber doppelte vollständige Werkzeug- und Kontextlisten durch Count-, Hash- und Referenzbindung.
+
+Der kompatible Migrationsvertrag liegt unter `docs/consumer-surface-migration-v2.md`.
 
 ## Betriebsgrenze
 

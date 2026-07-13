@@ -70,6 +70,16 @@ kurzlebige Single-Use-Referenzen für den root-eigenen Socket-Broker. Der Broker
 führt ausschließlich konfigurierte argv-Templates aus; sein Host-Bootstrap ist
 eine explizite Systemoperation.
 
+## Durable Jobs und Same-UID-Vertrauensgrenze
+
+Durable Jobs werden als bereits autorisierte lokale Kommandos im Benutzerkontext gestartet. Sie sind keine allgemeine Ausführungsfläche für vollständig untrusted Code.
+
+Neue Job-Metadaten enthalten einen normalisierten Origin-Vertrag. Dessen SHA-256 wird vor dem Unit-Start berechnet und als systemd-Umgebungs-Precondition an den Stop-Finalizer übergeben. Der Finalizer akzeptiert ein neues Outbox-Receipt nur, wenn Unit, Job-ID, Besitzer, argv-Hash, Scope, Notification-Anforderung, Origin-Hash und Startwerkzeug zusammenpassen. Teilweise vorhandene oder nachträglich neu gehashte Origin-Verträge scheitern geschlossen.
+
+Diese Bindung schützt gegen stille Metadatendrift und versehentliche oder begrenzte Same-UID-Manipulation. Sie authentifiziert jedoch nicht gegen einen Prozess, der den gesamten Benutzerkontext einschließlich systemd-Unit-Umgebung oder Runtime-Artefakten kompromittiert. Dafür wäre eine getrennte Sicherheitsdomäne nötig, etwa eigener Benutzer, Broker, Container oder MicroVM.
+
+Der Finalizer filtert seine Umgebung, läuft mit `-I` und setzt nur im eigenen kurzlebigen Prozess `UMask=0077`, `RLIMIT_CORE=0` sowie ein hohes, aber endliches `RLIMIT_NOFILE`. Der eigentliche Durable Job behält seine bisherige Umask- und Dateideskriptor-Semantik. Das Dateipublishing ist create-only, an einen geöffneten privaten Verzeichnis-FD gebunden und prüft Modus, Inode, Linkzahl und Directory-Fsync. Diese Härtung ist Defense-in-Depth und keine Untrusted-Isolationsbehauptung.
+
 ## Staged Capability Profiles
 
 `config/access.example.json` now uses `observe` as its repository-default

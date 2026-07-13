@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 from contextlib import ExitStack
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -80,6 +82,27 @@ class ConsumerSurfaceTests(unittest.TestCase):
             self.operator._decode_consumer_cursor(tampered, "surface:minimal:filter-a")
         with self.assertRaises(ValueError):
             self.operator._decode_consumer_cursor("not-base64!", "surface:minimal:filter-a")
+
+        malformed = {"schema_version": 1, "scope": "surface:minimal:filter-a"}
+        malformed["checksum"] = hashlib.sha256(
+            self.operator._canonical_json_bytes(malformed)
+        ).hexdigest()
+        encoded = base64.urlsafe_b64encode(
+            self.operator._canonical_json_bytes(malformed)
+        ).decode("ascii").rstrip("=")
+        with self.assertRaisesRegex(ValueError, "position is invalid"):
+            self.operator._decode_consumer_cursor(encoded, "surface:minimal:filter-a")
+
+        snapshot_cursor = self.operator._encode_consumer_cursor(
+            "checkout-summary:minimal:old-snapshot",
+            {"offset": 2},
+        )
+        with self.assertRaisesRegex(ValueError, "result snapshot changed"):
+            self.operator.consumer_surface.decode_cursor(
+                snapshot_cursor,
+                "checkout-summary:minimal:new-snapshot",
+                snapshot_scope="checkout-summary:minimal",
+            )
 
     def test_status_views_and_required_warnings_survive_projection(self) -> None:
         policy = {
@@ -422,7 +445,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
             / "src"
             / "grabowski_runtime_extensions.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("selected_view = operator._normalize_consumer_view", source)
+        self.assertIn("selected_view = consumer_surface.normalize_view", source)
         self.assertIn('if selected_view in {"standard", "evidence"}:', source)
         self.assertIn('if selected_view == "evidence":', source)
         for field in (
@@ -432,6 +455,11 @@ class ConsumerSurfaceTests(unittest.TestCase):
             '"does_not_establish"',
         ):
             self.assertIn(field, source)
+        self.assertIn('"expected_tools_sha256"', source)
+        self.assertIn('"expected_tool_count"', source)
+        self.assertNotIn('"expected_tools": expected_tools', source)
+        self.assertIn('["records_ref"] = "capabilities"', source)
+        self.assertIn('for key in ("tool", "category", "risk_class")', source)
 
 
 if __name__ == "__main__":

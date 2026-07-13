@@ -14,4 +14,4 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["grabowski_mcp", "grabowski_operator", "grabowski_operator_core", "grabowski_chronik", "grabowski_grips", "grabowski_repobrief", "grabowski_agent_workspace", "grabowski_agent_role", "grabowski_agent_sandbox", "grabowski_agent_writer"]
+py-modules = ["grabowski_mcp", "grabowski_operator", "grabowski_operator_core", "grabowski_consumer_surface", "grabowski_private_io", "grabowski_job_origin", "grabowski_job_finalizer", "grabowski_chronik", "grabowski_grips", "grabowski_repobrief", "grabowski_agent_workspace", "grabowski_agent_role", "grabowski_agent_sandbox", "grabowski_agent_writer"]
