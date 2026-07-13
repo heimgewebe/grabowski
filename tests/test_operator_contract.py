@@ -342,6 +342,27 @@ class OperatorContractTests(unittest.TestCase):
             "failed",
         )
         self.assertEqual(
+            operator._job_final_status(True, {"ActiveState": "failed", "Result": "exit-code", "ExecMainStatus": "0"}),
+            "succeeded",
+        )
+        postflight = operator._job_terminalization_evidence(
+            True,
+            {
+                "LoadState": "loaded",
+                "ActiveState": "failed",
+                "SubState": "failed",
+                "Result": "exit-code",
+                "ExecMainCode": "1",
+                "ExecMainStatus": "0",
+            },
+        )
+        self.assertEqual(postflight["final_status"], "succeeded")
+        self.assertEqual(postflight["postflight_evidence"]["state"], "failed")
+        self.assertEqual(
+            postflight["postflight_evidence"]["primary_job_status_preserved"],
+            "succeeded",
+        )
+        self.assertEqual(
             operator._job_final_status(True, {"ActiveState": "inactive", "Result": "", "ExecMainStatus": ""}),
             "terminated_unclear",
         )

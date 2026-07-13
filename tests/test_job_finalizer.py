@@ -283,6 +283,30 @@ class JobFinalizerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "origin contract is incomplete"):
             finalizer.finalize(self.directory, environment)
 
+    def test_complete_same_uid_control_is_explicitly_not_authenticated(self) -> None:
+        _origin, environment = self._bind_origin()
+        forged_origin = dict(self.metadata["origin"])
+        forged_origin["notify_on_done"] = {
+            **forged_origin["notify_on_done"],
+            "note": "same-uid-forged",
+        }
+        forged_hash = hashlib.sha256(
+            finalizer.job_origin.canonical_json_bytes(forged_origin)
+        ).hexdigest()
+        self.metadata["origin"] = forged_origin
+        self.metadata["origin_sha256"] = forged_hash
+        self.metadata["notify_on_done"]["note"] = "same-uid-forged"
+        self._write_metadata(self.metadata)
+        environment["GRABOWSKI_JOB_ORIGIN_SHA256"] = forged_hash
+
+        receipt = finalizer.finalize(self.directory, environment)["receipt"]
+        self.assertEqual(receipt["note"], "same-uid-forged")
+        self.assertEqual(receipt["trust_boundary"], "same_uid_authorized_job")
+        self.assertIn(
+            "untrusted_same_uid_job_authenticity",
+            receipt["does_not_establish"],
+        )
+
     def test_origin_contract_rejects_noncanonical_identity_fields(self) -> None:
         values = dict(
             unit=self.unit,
@@ -301,6 +325,17 @@ class JobFinalizerTests(unittest.TestCase):
         ):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, message):
                 finalizer.job_origin.build_origin(**{**values, key: invalid})
+
+    def test_filtered_environment_includes_directory_and_excludes_unrelated_values(self) -> None:
+        source = {
+            "GRABOWSKI_JOB_DIRECTORY": str(self.directory),
+            "SERVICE_RESULT": "success",
+            "UNRELATED_SECRET": "hidden",
+        }
+        filtered = finalizer._filtered_environment(source)
+        self.assertEqual(filtered["GRABOWSKI_JOB_DIRECTORY"], str(self.directory))
+        self.assertEqual(filtered["SERVICE_RESULT"], "success")
+        self.assertNotIn("UNRELATED_SECRET", filtered)
 
     def test_process_hardening_is_finalizer_local(self) -> None:
         with mock.patch.object(finalizer.os, "umask") as umask, mock.patch.object(
@@ -321,13 +356,33 @@ class JobFinalizerTests(unittest.TestCase):
             ],
         )
 
-    def test_main_fails_closed_when_process_hardening_fails(self) -> None:
+    def test_main_parses_filtered_environment_before_hardening(self) -> None:
+        filtered = {key: "" for key in finalizer.FINALIZER_ENV_KEYS}
         with mock.patch.object(
+            finalizer,
+            "_filtered_environment",
+            return_value=filtered,
+        ), mock.patch.object(finalizer, "_harden_process") as harden, mock.patch.object(
+            finalizer.sys,
+            "stderr",
+        ):
+            self.assertEqual(finalizer.main(), 2)
+        harden.assert_not_called()
+
+    def test_main_fails_closed_when_process_hardening_fails(self) -> None:
+        filtered = {key: "" for key in finalizer.FINALIZER_ENV_KEYS}
+        filtered["GRABOWSKI_JOB_DIRECTORY"] = str(self.directory)
+        with mock.patch.object(
+            finalizer,
+            "_filtered_environment",
+            return_value=filtered,
+        ), mock.patch.object(
             finalizer,
             "_harden_process",
             side_effect=OSError("limit denied"),
-        ), mock.patch.object(finalizer.sys, "stderr"):
+        ), mock.patch.object(finalizer.sys, "stderr") as stderr:
             self.assertEqual(finalizer.main(), 1)
+        self.assertIn("process_hardening", "".join(call.args[0] for call in stderr.write.call_args_list))
 
     def test_detects_metadata_identity_drift(self) -> None:
         path = self.directory / "metadata.json"

@@ -37,7 +37,7 @@ Task-, Friction- und Checkout-Antworten unterstützen begrenzte Cursor-Paginatio
 - Filter;
 - Snapshot, sofern die Oberfläche einen Snapshot bildet.
 
-Ein Cursor aus einer anderen Sicht oder Filterkombination wird abgewiesen. Ändert sich ein gebundener Snapshot, fordert die Fehlermeldung ausdrücklich zum Neustart ab Seite eins auf. Cursor besitzen keine Ablaufzeit, weil sie keine Autorisierung darstellen. Mehrseitenläufe ohne Duplikate oder Lücken sind regressionsgetestet.
+Ein Cursor aus einer anderen Sicht oder Filterkombination wird abgewiesen. Ändert sich ein gebundener Snapshot, liefert die Fehlermeldung das stabile Präfix `cursor_snapshot_changed:` und fordert zum Neustart ab Seite eins auf. Cursor besitzen keine Ablaufzeit, weil sie keine Autorisierung darstellen. Mehrseitenläufe ohne Duplikate oder Lücken sind regressionsgetestet.
 
 ## Capability Profiles v2
 
@@ -66,7 +66,7 @@ Die Outbox kennt nur:
 
 Ack ist create-only, receipt-hashgebunden, idempotent und auditiert. Schema 2 verlangt exakte Receipt- und Ack-Felder sowie die Origin-Bindung; unbekannte neu gehashte Claims werden abgewiesen. Schema-1-Receipts bleiben lesbar und quittierbar. Manipulierte, falsch gebundene, verlinkte oder unsichere Receipts werden nicht als gültig behandelt.
 
-Die Trust Boundary lautet `same_uid_authorized_job`: Die Bindung erkennt Metadatendrift gegenüber der systemd-Startprecondition, behauptet aber keine vollständige Isolation gegen kompromittierten Same-UID-Code.
+Die Trust Boundary lautet `same_uid_authorized_job`: Die Bindung erkennt Metadatendrift gegenüber der systemd-Startprecondition, solange diese Precondition nicht ebenfalls kontrolliert wird. Sie ist ausdrücklich **keine Isolation** gegen kompromittierten Same-UID-Code.
 
 Die Outbox behauptet ausdrücklich nicht:
 

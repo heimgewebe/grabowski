@@ -37,7 +37,7 @@ Für Consumer-Antworten mit Schema 2 gilt:
 
 Cursor bleiben an Oberfläche, Sicht, Filter und gegebenenfalls Snapshot gebunden. Sie besitzen absichtlich keine Zeitablaufsemantik, weil sie keine Autorisierung darstellen.
 
-Bei einer Änderung des Snapshot-Hashes antwortet der Server mit einem expliziten Fehler, der zum Neustart ab Seite eins auffordert. Clients dürfen einen solchen Cursor nicht unverändert wiederholen.
+Bei einer Änderung des Snapshot-Hashes antwortet der Server mit dem stabilen Fehlerpräfix `cursor_snapshot_changed:` und fordert zum Neustart ab Seite eins auf. Clients dürfen einen solchen Cursor nicht unverändert wiederholen. Ein Sicht- oder Filterwechsel bleibt dagegen ein normaler Scope-Mismatch.
 
 ## Durable Jobs
 
@@ -49,7 +49,9 @@ Neu gestartete Durable Jobs verwenden Metadaten-Schema 2. Es ergänzt:
 
 Der Origin-Hash wird vor dem Start berechnet und zusätzlich in die systemd-Unit-Umgebung geschrieben. Der Stop-Finalizer akzeptiert ein Schema-2-Receipt nur, wenn Metadaten, Unitname, Werkzeug und die beim Start gesetzte Hash-Precondition übereinstimmen.
 
-Alte Job-Metadaten ohne Origin-Vertrag bleiben lesbar. Der Legacy-Pfad wird nur verwendet, wenn weder Origin-Metadaten noch eine Launcher-Precondition vorhanden sind. Ein teilweise vorhandener Origin-Vertrag scheitert geschlossen.
+Der Jobstatus trennt den Ausgang des Hauptprozesses von der aggregierten systemd-Unit. Schlägt nur `ExecStopPost` fehl, bleibt `final_status="succeeded"`, während `terminalization_evidence.postflight_evidence.state="failed"` den Finalizer-/Postflightfehler sichtbar hält.
+
+Alte Job-Metadaten ohne Origin-Vertrag bleiben lesbar. Der Legacy-Pfad wird nur verwendet, wenn weder Origin-Metadaten noch eine Launcher-Precondition vorhanden sind. Ein teilweise vorhandener Origin-Vertrag scheitert geschlossen. Schema-2-Receipts sind ausschließlich für kanonische zwölfstellige Hex-Job-IDs zulässig; nichtkanonische historische Namen bleiben auf Schema 1 beschränkt.
 
 ## Outbox-Receipts und Acknowledgements
 
@@ -70,9 +72,19 @@ Dies belegt keine externe Pushzustellung und nicht, dass der Nutzer die Nachrich
 
 ## Vertrauensgrenze
 
-Durable Jobs laufen derzeit als autorisierte lokale Prozesse desselben Benutzers. Der Launcher-Origin-Vertrag erkennt nachträgliche Metadatenänderungen gegenüber der beim Unit-Start gesetzten Precondition. Er ist keine vollständige Isolation gegen einen Prozess, der den gesamten gleichen Benutzerkontext kompromittiert.
+Durable Jobs laufen derzeit als autorisierte lokale Prozesse desselben Benutzers. Der Launcher-Origin-Vertrag erkennt nachträgliche Metadatenänderungen nur, solange die Startprecondition nicht ebenfalls vom Angreifer kontrolliert wird. **Er ist keine Isolation.** Kontrolliert ein kompromittierter Same-UID-Prozess Metadaten und Finalizer-Precondition gemeinsam, kann er einen konsistent gefälschten Origin-Vertrag herstellen.
 
-Vollständig untrusted Code benötigt eine eigene Sicherheitsdomäne, beispielsweise einen getrennten Benutzer, Broker, Container oder eine MicroVM. Consumer Surface v2 behauptet diese Grenze nicht.
+Vollständig untrusted Code benötigt eine eigene Sicherheitsdomäne, beispielsweise einen getrennten Benutzer, root-eigenen Broker, Container oder eine MicroVM. Consumer Surface v2 behauptet diese Grenze nicht. Der adversariale Vertragstest hält diese Nichtaussage absichtlich ausführbar fest.
+
+## Breaking für neue Clients
+
+Für bereits vorhandene Schema-1-Leser bleibt der Lesepfad kompatibel. Neue oder auf Schema 2 migrierte Clients müssen jedoch folgende Änderungen als verbindlich behandeln:
+
+- `notify_on_done.requested=true` bedeutet eine lokale Outbox-Funktion und nicht mehr `metadata_only`;
+- Schema-2-Receipts und Acknowledgements besitzen exakte Feldmengen und werden bei unbekannten Feldern abgewiesen;
+- Schema-2-Receipts erfordern kanonische zwölfstellige Hex-Job-IDs;
+- Snapshotwechsel liefern das stabile Fehlerpräfix `cursor_snapshot_changed:`;
+- `context(evidence)` bindet den Werkzeugvertrag über Anzahl und SHA-256 statt über eine zweite vollständige Namensliste.
 
 ## Client-Snapshot
 

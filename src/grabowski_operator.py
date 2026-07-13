@@ -1098,6 +1098,7 @@ def _systemd_job_query_visible(result: dict[str, Any], properties: dict[str, str
 
 
 def _job_final_status(systemd_visible: bool, properties: dict[str, str]) -> str:
+    """Classify the main job process, not the aggregate unit postflight result."""
     if not systemd_visible:
         return "missing_finalization_evidence"
     active_state = properties.get("ActiveState", "")
@@ -1105,17 +1106,48 @@ def _job_final_status(systemd_visible: bool, properties: dict[str, str]) -> str:
     exec_status = properties.get("ExecMainStatus", "")
     if active_state in {"active", "activating", "reloading", "deactivating"}:
         return "running"
-    if active_state == "failed":
-        return "failed"
-    if active_state == "inactive":
-        if result == "success" and exec_status in {"", "0"}:
+    if active_state in {"inactive", "failed"}:
+        if exec_status not in {"", "0"}:
+            return "failed"
+        if exec_status == "0":
             return "succeeded"
         if result and result != "success":
             return "failed"
-        if exec_status not in {"", "0"}:
-            return "failed"
+        if result == "success":
+            return "succeeded"
         return "terminated_unclear"
     return "unknown"
+
+
+def _job_postflight_evidence(
+    systemd_visible: bool,
+    properties: dict[str, str],
+    primary_status: str,
+) -> dict[str, Any]:
+    active_state = properties.get("ActiveState", "")
+    result = properties.get("Result", "")
+    if not systemd_visible:
+        state = "unavailable"
+    elif primary_status == "running":
+        state = "pending"
+    elif primary_status == "succeeded" and (
+        active_state == "failed" or result not in {"", "success"}
+    ):
+        state = "failed"
+    elif result == "success":
+        state = "succeeded"
+    else:
+        state = "not_separable"
+    return {
+        "state": state,
+        "aggregate_unit_result": result,
+        "aggregate_active_state": active_state,
+        "primary_job_status_preserved": primary_status,
+        "does_not_establish": [
+            "notification_receipt_exists",
+            "postflight_root_cause",
+        ],
+    }
 
 
 def _job_terminalization_evidence(
@@ -1132,6 +1164,11 @@ def _job_terminalization_evidence(
         "query_valid": query_valid,
         "systemd_visible": systemd_visible,
         "final_status": final_status,
+        "postflight_evidence": _job_postflight_evidence(
+            systemd_visible,
+            properties,
+            final_status,
+        ),
         "load_state": properties.get("LoadState", ""),
         "active_state": properties.get("ActiveState", ""),
         "sub_state": properties.get("SubState", ""),
@@ -1313,6 +1350,8 @@ def _validated_job_notification(directory: Path, unit: str) -> dict[str, Any] | 
     )
     if expected_fields is None or set(receipt) != expected_fields:
         raise ValueError("job notification receipt schema is invalid")
+    if schema_version == 2 and job_origin.UNIT_RE.fullmatch(unit) is None:
+        raise ValueError("schema-2 job notification requires a canonical job unit")
     if (
         receipt.get("kind") != "grabowski_job_notification"
         or receipt.get("unit") != unit
@@ -1597,6 +1636,14 @@ def _job_status_record(
                 "receipt_state": finalization_receipt.get("state"),
                 "receipt_reason": finalization_receipt.get("reason"),
             }
+    terminalization.setdefault(
+        "postflight_evidence",
+        _job_postflight_evidence(
+            systemd_visible,
+            properties,
+            str(terminalization.get("final_status", "unknown")),
+        ),
+    )
     projected = _project_job_metadata(unit, metadata)
     notify_on_done = projected["notify_on_done"]
     return {

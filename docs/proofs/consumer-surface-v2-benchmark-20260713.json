@@ -10,23 +10,29 @@
       "context": 85.49,
       "friction": 53.75,
       "status": 63.31,
-      "tasks": 51.22
+      "tasks": 54.31
     }
   },
   "base_head": "0f5473e117ddc7f6e830b961a49e73fcf3ebb657",
   "branch": "fix/consumer-surface-optimization-v2",
-  "captured_at": "2026-07-13T03:54:25.979229+00:00",
+  "captured_at": "2026-07-13T04:49:20.589320+00:00",
   "command": "PYTHONPATH=src <runtime-python> tools/consumer_surface_benchmark.py --samples 5",
   "contract_evidence": {
     "common_consumer_module": true,
     "create_only_unlink_failure_rolls_back_visible_target": true,
+    "cursor_snapshot_error_code_is_stable": true,
     "evidence_capabilities_remain_complete_by_tool_category_and_risk": true,
     "evidence_expected_tools_bound_by_count_and_sha256": true,
     "finalizer_limits_are_process_local": true,
     "legacy_job_receipts_readable": true,
     "origin_bound_job_receipts": true,
+    "post_publish_directory_binding_rechecked": true,
+    "rollback_preserves_attacker_replacement_inode": true,
+    "same_uid_full_control_non_authenticity_tested": true,
     "same_uid_non_isolation_explicit": true,
+    "schema_two_requires_canonical_job_unit": true,
     "snapshot_change_error_is_explicit": true,
+    "structured_finalizer_failure_is_durable": true,
     "tests": [
       "tests.test_consumer_surface",
       "tests.test_private_io",
@@ -40,7 +46,7 @@
     "checkout": {
       "limit": 20,
       "returned": 20,
-      "snapshot_sha256": "d290f736ed04032d236215dcc0ca534a94426c171de36a89050d4ebd063abe0c",
+      "snapshot_sha256": "16f008b9d7b65ced27ce81706bf8d73823fe949f0a3308d6ffb393729bc1ae0a",
       "total_worktrees": 61,
       "view": "standard"
     },
@@ -62,7 +68,7 @@
     "tasks": {
       "limit": 20,
       "returned": 20,
-      "total_matching": 1375,
+      "total_matching": 1377,
       "view": "standard"
     }
   },
@@ -76,13 +82,13 @@
     "size and latency measurements do not independently establish workflow correctness"
   ],
   "measured_source_sha256": {
-    "src/grabowski_consumer_surface.py": "6e01b6d4f8d6fd378b97d1ff40b1f219cd277ab7f536c11e1ca1ecf603b88dd7",
+    "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
     "src/grabowski_friction.py": "3bd5e876e4a5e274eddcd60668c553b956553465164f7e1e9217c80b35012602",
-    "src/grabowski_job_finalizer.py": "38e0501e9b09bb3bd5e4c236162f662b26423f160719a2ea22933e66caea517e",
+    "src/grabowski_job_finalizer.py": "bc87ed9312af1a7000d91dc0f3b3a320b742286ef68176c74f868268aebe061e",
     "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
     "src/grabowski_mcp.py": "48f603f5638eea1320250e0bea14f765f88db5d233493668f9b4a15ea47f5952",
-    "src/grabowski_operator.py": "5864f57c4b9944c360e54971419506590570232e88dac4d6ea785d2ff5f4482c",
-    "src/grabowski_private_io.py": "53510d9aebaedaf0d27bcefa9858d4208eb2f8a3b57acf5f198ba3440a6d2ef0",
+    "src/grabowski_operator.py": "872ea8880cbca9285455a66070b687dfac1a1920adbcf2d9a6f1378579bf36f4",
+    "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
     "src/grabowski_read_surface.py": "c4f633a3303d08ac4916c034dc6d5c86d872daa7628704f3e1ba5b4d070917ac",
     "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
     "src/grabowski_tasks.py": "456ba252472b34a3c5ad0280ea27929f21a556f200d04ae64b2a7c303b535837",
@@ -112,9 +118,9 @@
           "reduction_percent": 80.12
         },
         "tasks": {
-          "after_bytes": 9465,
+          "after_bytes": 10461,
           "before_bytes": 113239,
-          "reduction_percent": 91.64
+          "reduction_percent": 90.76
         }
       },
       "standard": {
@@ -139,9 +145,9 @@
           "reduction_percent": 63.31
         },
         "tasks": {
-          "after_bytes": 55243,
+          "after_bytes": 51744,
           "before_bytes": 113239,
-          "reduction_percent": 51.22
+          "reduction_percent": 54.31
         }
       }
     },
@@ -161,106 +167,106 @@
       "checkout_evidence": {
         "bytes_median": 12733,
         "bytes_p90": 12733,
-        "elapsed_ms_median": 12.695,
-        "elapsed_ms_p90": 12.713,
+        "elapsed_ms_median": 12.437,
+        "elapsed_ms_p90": 12.569,
         "samples": 5
       },
       "checkout_minimal": {
         "bytes_median": 4763,
         "bytes_p90": 4763,
-        "elapsed_ms_median": 12.495,
-        "elapsed_ms_p90": 12.811,
+        "elapsed_ms_median": 12.584,
+        "elapsed_ms_p90": 12.711,
         "samples": 5
       },
       "checkout_standard": {
         "bytes_median": 4781,
         "bytes_p90": 4781,
-        "elapsed_ms_median": 12.378,
-        "elapsed_ms_p90": 12.534,
+        "elapsed_ms_median": 12.064,
+        "elapsed_ms_p90": 12.338,
         "samples": 5
       },
       "context_evidence": {
         "bytes_median": 32092,
         "bytes_p90": 32092,
-        "elapsed_ms_median": 94.316,
-        "elapsed_ms_p90": 97.036,
+        "elapsed_ms_median": 94.401,
+        "elapsed_ms_p90": 96.067,
         "samples": 5
       },
       "context_minimal": {
         "bytes_median": 1555,
         "bytes_p90": 1555,
-        "elapsed_ms_median": 16.487,
-        "elapsed_ms_p90": 16.805,
+        "elapsed_ms_median": 16.328,
+        "elapsed_ms_p90": 16.511,
         "samples": 5
       },
       "context_standard": {
         "bytes_median": 5455,
         "bytes_p90": 5455,
-        "elapsed_ms_median": 21.286,
-        "elapsed_ms_p90": 21.553,
+        "elapsed_ms_median": 20.39,
+        "elapsed_ms_p90": 21.772,
         "samples": 5
       },
       "friction_evidence": {
         "bytes_median": 58928,
         "bytes_p90": 58928,
-        "elapsed_ms_median": 37.418,
-        "elapsed_ms_p90": 37.569,
+        "elapsed_ms_median": 36.379,
+        "elapsed_ms_p90": 36.646,
         "samples": 5
       },
       "friction_minimal": {
         "bytes_median": 11219,
         "bytes_p90": 11219,
-        "elapsed_ms_median": 12.29,
-        "elapsed_ms_p90": 12.604,
+        "elapsed_ms_median": 11.842,
+        "elapsed_ms_p90": 12.095,
         "samples": 5
       },
       "friction_standard": {
         "bytes_median": 28142,
         "bytes_p90": 28142,
-        "elapsed_ms_median": 34.488,
-        "elapsed_ms_p90": 34.577,
+        "elapsed_ms_median": 34.68,
+        "elapsed_ms_p90": 34.75,
         "samples": 5
       },
       "status_evidence": {
         "bytes_median": 14507,
         "bytes_p90": 14507,
-        "elapsed_ms_median": 76.169,
-        "elapsed_ms_p90": 76.287,
+        "elapsed_ms_median": 78.024,
+        "elapsed_ms_p90": 78.255,
         "samples": 5
       },
       "status_minimal": {
         "bytes_median": 1507,
         "bytes_p90": 1507,
-        "elapsed_ms_median": 75.6,
-        "elapsed_ms_p90": 77.066,
+        "elapsed_ms_median": 77.206,
+        "elapsed_ms_p90": 78.533,
         "samples": 5
       },
       "status_standard": {
         "bytes_median": 2781,
         "bytes_p90": 2781,
-        "elapsed_ms_median": 74.559,
-        "elapsed_ms_p90": 74.76,
+        "elapsed_ms_median": 78.15,
+        "elapsed_ms_p90": 78.882,
         "samples": 5
       },
       "tasks_evidence": {
-        "bytes_median": 129261,
-        "bytes_p90": 129261,
-        "elapsed_ms_median": 8.087,
-        "elapsed_ms_p90": 8.099,
+        "bytes_median": 114188,
+        "bytes_p90": 114188,
+        "elapsed_ms_median": 8.139,
+        "elapsed_ms_p90": 8.147,
         "samples": 5
       },
       "tasks_minimal": {
-        "bytes_median": 9465,
-        "bytes_p90": 9465,
-        "elapsed_ms_median": 8.142,
-        "elapsed_ms_p90": 8.159,
+        "bytes_median": 10461,
+        "bytes_p90": 10461,
+        "elapsed_ms_median": 8.194,
+        "elapsed_ms_p90": 8.319,
         "samples": 5
       },
       "tasks_standard": {
-        "bytes_median": 55243,
-        "bytes_p90": 55243,
-        "elapsed_ms_median": 8.125,
-        "elapsed_ms_p90": 8.182,
+        "bytes_median": 51744,
+        "bytes_p90": 51744,
+        "elapsed_ms_median": 8.276,
+        "elapsed_ms_p90": 8.32,
         "samples": 5
       }
     },

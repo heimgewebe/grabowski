@@ -97,7 +97,10 @@ class ConsumerSurfaceTests(unittest.TestCase):
             "checkout-summary:minimal:old-snapshot",
             {"offset": 2},
         )
-        with self.assertRaisesRegex(ValueError, "result snapshot changed"):
+        with self.assertRaisesRegex(
+            ValueError,
+            self.operator.consumer_surface.CURSOR_SNAPSHOT_CHANGED_ERROR,
+        ):
             self.operator.consumer_surface.decode_cursor(
                 snapshot_cursor,
                 "checkout-summary:minimal:new-snapshot",

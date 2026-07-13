@@ -133,6 +133,33 @@ class JobNotificationOutboxTests(unittest.TestCase):
             {self.unit, legacy_unit},
         )
 
+    def test_schema_two_receipt_rejects_noncanonical_legacy_unit_name(self) -> None:
+        legacy_job_id = "legacy000001"
+        legacy_unit = f"grabowski-job-{legacy_job_id}"
+        legacy_directory = self.jobs / legacy_unit
+        legacy_directory.mkdir(mode=0o700)
+        receipt = {
+            **self.receipt,
+            "schema_version": 2,
+            "job_id": legacy_job_id,
+            "unit": legacy_unit,
+            "origin_sha256": "b" * 64,
+            "invoker_tool": "grabowski_job_start",
+            "origin_binding": self.operator.JOB_NOTIFICATION_ORIGIN_BINDING,
+            "trust_boundary": self.operator.JOB_NOTIFICATION_TRUST_BOUNDARY,
+        }
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = hashlib.sha256(
+            self.operator._canonical_json_bytes(receipt)
+        ).hexdigest()
+        self._write_json(legacy_directory / "notification.json", receipt)
+
+        result = self.operator.grabowski_job_notification_list(state="all")
+        self.assertTrue(any(
+            "canonical job unit" in row["error"]
+            for row in result["invalid_receipts"]
+        ))
+
     def test_ack_is_private_audited_and_idempotent(self) -> None:
         audit = mock.Mock()
         self.operator.base._append_audit = audit

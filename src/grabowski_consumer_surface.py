@@ -12,6 +12,10 @@ CONSUMER_VIEWS = frozenset({"minimal", "standard", "evidence"})
 CONSUMER_VIEW_ALIASES = {"concise": "minimal", "full": "evidence"}
 MAX_CONSUMER_FIELDS = 40
 MAX_CONSUMER_CURSOR_BYTES = 2048
+CURSOR_SNAPSHOT_CHANGED_ERROR = (
+    "cursor_snapshot_changed: result snapshot changed; "
+    "restart pagination from the first page"
+)
 _FIELD_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 
@@ -117,9 +121,6 @@ def decode_cursor(
             and actual_scope.startswith(snapshot_scope + ":")
             and scope.startswith(snapshot_scope + ":")
         ):
-            raise ValueError(
-                "cursor does not match because the result snapshot changed; "
-                "restart pagination from the first page"
-            )
+            raise ValueError(CURSOR_SNAPSHOT_CHANGED_ERROR)
         raise ValueError("cursor does not match this view or filter")
     return position

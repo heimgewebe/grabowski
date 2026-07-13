@@ -127,6 +127,64 @@ class PrivateCreateOnlyJsonTests(unittest.TestCase):
                 self.publish({"value": 4})
         self.assertFalse(self.target.exists())
 
+    def test_directory_identity_drift_after_publish_rolls_back_own_target(self) -> None:
+        real_assert = private_io._assert_open_directory_binding
+        calls = 0
+
+        def fail_second_binding(directory_fd, directory, *, label):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("test receipt directory identity is unsafe")
+            return real_assert(directory_fd, directory, label=label)
+
+        with mock.patch.object(
+            private_io,
+            "_assert_open_directory_binding",
+            side_effect=fail_second_binding,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "directory identity is unsafe"):
+                self.publish({"value": 5})
+        self.assertFalse(self.target.exists())
+        self.assertEqual(list(self.root.glob(".receipt.json.*.tmp")), [])
+
+    def test_attacker_replacement_is_not_deleted_during_rollback(self) -> None:
+        attacker = self.root / "attacker.json"
+        attacker.write_text('{"attacker":true}\n', encoding="utf-8")
+        attacker.chmod(0o600)
+        attacker_inode = attacker.lstat().st_ino
+        real_fsync = private_io.os.fsync
+        calls = 0
+
+        def replace_after_directory_fsync(descriptor):
+            nonlocal calls
+            calls += 1
+            result = real_fsync(descriptor)
+            if calls == 2:
+                attacker.replace(self.target)
+            return result
+
+        with mock.patch.object(private_io.os, "fsync", side_effect=replace_after_directory_fsync):
+            with self.assertRaisesRegex(RuntimeError, "integrity validation"):
+                self.publish({"value": 6})
+        self.assertEqual(self.target.lstat().st_ino, attacker_inode)
+        self.assertEqual(json.loads(self.target.read_text(encoding="utf-8")), {"attacker": True})
+
+
+    def test_cleanup_close_error_does_not_mask_primary_failure(self) -> None:
+        with mock.patch.object(
+            private_io.os,
+            "link",
+            side_effect=OSError("link failed"),
+        ), mock.patch.object(
+            private_io.os,
+            "close",
+            side_effect=OSError("close failed"),
+        ):
+            with self.assertRaisesRegex(OSError, "link failed"):
+                self.publish({"value": 7})
+
+
 
 if __name__ == "__main__":
     unittest.main()

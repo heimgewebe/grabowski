@@ -315,21 +315,36 @@ def finalize(directory: Path, environment: dict[str, str] | None = None) -> dict
     }
 
 
+def _log_failure(stage: str, error: str) -> None:
+    print(
+        json.dumps(
+            {
+                "kind": "grabowski_job_notification_finalizer_error",
+                "stage": stage,
+                "error": error[:500],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+    )
+
+
 def main() -> int:
-    try:
-        _harden_process()
-    except (OSError, ValueError) as exc:
-        print(f"job notification finalizer hardening failed: {exc}", file=sys.stderr)
-        return 1
     env = _filtered_environment(None)
     raw = env.get("GRABOWSKI_JOB_DIRECTORY", "")
     if not raw:
-        print("GRABOWSKI_JOB_DIRECTORY is required", file=sys.stderr)
+        _log_failure("environment", "GRABOWSKI_JOB_DIRECTORY is required")
         return 2
+    try:
+        _harden_process()
+    except (OSError, ValueError) as exc:
+        _log_failure("process_hardening", str(exc))
+        return 1
     try:
         result = finalize(Path(raw).expanduser(), env)
     except Exception as exc:
-        print(f"job notification finalizer failed: {exc}", file=sys.stderr)
+        _log_failure("finalization", str(exc))
         return 1
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
