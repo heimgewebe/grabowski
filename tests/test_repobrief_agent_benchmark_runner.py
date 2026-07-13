@@ -4,6 +4,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from decimal import Decimal
+from decimal import Decimal
 import importlib.util
 import json
 from pathlib import Path
@@ -323,6 +324,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 mcp_config=config,
                 max_cost_usd=Decimal("1.00"),
                 max_cost_usd=Decimal("1.00"),
+                max_cost_usd=Decimal("1.00"),
             )
         joined = " ".join(command)
         self.assertIn("--strict-mcp-config", command)
@@ -379,6 +381,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             returncode=0,
             started_at=started,
             ended_at=started + timedelta(seconds=1),
+            max_cost_usd=Decimal("1.00"),
             max_cost_usd=Decimal("1.00"),
             max_cost_usd=Decimal("1.00"),
         )
