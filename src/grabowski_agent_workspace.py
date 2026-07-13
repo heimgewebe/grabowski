@@ -65,6 +65,7 @@ PLAN_FIELDS = (
     "commands",
     "roles",
     "role_ownership",
+    "route_evidence",
     "resources",
 )
 PANE_ID_RE = re.compile(r"^%[0-9]+$")
@@ -83,6 +84,21 @@ AGENT_WORKSPACE_TASK_HOST = "heim-pc"
 MAX_ROLE_RETRIES = 1
 MAX_WORKSPACE_EVENTS = 512
 MAX_WORKSPACE_EVENT_BYTES = 1024 * 1024
+ROUTE_EXECUTION_MODES = frozenset({
+    "direct_operator",
+    "isolated_worktree",
+    "full_workspace",
+    "workspace_with_contrast",
+    "workspace_with_competition",
+})
+ROUTE_TASK_KINDS = frozenset({"code", "docs", "analysis", "operations"})
+ROUTE_NOVELTY = frozenset({"low", "medium", "high"})
+ROUTE_RISK_FLAGS = frozenset({
+    "security", "runtime", "deployment", "schema", "concurrency",
+    "data_migration", "privilege", "external_api", "cross_repo",
+    "destructive", "user_data",
+})
+ROUTE_EXTERNAL_AGENTS = frozenset({"claude", "agy"})
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 BindingVerifier = Callable[[str, str], dict[str, Any]]
 
@@ -141,6 +157,147 @@ def _argv(value: Any, field: str) -> list[str]:
     for index, item in enumerate(value):
         result.append(_required_string(item, f"{field}[{index}]", max_length=8192))
     return result
+
+
+def _normalize_route_input_facts(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AgentWorkspaceError("route_evidence.input_facts must be an object")
+    expected = {
+        "task_kind",
+        "changed_file_estimate",
+        "expected_duration_minutes",
+        "novelty",
+        "risk_flags",
+        "connector_instability",
+        "parallel_work",
+        "user_requested_external",
+        "available_external_agents",
+    }
+    if set(value) != expected:
+        raise AgentWorkspaceError("route_evidence.input_facts shape is invalid")
+    task_kind = _required_string(value.get("task_kind"), "route_evidence.input_facts.task_kind", max_length=32)
+    if task_kind not in ROUTE_TASK_KINDS:
+        raise AgentWorkspaceError("route_evidence task_kind is invalid")
+    changed_files = value.get("changed_file_estimate")
+    duration = value.get("expected_duration_minutes")
+    if isinstance(changed_files, bool) or not isinstance(changed_files, int) or not 0 <= changed_files <= 10000:
+        raise AgentWorkspaceError("route_evidence changed_file_estimate is invalid")
+    if isinstance(duration, bool) or not isinstance(duration, int) or not 0 <= duration <= 10080:
+        raise AgentWorkspaceError("route_evidence expected_duration_minutes is invalid")
+    novelty = _required_string(value.get("novelty"), "route_evidence.input_facts.novelty", max_length=16)
+    if novelty not in ROUTE_NOVELTY:
+        raise AgentWorkspaceError("route_evidence novelty is invalid")
+    raw_flags = value.get("risk_flags")
+    if not isinstance(raw_flags, list) or len(raw_flags) > len(ROUTE_RISK_FLAGS):
+        raise AgentWorkspaceError("route_evidence risk_flags are invalid")
+    flags = sorted({_required_string(item, "route_evidence.risk_flag", max_length=32) for item in raw_flags})
+    if len(flags) != len(raw_flags) or set(flags) - ROUTE_RISK_FLAGS:
+        raise AgentWorkspaceError("route_evidence risk_flags are invalid")
+    booleans: dict[str, bool] = {}
+    for field in ("connector_instability", "parallel_work", "user_requested_external"):
+        candidate = value.get(field)
+        if not isinstance(candidate, bool):
+            raise AgentWorkspaceError(f"route_evidence {field} must be boolean")
+        booleans[field] = candidate
+    raw_agents = value.get("available_external_agents")
+    if not isinstance(raw_agents, list) or len(raw_agents) > len(ROUTE_EXTERNAL_AGENTS):
+        raise AgentWorkspaceError("route_evidence available_external_agents are invalid")
+    agents = [_required_string(item, "route_evidence.external_agent", max_length=32) for item in raw_agents]
+    if len(set(agents)) != len(agents) or set(agents) - ROUTE_EXTERNAL_AGENTS:
+        raise AgentWorkspaceError("route_evidence available_external_agents are invalid")
+    return {
+        "task_kind": task_kind,
+        "changed_file_estimate": changed_files,
+        "expected_duration_minutes": duration,
+        "novelty": novelty,
+        "risk_flags": flags,
+        **booleans,
+        "available_external_agents": agents,
+    }
+
+
+def _normalize_route_evidence(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {
+            "schema_version": 1,
+            "status": "missing",
+            "recommendation_id": None,
+            "score": None,
+            "recommended_route": None,
+            "actual_route": "full_workspace",
+            "input_facts": None,
+            "external_candidates": [],
+            "deviation_reason": None,
+            "evidence_complete": False,
+        }
+    if not isinstance(value, dict):
+        raise AgentWorkspaceError("route_evidence must be an object")
+    expected = {
+        "schema_version",
+        "recommendation_id",
+        "score",
+        "recommended_route",
+        "actual_route",
+        "input_facts",
+        "external_candidates",
+        "deviation_reason",
+    }
+    if set(value) != expected or value.get("schema_version") != 1:
+        raise AgentWorkspaceError("route_evidence shape is invalid")
+    recommendation_id = _required_string(value.get("recommendation_id"), "route_evidence.recommendation_id", max_length=64).lower()
+    if SHA256_RE.fullmatch(recommendation_id) is None:
+        raise AgentWorkspaceError("route_evidence recommendation_id is invalid")
+    score = value.get("score")
+    if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 20:
+        raise AgentWorkspaceError("route_evidence score is invalid")
+    recommended = _required_string(value.get("recommended_route"), "route_evidence.recommended_route", max_length=40)
+    actual = _required_string(value.get("actual_route"), "route_evidence.actual_route", max_length=40)
+    if recommended not in ROUTE_EXECUTION_MODES or actual not in ROUTE_EXECUTION_MODES:
+        raise AgentWorkspaceError("route_evidence route is invalid")
+    if actual not in {"full_workspace", "workspace_with_contrast", "workspace_with_competition"}:
+        raise AgentWorkspaceError("agent workspace actual_route must be a workspace route")
+    facts = _normalize_route_input_facts(value.get("input_facts"))
+    raw_candidates = value.get("external_candidates")
+    if not isinstance(raw_candidates, list) or len(raw_candidates) > 2:
+        raise AgentWorkspaceError("route_evidence external_candidates are invalid")
+    candidates: list[dict[str, str]] = []
+    for item in raw_candidates:
+        if not isinstance(item, dict) or set(item) != {"provider", "mode", "timing"}:
+            raise AgentWorkspaceError("route_evidence external candidate shape is invalid")
+        provider = _required_string(item.get("provider"), "route_evidence.external_candidate.provider", max_length=32)
+        mode = _required_string(item.get("mode"), "route_evidence.external_candidate.mode", max_length=32)
+        timing = _required_string(item.get("timing"), "route_evidence.external_candidate.timing", max_length=80)
+        if provider not in ROUTE_EXTERNAL_AGENTS or mode not in {"competitor", "contrast"}:
+            raise AgentWorkspaceError("route_evidence external candidate is invalid")
+        candidates.append({"provider": provider, "mode": mode, "timing": timing})
+    expected_id = _sha256_json({
+        "schema_version": 1,
+        "score": score,
+        "execution_mode": recommended,
+        "input_facts": facts,
+        "external_candidates": candidates,
+    })
+    if recommendation_id != expected_id:
+        raise AgentWorkspaceError("route_evidence recommendation_id does not match its normalized recommendation")
+    reason = value.get("deviation_reason")
+    if recommended == actual:
+        if reason not in {None, ""}:
+            raise AgentWorkspaceError("route_evidence deviation_reason must be empty when routes match")
+        clean_reason = None
+    else:
+        clean_reason = _required_string(reason, "route_evidence.deviation_reason", max_length=1000)
+    return {
+        "schema_version": 1,
+        "status": "verified",
+        "recommendation_id": recommendation_id,
+        "score": score,
+        "recommended_route": recommended,
+        "actual_route": actual,
+        "input_facts": facts,
+        "external_candidates": candidates,
+        "deviation_reason": clean_reason,
+        "evidence_complete": True,
+    }
 
 
 def _role_privilege_escalator(command: list[str]) -> str | None:
@@ -810,6 +967,7 @@ def _normalize_create(
     memory_max_bytes: int | None,
     runner: CommandRunner,
     binding_verifier: BindingVerifier | None = None,
+    route_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     kind = _required_string(binding_kind, "binding_kind", max_length=32)
     if kind not in BINDING_KINDS:
@@ -915,6 +1073,7 @@ def _normalize_create(
             "observer": "optional_read_only_process_analysis",
             "reason": "coordination may be unified, but write, validation and review evidence remain technically isolated to avoid self-confirming success",
         },
+        "route_evidence": _normalize_route_evidence(route_evidence),
         "resources": {
             "owner_id": f"agent-workspace:{workspace_id}",
             "lease_keys": lease_keys,
@@ -1755,6 +1914,7 @@ def _recommended_next_action(
     *,
     creation_ready: bool,
     closed: bool,
+    route_gate_passed: bool,
     closeable: bool,
     success_ready: bool,
     role_retry: dict[str, Any],
@@ -1765,6 +1925,8 @@ def _recommended_next_action(
         return "none_closed"
     if not creation_ready:
         return "await_creation"
+    if not route_gate_passed:
+        return "recreate_with_route_evidence"
     if any(
         value.get("classification") == "role_start_outcome_unknown"
         for value in role_retry.values()
@@ -1854,6 +2016,288 @@ def _external_closeout_checklist(manifest: dict[str, Any]) -> list[dict[str, Any
         },
     ]
 
+
+OUTCOME_RECEIPT_PHASES = frozenset({"collection", "close"})
+
+
+def _outcome_identity(manifest: dict[str, Any], phase: str) -> str:
+    if phase == "collection":
+        collection = manifest.get("collection")
+        identity = collection.get("result_sha256") if isinstance(collection, dict) else None
+    elif phase == "close":
+        close_receipt = manifest.get("close_receipt")
+        identity = close_receipt.get("receipt_sha256") if isinstance(close_receipt, dict) else None
+    else:
+        raise AgentWorkspaceError("workspace outcome phase is invalid")
+    if not isinstance(identity, str) or SHA256_RE.fullmatch(identity) is None:
+        raise AgentWorkspaceError("workspace outcome identity is unavailable or invalid")
+    return identity
+
+
+def _outcome_receipt_path(manifest: dict[str, Any], phase: str) -> Path:
+    identity = _outcome_identity(manifest, phase)
+    return (
+        _workspace_dir(str(manifest["workspace_id"]))
+        / f"outcome-receipt.{phase}.{identity}.json"
+    )
+
+
+def _elapsed_seconds(started_at: Any, ended_at: Any) -> int | None:
+    if not isinstance(started_at, str) or not isinstance(ended_at, str):
+        return None
+    try:
+        started = datetime.fromisoformat(started_at)
+        ended = datetime.fromisoformat(ended_at)
+    except ValueError:
+        return None
+    seconds = int((ended - started).total_seconds())
+    return seconds if seconds >= 0 else None
+
+
+def _role_attempt_summary(manifest: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for role in ("writer", "tests", "review"):
+        final_attempt = 1 if role == "writer" else _role_final_attempt(manifest, role)
+        retry_state, retry_error = (
+            ({"count": 0, "attempts": []}, None)
+            if role == "writer"
+            else _role_retry_state(manifest, role)
+        )
+        summary[role] = {
+            "final_attempt": final_attempt,
+            "retries_used": (
+                retry_state.get("count")
+                if isinstance(retry_state, dict) and retry_error is None
+                else None
+            ),
+            "retry_state_valid": retry_error is None,
+        }
+    return summary
+
+
+def _first_pass_role_results(
+    manifest: dict[str, Any], collection: dict[str, Any]
+) -> dict[str, Any]:
+    writer = {
+        "state": (
+            collection.get("writer_task", {}).get("state")
+            if isinstance(collection.get("writer_task"), dict)
+            else None
+        ),
+        "receipt_sha256": collection.get("writer_receipt_sha256"),
+    }
+    result: dict[str, Any] = {"writer": writer}
+    for role in ("tests", "review"):
+        receipt = _role_receipt(manifest, role, attempt=1)
+        if not isinstance(receipt, dict) or not _receipt_integrity(receipt):
+            result[role] = {
+                "status": "missing",
+                "returncode": None,
+                "receipt_sha256": None,
+            }
+            continue
+        returncode = receipt.get("returncode")
+        item: dict[str, Any] = {
+            "status": "passed" if returncode == 0 else "failed",
+            "returncode": returncode,
+            "receipt_sha256": receipt.get("receipt_sha256"),
+        }
+        if role == "review":
+            item["verdict"] = receipt.get("verdict")
+            findings = receipt.get("findings")
+            item["finding_count"] = len(findings) if isinstance(findings, list) else None
+        result[role] = item
+    return result
+
+
+def _known_workspace_tool_calls(manifest: dict[str, Any], phase: str) -> dict[str, Any]:
+    retries = manifest.get("role_retries")
+    retry_count = 0
+    if isinstance(retries, dict):
+        for value in retries.values():
+            if isinstance(value, dict):
+                count = value.get("count")
+                if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                    retry_count += count
+    calls = {
+        "create": 1,
+        "collect": 1,
+        "role_retry": retry_count,
+        "close": 1 if phase == "close" else 0,
+    }
+    return {
+        "known_mutating_calls": calls,
+        "known_mutating_call_count": sum(calls.values()),
+        "role_task_ids": {
+            role: task_id
+            for role, task_id in manifest.get("tasks", {}).items()
+            if role in {"writer", "tests", "review"}
+        },
+        "read_only_status_attach_observe_calls_tracked": False,
+    }
+
+
+def _route_gate(manifest: dict[str, Any]) -> tuple[dict[str, Any], bool, bool]:
+    if "route_evidence" not in manifest:
+        return (
+            {
+                "schema_version": 1,
+                "status": "legacy_absent",
+                "recommendation_id": None,
+                "score": None,
+                "recommended_route": None,
+                "actual_route": "full_workspace",
+                "input_facts": None,
+                "external_candidates": [],
+                "deviation_reason": None,
+                "evidence_complete": False,
+            },
+            True,
+            True,
+        )
+    route = manifest.get("route_evidence")
+    complete = bool(
+        isinstance(route, dict)
+        and route.get("status") == "verified"
+        and route.get("evidence_complete") is True
+    )
+    return (dict(route) if isinstance(route, dict) else {}, complete, False)
+
+
+def _publish_workspace_outcome(
+    manifest: dict[str, Any],
+    phase: str,
+) -> dict[str, Any]:
+    if phase not in OUTCOME_RECEIPT_PHASES:
+        raise AgentWorkspaceError("workspace outcome phase is invalid")
+    collection = manifest.get("collection")
+    if not isinstance(collection, dict) or collection.get("state") != "complete":
+        raise AgentWorkspaceError("workspace outcome requires a complete collection")
+    close_receipt = manifest.get("close_receipt") if phase == "close" else None
+    if phase == "close" and (
+        not isinstance(close_receipt, dict)
+        or close_receipt.get("state") != "complete"
+        or not _close_integrity_status(manifest, close_receipt)["valid"]
+    ):
+        raise AgentWorkspaceError("close outcome requires a valid complete close receipt")
+    recorded_at = (
+        close_receipt.get("closed_at")
+        if isinstance(close_receipt, dict)
+        else collection.get("collected_at")
+    )
+    checklist = _external_closeout_checklist(manifest)
+    route_evidence, route_complete, legacy_route = _route_gate(manifest)
+    first_pass = _first_pass_role_results(manifest, collection)
+    elapsed = _elapsed_seconds(manifest.get("created_at"), recorded_at)
+    frozen_identity = {
+        "expected_base_head": collection.get("expected_base_head"),
+        "writer_head": collection.get("writer_head"),
+        "diff_sha256": collection.get("diff_sha256"),
+        "result_sha256": collection.get("result_sha256"),
+        "writer_patch_sha256": (
+            collection.get("writer_result", {}).get("sha256")
+            if isinstance(collection.get("writer_result"), dict)
+            else None
+        ),
+    }
+    missing_fields: list[str] = []
+    if not route_complete:
+        missing_fields.append("route_evidence")
+    if elapsed is None:
+        missing_fields.append("elapsed_seconds")
+    if not isinstance(recorded_at, str) or not recorded_at:
+        missing_fields.append("recorded_at")
+    for field, pattern in (
+        ("expected_base_head", SHA40_RE),
+        ("writer_head", SHA40_RE),
+        ("diff_sha256", SHA256_RE),
+        ("result_sha256", SHA256_RE),
+        ("writer_patch_sha256", SHA256_RE),
+    ):
+        value = frozen_identity[field]
+        if not isinstance(value, str) or pattern.fullmatch(value) is None:
+            missing_fields.append(f"frozen_result_identity.{field}")
+    for role in ("writer", "tests", "review"):
+        receipt_hash = first_pass.get(role, {}).get("receipt_sha256")
+        if not isinstance(receipt_hash, str) or SHA256_RE.fullmatch(receipt_hash) is None:
+            missing_fields.append(f"first_pass_role_results.{role}.receipt_sha256")
+    receipt = {
+        "schema_version": 2,
+        "kind": "agent_workspace_outcome",
+        "workspace_id": manifest["workspace_id"],
+        "phase": phase,
+        "outcome_identity": _outcome_identity(manifest, phase),
+        "recorded_at": recorded_at,
+        "binding": manifest.get("binding"),
+        "route_evidence": route_evidence,
+        "route_legacy_compatibility": legacy_route,
+        "first_pass_role_results": first_pass,
+        "final_role_results": {
+            "writer": first_pass["writer"],
+            "tests": dict(collection.get("tests", {})) if isinstance(collection.get("tests"), dict) else {},
+            "review": dict(collection.get("review", {})) if isinstance(collection.get("review"), dict) else {},
+        },
+        "role_attempts": _role_attempt_summary(manifest),
+        "elapsed_seconds": elapsed,
+        "tool_calls": _known_workspace_tool_calls(manifest, phase),
+        "frozen_result_identity": frozen_identity,
+        "integration_or_salvage_outcome": (
+            "workspace_closed_patch_preserved_external_truth_pending"
+            if phase == "close"
+            else "collection_complete_external_truth_pending"
+        ),
+        "closure_outcome": (
+            close_receipt.get("closure_outcome")
+            if isinstance(close_receipt, dict)
+            else None
+        ),
+        "external_closeout_completion": [
+            {
+                "item": item.get("item"),
+                "status": item.get("status"),
+                "source_of_truth": item.get("source_of_truth"),
+            }
+            for item in checklist
+            if isinstance(item, dict)
+        ],
+        "evidence_complete": not missing_fields,
+        "missing_fields": sorted(missing_fields),
+        "missing_fields_fail_closed": True,
+        "does_not_establish": [
+            "pull request integration",
+            "Bureau reconciliation",
+            "writer checkout cleanup",
+            "operator final summary",
+            "read-only tool call count",
+            "general productivity improvement",
+        ],
+    }
+    receipt["outcome_sha256"] = _sha256_json(receipt)
+    path = _outcome_receipt_path(manifest, phase)
+    if path.exists():
+        existing = _load_json(path)
+        if existing != receipt:
+            raise AgentWorkspaceError("existing workspace outcome receipt differs from deterministic outcome")
+    else:
+        _atomic_json(path, receipt)
+    references = dict(manifest.get("outcome_receipts", {}))
+    current = references.get(phase)
+    history = list(current.get("history", [])) if isinstance(current, dict) and isinstance(current.get("history"), list) else []
+    reference = {
+        "path": str(path),
+        "outcome_identity": receipt["outcome_identity"],
+        "outcome_sha256": receipt["outcome_sha256"],
+    }
+    if not any(
+        isinstance(item, dict) and item.get("outcome_sha256") == receipt["outcome_sha256"]
+        for item in history
+    ):
+        history.append(reference)
+    references[phase] = {**reference, "history": history}
+    manifest["outcome_receipts"] = references
+    return receipt
+
+
 def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict[str, Any]:
     snapshot: dict[str, Any]
     try:
@@ -1894,9 +2338,11 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         and collection.get("diff_sha256") == snapshot.get("diff_sha256")
     )
     creation_ready = manifest.get("creation_state") == "ready"
+    route_evidence, route_gate_passed, legacy_route = _route_gate(manifest)
     incomplete_roles = _collection_incomplete_roles(collection) if collection_complete else []
     closeable = bool(
         creation_ready
+        and route_gate_passed
         and all_terminal
         and collection_complete
         and not incomplete_roles
@@ -1933,6 +2379,7 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
     recommended_next_action = _recommended_next_action(
         creation_ready=creation_ready,
         closed=close_integrity["valid"],
+        route_gate_passed=route_gate_passed,
         closeable=closeable,
         success_ready=success_ready,
         role_retry=role_retry,
@@ -1944,6 +2391,9 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         "creation_state": manifest.get("creation_state"),
         "creation_ready": creation_ready,
         "binding": manifest["binding"],
+        "route_evidence": route_evidence,
+        "route_evidence_complete": route_gate_passed,
+        "route_legacy_compatibility": legacy_route,
         "repository": manifest["repository"],
         "expected_base_head": manifest["expected_base_head"],
         "writer": snapshot,
@@ -1970,6 +2420,7 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         "recommended_next_action": recommended_next_action,
         "close_integrity": close_integrity,
         "closed": close_integrity["valid"],
+        "outcome_receipts": manifest.get("outcome_receipts", {}),
         "external_closeout_checklist": _external_closeout_checklist(manifest),
     }
 
@@ -2272,6 +2723,7 @@ def grabowski_agent_workspace_create(
     writer_argv: list[str],
     test_argv: list[str],
     review_argv: list[str],
+    route_evidence: dict[str, Any] | None = None,
     forbidden_paths: list[str] | None = None,
     runtime_seconds: int = 3600,
     memory_max_bytes: int | None = None,
@@ -2293,6 +2745,7 @@ def grabowski_agent_workspace_create(
         writer_argv=writer_argv,
         test_argv=test_argv,
         review_argv=review_argv,
+        route_evidence=route_evidence,
         runtime_seconds=runtime_seconds,
         memory_max_bytes=memory_max_bytes,
         runner=_run,
@@ -2961,6 +3414,7 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
         result["state"] = "complete"
         result["result_sha256"] = _collection_result_sha256(result)
         manifest["collection"] = result
+        outcome_receipt = _publish_workspace_outcome(manifest, "collection")
         _append_workspace_event(
             manifest, "collection_completed", outcome="complete",
             evidence={"result_sha256": result["result_sha256"], "writer_head": result["writer_head"], "diff_sha256": result["diff_sha256"]},
@@ -2982,6 +3436,7 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
             "state": "complete",
             "result": result,
             "receipt_status": "passed",
+            "outcome_receipt": outcome_receipt,
             "external_closeout_checklist": _external_closeout_checklist(manifest),
         }
 
@@ -3285,6 +3740,11 @@ def grabowski_agent_workspace_close(
                 "workspace_id": identifier,
                 "close_receipt": existing,
                 "idempotent": True,
+                "outcome_receipt": (
+                    _load_json(_outcome_receipt_path(manifest, "close"))
+                    if _outcome_receipt_path(manifest, "close").is_file()
+                    else None
+                ),
                 "external_closeout_checklist": _external_closeout_checklist(manifest),
             }
         collection = manifest.get("collection")
@@ -3295,6 +3755,17 @@ def grabowski_agent_workspace_close(
             raise AgentWorkspaceError("collection receipt integrity is invalid")
         if collection.get("writer_head") != head or collection.get("diff_sha256") != diff_sha or collection.get("result_sha256") != result_sha:
             raise AgentWorkspaceError("close bindings do not match collection receipt")
+        route_evidence, route_gate_passed, legacy_route = _route_gate(manifest)
+        if not route_gate_passed:
+            return {
+                "workspace_id": identifier,
+                "state": "route_evidence_incomplete",
+                "route_evidence": route_evidence,
+                "route_legacy_compatibility": legacy_route,
+                "receipt_status": "blocked",
+                "recommended_next_action": "recreate_with_route_evidence",
+                "external_closeout_checklist": _external_closeout_checklist(manifest),
+            }
         snapshot = _git_snapshot(manifest, _run)
         if (
             snapshot["writer_head"] != head
@@ -3436,6 +3907,7 @@ def grabowski_agent_workspace_close(
         receipt["receipt_sha256"] = _sha256_json(receipt)
         _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
         manifest["close_receipt"] = receipt
+        outcome_receipt = _publish_workspace_outcome(manifest, "close")
         _append_workspace_event(
             manifest, "workspace_closed", outcome=receipt["closure_outcome"],
             evidence={"receipt_sha256": receipt["receipt_sha256"], "resources_released": receipt["resources_released"]},
@@ -3456,6 +3928,7 @@ def grabowski_agent_workspace_close(
             "workspace_id": identifier,
             "close_receipt": receipt,
             "idempotent": False,
+            "outcome_receipt": outcome_receipt,
             "external_closeout_checklist": _external_closeout_checklist(manifest),
         }
 

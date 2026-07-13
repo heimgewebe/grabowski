@@ -1463,7 +1463,27 @@ def grabowski_agent_execution_route(
         ]
     elif mode == "workspace_with_contrast":
         candidate_plan = [{"provider": external_available[0], "mode": "contrast", "timing": "after_primary_plan_or_candidate"}]
-    return {
+
+    input_facts = {
+        "task_kind": kind,
+        "changed_file_estimate": changed_file_estimate,
+        "expected_duration_minutes": expected_duration_minutes,
+        "novelty": novelty_value,
+        "risk_flags": normalized_flags,
+        "connector_instability": connector_flag,
+        "parallel_work": parallel_flag,
+        "user_requested_external": external_requested,
+        "available_external_agents": external_available,
+    }
+    trivial_work = bool(
+        changed_file_estimate <= 1
+        and expected_duration_minutes <= 15
+        and novelty_value == "low"
+        and not normalized_flags
+        and not connector_flag
+        and not parallel_flag
+    )
+    result = {
         "schema_version": 1,
         "score": score,
         "execution_mode": mode,
@@ -1475,6 +1495,9 @@ def grabowski_agent_execution_route(
         "automatic_winner_selection": False,
         "operator_remains_integrator": True,
         "roles_remain_isolated": mode != "direct_operator",
+        "input_facts": input_facts,
+        "trivial_work": trivial_work,
+        "deviation_requires_reason": True,
         "rationale": {
             "task_kind": kind,
             "novelty": novelty_value,
@@ -1492,6 +1515,14 @@ def grabowski_agent_execution_route(
         ],
         "does_not_establish": ["execution_authority", "candidate_correctness", "merge_readiness", "need_for_external_agents"],
     }
+    result["recommendation_id"] = _sha256_json({
+        "schema_version": result["schema_version"],
+        "score": score,
+        "execution_mode": mode,
+        "input_facts": input_facts,
+        "external_candidates": candidate_plan,
+    })
+    return result
 
 
 @mcp.tool(name="grabowski_agent_competition_start", annotations=MUTATING)
