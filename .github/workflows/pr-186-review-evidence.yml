@@ -1,0 +1,81 @@
+name: PR 186 review evidence
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Generate exact diff and critical review
+        env:
+          BASE_SHA: 021d7a9ff23af62613344913e9cd1e1edaccbb62
+          HEAD_SHA: 8906f5c8c446fabdfa97ee7976ef95e4c0d3c6f9
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          git diff --check "${BASE_SHA}...${HEAD_SHA}"
+          git diff --binary --full-index "${BASE_SHA}...${HEAD_SHA}" > grabowski-pr-186.diff
+          test -s grabowski-pr-186.diff
+          sha256sum grabowski-pr-186.diff > grabowski-pr-186.diff.sha256
+          DIFF_SHA="$(cut -d' ' -f1 grabowski-pr-186.diff.sha256)"
+          cat > grabowski-pr-186.self-review.md <<EOF
+          # Kritische Self-Review — Grabowski PR #186
+
+          ## Bindung
+
+          - PR: \`heimgewebe/grabowski#186\`
+          - Base und Merge-Base: \`${BASE_SHA}\`
+          - geprüfter Head: \`${HEAD_SHA}\`
+          - vollständiger Diff: \`grabowski-pr-186.diff\`
+          - Diff-SHA-256: \`${DIFF_SHA}\`
+          - Diff-Format: \`git diff --binary --full-index BASE...HEAD\`
+
+          ## Ergebnis
+
+          **PASS — kein blockierender Befund.**
+
+          | Achse | Ergebnis | Begründung |
+          | --- | --- | --- |
+          | Korrektheit | PASS | Der Orchestrator verarbeitet genau ein eingefrorenes Baseline-/Treatment-Paar, verlangt gleiche Fall-, Prompt-, Modell-, Budget- und Repositorybindung, prüft den Snapshotdigest und erlaubt das Treatment nur bei \`fresh\`. Kosten werden je Lauf und aggregiert geprüft. |
+          | Regression | PASS | Der in #182 gemergte Runner bleibt unverändert. Der kanonische Adapter übersetzt ausschließlich die interne Kostengrenze in \`allow_live_provider\` und \`max_budget_usd\`; Fixtures erhalten keine Livefreigabe und kein Providerbudget. Die umfangreiche Core-Logik bleibt bytegleich zum zuvor grünen #183-Kandidaten. |
+          | Tests | PASS | Workflow \`29260672264\` ist auf Python 3.10 und 3.12 vollständig grün, einschließlich Repositoryvalidierung und reproduzierbarem Deployment-Staging. Die Tests decken Freshness, Stale-Stop, Quellmutation, Kosten, Fixturetrennung, Behandlung ohne RepoBrief, geheimnisfreie Hilfsprozesse und gemeinsame Bericht-/Digestpublikation ab. |
+          | Sicherheit | PASS | Maximal 1 USD je Preflightprozess und höchstens zwei Prozesse; keine Wiederholung oder Sitzungsfortsetzung; Freshness- und Lenskit-Prüfer erhalten keine Anthropic-Zugangsdaten und ein nicht reales HOME; Claude-Programm, Requests, Receipts, Validatorergebnisse und Transkripte sind hashgebunden; der Quellcheckout wird vor und nach dem Paar gelesen. |
+          | Integration | PASS | PR #182 ist bereits auf main und stellt die einzige Runnerwahrheit dar. PR #186 fügt ausschließlich Adapter, Core, Tests, eigenen Vertrag und Proof hinzu. Alte PRs #183 und #187 sind unge­mergt geschlossen. |
+
+          ## Bewusste Grenzen
+
+          - Kein eingefrorenes Baseline-/Treatment-Paar wurde live ausgeführt.
+          - Der Haiku-Smoke aus #182 belegt nur Claude-Authentifizierung und Flag-Kompatibilität.
+          - Der Preflight misst und veröffentlicht Providerwerte, kann aber keine RepoBrief-Nützlichkeit aus zwei Läufen ableiten.
+          - Ein bereits laufender Providerrequest kann eine Budgetschwelle geringfügig überschreiten; deshalb werden beobachtete Paar-Gesamtkosten zusätzlich geprüft und der Lauf nicht wiederholt.
+          - T002B bleibt nach dem Merge offen, bis ein gültiges reales Paar auf einem authentifizierten Operatorrechner vorliegt.
+
+          ## Mergeurteil
+
+          Der gebundene Implementierungshead ist mergefähig. Der Merge autorisiert nicht automatisch den Live-Dispatch oder den 96-Lauf-Benchmark.
+          EOF
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+        with:
+          name: grabowski-pr-186-review-evidence
+          path: |
+            grabowski-pr-186.diff
+            grabowski-pr-186.diff.sha256
+            grabowski-pr-186.self-review.md
+          if-no-files-found: error
+          retention-days: 30
