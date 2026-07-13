@@ -1,0 +1,30 @@
+name: temporary PR 180 diagnostics
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - name: Capture full validation
+        shell: bash
+        run: |
+          set -o pipefail
+          make validate 2>&1 | tee pr180-validate.log
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+        with:
+          name: pr180-validation-${{ github.run_id }}
+          path: pr180-validate.log
+          if-no-files-found: error
+          retention-days: 7
