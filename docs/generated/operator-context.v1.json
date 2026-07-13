@@ -493,7 +493,7 @@
     },
     {
       "category": "command",
-      "description": "Run one non-interactive command and return redacted output.",
+      "description": "Run one direct command with fixed server-owned synchronous limits.",
       "effects": [
         "command-dependent"
       ],
@@ -796,7 +796,7 @@
     },
     {
       "category": "fleet",
-      "description": "Run one argv command on one registered local or SSH host.",
+      "description": "Run one fleet command with fixed server-owned synchronous limits.",
       "effects": [
         "remote-command-dependent"
       ],
@@ -1928,7 +1928,7 @@
       "sha256": "4e43dbd64009f9851c2ff6368984bde4e323d0005996abf74a38ff41e7669b5e"
     },
     "runtime_sources": {
-      "src/grabowski_agent_bootstrap.py": "c413e520172f70296c42e18e4c0f1fcb95a1931afa0fda7b7c36dba4b2d52e56",
+      "src/grabowski_agent_bootstrap.py": "9f863892e6289f6fde206353b5f65d48992b0ca9e0698db515cddd13e389dae7",
       "src/grabowski_agent_competition.py": "c07bf7b790a832c3e581e6384ab2da2e77da96daff7e57fe66ea4c1bb8857359",
       "src/grabowski_agent_role.py": "abef0db4aa6fffcd52976e2c60deb5f68abfadf76528ec5ac79dfebeddafe8bf",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
@@ -1941,7 +1941,7 @@
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
-      "src/grabowski_fleet.py": "e9841cfe956356eaba0ab086a7666df482f4ae7ec8bb3c3d6a11b2f868cc81fd",
+      "src/grabowski_fleet.py": "5762406f7a87a7d4a0f8bcf888170daef1cd3060a86acb8ebecb628aa7715a65",
       "src/grabowski_friction.py": "3bd5e876e4a5e274eddcd60668c553b956553465164f7e1e9217c80b35012602",
       "src/grabowski_grip_orchestration.py": "2c1d594433f92edbae23adc43a303b212bfff89d298121c516974d790259051d",
       "src/grabowski_grips.py": "f7fee83b8424d40ff1f3785a771a685c1ce2bb73e3029d38de1b7e2da073968a",
@@ -1949,7 +1949,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_mcp.py": "48f603f5638eea1320250e0bea14f765f88db5d233493668f9b4a15ea47f5952",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
-      "src/grabowski_operator.py": "872ea8880cbca9285455a66070b687dfac1a1920adbcf2d9a6f1378579bf36f4",
+      "src/grabowski_operator.py": "346bb655b9ba1930b2942c5816a9532ac3a2544eb5bca4af1ae94ba67435ac0d",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "8c20277f5372d2eb682d3ae1cbcef3782623443a9e63b5606cf962e5f87d55cd",
       "src/grabowski_read_surface.py": "c4f633a3303d08ac4916c034dc6d5c86d872daa7628704f3e1ba5b4d070917ac",
