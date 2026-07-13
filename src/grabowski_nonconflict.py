@@ -332,7 +332,7 @@ def evaluate_scope_manifests(existing: Any, requested: Any) -> dict[str, Any]:
     results: list[dict[str, Any]] = [
         _axis_result("task", [left["task_id"]] if left["task_id"] == right["task_id"] else []),
         _axis_result("branch", [left["branch"]] if left["branch"] == right["branch"] else []),
-        _axis_result("worktree", [left["worktree"]] if left["worktree"] == right["worktree"] else []),
+        _axis_result("worktree", _path_pairs([left["worktree"]], [right["worktree"]])),
         _axis_result(
             "base_head",
             [] if left["base_head"] == right["base_head"] else [

@@ -626,6 +626,14 @@ class NonConflictResourceTests(unittest.TestCase):
                 metadata={"scope_manifest": self.scope("a")},
             )
 
+    def test_nested_worktree_roots_conflict(self) -> None:
+        existing = self.scope("a")
+        requested = self.scope("b")
+        requested["worktree"] = str(Path(existing["worktree"]) / "nested")
+        result = nonconflict.evaluate_scope_manifests(existing, requested)
+        self.assertEqual(result["decision"], "deny")
+        self.assertIn("worktree", result["blocker_axes"])
+
     def test_cross_axis_paths_and_worktree_paths_conflict(self) -> None:
         existing = self.scope(
             "a",
