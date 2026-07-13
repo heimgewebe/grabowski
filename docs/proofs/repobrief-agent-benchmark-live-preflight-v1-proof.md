@@ -53,6 +53,7 @@ providerbezogenen Adapterbindungen fehlen.
 - maximal `1.00 USD` je Preflight-Prozess;
 - maximal zwei Providerprozesse;
 - kein dritter Claude-Prozess für eine Versionsprobe; die Programmidentität wird ausschließlich aus Pfad, Größe und SHA-256 gebildet;
+- die vom Runner tatsächlich verwendeten Credentialbytes werden nach dem Intent erneut gegen den im Ledger autorisierten SHA-256 geprüft;
 - kein Retry und keine Sitzungsfortsetzung;
 - maximal ein Baseline- und ein Treatmentintent; vorhandener oder unvollständiger
   Ledger blockiert jeden weiteren Start;

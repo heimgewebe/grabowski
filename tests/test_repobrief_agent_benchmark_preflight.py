@@ -422,6 +422,45 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             )
             self.assertEqual(events[-1]["payload"]["fixture_intents"], 1)
 
+    def test_credential_mutation_after_intent_blocks_before_provider_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            kwargs = _preflight_kwargs(root, environment)
+            original = support.preflight._core._record_dispatch_intent
+            credential = root / "fixture-claude-credentials.json"
+
+            def mutate_after_intent(*args, **record_kwargs):
+                result = original(*args, **record_kwargs)
+                request = args[1]
+                if request["condition"] == "baseline":
+                    credential.write_text('{"changed":true}\n', encoding="utf-8")
+                    credential.chmod(0o600)
+                return result
+
+            with mock.patch.object(
+                support.preflight._core,
+                "_record_dispatch_intent",
+                side_effect=mutate_after_intent,
+            ):
+                with self.assertRaisesRegex(
+                    support.preflight.runner.RunnerError,
+                    "credential file changed after authorization",
+                ):
+                    _execute_with_test_provider_binding(**kwargs)
+            self.assertFalse((root / "claude-invocations.jsonl").exists())
+            events = support.ledger_events(root / "state")
+            self.assertEqual(
+                [event["event"] for event in events],
+                [
+                    "authorized",
+                    "dispatch-intent",
+                    "condition-failed",
+                    "preflight-failed",
+                ],
+            )
+            self.assertEqual(events[-1]["payload"]["provider_process_intents"], 1)
+
     def test_credential_mutation_after_baseline_blocks_treatment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -444,7 +483,7 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     support.preflight.PreflightError,
-                    "dispatch binding changed",
+                    "credential file changed after authorization",
                 ):
                     _execute_with_test_provider_binding(**kwargs)
             events = support.ledger_events(root / "state")

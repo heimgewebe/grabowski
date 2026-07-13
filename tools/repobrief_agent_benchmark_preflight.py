@@ -30,11 +30,15 @@ SPEC.loader.exec_module(_core)
 
 _original_execute = _core.runner.execute
 _original_provider_environment = _core.runner._provider_environment
+_original_validated_credential_data = _core.runner._validated_credential_data
 _credential_file: ContextVar[Path | None] = ContextVar(
     "repobrief_preflight_credential_file", default=None
 )
 _command_sha256: ContextVar[str | None] = ContextVar(
     "repobrief_preflight_command_sha256", default=None
+)
+_authorized_credential_sha256: ContextVar[str | None] = ContextVar(
+    "repobrief_preflight_authorized_credential_sha256", default=None
 )
 
 
@@ -52,6 +56,32 @@ def _provider_environment_adapter(auth_config: Path | None = None) -> dict[str, 
     if auth_config is None:
         return _core._unprivileged_environment()
     return _original_provider_environment(auth_config)
+
+
+def _validated_credential_data_adapter(
+    *,
+    stream_fixture: Path | None,
+    credential_file: Path | None,
+) -> bytes | None:
+    data = _original_validated_credential_data(
+        stream_fixture=stream_fixture, credential_file=credential_file
+    )
+    expected = _authorized_credential_sha256.get()
+    if stream_fixture is not None:
+        if expected is not None:
+            raise _core.runner.RunnerError(
+                "synthetic fixture received a live credential authorization"
+            )
+        return data
+    if data is None or expected is None:
+        raise _core.runner.RunnerError(
+            "live credential authorization is unavailable"
+        )
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise _core.runner.RunnerError(
+            "Claude credential file changed after authorization"
+        )
+    return data
 
 
 def _dispatch_provider_binding_adapter(
@@ -78,7 +108,7 @@ def _dispatch_provider_binding_adapter(
             executable=claude,
             expected_sha256=command_sha,
         )
-        credential_data = _core.runner._validated_credential_data(
+        credential_data = _original_validated_credential_data(
             stream_fixture=None,
             credential_file=credential,
         )
@@ -90,6 +120,14 @@ def _dispatch_provider_binding_adapter(
     credential_path = credential.expanduser()
     executable_metadata = executable_path.lstat()
     credential_metadata = credential_path.lstat()
+    credential_sha256 = hashlib.sha256(credential_data).hexdigest()
+    authorized_sha256 = _authorized_credential_sha256.get()
+    if authorized_sha256 is None:
+        _authorized_credential_sha256.set(credential_sha256)
+    elif authorized_sha256 != credential_sha256:
+        raise _core.PreflightError(
+            "Claude credential file changed after authorization"
+        )
     return {
         "mode": "live_provider",
         "claude": {
@@ -100,7 +138,7 @@ def _dispatch_provider_binding_adapter(
         "credential": {
             "path": str(credential_path.resolve()),
             "bytes": len(credential_data),
-            "sha256": hashlib.sha256(credential_data).hexdigest(),
+            "sha256": credential_sha256,
             "mode": oct(credential_metadata.st_mode & 0o777),
         },
     }
@@ -146,6 +184,7 @@ def _execute_adapter(
 
 _core.runner._require_cost = _require_cost
 _core.runner._provider_environment = _provider_environment_adapter
+_core.runner._validated_credential_data = _validated_credential_data_adapter
 _core.runner.execute = _execute_adapter
 _core._dispatch_provider_binding = _dispatch_provider_binding_adapter
 runner = _core.runner
@@ -174,9 +213,11 @@ def execute_preflight(
         )
     credential_token = _credential_file.set(claude_credential_file)
     sha_token = _command_sha256.set(claude_command_sha256)
+    authorized_credential_token = _authorized_credential_sha256.set(None)
     try:
         return _core.execute_preflight(**kwargs)
     finally:
+        _authorized_credential_sha256.reset(authorized_credential_token)
         _command_sha256.reset(sha_token)
         _credential_file.reset(credential_token)
 
@@ -218,9 +259,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     credential_token = _credential_file.set(adapter.claude_credential_file)
     sha_token = _command_sha256.set(adapter.claude_command_sha256)
+    authorized_credential_token = _authorized_credential_sha256.set(None)
     try:
         return int(_core.main(remaining))
     finally:
+        _authorized_credential_sha256.reset(authorized_credential_token)
         _command_sha256.reset(sha_token)
         _credential_file.reset(credential_token)
 
