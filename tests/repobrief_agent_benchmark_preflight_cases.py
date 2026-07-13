@@ -524,6 +524,3 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
             with self.assertRaisesRegex(preflight.PreflightError, "already exists"):
                 preflight._write_report_artifacts(report_path, {"status": "second"})
 
-
-if __name__ == "__main__":
-    unittest.main()
