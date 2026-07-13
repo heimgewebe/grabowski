@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "3235ce8b5f7e2af6defe853dae1741cc1ebd7b5554e50adf86665b9b3f3ca7a7",
+  "capability_source_sha256": "8720755da0f19f397d1f9bfc80a48e7117b9d104a0fe10740032d1492e0ff7d5",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "22f31ec746bff24f794fc2bfb52fa134c119ca593c741d75b70edb7236823f73",
+  "contract_sha256": "32d81838b121e59f2bf0bda8cdc7fa1dbca9f52c7533fff7cc47902dbf3665f2",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1119,6 +1119,21 @@
       "reversibility": "proof-expiry",
       "risk_class": "medium",
       "tool": "grabowski_resource_nonconflict_assess"
+    },
+    {
+      "category": "resource",
+      "description": "Release only unchanged owner path leases after authoritative current terminal evidence.",
+      "effects": [
+        "lease-remove",
+        "audit-append",
+        "terminal-evidence-verify"
+      ],
+      "id": "grabowski_resource_reconcile_obsolete_path_leases",
+      "purpose": "Release only unchanged exact path leases after an authoritative workspace-close or current successful durable-task outcome proves terminal owner work.",
+      "read_only": false,
+      "reversibility": "resource-reacquire",
+      "risk_class": "high",
+      "tool": "grabowski_resource_reconcile_obsolete_path_leases"
     },
     {
       "category": "resource",
