@@ -30,7 +30,19 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Validate repository
-        run: make validate
+        shell: bash
+        run: |
+          set -o pipefail
+          make validate 2>&1 | tee "validate-${{ matrix.python-version }}.log"
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+        with:
+          name: pr186-validate-${{ matrix.python-version }}-${{ github.run_id }}
+          path: validate-${{ matrix.python-version }}.log
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Prove reproducible deployment staging
         run: make deploy-check
