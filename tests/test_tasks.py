@@ -734,6 +734,19 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn("--mode refresh", source)
         self.assertNotIn("--mode resume", source)
 
+    def test_shared_command_identity_is_in_runtime_contract(self) -> None:
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        modules = {
+            item["module"]: item["source"]
+            for item in contract["supporting_sources"]
+        }
+        self.assertEqual(
+            modules.get("grabowski_command_identity"),
+            "src/grabowski_command_identity.py",
+        )
+
     def test_runtime_registers_control_plane_and_tasks(self) -> None:
         source = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
         for module in (
