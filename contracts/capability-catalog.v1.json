@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "fdbbb1ec3f5545d589a0b167ce6703dbc146122e67a8269f1dbfbd049f92e655",
+  "capability_source_sha256": "5f50e95f32c12260a2dbbd74fa5787226529c62748641bc410341b433969fe6b",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "4e43dbd64009f9851c2ff6368984bde4e323d0005996abf74a38ff41e7669b5e",
+  "contract_sha256": "22f31ec746bff24f794fc2bfb52fa134c119ca593c741d75b70edb7236823f73",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1105,6 +1105,20 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_operator_recall_export"
+    },
+    {
+      "category": "resource",
+      "description": "Assess and audit same-repository work; issue a short proof only when disjoint.",
+      "effects": [
+        "audit-append",
+        "proof-issue"
+      ],
+      "id": "grabowski_resource_nonconflict_assess",
+      "purpose": "Assess and audit exact same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint.",
+      "read_only": false,
+      "reversibility": "proof-expiry",
+      "risk_class": "medium",
+      "tool": "grabowski_resource_nonconflict_assess"
     },
     {
       "category": "resource",

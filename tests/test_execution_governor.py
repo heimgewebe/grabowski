@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import inspect
 import json
+import time
 from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
@@ -244,6 +245,119 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertTrue(result["action_shape"]["state_readback_only"])
         self.assertFalse(result["action_shape"]["isolated_mutation"])
         self.assertIn("read the exact target state", " ".join(result["preflight_required"]))
+
+    def _nonconflict_proof(self, module, *, issued_at: int | None = None, ttl: int = 90):
+        now = int(time.time()) if issued_at is None else issued_at
+        proof_root = Path("/tmp/grabowski-governor-proof")
+        repository = str(proof_root / "repo")
+        existing = {
+            "schema_version": 1,
+            "repository": repository,
+            "task_id": "TASK-A",
+            "head": "a" * 40,
+            "branch": "feat/a",
+            "worktree": str(proof_root / "worktrees" / "a"),
+            "effects": ["write"],
+            "paths": [str(proof_root / "repo" / "src" / "a.py")],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        requested = {
+            **existing,
+            "task_id": "TASK-B",
+            "head": "b" * 40,
+            "branch": "feat/b",
+            "worktree": str(proof_root / "worktrees" / "b"),
+            "paths": [str(proof_root / "repo" / "src" / "b.py")],
+            "components": [],
+        }
+        lease = {
+            "resource_key": f"repo:{repository}",
+            "owner_id": "owner-a",
+            "acquired_at_unix": now,
+            "updated_at_unix": now,
+            "expires_at_unix": now + 180,
+            "metadata_sha256": "c" * 64,
+        }
+        return module.nonconflict.create_nonconflict_proof(
+            blocked_lease=lease,
+            existing_scope=existing,
+            requesting_owner="owner-b",
+            resource_keys=[f"path:{repository}/src/b.py"],
+            purpose="secondary exact work",
+            requested_scope=requested,
+            proof_ttl_seconds=ttl,
+            now=now,
+        )
+
+    def test_valid_nonconflict_proof_removes_only_the_lease_stop(self) -> None:
+        module = self._load_module()
+        proof = self._nonconflict_proof(module)
+        result = self._recommend(
+            module,
+            operation_class="mutation",
+            may_mutate=True,
+            lease_state="conflict",
+            post_state_read_available=True,
+            nonconflict_proof=proof,
+        )
+        self.assertEqual(result["recommended_route"], "typed_tool")
+        self.assertTrue(result["route_feasible"])
+        self.assertFalse(result["execution_authorized"])
+        self.assertIn("resource_lease_nonconflict_proof_valid", result["reason_codes"])
+        self.assertTrue(result["nonconflict_evidence"]["valid"])
+        self.assertTrue(
+            result["nonconflict_evidence"]["requires_atomic_resource_revalidation"]
+        )
+        self.assertIn("atomically revalidate", " ".join(result["preflight_required"]))
+
+    def test_invalid_or_stale_nonconflict_proof_keeps_the_lease_stop(self) -> None:
+        module = self._load_module()
+        proof = self._nonconflict_proof(module)
+        proof["requesting_owner"] = "tampered-owner"
+        tampered = self._recommend(
+            module,
+            operation_class="mutation",
+            may_mutate=True,
+            lease_state="conflict",
+            nonconflict_proof=proof,
+        )
+        self.assertEqual(tampered["recommended_route"], "stop_resource_conflict")
+        self.assertIn(
+            "resource_lease_nonconflict_proof_invalid", tampered["reason_codes"]
+        )
+        stale = self._nonconflict_proof(
+            module, issued_at=int(time.time()) - 120, ttl=30
+        )
+        stale_result = self._recommend(
+            module,
+            operation_class="mutation",
+            may_mutate=True,
+            lease_state="conflict",
+            nonconflict_proof=stale,
+        )
+        self.assertEqual(stale_result["recommended_route"], "stop_resource_conflict")
+        self.assertFalse(stale_result["nonconflict_evidence"]["valid"])
+
+    def test_nonconflict_proof_does_not_bypass_high_impact_preflight(self) -> None:
+        module = self._load_module()
+        result = self._recommend(
+            module,
+            operation_class="high_impact",
+            risk_level="critical",
+            may_mutate=True,
+            lease_state="conflict",
+            nonconflict_proof=self._nonconflict_proof(module),
+        )
+        self.assertEqual(result["recommended_route"], "explicit_preflight")
+        self.assertFalse(result["route_feasible"])
+        self.assertFalse(result["execution_authorized"])
+        self.assertIn("immutable_high_impact_boundary", result["reason_codes"])
 
     def test_policy_gate_never_becomes_an_adaptive_bypass(self) -> None:
         module = self._load_module()
