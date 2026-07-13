@@ -1,7 +1,7 @@
 # RepoBrief Agent Benchmark Runner v1
 
-Status: Implementierungs- und Qualifikationsvertrag für `RAB-V1-T002A`  
-Autorität: read-only, nicht anwendend  
+Status: Implementierungs- und Qualifikationsvertrag für `RAB-V1-T002A`
+Autorität: read-only, nicht anwendend
 Standardaktivierung: `false`
 
 ## Zweck
@@ -137,7 +137,15 @@ Der Livepfad startet Claude nicht interaktiv und ohne Sitzungsfortsetzung:
 - `--no-session-persistence`;
 - `--permission-mode dontAsk`;
 - strukturierte Ausgabe über den fest eingebauten JSON-Schema-Vertrag;
-- explizite Tool- und Allowed-Tool-Listen.
+- explizite Tool- und Allowed-Tool-Listen;
+- ein vor Prozessstart gesetztes `--max-budget-usd` aus dem verpflichtenden
+  Operatorargument `--max-cost-usd`.
+
+Das Kostenargument muss eine endliche positive Dezimalzahl sein. Der allgemeine
+Runner akzeptiert höchstens `10.00 USD`; der Live-Preflight begrenzt es zusätzlich
+auf höchstens `1.00 USD` je Prozess. Nach dem Lauf muss der Provider ein
+endliches, nichtnegatives `total_cost_usd` melden, das dieselbe Grenze nicht
+überschreitet.
 
 Die Umgebung wird auf eine kleine Allowlist reduziert. Der Runner übernimmt
 nur Pfad-, Home-, Sprach-, Temp- und explizite Anthropic-API-Umgebungswerte.
@@ -162,6 +170,8 @@ Ein gültiger Stream benötigt genau:
 - dieselbe exakte Modell-ID wie im Auftrag;
 - alle verpflichtenden read-only-Werkzeuge und keine unbekannten Werkzeuge;
 - ganzzahlige, nichtnegative, vom Provider gemeldete Input- und Output-Tokens;
+- endliche, nichtnegative und innerhalb der Operatorgrenze liegende
+  `total_cost_usd`;
 - eine strukturierte Abschlussantwort;
 - zu jedem Toolaufruf genau ein zugehöriges Toolresultat.
 
@@ -232,7 +242,7 @@ Behandlungslauf ausführen und belegen:
 - tatsächliche kumulative Provider-Nutzung;
 - tatsächliche Tool- und MCP-Ereignisse;
 - gültigen Lenskit-Receipt;
-- begrenzte Kosten;
+- vor Prozessstart wirksame und nach dem Resultat erneut geprüfte Kostenlimits;
 - unveränderten Quellcheckout.
 
 Der Preflight und der vollständige 96-Lauf-Benchmark gehören nicht zu T002A.
@@ -255,7 +265,9 @@ aufgenommen:
   "--state-root",
   "/private/path/to/benchmark-state",
   "--transcript-root",
-  "/private/path/to/benchmark-transcripts"
+  "/private/path/to/benchmark-transcripts",
+  "--max-cost-usd",
+  "1.00"
 ]
 ```
 
