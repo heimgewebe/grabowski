@@ -114,11 +114,12 @@ class DeploymentMetadataTests(unittest.TestCase):
             "grabowski_mcp": _sha256(base_snapshot),
         }
         manifest = {
-            "schema_version": 4,
+            "schema_version": 5,
             "release_id": release.name,
             "repo_head": "a" * 40,
             "entrypoint_contract": contract,
             "entrypoint_contract_sha256": _sha256(contract_path),
+            "agent_instructions": grabowski_mcp._agent_instructions_metadata(),
             "source_sha256": source_sha256s["grabowski_operator"],
             "source_sha256s": source_sha256s,
             "runtime_input_sha256": _sha256(runtime_input),
@@ -193,6 +194,19 @@ class DeploymentMetadataTests(unittest.TestCase):
         self.assertTrue(metadata["repo_head_valid"])
         self.assertTrue(metadata["platform_identity_valid"])
         self.assertTrue(metadata["provenance_valid"])
+
+    def test_agent_instructions_manifest_drift_invalidates_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self._release(Path(directory))
+            manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+            manifest["agent_instructions"]["sha256"] = "f" * 64
+            paths["manifest"].write_text(
+                json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            metadata = self._metadata(paths)
+        self.assertFalse(metadata["agent_instructions_identity_valid"])
+        self.assertFalse(metadata["artifact_integrity_valid"])
+        self.assertFalse(metadata["provenance_valid"])
 
     def test_runtime_input_tamper_invalidates_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

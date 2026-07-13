@@ -36,7 +36,14 @@ ENTRYPOINT_CONTRACT_RELATIVE = Path("config/runtime-entrypoint.json")
 RELEASES_DIR_NAME = "grabowski-mcp-releases"
 MANIFEST_NAME = "deployment-manifest.json"
 INCOMPLETE_MARKER = "deployment-incomplete.json"
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
+AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
+AGENT_INSTRUCTIONS_MAX_BYTES = 4_096
+AGENT_INSTRUCTIONS_HEADER_RE = re.compile(
+    r"^Grabowski agent-facing contract "
+    r"(?P<version>[a-z0-9][a-z0-9-]{0,127}) "
+    r"\(schema (?P<schema>[1-9][0-9]*)\)\.$"
+)
 MCP_PROTOCOL_VERSIONS = (
     "2025-06-18",
     "2025-03-26",
@@ -1020,7 +1027,74 @@ def stop_process(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=3)
 
 
-def probe_mcp(release_path: Path, python_exe: Path, contract: RuntimeContract) -> str:
+def _valid_agent_instructions_identity(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {
+            "schema_version",
+            "version",
+            "sha256",
+            "bytes",
+            "max_bytes",
+        }
+        and value.get("schema_version") == AGENT_INSTRUCTIONS_SCHEMA_VERSION
+        and isinstance(value.get("version"), str)
+        and AGENT_INSTRUCTIONS_HEADER_RE.fullmatch(
+            "Grabowski agent-facing contract "
+            f"{value.get('version')} "
+            f"(schema {value.get('schema_version')})."
+        )
+        is not None
+        and _is_lower_hex(value.get("sha256"), 64)
+        and isinstance(value.get("bytes"), int)
+        and not isinstance(value.get("bytes"), bool)
+        and 0 < value["bytes"] <= AGENT_INSTRUCTIONS_MAX_BYTES
+        and value.get("max_bytes") == AGENT_INSTRUCTIONS_MAX_BYTES
+    )
+
+
+def agent_instructions_identity(instructions: Any) -> dict[str, Any]:
+    if not isinstance(instructions, str) or not instructions:
+        fail("MCP initialize enthält keine Agentenanweisungen")
+    encoded = instructions.encode("utf-8")
+    if len(encoded) > AGENT_INSTRUCTIONS_MAX_BYTES:
+        fail(
+            "MCP-Agentenanweisungen überschreiten die Größenbegrenzung: "
+            f"{len(encoded)} > {AGENT_INSTRUCTIONS_MAX_BYTES}"
+        )
+    first_line = instructions.splitlines()[0]
+    match = AGENT_INSTRUCTIONS_HEADER_RE.fullmatch(first_line)
+    if match is None:
+        fail("MCP-Agentenanweisungen besitzen keinen versionierten Vertragskopf")
+    schema_version = int(match.group("schema"))
+    if schema_version != AGENT_INSTRUCTIONS_SCHEMA_VERSION:
+        fail(
+            "MCP-Agentenanweisungen besitzen eine nicht unterstützte Schema-Version: "
+            f"{schema_version}"
+        )
+    identity = {
+        "schema_version": schema_version,
+        "version": match.group("version"),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded),
+        "max_bytes": AGENT_INSTRUCTIONS_MAX_BYTES,
+    }
+    if not _valid_agent_instructions_identity(identity):
+        fail("MCP-Agentenanweisungsidentität ist ungültig")
+    return identity
+
+
+@dataclass(frozen=True)
+class MCPProbeResult:
+    protocol_version: str
+    agent_instructions: dict[str, Any]
+
+
+def probe_mcp(
+    release_path: Path,
+    python_exe: Path,
+    contract: RuntimeContract,
+) -> MCPProbeResult:
     last_error: Exception | None = None
 
     for version in MCP_PROTOCOL_VERSIONS:
@@ -1058,13 +1132,15 @@ def probe_mcp(release_path: Path, python_exe: Path, contract: RuntimeContract) -
                         f"initialize({version}) meldete {initialized['error']}"
                     )
 
-                negotiated = initialized.get("result", {}).get(
-                    "protocolVersion"
-                )
+                initialize_result = initialized.get("result", {})
+                negotiated = initialize_result.get("protocolVersion")
                 if not isinstance(negotiated, str):
                     raise DeployError(
                         f"Ungültige initialize-Antwort: {initialized!r}"
                     )
+                instructions = agent_instructions_identity(
+                    initialize_result.get("instructions")
+                )
 
                 send_json(
                     proc,
@@ -1108,7 +1184,10 @@ def probe_mcp(release_path: Path, python_exe: Path, contract: RuntimeContract) -
                     )
 
                 stop_process(proc)
-                return negotiated
+                return MCPProbeResult(
+                    protocol_version=negotiated,
+                    agent_instructions=instructions,
+                )
 
             except Exception as exc:
                 last_error = exc
@@ -1158,6 +1237,7 @@ class BuildResult:
     entrypoint_path: Path
     protocol_version: str
     provenance: dict[str, str]
+    agent_instructions: dict[str, Any] = field(default_factory=dict)
 
 
 def mark_incomplete(release_path: Path, phase: str, exc: BaseException) -> None:
@@ -1258,7 +1338,7 @@ def build_release(
         entrypoint_path = module_paths[snapshot.contract.module]
 
         phase = "mcp-probe"
-        protocol_version = probe_mcp(release_path, venv_python, snapshot.contract)
+        probe = probe_mcp(release_path, venv_python, snapshot.contract)
         provenance = python_provenance(venv_python)
 
         phase = "manifest"
@@ -1270,7 +1350,8 @@ def build_release(
             input_paths=input_paths,
             entrypoint_path=entrypoint_path,
             module_paths=module_paths,
-            protocol_version=protocol_version,
+            protocol_version=probe.protocol_version,
+            agent_instructions=probe.agent_instructions,
             provenance=provenance,
         )
         return BuildResult(
@@ -1278,8 +1359,9 @@ def build_release(
             release_path=release_path,
             python_exe=venv_python,
             entrypoint_path=entrypoint_path,
-            protocol_version=protocol_version,
+            protocol_version=probe.protocol_version,
             provenance=provenance,
+            agent_instructions=probe.agent_instructions,
         )
     except Exception as exc:
         mark_incomplete(release_path, phase, exc)
@@ -1296,14 +1378,18 @@ def write_manifest(
     entrypoint_path: Path,
     module_paths: dict[str, Path],
     protocol_version: str,
+    agent_instructions: dict[str, Any],
     provenance: dict[str, str],
 ) -> None:
+    if not _valid_agent_instructions_identity(agent_instructions):
+        fail("Deployment-Manifest benötigt eine gültige Agentenanweisungsidentität")
     manifest: dict[str, Any] = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "release_id": release_id,
         "repo_head": snapshot.repo_head,
         "entrypoint_contract": snapshot.contract.to_manifest(),
         "entrypoint_contract_sha256": snapshot.contract_sha256,
+        "agent_instructions": agent_instructions,
         "source_sha256": snapshot.source_sha256,
         "source_sha256s": snapshot.source_sha256s,
         "runtime_input_sha256": snapshot.runtime_input_sha256,
@@ -1353,6 +1439,7 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
         "repo_head": str,
         "entrypoint_contract": dict,
         "entrypoint_contract_sha256": str,
+        "agent_instructions": dict,
         "source_sha256": str,
         "source_sha256s": dict,
         "runtime_input_sha256": str,
@@ -1393,6 +1480,8 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
     ):
         if not _is_lower_hex(manifest.get(key), 64):
             errors.append(key)
+    if not _valid_agent_instructions_identity(manifest.get("agent_instructions")):
+        errors.append("agent_instructions")
 
     contract = manifest.get("entrypoint_contract")
     modules: set[str] = set()
@@ -2673,6 +2762,12 @@ def deploy(
         print(f"Lock-SHA256:     {snapshot.runtime_lock_sha256}")
         print(f"Entry-Point:     {snapshot.contract.describe()}")
         print(f"MCP-Protokoll:   {build.protocol_version}")
+        if build.agent_instructions:
+            print(
+                "Agent-Vertrag:  "
+                f"{build.agent_instructions.get('version')} "
+                f"{build.agent_instructions.get('sha256')}"
+            )
         print(f"Runtime-PID:     {identity['process']['pid']}")
         print(f"Runtime:         {runtime}")
         print(f"Release:         {build.release_path}")
@@ -2716,6 +2811,12 @@ def check(repo: Path, runtime: Path) -> None:
         print(f"Entry-Point:     {snapshot.contract.describe()}")
         print(f"Python:          {build.provenance['python_version']}")
         print(f"MCP-Protokoll:   {build.protocol_version}")
+        if build.agent_instructions:
+            print(
+                "Agent-Vertrag:  "
+                f"{build.agent_instructions.get('version')} "
+                f"{build.agent_instructions.get('sha256')}"
+            )
 
 
 def absolute_no_resolve(path: Path) -> Path:
