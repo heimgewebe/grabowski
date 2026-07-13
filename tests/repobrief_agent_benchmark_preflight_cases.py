@@ -301,6 +301,17 @@ def fixture_environment(root: Path, *, freshness: str = "fresh") -> dict:
     }
 
 
+def ledger_events(state_root: Path) -> list[dict]:
+    parent = state_root / "preflight-dispatch-ledger"
+    pair_roots = list(parent.iterdir())
+    if len(pair_roots) != 1:
+        raise AssertionError(f"expected one pair ledger, got {len(pair_roots)}")
+    return [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((pair_roots[0] / "events").glob("*.json"))
+    ]
+
+
 class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
     def test_load_pair_requires_exact_matching_pair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -351,7 +362,22 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
                     baseline_fixture=None,
                     treatment_fixture=None,
                 )
-            self.assertFalse((root / "state").exists())
+            events = ledger_events(root / "state")
+            self.assertEqual([event["event"] for event in events], ["authorized", "preflight-failed"])
+            self.assertEqual(events[-1]["payload"]["provider_process_intents"], 0)
+            self.assertFalse(events[-1]["payload"]["retry_permitted"])
+            with self.assertRaisesRegex(preflight.PreflightError, "blocks retry"):
+                preflight.execute_preflight(
+                    pair_id=PAIR_ID,
+                    request_root=env["request_root"],
+                    repository_map=env["repository_map"],
+                    state_root=root / "state",
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    claude=str(env["claude"]),
+                    max_cost_usd=Decimal("1.00"),
+                    validator_command=[sys.executable, str(root / "validator.py")],
+                )
 
     def test_source_integrity_detects_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

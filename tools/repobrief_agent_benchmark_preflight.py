@@ -9,6 +9,7 @@ credential file, and an absolute SHA-256-bound Claude executable.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from contextvars import ContextVar
 from decimal import Decimal
 import importlib.util
@@ -53,6 +54,58 @@ def _provider_environment_adapter(auth_config: Path | None = None) -> dict[str, 
     return _original_provider_environment(auth_config)
 
 
+def _dispatch_provider_binding_adapter(
+    claude: str, synthetic: bool
+) -> dict[str, Any]:
+    credential = _credential_file.get()
+    command_sha = _command_sha256.get()
+    if synthetic:
+        if credential is not None or command_sha is not None:
+            raise _core.PreflightError(
+                "synthetic fixtures must not carry live provider bindings"
+            )
+        return {
+            "mode": "synthetic_fixture",
+            "claude_command": claude,
+        }
+    if credential is None or command_sha is None:
+        raise _core.PreflightError(
+            "live preflight requires credential file and Claude executable SHA-256"
+        )
+    try:
+        executable = _core.runner._validate_provider_executable(
+            stream_fixture=None,
+            executable=claude,
+            expected_sha256=command_sha,
+        )
+        credential_data = _core.runner._validated_credential_data(
+            stream_fixture=None,
+            credential_file=credential,
+        )
+    except _core.runner.RunnerError as exc:
+        raise _core.PreflightError(str(exc)) from exc
+    if credential_data is None:
+        raise _core.PreflightError("live credential binding is unavailable")
+    executable_path = Path(executable)
+    credential_path = credential.expanduser()
+    executable_metadata = executable_path.lstat()
+    credential_metadata = credential_path.lstat()
+    return {
+        "mode": "live_provider",
+        "claude": {
+            "path": str(executable_path),
+            "bytes": executable_metadata.st_size,
+            "sha256": command_sha,
+        },
+        "credential": {
+            "path": str(credential_path.resolve()),
+            "bytes": len(credential_data),
+            "sha256": hashlib.sha256(credential_data).hexdigest(),
+            "mode": oct(credential_metadata.st_mode & 0o777),
+        },
+    }
+
+
 def _execute_adapter(
     request: dict[str, Any],
     *,
@@ -94,6 +147,7 @@ def _execute_adapter(
 _core.runner._require_cost = _require_cost
 _core.runner._provider_environment = _provider_environment_adapter
 _core.runner.execute = _execute_adapter
+_core._dispatch_provider_binding = _dispatch_provider_binding_adapter
 runner = _core.runner
 
 

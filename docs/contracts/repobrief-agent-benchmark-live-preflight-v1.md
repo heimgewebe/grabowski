@@ -1,7 +1,7 @@
 # RepoBrief Agent Benchmark Live Preflight v1
 
-Status: Ausführungs- und Evidenzvertrag für `RAB-V1-T002B`  
-Autorität: read-only, nicht anwendend  
+Status: One-shot-Ausführungs- und Evidenzvertrag für `RAB-V1-T002C` und den später separat autorisierten `RAB-V1-T002D`
+Autorität: read-only, nicht anwendend
 Standardaktivierung: `false`
 
 ## Zweck
@@ -32,6 +32,40 @@ nichtnegatives `total_cost_usd` liefern, das dieselbe Grenze nicht
 überschreitet. Eine bereits laufende Provideranfrage kann geringfügig über die
 Grenze hinauslaufen; deshalb prüft der Orchestrator zusätzlich die beobachteten
 Paar-Gesamtkosten und wiederholt den Lauf nicht.
+
+## Create-only Dispatch-Ledger
+
+Vor Freshness-Prüfung oder möglichem Providerstart erzeugt der Preflight
+exklusiv einen paargebundenen Ledger unter dem privaten `state_root`. Existiert
+dieser Pfad bereits, endet der Aufruf ohne Prozessstart. Das gilt auch bei:
+
+- gleichem Paar und gleichem Vertrag;
+- geändertem Code, Plan, Budget, Schema oder Pfad;
+- unvollständigem Ledger nach Prozess- oder Rechnerabbruch;
+- erfolgreicher Core-Ausführung, deren abschließender Bericht noch nicht
+  veröffentlicht wurde.
+
+Der Autorisierungsdatensatz bindet paarweise Auftragsdateien und -SHA-256,
+Taskset, Repository und Commit, Repository-Map, Manifest, Modell, Budgets,
+MCP- und Validatorbefehle samt auflösbaren Programmdateien, Zustands-,
+Transcript-, Receipt-, Report- und Digestpfade sowie SHA-256 und Größe von
+Adapter, Core und Runner. Bei einem Livevertrag bindet er zusätzlich die
+validierte Claude-Binärdatei und die private Credentialdatei.
+
+Diese Bindung wird vor jedem Baseline- oder Treatmentintent und nach beiden
+Läufen erneut gebildet. Jede Änderung blockiert den nächsten Prozess oder den
+Abschluss. Vorbestehende Transcript-, Receipt-, Report- oder Digestpfade
+blockieren bereits vor dem ersten Intent. Erst nach diesen Prüfungen wird ein
+unveränderliches `dispatch-intent`-Ereignis geschrieben und danach der Runner
+aufgerufen. Ein zweites Intent derselben Bedingung oder ein drittes
+Prozessintent wird abgewiesen.
+
+Alle Ledgerereignisse werden create-only geschrieben und über
+`previous_event_sha256` verkettet. Erfolg, Fehler, unklarer Startausgang,
+Transcriptstatus und beobachtete Kosten werden als neue Ereignisse ergänzt;
+frühere Daten werden nicht ersetzt. Ein Kostenstopp bewahrt auch eine
+providerseitig beobachtete Überschreitung. `retry_permitted` bleibt stets
+`false`.
 
 ## Live-Providerbindung
 
@@ -135,7 +169,9 @@ Der Bericht bindet:
 - Quellzustand vor und nach dem Paar.
 
 Bericht und gleichnamige `.sha256`-Datei werden gemeinsam create-only
-veröffentlicht. Bei einem Fehler werden beide entfernt.
+veröffentlicht. Bei einem Fehler werden unvollständige Berichtsausgaben
+entfernt; der Dispatch-Ledger bleibt dagegen dauerhaft als Sperr- und
+Fehlerbeleg erhalten.
 
 ## Stopregeln
 
@@ -150,7 +186,10 @@ Der Preflight endet ohne Retry bei:
 - nicht frischem Snapshot;
 - Quellmutation;
 - unvollständigem Transcript;
-- Programm-, Credential- oder Digestabweichung.
+- Programm-, Credential- oder Digestabweichung;
+- vorhandenem, unvollständigem oder anders gebundenem Dispatch-Ledger;
+- doppeltem Bedingungsintent oder drittem Prozessintent;
+- unklarem Prozessstart oder unterbrochener Abschlussveröffentlichung.
 
 In jedem dieser Fälle bleibt `RAB-V1-T002` geplant und gesperrt.
 
