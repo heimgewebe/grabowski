@@ -569,6 +569,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["audit-append", "proof-issue"],
         "reversibility": "proof-expiry",
     },
+    "grabowski_resource_reconcile_obsolete_path_leases": {
+        "category": "resource",
+        "purpose": "Release only unchanged exact path leases after an authoritative workspace-close or current successful durable-task outcome proves terminal owner work.",
+        "risk_class": "high",
+        "effects": ["lease-remove", "audit-append", "terminal-evidence-verify"],
+        "reversibility": "resource-reacquire",
+    },
     "grabowski_resource_acquire": {
         "category": "resource",
         "purpose": "Atomically acquire typed resource leases for one owner.",

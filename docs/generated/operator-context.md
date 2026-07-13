@@ -119,6 +119,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_connector_transport_diagnostics` | operations-observability | yes | low | Run bounded read-only diagnostics for connector transport failures. |
 | `grabowski_operator_recall_export` | operations-observability | yes | low | Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth. |
 | `grabowski_resource_nonconflict_assess` | resource | no | medium | Assess and audit complete, attested same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint. |
+| `grabowski_resource_reconcile_obsolete_path_leases` | resource | no | high | Release only unchanged exact path leases after an authoritative workspace-close or current successful durable-task outcome proves terminal owner work. |
 | `grabowski_resource_acquire` | resource | no | medium | Atomically acquire typed resource leases for one owner. |
 | `grabowski_resource_renew` | resource | no | medium | Renew live resource leases owned by one owner. |
 | `grabowski_resource_release` | resource | no | high | Release owner-bound resource leases with an explicit force override. |

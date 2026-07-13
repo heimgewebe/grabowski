@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import grabowski_mcp as base
 import grabowski_bureau_leases as bureau_leases
@@ -45,6 +47,28 @@ SERVICE_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,255}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 7 * 24 * 60 * 60
+MAX_TERMINAL_RECEIPT_BYTES = 64 * 1024
+OBSOLETE_PATH_RELEASE_SCHEMA_VERSION = 1
+OBSOLETE_PATH_RELEASE_KIND = "grabowski_obsolete_path_lease_release"
+LEASE_SNAPSHOT_KEYS = frozenset({
+    "resource_key",
+    "owner_id",
+    "acquired_at_unix",
+    "updated_at_unix",
+    "expires_at_unix",
+    "metadata_sha256",
+})
+TASK_RELEASABLE_STATES = frozenset({"completed"})
+RECONCILIATION_NON_CLAIMS = [
+    "permission_to_release_changed_lease",
+    "permission_to_release_other_owner",
+    "permission_to_bypass_active_overlap",
+    "merge_authority",
+    "deploy_authority",
+    "retry_authority",
+    "migration_authority",
+    "policy_bypass_authority",
+]
 
 
 class ResourceConflict(RuntimeError):
@@ -381,6 +405,547 @@ def _check_repository_semantic_conflicts(
     )
 
 
+def _release_lease_snapshot(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "resource_key": row["resource_key"],
+        "owner_id": row["owner_id"],
+        "acquired_at_unix": int(row["acquired_at_unix"]),
+        "updated_at_unix": int(row["updated_at_unix"]),
+        "expires_at_unix": int(row["expires_at_unix"]),
+        "metadata_sha256": row["metadata_sha256"],
+    }
+
+
+def _normalize_expected_lease_snapshots(
+    value: Any, *, owner_id: str, resource_keys: list[str]
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) != len(resource_keys):
+        raise ValueError("expected_leases must contain one snapshot per resource key")
+    snapshots: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != LEASE_SNAPSHOT_KEYS:
+            raise ValueError("expected lease snapshot is malformed")
+        key = normalize_resource_key(item["resource_key"])
+        if not key.startswith("path:"):
+            raise ValueError("obsolete lease reconciliation accepts exact path leases only")
+        if item["owner_id"] != owner_id:
+            raise PermissionError("expected lease snapshot is owned by another owner")
+        for field in ("acquired_at_unix", "updated_at_unix", "expires_at_unix"):
+            if type(item[field]) is not int:
+                raise ValueError(f"expected lease {field} is invalid")
+        if not (
+            item["acquired_at_unix"] <= item["updated_at_unix"]
+            < item["expires_at_unix"]
+        ):
+            raise ValueError("expected lease timestamps are inconsistent")
+        if not isinstance(item["metadata_sha256"], str) or SHA256_RE.fullmatch(
+            item["metadata_sha256"]
+        ) is None:
+            raise ValueError("expected lease metadata SHA-256 is invalid")
+        snapshots.append({**item, "resource_key": key})
+    snapshots.sort(key=lambda item: item["resource_key"])
+    if [item["resource_key"] for item in snapshots] != resource_keys:
+        raise ValueError("expected lease snapshots do not match resource_keys")
+    return snapshots
+
+
+def _load_private_receipt_json(path: Path) -> dict[str, Any]:
+    try:
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise PermissionError("terminal receipt directory is unsafe") from exc
+    descriptor = -1
+    try:
+        directory = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or directory.st_uid != os.getuid()
+            or stat.S_IMODE(directory.st_mode) & 0o077
+        ):
+            raise PermissionError("terminal receipt directory must be private and owned")
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            if isinstance(exc, FileNotFoundError):
+                raise
+            raise PermissionError("terminal receipt path is unsafe") from exc
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_size > MAX_TERMINAL_RECEIPT_BYTES
+        ):
+            raise PermissionError("terminal receipt must be one bounded private regular file")
+        raw = os.read(descriptor, MAX_TERMINAL_RECEIPT_BYTES + 1)
+        if len(raw) > MAX_TERMINAL_RECEIPT_BYTES:
+            raise PermissionError("terminal receipt exceeds the byte limit")
+        value = json.loads(raw.decode("utf-8"))
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+    if not isinstance(value, dict):
+        raise ValueError("terminal receipt must be a JSON object")
+    return value
+
+
+def _verify_workspace_terminal_source(
+    terminal_source: dict[str, Any],
+    *,
+    owner_id: str,
+    resource_keys: list[str],
+    expected_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if set(terminal_source) != {"kind", "workspace_id", "close_receipt_sha256"}:
+        raise ValueError("workspace terminal_source keys are invalid")
+    import grabowski_agent_workspace as workspace
+
+    workspace_id = terminal_source["workspace_id"]
+    receipt_sha256 = terminal_source["close_receipt_sha256"]
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise ValueError("workspace_id is invalid")
+    if not isinstance(receipt_sha256, str) or SHA256_RE.fullmatch(receipt_sha256) is None:
+        raise ValueError("close_receipt_sha256 is invalid")
+    manifest = workspace._manifest(workspace_id)
+    receipt_path = workspace._workspace_dir(workspace_id) / "close-receipt.json"
+    if not receipt_path.is_file():
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-missing", "workspace close receipt is absent"
+        )
+    receipt = workspace._load_json(receipt_path)
+    if not workspace._receipt_integrity(receipt):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "workspace close receipt integrity is invalid"
+        )
+    if receipt.get("receipt_sha256") != receipt_sha256:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-drift", "workspace close receipt identity changed"
+        )
+    state = receipt.get("state")
+    if state not in {"complete", "resource_release_incomplete"}:
+        raise nonconflict.NonConflictDenied(
+            "owner-work-nonterminal", "workspace closeout is not terminal and releasable"
+        )
+    if receipt.get("workspace_id") != workspace_id:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "workspace close receipt names another workspace"
+        )
+    closure_outcome = receipt.get("closure_outcome")
+    if closure_outcome not in {"successful", "abandoned_failed_roles"}:
+        raise nonconflict.NonConflictDenied(
+            "owner-work-nonterminal",
+            "workspace closure outcome is unknown or not explicitly terminal",
+        )
+    collection = manifest.get("collection")
+    if (
+        not isinstance(collection, dict)
+        or collection.get("state") != "complete"
+        or not workspace._collection_integrity_status(manifest, collection)["valid"]
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "workspace close receipt has no canonical complete collection",
+        )
+    canonical_failed_roles = workspace._collection_failed_roles(collection)
+    failed_roles = receipt.get("failed_roles")
+    if failed_roles != canonical_failed_roles:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "workspace close receipt failure roles differ from the canonical collection",
+        )
+    if canonical_failed_roles:
+        if (
+            closure_outcome != "abandoned_failed_roles"
+            or receipt.get("abandon_failed_roles") is not True
+        ):
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-invalid",
+                "failed workspace roles lack explicit canonical abandonment",
+            )
+    elif (
+        closure_outcome != "successful"
+        or receipt.get("abandon_failed_roles") is not False
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "successful workspace closeout has inconsistent failure evidence",
+        )
+    if state == "complete":
+        if not workspace._close_integrity_status(manifest, receipt)["valid"]:
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-invalid",
+                "workspace close receipt does not match the canonical manifest",
+            )
+    elif (
+        receipt.get("expected_head") != collection.get("writer_head")
+        or receipt.get("expected_diff_sha256") != collection.get("diff_sha256")
+        or receipt.get("expected_result_sha256") != collection.get("result_sha256")
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "incomplete workspace release receipt is not collection-bound",
+        )
+    task_states = receipt.get("task_states")
+    manifest_tasks = manifest.get("tasks")
+    if not isinstance(task_states, dict) or not isinstance(manifest_tasks, dict):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "workspace task evidence is malformed"
+        )
+    for role in ("writer", "tests", "review"):
+        recorded = task_states.get(role)
+        live = workspace._task_public(manifest_tasks.get(role))
+        if (
+            not isinstance(recorded, dict)
+            or recorded.get("terminal") is not True
+            or live.get("terminal") is not True
+            or recorded.get("state")
+            in {"outcome_unknown", "observation_error", "interrupted"}
+            or live.get("state")
+            in {"outcome_unknown", "observation_error", "interrupted"}
+            or any(
+                recorded.get(field) != live.get(field)
+                for field in ("task_id", "attempt", "state", "terminal")
+            )
+        ):
+            raise nonconflict.NonConflictDenied(
+                "owner-work-nonterminal",
+                "workspace task attempt changed or is not terminal",
+            )
+    resources_manifest = manifest.get("resources")
+    if not isinstance(resources_manifest, dict) or resources_manifest.get("owner_id") != owner_id:
+        raise PermissionError("workspace terminal evidence belongs to another lease owner")
+    declared_raw = resources_manifest.get("lease_keys")
+    if not isinstance(declared_raw, list) or any(not isinstance(item, str) for item in declared_raw):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "workspace declared lease keys are malformed"
+        )
+    declared_keys = normalize_resource_keys(declared_raw)
+    if not set(resource_keys).issubset(declared_keys):
+        raise PermissionError("workspace did not declare every requested resource key")
+    if receipt.get("state") == "resource_release_incomplete":
+        remaining = receipt.get("remaining_resource_keys")
+        if (
+            not isinstance(remaining, list)
+            or any(not isinstance(item, str) for item in remaining)
+            or not set(resource_keys).issubset(normalize_resource_keys(remaining))
+        ):
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-mismatch",
+                "workspace close receipt does not retain every requested resource",
+            )
+    closed_at = receipt.get("closed_at")
+    if not isinstance(closed_at, str):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "workspace close receipt has no canonical terminal timestamp",
+        )
+    try:
+        parsed_closed_at = datetime.fromisoformat(closed_at)
+        if parsed_closed_at.tzinfo is None or parsed_closed_at.utcoffset() is None:
+            raise ValueError("workspace close timestamp has no UTC offset")
+        terminal_at_unix = int(parsed_closed_at.timestamp())
+    except (ValueError, OverflowError) as exc:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "workspace close receipt terminal timestamp is invalid",
+        ) from exc
+    expected_metadata_sha256 = _metadata(
+        {
+            "workspace_id": workspace_id,
+            "binding": manifest.get("binding"),
+            "base_head": manifest.get("expected_base_head"),
+            "plan_sha256": manifest.get("plan_sha256"),
+        }
+    )[1]
+    snapshots_by_key = {item["resource_key"]: item for item in expected_leases}
+    for key in resource_keys:
+        snapshot = snapshots_by_key[key]
+        if snapshot["metadata_sha256"] != expected_metadata_sha256:
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-mismatch",
+                "workspace lease metadata does not bind the canonical workspace plan",
+            )
+        if snapshot["updated_at_unix"] > terminal_at_unix:
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-drift",
+                "workspace lease was updated after the terminal closeout began",
+            )
+    return {
+        "kind": "agent_workspace_close",
+        "workspace_id": workspace_id,
+        "close_receipt_sha256": receipt_sha256,
+        "closure_outcome": receipt.get("closure_outcome"),
+        "state": receipt.get("state"),
+        "owner_id": owner_id,
+        "resource_keys": resource_keys,
+    }
+
+
+def _verify_task_terminal_source(
+    terminal_source: dict[str, Any],
+    *,
+    owner_id: str,
+    resource_keys: list[str],
+    expected_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if set(terminal_source) != {"kind", "task_id", "outcome_receipt_sha256"}:
+        raise ValueError("task terminal_source keys are invalid")
+    import grabowski_tasks as tasks
+
+    task_id = terminal_source["task_id"]
+    receipt_sha256 = terminal_source["outcome_receipt_sha256"]
+    if not isinstance(task_id, str) or tasks.TASK_ID.fullmatch(task_id) is None:
+        raise ValueError("task_id is invalid")
+    if not isinstance(receipt_sha256, str) or SHA256_RE.fullmatch(receipt_sha256) is None:
+        raise ValueError("outcome_receipt_sha256 is invalid")
+    record = tasks._row(task_id)
+    expected_owner = record.get("lease_owner_id") or tasks._lease_owner(task_id)
+    if expected_owner != owner_id:
+        raise PermissionError("task terminal evidence belongs to another lease owner")
+    declared_keys = sorted(tasks._record_resource_keys(record))
+    if not set(resource_keys).issubset(declared_keys):
+        raise PermissionError("task did not declare every requested resource key")
+    receipt_path = tasks.TASK_OUTCOMES_DIR / f"{task_id}.json"
+    if not receipt_path.is_file():
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-missing", "task outcome receipt is absent"
+        )
+    receipt = _load_private_receipt_json(receipt_path)
+    stored_sha256 = receipt.get("receipt_sha256")
+    receipt_resource_keys = receipt.get("resource_keys")
+    if (
+        receipt.get("schema_version") != 1
+        or not isinstance(receipt_resource_keys, list)
+        or any(not isinstance(item, str) for item in receipt_resource_keys)
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "task outcome receipt shape is invalid"
+        )
+    if set(receipt) != {
+        "schema_version",
+        "task_id",
+        "unit",
+        "attempt",
+        "state",
+        "argv_sha256",
+        "execution_envelope_sha256",
+        "resource_keys",
+        "observed_at_unix",
+        "observation_sha256",
+        "observation",
+        "receipt_sha256",
+    }:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "task outcome receipt is not the canonical schema-1 shape",
+        )
+    core = {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+    if (
+        stored_sha256 != receipt_sha256
+        or not isinstance(stored_sha256, str)
+        or SHA256_RE.fullmatch(stored_sha256) is None
+        or hashlib.sha256(_canonical_json(core).encode("utf-8")).hexdigest() != stored_sha256
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "task outcome receipt integrity is invalid"
+        )
+    if (
+        receipt.get("task_id") != task_id
+        or receipt.get("state") not in TASK_RELEASABLE_STATES
+        or record.get("state") != receipt.get("state")
+        or record.get("attempt") != receipt.get("attempt")
+        or record.get("unit") != receipt.get("unit")
+        or record.get("argv_sha256") != receipt.get("argv_sha256")
+    ):
+        raise nonconflict.NonConflictDenied(
+            "owner-work-nonterminal",
+            "task outcome is not a current completed attempt",
+        )
+    if not set(resource_keys).issubset(normalize_resource_keys(receipt_resource_keys)):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-mismatch", "task receipt does not bind requested resources"
+        )
+    observed_at_unix = receipt.get("observed_at_unix")
+    if isinstance(observed_at_unix, bool) or not isinstance(observed_at_unix, int):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "task outcome receipt terminal timestamp is invalid",
+        )
+    expected_metadata_sha256 = _metadata(
+        {
+            "task_id": task_id,
+            "host": record.get("host"),
+            "attempt": record.get("attempt"),
+        }
+    )[1]
+    snapshots_by_key = {item["resource_key"]: item for item in expected_leases}
+    for key in resource_keys:
+        snapshot = snapshots_by_key[key]
+        if snapshot["metadata_sha256"] != expected_metadata_sha256:
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-mismatch",
+                "task lease metadata does not bind the canonical task attempt",
+            )
+        if snapshot["updated_at_unix"] > observed_at_unix:
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-drift",
+                "task lease was updated after the authoritative terminal observation",
+            )
+    return {
+        "kind": "durable_task_outcome",
+        "task_id": task_id,
+        "outcome_receipt_sha256": receipt_sha256,
+        "state": receipt.get("state"),
+        "attempt": receipt.get("attempt"),
+        "owner_id": owner_id,
+        "resource_keys": resource_keys,
+    }
+
+
+def _verify_terminal_source(
+    terminal_source: Any,
+    *,
+    owner_id: str,
+    resource_keys: list[str],
+    expected_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(terminal_source, dict):
+        raise ValueError("terminal_source must be an object")
+    kind = terminal_source.get("kind")
+    if kind == "agent_workspace_close":
+        return _verify_workspace_terminal_source(
+            terminal_source,
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            expected_leases=expected_leases,
+        )
+    if kind == "durable_task_outcome":
+        return _verify_task_terminal_source(
+            terminal_source,
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            expected_leases=expected_leases,
+        )
+    raise nonconflict.NonConflictDenied(
+        "unsupported-terminal-source",
+        "terminal_source kind must be agent_workspace_close or durable_task_outcome",
+    )
+
+
+def _reconcile_verified_path_leases(
+    *,
+    owner: str,
+    keys: list[str],
+    snapshots: list[dict[str, Any]],
+    terminal_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    expected_by_key = {item["resource_key"]: item for item in snapshots}
+    released: list[dict[str, Any]] = []
+    retained: list[dict[str, Any]] = []
+    now = _now()
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for key in keys:
+                row = connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()
+                if row is None:
+                    retained.append({"resource_key": key, "reason": "already_absent"})
+                    continue
+                live = _release_lease_snapshot(row)
+                if live["owner_id"] != owner:
+                    retained.append({"resource_key": key, "reason": "owner_changed"})
+                    continue
+                if live != expected_by_key[key]:
+                    retained.append({"resource_key": key, "reason": "lease_snapshot_changed"})
+                    continue
+                connection.execute(
+                    "DELETE FROM leases WHERE resource_key=? AND owner_id=?",
+                    (key, owner),
+                )
+                released.append(live)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    state = "complete" if len(released) == len(keys) else ("partial" if released else "no_change")
+    core = {
+        "schema_version": OBSOLETE_PATH_RELEASE_SCHEMA_VERSION,
+        "kind": OBSOLETE_PATH_RELEASE_KIND,
+        "state": state,
+        "owner_id": owner,
+        "resource_keys": keys,
+        "expected_leases": snapshots,
+        "terminal_evidence": terminal_evidence,
+        "released": released,
+        "retained": retained,
+        "reconciled_at_unix": now,
+        "does_not_establish": RECONCILIATION_NON_CLAIMS,
+    }
+    return {**core, "receipt_sha256": hashlib.sha256(
+        _canonical_json(core).encode("utf-8")
+    ).hexdigest()}
+
+
+def reconcile_obsolete_path_leases(
+    *,
+    owner_id: str,
+    resource_keys: Iterable[str],
+    expected_leases: Any,
+    terminal_source: Any,
+) -> dict[str, Any]:
+    owner = _owner(owner_id)
+    keys = normalize_resource_keys(resource_keys)
+    if any(not key.startswith("path:") for key in keys):
+        raise ValueError("obsolete lease reconciliation accepts exact path leases only")
+    snapshots = _normalize_expected_lease_snapshots(
+        expected_leases, owner_id=owner, resource_keys=keys
+    )
+    if not isinstance(terminal_source, dict):
+        raise ValueError("terminal_source must be an object")
+    if terminal_source.get("kind") == "agent_workspace_close":
+        import grabowski_agent_workspace as workspace
+
+        workspace_id = terminal_source.get("workspace_id")
+        if not isinstance(workspace_id, str) or not workspace_id:
+            raise ValueError("workspace_id is invalid")
+        with workspace._lock(workspace_id):
+            terminal_evidence = _verify_terminal_source(
+                terminal_source,
+                owner_id=owner,
+                resource_keys=keys,
+                expected_leases=snapshots,
+            )
+            return _reconcile_verified_path_leases(
+                owner=owner,
+                keys=keys,
+                snapshots=snapshots,
+                terminal_evidence=terminal_evidence,
+            )
+    terminal_evidence = _verify_terminal_source(
+        terminal_source,
+        owner_id=owner,
+        resource_keys=keys,
+        expected_leases=snapshots,
+    )
+    return _reconcile_verified_path_leases(
+        owner=owner,
+        keys=keys,
+        snapshots=snapshots,
+        terminal_evidence=terminal_evidence,
+    )
+
+
 def assess_nonconflict(
     *,
     blocked_resource_key: str,
@@ -392,9 +957,44 @@ def assess_nonconflict(
     proof_ttl_seconds: int = nonconflict.MAX_PROOF_TTL_SECONDS,
 ) -> dict[str, Any]:
     blocked_key = normalize_resource_key(blocked_resource_key)
-    if not blocked_key.startswith("repo:"):
-        raise ValueError("blocked_resource_key must be a repository lease")
     owner = _owner(requesting_owner)
+    if not blocked_key.startswith("repo:"):
+        now = _now()
+        with _database() as connection:
+            row = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (blocked_key,)
+            ).fetchone()
+        if blocked_key.startswith("path:"):
+            if row is None or row["expires_at_unix"] <= now:
+                return {
+                    "blocked_resource_key": blocked_key,
+                    "requesting_owner": owner,
+                    "decision": "deny",
+                    "code": "blocked-path-lease-absent-or-expired",
+                    "blocker_type": "exact_path_lease",
+                    "requires_atomic_revalidation": False,
+                    "recommended_next_action": "inspect the live lease and acquire normally",
+                }
+            return {
+                "blocked_resource_key": blocked_key,
+                "requesting_owner": owner,
+                "decision": "deny",
+                "code": "exact-path-owner-release-required",
+                "blocker_type": "exact_path_lease",
+                "blocked_lease": _release_lease_snapshot(row),
+                "requires_atomic_revalidation": True,
+                "recommended_next_action": "use grabowski_resource_reconcile_obsolete_path_leases only with authoritative terminal evidence and the unchanged lease snapshot",
+                "does_not_establish": RECONCILIATION_NON_CLAIMS,
+            }
+        return {
+            "blocked_resource_key": blocked_key,
+            "requesting_owner": owner,
+            "decision": "deny",
+            "code": "unsupported-blocker-type",
+            "blocker_type": blocked_key.split(":", 1)[0],
+            "requires_atomic_revalidation": False,
+            "recommended_next_action": "inspect the blocker and use its owner-specific lifecycle",
+        }
     keys = normalize_resource_keys(resource_keys)
     lease_purpose = _purpose(purpose)
     if requested_scope_complete is not True:
@@ -796,6 +1396,37 @@ def grabowski_resource_nonconflict_assess(
             "requested_scope_sha256": result["proof"]["requested_scope_sha256"],
             "existing_scope_sha256": result["proof"]["existing_scope_sha256"],
             "expires_at_unix": result["proof"]["expires_at_unix"],
+        }
+    )
+    return result
+
+
+@mcp.tool(name="grabowski_resource_reconcile_obsolete_path_leases", annotations=MUTATING)
+def grabowski_resource_reconcile_obsolete_path_leases(
+    owner_id: str,
+    resource_keys: list[str],
+    expected_leases: list[dict[str, Any]],
+    terminal_source: dict[str, Any],
+) -> dict[str, Any]:
+    """Release only unchanged owner path leases after authoritative current terminal evidence."""
+    operator._require_operator_mutation("resource_lease")
+    result = reconcile_obsolete_path_leases(
+        owner_id=owner_id,
+        resource_keys=resource_keys,
+        expected_leases=expected_leases,
+        terminal_source=terminal_source,
+    )
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "resource-obsolete-path-reconcile",
+            "owner_id": result["owner_id"],
+            "resource_keys": result["resource_keys"],
+            "state": result["state"],
+            "released_count": len(result["released"]),
+            "retained_count": len(result["retained"]),
+            "terminal_source_kind": result["terminal_evidence"]["kind"],
+            "receipt_sha256": result["receipt_sha256"],
         }
     )
     return result

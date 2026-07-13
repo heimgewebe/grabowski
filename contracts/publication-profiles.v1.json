@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "22f31ec746bff24f794fc2bfb52fa134c119ca593c741d75b70edb7236823f73"
+    "sha256": "32d81838b121e59f2bf0bda8cdc7fa1dbca9f52c7533fff7cc47902dbf3665f2"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "0f2966a9d2636d3d3aa534164ad56cd9b9e2b5622db3d1a735b37d5c7ad4ebcf"
+    "sha256": "7ed21bce7f47f31d3db518db61530c6aa8f7ae743b6d26366c0780aaedea9573"
   },
   "counts": {
     "core": 21,
-    "full": 121,
-    "operator": 106
+    "full": 122,
+    "operator": 107
   },
   "profiles": {
     "core": [
@@ -127,6 +127,7 @@
       "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
       "grabowski_resource_nonconflict_assess",
+      "grabowski_resource_reconcile_obsolete_path_leases",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",
       "grabowski_resource_release",
@@ -235,6 +236,7 @@
       "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
       "grabowski_resource_nonconflict_assess",
+      "grabowski_resource_reconcile_obsolete_path_leases",
       "grabowski_resource_acquire",
       "grabowski_resource_renew",
       "grabowski_resource_release",

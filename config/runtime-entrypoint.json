@@ -90,6 +90,7 @@
     "grabowski_connector_transport_diagnostics",
     "grabowski_operator_recall_export",
     "grabowski_resource_nonconflict_assess",
+    "grabowski_resource_reconcile_obsolete_path_leases",
     "grabowski_resource_acquire",
     "grabowski_resource_renew",
     "grabowski_resource_release",
