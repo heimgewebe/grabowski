@@ -157,8 +157,199 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         self.assertFalse(result["single_run_can_authorize_change"])
         repeated = {item["failure_class"]: item["workspace_count"] for item in result["repeated_failure_classes"]}
         self.assertEqual(repeated["environment_toolchain_failure"], 2)
+        self.assertEqual(
+            result["repeated_failure_classes"][0]["workspace_ids"], identifiers
+        )
+        self.assertEqual(
+            result["proposals"][0]["measured_baseline"]["independent_workspace_ids"],
+            identifiers,
+        )
         self.assertTrue(result["proposals"])
         self.assertTrue(all(item["authority"] == "proposal_only" for item in result["proposals"]))
+
+
+
+    def test_legacy_missing_pytest_is_toolchain_failure_and_recovers_identity(self) -> None:
+        identifier = "gaw-observer-test-legacy-pytest"
+        manifest = self._manifest(identifier)
+        manifest["expected_base_head"] = "a" * 40
+        manifest["commands"] = {
+            "tests": ["/usr/bin/python3", "-m", "pytest", "-q"],
+            "review": ["/usr/bin/python3", "-c", "print('ok')"],
+        }
+        manifest["collection"] = {
+            "state": "complete",
+            "writer_head": "c" * 40,
+            "expected_base_head": "a" * 40,
+            "diff_sha256": "d" * 64,
+            "tests": {"status": "failed"},
+            "review": {"status": "passed"},
+        }
+        status = self._status(failure="semantic_test_failure")
+        status["writer"] = {"writer_head": None, "diff_sha256": None}
+        status["failed_roles"] = ["tests"]
+        receipt = {
+            "returncode": 1,
+            "stderr_tail": "/usr/bin/python3: No module named pytest\n",
+            "stdout_tail": "",
+        }
+        with (
+            mock.patch.object(workspace, "_manifest", return_value=manifest),
+            mock.patch.object(workspace, "_status_data", return_value=status),
+            mock.patch.object(workspace, "_role_receipt", side_effect=lambda _manifest, role: receipt if role == "tests" else None),
+        ):
+            report = observer.grabowski_agent_workspace_observe(identifier, "legacy-fixture")
+        self.assertIn("environment_toolchain_failure", report["facts"]["failure_classes"])
+        self.assertNotIn("tests:semantic_test_failure", report["facts"]["failure_classes"])
+        self.assertEqual(report["facts"]["writer_head"], "c" * 40)
+        self.assertEqual(report["facts"]["diff_sha256"], "d" * 64)
+        self.assertEqual(report["facts"]["source"], "collection_receipt")
+
+    def test_unrelated_missing_application_module_remains_semantic_failure(self) -> None:
+        identifier = "gaw-observer-test-app-module"
+        manifest = self._manifest(identifier)
+        manifest["commands"] = {
+            "tests": ["/usr/bin/python3", "-m", "pytest", "-q"],
+            "review": ["/usr/bin/python3", "-c", "print('ok')"],
+        }
+        receipt = {
+            "returncode": 1,
+            "stderr_tail": "ImportError: No module named project_dependency\n",
+            "stdout_tail": "",
+        }
+        with mock.patch.object(
+            workspace, "_role_receipt", side_effect=lambda _manifest, role: receipt if role == "tests" else None
+        ):
+            self.assertEqual(
+                observer._receipt_failure_class(manifest, "tests"),
+                "semantic_test_failure",
+            )
+
+    def test_explicit_hash_bound_closeout_evidence_resolves_only_named_items(self) -> None:
+        identifier = "gaw-observer-test-closeout-evidence"
+        manifest = self._manifest(identifier)
+        status = self._status()
+        manifest["collection"] = {
+            "result_sha256": "a" * 64,
+            "writer_head": "b" * 40,
+            "diff_sha256": "c" * 64,
+        }
+        manifest["close_receipt"] = {"receipt_sha256": "d" * 64}
+        unsigned = {
+            "schema_version": 1,
+            "workspace_id": identifier,
+            "collection_result_sha256": "a" * 64,
+            "close_receipt_sha256": "d" * 64,
+            "writer_head": "b" * 40,
+            "diff_sha256": "c" * 64,
+            "items": [
+                {
+                    "item": "bureau_task_reconciliation",
+                    "status": "verified",
+                    "source_of_truth": "bureau",
+                    "reference": "bureau-task:TASK-1@verified",
+                }
+            ],
+        }
+        evidence = {**unsigned, "evidence_sha256": observer._sha256_json(unsigned)}
+        with (
+            mock.patch.object(workspace, "_manifest", return_value=manifest),
+            mock.patch.object(workspace, "_status_data", return_value=status),
+        ):
+            report = observer.grabowski_agent_workspace_observe(
+                identifier,
+                "closeout",
+                evidence,
+            )
+        self.assertEqual(report["facts"]["unresolved_external_closeout"], [])
+        resolved = {
+            item["item"]: item
+            for item in report["facts"]["external_closeout"]
+        }
+        self.assertEqual(resolved["bureau_task_reconciliation"]["status"], "verified")
+        self.assertEqual(resolved["bureau_task_reconciliation"]["evidence_mode"], "explicit_hash_bound")
+
+    def test_optimizer_excludes_legacy_reports_without_event_logs(self) -> None:
+        identifiers = [
+            "gaw-observer-test-legacy-opt-1",
+            "gaw-observer-test-legacy-opt-2",
+        ]
+        manifests = {identifier: self._manifest(identifier) for identifier in identifiers}
+        for manifest in manifests.values():
+            manifest["commands"] = {
+                "tests": ["/usr/bin/python3", "-m", "pytest"],
+                "review": ["/usr/bin/python3", "-c", "print('ok')"],
+            }
+            manifest["collection"] = {
+                "state": "complete",
+                "writer_head": "a" * 40,
+                "expected_base_head": "a" * 40,
+                "diff_sha256": "b" * 64,
+                "tests": {"status": "failed"},
+                "review": {"status": "passed"},
+            }
+            receipt = {
+                "schema_version": 1,
+                "role": "tests",
+                "attempt": 1,
+                "returncode": 1,
+                "stderr_tail": "/usr/bin/python3: No module named pytest",
+                "stdout_tail": "",
+            }
+            receipt["receipt_sha256"] = workspace._sha256_json(receipt)
+            manifest.setdefault("role_receipts", {})["tests"] = receipt
+
+        with (
+            mock.patch.object(workspace, "_manifest", side_effect=lambda identifier: manifests[identifier]),
+            mock.patch.object(
+                workspace,
+                "_status_data",
+                return_value=self._status(failure="environment_toolchain_failure"),
+            ),
+        ):
+            result = observer.grabowski_agent_workspace_optimize(identifiers)
+        self.assertEqual(result["repeated_failure_classes"], [])
+        self.assertEqual(result["proposals"], [])
+
+    def test_stale_closeout_evidence_is_rejected_after_collection_changes(self) -> None:
+        identifier = "gaw-observer-test-stale-closeout"
+        manifest = self._manifest(identifier)
+        manifest["collection"] = {
+            "result_sha256": "a" * 64,
+            "writer_head": "b" * 40,
+            "diff_sha256": "c" * 64,
+        }
+        manifest["close_receipt"] = {"receipt_sha256": "d" * 64}
+        unsigned = {
+            "schema_version": 1,
+            "workspace_id": identifier,
+            "collection_result_sha256": "e" * 64,
+            "close_receipt_sha256": "d" * 64,
+            "writer_head": "b" * 40,
+            "diff_sha256": "c" * 64,
+            "items": [],
+        }
+        evidence = {**unsigned, "evidence_sha256": observer._sha256_json(unsigned)}
+        with self.assertRaisesRegex(observer.WorkspaceObserverError, "stale or unbound"):
+            observer._validate_closeout_evidence(identifier, manifest, evidence)
+
+    def test_optimizer_ignores_success_classifications_and_unknown_closeout(self) -> None:
+        identifiers = ["gaw-observer-test-success-01", "gaw-observer-test-success-02"]
+        manifests = {identifier: self._manifest(identifier) for identifier in identifiers}
+
+        def load_manifest(identifier: str) -> dict:
+            return manifests[identifier]
+
+        success_status = self._status(failure="already_succeeded")
+        with (
+            mock.patch.object(workspace, "_manifest", side_effect=load_manifest),
+            mock.patch.object(workspace, "_status_data", return_value=success_status),
+            mock.patch.object(workspace, "_role_receipt", return_value=None),
+        ):
+            result = observer.grabowski_agent_workspace_optimize(identifiers)
+        self.assertEqual(result["repeated_failure_classes"], [])
+        self.assertEqual(result["proposals"], [])
+        self.assertFalse(result["proposal_threshold"]["success_states_counted_as_failures"])
 
 
 if __name__ == "__main__":

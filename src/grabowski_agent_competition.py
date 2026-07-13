@@ -1345,37 +1345,6 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
     return receipt
 
 
-def _route_score(
-    *,
-    task_kind: str,
-    changed_file_estimate: int,
-    expected_duration_minutes: int,
-    novelty: str,
-    risk_flags: list[str],
-    connector_instability: bool,
-    parallel_work: bool,
-) -> int:
-    score = 0
-    if task_kind == "code":
-        score += 2
-    elif task_kind == "operations":
-        score += 1
-    if changed_file_estimate >= 4:
-        score += 1
-    if changed_file_estimate >= 10:
-        score += 1
-    if expected_duration_minutes >= 30:
-        score += 1
-    if expected_duration_minutes >= 120:
-        score += 1
-    score += {"low": 0, "medium": 1, "high": 3}[novelty]
-    score += min(4, len(risk_flags))
-    if connector_instability:
-        score += 2
-    if parallel_work:
-        score += 2
-    return score
-
 
 @mcp.tool(name="grabowski_agent_execution_route", annotations=READ_ONLY)
 def grabowski_agent_execution_route(
@@ -1421,49 +1390,25 @@ def grabowski_agent_execution_route(
         if unsupported:
             raise AgentCompetitionError(f"unsupported external agents: {unsupported}")
         normalized_agents = [provider for provider in ("claude", "agy") if provider in requested_agents]
-    score = _route_score(
-        task_kind=kind,
-        changed_file_estimate=changed_file_estimate,
-        expected_duration_minutes=expected_duration_minutes,
-        novelty=novelty_value,
-        risk_flags=normalized_flags,
-        connector_instability=connector_flag,
-        parallel_work=parallel_flag,
-    )
-    design_space = novelty_value == "high" or any(flag in normalized_flags for flag in {"security", "schema", "concurrency", "data_migration", "cross_repo"})
-    external_available = [agent for agent in normalized_agents if agent in PROVIDERS]
-    if kind in {"docs", "analysis"} and score <= 2 and not external_requested:
-        mode = "direct_operator"
-    elif score <= 3 and not external_requested:
-        mode = "isolated_worktree"
-    elif score <= 6 and not external_requested:
-        mode = "full_workspace"
-    elif (
-        len(external_available) >= 2
-        and (external_requested or (design_space and score >= 9))
-    ):
-        mode = "workspace_with_competition"
-    elif (
-        external_available
-        and (
-            external_requested
-            or (design_space and score >= 8)
-            or score >= 10
-        )
-    ):
-        mode = "workspace_with_contrast"
-    else:
-        mode = "full_workspace"
-    candidate_plan: list[dict[str, Any]] = []
-    if mode == "workspace_with_competition":
-        providers = external_available[:2]
-        candidate_plan = [
-            {"provider": providers[0], "mode": "competitor", "timing": "before_primary_writer"},
-            {"provider": providers[1], "mode": "contrast", "timing": "after_primary_plan_or_candidate"},
-        ]
-    elif mode == "workspace_with_contrast":
-        candidate_plan = [{"provider": external_available[0], "mode": "contrast", "timing": "after_primary_plan_or_candidate"}]
-    return {
+    input_facts = {
+        "task_kind": kind,
+        "changed_file_estimate": changed_file_estimate,
+        "expected_duration_minutes": expected_duration_minutes,
+        "novelty": novelty_value,
+        "risk_flags": normalized_flags,
+        "connector_instability": connector_flag,
+        "parallel_work": parallel_flag,
+        "user_requested_external": external_requested,
+        "available_external_agents": normalized_agents,
+    }
+    decision = workspace._route_decision(input_facts)
+    score = int(decision["score"])
+    mode = str(decision["execution_mode"])
+    candidate_plan = list(decision["external_candidates"])
+    design_space = bool(decision["design_space"])
+    external_available = list(input_facts["available_external_agents"])
+    trivial_work = bool(decision["trivial_work"])
+    result = {
         "schema_version": 1,
         "score": score,
         "execution_mode": mode,
@@ -1475,6 +1420,9 @@ def grabowski_agent_execution_route(
         "automatic_winner_selection": False,
         "operator_remains_integrator": True,
         "roles_remain_isolated": mode != "direct_operator",
+        "input_facts": input_facts,
+        "trivial_work": trivial_work,
+        "deviation_requires_reason": True,
         "rationale": {
             "task_kind": kind,
             "novelty": novelty_value,
@@ -1492,6 +1440,14 @@ def grabowski_agent_execution_route(
         ],
         "does_not_establish": ["execution_authority", "candidate_correctness", "merge_readiness", "need_for_external_agents"],
     }
+    result["recommendation_id"] = _sha256_json({
+        "schema_version": result["schema_version"],
+        "score": score,
+        "execution_mode": mode,
+        "input_facts": input_facts,
+        "external_candidates": candidate_plan,
+    })
+    return result
 
 
 @mcp.tool(name="grabowski_agent_competition_start", annotations=MUTATING)
