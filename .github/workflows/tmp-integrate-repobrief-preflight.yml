@@ -1,0 +1,81 @@
+name: temporary integrate RepoBrief preflight
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          ref: integrate/repobrief-live-preflight-v1
+          fetch-depth: 0
+      - name: Adapt orchestrator to merged runner authorization contract
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('tools/repobrief_agent_benchmark_preflight.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''        output = runner.execute(
+            request,
+            request_root=request_root,
+            repository_map=repository_map,
+            state_root=state_root,
+            transcript_root=transcript_root,
+            claude=claude,
+            max_cost_usd=max_cost_usd,
+            stream_fixture=fixture_by_condition[condition],
+        )
+'''
+          new = '''        fixture = fixture_by_condition[condition]
+        output = runner.execute(
+            request,
+            request_root=request_root,
+            repository_map=repository_map,
+            state_root=state_root,
+            transcript_root=transcript_root,
+            claude=claude,
+            stream_fixture=fixture,
+            allow_live_provider=fixture is None,
+            max_budget_usd=(format(max_cost_usd, "f") if fixture is None else None),
+        )
+'''
+          if new not in text:
+              if old not in text:
+                  raise SystemExit('missing runner.execute integration anchor')
+              text = text.replace(old, new, 1)
+
+          old = '''        max_cost = runner._require_cost(
+            args.max_cost_usd,
+            "max_cost_usd",
+            maximum=MAX_PER_RUN_COST_USD,
+        )
+'''
+          new = '''        max_cost = Decimal(runner._parse_max_budget_usd(args.max_cost_usd))
+        if max_cost > MAX_PER_RUN_COST_USD:
+            raise PreflightError(
+                f"max cost must be > 0 and <= {MAX_PER_RUN_COST_USD}"
+            )
+'''
+          if new not in text:
+              if old not in text:
+                  raise SystemExit('missing CLI cost integration anchor')
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tools/repobrief_agent_benchmark_preflight.py
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "fix: integrate preflight with live-provider authorization"
+          git push origin HEAD:integrate/repobrief-live-preflight-v1
