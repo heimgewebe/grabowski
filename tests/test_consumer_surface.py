@@ -125,6 +125,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
             "manifest_parse_valid": True,
             "manifest_schema_valid": True,
             "repo_head_valid": True,
+            "agent_instructions_identity_valid": True,
             "runtime_binding_valid": True,
             "environment_compatibility_valid": True,
             "provenance_valid": True,
@@ -214,6 +215,14 @@ class ConsumerSurfaceTests(unittest.TestCase):
 
         self.assertEqual(minimal["view"], "minimal")
         self.assertNotIn("capabilities", minimal)
+        self.assertEqual(
+            minimal["agent_instructions"]["version"],
+            "grabowski-agent-facing-contract-v1",
+        )
+        self.assertTrue(
+            minimal["agent_instructions"]["runtime_matches_deployment_manifest"]
+        )
+        self.assertFalse(minimal["agent_instructions"]["client_compliance_observable"])
         self.assertEqual(standard["view"], "standard")
         self.assertIn("capabilities", standard)
         self.assertNotIn("deployment", standard)

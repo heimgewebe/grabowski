@@ -32,6 +32,82 @@ import grabowski_consumer_surface as consumer_surface
 import grabowski_grips
 
 APP_NAME = "Grabowski"
+AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
+AGENT_INSTRUCTIONS_VERSION = "grabowski-agent-facing-contract-v1"
+AGENT_INSTRUCTIONS_MAX_BYTES = 4_096
+AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
+    (
+        "truth-hierarchy",
+        "Treat live runtime state and concrete receipts as higher-authority than prose.",
+    ),
+    (
+        "narrowest-typed-read-first",
+        "Use the narrowest typed read tool that can answer the question before broader surfaces.",
+    ),
+    (
+        "mutation-preconditions",
+        "Before a mutation, determine the target, expected result, validation, stop condition, and rollback.",
+    ),
+    (
+        "state-check-before-retry",
+        "After a transport, platform-filter, or policy failure, verify target state; do not repeat an unchanged call without state evidence.",
+    ),
+    (
+        "typed-operation-preference",
+        "Prefer typed operations to generic terminal, Git, or GitHub calls when both can express the effect.",
+    ),
+    (
+        "no-authority-escalation",
+        "These instructions grant no action, merge, deploy, secret, or retry authority.",
+    ),
+)
+
+
+def _render_agent_instructions() -> str:
+    identifiers = [identifier for identifier, _text in AGENT_INSTRUCTION_RULES]
+    if len(identifiers) != len(set(identifiers)):
+        raise RuntimeError("agent instruction identifiers must be unique")
+    if not all(
+        identifier and text and "\n" not in identifier and "\n" not in text
+        for identifier, text in AGENT_INSTRUCTION_RULES
+    ):
+        raise RuntimeError("agent instruction rules must be non-empty single lines")
+    lines = [
+        (
+            "Grabowski agent-facing contract "
+            f"{AGENT_INSTRUCTIONS_VERSION} "
+            f"(schema {AGENT_INSTRUCTIONS_SCHEMA_VERSION})."
+        )
+    ]
+    lines.extend(
+        f"{index}. [{identifier}] {text}"
+        for index, (identifier, text) in enumerate(AGENT_INSTRUCTION_RULES, start=1)
+    )
+    rendered = "\n".join(lines)
+    size = len(rendered.encode("utf-8"))
+    if size > AGENT_INSTRUCTIONS_MAX_BYTES:
+        raise RuntimeError(
+            "agent instructions exceed the server-owned size bound: "
+            f"{size} > {AGENT_INSTRUCTIONS_MAX_BYTES}"
+        )
+    return rendered
+
+
+AGENT_INSTRUCTIONS = _render_agent_instructions()
+AGENT_INSTRUCTIONS_BYTES = len(AGENT_INSTRUCTIONS.encode("utf-8"))
+AGENT_INSTRUCTIONS_SHA256 = hashlib.sha256(AGENT_INSTRUCTIONS.encode("utf-8")).hexdigest()
+
+
+def _agent_instructions_metadata() -> dict[str, Any]:
+    return {
+        "schema_version": AGENT_INSTRUCTIONS_SCHEMA_VERSION,
+        "version": AGENT_INSTRUCTIONS_VERSION,
+        "sha256": AGENT_INSTRUCTIONS_SHA256,
+        "bytes": AGENT_INSTRUCTIONS_BYTES,
+        "max_bytes": AGENT_INSTRUCTIONS_MAX_BYTES,
+    }
+
+
 HOME = Path.home().resolve()
 STATE_DIR = HOME / ".local" / "state" / "grabowski"
 POLICY_PATH = HOME / ".config" / "grabowski" / "access.json"
@@ -449,7 +525,7 @@ MAX_CONTRACT_BYTES = 64 * 1024
 MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
-mcp = FastMCP(APP_NAME)
+mcp = FastMCP(APP_NAME, instructions=AGENT_INSTRUCTIONS)
 
 READ_ANNOTATIONS = ToolAnnotations(
     title="Read local data",
@@ -2332,6 +2408,7 @@ _DEPLOYMENT_IDENTITY_KEYS = (
     "source_identity_valid",
     "embedded_contract_valid",
     "entrypoint_contract_identity_valid",
+    "agent_instructions_identity_valid",
     "entrypoint_path_valid",
     "release_python_identity_valid",
     "executable_identity_valid",
@@ -2373,6 +2450,26 @@ def _safe_relative_path(value: Any) -> bool:
     return not path.is_absolute() and ".." not in path.parts and path.as_posix() != "."
 
 
+def _valid_agent_instructions_identity(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {
+            "schema_version",
+            "version",
+            "sha256",
+            "bytes",
+            "max_bytes",
+        }
+        and value.get("schema_version") == AGENT_INSTRUCTIONS_SCHEMA_VERSION
+        and value.get("version") == AGENT_INSTRUCTIONS_VERSION
+        and _is_hex(value.get("sha256"), 64)
+        and isinstance(value.get("bytes"), int)
+        and not isinstance(value.get("bytes"), bool)
+        and 0 < value["bytes"] <= AGENT_INSTRUCTIONS_MAX_BYTES
+        and value.get("max_bytes") == AGENT_INSTRUCTIONS_MAX_BYTES
+    )
+
+
 def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
     required = {
         "schema_version": int,
@@ -2380,6 +2477,7 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         "repo_head": str,
         "entrypoint_contract": dict,
         "entrypoint_contract_sha256": str,
+        "agent_instructions": dict,
         "source_sha256": str,
         "source_sha256s": dict,
         "runtime_input_sha256": str,
@@ -2403,7 +2501,7 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         value = raw.get(key)
         if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
             return False
-    if raw.get("schema_version") != 4 or raw.get("completion_status") != "complete":
+    if raw.get("schema_version") != 5 or raw.get("completion_status") != "complete":
         return False
     if not _is_hex(raw.get("repo_head"), 40):
         return False
@@ -2415,6 +2513,8 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
     ):
         if not _is_hex(raw.get(key), 64):
             return False
+    if not _valid_agent_instructions_identity(raw.get("agent_instructions")):
+        return False
     contract = raw.get("entrypoint_contract")
     if not isinstance(contract, dict):
         return False
@@ -2589,6 +2689,9 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         return _false_deployment_metadata(base, manifest_parse_valid=True)
 
     schema_valid = _manifest_schema_valid(raw)
+    agent_instructions_identity_valid = (
+        raw.get("agent_instructions") == _agent_instructions_metadata()
+    )
     release_root = manifest_path.parent.resolve()
     snapshot_paths = raw.get("snapshot_paths") if isinstance(raw.get("snapshot_paths"), dict) else {}
     canonical_runtime = EXPECTED_STABLE_RUNTIME
@@ -2808,6 +2911,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         source_snapshot_identity_valid,
         embedded_contract_valid,
         entrypoint_contract_identity_valid,
+        agent_instructions_identity_valid,
         protocol_identity_valid,
     ))
     runtime_binding_valid = all((
@@ -2835,7 +2939,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         key: raw.get(key)
         for key in (
             "schema_version", "release_id", "repo_head",
-            "entrypoint_contract_sha256", "source_sha256",
+            "entrypoint_contract_sha256", "agent_instructions", "source_sha256",
             "source_sha256s", "runtime_input_sha256", "runtime_lock_sha256",
             "mcp_protocol_version", "python_version",
             "python_implementation", "platform", "executable",
@@ -2859,6 +2963,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         "source_identity_by_module": module_identity_by_module,
         "embedded_contract_valid": embedded_contract_valid,
         "entrypoint_contract_identity_valid": entrypoint_contract_identity_valid,
+        "agent_instructions_identity_valid": agent_instructions_identity_valid,
         "entrypoint_path_valid": entrypoint_path_valid,
         "release_python_identity_valid": release_python_identity_valid,
         "executable_identity_valid": executable_identity_valid,
@@ -3058,6 +3163,7 @@ def grabowski_status(
         "manifest_parse_valid",
         "manifest_schema_valid",
         "repo_head_valid",
+        "agent_instructions_identity_valid",
         "runtime_binding_valid",
         "environment_compatibility_valid",
         "provenance_valid",
@@ -3076,6 +3182,8 @@ def grabowski_status(
         warnings.append({"code": "kill_switch_engaged"})
     if not bool(tool_contract.get("runtime_matches_deployment_contract")):
         warnings.append({"code": "runtime_tool_contract_drift"})
+    if not bool(deployment.get("agent_instructions_identity_valid")):
+        warnings.append({"code": "agent_instructions_drift"})
     if not bool(tool_contract.get("client_snapshot_observable")):
         warnings.append({
             "code": "client_snapshot_unobservable",
@@ -3113,6 +3221,13 @@ def grabowski_status(
                 "refresh_required_when_client_count_or_hash_differs"
             ),
         },
+        "agent_instructions": {
+            **_agent_instructions_metadata(),
+            "runtime_matches_deployment_manifest": deployment.get(
+                "agent_instructions_identity_valid"
+            ),
+            "client_compliance_observable": False,
+        },
         "warnings": warnings,
         "recommended_next_action": (
             "inspect warnings before mutation" if warnings else "none"
@@ -3121,9 +3236,11 @@ def grabowski_status(
             "release_id": deployment.get("release_id"),
             "repo_head": deployment.get("repo_head"),
             "audit_last_record_sha256": audit.get("last_record_sha256"),
+            "agent_instructions_sha256": AGENT_INSTRUCTIONS_SHA256,
         },
         "does_not_establish": [
             "client_snapshot_freshness",
+            "client_instruction_compliance",
             "individual_tool_behavior_correctness",
             "future_action_authority",
         ],

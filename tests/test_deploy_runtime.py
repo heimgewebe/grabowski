@@ -14,6 +14,11 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "tools" / "deploy_runtime.py"
+TEST_AGENT_INSTRUCTIONS = (
+    "Grabowski agent-facing contract grabowski-agent-facing-contract-v1 "
+    "(schema 1).\n"
+    "1. [truth-hierarchy] Runtime truth first."
+)
 
 
 def load_module():
@@ -102,6 +107,25 @@ class DeployRuntimeTests(unittest.TestCase):
             release_path=release_path if release_path is not None else runtime.parent / "new",
             previous=previous,
         )
+
+    def test_agent_instructions_identity_is_versioned_hash_bound_and_bounded(self) -> None:
+        identity = deploy_runtime.agent_instructions_identity(TEST_AGENT_INSTRUCTIONS)
+        self.assertEqual(identity["schema_version"], 1)
+        self.assertEqual(identity["version"], "grabowski-agent-facing-contract-v1")
+        self.assertEqual(identity["bytes"], len(TEST_AGENT_INSTRUCTIONS.encode("utf-8")))
+        self.assertEqual(identity["max_bytes"], 4_096)
+        self.assertEqual(len(identity["sha256"]), 64)
+
+    def test_agent_instructions_identity_rejects_missing_header_and_oversize(self) -> None:
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "Vertragskopf"):
+            deploy_runtime.agent_instructions_identity("not versioned")
+        oversized = (
+            "Grabowski agent-facing contract grabowski-agent-facing-contract-v1 "
+            "(schema 1).\n"
+            + "x" * 4_096
+        )
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "Größenbegrenzung"):
+            deploy_runtime.agent_instructions_identity(oversized)
 
     def test_sha256_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -406,7 +430,16 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "site_packages_path", side_effect=lambda python: python.parents[1] / "lib/python3.10/site-packages"),
                 patch.object(deploy_runtime, "verify_installed_distributions"),
                 patch.object(deploy_runtime, "import_module_path", side_effect=lambda python, module: python.parents[1] / "lib/python3.10/site-packages/grabowski_mcp.py"),
-                patch.object(deploy_runtime, "probe_mcp", return_value="2025-06-18"),
+                patch.object(
+                    deploy_runtime,
+                    "probe_mcp",
+                    return_value=deploy_runtime.MCPProbeResult(
+                        protocol_version="2025-06-18",
+                        agent_instructions=deploy_runtime.agent_instructions_identity(
+                            TEST_AGENT_INSTRUCTIONS
+                        ),
+                    ),
+                ),
                 patch.object(deploy_runtime, "python_provenance", return_value={"python_version": "3.10.12", "python_implementation": "CPython", "platform": "linux", "executable": "python", "pip_version": "pip 25"}),
             ):
                 result = deploy_runtime.build_release(
@@ -506,6 +539,9 @@ class DeployRuntimeTests(unittest.TestCase):
                 snapshot.contract.module: release / ".venv/lib/python3.10/site-packages/grabowski_mcp.py"
             },
             protocol_version="2025-06-18",
+            agent_instructions=deploy_runtime.agent_instructions_identity(
+                TEST_AGENT_INSTRUCTIONS
+            ),
             provenance={
                 "python_version": "3.10.12",
                 "python_implementation": "CPython",

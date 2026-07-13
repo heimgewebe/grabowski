@@ -119,6 +119,11 @@ class MultiSourceDeployTests(unittest.TestCase):
                 entrypoint_path=operator_path,
                 module_paths=module_paths,
                 protocol_version="2025-06-18",
+                agent_instructions=deploy_runtime.agent_instructions_identity(
+                    "Grabowski agent-facing contract "
+                    "grabowski-agent-facing-contract-v1 (schema 1).\n"
+                    "1. [truth-hierarchy] Runtime truth first."
+                ),
                 provenance={
                     "python_version": "3.10.12",
                     "python_implementation": "CPython",
