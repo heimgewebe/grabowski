@@ -121,16 +121,21 @@ Zulässige zusätzliche Flächen sind:
 - `live_freshness`.
 
 Der MCP-Startbefehl wird als Argumentliste übernommen, nicht als
-Shell-Zeichenkette. `--strict-mcp-config` verhindert das Laden weiterer
-Projekt-, Nutzer- oder Plugin-Server.
+Shell-Zeichenkette. Beide Bedingungen erhalten eine create-only MCP-Datei:
+Baseline mit leerem `mcpServers`-Objekt, Treatment ausschließlich mit
+`repobrief`. `--strict-mcp-config` ignoriert weitere Projekt-, Nutzer- und
+Plugin-Konfigurationen; Baseline sperrt zusätzlich `mcp__*`.
 
 ## Claude-Prozess
 
 Der Livepfad startet Claude nicht interaktiv und ohne Sitzungsfortsetzung:
 
-- `--safe-mode` zum Deaktivieren von Projekt- und Nutzeranpassungen bei erhaltener Authentisierung;
-- `--no-chrome` zum Ausschalten der Browserintegration;
-- `--disable-slash-commands` zum Ausschalten von Skills und Slash-Kommandos;
+- absoluter Claude-Binärpfad plus verpflichtende SHA-256-Bindung vor und nach
+  dem Prozess;
+- `--setting-sources=` und isolierte Inline-Settings ohne Nutzer-, Projekt-
+  oder lokale Settings, Hooks, Skills, Workflows, Artifact, Remote Control und
+  nichtverwaltete `CLAUDE.md`-Dateien;
+- `--no-chrome` und `--disable-slash-commands`;
 - Print-Modus `-p`;
 - exakte `--model`-Bindung;
 - `--output-format stream-json`;
@@ -139,29 +144,40 @@ Der Livepfad startet Claude nicht interaktiv und ohne Sitzungsfortsetzung:
 - `--no-session-persistence`;
 - `--permission-mode dontAsk`;
 - strukturierte Ausgabe über den fest eingebauten JSON-Schema-Vertrag;
-- explizite Tool- und Allowed-Tool-Listen;
+- explizite Tool- und MCP-Listen;
+- keine globale Freigabe für `Read`, `Glob` oder `Grep`: diese Werkzeuge sind
+  nur im isolierten Arbeitsverzeichnis ohne Rückfrage lesbar; Zugriffe außerhalb
+  werden im `dontAsk`-Modus abgewiesen;
+- `--allowedTools` nur für die exakt benannten RepoBrief-Behandlungswerkzeuge;
 - eine ausdrückliche Live-Freigabe über `--allow-live-provider`;
 - eine pro Einzelaufruf verpflichtende Provider-Kostenschwelle über
   `--max-budget-usd`.
 
-Fixture-Ausführung und Live-Freigabe schließen sich gegenseitig aus. Der Runner
-prüft diese Grenze vor Request-Root, Repository-Map, Checkout und Transcript,
-damit eine fehlende Freigabe keine einmalige Workspace-Identität verbraucht.
+Fixture-Ausführung und Live-Freigabe, Provider-Credentials sowie Binärbindung
+schließen sich gegenseitig aus. Der Runner prüft diese Grenzen vor Request-Root,
+Repository-Map, Checkout und Transcript, damit ein ungültiger Dispatch keine
+einmalige Workspace-Identität verbraucht.
 
-Die Umgebung wird auf eine kleine Allowlist reduziert. Der Runner übernimmt
-nur Pfad-, Home-, Sprach-, Temp- und explizite Anthropic-API-Umgebungswerte.
+Für OAuth wird ausschließlich die angegebene reguläre, nicht verlinkte, nicht
+gruppen- oder weltlesbare und auf 64 KiB begrenzte `.credentials.json` in ein
+privates Laufverzeichnis kopiert.
+`CLAUDE_CONFIG_DIR` zeigt nur auf dieses Verzeichnis. Nach jedem Providerprozess
+wird das gesamte Laufverzeichnis entfernt, auch bei Fehlern. Nutzerhistorie,
+Memory, Settings, Sessions und Plugins werden nicht übernommen.
 
-Der Safe-Mode erhält die vom Claude-Client verwaltete Authentisierung, aktiviert
-aber keine Projekt-Hooks, Skills, Plugins, MCP-Server oder Memory-Flächen. Die
-weiterhin mögliche Auflistung installierter Katalogmetadaten im `system/init`
-belegt keine Aktivierung; maßgeblich ist die streng validierte Tool-Liste.
+Die Umgebung wird auf Pfad-, Home-, Sprach- und Tempwerte reduziert.
+`ANTHROPIC_API_KEY` wird ausdrücklich nicht vererbt.
+`ENABLE_CLAUDEAI_MCP_SERVERS=false` deaktiviert kontoweite Claude.ai-Connectoren,
+während der explizite `--mcp-config`-Server erhalten bleibt.
+`CLAUDE_CODE_SKIP_PROMPT_HISTORY=1` ergänzt `--no-session-persistence`.
 
 Prozesszeit, Standardausgabe und Standardfehler sind begrenzt. Überschreitung,
 Timeout, Startfehler oder nichtleerer Standardfehler führen zum Abbruch. Es
 gibt keinen automatischen Retry.
 
-Die Kostenschwelle wird an Claude weitergereicht und der gemeldete
-`total_cost_usd`-Wert nach dem Lauf erneut gegen dieselbe Schwelle geprüft. Ein
+Die Kostenschwelle ist auf höchstens 1,00 USD pro Providerprozess begrenzt,
+wird an Claude weitergereicht und der gemeldete `total_cost_usd`-Wert nach dem
+Lauf erneut gegen dieselbe Schwelle geprüft. Ein
 Provider-Budgetfehler erzeugt keinen Erfolgsreceipt. Da eine bereits laufende
 Provideranfrage die Schwelle technisch geringfügig überschreiten kann, ist die
 Schwelle kein mathematisch harter Ausgabenstopp; der Live-Preflight muss deshalb
@@ -283,6 +299,12 @@ aufgenommen:
   "/private/path/to/benchmark-state",
   "--transcript-root",
   "/private/path/to/benchmark-transcripts",
+  "--claude-command",
+  "/absolute/versioned/path/to/claude",
+  "--claude-command-sha256",
+  "<64 lowercase hex characters>",
+  "--claude-credential-file",
+  "/private/path/to/.credentials.json",
   "--allow-live-provider",
   "--max-budget-usd",
   "0.05"
