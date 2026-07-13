@@ -259,7 +259,7 @@ def _sandbox_probe_python() -> str:
         if not resolved.is_relative_to(usr_root):
             continue
         if resolved.is_file() and os.access(resolved, os.X_OK):
-            return str(candidate)
+            return str(resolved)
     raise RuntimeError("no Python interpreter is available inside the minimal role sandbox")
 
 
