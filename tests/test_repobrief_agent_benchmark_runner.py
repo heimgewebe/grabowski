@@ -642,6 +642,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 )
             credential = root / "credentials.json"
             credential.write_bytes(b"{}")
+            credential.chmod(0o600)
             with self.assertRaisesRegex(
                 runner.RunnerError, "requires claude_command_sha256"
             ):
