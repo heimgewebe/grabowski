@@ -1,30 +1,111 @@
-name: temporary PR 180 diagnostics
+name: temporary PR 180 runner hardening
 
 on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
+  harden:
+    if: github.head_ref == 'feat/repobrief-benchmark-runner-v1'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          persist-credentials: true
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
-      - name: Capture full validation
+      - name: Apply exact provider-stream hardening
         shell: bash
         run: |
-          set -o pipefail
-          make validate 2>&1 | tee pr180-validate.log
-      - name: Upload diagnostics
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
-        with:
-          name: pr180-validation-${{ github.run_id }}
-          path: pr180-validate.log
-          if-no-files-found: error
-          retention-days: 7
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/repobrief_agent_benchmark_runner.py")
+          text = path.read_text(encoding="utf-8")
+          old_init = '''    available = set(_list(init.get("tools")))
+              allowed = set(READ_ONLY_BUILTINS)
+              if request.get("condition") == "treatment":
+                  allowed.update(TREATMENT_RESOURCE_TOOLS)
+                  allowed.update(TREATMENT_MCP_TOOLS)
+              unknown = available.difference(allowed)
+              if unknown:
+                  raise RunnerError(f"provider exposed unapproved tools: {sorted(unknown)!r}")
+              if not set(READ_ONLY_BUILTINS).issubset(available):
+                  raise RunnerError("provider did not expose all read-only baseline tools")
+              return model
+          '''.replace("              ", "")
+          new_init = '''    available = set(_list(init.get("tools")))
+              required = set(READ_ONLY_BUILTINS)
+              allowed = set(required)
+              if request.get("condition") == "treatment":
+                  treatment_tools = set(TREATMENT_RESOURCE_TOOLS) | set(TREATMENT_MCP_TOOLS)
+                  required.update(treatment_tools)
+                  allowed.update(treatment_tools)
+              unknown = available.difference(allowed)
+              if unknown:
+                  raise RunnerError(f"provider exposed unapproved tools: {sorted(unknown)!r}")
+              missing = required.difference(available)
+              if missing:
+                  raise RunnerError(
+                      f"provider did not expose all required tools: {sorted(missing)!r}"
+                  )
+              return model
+          '''.replace("              ", "")
+          if old_init in text:
+              text = text.replace(old_init, new_init, 1)
+          elif new_init not in text:
+              raise SystemExit("expected init validation block not found")
+
+          anchor = '''def _usage(request: Mapping[str, Any], result: Mapping[str, Any]) -> tuple[int, int]:
+          '''.replace("          ", "")
+          session_function = '''def _validate_provider_session(
+              init: Mapping[str, Any], result: Mapping[str, Any]
+          ) -> None:
+              init_session = _require_string(
+                  init.get("session_id"), "provider init session", maximum=300
+              )
+              result_session = _require_string(
+                  result.get("session_id"), "provider result session", maximum=300
+              )
+              if init_session != result_session:
+                  raise RunnerError("provider result session does not match init session")
+
+
+          '''.replace("          ", "")
+          if session_function not in text:
+              if anchor not in text:
+                  raise SystemExit("usage anchor not found")
+              text = text.replace(anchor, session_function + anchor, 1)
+
+          old_receipt = '''    model = _validate_init(request, init)
+              input_tokens, output_tokens = _usage(request, result)
+          '''.replace("              ", "")
+          new_receipt = '''    model = _validate_init(request, init)
+              _validate_provider_session(init, result)
+              input_tokens, output_tokens = _usage(request, result)
+          '''.replace("              ", "")
+          if old_receipt in text:
+              text = text.replace(old_receipt, new_receipt, 1)
+          elif new_receipt not in text:
+              raise SystemExit("receipt validation block not found")
+
+          path.write_text(text, encoding="utf-8")
+          PY
+      - name: Commit hardening when changed
+        shell: bash
+        run: |
+          if git diff --quiet -- tools/repobrief_agent_benchmark_runner.py; then
+            echo "runner already hardened"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tools/repobrief_agent_benchmark_runner.py
+          git commit -m "fix: harden benchmark provider stream binding"
+          git push origin HEAD:${{ github.head_ref }}
