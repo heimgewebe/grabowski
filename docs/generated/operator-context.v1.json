@@ -1436,7 +1436,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Derive advisory cross-workspace proposals from at least two immutable reports.",
+      "description": "Derive advisory cross-workspace proposals from repeated actionable failures.",
       "effects": [
         "task-state-refresh"
       ],
@@ -1948,11 +1948,11 @@
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c8c47bda693fbf40df69344aa527bf94ff1820cc5be86ea48b14f452100f9b54",
-      "src/grabowski_agent_competition.py": "c07bf7b790a832c3e581e6384ab2da2e77da96daff7e57fe66ea4c1bb8857359",
+      "src/grabowski_agent_competition.py": "1564c441fc90f6da41bbf3f11c74bc91b57b1358188530d106fbc0dc59ea3abb",
       "src/grabowski_agent_role.py": "011cb799cb9f331d763b470af220cdf8f5f3359766fcfa9bc9badcd3e5542537",
       "src/grabowski_agent_sandbox.py": "c42b2085d60ce9a28d210f6d678937ad235f94d2c7b51bc5026212b6e5bafd7a",
-      "src/grabowski_agent_workspace.py": "1a6495a53600c1022ab717cd2f79bc444031039a0c81bebbc5f0d13bab17cf97",
-      "src/grabowski_agent_workspace_observer.py": "192a3602db277c5b19a9553095cfa8b37ca60f39ca47f16d526c8a50365c64ba",
+      "src/grabowski_agent_workspace.py": "34c5c62a4185ab40ae6b34f30f2b5b7a4ceea7f578ca1638d4ba87cac8cabd76",
+      "src/grabowski_agent_workspace_observer.py": "728633a7a309f08d3cd293c3ecb2b7ad237c37af82b2d6aee496d9f533b9fb90",
       "src/grabowski_agent_writer.py": "136646fa508ed14d2ea345d7c56ff589036550d97f0ae7376cc3d23216b1bee4",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
