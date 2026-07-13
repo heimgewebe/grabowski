@@ -112,6 +112,20 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertIn("resource_leases", result["immutable_boundaries"])
         self.assertTrue(result["call_rules"]["one_independent_intent_per_call"])
         self.assertFalse(result["call_rules"]["unchanged_mutation_retry_allowed"])
+        self.assertFalse(result["call_rules"]["generic_sync_shell_composition_allowed"])
+        self.assertFalse(result["call_rules"]["generic_sync_indirect_execution_allowed"])
+        self.assertEqual(result["call_rules"]["generic_sync_timeout_ceiling_seconds"], 30)
+        self.assertEqual(result["call_rules"]["generic_sync_output_ceiling_bytes"], 64 * 1024)
+        self.assertFalse(result["call_rules"]["client_selected_sync_timeout_allowed"])
+        self.assertFalse(result["call_rules"]["client_selected_sync_output_limit_allowed"])
+        self.assertEqual(result["enforced_runtime_boundaries"]["limits_owned_by"], "server")
+        self.assertEqual(
+            result["enforced_runtime_boundaries"]["long_running_required_route"],
+            "durable_task",
+        )
+        self.assertTrue(
+            result["enforced_runtime_boundaries"]["internal_server_timeouts_retained"]
+        )
 
 
 if __name__ == "__main__":

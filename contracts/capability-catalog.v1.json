@@ -505,7 +505,7 @@
     },
     {
       "category": "command",
-      "description": "Run one non-interactive command and return redacted output.",
+      "description": "Run one direct command with fixed server-owned synchronous limits.",
       "effects": [
         "command-dependent"
       ],
@@ -808,7 +808,7 @@
     },
     {
       "category": "fleet",
-      "description": "Run one argv command on one registered local or SSH host.",
+      "description": "Run one fleet command with fixed server-owned synchronous limits.",
       "effects": [
         "remote-command-dependent"
       ],
