@@ -1,0 +1,148 @@
+name: temporary RepoBrief preflight final security fixes
+
+on:
+  push:
+    branches:
+      - feat/repobrief-live-preflight-v1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/repobrief-live-preflight-v1
+          fetch-depth: 0
+      - name: Apply exact final fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('tools/repobrief_agent_benchmark_preflight.py')
+          text = path.read_text(encoding='utf-8')
+          replacements = [
+              (
+                  'def _mcp_environment() -> dict[str, str]:\n'
+                  '    allowed = {"PATH", "LANG", "LC_ALL", "TMPDIR"}\n'
+                  '    environment = {key: value for key, value in os.environ.items() if key in allowed}\n'
+                  '    environment["HOME"] = "/nonexistent/repobrief-preflight"\n'
+                  '    return environment\n\n\n',
+                  'def _unprivileged_environment() -> dict[str, str]:\n'
+                  '    allowed = {"PATH", "LANG", "LC_ALL", "TMPDIR"}\n'
+                  '    environment = {key: value for key, value in os.environ.items() if key in allowed}\n'
+                  '    environment["HOME"] = "/nonexistent/repobrief-preflight"\n'
+                  '    return environment\n\n\n'
+                  'def _mcp_environment() -> dict[str, str]:\n'
+                  '    return _unprivileged_environment()\n\n\n',
+              ),
+              (
+                  'def _validate_receipt_external(\n'
+                  '    command_prefix: Sequence[str],\n'
+                  '    *,\n'
+                  '    request_path: Path,\n'
+                  '    receipt_path: Path,\n'
+                  '    transcript_root: Path,\n'
+                  ') -> dict[str, Any]:\n',
+                  'def _validate_receipt_external(\n'
+                  '    command_prefix: Sequence[str],\n'
+                  '    *,\n'
+                  '    request_path: Path,\n'
+                  '    receipt_path: Path,\n'
+                  '    transcript_root: Path,\n'
+                  ') -> dict[str, Any]:\n',
+              ),
+              (
+                  '            env=runner._provider_environment(),\n'
+                  '        )\n'
+                  '    except (OSError, subprocess.SubprocessError) as exc:\n'
+                  '        raise PreflightError("Lenskit receipt validator could not run") from exc\n',
+                  '            env=_unprivileged_environment(),\n'
+                  '        )\n'
+                  '    except (OSError, subprocess.SubprocessError) as exc:\n'
+                  '        raise PreflightError("Lenskit receipt validator could not run") from exc\n',
+              ),
+              (
+                  'def _request_files(request_root: Path) -> list[Path]:\n',
+                  'def _write_report_artifacts(report_path: Path, value: Mapping[str, Any]) -> None:\n'
+                  '    report_path = report_path.expanduser().resolve()\n'
+                  '    digest_path = Path(str(report_path) + ".sha256")\n'
+                  '    if report_path.exists() or digest_path.exists():\n'
+                  '        raise PreflightError("report or digest path already exists")\n'
+                  '    try:\n'
+                  '        _write_private_exclusive(report_path, value)\n'
+                  '        report_bytes = report_path.read_bytes()\n'
+                  '        digest = (\n'
+                  '            f"{_sha256_bytes(report_bytes)}  {report_path.name}\\n"\n'
+                  '        ).encode("ascii")\n'
+                  '        descriptor = os.open(\n'
+                  '            digest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600\n'
+                  '        )\n'
+                  '        with os.fdopen(descriptor, "wb") as handle:\n'
+                  '            handle.write(digest)\n'
+                  '            handle.flush()\n'
+                  '            os.fsync(handle.fileno())\n'
+                  '    except Exception:\n'
+                  '        report_path.unlink(missing_ok=True)\n'
+                  '        digest_path.unlink(missing_ok=True)\n'
+                  '        raise\n\n\n'
+                  'def _request_files(request_root: Path) -> list[Path]:\n',
+              ),
+              (
+                  '        report_path = args.report_out.expanduser().resolve()\n'
+                  '        _write_private_exclusive(report_path, report)\n'
+                  '        report_bytes = report_path.read_bytes()\n'
+                  '        digest_path = Path(str(report_path) + ".sha256")\n'
+                  '        digest = f"{_sha256_bytes(report_bytes)}  {report_path.name}\\n".encode("ascii")\n'
+                  '        digest_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)\n'
+                  '        descriptor = os.open(\n'
+                  '            digest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600\n'
+                  '        )\n'
+                  '        with os.fdopen(descriptor, "wb") as handle:\n'
+                  '            handle.write(digest)\n'
+                  '            handle.flush()\n'
+                  '            os.fsync(handle.fileno())\n',
+                  '        _write_report_artifacts(args.report_out, report)\n',
+              ),
+          ]
+          for old, new in replacements:
+              if old == new:
+                  continue
+              if new in text:
+                  continue
+              if old not in text:
+                  raise SystemExit(f'missing final patch anchor: {old[:120]!r}')
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+
+          tests = Path('tests/test_repobrief_agent_benchmark_preflight.py')
+          text = tests.read_text(encoding='utf-8')
+          text = text.replace(
+              '            environment = preflight._mcp_environment()\n',
+              '            environment = preflight._mcp_environment()\n            validator_environment = preflight._unprivileged_environment()\n',
+              1,
+          )
+          text = text.replace(
+              '        self.assertEqual(environment["HOME"], "/nonexistent/repobrief-preflight")\n',
+              '        self.assertEqual(environment["HOME"], "/nonexistent/repobrief-preflight")\n        self.assertNotIn("ANTHROPIC_API_KEY", validator_environment)\n        self.assertEqual(validator_environment["HOME"], "/nonexistent/repobrief-preflight")\n',
+              1,
+          )
+          addition = '''\n    def test_report_and_digest_are_published_together(self) -> None:\n        with tempfile.TemporaryDirectory() as temporary:\n            root = Path(temporary)\n            report_path = root / "preflight.json"\n            preflight._write_report_artifacts(report_path, {"status": "fixture"})\n            digest_path = Path(str(report_path) + ".sha256")\n            self.assertTrue(report_path.is_file())\n            self.assertTrue(digest_path.is_file())\n            expected = preflight._sha256_bytes(report_path.read_bytes())\n            self.assertTrue(digest_path.read_text(encoding="ascii").startswith(expected))\n            with self.assertRaisesRegex(preflight.PreflightError, "already exists"):\n                preflight._write_report_artifacts(report_path, {"status": "second"})\n'''
+          marker = '\n\nif __name__ == "__main__":\n'
+          if addition not in text:
+              if marker not in text:
+                  raise SystemExit('missing final test marker')
+              text = text.replace(marker, addition + marker, 1)
+          tests.write_text(text, encoding='utf-8')
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tools/repobrief_agent_benchmark_preflight.py tests/test_repobrief_agent_benchmark_preflight.py
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "fix: isolate RepoBrief preflight validation and publication"
+          git push origin HEAD:feat/repobrief-live-preflight-v1
