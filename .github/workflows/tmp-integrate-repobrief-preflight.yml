@@ -3,7 +3,7 @@ name: temporary integrate RepoBrief preflight
 on:
   pull_request:
     branches:
-      - main
+      - integrate/repobrief-live-preflight-v1
 
 permissions:
   contents: write
