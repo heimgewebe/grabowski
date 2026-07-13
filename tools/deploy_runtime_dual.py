@@ -500,6 +500,7 @@ def verify_url_runtime_identity(
     contract: core.RuntimeContract,
     *,
     snapshot: core.Snapshot,
+    agent_instructions: dict[str, Any],
 ) -> dict[str, Any]:
     if not runtime.is_symlink() or runtime.resolve() != release_path.resolve():
         core.fail("Stabiler Runtime-Symlink zeigt nicht auf das ausgewählte Release")
@@ -512,6 +513,7 @@ def verify_url_runtime_identity(
         release_path,
         snapshot=snapshot,
         stable_runtime=runtime,
+        expected_agent_instructions=agent_instructions,
     )
     core.verify_final_release_artifacts(
         release_path,
@@ -639,6 +641,7 @@ def deploy_url(
         build.release_path,
         snapshot=snapshot,
         stable_runtime=runtime,
+        expected_agent_instructions=build.agent_instructions,
     )
     activation = core.ActivationState(
         runtime=runtime,
@@ -694,6 +697,7 @@ def deploy_url(
             runtime,
             snapshot.contract,
             snapshot=snapshot,
+            agent_instructions=build.agent_instructions,
         )
 
         print("PASS: Zwei-Dienste-Deployment erfolgreich")

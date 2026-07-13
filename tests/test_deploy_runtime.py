@@ -32,6 +32,17 @@ def load_module():
 
 
 deploy_runtime = load_module()
+TEST_AGENT_INSTRUCTIONS_IDENTITY = deploy_runtime.agent_instructions_identity(
+    TEST_AGENT_INSTRUCTIONS
+)
+
+
+def _build_result(*args, **kwargs):
+    kwargs.setdefault(
+        "agent_instructions",
+        TEST_AGENT_INSTRUCTIONS_IDENTITY,
+    )
+    return deploy_runtime.BuildResult(*args, **kwargs)
 
 
 class DeployRuntimeTests(unittest.TestCase):
@@ -593,6 +604,84 @@ class DeployRuntimeTests(unittest.TestCase):
                 process={"exe": str(python)},
             )
 
+    def test_verify_manifest_rejects_agent_instructions_handshake_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self._snapshot()
+            self._write_complete_release(release, snapshot, runtime)
+            expected = deploy_runtime.agent_instructions_identity(
+                TEST_AGENT_INSTRUCTIONS
+            )
+            manifest_path = release / deploy_runtime.MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["agent_instructions"]["sha256"] = "f" * 64
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                deploy_runtime.DeployError,
+                "agent_instructions",
+            ):
+                deploy_runtime.verify_manifest(
+                    release,
+                    snapshot=snapshot,
+                    stable_runtime=runtime,
+                    expected_agent_instructions=expected,
+                )
+
+    def test_deploy_rejects_agent_instructions_drift_before_pointer_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "grabowski-mcp"
+            old_release = root / "old"
+            old_release.mkdir()
+            runtime.symlink_to(old_release)
+            new_release = root / "new"
+            (new_release / "inputs/src").mkdir(parents=True)
+            snapshot = self._snapshot()
+            build = _build_result(
+                release_id="new",
+                release_path=new_release,
+                python_exe=new_release / ".venv/bin/python",
+                entrypoint_path=new_release / "module.py",
+                protocol_version="2025-06-18",
+                provenance={},
+            )
+            self._write_manifest(new_release, snapshot, runtime)
+            manifest_path = new_release / deploy_runtime.MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["agent_instructions"]["sha256"] = "f" * 64
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(deploy_runtime, "snapshot_from_git", return_value=snapshot),
+                patch.object(deploy_runtime, "require_runtime_replaceable", return_value=runtime),
+                patch.object(deploy_runtime, "require_profile_matches_contract"),
+                patch.object(deploy_runtime, "observe_service", return_value=self._obs_active()),
+                patch.object(deploy_runtime, "build_release", return_value=build),
+                patch.object(deploy_runtime, "verify_apply_snapshot_unchanged"),
+                patch.object(deploy_runtime, "capture_pointer") as capture_pointer,
+            ):
+                with self.assertRaisesRegex(
+                    deploy_runtime.DeployError,
+                    "agent_instructions",
+                ):
+                    deploy_runtime.deploy(
+                        ROOT,
+                        runtime,
+                        root / "profile.yaml",
+                        timeout_seconds=1,
+                    )
+            capture_pointer.assert_not_called()
+
     def test_final_identity_accepts_complete_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -735,7 +824,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult(
+            build = _build_result(
                 release_id="new",
                 release_path=new_release,
                 python_exe=new_release / ".venv/bin/python",
@@ -861,7 +950,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            build = _build_result("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
 
             def fake_run(argv, **kwargs):
@@ -894,7 +983,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            build = _build_result("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
 
             with (
@@ -921,7 +1010,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            build = _build_result("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
             live_entrypoint = deploy_runtime.EntryPoint(
                 mode="module",
@@ -958,7 +1047,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            build = _build_result("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
 
             def fake_run(argv, **kwargs):
@@ -991,7 +1080,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
+            build = _build_result("new", new_release, new_release / ".venv/bin/python", new_release / "module.py", "2025-06-18", {})
             self._write_manifest(new_release, snapshot, runtime)
 
             with (
@@ -1548,7 +1637,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult(
+            build = _build_result(
                 "new", new_release, new_release / ".venv/bin/python",
                 new_release / "module.py", "2025-06-18", {}
             )
@@ -1591,7 +1680,7 @@ class DeployRuntimeTests(unittest.TestCase):
             new_release = root / "new"
             (new_release / "inputs/src").mkdir(parents=True)
             snapshot = self._snapshot()
-            build = deploy_runtime.BuildResult(
+            build = _build_result(
                 "new", new_release, new_release / ".venv/bin/python",
                 new_release / "module.py", "2025-06-18", {}
             )

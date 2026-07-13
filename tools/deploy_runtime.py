@@ -1237,7 +1237,7 @@ class BuildResult:
     entrypoint_path: Path
     protocol_version: str
     provenance: dict[str, str]
-    agent_instructions: dict[str, Any] = field(default_factory=dict)
+    agent_instructions: dict[str, Any]
 
 
 def mark_incomplete(release_path: Path, phase: str, exc: BaseException) -> None:
@@ -1586,6 +1586,7 @@ def verify_manifest(
     *,
     snapshot: Snapshot,
     stable_runtime: Path | None = None,
+    expected_agent_instructions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = read_manifest(runtime_or_release)
     schema_errors = validate_manifest_schema(manifest)
@@ -1600,6 +1601,10 @@ def verify_manifest(
         "entrypoint_contract_sha256": snapshot.contract_sha256,
         "entrypoint_contract": snapshot.contract.to_manifest(),
     }
+    if expected_agent_instructions is not None:
+        if not _valid_agent_instructions_identity(expected_agent_instructions):
+            fail("Erwartete Agentenanweisungsidentität ist ungültig")
+        expected["agent_instructions"] = expected_agent_instructions
     if stable_runtime is not None:
         expected["expected_stable_runtime_path"] = str(stable_runtime)
     for key, value in expected.items():
@@ -2221,12 +2226,14 @@ def verify_runtime_identity(
     contract: RuntimeContract,
     *,
     snapshot: Snapshot,
+    agent_instructions: dict[str, Any],
 ) -> dict[str, Any]:
     process = verify_running_runtime(release_path, runtime, contract)
     manifest = verify_manifest(
         release_path,
         snapshot=snapshot,
         stable_runtime=runtime,
+        expected_agent_instructions=agent_instructions,
     )
     verify_final_release_artifacts(
         release_path,
@@ -2686,7 +2693,12 @@ def deploy(
 
     build = build_release(snapshot, releases_root_for(runtime), runtime)
     verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
-    verify_manifest(build.release_path, snapshot=snapshot, stable_runtime=runtime)
+    verify_manifest(
+        build.release_path,
+        snapshot=snapshot,
+        stable_runtime=runtime,
+        expected_agent_instructions=build.agent_instructions,
+    )
 
     previous = capture_pointer(runtime)
     activation = ActivationState(
@@ -2753,6 +2765,7 @@ def deploy(
             runtime,
             snapshot.contract,
             snapshot=snapshot,
+            agent_instructions=build.agent_instructions,
         )
 
         print("PASS: Deployment erfolgreich")
@@ -2801,7 +2814,12 @@ def check(repo: Path, runtime: Path) -> None:
         check_runtime = Path(directory) / runtime.name
         releases_root = Path(directory) / RELEASES_DIR_NAME
         build = build_release(snapshot, releases_root, check_runtime)
-        verify_manifest(build.release_path, snapshot=snapshot, stable_runtime=check_runtime)
+        verify_manifest(
+            build.release_path,
+            snapshot=snapshot,
+            stable_runtime=check_runtime,
+            expected_agent_instructions=build.agent_instructions,
+        )
         print("PASS: Deployment-Check ist dependency-locked")
         print(f"Repo-HEAD:       {snapshot.repo_head}")
         print(f"Arbeitsbaum:     {'dirty' if snapshot.dirty else 'clean'}")

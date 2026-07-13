@@ -20,6 +20,14 @@ import deploy_runtime_dual as dual
 
 RUNTIME = Path("/home/alex/.local/share/grabowski-mcp")
 CONTRACT = core.load_contract(ROOT / "config" / "runtime-entrypoint.json")
+TEST_AGENT_INSTRUCTIONS = (
+    "Grabowski agent-facing contract grabowski-agent-facing-contract-v1 "
+    "(schema 1).\n"
+    "1. [truth-hierarchy] Runtime truth first."
+)
+TEST_AGENT_INSTRUCTIONS_IDENTITY = core.agent_instructions_identity(
+    TEST_AGENT_INSTRUCTIONS
+)
 
 
 def observation(active: bool) -> core.ServiceObservation:
@@ -216,6 +224,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             release_path=Path("/release/new"),
             release_id="new",
             protocol_version="2025-06-18",
+            agent_instructions=TEST_AGENT_INSTRUCTIONS_IDENTITY,
         )
 
     def test_url_preflight_requires_operator_listener(self) -> None:
@@ -260,6 +269,39 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "verify:tunnel",
             ],
         )
+
+    def test_url_runtime_identity_binds_expected_agent_instructions(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(release)
+            snapshot = self.snapshot()
+            with (
+                mock.patch.object(core, "verify_manifest", return_value={}) as verify_manifest,
+                mock.patch.object(core, "verify_final_release_artifacts"),
+                mock.patch.object(
+                    dual,
+                    "verify_operator_process",
+                    return_value={"pid": 1},
+                ),
+            ):
+                dual.verify_url_runtime_identity(
+                    release,
+                    runtime,
+                    CONTRACT,
+                    snapshot=snapshot,
+                    agent_instructions=TEST_AGENT_INSTRUCTIONS_IDENTITY,
+                )
+            verify_manifest.assert_called_once_with(
+                release,
+                snapshot=snapshot,
+                stable_runtime=runtime,
+                expected_agent_instructions=TEST_AGENT_INSTRUCTIONS_IDENTITY,
+            )
 
     def test_cutover_order_is_tunnel_then_operator_and_reverse_on_start(self) -> None:
         events: list[str] = []
