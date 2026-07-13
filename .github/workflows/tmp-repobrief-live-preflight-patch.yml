@@ -1,0 +1,224 @@
+name: temporary RepoBrief live preflight patch
+
+on:
+  push:
+    branches:
+      - feat/repobrief-live-preflight-v1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/repobrief-live-preflight-v1
+          fetch-depth: 0
+      - name: Apply exact bounded-cost patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          runner = Path('tools/repobrief_agent_benchmark_runner.py')
+          text = runner.read_text(encoding='utf-8')
+
+          replacements = [
+              (
+                  'from datetime import datetime, timezone\n',
+                  'from datetime import datetime, timezone\nfrom decimal import Decimal, InvalidOperation\n',
+              ),
+              (
+                  'MAX_PLANNED_REQUESTS = 128\n',
+                  'MAX_PLANNED_REQUESTS = 128\nMAX_LIVE_COST_USD = Decimal("10.00")\n',
+              ),
+              (
+                  'def _require_int(value: Any, label: str, *, minimum: int = 0) -> int:\n'
+                  '    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:\n'
+                  '        raise RunnerError(f"{label} must be an integer >= {minimum}")\n'
+                  '    return value\n\n\n',
+                  'def _require_int(value: Any, label: str, *, minimum: int = 0) -> int:\n'
+                  '    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:\n'
+                  '        raise RunnerError(f"{label} must be an integer >= {minimum}")\n'
+                  '    return value\n\n\n'
+                  'def _require_cost(value: Any, label: str, *, maximum: Decimal = MAX_LIVE_COST_USD) -> Decimal:\n'
+                  '    try:\n'
+                  '        cost = Decimal(str(value))\n'
+                  '    except (InvalidOperation, ValueError) as exc:\n'
+                  '        raise RunnerError(f"{label} must be a finite decimal amount") from exc\n'
+                  '    if not cost.is_finite() or cost <= 0 or cost > maximum:\n'
+                  '        raise RunnerError(f"{label} must be > 0 and <= {maximum}")\n'
+                  '    return cost\n\n\n',
+              ),
+              (
+                  'def build_claude_command(\n'
+                  '    request: Mapping[str, Any], *, claude: str, mcp_config: Path | None\n'
+                  ') -> list[str]:\n',
+                  'def build_claude_command(\n'
+                  '    request: Mapping[str, Any],\n'
+                  '    *,\n'
+                  '    claude: str,\n'
+                  '    mcp_config: Path | None,\n'
+                  '    max_cost_usd: Decimal,\n'
+                  ') -> list[str]:\n',
+              ),
+              (
+                  '        "--json-schema",\n'
+                  '        _canonical_json(ANSWER_SCHEMA),\n'
+                  '    ]\n',
+                  '        "--json-schema",\n'
+                  '        _canonical_json(ANSWER_SCHEMA),\n'
+                  '        "--max-budget-usd",\n'
+                  '        format(max_cost_usd, "f"),\n'
+                  '    ]\n',
+              ),
+              (
+                  'def _usage(request: Mapping[str, Any], result: Mapping[str, Any]) -> tuple[int, int]:\n',
+                  'def _provider_cost(result: Mapping[str, Any], max_cost_usd: Decimal) -> Decimal:\n'
+                  '    value = result.get("total_cost_usd")\n'
+                  '    try:\n'
+                  '        cost = Decimal(str(value))\n'
+                  '    except (InvalidOperation, ValueError) as exc:\n'
+                  '        raise RunnerError("provider total_cost_usd is missing or invalid") from exc\n'
+                  '    if not cost.is_finite() or cost < 0:\n'
+                  '        raise RunnerError("provider total_cost_usd is missing or invalid")\n'
+                  '    if cost > max_cost_usd:\n'
+                  '        raise RunnerError("provider total_cost_usd exceeds operator cost ceiling")\n'
+                  '    return cost\n\n\n'
+                  'def _usage(request: Mapping[str, Any], result: Mapping[str, Any]) -> tuple[int, int]:\n',
+              ),
+              (
+                  '    ended_at: datetime,\n'
+                  ') -> dict[str, Any]:\n',
+                  '    ended_at: datetime,\n'
+                  '    max_cost_usd: Decimal,\n'
+                  ') -> dict[str, Any]:\n',
+              ),
+              (
+                  '    input_tokens, output_tokens = _usage(request, result)\n'
+                  '    if returncode != 0 or result.get("is_error") is True or result.get("subtype") != "success":\n',
+                  '    input_tokens, output_tokens = _usage(request, result)\n'
+                  '    _provider_cost(result, max_cost_usd)\n'
+                  '    if returncode != 0 or result.get("is_error") is True or result.get("subtype") != "success":\n',
+              ),
+              (
+                  '    claude: str,\n'
+                  '    stream_fixture: Path | None = None,\n'
+                  ') -> dict[str, Any]:\n',
+                  '    claude: str,\n'
+                  '    max_cost_usd: Decimal,\n'
+                  '    stream_fixture: Path | None = None,\n'
+                  ') -> dict[str, Any]:\n',
+              ),
+              (
+                  '        command = build_claude_command(request, claude=claude, mcp_config=mcp_config)\n',
+                  '        command = build_claude_command(\n'
+                  '            request,\n'
+                  '            claude=claude,\n'
+                  '            mcp_config=mcp_config,\n'
+                  '            max_cost_usd=max_cost_usd,\n'
+                  '        )\n',
+              ),
+              (
+                  '        ended_at=ended,\n'
+                  '    )\n',
+                  '        ended_at=ended,\n'
+                  '        max_cost_usd=max_cost_usd,\n'
+                  '    )\n',
+              ),
+              (
+                  '    parser.add_argument("--claude-command", default="claude")\n',
+                  '    parser.add_argument("--claude-command", default="claude")\n'
+                  '    parser.add_argument(\n'
+                  '        "--max-cost-usd",\n'
+                  '        required=True,\n'
+                  '        help="Hard per-process Claude API spend ceiling; maximum 10.00 USD.",\n'
+                  '    )\n',
+              ),
+              (
+                  '        request = _load_object_bytes(_bounded_stdin(), label="stdin request")\n'
+                  '        receipt = execute(\n',
+                  '        request = _load_object_bytes(_bounded_stdin(), label="stdin request")\n'
+                  '        max_cost_usd = _require_cost(args.max_cost_usd, "max_cost_usd")\n'
+                  '        receipt = execute(\n',
+              ),
+              (
+                  '            claude=args.claude_command,\n'
+                  '            stream_fixture=args.stream_fixture,\n',
+                  '            claude=args.claude_command,\n'
+                  '            max_cost_usd=max_cost_usd,\n'
+                  '            stream_fixture=args.stream_fixture,\n',
+              ),
+          ]
+
+          changed = False
+          for old, new in replacements:
+              if new in text:
+                  continue
+              if old not in text:
+                  raise SystemExit(f'missing exact runner patch anchor: {old[:120]!r}')
+              text = text.replace(old, new, 1)
+              changed = True
+          if changed:
+              runner.write_text(text, encoding='utf-8')
+
+          tests = Path('tests/test_repobrief_agent_benchmark_runner.py')
+          test_text = tests.read_text(encoding='utf-8')
+          test_text = test_text.replace(
+              'from datetime import datetime, timedelta, timezone\n',
+              'from datetime import datetime, timedelta, timezone\nfrom decimal import Decimal\n',
+              1,
+          )
+          test_text = test_text.replace(
+              '            request(), claude="claude", mcp_config=None\n',
+              '            request(), claude="claude", mcp_config=None, max_cost_usd=Decimal("1.00")\n',
+              1,
+          )
+          test_text = test_text.replace(
+              '                mcp_config=config,\n',
+              '                mcp_config=config,\n                max_cost_usd=Decimal("1.00"),\n',
+              1,
+          )
+          test_text = test_text.replace(
+              '            ended_at=started + timedelta(seconds=1),\n',
+              '            ended_at=started + timedelta(seconds=1),\n            max_cost_usd=Decimal("1.00"),\n',
+              1,
+          )
+          test_text = test_text.replace(
+              '            ended_at=started,\n        )\n        self.assertEqual(receipt["tool_calls"][0]["name"], "ask_context")\n',
+              '            ended_at=started,\n            max_cost_usd=Decimal("1.00"),\n        )\n        self.assertEqual(receipt["tool_calls"][0]["name"], "ask_context")\n',
+              1,
+          )
+          test_text = test_text.replace(
+              '                        ended_at=started,\n                    )\n',
+              '                        ended_at=started,\n                        max_cost_usd=Decimal("1.00"),\n                    )\n',
+              1,
+          )
+          test_text = test_text.replace(
+              '                ended_at=started,\n            )\n\n    def test_duplicate_tool_use',
+              '                ended_at=started,\n                max_cost_usd=Decimal("1.00"),\n            )\n\n    def test_duplicate_tool_use',
+              1,
+          )
+          test_text = test_text.replace(
+              '                claude="claude",\n                stream_fixture=fixture,\n',
+              '                claude="claude",\n                max_cost_usd=Decimal("1.00"),\n                stream_fixture=fixture,\n',
+              1,
+          )
+          marker = '    def test_build_receipt_normalizes_provider_evidence(self) -> None:\n'
+          addition = '''    def test_cost_ceiling_is_required_and_forwarded(self) -> None:\n        with self.assertRaisesRegex(runner.RunnerError, "max_cost_usd"):\n            runner._require_cost("0", "max_cost_usd")\n        with self.assertRaisesRegex(runner.RunnerError, "max_cost_usd"):\n            runner._require_cost("10.01", "max_cost_usd")\n        command = runner.build_claude_command(\n            request(),\n            claude="claude",\n            mcp_config=None,\n            max_cost_usd=Decimal("1.00"),\n        )\n        index = command.index("--max-budget-usd")\n        self.assertEqual(command[index + 1], "1.00")\n\n    def test_provider_cost_above_ceiling_is_rejected(self) -> None:\n        value = request()\n        messages = runner.parse_jsonl(stream(value))\n        result = next(item for item in messages if item["type"] == "result")\n        result["total_cost_usd"] = 1.01\n        raw = b"".join(\n            json.dumps(message, sort_keys=True).encode("utf-8") + b"\\n"\n            for message in messages\n        )\n        started = datetime.now(timezone.utc)\n        with self.assertRaisesRegex(runner.RunnerError, "cost ceiling"):\n            runner.build_receipt(\n                value,\n                raw,\n                transcript_artifact="transcript.jsonl",\n                returncode=0,\n                started_at=started,\n                ended_at=started,\n                max_cost_usd=Decimal("1.00"),\n            )\n\n'''
+          if addition not in test_text:
+              if marker not in test_text:
+                  raise SystemExit('missing test insertion anchor')
+              test_text = test_text.replace(marker, addition + marker, 1)
+          tests.write_text(test_text, encoding='utf-8')
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tools/repobrief_agent_benchmark_runner.py tests/test_repobrief_agent_benchmark_runner.py
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "feat: enforce Claude benchmark cost ceiling"
+          git push origin HEAD:feat/repobrief-live-preflight-v1
