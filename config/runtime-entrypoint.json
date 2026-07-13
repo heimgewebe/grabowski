@@ -207,6 +207,10 @@
       "source": "src/grabowski_recall.py"
     },
     {
+      "module": "grabowski_bureau_leases",
+      "source": "src/grabowski_bureau_leases.py"
+    },
+    {
       "module": "grabowski_resources",
       "source": "src/grabowski_resources.py"
     },

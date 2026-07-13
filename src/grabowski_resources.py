@@ -10,6 +10,7 @@ import time
 from typing import Any, Iterable
 
 import grabowski_mcp as base
+import grabowski_bureau_leases as bureau_leases
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -210,6 +211,68 @@ def _public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bureau_metadata_phase(row: sqlite3.Row) -> str | None:
+    try:
+        value = json.loads(row["metadata_json"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    phase = value.get("bureau_phase")
+    return phase if isinstance(phase, str) else None
+
+
+def _check_bureau_semantic_conflicts(
+    connection: sqlite3.Connection,
+    *,
+    keys: list[str],
+    owner: str,
+    now: int,
+    bureau_contract: dict[str, Any] | None,
+) -> None:
+    if bureau_contract is None:
+        return
+    incoming_phase = bureau_contract["phase"]
+    incoming_global_recovery = (
+        incoming_phase == "emergency-recovery"
+        and bureau_leases.BROAD_BUREAU_REPOSITORY_KEY in keys
+    )
+    rows = connection.execute(
+        "SELECT * FROM leases WHERE expires_at_unix>? ORDER BY resource_key",
+        (now,),
+    ).fetchall()
+    nonrenewable_effect_keys = {
+        bureau_leases.BROAD_BUREAU_REPOSITORY_KEY,
+        bureau_leases.BUREAU_MERGE_GATE_KEY,
+        bureau_leases.BUREAU_WORKTREE_ADMIN_KEY,
+    }
+    for row in rows:
+        existing_key = row["resource_key"]
+        if not bureau_leases.is_bureau_resource_key(existing_key):
+            continue
+        same_owner = row["owner_id"] == owner
+        existing_global_recovery = (
+            existing_key == bureau_leases.BROAD_BUREAU_REPOSITORY_KEY
+            and _bureau_metadata_phase(row) == "emergency-recovery"
+        )
+        if incoming_global_recovery or existing_global_recovery:
+            raise ResourceConflict(
+                existing_key,
+                row["owner_id"],
+                row["expires_at_unix"],
+            )
+        if (
+            same_owner
+            and existing_key in keys
+            and existing_key in nonrenewable_effect_keys
+        ):
+            raise ResourceConflict(
+                existing_key,
+                row["owner_id"],
+                row["expires_at_unix"],
+            )
+
+
 def acquire_resources(
     owner_id: str,
     resource_keys: Iterable[str],
@@ -222,13 +285,24 @@ def acquire_resources(
     keys = normalize_resource_keys(resource_keys)
     lease_purpose = _purpose(purpose)
     ttl = _ttl(ttl_seconds)
-    metadata_json, metadata_sha256 = _metadata(metadata)
+    sanitized_metadata = bureau_leases.sanitize_bureau_metadata(keys, metadata)
+    metadata_json, metadata_sha256 = _metadata(sanitized_metadata)
+    bureau_contract = bureau_leases.enforce_bureau_lease_contract(
+        keys, ttl_seconds=ttl, metadata=metadata
+    )
     now = _now()
     expires = now + ttl
     reclaimed: list[dict[str, Any]] = []
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            _check_bureau_semantic_conflicts(
+                connection,
+                keys=keys,
+                owner=owner,
+                now=now,
+                bureau_contract=bureau_contract,
+            )
             existing: dict[str, sqlite3.Row] = {}
             for key in keys:
                 row = connection.execute(
@@ -297,6 +371,7 @@ def acquire_resources(
         "expires_at_unix": expires,
         "leases": [_public(row) for row in rows],
         "reclaimed": reclaimed,
+        "bureau_contract": bureau_contract,
     }
 
 
@@ -309,11 +384,21 @@ def renew_resources(
     owner = _owner(owner_id)
     keys = normalize_resource_keys(resource_keys)
     ttl = _ttl(ttl_seconds)
+    bureau_contract = bureau_leases.enforce_bureau_lease_renewal(
+        keys, ttl_seconds=ttl
+    )
     now = _now()
     expires = now + ttl
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            _check_bureau_semantic_conflicts(
+                connection,
+                keys=keys,
+                owner=owner,
+                now=now,
+                bureau_contract=bureau_contract,
+            )
             for key in keys:
                 row = connection.execute(
                     "SELECT owner_id, expires_at_unix FROM leases WHERE resource_key=?",
@@ -339,7 +424,11 @@ def renew_resources(
         except Exception:
             connection.rollback()
             raise
-    return {"owner_id": owner, "leases": [_public(row) for row in rows]}
+    return {
+        "owner_id": owner,
+        "leases": [_public(row) for row in rows],
+        "bureau_contract": bureau_contract,
+    }
 
 
 def release_resources(
@@ -435,6 +524,7 @@ def grabowski_resource_acquire(
             "resource_keys": [item["resource_key"] for item in result["leases"]],
             "expires_at_unix": result["expires_at_unix"],
             "reclaimed_count": len(result["reclaimed"]),
+            "bureau_contract": result.get("bureau_contract"),
         }
     )
     return result
@@ -455,6 +545,7 @@ def grabowski_resource_renew(
             "operation": "resource-renew",
             "owner_id": result["owner_id"],
             "resource_keys": [item["resource_key"] for item in result["leases"]],
+            "bureau_contract": result.get("bureau_contract"),
         }
     )
     return result
