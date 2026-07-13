@@ -41,7 +41,7 @@ The exception is denied when:
 - the blocking lease lacks a scope manifest, belongs to the requester, changed, expired or has less than 30 seconds remaining;
 - the blocker is marked `lease_mode=emergency-recovery`;
 - owner, purpose, exact resources or requested scope changed after assessment;
-- the proof is stale, future-dated, tampered with, ambiguous or shorter than the requested lease;
+- the proof is stale, future-dated, tampered with, carries non-canonical axis evidence, is ambiguous or shorter than the requested lease;
 - an exact resource key is already held by another owner;
 - no live blocker or more than one plausible blocker exists;
 - Bureau and non-Bureau keys are mixed, or the dedicated Bureau always-open contract applies instead.

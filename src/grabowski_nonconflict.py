@@ -403,7 +403,7 @@ def create_nonconflict_proof(
     now: int | None = None,
 ) -> dict[str, Any]:
     issued = int(time.time()) if now is None else int(now)
-    if not isinstance(proof_ttl_seconds, int) or not 30 <= proof_ttl_seconds <= MAX_PROOF_TTL_SECONDS:
+    if type(proof_ttl_seconds) is not int or not 30 <= proof_ttl_seconds <= MAX_PROOF_TTL_SECONDS:
         raise ValueError(f"proof_ttl_seconds must be between 30 and {MAX_PROOF_TTL_SECONDS}")
     if requested_scope_complete is not True:
         raise NonConflictDenied(
@@ -523,10 +523,8 @@ def validate_public_proof(proof: Any, *, now: int | None = None) -> dict[str, An
         observed_axes.append(item["axis"] if isinstance(item["axis"], str) else "")
         if item["status"] != "disjoint" or item["overlap_count"] != 0:
             raise NonConflictDenied("proof-axis-conflict", "nonconflict proof contains a conflicting axis")
-        if not isinstance(item["overlap_sha256"], str) or re.fullmatch(
-            r"[0-9a-f]{64}", item["overlap_sha256"]
-        ) is None:
-            raise ValueError("nonconflict proof axis hash is invalid")
+        if item["overlap_sha256"] != _sha256([]):
+            raise ValueError("disjoint axis hash must bind an empty overlap set")
     if tuple(observed_axes) != EXPECTED_AXIS_NAMES:
         raise ValueError("nonconflict proof axis order or membership is invalid")
     if proof["does_not_establish"] != DOES_NOT_ESTABLISH:
@@ -567,6 +565,13 @@ def validate_proof_against_live_lease(
         raise NonConflictDenied("scope-conflict", "live scopes are no longer disjoint")
     if evaluation["existing_scope_sha256"] != checked.get("existing_scope_sha256"):
         raise NonConflictDenied("existing-scope-drift", "blocked scope changed after proof creation")
+    if evaluation["axis_results"] != checked["axis_results"]:
+        raise NonConflictDenied(
+            "axis-evidence-drift",
+            "conflict-axis evidence changed after proof creation",
+        )
+    if type(requested_ttl_seconds) is not int or requested_ttl_seconds <= 0:
+        raise ValueError("requested_ttl_seconds must be a positive integer")
     if requested_ttl_seconds > MAX_PROOF_TTL_SECONDS or current + requested_ttl_seconds > checked["expires_at_unix"]:
         raise NonConflictDenied("lease-outlives-proof", "requested lease would outlive the non-conflict proof")
     receipt_core = {
