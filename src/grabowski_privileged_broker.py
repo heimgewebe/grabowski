@@ -19,6 +19,8 @@ MAX_ARG_BYTES = 32 * 1024
 MAX_TARGET_BYTES = 48 * 1024
 MAX_GATE_MARKER_BYTES = 64 * 1024
 MAX_RECOVERY_AGE_SECONDS = 7 * 24 * 3600
+RECOVERY_LOCK_TIMEOUT_SECONDS = 2.0
+RECOVERY_LOCK_POLL_SECONDS = 0.02
 RECOVERY_SOURCE_SCHEMA_VERSION = 1
 RECOVERY_RECORD_SCHEMA_VERSION = 2
 RECOVERY_RECORD_KIND = "grabowski_recovery_freshness"
@@ -250,6 +252,8 @@ def _read_safe_regular_file(
             raise PermissionError(f"{label} must be a regular file")
         if before.st_mode & 0o022:
             raise PermissionError(f"{label} must not be group/world writable")
+        if before.st_nlink != 1:
+            raise PermissionError(f"{label} must not have multiple hard links")
         if require_root_owned and before.st_uid != 0:
             raise PermissionError(f"{label} must be root-owned")
         if expected_uid is not None and before.st_uid != expected_uid:
@@ -268,8 +272,16 @@ def _read_safe_regular_file(
     finally:
         os.close(descriptor)
     raw = b"".join(chunks)
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    identity_before = (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+        before.st_ctime_ns, before.st_mode, before.st_uid, before.st_gid,
+        before.st_nlink,
+    )
+    identity_after = (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+        after.st_ctime_ns, after.st_mode, after.st_uid, after.st_gid,
+        after.st_nlink,
+    )
     if len(raw) != before.st_size or identity_before != identity_after:
         raise ValueError(f"{label} changed while being read")
     return raw, before
@@ -470,18 +482,46 @@ def _atomic_write_recovery_record(
         raise PermissionError("recovery destination parent must be root-owned")
     if metadata.st_mode & 0o022:
         raise PermissionError("recovery destination parent must not be group/world writable")
+    parent_identity = (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid, metadata.st_gid)
+    if destination.exists() or destination.is_symlink():
+        existing = destination.lstat()
+        if destination.is_symlink() or not stat.S_ISREG(existing.st_mode):
+            raise PermissionError("recovery destination must be a regular non-symlink file")
+        if require_root_owned_destination and existing.st_uid != 0:
+            raise PermissionError("recovery destination must be root-owned")
+        if existing.st_nlink != 1:
+            raise PermissionError("recovery destination must not have multiple hard links")
+
     raw = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     descriptor, temporary_name = tempfile.mkstemp(prefix=".grabowski-recovery-", dir=parent)
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o644)
         offset = 0
         while offset < len(raw):
             offset += os.write(descriptor, raw[offset:])
         os.fsync(descriptor)
+        os.fchmod(descriptor, 0o644)
+        os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
+
+        current_parent = parent.lstat()
+        current_identity = (
+            current_parent.st_dev, current_parent.st_ino, current_parent.st_mode,
+            current_parent.st_uid, current_parent.st_gid,
+        )
+        if current_identity != parent_identity:
+            raise PermissionError("recovery destination parent changed before replace")
         os.replace(temporary, destination)
+        readback = destination.lstat()
+        if destination.is_symlink() or not stat.S_ISREG(readback.st_mode):
+            raise RuntimeError("recovery destination readback is not a regular file")
+        if stat.S_IMODE(readback.st_mode) != 0o644:
+            raise RuntimeError("recovery destination readback mode is invalid")
+        if require_root_owned_destination and readback.st_uid != 0:
+            raise RuntimeError("recovery destination readback is not root-owned")
+        if readback.st_nlink != 1:
+            raise RuntimeError("recovery destination readback has multiple hard links")
         directory_fd = os.open(parent, os.O_RDONLY | os.O_CLOEXEC)
         try:
             os.fsync(directory_fd)
@@ -570,46 +610,95 @@ def _resolve_recovery_marker_publish_action(
     }
 
 
+def _require_kill_switch_clear(path: Path) -> None:
+    if path.exists():
+        raise PermissionError("power kill-switch is engaged")
+
+
+def _acquire_recovery_lock(
+    descriptor: int,
+    *,
+    timeout_seconds: float | None = None,
+) -> None:
+    timeout = RECOVERY_LOCK_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PermissionError(
+                    "canonical recovery marker is currently locked by another process"
+                ) from exc
+            time.sleep(min(RECOVERY_LOCK_POLL_SECONDS, remaining))
+
+
+def _validated_recovery_source_for_execution(
+    execution: dict[str, Any],
+    *,
+    now: int,
+) -> dict[str, Any]:
+    source_path = Path(execution["source_path"])
+    raw, metadata = _read_safe_regular_file(
+        source_path,
+        label="recovery source record",
+        expected_uid=execution["expected_source_uid"],
+    )
+    validated = _validate_recovery_source_record(
+        raw,
+        source_owner_uid=metadata.st_uid,
+        max_age_seconds=execution["max_recovery_age_seconds"],
+        configured_target=execution["configured_target"],
+        now=now,
+    )
+    source_sha = validated["source_record_sha256"]
+    generated_at = validated["source"]["completed_at_unix"]
+    if (
+        source_sha != execution["expected_source_record_sha256"]
+        or generated_at != execution["expected_generated_at_unix"]
+    ):
+        raise PermissionError("recovery source changed after reference validation")
+    return validated
+
+
 def publish_recovery_marker(execution: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
     if execution.get("mode") != "recovery-marker-publish" or execution.get("internal_action") != "publish-recovery-marker":
         raise ValueError("recovery marker execution contract is invalid")
     current = int(time.time()) if now is None else now
     kill_switch = Path(execution["kill_switch_path"])
-    if kill_switch.exists():
-        raise PermissionError("power kill-switch is engaged")
-    source_path = Path(execution["source_path"])
+    _require_kill_switch_clear(kill_switch)
     destination = Path(execution["destination_path"])
-    expected_uid = execution["expected_source_uid"]
     max_age = execution["max_recovery_age_seconds"]
     configured_target = execution["configured_target"]
-    raw, metadata = _read_safe_regular_file(
-        source_path,
-        label="recovery source record",
-        expected_uid=expected_uid,
-    )
-    validated = _validate_recovery_source_record(
-        raw,
-        source_owner_uid=metadata.st_uid,
-        max_age_seconds=max_age,
-        configured_target=configured_target,
-        now=current,
-    )
-    source_sha = validated["source_record_sha256"]
-    generated_at = validated["source"]["completed_at_unix"]
-    if source_sha != execution["expected_source_record_sha256"] or generated_at != execution["expected_generated_at_unix"]:
-        raise PermissionError("recovery source changed after reference validation")
+    require_root_destination = execution["require_root_owned_destination"]
     lock_path = destination.with_name(destination.name + ".lock")
     lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     lock_fd = os.open(lock_path, lock_flags, 0o600)
+    locked = False
     try:
+        lock_metadata = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_metadata.st_mode):
+            raise PermissionError("canonical recovery lock must be a regular file")
+        if lock_metadata.st_nlink != 1:
+            raise PermissionError("canonical recovery lock must not have multiple hard links")
+        if require_root_destination and lock_metadata.st_uid != 0:
+            raise PermissionError("canonical recovery lock must be root-owned")
         os.fchmod(lock_fd, 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _acquire_recovery_lock(lock_fd)
+        locked = True
+        _require_kill_switch_clear(kill_switch)
+
+        validated = _validated_recovery_source_for_execution(execution, now=current)
+        source_sha = validated["source_record_sha256"]
+        generated_at = validated["source"]["completed_at_unix"]
         existing = inspect_canonical_recovery_record(
             destination,
             now=current,
             expected_max_age_seconds=max_age,
             expected_target=configured_target,
-            require_root_owned=execution["require_root_owned_destination"],
+            require_root_owned=require_root_destination,
         )
         existing_generated = existing.get("generated_at_unix")
         if isinstance(existing_generated, int):
@@ -626,17 +715,22 @@ def publish_recovery_marker(execution: dict[str, Any], *, now: int | None = None
                         "freshness_reason": existing.get("freshness_reason"),
                     }
                 raise PermissionError("recovery generation collision is forbidden")
+
+        _require_kill_switch_clear(kill_switch)
+        final_source = _validated_recovery_source_for_execution(execution, now=current)
+        if final_source["source_record_sha256"] != source_sha:
+            raise PermissionError("recovery source changed before canonical replace")
         _atomic_write_recovery_record(
             destination,
-            validated["canonical_record"],
-            require_root_owned_destination=execution["require_root_owned_destination"],
+            final_source["canonical_record"],
+            require_root_owned_destination=require_root_destination,
         )
         readback = inspect_canonical_recovery_record(
             destination,
             now=current,
             expected_max_age_seconds=max_age,
             expected_target=configured_target,
-            require_root_owned=execution["require_root_owned_destination"],
+            require_root_owned=require_root_destination,
         )
         if not readback.get("valid") or readback.get("source_record_sha256") != source_sha:
             raise RuntimeError("canonical recovery record readback failed")
@@ -649,7 +743,8 @@ def publish_recovery_marker(execution: dict[str, Any], *, now: int | None = None
             "freshness_reason": readback["freshness_reason"],
         }
     finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        if locked:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
 
 

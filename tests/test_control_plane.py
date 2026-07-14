@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -815,6 +816,40 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertIn("raise SystemExit(0)", broker)
         self.assertIn("except Exception as exc:", broker)
         self.assertIn("raise SystemExit(2)", broker)
+
+    def test_recovery_publication_timeout_returns_structured_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(privileged, "POWER_REFERENCE_DIR", root), patch.object(
+                privileged,
+                "grabowski_privileged_broker_status",
+                return_value={"ready": True, "request_client": "/usr/local/bin/grabowski-privileged-request"},
+            ), patch.object(
+                privileged.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(
+                    cmd=["grabowski-privileged-request"],
+                    timeout=45,
+                    stderr=b"broker stalled",
+                ),
+            ), patch.object(privileged, "_append_operator_audit") as append_audit:
+                result = privileged.publish_recovery_marker_reference(
+                    source_record_sha256="a" * 64,
+                    generated_at_unix=123,
+                )
+
+            self.assertFalse(result["success"])
+            self.assertTrue(result["broker_client_timed_out"])
+            self.assertIsNone(result["broker_client_returncode"])
+            self.assertEqual(result["failure_reason"], "privileged broker client timed out")
+            self.assertEqual(list(root.iterdir()), [])
+            append_audit.assert_called_once()
+            self.assertTrue(append_audit.call_args.args[0]["broker_client_timed_out"])
+
+    def test_missing_operator_audit_backend_fails_explicitly(self) -> None:
+        with patch.object(privileged.operator, "base", None):
+            with self.assertRaisesRegex(RuntimeError, "audit backend"):
+                privileged._append_operator_audit({"operation": "test"})
 
     def test_privileged_status_is_fail_closed_without_root_assets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

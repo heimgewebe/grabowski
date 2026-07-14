@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -219,6 +220,109 @@ class RecoveryFreshnessContractTests(unittest.TestCase):
             self.assertEqual(inspected["generated_at_unix"], now)
             self.assertEqual(inspected["snapshot_id"], "newer")
             self.assertEqual(inspected["source_record_sha256"], newer_digest)
+
+    def test_source_is_revalidated_after_lock_acquisition(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.json"
+            destination = root / "canonical.json"
+            digest, _ = _write_source(source, now, snapshot_id="before-lock")
+            execution = _execution(source, destination, digest, now)
+            original_acquire = broker._acquire_recovery_lock
+
+            def acquire_then_replace(descriptor: int, *, timeout_seconds: float | None = None) -> None:
+                original_acquire(descriptor, timeout_seconds=timeout_seconds)
+                _write_source(source, now, snapshot_id="after-lock")
+
+            with patch.object(
+                broker,
+                "_acquire_recovery_lock",
+                side_effect=acquire_then_replace,
+            ):
+                with self.assertRaisesRegex(PermissionError, "source changed"):
+                    broker.publish_recovery_marker(execution, now=now)
+            self.assertFalse(destination.exists())
+
+    def test_lock_contention_fails_within_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            lock = Path(raw) / "canonical.json.lock"
+            flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+            holder = os.open(lock, flags, 0o600)
+            contender = os.open(lock, flags, 0o600)
+            try:
+                broker.fcntl.flock(holder, broker.fcntl.LOCK_EX | broker.fcntl.LOCK_NB)
+                started = time.monotonic()
+                with self.assertRaisesRegex(PermissionError, "currently locked"):
+                    broker._acquire_recovery_lock(contender, timeout_seconds=0.03)
+                self.assertLess(time.monotonic() - started, 0.5)
+            finally:
+                broker.fcntl.flock(holder, broker.fcntl.LOCK_UN)
+                os.close(contender)
+                os.close(holder)
+
+    def test_temporary_record_stays_private_until_fully_written(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.json"
+            destination = root / "canonical.json"
+            digest, _ = _write_source(source, now, snapshot_id="private-temp")
+            observed_modes: list[int] = []
+            original_write = broker.os.write
+
+            def observe_mode(descriptor: int, data: bytes) -> int:
+                observed_modes.append(os.fstat(descriptor).st_mode & 0o777)
+                return original_write(descriptor, data)
+
+            with patch.object(broker.os, "write", side_effect=observe_mode):
+                broker.publish_recovery_marker(
+                    _execution(source, destination, digest, now),
+                    now=now,
+                )
+            self.assertTrue(observed_modes)
+            self.assertEqual(set(observed_modes), {0o600})
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o644)
+
+    def test_source_hardlinks_are_rejected(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.json"
+            destination = root / "canonical.json"
+            digest, _ = _write_source(source, now, snapshot_id="hardlink")
+            os.link(source, root / "source-link.json")
+
+            with self.assertRaisesRegex(PermissionError, "hard links"):
+                broker.publish_recovery_marker(
+                    _execution(source, destination, digest, now),
+                    now=now,
+                )
+            self.assertFalse(destination.exists())
+
+    def test_kill_switch_is_rechecked_after_lock_acquisition(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.json"
+            destination = root / "canonical.json"
+            digest, _ = _write_source(source, now, snapshot_id="kill-switch")
+            execution = _execution(source, destination, digest, now)
+            kill_switch = Path(str(execution["kill_switch_path"]))
+            original_acquire = broker._acquire_recovery_lock
+
+            def acquire_then_stop(descriptor: int, *, timeout_seconds: float | None = None) -> None:
+                original_acquire(descriptor, timeout_seconds=timeout_seconds)
+                kill_switch.write_text("stop\n", encoding="utf-8")
+
+            with patch.object(
+                broker,
+                "_acquire_recovery_lock",
+                side_effect=acquire_then_stop,
+            ):
+                with self.assertRaisesRegex(PermissionError, "kill-switch"):
+                    broker.publish_recovery_marker(execution, now=now)
+            self.assertFalse(destination.exists())
 
     def test_publish_action_is_fixed_and_has_no_argv_contract(self) -> None:
         now = int(time.time())

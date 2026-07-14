@@ -502,6 +502,23 @@ def _write_server_marker(*, completed_at_unix: int, snapshot_id: str) -> dict[st
     }
 
 
+def _publication_failure_detail(publication: dict[str, Any]) -> str:
+    candidates = (
+        publication.get("failure_reason"),
+        publication.get("stderr"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return " ".join(candidate.split())[:500]
+    response = publication.get("broker_response")
+    if isinstance(response, dict):
+        for key in ("error", "message"):
+            candidate = response.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return " ".join(candidate.split())[:500]
+    return "no structured failure reason was returned"
+
+
 def server_recovery_probe() -> dict[str, Any]:
     http_password = _read_secret_text(SERVER_RECOVERY_HTTP_PASSWORD)
     if not _bounded_file(SERVER_RECOVERY_REPOSITORY_PASSWORD):
@@ -580,7 +597,10 @@ def server_recovery_probe() -> dict[str, Any]:
                 generated_at_unix=source_write["generated_at_unix"],
             )
             if not publication.get("success"):
-                raise RuntimeError("canonical root recovery publication failed")
+                raise RuntimeError(
+                    "canonical root recovery publication failed: "
+                    + _publication_failure_detail(publication)
+                )
     finally:
         _terminate_process(tunnel)
         tunnel_stdout_path.write_bytes(tunnel_stdout_capture.finish())

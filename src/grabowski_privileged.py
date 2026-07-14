@@ -125,6 +125,14 @@ def _redact_text(value: str, extra_secrets: list[str] | None = None) -> str:
     return redactor(value, extra_secrets)
 
 
+def _append_operator_audit(record: dict[str, Any]) -> None:
+    backend = getattr(operator, "base", None)
+    append = getattr(backend, "_append_audit", None)
+    if not callable(append):
+        raise RuntimeError("operator audit backend is unavailable")
+    append(record)
+
+
 def _limit_text(value: str, limit: int) -> tuple[str, bool]:
     limiter = getattr(operator, "_limit", None)
     if limiter is not None:
@@ -246,8 +254,12 @@ def publish_recovery_marker_reference(
     source_record_sha256: str,
     generated_at_unix: int,
 ) -> dict[str, Any]:
-    if not isinstance(source_record_sha256, str) or len(source_record_sha256) != 64:
-        raise ValueError("source_record_sha256 must be a SHA-256 digest")
+    if (
+        not isinstance(source_record_sha256, str)
+        or len(source_record_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in source_record_sha256)
+    ):
+        raise ValueError("source_record_sha256 must be a lowercase SHA-256 digest")
     if isinstance(generated_at_unix, bool) or not isinstance(generated_at_unix, int):
         raise ValueError("generated_at_unix must be an integer")
     broker = grabowski_privileged_broker_status()
@@ -269,6 +281,8 @@ def publish_recovery_marker_reference(
     )
     reference_path = _write_power_reference(reference)
     client = str(broker["request_client"])
+    client_timed_out = False
+    broker_client_returncode: int | None
     try:
         completed = subprocess.run(
             [client, str(reference_path)],
@@ -280,22 +294,45 @@ def publish_recovery_marker_reference(
             check=False,
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
         )
+        broker_client_returncode = completed.returncode
+        stdout_raw = completed.stdout
+        stderr_raw = completed.stderr
+    except subprocess.TimeoutExpired as exc:
+        client_timed_out = True
+        broker_client_returncode = None
+        stdout_raw = exc.stdout or b""
+        stderr_raw = exc.stderr or b"privileged broker client timed out"
     finally:
-        reference_path.unlink(missing_ok=True)
-    stdout = _redact_text(completed.stdout.decode("utf-8", errors="replace"))
-    stderr = _redact_text(completed.stderr.decode("utf-8", errors="replace"))
+        try:
+            reference_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    stdout = _redact_text(stdout_raw.decode("utf-8", errors="replace"))
+    stderr = _redact_text(stderr_raw.decode("utf-8", errors="replace"))
     try:
         parsed = json.loads(stdout) if stdout.strip() else None
     except json.JSONDecodeError:
         parsed = None
     publication = parsed.get("publication") if isinstance(parsed, dict) else None
     success = bool(
-        completed.returncode == 0
+        broker_client_returncode == 0
+        and not client_timed_out
         and isinstance(parsed, dict)
         and parsed.get("returncode") == 0
         and isinstance(publication, dict)
         and publication.get("freshness_reason") == "ready"
     )
+    failure_reason: str | None = None
+    if client_timed_out:
+        failure_reason = "privileged broker client timed out"
+    elif broker_client_returncode != 0:
+        failure_reason = f"privileged broker client exited with {broker_client_returncode}"
+    elif isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+        failure_reason = parsed["error"]
+    elif not success:
+        failure_reason = stderr.strip() or "privileged broker returned no valid publication receipt"
+
     audit_record = {
         "tool": "publish_recovery_marker_reference",
         "action": RECOVERY_PUBLISH_ACTION,
@@ -303,15 +340,19 @@ def publish_recovery_marker_reference(
         "reference_sha256": reference["reference_sha256"],
         "source_record_sha256": source_record_sha256,
         "generated_at_unix": generated_at_unix,
-        "broker_client_returncode": completed.returncode,
+        "broker_client_returncode": broker_client_returncode,
+        "broker_client_timed_out": client_timed_out,
+        "failure_reason": failure_reason,
         "success": success,
     }
-    getattr(operator, "base")._append_audit(audit_record)
+    _append_operator_audit(audit_record)
     return {
         "success": success,
         "request_id": reference["request_id"],
         "reference_sha256": reference["reference_sha256"],
-        "broker_client_returncode": completed.returncode,
+        "broker_client_returncode": broker_client_returncode,
+        "broker_client_timed_out": client_timed_out,
+        "failure_reason": failure_reason,
         "broker_response": parsed,
         "publication": publication,
         "stderr": stderr,
@@ -419,7 +460,7 @@ def grabowski_power_run(
         "duration_seconds": round(time.monotonic() - started, 3),
         "recovery_checked_at_unix": recovery.get("checked_at_unix"),
     }
-    getattr(operator, "base")._append_audit(audit_record)
+    _append_operator_audit(audit_record)
     return {
         "success": success,
         "execution_model": "recovery-gated-root-power-worker",
