@@ -220,6 +220,23 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         runner.validate_request(request())
         runner.validate_request(request(condition="treatment"))
 
+    def test_validate_request_accepts_known_execution_contract(self) -> None:
+        value = request()
+        value["runner"]["execution_contract"] = runner.EXECUTION_CONTRACT
+
+        runner.validate_request(value)
+
+    def test_validate_request_rejects_unknown_execution_contract_and_fields(self) -> None:
+        unknown_contract = request()
+        unknown_contract["runner"]["execution_contract"] = "unknown-live-contract"
+        with self.assertRaisesRegex(runner.RunnerError, "execution_contract"):
+            runner.validate_request(unknown_contract)
+
+        unknown_field = request()
+        unknown_field["runner"]["unexpected"] = True
+        with self.assertRaisesRegex(runner.RunnerError, "runner contract mismatch"):
+            runner.validate_request(unknown_field)
+
     def test_validate_request_rejects_contract_drift(self) -> None:
         mutations = [
             (lambda value: value.update({"unknown": True}), "unknown fields"),
