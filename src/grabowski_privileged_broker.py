@@ -468,29 +468,53 @@ def inspect_canonical_recovery_record(
     return result
 
 
+def _validated_recovery_destination_parent(
+    destination: Path,
+    *,
+    require_root_owned_destination: bool,
+) -> tuple[Path, tuple[int, int, int, int, int]]:
+    parent = destination.parent
+    metadata = parent.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise PermissionError("recovery destination parent must be a regular directory")
+    if require_root_owned_destination and metadata.st_uid != 0:
+        raise PermissionError("recovery destination parent must be root-owned")
+    if metadata.st_mode & 0o022:
+        raise PermissionError("recovery destination parent must not be group/world writable")
+    return parent, (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _validate_replaceable_recovery_destination(destination: Path) -> None:
+    try:
+        existing = destination.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+        raise PermissionError("recovery destination must be a regular non-symlink file")
+    if existing.st_nlink != 1:
+        raise PermissionError("recovery destination must not have multiple hard links")
+    # The parent is identity-bound, non-writable and, for the production
+    # contract, root-owned. Replacing a legacy regular inode atomically is
+    # safe even when that obsolete inode still has a non-root owner.
+
+
 def _atomic_write_recovery_record(
     destination: Path,
     value: dict[str, Any],
     *,
     require_root_owned_destination: bool,
 ) -> str:
-    parent = destination.parent
-    metadata = parent.lstat()
-    if parent.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
-        raise PermissionError("recovery destination parent must be a regular directory")
-    if require_root_owned_destination and metadata.st_uid != 0:
-        raise PermissionError("recovery destination parent must be root-owned")
-    if metadata.st_mode & 0o022:
-        raise PermissionError("recovery destination parent must not be group/world writable")
-    parent_identity = (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid, metadata.st_gid)
-    if destination.exists() or destination.is_symlink():
-        existing = destination.lstat()
-        if destination.is_symlink() or not stat.S_ISREG(existing.st_mode):
-            raise PermissionError("recovery destination must be a regular non-symlink file")
-        if require_root_owned_destination and existing.st_uid != 0:
-            raise PermissionError("recovery destination must be root-owned")
-        if existing.st_nlink != 1:
-            raise PermissionError("recovery destination must not have multiple hard links")
+    parent, parent_identity = _validated_recovery_destination_parent(
+        destination,
+        require_root_owned_destination=require_root_owned_destination,
+    )
+    _validate_replaceable_recovery_destination(destination)
 
     raw = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     descriptor, temporary_name = tempfile.mkstemp(prefix=".grabowski-recovery-", dir=parent)
@@ -635,6 +659,31 @@ def _acquire_recovery_lock(
             time.sleep(min(RECOVERY_LOCK_POLL_SECONDS, remaining))
 
 
+def _repair_recovery_lock_owner(
+    descriptor: int,
+    metadata: os.stat_result,
+    *,
+    require_root_owned: bool,
+) -> os.stat_result:
+    if not require_root_owned or metadata.st_uid == 0:
+        return metadata
+    identity = (metadata.st_dev, metadata.st_ino)
+    try:
+        os.fchown(descriptor, 0, 0)
+    except OSError as exc:
+        raise PermissionError("canonical recovery lock owner could not be repaired") from exc
+    repaired = os.fstat(descriptor)
+    if (repaired.st_dev, repaired.st_ino) != identity:
+        raise RuntimeError("canonical recovery lock identity changed during owner repair")
+    if not stat.S_ISREG(repaired.st_mode):
+        raise PermissionError("canonical recovery lock must remain a regular file")
+    if repaired.st_nlink != 1:
+        raise PermissionError("canonical recovery lock must not have multiple hard links")
+    if repaired.st_uid != 0 or repaired.st_gid != 0:
+        raise PermissionError("canonical recovery lock owner repair did not reach root")
+    return repaired
+
+
 def _validated_recovery_source_for_execution(
     execution: dict[str, Any],
     *,
@@ -673,6 +722,10 @@ def publish_recovery_marker(execution: dict[str, Any], *, now: int | None = None
     max_age = execution["max_recovery_age_seconds"]
     configured_target = execution["configured_target"]
     require_root_destination = execution["require_root_owned_destination"]
+    _validated_recovery_destination_parent(
+        destination,
+        require_root_owned_destination=require_root_destination,
+    )
     lock_path = destination.with_name(destination.name + ".lock")
     lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     lock_fd = os.open(lock_path, lock_flags, 0o600)
@@ -683,38 +736,54 @@ def publish_recovery_marker(execution: dict[str, Any], *, now: int | None = None
             raise PermissionError("canonical recovery lock must be a regular file")
         if lock_metadata.st_nlink != 1:
             raise PermissionError("canonical recovery lock must not have multiple hard links")
-        if require_root_destination and lock_metadata.st_uid != 0:
-            raise PermissionError("canonical recovery lock must be root-owned")
-        os.fchmod(lock_fd, 0o600)
         _acquire_recovery_lock(lock_fd)
         locked = True
+        _repair_recovery_lock_owner(
+            lock_fd,
+            lock_metadata,
+            require_root_owned=require_root_destination,
+        )
+        os.fchmod(lock_fd, 0o600)
         _require_kill_switch_clear(kill_switch)
 
         validated = _validated_recovery_source_for_execution(execution, now=current)
         source_sha = validated["source_record_sha256"]
         generated_at = validated["source"]["completed_at_unix"]
-        existing = inspect_canonical_recovery_record(
+        strict_existing = inspect_canonical_recovery_record(
             destination,
             now=current,
             expected_max_age_seconds=max_age,
             expected_target=configured_target,
             require_root_owned=require_root_destination,
         )
+        existing = strict_existing
+        if require_root_destination and strict_existing.get("freshness_reason") == "unsafe-file":
+            relaxed_existing = inspect_canonical_recovery_record(
+                destination,
+                now=current,
+                expected_max_age_seconds=max_age,
+                expected_target=configured_target,
+                require_root_owned=False,
+            )
+            if relaxed_existing.get("valid"):
+                existing = relaxed_existing
         existing_generated = existing.get("generated_at_unix")
         if isinstance(existing_generated, int):
             if existing_generated > generated_at:
                 raise PermissionError("recovery generation rollback is forbidden")
             if existing_generated == generated_at:
                 if existing.get("source_record_sha256") == source_sha and existing.get("record_sha256"):
-                    return {
-                        "published": False,
-                        "idempotent": True,
-                        "record_sha256": existing["record_sha256"],
-                        "source_record_sha256": source_sha,
-                        "generated_at_unix": generated_at,
-                        "freshness_reason": existing.get("freshness_reason"),
-                    }
-                raise PermissionError("recovery generation collision is forbidden")
+                    if strict_existing.get("valid"):
+                        return {
+                            "published": False,
+                            "idempotent": True,
+                            "record_sha256": existing["record_sha256"],
+                            "source_record_sha256": source_sha,
+                            "generated_at_unix": generated_at,
+                            "freshness_reason": existing.get("freshness_reason"),
+                        }
+                else:
+                    raise PermissionError("recovery generation collision is forbidden")
 
         _require_kill_switch_clear(kill_switch)
         final_source = _validated_recovery_source_for_execution(execution, now=current)
