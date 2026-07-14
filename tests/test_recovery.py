@@ -47,10 +47,18 @@ import grabowski_recovery as recovery
 
 
 def _fresh_server_marker(target: str) -> dict[str, object]:
+    now = int(time.time())
     return {
+        "path": "/var/lib/grabowski/power-worker-recovery-gate.json",
+        "exists": True,
         "valid": True,
-        "timestamp_unix": int(time.time()),
+        "freshness_reason": "ready",
+        "generated_at_unix": now,
+        "timestamp_unix": now,
         "age_seconds": 0,
+        "max_age_seconds": recovery.MAX_AGE_SECONDS,
+        "record_sha256": "b" * 64,
+        "source_record_sha256": "a" * 64,
         "snapshot_id": "abc12345",
         "restore_probe_valid": True,
         "repository_check_valid": True,
@@ -62,12 +70,34 @@ def _fresh_server_marker(target: str) -> dict[str, object]:
     }
 
 
+def _source_server_marker(target: str) -> dict[str, object]:
+    value = _fresh_server_marker(target)
+    return {
+        "path": "/home/alex/.local/state/grabowski/recovery/last-server-recovery.json",
+        "exists": value["exists"],
+        "valid": value["valid"],
+        "timestamp_unix": value["generated_at_unix"],
+        "age_seconds": value["age_seconds"],
+        "snapshot_id": value["snapshot_id"],
+        "restore_probe_valid": value["restore_probe_valid"],
+        "repository_check_valid": value["repository_check_valid"],
+        "target": value["target"],
+        "configured_target": value["configured_target"],
+        "target_matches_configured": value["target_matches_configured"],
+        "configured_target_valid": value["configured_target_valid"],
+        "error": value["error"],
+    }
+
+
 def _run_ready_recovery_status(server_marker: dict[str, object], *, host: str, target: str) -> dict[str, object]:
+    source_marker = _source_server_marker(target)
     with patch.object(recovery.base, "_verify_audit_log", return_value={"valid": True}), patch.object(
         recovery.base, "_deployment_metadata", return_value={"provenance_valid": True}
     ), patch.object(recovery, "_fresh_text_marker", return_value={"valid": True}), patch.object(
-        recovery, "_server_marker", return_value=server_marker
-    ), patch.object(recovery, "_timer_probe", return_value={"ok": True}), patch.object(
+        recovery, "_canonical_server_marker", return_value=server_marker
+    ), patch.object(recovery, "_server_source_marker", return_value=source_marker), patch.object(
+        recovery, "_timer_probe", return_value={"ok": True}
+    ), patch.object(
         recovery.privileged, "grabowski_privileged_broker_status", return_value={"ready": True}
     ), patch.object(recovery, "SERVER_RECOVERY_HOST", host), patch.object(
         recovery, "SERVER_RECOVERY_TARGET", target
@@ -224,7 +254,7 @@ class RecoveryToolTests(unittest.TestCase):
             with patch.object(recovery, "SERVER_RECOVERY", marker_path), patch.object(
                 recovery, "SERVER_RECOVERY_TARGET", invalid_target
             ):
-                marker = recovery._server_marker()
+                marker = recovery._server_source_marker()
 
         self.assertFalse(marker["valid"])
         self.assertFalse(marker["configured_target_valid"])
@@ -251,7 +281,7 @@ class RecoveryToolTests(unittest.TestCase):
             with patch.object(recovery, "SERVER_RECOVERY", marker_path), patch.object(
                 recovery, "SERVER_RECOVERY_TARGET", "wg-prod-1:rest-server/grabowski-recovery-probe"
             ):
-                marker = recovery._server_marker()
+                marker = recovery._server_source_marker()
 
         self.assertFalse(marker["valid"])
         self.assertFalse(marker["target_matches_configured"])

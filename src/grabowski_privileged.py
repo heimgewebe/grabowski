@@ -100,6 +100,7 @@ def grabowski_privileged_broker_status() -> dict[str, Any]:
     }
 
 POWER_ACTION = "operator_power_argv"
+RECOVERY_PUBLISH_ACTION = "publish_recovery_marker"
 POWER_REFERENCE_TTL_SECONDS = 900
 POWER_MAX_TARGET_BYTES = 48 * 1024
 POWER_REFERENCE_DIR = Path(os.environ.get(
@@ -191,7 +192,12 @@ def _power_recovery_status() -> dict[str, Any]:
     return recovery.grabowski_recovery_status()
 
 
-def _create_power_reference(target: str, justification: str) -> dict[str, Any]:
+def _create_privileged_reference(
+    *,
+    action: str,
+    target: str,
+    justification: str,
+) -> dict[str, Any]:
     if len(target.encode("utf-8")) > POWER_MAX_TARGET_BYTES:
         raise ValueError("privileged target exceeds size limit")
     created_at = int(time.time())
@@ -201,7 +207,7 @@ def _create_power_reference(target: str, justification: str) -> dict[str, Any]:
         "may_execute": False,
         "requires_external_privileged_agent": True,
         "replay_policy": "single-use-external-broker",
-        "action": POWER_ACTION,
+        "action": action,
         "target": target,
         "justification": justification,
         "request_id": uuid.uuid4().hex,
@@ -211,6 +217,13 @@ def _create_power_reference(target: str, justification: str) -> dict[str, Any]:
     payload["reference_sha256"] = _canonical_sha256(payload)
     return payload
 
+
+def _create_power_reference(target: str, justification: str) -> dict[str, Any]:
+    return _create_privileged_reference(
+        action=POWER_ACTION,
+        target=target,
+        justification=justification,
+    )
 
 def _write_power_reference(reference: dict[str, Any]) -> Path:
     POWER_REFERENCE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -226,6 +239,83 @@ def _write_power_reference(reference: dict[str, Any]) -> Path:
     path = Path(name)
     path.chmod(0o600)
     return path
+
+
+def publish_recovery_marker_reference(
+    *,
+    source_record_sha256: str,
+    generated_at_unix: int,
+) -> dict[str, Any]:
+    if not isinstance(source_record_sha256, str) or len(source_record_sha256) != 64:
+        raise ValueError("source_record_sha256 must be a SHA-256 digest")
+    if isinstance(generated_at_unix, bool) or not isinstance(generated_at_unix, int):
+        raise ValueError("generated_at_unix must be an integer")
+    broker = grabowski_privileged_broker_status()
+    if not broker.get("ready"):
+        raise PermissionError("privileged broker is not ready")
+    target = json.dumps(
+        {
+            "source_record_sha256": source_record_sha256,
+            "generated_at_unix": generated_at_unix,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    reference = _create_privileged_reference(
+        action=RECOVERY_PUBLISH_ACTION,
+        target=target,
+        justification="Publish one validated recovery record to the root-owned canonical gate",
+    )
+    reference_path = _write_power_reference(reference)
+    client = str(broker["request_client"])
+    try:
+        completed = subprocess.run(
+            [client, str(reference_path)],
+            cwd="/",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=45,
+            check=False,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        )
+    finally:
+        reference_path.unlink(missing_ok=True)
+    stdout = _redact_text(completed.stdout.decode("utf-8", errors="replace"))
+    stderr = _redact_text(completed.stderr.decode("utf-8", errors="replace"))
+    try:
+        parsed = json.loads(stdout) if stdout.strip() else None
+    except json.JSONDecodeError:
+        parsed = None
+    publication = parsed.get("publication") if isinstance(parsed, dict) else None
+    success = bool(
+        completed.returncode == 0
+        and isinstance(parsed, dict)
+        and parsed.get("returncode") == 0
+        and isinstance(publication, dict)
+        and publication.get("freshness_reason") == "ready"
+    )
+    audit_record = {
+        "tool": "publish_recovery_marker_reference",
+        "action": RECOVERY_PUBLISH_ACTION,
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+        "source_record_sha256": source_record_sha256,
+        "generated_at_unix": generated_at_unix,
+        "broker_client_returncode": completed.returncode,
+        "success": success,
+    }
+    getattr(operator, "base")._append_audit(audit_record)
+    return {
+        "success": success,
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+        "broker_client_returncode": completed.returncode,
+        "broker_response": parsed,
+        "publication": publication,
+        "stderr": stderr,
+    }
 
 
 @mcp.tool(name="grabowski_power_run", annotations=MUTATING)

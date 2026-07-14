@@ -189,6 +189,10 @@
       "source": "src/grabowski_privileged.py"
     },
     {
+      "module": "grabowski_privileged_broker",
+      "source": "src/grabowski_privileged_broker.py"
+    },
+    {
       "module": "grabowski_command_identity",
       "source": "src/grabowski_command_identity.py"
     },
