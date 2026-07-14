@@ -4,6 +4,7 @@ import fcntl
 import json
 import multiprocessing
 import os
+import stat
 from pathlib import Path
 import tempfile
 import unittest
@@ -213,6 +214,60 @@ class AuditInterprocessLockTests(unittest.TestCase):
                 self.assertEqual(status["records"], 1)
                 record = json.loads(audit.read_text(encoding="utf-8"))
                 self.assertEqual(record["payload"], "x" * 200)
+
+
+    def test_partial_write_failure_restores_previous_audit_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._state_patches(state)
+            with patches[0], patches[1], patches[2], patches[3]:
+                grabowski_mcp._append_audit({"operation": "first"})
+                before = audit.read_bytes()
+                real_write = os.write
+                calls = 0
+
+                def fail_after_partial_write(descriptor: int, payload: bytes) -> int:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return real_write(descriptor, payload[:5])
+                    raise OSError("injected append failure")
+
+                with patch.object(
+                    grabowski_mcp.os,
+                    "write",
+                    side_effect=fail_after_partial_write,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "injected append failure",
+                    ):
+                        grabowski_mcp._append_audit({"operation": "blocked"})
+                self.assertEqual(audit.read_bytes(), before)
+                status = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(status["valid"], status)
+                self.assertEqual(status["records"], 1)
+
+    def test_failed_first_append_leaves_safe_empty_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._state_patches(state)
+            with patches[0], patches[1], patches[2], patches[3]:
+                with self.assertRaises(TypeError):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "invalid",
+                            "payload": object(),
+                        }
+                    )
+                self.assertTrue(audit.is_file())
+                self.assertEqual(audit.read_bytes(), b"")
+                self.assertEqual(stat.S_IMODE(audit.stat().st_mode), 0o600)
+                status = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(status["valid"], status)
+                self.assertEqual(status["records"], 0)
 
     def test_append_refuses_to_cross_audit_byte_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
