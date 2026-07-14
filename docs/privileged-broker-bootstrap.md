@@ -13,13 +13,16 @@ Dieser Bootstrap ist die einzige absichtlich externe Root-Stufe. Vorher bleibt d
 | `config/privileged-actions.example.json` | `/etc/grabowski/privileged-actions.json` | `0600` |
 | `systemd/grabowski-privileged-broker.socket` | `/etc/systemd/system/` | `0644` |
 | `systemd/grabowski-privileged-broker@.service` | `/etc/systemd/system/` | `0644` |
+| `systemd/grabowski-privileged-broker@.service.d/recovery-source.conf` | `/etc/systemd/system/grabowski-privileged-broker@.service.d/recovery-source.conf` | `0644` |
 | `tmpfiles/grabowski.conf` | `/etc/tmpfiles.d/grabowski.conf` | `0644` |
 
 Danach wird eine Systemgruppe `grabowski` angelegt, der Operator dieser Gruppe hinzugefügt und `systemd-tmpfiles --create /etc/tmpfiles.d/grabowski.conf` ausgeführt. Das versionierte tmpfiles-Fragment stellt sicher, dass `/run/grabowski` dauerhaft `root:grabowski` mit Modus `0750` gehört; `SocketGroup=grabowski` allein setzt nur die Gruppe des Sockets, nicht die des Elternverzeichnisses. Erst anschließend werden `systemctl daemon-reload` und ausschließlich `grabowski-privileged-broker.socket` aktiviert. Neue Gruppenmitgliedschaften gelten erst in einer frischen Login-Sitzung.
 
+Das Recovery-Source-Drop-in hält das Home-Verzeichnis mit `ProtectHome=tmpfs` verborgen. Vorherige Bind-Mount-Listen werden geleert. Sichtbar sind ausschließlich der feste Quellbeleg `last-server-recovery.json` und, falls vorhanden, der feste Kill-Switch. Eine Freigabe des gesamten Recovery-Verzeichnisses ist nicht Teil des Vertrags. `ProtectHome=yes` darf hier nicht verwendet werden: systemd kann darunter keine verschachtelten `BindReadOnlyPaths` erreichbar machen.
+
 ## Bestehende Installation auf den kanonischen Publisher migrieren
 
-Eine bereits aktive Rootbroker-Installation wird nicht durch Kopieren der Beispielkonfiguration ersetzt. Dafür existiert ausschließlich `tools/grabowski_rootbroker_cutover.py`. Der Helper bindet sich an einen ausdrücklich angegebenen vollständigen Commit, liest Broker, Client, Helper und Publishervertrag direkt aus dessen Git-Objekten und lehnt einen abweichenden Checkout-HEAD ab. Ein veränderter Arbeitsbaum ist damit keine Installationsquelle.
+Eine bereits aktive Rootbroker-Installation wird nicht durch Kopieren der Beispielkonfiguration ersetzt. Dafür existiert ausschließlich `tools/grabowski_rootbroker_cutover.py`. Der Helper bindet sich an einen ausdrücklich angegebenen vollständigen Commit, liest Broker, Client, Helper, Recovery-Source-Drop-in und Publishervertrag direkt aus dessen Git-Objekten und lehnt einen abweichenden Checkout-HEAD ab. Ein veränderter Arbeitsbaum ist damit keine Installationsquelle.
 
 Ohne `--apply` erzeugt der Helper nur einen Plan. Dieser vergleicht installierte und gewünschte SHA-256-Werte und beweist, welche Konfigurationsanteile erhalten bleiben. Mit `--apply` verlangt der Helper UID 0, einen bereits aktiven Rootbroker-Socket und einen exklusiven root-eigenen Lock unter `/run/grabowski/rootbroker-cutover.lock`. Ein inaktiver oder nicht eindeutig prüfbarer Socket blockiert vor Backup und Mutation; der Helper aktiviert keinen zuvor inaktiven Rootbroker.
 
@@ -28,11 +31,12 @@ Der Mutationspfad ist eng begrenzt:
 1. Die bestehende Konfiguration muss Schema 2 enthalten und `operator_power_argv` bereits aktiviert haben.
 2. Kill-Switch-Pfad, Recovery-Marker-Pfad, Maximalalter und Root-Eigentumsvertrag des bestehenden Power-Gates müssen exakt zum versionierten Publisher passen.
 3. Der Helper ergänzt ausschließlich `publish_recovery_marker` und `gate.configured_target`. Alle sonstigen Aktionen und alle übrigen Felder von `operator_power_argv` müssen bytewertgleich bleiben.
-4. Sämtliche Python-Artefakte werden vor der ersten Mutation aus dem gebundenen Commit geladen, digestgeprüft und kompiliert.
+4. Sämtliche Python-Artefakte werden vor der ersten Mutation aus dem gebundenen Commit geladen, digestgeprüft und kompiliert. Das Recovery-Source-Drop-in muss bytegenau aus Publisher-Quellpfad und Kill-Switch-Pfad ableitbar sein; breite oder zusätzliche Home-Freigaben werden abgelehnt.
 5. Vor jeder Änderung werden root-eigene Preimages mit SHA-256, Modus, UID und GID unter `/var/lib/grabowski/rootbroker-cutover-backups` gesichert und unmittelbar vor dem Replace erneut geprüft.
 6. Installationen erfolgen über private temporäre Dateien, Datei-`fsync`, atomaren Replace, Readback und Directory-`fsync`.
-7. Jeder Fehler einschließlich eines fehlgeschlagenen Erfolgs-Receipts löst die Wiederherstellung aller Preimages und des vorherigen Socket-Zustands aus. Erfolg und Fehler werden root-eigen unter `/var/lib/grabowski/rootbroker-cutover-receipts` belegt.
-8. Bei Erfolg installiert der Helper auch sich selbst root-eigen unter `/usr/local/libexec/grabowski-rootbroker-cutover`. Spätere Prüfungen benötigen daher kein veränderbares Helper-Skript aus einem Benutzercheckout.
+7. Nach der Installation des Drop-ins führt der Helper `systemctl daemon-reload` aus, bevor der Socket wieder startet. Jeder Fehler einschließlich Reload-, Start- oder Erfolgs-Receipt-Fehler löst die Wiederherstellung aller Preimages, einen erneuten Reload und die Wiederherstellung des vorherigen Socket-Zustands aus.
+8. Erfolg und Fehler werden root-eigen unter `/var/lib/grabowski/rootbroker-cutover-receipts` belegt. Der Erfolgsbeleg bindet installierte SHA-256-Werte und den abgeschlossenen Reload.
+9. Bei Erfolg installiert der Helper auch sich selbst root-eigen unter `/usr/local/libexec/grabowski-rootbroker-cutover`. Spätere Prüfungen benötigen daher kein veränderbares Helper-Skript aus einem Benutzercheckout.
 
 Die einmalige Ausführung über eine Desktop-Autorisierung oder einen anderen ausdrücklich freigegebenen Rootpfad ist eine echte Privilegiengrenze. Sie darf weder durch einen veralteten Recovery-Marker noch durch eine Erweiterung des Brokerkatalogs um einen generischen Installations- oder Shellpfad umgangen werden.
 

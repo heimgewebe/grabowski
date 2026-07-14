@@ -21,6 +21,9 @@ BROKER_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_privileged_broke
 BROKER_WRAPPER_TARGET = Path("/usr/local/libexec/grabowski-privileged-broker")
 REQUEST_CLIENT_TARGET = Path("/usr/local/bin/grabowski-privileged-request")
 CUTOVER_HELPER_TARGET = Path("/usr/local/libexec/grabowski-rootbroker-cutover")
+RECOVERY_SOURCE_DROPIN_TARGET = Path(
+    "/etc/systemd/system/grabowski-privileged-broker@.service.d/recovery-source.conf"
+)
 BACKUP_ROOT = Path("/var/lib/grabowski/rootbroker-cutover-backups")
 RECEIPT_ROOT = Path("/var/lib/grabowski/rootbroker-cutover-receipts")
 CUTOVER_LOCK = Path("/run/grabowski/rootbroker-cutover.lock")
@@ -39,6 +42,7 @@ class Artifact:
     source_relative: str
     target: Path
     mode: int
+    python_source: bool = False
 
 
 ARTIFACTS = (
@@ -46,21 +50,30 @@ ARTIFACTS = (
         "src/grabowski_privileged_broker.py",
         BROKER_MODULE_TARGET,
         0o644,
+        True,
     ),
     Artifact(
         "tools/grabowski_privileged_broker.py",
         BROKER_WRAPPER_TARGET,
         0o755,
+        True,
     ),
     Artifact(
         "tools/grabowski_privileged_request.py",
         REQUEST_CLIENT_TARGET,
         0o755,
+        True,
     ),
     Artifact(
         "tools/grabowski_rootbroker_cutover.py",
         CUTOVER_HELPER_TARGET,
         0o755,
+        True,
+    ),
+    Artifact(
+        "systemd/grabowski-privileged-broker@.service.d/recovery-source.conf",
+        RECOVERY_SOURCE_DROPIN_TARGET,
+        0o644,
     ),
 )
 
@@ -346,17 +359,53 @@ def _source_artifacts(
     return result
 
 
-def _validate_python_artifacts(
+def _validate_source_artifacts(
     artifacts: dict[Path, tuple[bytes, int, str]],
+    *,
+    python_targets: set[Path],
 ) -> None:
     for target, (data, _mode, expected_sha256) in artifacts.items():
         if _sha256(data) != expected_sha256:
             raise CutoverError(f"source artifact digest mismatch: {target}")
+        if target not in python_targets:
+            continue
         try:
             source = data.decode("utf-8")
             compile(source, str(target), "exec", dont_inherit=True)
         except (UnicodeDecodeError, SyntaxError) as exc:
             raise CutoverError(f"source artifact is not valid Python: {target}") from exc
+
+
+def _expected_recovery_source_dropin(publisher: dict[str, Any]) -> bytes:
+    source_path = publisher.get("source_path")
+    kill_switch_path = publisher.get("kill_switch_path")
+    if not isinstance(source_path, str) or not source_path.startswith("/"):
+        raise CutoverError("recovery publisher source path is invalid")
+    if not isinstance(kill_switch_path, str) or not kill_switch_path.startswith("/"):
+        raise CutoverError("recovery publisher kill-switch path is invalid")
+    if any(character in source_path + kill_switch_path for character in "\n\r "):
+        raise CutoverError("recovery sandbox paths contain forbidden whitespace")
+    return (
+        "[Service]\n"
+        "ProtectHome=tmpfs\n"
+        "BindReadOnlyPaths=\n"
+        f"BindReadOnlyPaths={source_path}\n"
+        f"BindReadOnlyPaths=-{kill_switch_path}\n"
+    ).encode("utf-8")
+
+
+def _validate_recovery_source_dropin(
+    artifacts: dict[Path, tuple[bytes, int, str]],
+    *,
+    publisher: dict[str, Any],
+) -> None:
+    artifact = artifacts.get(RECOVERY_SOURCE_DROPIN_TARGET)
+    if artifact is None:
+        raise CutoverError("commit-bound recovery source drop-in is missing")
+    data, mode, digest = artifact
+    expected = _expected_recovery_source_dropin(publisher)
+    if data != expected or digest != _sha256(expected) or mode != 0o644:
+        raise CutoverError("recovery source drop-in differs from publisher contract")
 
 
 def _verify_running_helper(
@@ -785,7 +834,15 @@ def _apply_cutover_locked(
         expected_head=expected_head,
         runner=runner,
     )
-    _validate_python_artifacts(source_artifacts)
+    python_targets = (
+        set(source_artifacts)
+        if artifact_targets is not None
+        else {artifact.target for artifact in ARTIFACTS if artifact.python_source}
+    )
+    _validate_source_artifacts(
+        source_artifacts,
+        python_targets=python_targets,
+    )
     if artifact_targets is None:
         _verify_running_helper(source_artifacts)
     publisher = _publisher_from_repository(
@@ -793,6 +850,11 @@ def _apply_cutover_locked(
         expected_head=expected_head,
         runner=runner,
     )
+    if artifact_targets is None:
+        _validate_recovery_source_dropin(
+            source_artifacts,
+            publisher=publisher,
+        )
     current_config_data, _ = _read_regular_file(
         config_target,
         require_root_owned=require_root,
@@ -852,6 +914,7 @@ def _apply_cutover_locked(
                 gid=install_gid,
                 expected_parent_uid=install_uid,
             )
+        _checked_run(runner, ["/usr/bin/systemctl", "daemon-reload"])
         _checked_run(runner, ["/usr/bin/systemctl", "start", SOCKET_UNIT])
         _checked_run(runner, ["/usr/bin/systemctl", "is-active", "--quiet", SOCKET_UNIT])
         installed: dict[str, Any] = {}
@@ -886,6 +949,7 @@ def _apply_cutover_locked(
             "socket_unit": SOCKET_UNIT,
             "socket_active": True,
             "socket_was_active": was_active,
+            "daemon_reload_complete": True,
             "rollback_performed": False,
         }
         _ensure_private_directory(
@@ -920,6 +984,10 @@ def _apply_cutover_locked(
                 expected_parent_uid=install_uid,
             ),
         )
+        attempt(
+            "reload restored systemd units",
+            lambda: _checked_run(runner, ["/usr/bin/systemctl", "daemon-reload"]),
+        )
         if was_active:
             attempt(
                 "restore active socket",
@@ -948,6 +1016,10 @@ def _apply_cutover_locked(
             "rollback_complete": not rollback_errors,
             "rollback_errors": rollback_errors,
             "socket_was_active": was_active,
+            "daemon_reload_restored": not any(
+                item.startswith("reload restored systemd units:")
+                for item in rollback_errors
+            ),
             "error": str(exc)[:1000],
         }
 
@@ -983,12 +1055,21 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         expected_head=expected_head,
         runner=runner,
     )
-    _validate_python_artifacts(source_artifacts)
+    _validate_source_artifacts(
+        source_artifacts,
+        python_targets={
+            artifact.target for artifact in ARTIFACTS if artifact.python_source
+        },
+    )
     _verify_running_helper(source_artifacts)
     publisher = _publisher_from_repository(
         repository,
         expected_head=expected_head,
         runner=runner,
+    )
+    _validate_recovery_source_dropin(
+        source_artifacts,
+        publisher=publisher,
     )
     current_data, metadata = _read_regular_file(CONFIG_TARGET, require_root_owned=True)
     current = _decode_json_object(current_data, label=str(CONFIG_TARGET))
