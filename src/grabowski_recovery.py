@@ -15,6 +15,7 @@ from typing import Any
 
 import grabowski_mcp as base
 import grabowski_privileged as privileged
+import grabowski_privileged_broker as broker_contract
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -32,8 +33,12 @@ SERVER_RECOVERY = Path(os.environ.get(
     "GRABOWSKI_SERVER_RECOVERY_MARKER",
     str(operator.STATE_DIR / "recovery/last-server-recovery.json"),
 )).expanduser()
+CANONICAL_RECOVERY = Path(os.environ.get(
+    "GRABOWSKI_CANONICAL_RECOVERY_MARKER",
+    "/var/lib/grabowski/power-worker-recovery-gate.json",
+)).expanduser()
 BACKUP_TIMER = os.environ.get("GRABOWSKI_BACKUP_TIMER", "restic-backup-1930.timer")
-MAX_AGE_SECONDS = int(os.environ.get("GRABOWSKI_RECOVERY_MAX_AGE_SECONDS", str(36 * 60 * 60)))
+MAX_AGE_SECONDS = int(os.environ.get("GRABOWSKI_RECOVERY_MAX_AGE_SECONDS", str(24 * 60 * 60)))
 SERVER_RECOVERY_HOST = os.environ.get("GRABOWSKI_SERVER_RECOVERY_HOST", "heimserver")
 SERVER_RECOVERY_REMOTE_PORT = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_REMOTE_PORT", "18081"))
 SERVER_RECOVERY_REST_USER = os.environ.get("GRABOWSKI_SERVER_RECOVERY_REST_USER", "grabowski")
@@ -215,16 +220,19 @@ def _fresh_text_marker(path: Path) -> dict[str, Any]:
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         result["error"] = str(exc)
         return result
-    age = max(0, int(time.time()) - stamp)
+    delta = int(time.time()) - stamp
+    age = max(0, delta)
     result["timestamp_unix"] = stamp
     result["age_seconds"] = age
-    result["valid"] = age <= MAX_AGE_SECONDS
-    if not result["valid"]:
+    result["valid"] = 0 <= delta <= MAX_AGE_SECONDS
+    if delta < 0:
+        result["error"] = "marker is future-dated"
+    elif not result["valid"]:
         result["error"] = "marker is stale"
     return result
 
 
-def _server_marker() -> dict[str, Any]:
+def _server_source_marker() -> dict[str, Any]:
     result: dict[str, Any] = {
         "path": str(SERVER_RECOVERY), "exists": SERVER_RECOVERY.exists(),
         "valid": False, "timestamp_unix": None, "age_seconds": None,
@@ -251,7 +259,8 @@ def _server_marker() -> dict[str, Any]:
     if not isinstance(stamp, int):
         result["error"] = "server marker timestamp is invalid"
         return result
-    age = max(0, int(time.time()) - stamp)
+    delta = int(time.time()) - stamp
+    age = max(0, delta)
     marker_target = value["target"]
     target_info = _configured_recovery_target_info()
     configured_target_valid = bool(target_info.get("valid"))
@@ -267,7 +276,7 @@ def _server_marker() -> dict[str, Any]:
         "target_matches_configured": target_matches_configured,
     })
     base_valid = all((
-        age <= MAX_AGE_SECONDS,
+        0 <= delta <= MAX_AGE_SECONDS,
         isinstance(result["snapshot_id"], str) and bool(result["snapshot_id"]),
         result["restore_probe_valid"], result["repository_check_valid"],
         isinstance(result["target"], str) and bool(result["target"]),
@@ -275,12 +284,23 @@ def _server_marker() -> dict[str, Any]:
     result["valid"] = base_valid and target_matches_configured
     if not configured_target_valid:
         result["error"] = str(target_info.get("error") or "server recovery target configuration is invalid")
+    elif delta < 0:
+        result["error"] = "server recovery evidence is future-dated"
     elif not base_valid:
         result["error"] = "server recovery evidence is incomplete or stale"
     elif not target_matches_configured:
         result["error"] = "server recovery target does not match configured target"
     return result
 
+
+
+def _canonical_server_marker() -> dict[str, Any]:
+    return broker_contract.inspect_canonical_recovery_record(
+        CANONICAL_RECOVERY,
+        expected_max_age_seconds=MAX_AGE_SECONDS,
+        expected_target=SERVER_RECOVERY_TARGET,
+        require_root_owned=True,
+    )
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -441,7 +461,7 @@ def _snapshot_from_backup_output(output: str) -> str:
     raise RuntimeError("restic backup did not report a snapshot id")
 
 
-def _write_server_marker(*, completed_at_unix: int, snapshot_id: str) -> None:
+def _write_server_marker(*, completed_at_unix: int, snapshot_id: str) -> dict[str, Any]:
     payload = {
         "schema_version": 1,
         "completed_at_unix": completed_at_unix,
@@ -451,7 +471,35 @@ def _write_server_marker(*, completed_at_unix: int, snapshot_id: str) -> None:
         "target": SERVER_RECOVERY_TARGET,
     }
     SERVER_RECOVERY.parent.mkdir(parents=True, exist_ok=True)
-    SERVER_RECOVERY.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".server-recovery-",
+        dir=SERVER_RECOVERY.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(descriptor, raw[offset:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, SERVER_RECOVERY)
+        directory_fd = os.open(SERVER_RECOVERY.parent, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+    return {
+        "path": str(SERVER_RECOVERY),
+        "source_record_sha256": hashlib.sha256(raw).hexdigest(),
+        "generated_at_unix": completed_at_unix,
+    }
 
 
 def server_recovery_probe() -> dict[str, Any]:
@@ -523,18 +571,39 @@ def server_recovery_probe() -> dict[str, Any]:
                 log=log_path,
                 timeout_seconds=SERVER_RECOVERY_TIMEOUT_SECONDS,
             )
-            _write_server_marker(completed_at_unix=completed_at_unix, snapshot_id=snapshot_id[:8])
+            source_write = _write_server_marker(
+                completed_at_unix=completed_at_unix,
+                snapshot_id=snapshot_id[:8],
+            )
+            publication = privileged.publish_recovery_marker_reference(
+                source_record_sha256=source_write["source_record_sha256"],
+                generated_at_unix=source_write["generated_at_unix"],
+            )
+            if not publication.get("success"):
+                raise RuntimeError("canonical root recovery publication failed")
     finally:
         _terminate_process(tunnel)
         tunnel_stdout_path.write_bytes(tunnel_stdout_capture.finish())
         tunnel_stderr_path.write_bytes(tunnel_stderr_capture.finish())
     log_sha256 = _sha256_file(log_path) if log_path.exists() else None
-    marker = _server_marker()
+    source_marker = _server_source_marker()
+    canonical_marker = _canonical_server_marker()
+    if not canonical_marker.get("valid"):
+        raise RuntimeError("canonical recovery record readback is not ready")
+    if canonical_marker.get("source_record_sha256") != source_write.get("source_record_sha256"):
+        raise RuntimeError("canonical recovery record source digest mismatch")
     audit_record = {
         "timestamp_unix": completed_at_unix,
         "operation": "server-recovery-probe",
-        "snapshot_id": marker.get("snapshot_id"),
+        "snapshot_id": canonical_marker.get("snapshot_id"),
         "target": SERVER_RECOVERY_TARGET,
+        "canonical_record_sha256": canonical_marker.get("record_sha256"),
+        "source_record_sha256": canonical_marker.get("source_record_sha256"),
+        "canonical_generated_at_unix": canonical_marker.get("generated_at_unix"),
+        "canonical_max_age_seconds": canonical_marker.get("max_age_seconds"),
+        "canonical_freshness_reason": canonical_marker.get("freshness_reason"),
+        "publication_request_id": publication.get("request_id"),
+        "publication_reference_sha256": publication.get("reference_sha256"),
         "restore_probe_valid": True,
         "repository_check_valid": True,
         "log_sha256": log_sha256,
@@ -545,12 +614,15 @@ def server_recovery_probe() -> dict[str, Any]:
     return {
         "schema_version": 1,
         "completed_at_unix": completed_at_unix,
-        "snapshot_id": marker.get("snapshot_id"),
+        "snapshot_id": canonical_marker.get("snapshot_id"),
         "target": SERVER_RECOVERY_TARGET,
         "restore_probe_valid": True,
         "repository_check_valid": True,
-        "marker_valid": marker.get("valid"),
-        "marker_path": str(SERVER_RECOVERY),
+        "marker_valid": canonical_marker.get("valid"),
+        "marker_path": str(CANONICAL_RECOVERY),
+        "canonical_recovery": canonical_marker,
+        "source_recovery": source_marker,
+        "publication": publication,
         "log_path": str(log_path),
         "log_sha256": log_sha256,
         "tunnel_stderr_path": str(tunnel_stderr_path),
@@ -573,7 +645,8 @@ def recovery_status() -> dict[str, Any]:
     audit = base._verify_audit_log(base.AUDIT_LOG)
     deployment = base._deployment_metadata()
     local_backup = _fresh_text_marker(BACKUP_SUCCESS)
-    server_backup = _server_marker()
+    server_backup = _canonical_server_marker()
+    server_source = _server_source_marker()
     timer_enabled = _timer_probe("is-enabled")
     timer_active = _timer_probe("is-active")
     broker = privileged.grabowski_privileged_broker_status()
@@ -598,9 +671,11 @@ def recovery_status() -> dict[str, Any]:
         actions.append(f"enable and start {BACKUP_TIMER}")
     if not checks["server_recovery_fresh"]:
         target_info = _configured_recovery_target_info()
+        if server_source.get("valid") and server_source.get("target") == SERVER_RECOVERY_TARGET:
+            actions.append("publish the fresh source evidence to the canonical root recovery record")
         if not bool(target_info.get("valid")):
             actions.append(f"repair server recovery target configuration: {target_info.get('error')}")
-        elif bool(server_backup.get("target")) and not bool(server_backup.get("target_matches_configured")):
+        elif bool(server_backup.get("target")) and not _server_recovery_target_matches_configured(server_backup):
             actions.append(f"produce fresh server recovery evidence for configured target {SERVER_RECOVERY_TARGET}")
         elif _uses_default_heimserver_recovery_backend():
             actions.append("configure and prove a non-heimserver recovery target, or restore fresh heimserver recovery evidence")
@@ -611,13 +686,22 @@ def recovery_status() -> dict[str, Any]:
     if not checks["privileged_broker_ready"]:
         actions.append("install and verify the privileged broker")
     return {
-        "schema_version": 1, "checked_at_unix": int(time.time()),
+        "schema_version": 2, "checked_at_unix": int(time.time()),
         "ready_for_user_power_worker": user_gate,
         "ready_for_privileged_actions": user_gate and checks["privileged_broker_ready"],
         "checks": checks, "audit": audit, "deployment": deployment,
         "local_backup": local_backup,
         "backup_timer": {"unit": BACKUP_TIMER, "enabled": timer_enabled, "active": timer_active},
         "server_recovery": server_backup,
+        "server_recovery_source": server_source,
+        "canonical_recovery_record_identity": {
+            "record_sha256": server_backup.get("record_sha256"),
+            "source_record_sha256": server_backup.get("source_record_sha256"),
+            "generated_at_unix": server_backup.get("generated_at_unix"),
+            "age_seconds": server_backup.get("age_seconds"),
+            "max_age_seconds": server_backup.get("max_age_seconds"),
+            "freshness_reason": server_backup.get("freshness_reason"),
+        },
         "recovery_evidence_boundary": _server_recovery_evidence_boundary(server_backup),
         "privileged_broker": broker,
         "required_actions": actions,

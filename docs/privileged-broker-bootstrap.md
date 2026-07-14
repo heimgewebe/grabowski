@@ -18,11 +18,21 @@ Danach wird eine Systemgruppe `grabowski` angelegt, der Operator dieser Gruppe h
 
 ## Aktivierung einer Aktion
 
-Die mitgelieferte Konfiguration enthält nur deaktivierte Beispielaktionen. `edit_system_service` bleibt ein deaktiviertes Restart-Beispiel; `reset_failed_systemd_unit` ist ein enger Pfad für `systemctl reset-failed {target}` und ist ebenfalls standardmäßig deaktiviert. Eine Aktivierung ist erst zulässig, nachdem Zielregex, absolutes argv-Template und Timeout einzeln geprüft wurden. Der Platzhalter `{target}` darf ausschließlich als vollständiges argv-Token vorkommen.
+Die mitgelieferte Konfiguration lässt allgemeine Rootaktionen deaktiviert. Nur der feste Publisher `publish_recovery_marker` ist aktiviert; er besitzt keinen argv-Pfad und kann ausschließlich einen streng validierten Recovery-Beleg vom fest konfigurierten Quellpfad in den fest konfigurierten root-eigenen Zielpfad überführen. `edit_system_service` bleibt ein deaktiviertes Restart-Beispiel; `reset_failed_systemd_unit` ist ein enger Pfad für `systemctl reset-failed {target}` und ist ebenfalls standardmäßig deaktiviert. Eine Aktivierung ist erst zulässig, nachdem Zielregex, absolutes argv-Template und Timeout einzeln geprüft wurden. Der Platzhalter `{target}` darf ausschließlich als vollständiges argv-Token vorkommen.
 
 `operator_power_argv` ist der maximale Operatorpfad. Er nutzt `mode=argv-json`; `target` enthält ein JSON-Objekt mit `argv` und `cwd`. Der Broker verlangt absolute Executables, bounded argv-Länge, `cwd_pattern`, Timeout und eine explizite `allow_shell`-Entscheidung. Optional kann `allowed_argv_prefixes` gesetzt werden; dann akzeptiert der Broker nur argv, die mit einem der katalogisierten Präfixe beginnen. `policy_intent` kann diese Konfiguration ausdrücklich als trusted-owner-high-power-Katalog kennzeichnen. Prefixe sind keine vollständige Argument- oder Zielvalidierung; für maximale Handlungsfähigkeit dürfen sie breit sein, müssen aber über Audit, Recovery-Gate und Kill-Switch kontrolliert werden. Mit `allow_shell=false` sind nur direkte bekannte Shell-Executables blockiert; das ist keine Sandbox und verhindert keine Interpreter wie Python, awk oder busybox. Mit `allow_shell=true` wird auch die direkte Shell-Form bewusst zugelassen. In beiden Fällen darf die Aktion nur mit root-seitiger `gate`-Prüfung für Kill-Switch und frische Recovery-Marker aktiviert werden.
 
 `reset_failed_systemd_unit` darf nur Failed-State-Metadaten einer explizit gematchten `.service`-Unit löschen. Der Pfad darf keine Units starten, stoppen, restarten, enablen, disablen oder editieren. Für Fälle wie einen stale `user@111.service`-Fail bleibt vor der Ausführung eine read-only Prüfung von `systemctl --failed` und `getent passwd <uid>` nötig.
+
+## Kanonischer Recovery-Freshness-Vertrag
+
+`grabowski_recovery_server_probe` schreibt nach erfolgreichem Backup, bytegleichem Restore und Repository-Check atomar den benutzereigenen Quellbeleg. Anschließend erzeugt es eine einmalige, digest- und generationsgebundene Brokerreferenz für `publish_recovery_marker`. Der Rootbroker prüft vor und unmittelbar vor dem Schreiben erneut Quellpfad, Besitzer-UID, Dateimodus, exakte JSON-Schlüssel, Ziel, Alter, Snapshot-ID und SHA-256. Die Aktion führt kein frei wählbares Programm aus.
+
+Der Rootbroker veröffentlicht `/var/lib/grabowski/power-worker-recovery-gate.json` unter exklusivem Dateilock mit temporärer Datei, `fsync`, atomarem `replace` und anschließendem Readback. Ältere Generationen und gleichzeitige Kollisionen werden abgelehnt; eine identische Wiederholung ist idempotent. Der kanonische Datensatz ist `root:root`, Modus `0644`: für den unprivilegierten Status lesbar, aber nicht beschreibbar. Er enthält keine Secrets, sondern ausschließlich Zeit, Maximalalter, Ziel, Snapshot-ID und Quell-/Datensatzdigests.
+
+`grabowski_recovery_status` und das Rootbroker-Power-Gate lesen danach denselben kanonischen Datensatz und melden dieselbe `generated_at_unix`, `age_seconds`, `max_age_seconds`, `freshness_reason`, `record_sha256` und `source_record_sha256`. Fehlende, partielle, malformed, future-dated, stale oder zielabweichende Datensätze bleiben auf beiden Seiten fail-closed. Der Benutzer-Quellbeleg allein autorisiert keine privilegierte Aktion.
+
+Diese Kopplung stellt kohärente Recovery-Freshness und root-eigenen Schreibschutz her. Sie ist keine unabhängige kryptografische Attestierung gegen den angemeldeten Trusted Owner; der Rootbroker bleibt ein eng katalogisierter Capability-Broker mit Audit, Kill-Switch und festen Pfaden.
 
 ## Abnahme
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -413,22 +414,46 @@ class PrivilegedBrokerTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "target"):
                     privileged_broker.resolve_action(config, parsed)
 
-    def _power_gate(self, directory: str | Path) -> dict[str, object]:
+    def _power_gate(
+        self,
+        directory: str | Path,
+        *,
+        generated_at_unix: int | None = None,
+        max_age_seconds: int = 86400,
+        target: str = "heimberry:rest-server/grabowski-recovery-probe",
+    ) -> dict[str, object]:
         root = Path(directory)
         marker = root / "recovery-gate.json"
-        marker.write_text(json.dumps({
-            "timestamp_unix": int(time.time()),
-            "restore_probe_valid": True,
-            "repository_check_valid": True,
-            "configured_target_valid": True,
-            "target_matches_configured": True,
-        }), encoding="utf-8")
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "kind": "grabowski_recovery_freshness",
+                    "generated_at_unix": int(time.time()) if generated_at_unix is None else generated_at_unix,
+                    "max_age_seconds": max_age_seconds,
+                    "snapshot_id": "abc12345",
+                    "restore_probe_valid": True,
+                    "repository_check_valid": True,
+                    "target": target,
+                    "configured_target": target,
+                    "configured_target_valid": True,
+                    "target_matches_configured": True,
+                    "source_record_sha256": "a" * 64,
+                    "source_owner_uid": os.getuid(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         marker.chmod(0o600)
         return {
             "kill_switch_path": str(root / "operator-kill-switch"),
             "recovery_marker_path": str(marker),
-            "max_recovery_age_seconds": 86400,
+            "max_recovery_age_seconds": max_age_seconds,
             "require_root_owned_gate_files": False,
+            "configured_target": target,
         }
 
     def _power_reference(self, payload: dict[str, object], now: int = 1000) -> dict[str, object]:
@@ -475,11 +500,11 @@ class PrivilegedBrokerTests(unittest.TestCase):
 
     def test_power_gate_opens_marker_with_file_descriptor_checks(self) -> None:
         source = (ROOT / "src" / "grabowski_privileged_broker.py").read_text(encoding="utf-8")
-        self.assertIn("os.open(marker, flags)", source)
+        self.assertIn("os.open(path, flags)", source)
         self.assertIn('getattr(os, "O_NOFOLLOW", 0)', source)
-        self.assertIn("metadata = os.fstat(descriptor)", source)
-        self.assertIn("raw = os.read(descriptor, metadata.st_size)", source)
-        self.assertNotIn("raw = marker.read_bytes()", source)
+        self.assertIn("before = os.fstat(descriptor)", source)
+        self.assertIn("chunk = os.read(descriptor", source)
+        self.assertNotIn("raw = path.read_bytes()", source)
 
     def test_power_argv_json_missing_recovery_marker_is_handled_denial(self) -> None:
         reference = self._power_reference({"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})

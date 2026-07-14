@@ -18,6 +18,7 @@ from grabowski_privileged_broker import (
     claim_once,
     load_root_config,
     parse_reference,
+    publish_recovery_marker,
     resolve_execution,
 )
 
@@ -52,7 +53,7 @@ def _base_audit_record(
     execution: dict[str, object],
     started: float,
 ) -> dict[str, object]:
-    argv = execution["argv"]
+    argv = execution.get("argv")
     cwd = execution.get("cwd")
     record = {
         "schema_version": 1,
@@ -62,16 +63,23 @@ def _base_audit_record(
         "action": str(reference["action"]),
         "mode": str(execution.get("mode", "template")),
         "target_sha256": hashlib.sha256(str(reference["target"]).encode("utf-8")).hexdigest(),
-        "argv_sha256": hashlib.sha256(
-            json.dumps(argv, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        ).hexdigest(),
         "cwd_sha256": hashlib.sha256(str(cwd or "").encode("utf-8")).hexdigest(),
         "duration_seconds": round(time.monotonic() - started, 3),
     }
+    if isinstance(argv, list):
+        record["argv_sha256"] = hashlib.sha256(
+            json.dumps(argv, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    if execution.get("internal_action") is not None:
+        record["internal_action"] = str(execution["internal_action"])
     gate = execution.get("gate")
     if isinstance(gate, dict):
         record["gate_recovery_marker_sha256"] = gate.get("recovery_marker_sha256")
+        record["gate_recovery_marker_source_sha256"] = gate.get("recovery_marker_source_sha256")
         record["gate_recovery_marker_timestamp_unix"] = gate.get("recovery_marker_timestamp_unix")
+        record["gate_recovery_marker_age_seconds"] = gate.get("recovery_marker_age_seconds")
+        record["gate_recovery_marker_max_age_seconds"] = gate.get("recovery_marker_max_age_seconds")
+        record["gate_recovery_marker_freshness_reason"] = gate.get("recovery_marker_freshness_reason")
     for optional_key in (
         "policy_intent",
         "argv_catalog_sha256",
@@ -83,6 +91,37 @@ def _base_audit_record(
     return record
 
 
+
+def _run_recovery_publication(
+    reference: dict[str, object],
+    execution: dict[str, object],
+) -> int:
+    claim_once(STATE / "used", str(reference["request_id"]))
+    started = time.monotonic()
+    published = publish_recovery_marker(execution)
+    record = {
+        **_base_audit_record(reference, execution, started),
+        "returncode": 0,
+        "timed_out": False,
+        "published": published.get("published"),
+        "idempotent": published.get("idempotent"),
+        "recovery_record_sha256": published.get("record_sha256"),
+        "recovery_source_record_sha256": published.get("source_record_sha256"),
+        "recovery_generated_at_unix": published.get("generated_at_unix"),
+        "recovery_freshness_reason": published.get("freshness_reason"),
+    }
+    append_audit(record)
+    print(json.dumps({
+        "request_id": reference["request_id"],
+        "action": reference["action"],
+        "mode": execution["mode"],
+        "returncode": 0,
+        "timed_out": False,
+        "publication": published,
+        "audit": record,
+    }, ensure_ascii=False, sort_keys=True))
+    return 0
+
 def main() -> int:
     if os.geteuid() != 0:
         raise PermissionError("privileged broker must run as root")
@@ -90,6 +129,8 @@ def main() -> int:
     reference = parse_reference(data)
     config = load_root_config(CONFIG)
     execution = resolve_execution(config, reference)
+    if execution.get("mode") == "recovery-marker-publish":
+        return _run_recovery_publication(reference, execution)
     argv = execution["argv"]
     timeout = execution["timeout_seconds"]
     cwd = execution.get("cwd")

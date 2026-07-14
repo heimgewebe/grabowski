@@ -21,6 +21,17 @@
       ],
       "timeout_seconds": 30
     },
+    "publish_recovery_marker": {
+      "enabled": true,
+      "mode": "recovery-marker-publish",
+      "source_path": "/home/alex/.local/state/grabowski/recovery/last-server-recovery.json",
+      "destination_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
+      "expected_source_uid": 1000,
+      "max_recovery_age_seconds": 86400,
+      "configured_target": "heimberry:rest-server/grabowski-recovery-probe",
+      "kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+      "require_root_owned_destination": true
+    },
     "operator_power_argv": {
       "enabled": false,
       "mode": "argv-json",
@@ -46,7 +57,8 @@
         "kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
         "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
         "max_recovery_age_seconds": 86400,
-        "require_root_owned_gate_files": true
+        "require_root_owned_gate_files": true,
+        "configured_target": "heimberry:rest-server/grabowski-recovery-probe"
       }
     }
   }
