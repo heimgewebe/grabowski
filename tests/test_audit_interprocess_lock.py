@@ -5,7 +5,6 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
-import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -38,6 +37,17 @@ class AuditInterprocessLockTests(unittest.TestCase):
                 state / "operator-kill-switch",
             ),
         )
+
+    def test_missing_audit_verification_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._state_patches(state)
+            with patches[0], patches[1], patches[2], patches[3]:
+                status = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(status["valid"], status)
+                self.assertFalse(status["exists"])
+                self.assertEqual(list(state.iterdir()), [])
 
     def test_parallel_processes_append_one_valid_monotonic_chain(self) -> None:
         if "fork" not in multiprocessing.get_all_start_methods():
@@ -82,56 +92,52 @@ class AuditInterprocessLockTests(unittest.TestCase):
                     len({record["record_sha256"] for record in records}),
                     expected_records,
                 )
-                lock_path = grabowski_mcp._audit_lock_path(audit)
-                self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
 
-    def test_symlink_lock_is_rejected_without_audit_mutation(self) -> None:
+    def test_symlink_audit_is_rejected_without_target_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = root / "state"
             state.mkdir(mode=0o700)
             audit, patches = self._state_patches(state)
-            outside = root / "outside.lock"
-            outside.write_text("outside\n", encoding="utf-8")
-            grabowski_mcp._audit_lock_path(audit).symlink_to(outside)
+            outside = root / "outside.jsonl"
+            outside.write_bytes(b"")
+            os.chmod(outside, 0o600)
+            audit.symlink_to(outside)
             with patches[0], patches[1], patches[2], patches[3]:
-                with self.assertRaisesRegex(PermissionError, "opened safely"):
-                    grabowski_mcp._append_audit({"operation": "blocked"})
-                self.assertFalse(audit.exists())
                 status = grabowski_mcp._verify_audit_log(audit)
                 self.assertFalse(status["valid"])
-                self.assertIn("audit-lock-error", status["error"])
+                with self.assertRaisesRegex(PermissionError, "symlink"):
+                    grabowski_mcp._append_audit({"operation": "blocked"})
+                self.assertEqual(outside.read_bytes(), b"")
 
-    def test_hardlinked_or_broad_lock_is_rejected(self) -> None:
+    def test_hardlinked_or_broad_audit_is_rejected(self) -> None:
         for unsafe_kind in ("hardlink", "mode"):
             with self.subTest(unsafe_kind=unsafe_kind), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 state = root / "state"
                 state.mkdir(mode=0o700)
                 audit, patches = self._state_patches(state)
-                lock_path = grabowski_mcp._audit_lock_path(audit)
                 if unsafe_kind == "hardlink":
-                    source = root / "shared.lock"
+                    source = root / "shared.jsonl"
                     source.write_bytes(b"")
                     os.chmod(source, 0o600)
-                    os.link(source, lock_path)
+                    os.link(source, audit)
                 else:
-                    lock_path.write_bytes(b"")
-                    os.chmod(lock_path, 0o644)
+                    audit.write_bytes(b"")
+                    os.chmod(audit, 0o644)
                 with patches[0], patches[1], patches[2], patches[3]:
                     with self.assertRaisesRegex(PermissionError, "file contract"):
                         grabowski_mcp._append_audit({"operation": "blocked"})
-                    self.assertFalse(audit.exists())
+                    self.assertEqual(audit.read_bytes(), b"")
 
     def test_lock_timeout_fails_closed_without_hanging(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
             state.mkdir(mode=0o700)
             audit, patches = self._state_patches(state)
-            lock_path = grabowski_mcp._audit_lock_path(audit)
-            lock_path.write_bytes(b"")
-            os.chmod(lock_path, 0o600)
-            holder = os.open(lock_path, os.O_RDWR | os.O_CLOEXEC)
+            audit.write_bytes(b"")
+            os.chmod(audit, 0o600)
+            holder = os.open(audit, os.O_RDWR | os.O_CLOEXEC)
             try:
                 fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 with (
@@ -146,11 +152,10 @@ class AuditInterprocessLockTests(unittest.TestCase):
                     self.assertIn("timed out", status["error"])
                     with self.assertRaisesRegex(RuntimeError, "timed out"):
                         grabowski_mcp._append_audit({"operation": "blocked"})
-                    self.assertFalse(audit.exists())
+                    self.assertEqual(audit.read_bytes(), b"")
             finally:
                 fcntl.flock(holder, fcntl.LOCK_UN)
                 os.close(holder)
-
 
     def test_audit_path_rebind_during_append_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -180,17 +185,36 @@ class AuditInterprocessLockTests(unittest.TestCase):
                         grabowski_mcp._append_audit({"operation": "blocked"})
                 self.assertEqual(audit.read_bytes(), b"")
 
-    def test_unsafe_existing_audit_file_is_not_appended(self) -> None:
+    def test_append_refuses_to_cross_audit_byte_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
             state.mkdir(mode=0o700)
             audit, patches = self._state_patches(state)
-            audit.write_bytes(b"")
-            os.chmod(audit, 0o644)
             with patches[0], patches[1], patches[2], patches[3]:
-                with self.assertRaisesRegex(PermissionError, "file contract"):
+                grabowski_mcp._append_audit({"operation": "first"})
+                before = audit.read_bytes()
+                with patch.object(
+                    grabowski_mcp,
+                    "MAX_AUDIT_BYTES",
+                    len(before) + 1,
+                ):
+                    with self.assertRaisesRegex(ValueError, "byte limit"):
+                        grabowski_mcp._append_audit({"operation": "blocked"})
+                self.assertEqual(audit.read_bytes(), before)
+
+    def test_shared_audit_parent_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o755)
+            os.chmod(state, 0o755)
+            audit, patches = self._state_patches(state)
+            with patches[0], patches[1], patches[2], patches[3]:
+                status = grabowski_mcp._verify_audit_log(audit)
+                self.assertFalse(status["valid"])
+                self.assertIn("parent directory", status["error"])
+                with self.assertRaisesRegex(PermissionError, "parent directory"):
                     grabowski_mcp._append_audit({"operation": "blocked"})
-                self.assertEqual(audit.read_bytes(), b"")
+                self.assertFalse(audit.exists())
 
 
 if __name__ == "__main__":
