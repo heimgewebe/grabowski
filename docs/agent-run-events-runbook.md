@@ -9,7 +9,7 @@ Scope: optional Grabowski task lifecycle events for Chronik
 
 **Antithese:** Enabling this globally would turn a useful observation seam into quiet infrastructure coupling.
 
-**Synthese:** Use the writer only as an explicit opt-in experiment. Keep it local, reversible, and off by default.
+**Synthese:** Use the writer as an explicit, local observation seam. Target identity comes from canonical task resource claims, never from parsing argv or logs.
 
 ## Preconditions
 
@@ -18,7 +18,8 @@ Before any activation experiment:
 - Runtime identity is healthy.
 - `grabowski_chronik` is present in the deployed runtime source set.
 - `tests.test_chronik_agent_outbox` passes as a direct unittest module.
-- Chronik demo view can read a generated event.
+- The Chronik checkout used for the demo contains the merged scoped-event contract from `heimgewebe/chronik#219`; a stale feature checkout is not valid proof.
+- Chronik demo view can read a generated repository-scoped event.
 - The production writer switch is not set in the user manager environment.
 
 ## Switches
@@ -46,9 +47,16 @@ Use these task parameters for a real smoke:
 ```text
 chronik_outbox=True
 chronik_outbox_state_root=/tmp/grabowski-chronik-smoke
+chronik_operation=implement
 ```
 
 The state root is accepted only when `chronik_outbox` is true. This prevents accidental path configuration without activation.
+
+## Target identity and privacy
+
+For a local task with exactly one canonical `repo:/absolute/path` resource claim, Grabowski reads that repository's `origin` URL and records a repository-scoped subject only when it resolves to a bounded `heimgewebe/<repo>` identity. Otherwise the subject is explicitly host-scoped. Multiple claims, foreign remotes, missing remotes and remote-host tasks never fabricate a repository.
+
+Every new event carries bounded `operation` and `task_class` fields. `chronik_operation` accepts only `implement`, `review`, `merge`, `deploy`, `runtime_verify`, `recovery` or `other`; the task class is derived deterministically from that value. Non-`other` operations require an enabled task-local outbox. Events never contain raw argv, cwd, environment variables, secrets or private filesystem paths.
 
 ## Safe temporary smoke
 
@@ -75,14 +83,10 @@ Expected result:
 A generated event must be readable by Chronik's demo view.
 
 ```bash
-/home/alex/repos/chronik/.venv/bin/python -c 'import sys; sys.path.insert(0,"/home/alex/repos/chronik"); import grabowski_chronik as c; from tools import agent_ledger_view as v; e=c.build_event({"task_id":"eeeeeeeeeeeeeeeeeeeeeeee","unit":"u","attempt":1}, "completed"); rows=v.build_view([e]); print(len(rows), rows[0].repo, rows[0].result)'
+/home/alex/repos/chronik/.venv/bin/python -c 'import sys; sys.path.insert(0,"/home/alex/.local/share/grabowski-mcp/inputs/src"); sys.path.insert(0,"/home/alex/repos/chronik"); import grabowski_chronik as c; from tools import agent_ledger_view as v; e=c.build_event({"task_id":"eeeeeeeeeeeeeeeeeeeeeeee","unit":"u","attempt":1,"chronik_context_json":{"subject_scope":"repository","repo":"heimgewebe/chronik","operation":"implement","task_class":"coding"}}, "completed"); rows=v.build_view([e]); print(len(rows), rows[0].repo, rows[0].result)'
 ```
 
-Expected result:
-
-```text
-1 heimgewebe/grabowski completed
-```
+Expected result for this explicit repository-scoped demo: `1 heimgewebe/chronik completed`. Host-scoped events remain valid for import but are not rendered by this legacy repo-only demo view.
 
 ## Production non-activation check
 
@@ -122,7 +126,7 @@ A real `grabowski_task_start` activation smoke is allowed only with `chronik_out
 Stop the experiment if any of these happen:
 
 - event writing blocks a task state change
-- event payload includes raw logs, prompts, or tool outputs
+- event payload includes raw logs, prompts, argv, cwd, environment values or tool outputs
 - more than one file is written for the same task attempt without a clear reason
 - the demo view cannot read the event
 - the switch remains globally enabled after the test

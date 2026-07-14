@@ -79,7 +79,8 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         self.assertEqual(event["schema_version"], "agent-run-event.v0")
         self.assertEqual(event["kind"], "agent.run.started")
         self.assertEqual(event["source"]["repo"], "heimgewebe/grabowski")
-        self.assertEqual(event["data"], {"result": "started"})
+        self.assertEqual(event["subject"], {"scope": "host", "host": "unknown"})
+        self.assertEqual(event["data"], {"result": "started", "operation": "other", "task_class": "other"})
         self.assertLessEqual(len(event["caused_by"]), 3)
         self.assertLessEqual(len(event["evidence_refs"]), 5)
 
@@ -88,18 +89,63 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         chronik.record_task_state(record(), "completed")
         event = json.loads(self.lines()[0])
         self.assertEqual(event["kind"], "agent.run.completed")
-        self.assertEqual(event["data"], {"result": "completed"})
+        self.assertEqual(event["data"], {"result": "completed", "operation": "other", "task_class": "other"})
         self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name); os.environ[chronik.STATE_ROOT_ENV] = str(self.root)
         chronik.record_task_state(record(), "failed")
         event = json.loads(self.lines()[0])
         self.assertEqual(event["kind"], "agent.run.blocked")
-        self.assertEqual(event["data"], {"result": "blocked", "blocker_code": "task-failed"})
+        self.assertEqual(event["data"], {"result": "blocked", "blocker_code": "task-failed", "operation": "other", "task_class": "other"})
+
+    def test_repository_context_is_projected_without_raw_execution_data(self):
+        self.enable()
+        context = {
+            "subject_scope": "repository",
+            "repo": "heimgewebe/chronik",
+            "operation": "implement",
+            "task_class": "coding",
+            "branch": "fix/target-identity",
+            "head": "a" * 40,
+        }
+        chronik.record_task_state(record(host="local", chronik_context_json=json.dumps(context)), "completed")
+        event = json.loads(self.lines()[0])
+        self.assertEqual(event["subject"], {
+            "scope": "repository", "repo": "heimgewebe/chronik",
+            "branch": "fix/target-identity", "head": "a" * 40,
+        })
+        self.assertEqual(event["data"], {
+            "result": "completed", "operation": "implement", "task_class": "coding",
+        })
+        rendered = json.dumps(event, sort_keys=True)
+        self.assertNotIn("argv", rendered)
+        self.assertNotIn("cwd", rendered)
+        self.assertNotIn("environment", rendered)
+
+    def test_host_context_never_fabricates_repository(self):
+        self.enable()
+        context = {
+            "subject_scope": "host", "host": "heim-pc",
+            "operation": "recovery", "task_class": "recovery",
+        }
+        chronik.record_task_state(record(host="heim-pc", chronik_context_json=json.dumps(context)), "failed")
+        event = json.loads(self.lines()[0])
+        self.assertEqual(event["subject"], {"scope": "host", "host": "heim-pc"})
+        self.assertNotIn("repo", event["subject"])
+        self.assertEqual(event["data"]["operation"], "recovery")
+        self.assertEqual(event["data"]["task_class"], "recovery")
 
     def test_deduplicates_same_event(self):
         self.enable()
         chronik.record_task_state(record(), "running")
         chronik.record_task_state(record(), "running")
         self.assertEqual(len(self.lines()), 1)
+
+    def test_event_ids_are_state_unique_and_retry_stable(self):
+        value = record(host="local")
+        started = chronik.build_event(value, "running")
+        completed = chronik.build_event(value, "completed")
+        blocked = chronik.build_event(value, "failed")
+        self.assertEqual(started["event_id"], chronik.build_event(value, "running")["event_id"])
+        self.assertEqual(len({started["event_id"], completed["event_id"], blocked["event_id"]}), 3)
 
     def test_failure_is_non_blocking(self):
         bad_root = self.root / "occupied"
