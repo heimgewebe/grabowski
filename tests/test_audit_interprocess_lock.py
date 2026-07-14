@@ -185,6 +185,35 @@ class AuditInterprocessLockTests(unittest.TestCase):
                         grabowski_mcp._append_audit({"operation": "blocked"})
                 self.assertEqual(audit.read_bytes(), b"")
 
+
+    def test_append_completes_after_short_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._state_patches(state)
+            real_write = os.write
+
+            def short_write(descriptor: int, payload: bytes) -> int:
+                return real_write(descriptor, payload[:7])
+
+            with patches[0], patches[1], patches[2], patches[3]:
+                with patch.object(
+                    grabowski_mcp.os,
+                    "write",
+                    side_effect=short_write,
+                ):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "short-write-test",
+                            "payload": "x" * 200,
+                        }
+                    )
+                status = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(status["valid"], status)
+                self.assertEqual(status["records"], 1)
+                record = json.loads(audit.read_text(encoding="utf-8"))
+                self.assertEqual(record["payload"], "x" * 200)
+
     def test_append_refuses_to_cross_audit_byte_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
