@@ -2211,6 +2211,7 @@ def _validate_audit_file_contract(
         or opened.st_dev != linked.st_dev
         or opened.st_ino != linked.st_ino
         or opened.st_uid != os.getuid()
+        or opened.st_gid != os.getgid()
         or opened.st_nlink != 1
         or statmod.S_IMODE(opened.st_mode) != 0o600
     ):
@@ -2250,11 +2251,12 @@ def _audit_parent(path: Path) -> Path:
         _state_root()
     if parent.is_symlink():
         raise PermissionError("Audit parent directory may not be a symlink")
-    metadata = parent.stat()
+    metadata = os.stat(parent, follow_symlinks=False)
     if (
         not statmod.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.getuid()
-        or metadata.st_mode & 0o077
+        or metadata.st_gid != os.getgid()
+        or statmod.S_IMODE(metadata.st_mode) & 0o077
     ):
         raise PermissionError(
             "Audit parent directory does not satisfy its file contract"
@@ -2561,7 +2563,7 @@ def _append_audit(record: dict[str, Any]) -> None:
     with AUDIT_APPEND_LOCK:
         if AUDIT_LOG.is_symlink():
             raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
-        descriptor, _created = _open_audit_append_target(AUDIT_LOG)
+        descriptor, created = _open_audit_append_target(AUDIT_LOG)
         try:
             status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
             if not status["valid"]:
@@ -2591,6 +2593,11 @@ def _append_audit(record: dict[str, Any]) -> None:
             _write_all(descriptor, payload)
             os.fsync(descriptor)
             _require_audit_descriptor_bound(descriptor, AUDIT_LOG)
+            appended = os.fstat(descriptor)
+            if appended.st_size != current_size + len(payload):
+                raise RuntimeError("Audit append size postflight mismatch")
+            if created:
+                _fsync_directory(AUDIT_LOG.parent)
         finally:
             _close_audit_descriptor(descriptor)
 
