@@ -5,7 +5,7 @@
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "18eeba7e4fb8d658753931530725051be37ca4a7fa5938d28da7f6ba5f81093d"
+    "sha256": "28ae1103f29db80de4d76948f36dbcefa2b54dfbbc2c8ec659b5eb601b523af7"
   },
   "counts": {
     "core": 21,
