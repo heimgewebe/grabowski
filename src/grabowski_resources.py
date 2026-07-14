@@ -59,6 +59,7 @@ LEASE_SNAPSHOT_KEYS = frozenset({
     "metadata_sha256",
 })
 TASK_RELEASABLE_STATES = frozenset({"completed"})
+NONRENEWABLE_CRITICAL_RESOURCE_PREFIXES = ("gate:github-merge:",)
 RECONCILIATION_NON_CLAIMS = [
     "permission_to_release_changed_lease",
     "permission_to_release_other_owner",
@@ -1115,6 +1116,187 @@ def _check_bureau_semantic_conflicts(
             )
 
 
+def _merge_guard_repository_from_row(row: sqlite3.Row) -> str | None:
+    metadata = _row_metadata(row)
+    guard = metadata.get("merge_guard")
+    if not isinstance(guard, dict):
+        return None
+    repository = guard.get("local_resource_repository")
+    if not isinstance(repository, str):
+        return None
+    normalized = Path(repository).expanduser()
+    if not normalized.is_absolute():
+        return None
+    return os.path.normpath(str(normalized))
+
+
+def _check_active_merge_guard_conflicts(
+    connection: sqlite3.Connection,
+    *,
+    keys: list[str],
+    metadata: dict[str, Any],
+    now: int,
+) -> None:
+    requested_scope = _scope_manifest_from_metadata(metadata, required=False)
+    requested_repositories = {
+        key.split(":", 1)[1]
+        for key in keys
+        if key.startswith("repo:")
+    }
+    if requested_scope is not None:
+        requested_repositories.add(requested_scope["repository"])
+    rows = connection.execute(
+        "SELECT * FROM leases WHERE resource_key LIKE 'gate:github-merge:%' "
+        "AND expires_at_unix>? ORDER BY resource_key",
+        (now,),
+    ).fetchall()
+    for row in rows:
+        repository = _merge_guard_repository_from_row(row)
+        if repository is None:
+            raise ResourceConflict(
+                row["resource_key"], row["owner_id"], row["expires_at_unix"]
+            )
+        overlaps = repository in requested_repositories or any(
+            _path_is_within_repository(key, repository) for key in keys
+        )
+        if overlaps:
+            raise ResourceConflict(
+                row["resource_key"], row["owner_id"], row["expires_at_unix"]
+            )
+
+
+def acquire_merge_guard_resources(
+    guard_owner_id: str,
+    lease_owner_id: str,
+    resource_keys: Iterable[str],
+    *,
+    repository: str,
+    purpose: str,
+    ttl_seconds: int = 300,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    guard_owner = _owner(guard_owner_id)
+    lease_owner = _owner(lease_owner_id)
+    if guard_owner == lease_owner:
+        raise ValueError("merge guard owner must be distinct from lease owner")
+    keys = normalize_resource_keys(resource_keys)
+    lease_purpose = _purpose(purpose)
+    ttl = _ttl(ttl_seconds)
+    repository_path = Path(repository).expanduser()
+    if not repository_path.is_absolute():
+        raise ValueError("merge guard repository must be absolute")
+    canonical_repository = os.path.normpath(str(repository_path))
+    repo_key = f"repo:{canonical_repository}"
+    if repo_key not in keys:
+        raise ValueError("merge guard resources must include the canonical repository key")
+    gate_keys = [key for key in keys if key.startswith("gate:github-merge:")]
+    if len(gate_keys) != 1:
+        raise ValueError("merge guard resources must include exactly one GitHub merge gate")
+    normalized_metadata: dict[str, Any] = {} if metadata is None else dict(metadata)
+    if "scope_manifest" in normalized_metadata:
+        normalized_metadata["scope_manifest"] = nonconflict.normalize_scope_manifest(
+            normalized_metadata["scope_manifest"]
+        )
+    metadata_json, metadata_sha256 = _metadata(normalized_metadata)
+    now = _now()
+    expires = now + ttl
+    observed: list[dict[str, Any]] = []
+    acquired_rows: list[sqlite3.Row] = []
+    held_keys: list[str] = []
+    observed_at_unix_ns = 0
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            observed_at_unix_ns = time.time_ns()
+            rows = connection.execute(
+                "SELECT * FROM leases WHERE expires_at_unix>? ORDER BY resource_key",
+                (now,),
+            ).fetchall()
+            existing_repo_owned = False
+            for row in rows:
+                row_key = row["resource_key"]
+                row_metadata = _row_metadata(row)
+                row_scope = _scope_manifest_from_metadata(row_metadata, required=False)
+                relevant = (
+                    row_key in keys
+                    or row_key == repo_key
+                    or _path_is_within_repository(row_key, canonical_repository)
+                    or (
+                        row_scope is not None
+                        and row_scope["repository"] == canonical_repository
+                    )
+                )
+                if not relevant:
+                    continue
+                snapshot = _public(row)
+                observed.append(snapshot)
+                same_lease_owner = row["owner_id"] == lease_owner
+                if row_key == repo_key and same_lease_owner:
+                    existing_repo_owned = True
+                    continue
+                if same_lease_owner and row_key not in keys:
+                    continue
+                raise ResourceConflict(
+                    row_key, row["owner_id"], row["expires_at_unix"]
+                )
+
+            keys_to_acquire = [
+                key for key in keys if not (key == repo_key and existing_repo_owned)
+            ]
+            for key in keys_to_acquire:
+                connection.execute(
+                    """
+                    INSERT INTO leases(
+                        resource_key, owner_id, purpose, acquired_at_unix,
+                        updated_at_unix, expires_at_unix, metadata_sha256,
+                        metadata_json, reclaimed_from_owner
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    ON CONFLICT(resource_key) DO UPDATE SET
+                        owner_id=excluded.owner_id,
+                        purpose=excluded.purpose,
+                        acquired_at_unix=excluded.acquired_at_unix,
+                        updated_at_unix=excluded.updated_at_unix,
+                        expires_at_unix=excluded.expires_at_unix,
+                        metadata_sha256=excluded.metadata_sha256,
+                        metadata_json=excluded.metadata_json,
+                        reclaimed_from_owner=leases.owner_id
+                    """,
+                    (
+                        key,
+                        guard_owner,
+                        lease_purpose,
+                        now,
+                        now,
+                        expires,
+                        metadata_sha256,
+                        metadata_json,
+                    ),
+                )
+            if keys_to_acquire:
+                acquired_rows = connection.execute(
+                    f"SELECT * FROM leases WHERE resource_key IN ({','.join('?' for _ in keys_to_acquire)}) "
+                    "ORDER BY resource_key",
+                    keys_to_acquire,
+                ).fetchall()
+            held_keys = sorted(keys_to_acquire)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return {
+        "guard_owner_id": guard_owner,
+        "lease_owner_id": lease_owner,
+        "repository": canonical_repository,
+        "observed_at_unix": now,
+        "observed_at_unix_ns": observed_at_unix_ns,
+        "expires_at_unix": expires,
+        "observed_leases": observed,
+        "acquired_leases": [_public(row) for row in acquired_rows],
+        "held_resource_keys": held_keys,
+        "resource_keys": keys,
+    }
+
+
 def acquire_resources(
     owner_id: str,
     resource_keys: Iterable[str],
@@ -1151,6 +1333,9 @@ def acquire_resources(
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            _check_active_merge_guard_conflicts(
+                connection, keys=keys, metadata=sanitized_metadata, now=now
+            )
             _check_bureau_semantic_conflicts(
                 connection,
                 keys=keys,
@@ -1165,7 +1350,12 @@ def acquire_resources(
                 ).fetchone()
                 if row is not None:
                     existing[key] = row
-                    if row["owner_id"] != owner and row["expires_at_unix"] > now:
+                    live = row["expires_at_unix"] > now
+                    critical_reentry = live and any(
+                        key.startswith(prefix)
+                        for prefix in NONRENEWABLE_CRITICAL_RESOURCE_PREFIXES
+                    )
+                    if live and (row["owner_id"] != owner or critical_reentry):
                         raise ResourceConflict(
                             key, row["owner_id"], row["expires_at_unix"]
                         )

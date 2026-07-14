@@ -73,6 +73,106 @@ class ResourceTests(unittest.TestCase):
         self.assertIsNone(resources.inspect_resource("port:9223"))
         self.assertEqual(resources.inspect_resource("port:9222")["owner_id"], "owner-a")
 
+    def test_github_merge_gate_is_nonrenewable_even_for_same_owner(self) -> None:
+        key = "gate:github-merge:heimgewebe-grabowski:main"
+        first = resources.acquire_resources(
+            "owner-a", [key], purpose="first merge dispatch", ttl_seconds=60
+        )
+        self.assertEqual("owner-a", first["leases"][0]["owner_id"])
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "owner-a", [key], purpose="concurrent duplicate merge", ttl_seconds=60
+            )
+        self.assertEqual("owner-a", resources.inspect_resource(key)["owner_id"])
+
+    def test_merge_guard_snapshots_existing_owner_leases_and_releases_only_guard_keys(self) -> None:
+        repository = self.root / "repo"
+        repository.mkdir()
+        existing_path = f"path:{repository / 'src' / 'owned.py'}"
+        resources.acquire_resources(
+            "task-owner", [existing_path], purpose="active task path", ttl_seconds=120
+        )
+        keys = [
+            f"repo:{repository}",
+            "component:github-branch:heimgewebe-grabowski:main",
+            "service:github-main:heimgewebe-grabowski",
+            "service:github-pr:heimgewebe-grabowski-57",
+            "gate:github-merge:heimgewebe-grabowski:main",
+            "deployment:github:heimgewebe-grabowski:main",
+        ]
+        result = resources.acquire_merge_guard_resources(
+            "captain-merge:guard-1",
+            "task-owner",
+            keys,
+            repository=str(repository),
+            purpose="atomic merge guard",
+            ttl_seconds=60,
+            metadata={
+                "merge_guard": {
+                    "local_resource_repository": str(repository),
+                    "head_sha": "a" * 40,
+                    "diff_sha256": "b" * 64,
+                }
+            },
+        )
+        self.assertEqual([existing_path], [
+            item["resource_key"] for item in result["observed_leases"]
+        ])
+        self.assertEqual(sorted(keys), result["held_resource_keys"])
+        resources.release_resources(
+            "captain-merge:guard-1", result["held_resource_keys"]
+        )
+        self.assertEqual("task-owner", resources.inspect_resource(existing_path)["owner_id"])
+        self.assertEqual([existing_path], [
+            item["resource_key"] for item in resources.list_resources()
+        ])
+
+    def test_merge_guard_preserves_existing_owner_repo_lease_and_blocks_new_overlap(self) -> None:
+        repository = self.root / "repo"
+        repository.mkdir()
+        repo_key = f"repo:{repository}"
+        resources.acquire_resources(
+            "task-owner", [repo_key], purpose="active task repo", ttl_seconds=120
+        )
+        keys = [
+            repo_key,
+            "component:github-branch:heimgewebe-grabowski:main",
+            "service:github-main:heimgewebe-grabowski",
+            "service:github-pr:heimgewebe-grabowski-57",
+            "gate:github-merge:heimgewebe-grabowski:main",
+            "deployment:github:heimgewebe-grabowski:main",
+        ]
+        result = resources.acquire_merge_guard_resources(
+            "captain-merge:guard-2",
+            "task-owner",
+            keys,
+            repository=str(repository),
+            purpose="atomic merge guard",
+            ttl_seconds=60,
+            metadata={
+                "merge_guard": {
+                    "local_resource_repository": str(repository),
+                    "head_sha": "a" * 40,
+                    "diff_sha256": "b" * 64,
+                }
+            },
+        )
+        self.assertEqual([repo_key], [
+            item["resource_key"] for item in result["observed_leases"]
+        ])
+        self.assertNotIn(repo_key, result["held_resource_keys"])
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "task-owner",
+                [f"path:{repository / 'late.py'}"],
+                purpose="late same-owner write",
+                ttl_seconds=60,
+            )
+        resources.release_resources(
+            "captain-merge:guard-2", result["held_resource_keys"]
+        )
+        self.assertEqual("task-owner", resources.inspect_resource(repo_key)["owner_id"])
+
     def test_expired_lease_is_reclaimed(self) -> None:
         resources.acquire_resources(
             "owner-a", ["service:test.service"], purpose="first", ttl_seconds=60

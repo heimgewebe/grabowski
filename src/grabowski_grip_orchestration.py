@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import grabowski_merge_guard
+
 CoreModule = Any
 
 
@@ -240,13 +242,25 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
     action_records: list[dict[str, Any]] = []
     for action in actions:
         if action["action"] == "pr-merge":
-            execution_result = core._run_captain_pr_merge(repo_path, action, parameters, github_runner)
+            guarded_runner = grabowski_merge_guard.CaptainMergeGuardRunner(
+                repo_path=repo_path,
+                action=action,
+                parameters=parameters,
+                github_runner=github_runner,
+                execution_intent_sha256=str(intent_info["intent_sha256"]),
+                lease_owner_id=str(
+                    parameters["execution_intent"]["context"].get("lease_owner_id", "")
+                ),
+            )
+            execution_result = core._run_captain_pr_merge(
+                repo_path, action, parameters, guarded_runner
+            )
+            guarded_runner.finalize(execution_result)
         elif action["action"] == "runtime-deploy":
             execution_result = core._run_captain_runtime_deploy(action, parameters)
         else:
             raise core.GripPreflightError(f"captain-run has no executor for {action['action']}")
         executions.append(execution_result)
-        attempted = execution_result.get("execution_attempted") is True
         invoked = execution_result.get("execution_invoked") is True
         command_returned = execution_result.get("command_returned") is True
         verified = execution_result.get("verification_passed") is True
