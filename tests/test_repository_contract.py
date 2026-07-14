@@ -17,6 +17,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertTrue((ROOT / "src" / "grabowski_runtime.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_read_surface.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_grip_orchestration.py").is_file())
+        self.assertTrue((ROOT / "src" / "grabowski_merge_guard.py").is_file())
 
     def test_grabowski_tool_names_are_present(self) -> None:
         source = (
@@ -188,7 +189,8 @@ class RepositoryContractTests(unittest.TestCase):
             "src/grabowski_privileged_broker.py",
         )
         self.assertEqual(supporting["grabowski_grip_orchestration"], "src/grabowski_grip_orchestration.py")
-        for module in ("grabowski_mcp", "grabowski_grips", "grabowski_grip_orchestration", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_privileged_broker", "grabowski_tasks", "grabowski_recovery", "grabowski_friction", "grabowski_agent_bootstrap", "grabowski_recall", "grabowski_consumer_surface", "grabowski_private_io", "grabowski_job_origin", "grabowski_job_finalizer"):
+        self.assertEqual(supporting["grabowski_merge_guard"], "src/grabowski_merge_guard.py")
+        for module in ("grabowski_mcp", "grabowski_grips", "grabowski_grip_orchestration", "grabowski_merge_guard", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_privileged_broker", "grabowski_tasks", "grabowski_recovery", "grabowski_friction", "grabowski_agent_bootstrap", "grabowski_recall", "grabowski_consumer_surface", "grabowski_private_io", "grabowski_job_origin", "grabowski_job_finalizer"):
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
 

@@ -1815,6 +1815,10 @@
         "source": "src/grabowski_grip_orchestration.py"
       },
       {
+        "module": "grabowski_merge_guard",
+        "source": "src/grabowski_merge_guard.py"
+      },
+      {
         "module": "grabowski_agent_workspace_observer",
         "source": "src/grabowski_agent_workspace_observer.py"
       },
@@ -1968,7 +1972,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "8afcc76b890ee0880fcf57d4bba8999d2166510715d2c981eb5c1595744537d7"
+      "sha256": "d6f13ab8227f3fd816901f103ac71efa1ecad152c8ec61484feda5c500a62ae3"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c8c47bda693fbf40df69344aa527bf94ff1820cc5be86ea48b14f452100f9b54",
@@ -1992,6 +1996,7 @@
       "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_mcp.py": "cd8e90ea1b4de3871f2d3ada985e25f528595b51a3fc8f26828fde2b6946562f",
+      "src/grabowski_merge_guard.py": "3994e4b572f556f7eded6ea0b7ccfaa24d87889f120c828276e12043792323f7",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "214233836855c6c60c76d504e41467f04ddcbaa6a2a104c83eacb30a936cf6bd",

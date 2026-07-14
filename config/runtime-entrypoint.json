@@ -149,6 +149,10 @@
       "source": "src/grabowski_grip_orchestration.py"
     },
     {
+      "module": "grabowski_merge_guard",
+      "source": "src/grabowski_merge_guard.py"
+    },
+    {
       "module": "grabowski_agent_workspace_observer",
       "source": "src/grabowski_agent_workspace_observer.py"
     },
