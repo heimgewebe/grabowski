@@ -138,6 +138,8 @@ class FakeRunner:
             return _completed(argv)
         if argv[:3] == ["/usr/bin/systemctl", "list-units", "--type=service"]:
             return _completed(argv, stdout=self.active_instance_output)
+        if argv == ["/usr/bin/systemctl", "daemon-reload"]:
+            return _completed(argv)
         if argv[:2] == ["/usr/bin/systemctl", "start"]:
             if self.fail_first_start and self.start_failures == 0:
                 self.start_failures += 1
@@ -226,6 +228,49 @@ class RootbrokerCutoverTests(unittest.TestCase):
                     artifacts,
                     running_path=running,
                 )
+
+    def test_recovery_source_dropin_is_exact_and_narrow(self) -> None:
+        publisher = _publisher()
+        expected = (
+            "[Service]\n"
+            "ProtectHome=tmpfs\n"
+            "BindReadOnlyPaths=\n"
+            "BindReadOnlyPaths=/home/alex/.local/state/grabowski/recovery/"
+            "last-server-recovery.json\n"
+            "BindReadOnlyPaths=-/home/alex/.local/state/grabowski/"
+            "operator-kill-switch\n"
+        ).encode("utf-8")
+        artifacts = {
+            cutover.RECOVERY_SOURCE_DROPIN_TARGET: (
+                expected,
+                0o644,
+                hashlib.sha256(expected).hexdigest(),
+            )
+        }
+
+        cutover._validate_recovery_source_dropin(
+            artifacts,
+            publisher=publisher,
+        )
+        self.assertEqual(
+            cutover._expected_recovery_source_dropin(publisher),
+            expected,
+        )
+
+        broad = expected.replace(
+            b"recovery/last-server-recovery.json",
+            b"recovery",
+        )
+        artifacts[cutover.RECOVERY_SOURCE_DROPIN_TARGET] = (
+            broad,
+            0o644,
+            hashlib.sha256(broad).hexdigest(),
+        )
+        with self.assertRaisesRegex(cutover.CutoverError, "differs"):
+            cutover._validate_recovery_source_dropin(
+                artifacts,
+                publisher=publisher,
+            )
 
     def test_publisher_is_loaded_from_bound_commit_not_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -333,6 +378,11 @@ class RootbrokerCutoverTests(unittest.TestCase):
 
             self.assertTrue(receipt["success"])
             self.assertFalse(receipt["rollback_performed"])
+            self.assertTrue(receipt["daemon_reload_complete"])
+            self.assertIn(
+                ["/usr/bin/systemctl", "daemon-reload"],
+                runner.calls,
+            )
             self.assertTrue(runner.active)
             for path, (data, mode) in layout["desired_data"].items():
                 self.assertEqual(path.read_bytes(), data)
