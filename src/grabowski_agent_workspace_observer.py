@@ -182,14 +182,19 @@ def _failure_classes(
     manifest: dict[str, Any],
 ) -> list[str]:
     classes: list[str] = []
+    generic_failures: list[tuple[str | None, str]] = []
+    specifically_classified_roles: set[str] = set()
     for event in events:
         outcome = event.get("outcome")
+        role = event.get("role") if isinstance(event.get("role"), str) else None
         evidence = event.get("evidence") if isinstance(event.get("evidence"), dict) else {}
         failure = evidence.get("failure_classification")
         if isinstance(failure, str) and failure and failure not in SUCCESS_CLASSIFICATIONS:
             classes.append(failure)
+            if role:
+                specifically_classified_roles.add(role)
         elif outcome in {"environment_failure", "failed", "incomplete"}:
-            classes.append(f"{event.get('event_type')}:{outcome}")
+            generic_failures.append((role, f"{event.get('event_type')}:{outcome}"))
     legacy_receipt_classes = {
         role: _receipt_failure_class(manifest, role)
         for role in ("tests", "review")
@@ -199,6 +204,7 @@ def _failure_classes(
             continue
         if legacy_receipt_classes.get(role):
             classes.append(str(legacy_receipt_classes[role]))
+            specifically_classified_roles.add(role)
             continue
         classification = value.get("classification")
         if (
@@ -207,6 +213,12 @@ def _failure_classes(
             and classification not in {"retry_limit_reached"}
         ):
             classes.append(f"{role}:{classification}")
+            specifically_classified_roles.add(role)
+    classes.extend(
+        failure
+        for role, failure in generic_failures
+        if role is None or role not in specifically_classified_roles
+    )
     if not events:
         classes.extend(_legacy_failure_classes(manifest, status))
     return sorted(set(classes))

@@ -1976,7 +1976,7 @@
       "src/grabowski_agent_role.py": "4a8140128cf22ff7c7566f6637af47d82f63b491a971f42296099db8d8a21729",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
       "src/grabowski_agent_workspace.py": "55426be1061dfd5790352303cd5aabb7f8b352d38bb7a9ca5b19abaf5097495f",
-      "src/grabowski_agent_workspace_observer.py": "59ff94bdeea6ea71c1c6db4207157b606f44d0609d3c8b8eca57cd73b929b43f",
+      "src/grabowski_agent_workspace_observer.py": "9be8c468e08a4a6c6f5101748b0ec4e755f6fc25742f60272ec8b2ec0ce04837",
       "src/grabowski_agent_writer.py": "1ccf0168b78db145c36292397410eb8878b78ad004e1795cfe5a490763530b69",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
