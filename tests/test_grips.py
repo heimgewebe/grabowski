@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import grabowski_grips as grips
 import grabowski_grip_orchestration as grip_orchestration
+import grabowski_merge_guard as merge_guard
+import grabowski_resources as resources
 
 def _self_review_audit(
     *,
@@ -135,6 +137,7 @@ class FakeGh:
         repo_settings: dict[str, object] | None = None,
         repo_settings_returncode: int = 0,
         repo_settings_invalid_json: bool = False,
+        diff_text: str = "captain-diff\n",
     ):
         self.existing = existing
         self.failure = failure
@@ -150,6 +153,8 @@ class FakeGh:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         }
+        self.view.setdefault("baseRefOid", "e" * 40)
+        self.diff_text = diff_text
         self.view_failure_after_merge = view_failure_after_merge
         self.post_merge_view = post_merge_view or {}
         self.post_merge_view_failures = post_merge_view_failures
@@ -203,6 +208,8 @@ class FakeGh:
             return {"returncode": 0, "stdout": str(self.view["url"]), "stderr": ""}
         if argv[:2] == ["pr", "edit"]:
             return {"returncode": 0, "stdout": "", "stderr": ""}
+        if argv[:2] == ["pr", "diff"]:
+            return {"returncode": 0, "stdout": self.diff_text, "stderr": ""}
         if argv[:2] == ["pr", "merge"]:
             if self.merge_exception:
                 raise RuntimeError("merge runner exploded")
@@ -223,6 +230,7 @@ class FakeGh:
                 return {"returncode": 0, "stdout": "{", "stderr": ""}
             if self.view_sequence:
                 self.view = dict(self.view_sequence.pop(0))
+                self.view.setdefault("baseRefOid", "e" * 40)
                 return {"returncode": 0, "stdout": json.dumps(self.view), "stderr": ""}
             if self.view_failure_after_merge and self.merged:
                 return {"returncode": 1, "stdout": "", "stderr": "transient PR view failure"}
@@ -2619,7 +2627,8 @@ class RuntimeDeployGripTests(unittest.TestCase):
 
 
 CAPTAIN_HEAD = "b" * 40
-CAPTAIN_DIFF = "c" * 64
+CAPTAIN_DIFF_TEXT = "captain-diff\n"
+CAPTAIN_DIFF = hashlib.sha256(CAPTAIN_DIFF_TEXT.encode("utf-8")).hexdigest()
 
 
 def captain_action(**overrides) -> dict[str, object]:
@@ -2724,14 +2733,44 @@ def captain_execution_intent(parameters: dict[str, object], **overrides) -> dict
             "authorization_sha256": grips._captain_execution_intent_authorization_sha256(parameters),
         },
         "actor": {"id": "alex", "kind": "trusted-owner"},
-        "context": {"surface": "captain-run", "workspace": "bureau-task"},
+        "context": {
+            "surface": "captain-run",
+            "workspace": "bureau-task",
+            "lease_owner_id": "captain-test-owner",
+        },
         "issued_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     intent.update(overrides)
     return intent
 
 
+def authorized_captain_run_parameters(**overrides) -> dict[str, object]:
+    parameters = captain_parameters(
+        trusted_owner_mode=True,
+        autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+        allow_execution=True,
+        **overrides,
+    )
+    parameters.pop("human_authorization")
+    parameters.pop("execution_authority")
+    parameters["execution_intent"] = captain_execution_intent(parameters)
+    return parameters
+
+
 class CaptainAuthorityPathTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._resource_tempdir = tempfile.TemporaryDirectory()
+        self._resource_db_patch = patch.object(
+            resources,
+            "RESOURCE_DB",
+            Path(self._resource_tempdir.name) / "resources.sqlite3",
+        )
+        self._resource_db_patch.start()
+
+    def tearDown(self) -> None:
+        self._resource_db_patch.stop()
+        self._resource_tempdir.cleanup()
+
     def run_captain(self, parameters: dict[str, object]) -> dict[str, object]:
         return grips.grip_run("captain-preflight", parameters, profile="captain", command_runner=FakeGit())
 
@@ -4924,7 +4963,240 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             self.assertEqual("blocked", result["receipt"]["status"])
 
 
+    def test_atomic_merge_guard_receipt_binds_live_base_diff_resources_and_timestamps(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(view={
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": "e" * 40,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }, diff_text=CAPTAIN_DIFF_TEXT.rstrip("\n"))
+        result = grips.grip_run(
+            "captain-run", parameters, profile="captain", allow_mutation=True,
+            command_runner=FakeGit(), github_runner=gh,
+        )
+        self.assertEqual("passed", result["receipt"]["status"])
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("completed", guard["status"])
+        self.assertTrue(guard["contract_satisfied"])
+        self.assertTrue(guard["dispatch_called"])
+        self.assertEqual(CAPTAIN_HEAD, guard["bindings"]["head_sha"])
+        self.assertEqual("e" * 40, guard["bindings"]["base_sha"])
+        self.assertEqual(CAPTAIN_DIFF, guard["bindings"]["diff_sha256"])
+        self.assertEqual(6, len(guard["resource_keys"]))
+        self.assertLessEqual(
+            guard["observed_at_unix_ns"],
+            guard["lease_snapshot_observed_at_unix_ns"],
+        )
+        self.assertLessEqual(
+            guard["lease_snapshot_observed_at_unix_ns"],
+            guard["dispatch_at_unix_ns"],
+        )
+        self.assertLessEqual(guard["dispatch_at_unix_ns"], guard["completed_at_unix_ns"])
+        self.assertRegex(guard["lease_snapshot_sha256"], r"[0-9a-f]{64}\Z")
+        self.assertRegex(guard["receipt_sha256"], r"[0-9a-f]{64}\Z")
+        self.assertEqual([], resources.list_resources())
+
+    def test_atomic_merge_guard_blocks_lease_acquired_after_review_before_dispatch(self) -> None:
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(view={
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "baseRefOid": "e" * 40, "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        })
+        inserted = False
+        def late_lease_runner(repo: Path, argv: list[str]) -> dict[str, object]:
+            nonlocal inserted
+            result = gh(repo, argv)
+            if argv[:2] == ["pr", "diff"] and not inserted:
+                resources.acquire_resources(
+                    "foreign-writer",
+                    [f"path:{local_repo / 'src' / 'late.py'}"],
+                    purpose="late writer lease",
+                    ttl_seconds=60,
+                )
+                inserted = True
+            return result
+        result = grips.grip_run(
+            "captain-run", parameters, profile="captain", allow_mutation=True,
+            command_runner=FakeGit(), github_runner=late_lease_runner,
+        )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["merge_dispatch_blocked_by_lease_guard"])
+        self.assertEqual("blocked_by_live_lease", execution["merge_lease_guard"]["status"])
+        self.assertFalse(execution["merge_lease_guard"]["contract_satisfied"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_requires_hash_bound_lease_owner(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"].pop("lease_owner_id")
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        gh = FakeGh(view={
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "baseRefOid": "e" * 40, "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        })
+        result = grips.grip_run(
+            "captain-run", parameters, profile="captain", allow_mutation=True,
+            command_runner=FakeGit(), github_runner=gh,
+        )
+        execution = result["output"]["executions"][0]
+        self.assertEqual("blocked_before_guard", execution["merge_lease_guard"]["status"])
+        self.assertIn(
+            "merge_guard_lease_owner_invalid", execution["merge_lease_guard"]["errors"]
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_rejects_cached_snapshot_and_live_diff_drift(self) -> None:
+        for parameters, gh, expected in (
+            (
+                authorized_captain_run_parameters(merge_lease_snapshot={"sha256": "0" * 64}),
+                FakeGh(),
+                "merge_guard_cached_snapshot_input_forbidden",
+            ),
+            (
+                authorized_captain_run_parameters(),
+                FakeGh(diff_text="different-diff\n"),
+                "merge_guard_diff_drift",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                gh.view.update({
+                    "number": 96, "state": "OPEN", "baseRefName": "main",
+                    "baseRefOid": "e" * 40, "headRefOid": CAPTAIN_HEAD,
+                    "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                })
+                result = grips.grip_run(
+                    "captain-run", parameters, profile="captain", allow_mutation=True,
+                    command_runner=FakeGit(), github_runner=gh,
+                )
+                execution = result["output"]["executions"][0]
+                self.assertEqual("blocked_before_guard", execution["merge_lease_guard"]["status"])
+                self.assertTrue(any(expected in item for item in execution["merge_lease_guard"]["errors"]))
+                self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_blocks_legacy_repo_lease_and_same_owner_concurrent_gate(self) -> None:
+        for mode in ("legacy-repo", "same-owner-gate"):
+            with self.subTest(mode=mode):
+                resources.RESOURCE_DB.unlink(missing_ok=True)
+                local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+                parameters = authorized_captain_run_parameters()
+                keys = merge_guard.merge_guard_resource_keys(
+                    local_repo,
+                    repo_slug="heimgewebe/grabowski",
+                    pr_number=96,
+                    base="main",
+                )
+                if mode == "legacy-repo":
+                    resources.acquire_resources(
+                        "foreign-legacy", [f"repo:{local_repo}"],
+                        purpose="legacy unscoped repository lease", ttl_seconds=60,
+                    )
+                else:
+                    gate = next(key for key in keys if key.startswith("gate:github-merge:"))
+                    resources.acquire_resources(
+                        "alex", [gate], purpose="first concurrent merge", ttl_seconds=60,
+                    )
+                gh = FakeGh(view={
+                    "number": 96, "state": "OPEN", "baseRefName": "main",
+                    "baseRefOid": "e" * 40, "headRefOid": CAPTAIN_HEAD,
+                    "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                })
+                result = grips.grip_run(
+                    "captain-run", parameters, profile="captain", allow_mutation=True,
+                    command_runner=FakeGit(), github_runner=gh,
+                )
+                execution = result["output"]["executions"][0]
+                self.assertEqual("blocked_by_live_lease", execution["merge_lease_guard"]["status"])
+                self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_allows_exact_nonoverlap(self) -> None:
+        resources.acquire_resources(
+            "foreign-other-repo",
+            ["gate:github-merge:heimgewebe-other:main"],
+            purpose="unrelated repository merge", ttl_seconds=60,
+        )
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(view={
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "baseRefOid": "e" * 40, "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        })
+        result = grips.grip_run(
+            "captain-run", parameters, profile="captain", allow_mutation=True,
+            command_runner=FakeGit(), github_runner=gh,
+        )
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("foreign-other-repo", resources.inspect_resource(
+            "gate:github-merge:heimgewebe-other:main"
+        )["owner_id"])
+
+    def test_atomic_merge_guard_external_merge_does_not_manufacture_compliance(self) -> None:
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        parameters = authorized_captain_run_parameters()
+        open_view = {
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "baseRefOid": "e" * 40, "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        }
+        merged_view = dict(
+            open_view,
+            state="MERGED",
+            mergedAt="2026-07-14T08:00:00Z",
+            mergeCommit={"oid": "d" * 40},
+        )
+        gh = FakeGh(view_sequence=[open_view, open_view, merged_view], merge_updates_view=False)
+        inserted = False
+        def external_runner(repo: Path, argv: list[str]) -> dict[str, object]:
+            nonlocal inserted
+            result = gh(repo, argv)
+            if argv[:2] == ["pr", "diff"] and not inserted:
+                resources.acquire_resources(
+                    "foreign-writer",
+                    [f"path:{local_repo / 'late.py'}"],
+                    purpose="late external lease", ttl_seconds=60,
+                )
+                inserted = True
+            return result
+        result = grips.grip_run(
+            "captain-run", parameters, profile="captain", allow_mutation=True,
+            command_runner=FakeGit(), github_runner=external_runner,
+        )
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        self.assertTrue(execution["remote_mutation_observed"])
+        self.assertTrue(guard["external_merge_observed"])
+        self.assertFalse(guard["contract_satisfied"])
+        self.assertFalse(guard["dispatch_called"])
+        self.assertEqual(
+            "external_merge_observed_after_merge_guard_block",
+            execution["verification_error"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
 class CaptainExecutionIntentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._resource_tempdir = tempfile.TemporaryDirectory()
+        self._resource_db_patch = patch.object(
+            resources,
+            "RESOURCE_DB",
+            Path(self._resource_tempdir.name) / "resources.sqlite3",
+        )
+        self._resource_db_patch.start()
+
+    def tearDown(self) -> None:
+        self._resource_db_patch.stop()
+        self._resource_tempdir.cleanup()
+
     def executable_parameters(self, actions: list[dict[str, object]] | None = None) -> dict[str, object]:
         parameters = captain_parameters(
             actions,
@@ -5226,7 +5498,11 @@ class CaptainExecutionIntentTests(unittest.TestCase):
                 parameters = self.executable_parameters()
                 overrides: dict[str, object] = {
                     "actor": {"id": "alex", "session_token": actor_secret},
-                    "context": {"surface": "captain-run", "api_key": context_secret},
+                    "context": {
+                        "surface": "captain-run",
+                        "lease_owner_id": "captain-test-owner",
+                        "api_key": context_secret,
+                    },
                 }
                 if drift:
                     overrides["expected_head"] = "a" * 40
