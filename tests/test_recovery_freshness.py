@@ -4,11 +4,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 
@@ -164,6 +167,217 @@ class RecoveryFreshnessContractTests(unittest.TestCase):
             self.assertEqual(first["record_sha256"], second["record_sha256"])
             self.assertEqual(destination.stat().st_mode & 0o777, 0o644)
             self.assertEqual(list(root.glob(".grabowski-recovery-*")), [])
+
+    def test_safe_legacy_owner_is_rewritten_instead_of_false_idempotence(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.json"
+            destination = root / "canonical.json"
+            digest, _ = _write_source(source, now, snapshot_id="legacy-owner")
+            base_execution = _execution(source, destination, digest, now)
+            broker.publish_recovery_marker(base_execution, now=now)
+            strict_calls = 0
+            original_inspect = broker.inspect_canonical_recovery_record
+            original_parent = broker._validated_recovery_destination_parent
+            original_atomic = broker._atomic_write_recovery_record
+
+            def inspect_with_legacy_owner(
+                path: Path,
+                *,
+                now: int | None = None,
+                expected_max_age_seconds: int | None = None,
+                expected_target: str | None = None,
+                require_root_owned: bool = True,
+            ) -> dict[str, object]:
+                nonlocal strict_calls
+                result = original_inspect(
+                    path,
+                    now=now,
+                    expected_max_age_seconds=expected_max_age_seconds,
+                    expected_target=expected_target,
+                    require_root_owned=False,
+                )
+                if require_root_owned:
+                    strict_calls += 1
+                    if strict_calls == 1:
+                        result = dict(result)
+                        result.update(
+                            valid=False,
+                            freshness_reason="unsafe-file",
+                            error="canonical recovery record must be root-owned",
+                        )
+                return result
+
+            def parent_without_test_uid_requirement(
+                path: Path,
+                *,
+                require_root_owned_destination: bool,
+            ) -> tuple[Path, tuple[int, int, int, int, int]]:
+                return original_parent(path, require_root_owned_destination=False)
+
+            def atomic_without_test_uid_requirement(
+                path: Path,
+                value: dict[str, object],
+                *,
+                require_root_owned_destination: bool,
+            ) -> str:
+                return original_atomic(path, value, require_root_owned_destination=False)
+
+            def record_lock_acquisition(
+                descriptor: int,
+                *,
+                timeout_seconds: float | None = None,
+            ) -> None:
+                del descriptor, timeout_seconds
+                events.append("locked")
+
+            def record_owner_repair(
+                descriptor: int,
+                metadata: os.stat_result,
+                *,
+                require_root_owned: bool,
+            ) -> os.stat_result:
+                del descriptor, require_root_owned
+                events.append("owner-repaired")
+                return metadata
+
+            execution = dict(base_execution)
+            execution["require_root_owned_destination"] = True
+            events: list[str] = []
+
+            with patch.object(
+                broker,
+                "inspect_canonical_recovery_record",
+                side_effect=inspect_with_legacy_owner,
+            ), patch.object(
+                broker,
+                "_validated_recovery_destination_parent",
+                side_effect=parent_without_test_uid_requirement,
+            ), patch.object(
+                broker,
+                "_atomic_write_recovery_record",
+                side_effect=atomic_without_test_uid_requirement,
+            ), patch.object(
+                broker,
+                "_acquire_recovery_lock",
+                side_effect=record_lock_acquisition,
+            ), patch.object(
+                broker,
+                "_repair_recovery_lock_owner",
+                side_effect=record_owner_repair,
+            ):
+                outcome = broker.publish_recovery_marker(execution, now=now)
+
+            self.assertTrue(outcome["published"])
+            self.assertFalse(outcome["idempotent"])
+            self.assertGreaterEqual(strict_calls, 2)
+            self.assertEqual(events, ["locked", "owner-repaired"])
+
+    def test_safe_legacy_owner_still_preserves_generation_rollback_guard(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            destination = root / "canonical.json"
+            newer_source = root / "newer.json"
+            older_source = root / "older.json"
+            newer_digest, _ = _write_source(newer_source, now, snapshot_id="newer")
+            older_digest, _ = _write_source(older_source, now - 1, snapshot_id="older")
+            broker.publish_recovery_marker(
+                _execution(newer_source, destination, newer_digest, now),
+                now=now,
+            )
+            original_inspect = broker.inspect_canonical_recovery_record
+            original_parent = broker._validated_recovery_destination_parent
+
+            def inspect_with_legacy_owner(
+                path: Path,
+                *,
+                now: int | None = None,
+                expected_max_age_seconds: int | None = None,
+                expected_target: str | None = None,
+                require_root_owned: bool = True,
+            ) -> dict[str, object]:
+                result = original_inspect(
+                    path,
+                    now=now,
+                    expected_max_age_seconds=expected_max_age_seconds,
+                    expected_target=expected_target,
+                    require_root_owned=False,
+                )
+                if require_root_owned:
+                    result = dict(result)
+                    result.update(valid=False, freshness_reason="unsafe-file", error="legacy owner")
+                return result
+
+            def parent_without_test_uid_requirement(
+                path: Path,
+                *,
+                require_root_owned_destination: bool,
+            ) -> tuple[Path, tuple[int, int, int, int, int]]:
+                return original_parent(path, require_root_owned_destination=False)
+
+            execution = _execution(older_source, destination, older_digest, now - 1)
+            execution["require_root_owned_destination"] = True
+            with patch.object(
+                broker,
+                "inspect_canonical_recovery_record",
+                side_effect=inspect_with_legacy_owner,
+            ), patch.object(
+                broker,
+                "_validated_recovery_destination_parent",
+                side_effect=parent_without_test_uid_requirement,
+            ), patch.object(
+                broker,
+                "_repair_recovery_lock_owner",
+                side_effect=lambda descriptor, metadata, require_root_owned: metadata,
+            ):
+                with self.assertRaisesRegex(PermissionError, "rollback"):
+                    broker.publish_recovery_marker(execution, now=now)
+
+    def test_recovery_lock_owner_repair_is_descriptor_bound(self) -> None:
+        initial = cast(
+            os.stat_result,
+            SimpleNamespace(st_dev=7, st_ino=11, st_uid=1000, st_gid=1000),
+        )
+        repaired = cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=7,
+                st_ino=11,
+                st_uid=0,
+                st_gid=0,
+                st_mode=stat.S_IFREG | 0o600,
+                st_nlink=1,
+            ),
+        )
+        with patch.object(broker.os, "fchown") as fchown, patch.object(
+            broker.os,
+            "fstat",
+            return_value=repaired,
+        ):
+            result = broker._repair_recovery_lock_owner(
+                23,
+                initial,
+                require_root_owned=True,
+            )
+        fchown.assert_called_once_with(23, 0, 0)
+        self.assertIs(result, repaired)
+
+    def test_replaceable_destination_still_rejects_symlink_and_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = root / "target.json"
+            target.write_text("{}\n", encoding="utf-8")
+            symlink = root / "symlink.json"
+            symlink.symlink_to(target)
+            with self.assertRaisesRegex(PermissionError, "non-symlink"):
+                broker._validate_replaceable_recovery_destination(symlink)
+
+            hardlink = root / "hardlink.json"
+            os.link(target, hardlink)
+            with self.assertRaisesRegex(PermissionError, "hard links"):
+                broker._validate_replaceable_recovery_destination(target)
 
     def test_source_digest_change_is_denied_before_publication(self) -> None:
         now = int(time.time())
