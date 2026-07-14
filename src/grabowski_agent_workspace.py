@@ -2439,6 +2439,7 @@ def _recommended_next_action(
     role_retry: dict[str, Any],
     failed_roles: list[str],
     incomplete_roles: list[str],
+    writer_terminal_failure: bool = False,
 ) -> str:
     if closed:
         return "none_closed"
@@ -2446,6 +2447,8 @@ def _recommended_next_action(
         return "await_creation"
     if not route_gate_passed:
         return "recreate_with_route_evidence"
+    if writer_terminal_failure:
+        return "salvage_or_close_failed_writer"
     if any(
         value.get("classification") == "role_start_outcome_unknown"
         for value in role_retry.values()
@@ -2960,6 +2963,13 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
     )
     close_integrity = _close_integrity_status(manifest, manifest.get("close_receipt"))
     failed_roles = _collection_failed_roles(collection)
+    writer_terminal_failure = bool(
+        task_state["writer"]["terminal"]
+        and task_state["writer"]["state"] in {"failed", "interrupted", "cancelled"}
+        and not collection_complete
+    )
+    if writer_terminal_failure and "writer" not in failed_roles:
+        failed_roles = ["writer", *failed_roles]
     role_retry = _status_role_retry(manifest)
     closure_outcome = _prospective_closure_outcome(manifest, collection)
     recommended_next_action = _recommended_next_action(
@@ -2971,6 +2981,7 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         role_retry=role_retry,
         failed_roles=failed_roles,
         incomplete_roles=incomplete_roles,
+        writer_terminal_failure=writer_terminal_failure,
     )
     return {
         "workspace_id": manifest["workspace_id"],
@@ -2998,6 +3009,7 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         "collection_integrity": collection_integrity,
         "unresolved_findings": findings,
         "failed_roles": failed_roles,
+        "writer_terminal_failure": writer_terminal_failure,
         "incomplete_roles": incomplete_roles,
         "role_retry": role_retry,
         "closeable": closeable,

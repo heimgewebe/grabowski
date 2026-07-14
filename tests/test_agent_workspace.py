@@ -4243,5 +4243,48 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(manifest["outcome_receipts"]["collection"]["history"]), 2)
 
 
+    def test_declared_external_virtualenv_is_bound_read_only_without_home_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repo"
+            repo.mkdir()
+            environment = base / "toolchain" / ".venv"
+            executable = environment / "bin" / "python"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            (environment / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+            bindings, directories = role._declared_virtualenv_binding(repo, [str(executable), "-m", "unittest"])
+        self.assertEqual(bindings, [(environment.resolve(), environment.resolve())])
+        self.assertIn(environment.parent.resolve(), directories)
+        self.assertNotIn(Path.home(), [source for source, _target in bindings])
+
+    def test_workspace_local_virtualenv_needs_no_extra_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            executable = repo / ".venv" / "bin" / "python"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            (repo / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+            bindings, directories = role._declared_virtualenv_binding(repo, [str(executable)])
+        self.assertEqual(bindings, [])
+        self.assertEqual(directories, [])
+
+    def test_terminal_writer_failure_has_explicit_salvage_action(self) -> None:
+        action = workspace._recommended_next_action(
+            creation_ready=True,
+            closed=False,
+            route_gate_passed=True,
+            closeable=False,
+            success_ready=False,
+            role_retry={},
+            failed_roles=["writer"],
+            incomplete_roles=[],
+            writer_terminal_failure=True,
+        )
+        self.assertEqual(action, "salvage_or_close_failed_writer")
+
+
 if __name__ == "__main__":
     unittest.main()

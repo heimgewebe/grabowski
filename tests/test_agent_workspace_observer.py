@@ -389,5 +389,29 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         self.assertFalse(result["proposal_threshold"]["success_states_counted_as_failures"])
 
 
+    def test_closeout_handoff_is_deterministic_and_non_authorizing(self) -> None:
+        closeout = [
+            {"item": "pr_integration_truth", "status": "verified"},
+            {"item": "bureau_task_reconciliation", "status": "unknown"},
+        ]
+        handoff = observer._closeout_handoff(closeout, ["bureau_task_reconciliation"])
+        self.assertEqual(handoff["state"], "pending_external_truth")
+        self.assertEqual(handoff["next_action"], "verify:bureau_task_reconciliation")
+        self.assertFalse(handoff["mutation_authorized"])
+
+    def test_metrics_summary_is_report_hash_bound_and_read_only(self) -> None:
+        reports = [
+            {"report_sha256": "a" * 64, "facts": {"closed": True, "closure_outcome": "successful", "failed_roles": [], "actionable_failure_classes": []}},
+            {"report_sha256": "b" * 64, "facts": {"closed": False, "closure_outcome": "not_ready", "failed_roles": ["writer"], "actionable_failure_classes": ["writer:failed"]}},
+        ]
+        metrics = observer._metrics_summary(reports)
+        self.assertEqual(metrics["sample_size"], 2)
+        self.assertEqual(metrics["successful_close_count"], 1)
+        self.assertEqual(metrics["failed_role_workspace_count"], 1)
+        self.assertEqual(metrics["success_ratio"], 0.5)
+        self.assertTrue(metrics["read_only_projection"])
+        self.assertEqual(metrics["source_report_sha256"], ["a" * 64, "b" * 64])
+
+
 if __name__ == "__main__":
     unittest.main()
