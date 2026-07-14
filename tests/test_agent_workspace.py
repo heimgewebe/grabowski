@@ -1099,6 +1099,53 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertIn("--cap-drop", argv)
         self.assertNotIn("--unshare-net", argv)
 
+    def test_sandbox_binds_resolver_from_resolved_regular_file(self) -> None:
+        resolver = Path("/etc/resolv.conf")
+        try:
+            resolved = resolver.resolve(strict=True)
+        except OSError:
+            self.skipTest("host has no resolv.conf")
+        self.assertTrue(resolved.is_file())
+
+        argv = sandbox.minimal_sandbox_argv(
+            workspace=self.git.repo,
+            command=["/usr/bin/python3", "-c", "print('ok')"],
+            workspace_writable=False,
+        )
+        read_only_bindings = [
+            (argv[index + 1], argv[index + 2])
+            for index, item in enumerate(argv)
+            if item == "--ro-bind"
+        ]
+        self.assertIn((str(resolved), str(resolver)), read_only_bindings)
+
+    def test_fixed_system_file_bind_follows_symlink_to_regular_file(self) -> None:
+        resolver = self.root / "resolver"
+        resolver.write_text("nameserver 127.0.0.53\n", encoding="utf-8")
+        link = self.root / "resolv.conf"
+        link.symlink_to(resolver)
+        arguments: list[str] = []
+
+        sandbox._bind_fixed_system_file(arguments, str(link), "/etc/resolv.conf")
+
+        self.assertEqual(
+            arguments,
+            ["--ro-bind", str(resolver.resolve(strict=True)), "/etc/resolv.conf"],
+        )
+
+    def test_fixed_system_file_bind_skips_relative_dangling_and_directory(self) -> None:
+        dangling = self.root / "dangling-resolver"
+        dangling.symlink_to(self.root / "missing-resolver")
+        directory = self.root / "resolver-directory"
+        directory.mkdir()
+        arguments: list[str] = []
+
+        sandbox._bind_fixed_system_file(arguments, "relative-resolver", "/etc/resolv.conf")
+        sandbox._bind_fixed_system_file(arguments, str(dangling), "/etc/resolv.conf")
+        sandbox._bind_fixed_system_file(arguments, str(directory), "/etc/resolv.conf")
+
+        self.assertEqual(arguments, [])
+
     def test_claude_profile_binds_binary_and_private_auth_without_home(self) -> None:
         auth_root = self.root / "claude-auth"
         auth_root.mkdir(mode=0o700)
@@ -1151,6 +1198,29 @@ class AgentWorkspaceTests(unittest.TestCase):
             clear=False,
         ):
             with self.assertRaisesRegex(sandbox.AgentSandboxError, "owner-private"):
+                sandbox.prepare_external_agent_command(["claude", "--version"])
+
+    def test_claude_profile_still_rejects_symlinked_credentials(self) -> None:
+        auth_root = self.root / "claude-auth-symlink"
+        auth_root.mkdir(mode=0o700)
+        private_credentials = self.root / "private-credentials.json"
+        private_credentials.write_text("{}\n", encoding="utf-8")
+        private_credentials.chmod(0o600)
+        (auth_root / ".credentials.json").symlink_to(private_credentials)
+        executable = self.root / "claude-bin-symlink-auth"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CLAUDE_BIN": str(executable),
+                "GRABOWSKI_CLAUDE_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                sandbox.AgentSandboxError, "absolute non-symlink path"
+            ):
                 sandbox.prepare_external_agent_command(["claude", "--version"])
 
     def test_partial_creation_blocks_status_success_collect_and_close(self) -> None:
