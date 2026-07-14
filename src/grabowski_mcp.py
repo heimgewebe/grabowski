@@ -2559,11 +2559,18 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         remaining = remaining[written:]
 
 
+def _rollback_audit_descriptor(descriptor: int, expected_size: int) -> None:
+    os.ftruncate(descriptor, expected_size)
+    os.fsync(descriptor)
+    if os.fstat(descriptor).st_size != expected_size:
+        raise RuntimeError("Audit append rollback size postflight mismatch")
+
+
 def _append_audit(record: dict[str, Any]) -> None:
     with AUDIT_APPEND_LOCK:
         if AUDIT_LOG.is_symlink():
             raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
-        descriptor, created = _open_audit_append_target(AUDIT_LOG)
+        descriptor, _created = _open_audit_append_target(AUDIT_LOG)
         try:
             status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
             if not status["valid"]:
@@ -2590,14 +2597,21 @@ def _append_audit(record: dict[str, Any]) -> None:
             if current_size + len(payload) > MAX_AUDIT_BYTES:
                 raise ValueError("Audit log would exceed its byte limit")
             _require_audit_descriptor_bound(descriptor, AUDIT_LOG)
-            _write_all(descriptor, payload)
-            os.fsync(descriptor)
-            _require_audit_descriptor_bound(descriptor, AUDIT_LOG)
-            appended = os.fstat(descriptor)
-            if appended.st_size != current_size + len(payload):
-                raise RuntimeError("Audit append size postflight mismatch")
-            if created:
-                _fsync_directory(AUDIT_LOG.parent)
+            try:
+                _write_all(descriptor, payload)
+                os.fsync(descriptor)
+                _require_audit_descriptor_bound(descriptor, AUDIT_LOG)
+                appended = os.fstat(descriptor)
+                if appended.st_size != current_size + len(payload):
+                    raise RuntimeError("Audit append size postflight mismatch")
+            except BaseException:
+                try:
+                    _rollback_audit_descriptor(descriptor, current_size)
+                except BaseException as rollback_error:
+                    raise RuntimeError(
+                        "Audit append failed and rollback did not complete"
+                    ) from rollback_error
+                raise
         finally:
             _close_audit_descriptor(descriptor)
 
