@@ -106,6 +106,25 @@ def _run_ready_recovery_status(server_marker: dict[str, object], *, host: str, t
 
 
 class RecoveryToolTests(unittest.TestCase):
+    def test_publication_failure_detail_prefers_structured_reason(self) -> None:
+        self.assertEqual(
+            recovery._publication_failure_detail(
+                {
+                    "failure_reason": "privileged broker client timed out",
+                    "stderr": "less useful detail",
+                }
+            ),
+            "privileged broker client timed out",
+        )
+
+    def test_publication_failure_detail_is_bounded_and_single_line(self) -> None:
+        detail = recovery._publication_failure_detail(
+            {"stderr": "line one\n" + ("x" * 800)}
+        )
+        self.assertNotIn("\n", detail)
+        self.assertLessEqual(len(detail), 500)
+        self.assertTrue(detail.startswith("line one"))
+
     def test_tool_uses_base_capability_resolver_for_audit_verify(self) -> None:
         expected = {"ready_for_user_power_worker": False}
         with patch.object(recovery.base, "_require_capability") as require, patch.object(
