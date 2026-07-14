@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 import base64
+import fcntl
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -2159,6 +2161,63 @@ def _write_json_evidence(path: Path, payload: dict[str, Any]) -> None:
         os.close(descriptor)
 
 
+def _audit_append_lock_path(audit_path: Path | None = None) -> Path:
+    target = AUDIT_LOG if audit_path is None else audit_path
+    return target.parent / f".{target.name}.lock"
+
+
+@contextmanager
+def _exclusive_audit_append_lock(audit_path: Path | None = None):
+    """Serialize audit verification and append across independent processes."""
+    target = AUDIT_LOG if audit_path is None else audit_path
+    root = _state_root()
+    try:
+        parent = target.parent.resolve(strict=True)
+    except OSError as exc:
+        raise PermissionError("cannot resolve audit log parent") from exc
+    if parent != root:
+        raise PermissionError("audit log must be directly inside Grabowski state")
+
+    lock_path = _audit_append_lock_path(target)
+    if lock_path.is_symlink():
+        raise PermissionError(f"Audit append lock may not be a symlink: {lock_path}")
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise PermissionError("cannot safely open audit append lock") from exc
+
+    locked = False
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(lock_path, follow_symlinks=False)
+        if not statmod.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise PermissionError("audit append lock must be one regular file")
+        if opened.st_uid != os.geteuid():
+            raise PermissionError("audit append lock owner is invalid")
+        if statmod.S_IMODE(opened.st_mode) != 0o600:
+            raise PermissionError("audit append lock mode must be 0600")
+        if opened.st_dev != linked.st_dev or opened.st_ino != linked.st_ino:
+            raise PermissionError("audit append lock changed while opening")
+
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        current = os.stat(lock_path, follow_symlinks=False)
+        if (
+            not statmod.S_ISREG(current.st_mode)
+            or current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+            or current.st_uid != opened.st_uid
+            or current.st_nlink != opened.st_nlink
+        ):
+            raise PermissionError("audit append lock changed while held")
+        yield
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _audit_record_hash(record: dict[str, Any]) -> str:
     material = {
         key: value
@@ -2345,34 +2404,34 @@ def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
 
 def _append_audit(record: dict[str, Any]) -> None:
     with AUDIT_APPEND_LOCK:
-        _state_root()
-        if AUDIT_LOG.is_symlink():
-            raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
-        status = _verify_audit_log(AUDIT_LOG)
-        if not status["valid"]:
-            raise RuntimeError(f"Audit log verification failed: {status['error']}")
+        with _exclusive_audit_append_lock(AUDIT_LOG):
+            _state_root()
+            if AUDIT_LOG.is_symlink():
+                raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
+            status = _verify_audit_log(AUDIT_LOG)
+            if not status["valid"]:
+                raise RuntimeError(f"Audit log verification failed: {status['error']}")
 
-        enriched = {**record}
-        enriched.setdefault("timestamp", _utc_timestamp())
-        enriched["audit_schema_version"] = AUDIT_SCHEMA_VERSION
-        enriched["sequence"] = int(status["records"]) + 1
-        enriched["previous_record_sha256"] = status["last_record_sha256"]
-        enriched["record_sha256"] = _audit_record_hash(enriched)
-        payload = (
-            json.dumps(enriched, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-            + "\n"
-        )
-        fd = os.open(
-            AUDIT_LOG,
-            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC,
-            0o600,
-        )
-        try:
-            os.write(fd, payload.encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
+            enriched = {**record}
+            enriched.setdefault("timestamp", _utc_timestamp())
+            enriched["audit_schema_version"] = AUDIT_SCHEMA_VERSION
+            enriched["sequence"] = int(status["records"]) + 1
+            enriched["previous_record_sha256"] = status["last_record_sha256"]
+            enriched["record_sha256"] = _audit_record_hash(enriched)
+            payload = (
+                json.dumps(enriched, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                + "\n"
+            )
+            fd = os.open(
+                AUDIT_LOG,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC,
+                0o600,
+            )
+            try:
+                os.write(fd, payload.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
 def _audit_records() -> list[dict[str, Any]]:
     status = _verify_audit_log(AUDIT_LOG)

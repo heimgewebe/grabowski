@@ -5,8 +5,10 @@ import base64
 import hashlib
 import importlib.util
 import json
+import multiprocessing
 import os
 from pathlib import Path
+import queue
 import sys
 import tempfile
 import types
@@ -77,6 +79,33 @@ def _state_text(root: Path) -> str:
         if path.is_file():
             chunks.append(path.read_text(encoding="utf-8", errors="replace"))
     return "\n".join(chunks)
+
+
+def _audit_append_process_worker(
+    state_dir: str,
+    audit_log: str,
+    ready,
+    release,
+    attempting,
+    results,
+) -> None:
+    grabowski_mcp.STATE_DIR = Path(state_dir)
+    grabowski_mcp.AUDIT_LOG = Path(audit_log)
+    grabowski_mcp.QUARANTINE_DIR = Path(state_dir) / "quarantine"
+    grabowski_mcp.KILL_SWITCH_PATH = Path(state_dir) / "operator-kill-switch"
+    ready.set()
+    if not release.wait(5):
+        results.put(("error", "release timeout"))
+        return
+    attempting.set()
+    try:
+        grabowski_mcp._append_audit(
+            {"operation": "cross-process-test", "path": "/test"}
+        )
+    except BaseException as exc:
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+    else:
+        results.put(("ok", None))
 
 
 def _static_tool_guard_requirements() -> tuple[dict[str, tuple[str, ...]], set[str]]:
@@ -594,6 +623,60 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     "legacy-record-after-v2",
                 ):
                     grabowski_mcp._require_valid_audit_chain()
+
+
+    def test_audit_append_waits_for_cross_process_lock(self) -> None:
+        if "fork" not in multiprocessing.get_all_start_methods():
+            self.skipTest("cross-process flock test requires fork")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _work, _secret, _browser, _export, state, *patches = self._patched_runtime(root)
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                context = multiprocessing.get_context("fork")
+                ready = context.Event()
+                release = context.Event()
+                attempting = context.Event()
+                results = context.Queue()
+                audit = state / "write-audit.jsonl"
+                process = context.Process(
+                    target=_audit_append_process_worker,
+                    args=(
+                        str(state),
+                        str(audit),
+                        ready,
+                        release,
+                        attempting,
+                        results,
+                    ),
+                )
+                process.start()
+                try:
+                    self.assertTrue(ready.wait(5))
+                    with grabowski_mcp._exclusive_audit_append_lock(audit):
+                        release.set()
+                        self.assertTrue(attempting.wait(5))
+                        with self.assertRaises(queue.Empty):
+                            results.get(timeout=0.4)
+                        self.assertTrue(process.is_alive())
+                    self.assertEqual(results.get(timeout=5), ("ok", None))
+                    process.join(5)
+                    self.assertFalse(process.is_alive())
+                    self.assertEqual(process.exitcode, 0)
+                finally:
+                    release.set()
+                    process.join(5)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(5)
+                    process.close()
+                    results.close()
+
+                status = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(status["valid"])
+                self.assertEqual(status["records"], 1)
+                lock_path = grabowski_mcp._audit_append_lock_path(audit)
+                self.assertTrue(lock_path.is_file())
+                self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
 
     def test_replace_quarantines_preimage_and_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
