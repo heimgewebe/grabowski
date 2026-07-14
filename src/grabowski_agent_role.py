@@ -189,20 +189,59 @@ def write_receipt(path: Path, payload: dict[str, Any], *, create_only: bool = Fa
             pass
 
 
+def _declared_virtualenv_binding(repo: Path, command: list[str]) -> tuple[list[tuple[Path, Path]], list[Path]]:
+    """Bind one explicitly invoked Python virtualenv read-only, never a broad home tree."""
+    if not command:
+        return [], []
+    executable = Path(command[0]).expanduser()
+    if not executable.is_absolute():
+        return [], []
+    try:
+        declared = executable.resolve(strict=True)
+        repo_root = repo.resolve(strict=True)
+    except OSError:
+        return [], []
+    candidates = [executable.parent.parent, declared.parent.parent]
+    declared_root = next(
+        (
+            candidate
+            for candidate in candidates
+            if (candidate / "pyvenv.cfg").is_file()
+        ),
+        None,
+    )
+    if declared_root is None:
+        return [], []
+    source_root = declared_root.resolve(strict=True)
+    target_root = declared_root.absolute()
+    if source_root == repo_root or source_root.is_relative_to(repo_root):
+        return [], []
+    if source_root == Path("/") or source_root.is_relative_to(Path("/usr")):
+        return [], []
+    directories = [
+        parent
+        for parent in reversed(target_root.parents)
+        if parent != Path("/") and parent.is_dir()
+    ]
+    return [(source_root, target_root)], directories
+
+
 def sandbox_argv(repo: Path, command: list[str], *, declared_command: list[str] | None = None) -> list[str]:
     common_raw = git_text(repo, "rev-parse", "--git-common-dir")
     common = Path(common_raw)
     if not common.is_absolute():
         common = (repo / common).resolve(strict=True)
-    prepared = prepare_external_agent_command(command if declared_command is None else declared_command)
+    declared = command if declared_command is None else declared_command
+    prepared = prepare_external_agent_command(declared)
     actual_command = list(prepared.command) if declared_command is None else command
+    venv_read_only, venv_directories = _declared_virtualenv_binding(repo, declared)
     return minimal_sandbox_argv(
         workspace=repo,
         command=actual_command,
         workspace_writable=False,
         git_common_dir=common,
-        extra_read_only=prepared.extra_read_only,
-        extra_directories=prepared.extra_directories,
+        extra_read_only=(*prepared.extra_read_only, *venv_read_only),
+        extra_directories=(*prepared.extra_directories, *venv_directories),
     )
 
 
@@ -304,7 +343,8 @@ def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
         _EXECUTABLE_PROBE_SOURCE,
         executable,
     ]
-    if prepared.profile is None:
+    venv_read_only, _venv_directories = _declared_virtualenv_binding(repo, command)
+    if prepared.profile is None and not venv_read_only:
         executable_payload, error, returncode = _probe_json(repo, executable_probe)
     else:
         executable_payload, error, returncode = _probe_json_for_declared_command(
@@ -333,18 +373,21 @@ def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
         return result
     module_found = True
     if module is not None:
-        module_payload, module_error, module_returncode = _probe_json(
-            repo,
-            [
-                resolved,
-                "-I",
-                "-S",
-                "-c",
-                _MODULE_PROBE_SOURCE,
-                module,
-                resolved,
-            ],
-        )
+        module_probe = [
+            resolved,
+            "-I",
+            "-S",
+            "-c",
+            _MODULE_PROBE_SOURCE,
+            module,
+            resolved,
+        ]
+        if prepared.profile is None and not venv_read_only:
+            module_payload, module_error, module_returncode = _probe_json(repo, module_probe)
+        else:
+            module_payload, module_error, module_returncode = _probe_json_for_declared_command(
+                repo, module_probe, command
+            )
         if module_error is not None or module_payload is None:
             result["probe_error"] = module_error
             result["probe_returncode"] = module_returncode

@@ -350,6 +350,36 @@ def _is_actionable_failure(value: str) -> bool:
     )
 
 
+def _closeout_handoff(closeout: list[dict[str, Any]], unresolved: list[str]) -> dict[str, Any]:
+    verified = [str(item.get("item")) for item in closeout if item.get("status") == "verified"]
+    return {
+        "state": "complete" if not unresolved else "pending_external_truth",
+        "verified_items": verified,
+        "unresolved_items": list(unresolved),
+        "next_action": "none" if not unresolved else f"verify:{unresolved[0]}",
+        "mutation_authorized": False,
+    }
+
+
+def _metrics_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
+    closed = sum(report["facts"].get("closed") is True for report in reports)
+    success = sum(report["facts"].get("closure_outcome") == "successful" for report in reports)
+    failed = sum(bool(report["facts"].get("failed_roles")) for report in reports)
+    actionable = sum(bool(report["facts"].get("actionable_failure_classes")) for report in reports)
+    return {
+        "schema_version": 1,
+        "sample_size": len(reports),
+        "closed_count": closed,
+        "successful_close_count": success,
+        "failed_role_workspace_count": failed,
+        "actionable_failure_workspace_count": actionable,
+        "success_ratio": (success / len(reports)) if reports else None,
+        "source_report_sha256": [report["report_sha256"] for report in reports],
+        "read_only_projection": True,
+        "does_not_establish": ["causality", "global_workspace_population", "automatic_change_authority"],
+    }
+
+
 def _observer_report(
     workspace_id: str,
     *,
@@ -387,6 +417,7 @@ def _observer_report(
         ),
         "external_closeout": closeout,
         "unresolved_external_closeout": unresolved,
+        "external_closeout_handoff": _closeout_handoff(closeout, unresolved),
         "supplied_closeout_evidence_sha256": (
             external_closeout_evidence.get("evidence_sha256")
             if isinstance(external_closeout_evidence, dict)
@@ -522,6 +553,7 @@ def grabowski_agent_workspace_optimize(workspace_ids: list[str]) -> dict[str, An
         "workspace_ids": identifiers,
         "sample_size": len(reports),
         "repeated_failure_classes": repeated,
+        "metrics": _metrics_summary(reports),
         "proposals": proposals,
         "minimum_evidence_met": len(reports) >= 2,
         "proposal_threshold": {
