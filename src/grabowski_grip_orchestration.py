@@ -195,10 +195,18 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
     unsupported = [action["action"] for action in actions if action["action"] not in core.CAPTAIN_EXECUTABLE_ACTIONS]
     if unsupported:
         blocked_reasons.extend(f"captain_action_execution_not_implemented:{name}" for name in unsupported)
+    intent_info, intent_errors = core._captain_execution_intent_review(parameters, actions)
+    blocked_reasons.extend(intent_errors)
     if blocked_reasons:
         for gate in gates:
             core._check(receipt, f"captain-gate-{gate['id']}", "pass" if gate["status"] == "pass" else "fail", str(gate["reason"]))
         core._check(receipt, "captain-gates-pass", "fail", "; ".join(blocked_reasons))
+        core._check(
+            receipt,
+            "execution-intent-bound",
+            "fail" if intent_errors else "pass",
+            "; ".join(intent_errors) if intent_errors else f"intent_sha256={intent_info['intent_sha256']}",
+        )
         core._check(receipt, "receipt-bound-execution", "skip", "execution not attempted")
         return {
             "schema_version": 1,
@@ -210,10 +218,19 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
             "blocked_reasons": blocked_reasons,
             "gates": gates,
             "status_projection": projection_info,
+            "execution_intent": intent_info,
             "actions_sha256": core._captain_actions_sha256(actions),
             "authority_contract": core._captain_authority_contract("captain-run"),
             "executable_action_allowlist": sorted(core.CAPTAIN_EXECUTABLE_ACTIONS),
-            "actions": [core._captain_action_record(action, gate_decision="blocked", projection_info=projection_info) for action in actions],
+            "actions": [
+                core._captain_action_record(
+                    action,
+                    gate_decision="blocked",
+                    projection_info=projection_info,
+                    execution_intent_sha256=intent_info["intent_sha256"],
+                )
+                for action in actions
+            ],
             "executions": [],
             "non_claims": list(core.CAPTAIN_NON_CLAIMS),
         }
@@ -269,6 +286,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
                 ),
                 execution=execution_label,
                 execution_result=execution_result,
+                execution_intent_sha256=intent_info["intent_sha256"],
                 does_not_establish=core.CAPTAIN_EXECUTION_DOES_NOT_ESTABLISH if invoked else core.CAPTAIN_DOES_NOT_ESTABLISH,
             )
         )
@@ -305,6 +323,12 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
     for gate in gates:
         core._check(receipt, f"captain-gate-{gate['id']}", "pass", str(gate["reason"]))
     core._check(receipt, "captain-gates-pass", "pass", action_names)
+    core._check(
+        receipt,
+        "execution-intent-bound",
+        "pass",
+        f"intent_sha256={intent_info['intent_sha256']} issued_at={intent_info['issued_at']}",
+    )
     core._check(receipt, "trusted-owner-autonomy", "pass" if core._captain_trusted_owner_autonomy_ready(parameters, actions) else "warn", str(parameters.get("autonomy_policy") or "manual evidence mode"))
     core._check(receipt, "receipt-bound-execution", "pass", f"execution_records={len(executions)} invoked={invoked_count} command_returned={command_returned_count} attempted={attempted_count} verified={verified_count}")
     preflight_reasons = [
@@ -343,6 +367,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         "failed_reasons": post_execution_reasons,
         "gates": gates,
         "status_projection": projection_info,
+        "execution_intent": intent_info,
         "actions_sha256": core._captain_actions_sha256(actions),
         "authority_contract": core._captain_authority_contract("captain-run"),
         "executable_action_allowlist": sorted(core.CAPTAIN_EXECUTABLE_ACTIONS),
@@ -356,7 +381,8 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         "executions": executions,
         "non_claims": [
             "does not execute actions outside the explicit executable_action_allowlist",
-            "does not bypass expected_head, review, diff, CI or status-projection gates",
+            "does not bypass expected_head, review, diff, CI, status-projection or execution-intent gates",
             "does not establish semantic correctness beyond the observed execution receipt",
+            "does not echo raw execution_intent, actor or context values; receipts carry only normalized fields and digests",
         ],
     }

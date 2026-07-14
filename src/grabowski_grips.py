@@ -171,11 +171,11 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "captain-run": GripSpec(
         name="captain-run",
-        version="1.0",
+        version="1.1",
         summary="Execute action-specific Captain operations when autonomy gates are satisfied.",
         effect=MUTATING,
         required_parameters=("actions",),
-        acceptance_ids=("captain-gates-pass", "trusted-owner-autonomy", "receipt-bound-execution"),
+        acceptance_ids=("captain-gates-pass", "execution-intent-bound", "trusted-owner-autonomy", "receipt-bound-execution"),
         runner="captain_run",
         uses_github=True,
     ),
@@ -327,6 +327,30 @@ CAPTAIN_STATUS_PROJECTION_ALLOWLISTED_SOURCES = frozenset({
 CAPTAIN_STATUS_PROJECTION_TRUSTED_SOURCES = CAPTAIN_STATUS_PROJECTION_ALLOWLISTED_SOURCES
 CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS = 3600
 CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS = 300
+CAPTAIN_EXECUTION_INTENT_KIND = "grabowski_captain_execution_intent"
+CAPTAIN_EXECUTION_INTENT_SCHEMA_VERSION = 1
+CAPTAIN_EXECUTION_INTENT_MAX_AGE_SECONDS = 600
+CAPTAIN_EXECUTION_INTENT_CLOCK_SKEW_TOLERANCE_SECONDS = 120
+CAPTAIN_EXECUTION_INTENT_FIELDS = (
+    "schema_version",
+    "kind",
+    "action",
+    "target_sha256",
+    "expected_head",
+    "expected_base",
+    "evidence_sha256",
+    "actor",
+    "context",
+    "issued_at",
+)
+CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS = (
+    "actions_sha256",
+    "status_projection_sha256",
+    "diff_sha256",
+    "review_evidence_sha256",
+    "ci_evidence_sha256",
+    "authorization_sha256",
+)
 CAPTAIN_BASE_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 CAPTAIN_DOES_NOT_ESTABLISH = (
     "automatic_merge_authority",
@@ -353,6 +377,7 @@ CAPTAIN_NON_CLAIMS = (
     "does not grant execution because allow_execution, execution_authority or any other single parameter is set",
     "trusted-owner autonomy requires the explicit autonomy_policy and still blocks irreversible or ambiguous actions",
     "human authorization is recorded evidence, never an automatic execution release",
+    "captain-run requires a fresh action-bound execution_intent; receipts never echo raw intent, actor or context values",
 )
 CAPTAIN_NO_MUTATION_REASON = (
     "captain-preflight is read-only authority evaluation; it never mutates. "
@@ -386,8 +411,22 @@ def _captain_authority_contract(surface: str) -> dict[str, Any]:
                     "exactly one action",
                     "implemented executor",
                     "expected_head and target binding",
+                    "fresh action-bound execution_intent",
                     "post-execution verification",
                 ],
+                "does_not_grant_by_itself": ["execution", "mutation", "merge", "deploy", "service_restart", "fleet_mutation", "cleanup"],
+            },
+            "execution_intent": {
+                "meaning": "a fresh structured intent that binds action, canonical target digest, expected head, expected base, decisive evidence digests, actor/context and a plausibility-checked UTC timestamp before any executor call",
+                "parameter": "execution_intent",
+                "check": "execution-intent-bound",
+                "surfaces": ["captain-run"],
+                "required_fields": list(CAPTAIN_EXECUTION_INTENT_FIELDS),
+                "evidence_digests": list(CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS),
+                "freshness": {
+                    "max_age_seconds": CAPTAIN_EXECUTION_INTENT_MAX_AGE_SECONDS,
+                    "clock_skew_tolerance_seconds": CAPTAIN_EXECUTION_INTENT_CLOCK_SKEW_TOLERANCE_SECONDS,
+                },
                 "does_not_grant_by_itself": ["execution", "mutation", "merge", "deploy", "service_restart", "fleet_mutation", "cleanup"],
             },
         },
@@ -397,14 +436,17 @@ def _captain_authority_contract(surface: str) -> dict[str, Any]:
                 "allow_execution must be true",
                 "same evidence gates must pass",
                 "action must be in executable_action_allowlist",
+                "a fresh execution_intent must bind action, canonical target digest, expected head, expected base and decisive evidence digests",
                 "executor must verify the target before and after mutation",
             ],
         },
         "non_claims": [
             "allow_execution alone is never sufficient",
             "execution_authority evidence alone is never sufficient",
+            "execution_intent alone is never sufficient",
             "trusted-owner autonomy is limited to reversible, target-bound implemented executors",
             "unsupported high-impact actions remain blocked",
+            "receipts never echo raw execution_intent, actor or context values; only normalized fields and digests",
         ],
     }
 
@@ -3625,6 +3667,7 @@ def _captain_action_record(
     decision: str = "blocked",
     execution: str = "not-performed",
     execution_result: dict[str, Any] | None = None,
+    execution_intent_sha256: str | None = None,
     does_not_establish: tuple[str, ...] = CAPTAIN_DOES_NOT_ESTABLISH,
 ) -> dict[str, Any]:
     captain_receipt = {
@@ -3654,6 +3697,8 @@ def _captain_action_record(
     }
     if execution_result is not None:
         captain_receipt["execution_result_sha256"] = sha256_json(execution_result)
+    if execution_intent_sha256 is not None:
+        captain_receipt["execution_intent_sha256"] = execution_intent_sha256
     captain_receipt["receipt_sha256"] = _mechanic_record_sha256(captain_receipt)
     record = {**action, "captain_receipt": captain_receipt, "receipt_sha256": captain_receipt["receipt_sha256"], "execution": execution}
     if execution_result is not None:
@@ -3716,6 +3761,233 @@ def _captain_blocked_reasons(gates: list[dict[str, Any]]) -> list[str]:
         else:
             blocked_reasons.append(f"{gate['id']}: {gate['reason']}")
     return blocked_reasons
+
+
+def _captain_intent_canonical_hex_status(value: Any, *, length: int) -> str:
+    if not isinstance(value, str) or len(value) != length:
+        return "invalid"
+    lowered = value.lower()
+    if any(char not in "0123456789abcdef" for char in lowered):
+        return "invalid"
+    if value != lowered:
+        return "not_canonical"
+    return "ok"
+
+
+def _captain_execution_intent_expected_base(action: dict[str, Any]) -> str | None:
+    target = action.get("target")
+    if not isinstance(target, dict):
+        return None
+    if action.get("action") == "pr-merge":
+        base = target.get("base")
+    elif action.get("action") == "runtime-deploy":
+        base = next(
+            (
+                target.get(key)
+                for key in ("environment", "runtime_target")
+                if isinstance(target.get(key), str) and target.get(key).strip()
+            ),
+            None,
+        )
+    else:
+        base = None
+    if isinstance(base, str) and base.strip():
+        return base
+    return None
+
+
+def _captain_execution_intent_authorization_sha256(parameters: dict[str, Any]) -> str:
+    """Bind the complete authorization mode without exposing raw evidence."""
+    return sha256_json(
+        {
+            "execution_authority": parameters.get("execution_authority"),
+            "human_authorization": parameters.get("human_authorization"),
+            "trusted_owner_mode": parameters.get("trusted_owner_mode") is True,
+            "autonomy_policy": parameters.get("autonomy_policy"),
+        }
+    )
+
+
+def _captain_execution_intent_expected_evidence(
+    parameters: dict[str, Any],
+    actions: list[dict[str, Any]],
+) -> dict[str, str | None]:
+    projection = parameters.get("status_projection")
+    review = parameters.get("review_evidence")
+    ci = parameters.get("ci_evidence")
+    diff = parameters.get("diff_sha256")
+    return {
+        "actions_sha256": _captain_actions_sha256(actions),
+        "status_projection_sha256": sha256_json(projection) if isinstance(projection, dict) and projection else None,
+        "diff_sha256": diff if _is_sha256_hex(diff) else None,
+        "review_evidence_sha256": sha256_json(review) if isinstance(review, dict) and review else None,
+        "ci_evidence_sha256": sha256_json(ci) if isinstance(ci, dict) and ci else None,
+        "authorization_sha256": _captain_execution_intent_authorization_sha256(parameters),
+    }
+
+
+def _captain_execution_intent_review(
+    parameters: dict[str, Any],
+    actions: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate the captain-run execution_intent binding fail-closed.
+
+    Returns a receipt-safe info record plus error codes. The info record never
+    echoes raw intent, actor or context values: only fixed error codes, digests
+    and fields whose values were verified equal to the bound request.
+    """
+    intent = parameters.get("execution_intent")
+    info: dict[str, Any] = {
+        "required": True,
+        "present": intent is not None,
+        "valid": False,
+        "kind": None,
+        "schema_version": None,
+        "intent_sha256": sha256_json(intent) if intent is not None else None,
+        "action": None,
+        "target_sha256": None,
+        "expected_head": None,
+        "expected_base": None,
+        "evidence_sha256": {key: None for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS},
+        "actor_sha256": None,
+        "context_sha256": None,
+        "issued_at": None,
+        "age_seconds": None,
+        "max_age_seconds": CAPTAIN_EXECUTION_INTENT_MAX_AGE_SECONDS,
+        "clock_skew_tolerance_seconds": CAPTAIN_EXECUTION_INTENT_CLOCK_SKEW_TOLERANCE_SECONDS,
+        "errors": [],
+    }
+    errors: list[str] = []
+    if intent is None:
+        errors.append("execution_intent_missing")
+        info["errors"] = list(errors)
+        return info, errors
+    if not isinstance(intent, dict) or not intent:
+        errors.append("execution_intent_malformed")
+        info["errors"] = list(errors)
+        return info, errors
+    for name in CAPTAIN_EXECUTION_INTENT_FIELDS:
+        if name not in intent:
+            errors.append(f"execution_intent_field_missing:{name}")
+    if any(key not in CAPTAIN_EXECUTION_INTENT_FIELDS for key in intent):
+        errors.append("execution_intent_unknown_fields_present")
+    schema_version = intent.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != CAPTAIN_EXECUTION_INTENT_SCHEMA_VERSION:
+        if "schema_version" in intent:
+            errors.append("execution_intent_schema_version_invalid")
+    else:
+        info["schema_version"] = CAPTAIN_EXECUTION_INTENT_SCHEMA_VERSION
+    if intent.get("kind") != CAPTAIN_EXECUTION_INTENT_KIND:
+        if "kind" in intent:
+            errors.append("execution_intent_kind_invalid")
+    else:
+        info["kind"] = CAPTAIN_EXECUTION_INTENT_KIND
+    if "actor" in intent:
+        actor = intent.get("actor")
+        info["actor_sha256"] = sha256_json(actor)
+        if not isinstance(actor, dict) or not actor or not isinstance(actor.get("id"), str) or not actor["id"].strip():
+            errors.append("execution_intent_actor_invalid")
+    if "context" in intent:
+        context = intent.get("context")
+        info["context_sha256"] = sha256_json(context)
+        if not isinstance(context, dict) or not context:
+            errors.append("execution_intent_context_invalid")
+    if "issued_at" in intent:
+        issued_at = intent.get("issued_at")
+        parsed_issued_at = (
+            _parse_captain_projection_generated_at(issued_at)
+            if isinstance(issued_at, str) and issued_at.strip()
+            else None
+        )
+        if parsed_issued_at is None:
+            errors.append("execution_intent_issued_at_invalid")
+        else:
+            info["issued_at"] = parsed_issued_at.isoformat().replace("+00:00", "Z")
+            age_seconds = (_captain_now_utc() - parsed_issued_at).total_seconds()
+            info["age_seconds"] = int(age_seconds)
+            if age_seconds < -CAPTAIN_EXECUTION_INTENT_CLOCK_SKEW_TOLERANCE_SECONDS:
+                errors.append("execution_intent_issued_at_in_future")
+            elif age_seconds > CAPTAIN_EXECUTION_INTENT_MAX_AGE_SECONDS:
+                errors.append("execution_intent_issued_at_stale")
+    if len(actions) != 1:
+        errors.append("execution_intent_requires_exactly_one_action")
+        info["errors"] = list(errors)
+        return info, errors
+    action = actions[0]
+    if "action" in intent:
+        declared_action = intent.get("action")
+        if not isinstance(declared_action, str) or not declared_action.strip():
+            errors.append("execution_intent_field_invalid:action")
+        elif declared_action != action["action"]:
+            errors.append("execution_intent_action_drift")
+        else:
+            info["action"] = declared_action
+    if "target_sha256" in intent:
+        declared_target = intent.get("target_sha256")
+        target_status = _captain_intent_canonical_hex_status(declared_target, length=64)
+        if target_status == "invalid":
+            errors.append("execution_intent_field_invalid:target_sha256")
+        elif target_status == "not_canonical":
+            errors.append("execution_intent_field_not_canonical:target_sha256")
+        elif declared_target != action["target_sha256"]:
+            errors.append("execution_intent_target_drift")
+        else:
+            info["target_sha256"] = declared_target
+    if "expected_head" in intent:
+        declared_head = intent.get("expected_head")
+        head_status = _captain_intent_canonical_hex_status(declared_head, length=40)
+        expected_head = _normalize_40_sha(parameters.get("expected_head"))
+        if head_status == "invalid":
+            errors.append("execution_intent_field_invalid:expected_head")
+        elif head_status == "not_canonical":
+            errors.append("execution_intent_field_not_canonical:expected_head")
+        elif expected_head is None:
+            errors.append("execution_intent_head_unverifiable")
+        elif declared_head != expected_head:
+            errors.append("execution_intent_head_drift")
+        else:
+            info["expected_head"] = declared_head
+    if "expected_base" in intent:
+        declared_base = intent.get("expected_base")
+        expected_base = _captain_execution_intent_expected_base(action)
+        if not isinstance(declared_base, str) or not declared_base.strip():
+            errors.append("execution_intent_field_invalid:expected_base")
+        elif expected_base is None:
+            errors.append("execution_intent_base_unverifiable")
+        elif declared_base != expected_base:
+            errors.append("execution_intent_base_drift")
+        else:
+            info["expected_base"] = declared_base
+    if "evidence_sha256" in intent:
+        declared_evidence = intent.get("evidence_sha256")
+        if not isinstance(declared_evidence, dict) or not declared_evidence:
+            errors.append("execution_intent_field_invalid:evidence_sha256")
+        else:
+            if any(key not in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS for key in declared_evidence):
+                errors.append("execution_intent_evidence_unknown_keys_present")
+            expected_evidence = _captain_execution_intent_expected_evidence(parameters, actions)
+            for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS:
+                if key not in declared_evidence:
+                    errors.append(f"execution_intent_evidence_missing:{key}")
+                    continue
+                declared_value = declared_evidence.get(key)
+                value_status = _captain_intent_canonical_hex_status(declared_value, length=64)
+                if value_status == "invalid":
+                    errors.append(f"execution_intent_evidence_invalid:{key}")
+                    continue
+                if value_status == "not_canonical":
+                    errors.append(f"execution_intent_evidence_not_canonical:{key}")
+                    continue
+                expected_value = expected_evidence.get(key)
+                if expected_value is None:
+                    errors.append(f"execution_intent_evidence_unverifiable:{key}")
+                elif declared_value != expected_value:
+                    errors.append(f"execution_intent_evidence_drift:{key}")
+                else:
+                    info["evidence_sha256"][key] = declared_value
+    info["valid"] = not errors
+    info["errors"] = list(errors)
+    return info, errors
 
 
 def _captain_execution_cwd(parameters: dict[str, Any]) -> Path:

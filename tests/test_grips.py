@@ -2463,6 +2463,46 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
     return parameters
 
 
+def captain_execution_intent(parameters: dict[str, object], **overrides) -> dict[str, object]:
+    actions = grips._captain_actions({"actions": parameters["actions"]}, gate_native_validation=True)
+    action = actions[0]
+    target = action["target"]
+    if action["action"] == "pr-merge":
+        expected_base = target.get("base")
+    elif action["action"] == "runtime-deploy":
+        expected_base = next(
+            (
+                target.get(key)
+                for key in ("environment", "runtime_target")
+                if isinstance(target.get(key), str) and target.get(key).strip()
+            ),
+            None,
+        )
+    else:
+        expected_base = None
+    intent: dict[str, object] = {
+        "schema_version": grips.CAPTAIN_EXECUTION_INTENT_SCHEMA_VERSION,
+        "kind": grips.CAPTAIN_EXECUTION_INTENT_KIND,
+        "action": action["action"],
+        "target_sha256": action["target_sha256"],
+        "expected_head": parameters.get("expected_head"),
+        "expected_base": expected_base,
+        "evidence_sha256": {
+            "actions_sha256": action["actions_sha256"],
+            "status_projection_sha256": grips.sha256_json(parameters["status_projection"]),
+            "diff_sha256": parameters.get("diff_sha256"),
+            "review_evidence_sha256": grips.sha256_json(parameters["review_evidence"]),
+            "ci_evidence_sha256": grips.sha256_json(parameters["ci_evidence"]),
+            "authorization_sha256": grips._captain_execution_intent_authorization_sha256(parameters),
+        },
+        "actor": {"id": "alex", "kind": "trusted-owner"},
+        "context": {"surface": "captain-run", "workspace": "bureau-task"},
+        "issued_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    intent.update(overrides)
+    return intent
+
+
 class CaptainAuthorityPathTests(unittest.TestCase):
     def run_captain(self, parameters: dict[str, object]) -> dict[str, object]:
         return grips.grip_run("captain-preflight", parameters, profile="captain", command_runner=FakeGit())
@@ -3014,6 +3054,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(view={
             "number": 96,
             "state": "OPEN",
@@ -3059,6 +3100,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(
             view={
                 "number": 96,
@@ -3132,6 +3174,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 )
                 parameters.pop("human_authorization")
                 parameters.pop("execution_authority")
+                parameters["execution_intent"] = captain_execution_intent(parameters)
                 result = grips.grip_run(
                     "captain-run",
                     parameters,
@@ -3177,6 +3220,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         preflight = {
             "adapter": "grabowski-self",
             "repository": "/home/alex/repos/grabowski",
@@ -3233,6 +3277,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("scheduled", result["output"]["decision"])
         self.assertEqual("scheduled", result["output"]["actions"][0]["execution"])
+        self.assertTrue(result["output"]["execution_intent"]["valid"])
+        self.assertEqual("heim-pc", result["output"]["execution_intent"]["expected_base"])
         execution = result["output"]["executions"][0]
         self.assertTrue(execution["deployment_scheduled"])
         self.assertTrue(execution["new_job_registered"])
@@ -3268,6 +3314,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         preflight = {
             "adapter": "grabowski-self",
             "repository": "/home/alex/repos/grabowski",
@@ -3335,6 +3382,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         preflight = {
             "adapter": "grabowski-self",
             "repository": "/home/alex/repos/grabowski",
@@ -3457,6 +3505,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(
             view={
                 "number": 96,
@@ -3534,6 +3583,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 )
                 parameters.pop("human_authorization")
                 parameters.pop("execution_authority")
+                parameters["execution_intent"] = captain_execution_intent(parameters)
                 view = {
                     "number": 96,
                     "state": "OPEN",
@@ -3576,6 +3626,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 )
                 parameters.pop("human_authorization")
                 parameters.pop("execution_authority")
+                parameters["execution_intent"] = captain_execution_intent(parameters)
                 view = {
                     "number": 96,
                     "state": "OPEN",
@@ -3611,6 +3662,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 )
                 parameters.pop("human_authorization")
                 parameters.pop("execution_authority")
+                parameters["execution_intent"] = captain_execution_intent(parameters)
                 view = {
                     "number": 96,
                     "state": "OPEN",
@@ -3645,6 +3697,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         unknown_view = {
             "number": 96,
             "state": "OPEN",
@@ -3685,6 +3738,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         unknown_view = {
             "number": 96,
             "state": "OPEN",
@@ -3731,6 +3785,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 )
                 parameters.pop("human_authorization")
                 parameters.pop("execution_authority")
+                parameters["execution_intent"] = captain_execution_intent(parameters)
 
                 result = grips.grip_run(
                     "captain-run",
@@ -3761,6 +3816,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         clean_view = {
             "number": 96,
             "state": "OPEN",
@@ -3801,6 +3857,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         hard_blocked_view = {
             "number": 96,
             "state": "OPEN",
@@ -3846,6 +3903,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 )
                 parameters.pop("human_authorization")
                 parameters.pop("execution_authority")
+                parameters["execution_intent"] = captain_execution_intent(parameters)
                 gh = FakeGh(
                     view={
                         "number": 96,
@@ -3883,6 +3941,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(
             view={
                 "number": 96,
@@ -3924,6 +3983,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 )
                 parameters.pop("human_authorization")
                 parameters.pop("execution_authority")
+                parameters["execution_intent"] = captain_execution_intent(parameters)
                 gh = FakeGh(
                     view={
                         "number": 96,
@@ -3966,6 +4026,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         long_stdout = "y" * (grips.CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT + 50)
         long_stderr = "x" * (grips.CAPTAIN_COMMAND_OUTPUT_PREVIEW_LIMIT + 100)
         gh = FakeGh(
@@ -4010,6 +4071,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(
             view={
                 "number": 96,
@@ -4053,6 +4115,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(
             view={
                 "number": 96,
@@ -4104,6 +4167,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 )
                 parameters.pop("human_authorization")
                 parameters.pop("execution_authority")
+                parameters["execution_intent"] = captain_execution_intent(parameters)
                 gh = FakeGh(
                     view={
                         "number": 96,
@@ -4144,6 +4208,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         parameters.pop("human_authorization")
         parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
 
         result = grips.grip_run(
             "captain-run",
@@ -4629,3 +4694,333 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 github_runner=FakeGh(),
             )
             self.assertEqual("blocked", result["receipt"]["status"])
+
+
+class CaptainExecutionIntentTests(unittest.TestCase):
+    def executable_parameters(self, actions: list[dict[str, object]] | None = None) -> dict[str, object]:
+        parameters = captain_parameters(
+            actions,
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        return parameters
+
+    def mergeable_gh(self) -> FakeGh:
+        return FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+    def run_captain_run(self, parameters: dict[str, object], gh: FakeGh) -> dict[str, object]:
+        return grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+    def assert_blocked_without_executor_calls(
+        self,
+        result: dict[str, object],
+        gh: FakeGh,
+        expected_reason: str,
+    ) -> None:
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("blocked", result["output"]["decision"])
+        self.assertIn(expected_reason, result["output"]["blocked_reasons"])
+        self.assertEqual([], result["output"]["executions"])
+        info = result["output"]["execution_intent"]
+        self.assertTrue(info["required"])
+        self.assertFalse(info["valid"])
+        self.assertIn(expected_reason, info["errors"])
+        self.assertEqual([], gh.calls)
+        intent_checks = [check for check in result["receipt"]["checks"] if check["id"] == "execution-intent-bound"]
+        self.assertEqual("fail", intent_checks[-1]["status"])
+
+    def test_captain_run_blocks_missing_execution_intent_before_any_executor(self) -> None:
+        parameters = self.executable_parameters()
+        gh = self.mergeable_gh()
+
+        result = self.run_captain_run(parameters, gh)
+
+        self.assert_blocked_without_executor_calls(result, gh, "execution_intent_missing")
+        self.assertFalse(result["output"]["execution_intent"]["present"])
+        self.assertIsNone(result["output"]["execution_intent"]["intent_sha256"])
+
+    def test_captain_run_blocks_malformed_execution_intent(self) -> None:
+        cases = (
+            ("execution_intent_malformed", lambda intent: "merge it"),
+            ("execution_intent_malformed", lambda intent: {}),
+            ("execution_intent_field_missing:actor", lambda intent: {k: v for k, v in intent.items() if k != "actor"}),
+            ("execution_intent_field_missing:issued_at", lambda intent: {k: v for k, v in intent.items() if k != "issued_at"}),
+            ("execution_intent_schema_version_invalid", lambda intent: dict(intent, schema_version=2)),
+            ("execution_intent_schema_version_invalid", lambda intent: dict(intent, schema_version=True)),
+            ("execution_intent_kind_invalid", lambda intent: dict(intent, kind="grabowski_generic_intent")),
+            ("execution_intent_unknown_fields_present", lambda intent: dict(intent, note="extra")),
+            ("execution_intent_field_invalid:evidence_sha256", lambda intent: dict(intent, evidence_sha256=[])),
+            (
+                "execution_intent_evidence_missing:ci_evidence_sha256",
+                lambda intent: dict(
+                    intent,
+                    evidence_sha256={k: v for k, v in intent["evidence_sha256"].items() if k != "ci_evidence_sha256"},
+                ),
+            ),
+            (
+                "execution_intent_evidence_unknown_keys_present",
+                lambda intent: dict(intent, evidence_sha256=dict(intent["evidence_sha256"], extra_sha256="0" * 64)),
+            ),
+            (
+                "execution_intent_evidence_invalid:diff_sha256",
+                lambda intent: dict(intent, evidence_sha256=dict(intent["evidence_sha256"], diff_sha256="short")),
+            ),
+            ("execution_intent_actor_invalid", lambda intent: dict(intent, actor="alex")),
+            ("execution_intent_actor_invalid", lambda intent: dict(intent, actor={"id": "   "})),
+            ("execution_intent_context_invalid", lambda intent: dict(intent, context={})),
+            ("execution_intent_field_invalid:action", lambda intent: dict(intent, action="  ")),
+            ("execution_intent_field_invalid:expected_base", lambda intent: dict(intent, expected_base=None)),
+            ("execution_intent_field_invalid:expected_head", lambda intent: dict(intent, expected_head="b" * 39)),
+            ("execution_intent_issued_at_invalid", lambda intent: dict(intent, issued_at="soon")),
+            (
+                "execution_intent_issued_at_invalid",
+                lambda intent: dict(intent, issued_at=datetime.now(timezone.utc).replace(tzinfo=None).isoformat()),
+            ),
+        )
+        for expected_reason, mutate in cases:
+            with self.subTest(expected_reason=expected_reason):
+                parameters = self.executable_parameters()
+                parameters["execution_intent"] = mutate(captain_execution_intent(parameters))
+                gh = self.mergeable_gh()
+
+                result = self.run_captain_run(parameters, gh)
+
+                self.assert_blocked_without_executor_calls(result, gh, expected_reason)
+
+    def test_captain_run_blocks_non_canonical_execution_intent_digests(self) -> None:
+        cases = (
+            (
+                "execution_intent_field_not_canonical:expected_head",
+                lambda intent: dict(intent, expected_head=str(intent["expected_head"]).upper()),
+            ),
+            (
+                "execution_intent_field_not_canonical:target_sha256",
+                lambda intent: dict(intent, target_sha256=str(intent["target_sha256"]).upper()),
+            ),
+            (
+                "execution_intent_evidence_not_canonical:diff_sha256",
+                lambda intent: dict(
+                    intent,
+                    evidence_sha256=dict(
+                        intent["evidence_sha256"],
+                        diff_sha256=str(intent["evidence_sha256"]["diff_sha256"]).upper(),
+                    ),
+                ),
+            ),
+        )
+        for expected_reason, mutate in cases:
+            with self.subTest(expected_reason=expected_reason):
+                parameters = self.executable_parameters()
+                parameters["execution_intent"] = mutate(captain_execution_intent(parameters))
+                gh = self.mergeable_gh()
+
+                result = self.run_captain_run(parameters, gh)
+
+                self.assert_blocked_without_executor_calls(result, gh, expected_reason)
+
+    def test_captain_run_blocks_execution_intent_action_target_head_and_base_drift(self) -> None:
+        cases = (
+            ("execution_intent_action_drift", lambda intent: dict(intent, action="runtime-deploy")),
+            ("execution_intent_target_drift", lambda intent: dict(intent, target_sha256="f" * 64)),
+            ("execution_intent_head_drift", lambda intent: dict(intent, expected_head="a" * 40)),
+            ("execution_intent_base_drift", lambda intent: dict(intent, expected_base="develop")),
+        )
+        for expected_reason, mutate in cases:
+            with self.subTest(expected_reason=expected_reason):
+                parameters = self.executable_parameters()
+                parameters["execution_intent"] = mutate(captain_execution_intent(parameters))
+                gh = self.mergeable_gh()
+
+                result = self.run_captain_run(parameters, gh)
+
+                self.assert_blocked_without_executor_calls(result, gh, expected_reason)
+
+    def test_captain_run_blocks_execution_intent_evidence_drift_for_every_decisive_digest(self) -> None:
+        for key in grips.CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS:
+            with self.subTest(key=key):
+                parameters = self.executable_parameters()
+                intent = captain_execution_intent(parameters)
+                intent["evidence_sha256"] = dict(intent["evidence_sha256"], **{key: "f" * 64})
+                parameters["execution_intent"] = intent
+                gh = self.mergeable_gh()
+
+                result = self.run_captain_run(parameters, gh)
+
+                self.assert_blocked_without_executor_calls(result, gh, f"execution_intent_evidence_drift:{key}")
+
+    def test_captain_run_blocks_execution_intent_authorization_drift(self) -> None:
+        mutations = (
+            lambda parameters: parameters.__setitem__(
+                "execution_authority",
+                {"granted_by": "mallory", "reference": "replacement authority"},
+            ),
+            lambda parameters: parameters.__setitem__(
+                "human_authorization",
+                {"authorized_by": "mallory", "statement": "replacement authorization"},
+            ),
+            lambda parameters: parameters.__setitem__("trusted_owner_mode", True),
+            lambda parameters: parameters.__setitem__(
+                "autonomy_policy",
+                grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            ),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                parameters = captain_parameters()
+                parameters["execution_intent"] = captain_execution_intent(parameters)
+                mutate(parameters)
+                gh = self.mergeable_gh()
+                result = self.run_captain_run(parameters, gh)
+                self.assert_blocked_without_executor_calls(
+                    result,
+                    gh,
+                    "execution_intent_evidence_drift:authorization_sha256",
+                )
+
+    def test_captain_run_blocks_stale_and_future_dated_execution_intent(self) -> None:
+        stale_issued_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=grips.CAPTAIN_EXECUTION_INTENT_MAX_AGE_SECONDS + 60)
+        ).isoformat()
+        future_issued_at = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=grips.CAPTAIN_EXECUTION_INTENT_CLOCK_SKEW_TOLERANCE_SECONDS + 60)
+        ).isoformat()
+        cases = (
+            ("execution_intent_issued_at_stale", stale_issued_at),
+            ("execution_intent_issued_at_in_future", future_issued_at),
+        )
+        for expected_reason, issued_at in cases:
+            with self.subTest(expected_reason=expected_reason):
+                parameters = self.executable_parameters()
+                parameters["execution_intent"] = captain_execution_intent(parameters, issued_at=issued_at)
+                gh = self.mergeable_gh()
+
+                result = self.run_captain_run(parameters, gh)
+
+                self.assert_blocked_without_executor_calls(result, gh, expected_reason)
+
+    def test_captain_run_accepts_small_execution_intent_clock_skew(self) -> None:
+        parameters = self.executable_parameters()
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters,
+            issued_at=(datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
+        )
+        gh = self.mergeable_gh()
+
+        result = self.run_captain_run(parameters, gh)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertNotIn("execution_intent_issued_at_in_future", result["output"]["execution_intent"]["errors"])
+
+    def test_captain_run_executes_with_valid_execution_intent_and_binds_receipt(self) -> None:
+        parameters = self.executable_parameters()
+        intent = captain_execution_intent(parameters)
+        parameters["execution_intent"] = intent
+        gh = self.mergeable_gh()
+
+        result = self.run_captain_run(parameters, gh)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("executed", result["output"]["decision"])
+        info = result["output"]["execution_intent"]
+        self.assertTrue(info["present"])
+        self.assertTrue(info["valid"])
+        self.assertEqual([], info["errors"])
+        self.assertEqual(grips.sha256_json(intent), info["intent_sha256"])
+        self.assertEqual("pr-merge", info["action"])
+        self.assertEqual(CAPTAIN_HEAD, info["expected_head"])
+        self.assertEqual("main", info["expected_base"])
+        self.assertEqual(intent["target_sha256"], info["target_sha256"])
+        self.assertEqual(intent["evidence_sha256"], info["evidence_sha256"])
+        self.assertEqual(grips.sha256_json(intent["actor"]), info["actor_sha256"])
+        self.assertEqual(grips.sha256_json(intent["context"]), info["context_sha256"])
+        self.assertEqual(
+            info["intent_sha256"],
+            result["output"]["actions"][0]["captain_receipt"]["execution_intent_sha256"],
+        )
+        intent_checks = [check for check in result["receipt"]["checks"] if check["id"] == "execution-intent-bound"]
+        self.assertEqual("pass", intent_checks[-1]["status"])
+        self.assertTrue([call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_captain_run_blocks_runtime_deploy_without_intent_before_scheduler(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "inspect the scheduled job and roll back to the previous release",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        parameters = self.executable_parameters([action])
+        gh = FakeGh()
+
+        with patch.object(grips, "_runtime_deploy_self_preflight") as preflight, patch.object(
+            grips, "_runtime_deploy_self_schedule"
+        ) as scheduler:
+            result = self.run_captain_run(parameters, gh)
+
+        self.assert_blocked_without_executor_calls(result, gh, "execution_intent_missing")
+        preflight.assert_not_called()
+        scheduler.assert_not_called()
+
+    def test_captain_run_receipts_do_not_echo_execution_intent_secrets(self) -> None:
+        actor_secret = "SECRET-ACTOR-TOKEN-b2f0"
+        context_secret = "SECRET-CONTEXT-KEY-91cd"
+        for drift in (False, True):
+            with self.subTest(drift=drift):
+                parameters = self.executable_parameters()
+                overrides: dict[str, object] = {
+                    "actor": {"id": "alex", "session_token": actor_secret},
+                    "context": {"surface": "captain-run", "api_key": context_secret},
+                }
+                if drift:
+                    overrides["expected_head"] = "a" * 40
+                    overrides["smuggled_credential"] = context_secret
+                intent = captain_execution_intent(parameters, **overrides)
+                parameters["execution_intent"] = intent
+                gh = self.mergeable_gh()
+
+                result = self.run_captain_run(parameters, gh)
+
+                serialized = grips.canonical_json(result)
+                self.assertNotIn(actor_secret, serialized)
+                self.assertNotIn(context_secret, serialized)
+                self.assertNotIn("session_token", serialized)
+                self.assertNotIn("api_key", serialized)
+                self.assertNotIn("smuggled_credential", serialized)
+                info = result["output"]["execution_intent"]
+                self.assertEqual(grips.sha256_json(intent["actor"]), info["actor_sha256"])
+                self.assertEqual(grips.sha256_json(intent["context"]), info["context_sha256"])
+                if drift:
+                    self.assertEqual("blocked", result["receipt"]["status"])
+                    self.assertIn("execution_intent_head_drift", result["output"]["blocked_reasons"])
+                    self.assertEqual([], gh.calls)
+                else:
+                    self.assertEqual("passed", result["receipt"]["status"])
