@@ -166,6 +166,23 @@ def _bind_file(arguments: list[str], source: str, target: str | None = None) -> 
         arguments.extend(["--ro-bind", source, target or source])
 
 
+def _bind_fixed_system_file(
+    arguments: list[str], source: str, target: str | None = None
+) -> None:
+    """Resolve one trusted fixed host path and bind its regular file read-only."""
+    path = Path(source)
+    if not path.is_absolute():
+        return
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError:
+        return
+    if not stat.S_ISREG(metadata.st_mode):
+        return
+    arguments.extend(["--ro-bind", str(resolved), target or source])
+
+
 def _bind_dir(arguments: list[str], source: str, target: str | None = None) -> None:
     path = Path(source)
     if path.is_dir() and not path.is_symlink():
@@ -314,10 +331,10 @@ def minimal_sandbox_argv(
         "/etc/nsswitch.conf",
         "/etc/hosts",
         "/etc/host.conf",
-        "/etc/resolv.conf",
         "/etc/gai.conf",
     ):
         _bind_file(arguments, path)
+    _bind_fixed_system_file(arguments, "/etc/resolv.conf")
     _bind_dir(arguments, "/etc/ssl/certs")
     arguments.extend(["--ro-bind", str(worktree), str(worktree)])
     for target in writable:
