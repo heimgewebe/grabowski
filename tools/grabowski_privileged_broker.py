@@ -186,7 +186,7 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (FileExistsError, PermissionError, ValueError) as exc:
+    except (FileExistsError, FileNotFoundError, PermissionError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False, sort_keys=True))
         raise SystemExit(0)
     except Exception as exc:
