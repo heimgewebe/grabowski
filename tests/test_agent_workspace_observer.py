@@ -169,6 +169,43 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
 
 
 
+    def test_specific_retry_classification_suppresses_generic_role_failure(self) -> None:
+        identifier = "gaw-observer-test-specific-role-failure"
+        manifest = self._manifest(identifier)
+        workspace._append_workspace_event(
+            manifest,
+            "role_finished",
+            role="review",
+            outcome="failed",
+            evidence={"returncode": 126},
+        )
+        status = self._status()
+        status["role_retry"]["review"] = {"classification": "invalid_receipt"}
+        with (
+            mock.patch.object(workspace, "_manifest", return_value=manifest),
+            mock.patch.object(workspace, "_status_data", return_value=status),
+        ):
+            report = observer.grabowski_agent_workspace_observe(identifier, "specificity-fixture")
+        self.assertIn("review:invalid_receipt", report["facts"]["failure_classes"])
+        self.assertNotIn("role_finished:failed", report["facts"]["failure_classes"])
+
+    def test_unclassified_role_failure_retains_generic_failure(self) -> None:
+        identifier = "gaw-observer-test-generic-role-failure"
+        manifest = self._manifest(identifier)
+        workspace._append_workspace_event(
+            manifest,
+            "role_finished",
+            role="review",
+            outcome="failed",
+            evidence={"returncode": 1},
+        )
+        with (
+            mock.patch.object(workspace, "_manifest", return_value=manifest),
+            mock.patch.object(workspace, "_status_data", return_value=self._status()),
+        ):
+            report = observer.grabowski_agent_workspace_observe(identifier, "generic-fixture")
+        self.assertIn("role_finished:failed", report["facts"]["failure_classes"])
+
     def test_legacy_missing_pytest_is_toolchain_failure_and_recovers_identity(self) -> None:
         identifier = "gaw-observer-test-legacy-pytest"
         manifest = self._manifest(identifier)
