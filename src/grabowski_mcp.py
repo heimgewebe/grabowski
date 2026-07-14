@@ -2596,15 +2596,16 @@ def _append_audit(record: dict[str, Any]) -> None:
 
 
 def _audit_records() -> list[dict[str, Any]]:
-    descriptor = _open_audit_file_lock(AUDIT_LOG, exclusive=False)
+    descriptor = _open_audit_read_target(AUDIT_LOG)
+    if descriptor is None:
+        return []
     try:
-        status = _verify_audit_log_unlocked(AUDIT_LOG)
+        data = _read_audit_descriptor(descriptor, AUDIT_LOG)
+        status = _verify_audit_bytes(AUDIT_LOG, data, exists=True)
         if not status["valid"]:
             raise RuntimeError(f"Audit log verification failed: {status['error']}")
-        if not AUDIT_LOG.exists():
-            return []
         records = []
-        for line in AUDIT_LOG.read_bytes().splitlines():
+        for line in data.splitlines():
             parsed = json.loads(line.decode("utf-8"))
             if isinstance(parsed, dict):
                 records.append(parsed)
