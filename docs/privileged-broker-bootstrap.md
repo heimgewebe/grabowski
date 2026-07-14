@@ -21,7 +21,7 @@ Danach wird eine Systemgruppe `grabowski` angelegt, der Operator dieser Gruppe h
 
 Eine bereits aktive Rootbroker-Installation wird nicht durch Kopieren der Beispielkonfiguration ersetzt. Dafür existiert ausschließlich `tools/grabowski_rootbroker_cutover.py`. Der Helper bindet sich an einen ausdrücklich angegebenen vollständigen Commit, liest Broker, Client, Helper und Publishervertrag direkt aus dessen Git-Objekten und lehnt einen abweichenden Checkout-HEAD ab. Ein veränderter Arbeitsbaum ist damit keine Installationsquelle.
 
-Ohne `--apply` erzeugt der Helper nur einen Plan. Dieser vergleicht installierte und gewünschte SHA-256-Werte und beweist, welche Konfigurationsanteile erhalten bleiben. Mit `--apply` verlangt der Helper UID 0 und einen exklusiven root-eigenen Lock unter `/run/grabowski/rootbroker-cutover.lock`.
+Ohne `--apply` erzeugt der Helper nur einen Plan. Dieser vergleicht installierte und gewünschte SHA-256-Werte und beweist, welche Konfigurationsanteile erhalten bleiben. Mit `--apply` verlangt der Helper UID 0, einen bereits aktiven Rootbroker-Socket und einen exklusiven root-eigenen Lock unter `/run/grabowski/rootbroker-cutover.lock`. Ein inaktiver oder nicht eindeutig prüfbarer Socket blockiert vor Backup und Mutation; der Helper aktiviert keinen zuvor inaktiven Rootbroker.
 
 Der Mutationspfad ist eng begrenzt:
 

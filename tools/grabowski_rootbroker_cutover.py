@@ -706,7 +706,12 @@ def _restore_preimages(
 
 def _socket_active(runner: RunCommand) -> bool:
     completed = runner(["/usr/bin/systemctl", "is-active", "--quiet", SOCKET_UNIT])
-    return completed.returncode == 0
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 3:
+        return False
+    detail = (completed.stderr or completed.stdout or "systemctl is-active failed").strip()
+    raise CutoverError(f"cannot determine Rootbroker socket state: {detail[:500]}")
 
 
 def _require_no_active_broker_instances(runner: RunCommand) -> None:
@@ -805,6 +810,9 @@ def _apply_cutover_locked(
         0o600,
         _sha256(merged_config_data),
     )
+    was_active = _socket_active(runner)
+    if not was_active:
+        raise CutoverError("Rootbroker socket must be active before cutover")
     preimages = [
         _capture_preimage(target, require_root_owned=require_root)
         for target in desired
@@ -819,7 +827,6 @@ def _apply_cutover_locked(
         install_uid=install_uid,
         install_gid=install_gid,
     )
-    was_active = _socket_active(runner)
     preimage_by_target = {preimage.target: preimage for preimage in preimages}
     attempted_targets: list[str] = []
     try:
