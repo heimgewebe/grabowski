@@ -21,6 +21,7 @@ import grabowski_mcp as base
 import grabowski_resources as resources
 import grabowski_tasks as tasks
 import grabowski_command_identity as command_identity
+import grabowski_checkouts as checkouts
 from grabowski_agent_sandbox import safe_git_environment
 try:
     import grabowski_operator_core as operator
@@ -87,6 +88,10 @@ WORKSPACE_LOCK_POLL_SECONDS = 0.05
 AGENT_WORKSPACE_TASK_HOST = "heim-pc"
 MAX_ROLE_RETRIES = 1
 MAX_WORKSPACE_EVENTS = 512
+WORKSPACE_CLEANUP_RETENTION_SECONDS = 30 * 24 * 60 * 60
+MAX_CLEANUP_WORKSPACES = 100
+MAX_WORKSPACE_REFERENCE_SCAN = 1000
+STALE_WORKSPACE_MINIMUM_AGE_SECONDS = 60 * 60
 MAX_WORKSPACE_EVENT_BYTES = 1024 * 1024
 ROUTE_EXECUTION_MODES = frozenset({
     "direct_operator",
@@ -4581,6 +4586,1112 @@ def grabowski_agent_workspace_close(
             "outcome_receipt": outcome_receipt,
             "external_closeout_checklist": _external_closeout_checklist(manifest),
         }
+
+
+
+def _path_identity(value: str) -> str:
+    return os.path.realpath(os.path.abspath(os.path.expanduser(value)))
+
+
+def _workspace_cleanup_owner(workspace_id: str) -> str:
+    return checkouts._owner(f"agent-workspace-cleanup:{workspace_id}")
+
+
+def _valid_workspace_cleanup_receipt(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    receipt_sha256 = value.get("receipt_sha256")
+    if not isinstance(receipt_sha256, str) or SHA256_RE.fullmatch(receipt_sha256) is None:
+        return False
+    stable = dict(value)
+    stable.pop("receipt_sha256", None)
+    return _sha256_json(stable) == receipt_sha256
+
+
+def _workspace_cleanup_integrity_status(
+    manifest: dict[str, Any], receipt: Any
+) -> dict[str, Any]:
+    result = {
+        "valid": False,
+        "hash_valid": False,
+        "receipt_present": False,
+        "receipt_matches_manifest": False,
+    }
+    if isinstance(receipt, dict):
+        result["hash_valid"] = _valid_workspace_cleanup_receipt(receipt)
+    path = _workspace_dir(str(manifest["workspace_id"])) / "cleanup-receipt.json"
+    if not path.exists():
+        return result
+    try:
+        stored = _load_json(path)
+    except Exception as exc:
+        result["error"] = _error_summary(exc)
+        return result
+    result["receipt_present"] = True
+    result["receipt_matches_manifest"] = isinstance(receipt, dict) and stored == receipt
+    result["valid"] = bool(
+        result["hash_valid"] and result["receipt_matches_manifest"]
+    )
+    return result
+
+
+def _workspace_cleanup_references(
+    writer_worktree: str, current_workspace_id: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    target = _path_identity(writer_worktree)
+    references: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    if not WORKSPACE_ROOT.exists():
+        return references, errors
+    if WORKSPACE_ROOT.is_symlink() or not WORKSPACE_ROOT.is_dir():
+        raise AgentWorkspaceError("workspace root must be one real directory")
+    entries = [
+        entry
+        for entry in sorted(WORKSPACE_ROOT.iterdir(), key=lambda item: item.name)
+        if WORKSPACE_ID_RE.fullmatch(entry.name) is not None
+    ]
+    if len(entries) > MAX_WORKSPACE_REFERENCE_SCAN:
+        return references, [
+            {
+                "code": "workspace_reference_scan_limit_exceeded",
+                "observed_entries": len(entries),
+                "maximum_entries": MAX_WORKSPACE_REFERENCE_SCAN,
+            }
+        ]
+    for directory in entries:
+        if directory.is_symlink() or not directory.is_dir():
+            errors.append(
+                {
+                    "code": "workspace_registry_entry_unsafe",
+                    "workspace_id": directory.name,
+                }
+            )
+            continue
+        manifest_path = directory / "manifest.json"
+        try:
+            candidate = _load_json(manifest_path)
+        except Exception as exc:
+            errors.append(
+                {
+                    "code": "workspace_manifest_unreadable",
+                    "workspace_id": directory.name,
+                    "error": _error_summary(exc),
+                }
+            )
+            continue
+        candidate_path = candidate.get("writer_worktree")
+        candidate_id = candidate.get("workspace_id")
+        if candidate_id != directory.name or not isinstance(candidate_path, str):
+            errors.append(
+                {
+                    "code": "workspace_manifest_identity_invalid",
+                    "workspace_id": directory.name,
+                }
+            )
+            continue
+        if _path_identity(candidate_path) != target:
+            continue
+        close_receipt = candidate.get("close_receipt")
+        close_integrity = _close_integrity_status(candidate, close_receipt)
+        fully_closed = bool(
+            isinstance(close_receipt, dict)
+            and close_receipt.get("state") == "complete"
+            and close_receipt.get("resources_released") is True
+            and close_integrity["valid"]
+        )
+        references.append(
+            {
+                "workspace_id": candidate_id,
+                "current": candidate_id == current_workspace_id,
+                "creation_state": candidate.get("creation_state"),
+                "close_receipt_present": isinstance(close_receipt, dict),
+                "close_receipt_valid": close_integrity["valid"],
+                "closed": fully_closed,
+                "resources_released": (
+                    close_receipt.get("resources_released")
+                    if isinstance(close_receipt, dict)
+                    else None
+                ),
+            }
+        )
+    return references, errors
+
+
+def _workspace_created_unix(manifest: dict[str, Any]) -> int | None:
+    created_at = manifest.get("created_at")
+    if not isinstance(created_at, str) or not created_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+def _closed_workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
+    close_receipt = manifest.get("close_receipt")
+    task_states = (
+        dict(close_receipt.get("task_states", {}))
+        if isinstance(close_receipt, dict)
+        and isinstance(close_receipt.get("task_states"), dict)
+        else {}
+    )
+    created_unix = _workspace_created_unix(manifest)
+    stale_after_unix = (
+        created_unix + STALE_WORKSPACE_MINIMUM_AGE_SECONDS
+        if created_unix is not None
+        else None
+    )
+    return {
+        "created_at": manifest.get("created_at"),
+        "created_at_unix": created_unix,
+        "stale_after_unix": stale_after_unix,
+        "stale_threshold_met": bool(
+            stale_after_unix is not None and _now() >= stale_after_unix
+        ),
+        "task_states": task_states,
+        "nonterminal_roles": [],
+        "live_resource_keys": [],
+        "resource_observation_error": None,
+        "session_live": False,
+        "unresolved_task_start_roles": [],
+        "source": "complete_close_receipt",
+    }
+
+def _workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
+    task_states: dict[str, dict[str, Any]] = {}
+    nonterminal_roles: list[str] = []
+    for role_name in ("writer", "tests", "review"):
+        task_id = manifest.get("tasks", {}).get(role_name)
+        public = _task_public(task_id)
+        task_states[role_name] = public
+        if task_id is not None and not public.get("terminal"):
+            nonterminal_roles.append(role_name)
+    resource_owner = manifest.get("resources", {}).get("owner_id")
+    live_resource_keys: list[str] = []
+    resource_observation_error: str | None = None
+    if isinstance(resource_owner, str) and resource_owner:
+        try:
+            observed = resources.list_resources(
+                owner_id=resource_owner,
+                include_expired=False,
+                limit=MAX_PATHS + 8,
+            )
+            live_resource_keys = sorted(
+                str(item.get("resource_key"))
+                for item in observed
+                if isinstance(item, dict) and isinstance(item.get("resource_key"), str)
+            )
+        except Exception as exc:
+            resource_observation_error = _error_summary(exc)
+    session_name = manifest.get("session_name")
+    session_live = bool(
+        isinstance(session_name, str) and session_name and _tmux_has_session(session_name)
+    )
+    start_intents = manifest.get("task_start_intents", {})
+    unresolved_start_roles = sorted(start_intents) if isinstance(start_intents, dict) else ["invalid"]
+    created_unix = _workspace_created_unix(manifest)
+    stale_after_unix = (
+        created_unix + STALE_WORKSPACE_MINIMUM_AGE_SECONDS
+        if created_unix is not None
+        else None
+    )
+    return {
+        "created_at": manifest.get("created_at"),
+        "created_at_unix": created_unix,
+        "stale_after_unix": stale_after_unix,
+        "stale_threshold_met": bool(
+            stale_after_unix is not None and _now() >= stale_after_unix
+        ),
+        "task_states": task_states,
+        "nonterminal_roles": nonterminal_roles,
+        "live_resource_keys": live_resource_keys,
+        "resource_observation_error": resource_observation_error,
+        "session_live": session_live,
+        "unresolved_task_start_roles": unresolved_start_roles,
+        "source": "live_runtime",
+    }
+
+
+def _stale_workspace_reconciliation_plan(
+    manifest: dict[str, Any], liveness: dict[str, Any]
+) -> dict[str, Any]:
+    blockers: list[dict[str, Any]] = []
+    close_receipt = manifest.get("close_receipt")
+    if isinstance(close_receipt, dict):
+        blockers.append({"code": "workspace_already_closed"})
+    if liveness.get("created_at_unix") is None:
+        blockers.append({"code": "workspace_age_unknown"})
+    elif liveness.get("stale_threshold_met") is not True:
+        blockers.append(
+            {
+                "code": "workspace_not_stale",
+                "stale_after_unix": liveness.get("stale_after_unix"),
+                "minimum_age_seconds": STALE_WORKSPACE_MINIMUM_AGE_SECONDS,
+            }
+        )
+    if liveness.get("session_live"):
+        blockers.append({"code": "workspace_tmux_session_live"})
+    if liveness.get("resource_observation_error"):
+        blockers.append(
+            {
+                "code": "workspace_resource_outcome_unknown",
+                "error": liveness["resource_observation_error"],
+            }
+        )
+    if liveness.get("live_resource_keys"):
+        blockers.append(
+            {
+                "code": "workspace_resources_live",
+                "resource_keys": liveness["live_resource_keys"],
+            }
+        )
+    if liveness.get("nonterminal_roles"):
+        blockers.append(
+            {
+                "code": "workspace_tasks_nonterminal",
+                "roles": liveness["nonterminal_roles"],
+            }
+        )
+    if liveness.get("unresolved_task_start_roles"):
+        blockers.append(
+            {
+                "code": "workspace_task_start_outcome_unknown",
+                "roles": liveness["unresolved_task_start_roles"],
+            }
+        )
+    return {
+        "eligible": not blockers,
+        "blockers": blockers,
+        "minimum_age_seconds": STALE_WORKSPACE_MINIMUM_AGE_SECONDS,
+        "action": "mark-stale-workspace-abandoned",
+        "mutates_tasks": False,
+        "mutates_resources": False,
+        "removes_tmux": False,
+        "removes_worktree": False,
+        "deletes_workspace_evidence": False,
+    }
+
+
+def _workspace_cleanup_plan_data(
+    manifest: dict[str, Any]
+) -> dict[str, Any]:
+    identifier = str(manifest["workspace_id"])
+    repository = str(manifest["repository"])
+    writer_worktree = str(manifest["writer_worktree"])
+    writer_branch = str(manifest["writer_branch"])
+    owner = _workspace_cleanup_owner(identifier)
+    close_receipt = manifest.get("close_receipt")
+    close_integrity = _close_integrity_status(manifest, close_receipt)
+    fully_closed = bool(
+        isinstance(close_receipt, dict)
+        and close_receipt.get("state") == "complete"
+        and close_receipt.get("resources_released") is True
+        and close_integrity["valid"]
+    )
+    liveness = (
+        _closed_workspace_liveness(manifest)
+        if fully_closed
+        else _workspace_liveness(manifest)
+    )
+    stale_reconciliation = _stale_workspace_reconciliation_plan(manifest, liveness)
+    blockers: list[dict[str, Any]] = []
+    cleanup_receipt = manifest.get("workspace_cleanup_receipt")
+    cleanup_intent = manifest.get("workspace_cleanup_intent")
+    cleanup_integrity = _workspace_cleanup_integrity_status(
+        manifest, cleanup_receipt
+    )
+    cleanup_receipt_valid = cleanup_integrity["valid"]
+    close_receipt_path = _workspace_dir(identifier) / "close-receipt.json"
+    if cleanup_integrity["receipt_present"] and cleanup_receipt is None:
+        blockers.append({"code": "cleanup_receipt_outcome_unknown"})
+    elif cleanup_receipt is not None and not cleanup_receipt_valid:
+        blockers.append(
+            {"code": "cleanup_receipt_invalid", "integrity": cleanup_integrity}
+        )
+    if close_receipt is None and close_receipt_path.exists():
+        blockers.append({"code": "workspace_close_outcome_unknown"})
+    elif not isinstance(close_receipt, dict):
+        blockers.append({"code": "workspace_not_closed"})
+    elif not close_integrity["valid"]:
+        blockers.append(
+            {
+                "code": "workspace_close_receipt_invalid",
+                "integrity": close_integrity,
+            }
+        )
+    elif close_receipt.get("state") != "complete":
+        blockers.append({"code": "workspace_not_closed"})
+    elif close_receipt.get("resources_released") is not True:
+        blockers.append({"code": "workspace_resources_not_released"})
+    if isinstance(cleanup_intent, dict) and cleanup_intent.get("state") == "started":
+        blockers.append(
+            {
+                "code": "cleanup_outcome_unknown",
+                "intent_id": cleanup_intent.get("intent_id"),
+                "archive_id": cleanup_intent.get("archive_id"),
+            }
+        )
+    references, reference_scan_errors = _workspace_cleanup_references(
+        writer_worktree, identifier
+    )
+    if reference_scan_errors:
+        blockers.append(
+            {
+                "code": "workspace_reference_inventory_incomplete",
+                "errors": reference_scan_errors,
+            }
+        )
+    open_references = [
+        item for item in references if not item["current"] and not item["closed"]
+    ]
+    if open_references:
+        blockers.append(
+            {
+                "code": "worktree_referenced_by_open_workspace",
+                "workspace_ids": sorted(item["workspace_id"] for item in open_references),
+            }
+        )
+    checkout_state: dict[str, Any] = {
+        "exists": False,
+        "linked": False,
+        "clean": False,
+        "head": None,
+        "branch": None,
+        "checkout_key": None,
+        "coordination": None,
+    }
+    checkout_path = Path(writer_worktree).expanduser()
+    if checkout_path.is_symlink():
+        blockers.append({"code": "writer_worktree_is_symlink"})
+    elif not checkout_path.exists():
+        if not cleanup_receipt_valid and not fully_closed:
+            blockers.append({"code": "writer_worktree_missing_without_valid_cleanup_receipt"})
+    elif not checkout_path.is_dir():
+        blockers.append({"code": "writer_worktree_not_directory"})
+    else:
+        checkout_state["exists"] = True
+        try:
+            top_level, _common_dir, record = checkouts._worktree_for_path(
+                checkouts._resolve_repo(repository), checkout_path
+            )
+            status = checkouts._worktree_status(record)
+            clean = status.get("dirty") is False
+            checkout_state.update(
+                {
+                    "linked": True,
+                    "clean": clean,
+                    "head": record.get("head"),
+                    "branch": record.get("branch"),
+                    "checkout_key": record.get("checkout_key"),
+                    "status": status,
+                    "repo": str(top_level),
+                }
+            )
+            if not clean:
+                blockers.append(
+                    {
+                        "code": "checkout_not_clean_linked",
+                        "error": "Checkout must be clean before archival or cleanup",
+                    }
+                )
+            if record.get("branch") != writer_branch:
+                blockers.append(
+                    {
+                        "code": "writer_branch_mismatch",
+                        "expected": writer_branch,
+                        "actual": record.get("branch"),
+                    }
+                )
+            expected_head = (
+                close_receipt.get("expected_head")
+                if isinstance(close_receipt, dict)
+                else None
+            )
+            if isinstance(expected_head, str) and record.get("head") != expected_head:
+                blockers.append(
+                    {
+                        "code": "writer_head_mismatch",
+                        "expected": expected_head,
+                        "actual": record.get("head"),
+                    }
+                )
+            coordination = checkouts._linked_checkout_coordination(
+                checkout_path,
+                top_level,
+                owner_id=owner,
+                include_processes=True,
+                include_tasks=True,
+                include_resources=True,
+            )
+            checkout_state["coordination"] = coordination
+            if coordination.get("blocking"):
+                blockers.append(
+                    {
+                        "code": "active_checkout_coordination",
+                        "blocking_counts": coordination.get("blocking_counts", {}),
+                    }
+                )
+        except Exception as exc:
+            blockers.append(
+                {
+                    "code": "checkout_state_unverified",
+                    "error": _error_summary(exc),
+                }
+            )
+    stale_blockers = list(stale_reconciliation["blockers"])
+    if close_receipt is None and close_receipt_path.exists():
+        stale_blockers.append({"code": "workspace_close_outcome_unknown"})
+    if cleanup_receipt is not None or cleanup_integrity["receipt_present"]:
+        stale_blockers.append({"code": "workspace_cleanup_state_present"})
+    if cleanup_intent is not None:
+        stale_blockers.append({"code": "workspace_cleanup_intent_present"})
+    if checkout_state["exists"] and not checkout_state["clean"]:
+        stale_blockers.append({"code": "stale_workspace_dirty_checkout"})
+    if reference_scan_errors:
+        stale_blockers.append(
+            {
+                "code": "workspace_reference_inventory_incomplete",
+                "errors": reference_scan_errors,
+            }
+        )
+    if open_references:
+        stale_blockers.append(
+            {
+                "code": "shared_worktree_open_reference",
+                "workspace_ids": sorted(item["workspace_id"] for item in open_references),
+            }
+        )
+    coordination = checkout_state.get("coordination")
+    if isinstance(coordination, dict) and coordination.get("blocking"):
+        stale_blockers.append(
+            {
+                "code": "stale_workspace_checkout_coordination_active",
+                "blocking_counts": coordination.get("blocking_counts", {}),
+            }
+        )
+    stale_reconciliation = {
+        **stale_reconciliation,
+        "eligible": not stale_blockers,
+        "blockers": stale_blockers,
+    }
+    if cleanup_receipt_valid and checkout_state["exists"]:
+        blockers.append({"code": "writer_worktree_reappeared_after_cleanup"})
+    already_cleaned = bool(cleanup_receipt_valid and not checkout_state["exists"])
+    already_absent = bool(
+        fully_closed
+        and not checkout_state["exists"]
+        and not cleanup_receipt_valid
+        and not blockers
+    )
+    eligible = not blockers and checkout_state["exists"] and checkout_state["linked"]
+    body = {
+        "schema_version": 1,
+        "operation": "agent-workspace-cleanup",
+        "workspace_id": identifier,
+        "owner_id": owner,
+        "repository": repository,
+        "writer_worktree": writer_worktree,
+        "writer_branch": writer_branch,
+        "closed": fully_closed,
+        "closure_outcome": (
+            close_receipt.get("closure_outcome")
+            if isinstance(close_receipt, dict)
+            else None
+        ),
+        "resources_released": (
+            close_receipt.get("resources_released")
+            if isinstance(close_receipt, dict)
+            else None
+        ),
+        "close_receipt_integrity": close_integrity,
+        "cleanup_receipt_integrity": cleanup_integrity,
+        "workspace_references": references,
+        "workspace_reference_scan_errors": reference_scan_errors,
+        "liveness": liveness,
+        "stale_reconciliation": stale_reconciliation,
+        "checkout": checkout_state,
+        "prior_failed_intent": (
+            cleanup_intent
+            if isinstance(cleanup_intent, dict) and cleanup_intent.get("state") == "failed"
+            else None
+        ),
+        "already_cleaned": already_cleaned,
+        "already_absent": already_absent,
+        "eligible": eligible,
+        "blockers": blockers,
+        "historical_evidence_preserved": True,
+        "workspace_state_deleted": False,
+        "execution_authorized": False,
+        "cleanup_method": "archive-recovery-refs-then-remove-linked-checkout",
+        "confirmation_required": "archive-and-remove-worktree",
+        "does_not_establish": [
+            "branch_merge_readiness",
+            "pull_request_truth",
+            "permission_to_delete_workspace_evidence",
+        ],
+    }
+    return {**body, "plan_sha256": _sha256_json(body)}
+
+
+@mcp.tool(name="grabowski_agent_workspace_cleanup_plan", annotations=READ_ONLY)
+def grabowski_agent_workspace_cleanup_plan(
+    workspace_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Inventory cleanup eligibility without deleting workspace evidence or a checkout."""
+    operator._require_operator_capability("durable_job")
+    operator._require_operator_capability("git_cli")
+    operator._require_operator_capability("resource_lease")
+    operator._require_operator_capability("tmux_interaction")
+    selected: list[str]
+    if workspace_ids is None:
+        if not WORKSPACE_ROOT.exists():
+            selected = []
+        elif WORKSPACE_ROOT.is_symlink() or not WORKSPACE_ROOT.is_dir():
+            raise AgentWorkspaceError("workspace root must be a real directory")
+        else:
+            selected = sorted(
+                directory.name
+                for directory in WORKSPACE_ROOT.iterdir()
+                if directory.is_dir()
+                and not directory.is_symlink()
+                and WORKSPACE_ID_RE.fullmatch(directory.name) is not None
+            )
+    else:
+        if not isinstance(workspace_ids, list) or not workspace_ids:
+            raise AgentWorkspaceError("workspace_ids must be a non-empty list or null")
+        selected = []
+        for raw in workspace_ids:
+            identifier = _required_string(raw, "workspace_id", max_length=80)
+            if WORKSPACE_ID_RE.fullmatch(identifier) is None:
+                raise AgentWorkspaceError(f"invalid workspace_id: {identifier}")
+            if identifier not in selected:
+                selected.append(identifier)
+    if len(selected) > MAX_CLEANUP_WORKSPACES:
+        raise AgentWorkspaceError(
+            f"cleanup inventory exceeds {MAX_CLEANUP_WORKSPACES} workspaces"
+        )
+    plans = [_workspace_cleanup_plan_data(_manifest(identifier)) for identifier in selected]
+    summary = {
+        "workspace_count": len(plans),
+        "eligible_count": sum(1 for plan in plans if plan["eligible"]),
+        "already_cleaned_count": sum(1 for plan in plans if plan["already_cleaned"]),
+        "already_absent_count": sum(1 for plan in plans if plan["already_absent"]),
+        "stale_reconciliation_eligible_count": sum(
+            1 for plan in plans if plan["stale_reconciliation"]["eligible"]
+        ),
+        "blocked_count": sum(
+            1
+            for plan in plans
+            if not plan["eligible"]
+            and not plan["already_cleaned"]
+            and not plan["already_absent"]
+        ),
+    }
+    body = {
+        "schema_version": 1,
+        "report_kind": "agent_workspace_cleanup_inventory",
+        "owner_strategy": "derived-per-workspace",
+        "plans": plans,
+        "summary": summary,
+        "execution_authorized": False,
+        "historical_evidence_preserved": True,
+    }
+    return {**body, "inventory_sha256": _sha256_json(body)}
+
+
+
+@mcp.tool(name="grabowski_agent_workspace_reconcile_stale", annotations=MUTATING)
+def grabowski_agent_workspace_reconcile_stale(
+    workspace_id: str,
+    expected_plan_sha256: str,
+    confirmation: str = "",
+) -> dict[str, Any]:
+    """Mark one provably inactive stale workspace abandoned without stopping or deleting anything."""
+    operator._require_operator_mutation("durable_job")
+    operator._require_operator_mutation("git_cli")
+    operator._require_operator_mutation("resource_lease")
+    operator._require_operator_mutation("tmux_interaction")
+    identifier = _required_string(workspace_id, "workspace_id", max_length=80)
+    if WORKSPACE_ID_RE.fullmatch(identifier) is None:
+        raise AgentWorkspaceError(f"invalid workspace_id: {identifier}")
+    expected_hash = _required_string(
+        expected_plan_sha256, "expected_plan_sha256", max_length=64
+    )
+    if SHA256_RE.fullmatch(expected_hash) is None:
+        raise AgentWorkspaceError("expected_plan_sha256 must be a lowercase SHA-256")
+    if confirmation != "mark-stale-workspace-abandoned":
+        raise AgentWorkspaceError(
+            "confirmation must be exactly 'mark-stale-workspace-abandoned'"
+        )
+    with _lock(identifier):
+        manifest = _manifest(identifier)
+        existing = manifest.get("close_receipt")
+        if isinstance(existing, dict) and _close_integrity_status(manifest, existing)["valid"]:
+            return {
+                "workspace_id": identifier,
+                "state": "already_closed",
+                "idempotent": True,
+                "close_receipt": existing,
+            }
+        plan = _workspace_cleanup_plan_data(manifest)
+        if plan["plan_sha256"] != expected_hash:
+            raise AgentWorkspaceError("workspace lifecycle plan is stale; rerun cleanup_plan")
+        stale = plan["stale_reconciliation"]
+        if not stale["eligible"]:
+            return {
+                "workspace_id": identifier,
+                "state": "stale_reconciliation_blocked",
+                "idempotent": False,
+                "plan": plan,
+            }
+        task_states = plan["liveness"]["task_states"]
+        failed_roles = sorted(
+            role_name
+            for role_name, task in task_states.items()
+            if task.get("task_id") is not None and task.get("state") != "completed"
+        )
+        receipt = {
+            "schema_version": 1,
+            "state": "complete",
+            "workspace_id": identifier,
+            "source_plan_sha256": expected_hash,
+            "expected_head": plan["checkout"]["head"],
+            "closed_at": _utc(),
+            "task_states": task_states,
+            "cancelled_roles": [],
+            "writer_worktree": manifest["writer_worktree"],
+            "writer_branch": manifest["writer_branch"],
+            "worktree_preserved": bool(plan["checkout"]["exists"]),
+            "branch_preserved": bool(plan["checkout"]["exists"]),
+            "dirty": None if not plan["checkout"]["exists"] else not plan["checkout"]["clean"],
+            "tmux_removed": False,
+            "resources_released": True,
+            "released_resource_keys": [],
+            "remaining_resource_keys": [],
+            "resource_release_error": None,
+            "no_unsecured_changes_discarded": True,
+            "failed_roles": failed_roles,
+            "abandon_failed_roles": True,
+            "closure_outcome": "abandoned_stale_workspace",
+            "stale_reconciliation": True,
+            "task_mutation_performed": False,
+            "resource_mutation_performed": False,
+            "worktree_mutation_performed": False,
+            "historical_evidence_preserved": True,
+        }
+        receipt["receipt_sha256"] = _sha256_json(receipt)
+        _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
+        manifest["close_receipt"] = receipt
+        _append_workspace_event(
+            manifest,
+            "workspace_stale_reconciled",
+            outcome="abandoned_stale_workspace",
+            evidence={
+                "receipt_sha256": receipt["receipt_sha256"],
+                "source_plan_sha256": expected_hash,
+                "task_mutation_performed": False,
+                "resource_mutation_performed": False,
+                "worktree_mutation_performed": False,
+            },
+        )
+        _write_manifest(manifest)
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "agent-workspace-stale-reconcile",
+            "workspace_id": identifier,
+            "source_plan_sha256": expected_hash,
+            "closure_outcome": "abandoned_stale_workspace",
+            "task_mutation_performed": False,
+            "resource_mutation_performed": False,
+            "worktree_mutation_performed": False,
+            "historical_evidence_preserved": True,
+        }
+    )
+    return {
+        "workspace_id": identifier,
+        "state": "stale_workspace_reconciled",
+        "idempotent": False,
+        "close_receipt": receipt,
+        "worktree_preserved": receipt["worktree_preserved"],
+        "historical_evidence_preserved": True,
+    }
+
+
+def _verified_workspace_cleanup_archive(
+    manifest: dict[str, Any],
+    intent: dict[str, Any],
+    owner: str,
+) -> dict[str, Any] | None:
+    archive_id = intent.get("archive_id")
+    if not isinstance(archive_id, str):
+        return None
+    expected = {
+        "checkout_path": _path_identity(str(manifest["writer_worktree"])),
+        "head": intent.get("writer_head"),
+        "branch": intent.get("writer_branch"),
+        "owner_id": owner,
+    }
+    if (
+        intent.get("owner_id") != owner
+        or _path_identity(str(intent.get("writer_worktree", "")))
+        != expected["checkout_path"]
+        or intent.get("writer_branch") != manifest.get("writer_branch")
+        or not isinstance(intent.get("writer_head"), str)
+    ):
+        return None
+    try:
+        archive = checkouts._load_archive(archive_id)
+    except Exception:
+        return None
+    if (
+        archive.get("cleaned_at_unix") is None
+        or archive.get("cleanup_plan_id") is None
+        or _path_identity(str(archive.get("checkout_path", "")))
+        != expected["checkout_path"]
+        or archive.get("head") != expected["head"]
+        or archive.get("branch") != expected["branch"]
+        or archive.get("owner_id") != owner
+    ):
+        return None
+    try:
+        repo = checkouts._resolve_repo(str(manifest["repository"]))
+        if _path_identity(str(archive.get("repo_path", ""))) != _path_identity(str(repo)):
+            return None
+        archive_root = checkouts.ARCHIVE_ROOT
+        if archive_root.is_symlink() or not archive_root.is_dir():
+            return None
+        expected_manifest = archive_root.resolve(strict=True) / archive_id / "manifest.json"
+        manifest_path = Path(str(archive.get("manifest_path", "")))
+        if manifest_path.is_symlink() or manifest_path.resolve(strict=True) != expected_manifest:
+            return None
+        archive_manifest = _load_json(manifest_path)
+    except Exception:
+        return None
+    recovery_refs = archive.get("recovery_refs")
+    if (
+        archive_manifest.get("schema_version") != 1
+        or archive_manifest.get("archive_id") != archive_id
+        or _path_identity(str(archive_manifest.get("checkout_path", "")))
+        != expected["checkout_path"]
+        or archive_manifest.get("head") != expected["head"]
+        or archive_manifest.get("branch") != expected["branch"]
+        or archive_manifest.get("owner_id") != owner
+        or archive_manifest.get("recovery_refs") != recovery_refs
+        or not isinstance(recovery_refs, list)
+        or not recovery_refs
+    ):
+        return None
+    head_ref_valid = False
+    for item in recovery_refs:
+        if not isinstance(item, dict):
+            return None
+        ref = item.get("ref")
+        target = item.get("target")
+        role = item.get("role")
+        if not isinstance(ref, str) or not isinstance(target, str):
+            return None
+        try:
+            observed = checkouts._git_read(
+                repo, ["rev-parse", "--verify", f"{ref}^{{commit}}"]
+            ).stdout.strip()
+        except Exception:
+            return None
+        if observed != target:
+            return None
+        if role == "head" and target == expected["head"]:
+            head_ref_valid = True
+    return archive if head_ref_valid else None
+
+
+def _workspace_cleanup_finalize_missing(
+    manifest: dict[str, Any], expected_plan_sha256: str, owner: str
+) -> dict[str, Any] | None:
+    intent = manifest.get("workspace_cleanup_intent")
+    if not isinstance(intent, dict):
+        return None
+    if intent.get("source_plan_sha256") != expected_plan_sha256:
+        return None
+    archive = _verified_workspace_cleanup_archive(manifest, intent, owner)
+    if archive is None:
+        return None
+    return {
+        "archive_id": archive["archive_id"],
+        "checkout_cleanup_plan_id": archive["cleanup_plan_id"],
+        "applied_at_unix": archive["cleaned_at_unix"],
+        "reconciled_after_missing_worktree": True,
+    }
+
+
+def _publish_workspace_cleanup_receipt(
+    manifest: dict[str, Any],
+    *,
+    source_plan_sha256: str,
+    archive_id: str,
+    checkout_cleanup_plan_id: str,
+    checkout_cleanup_plan_sha256: str | None,
+    applied_at_unix: int,
+    reconciled_after_missing_worktree: bool,
+) -> dict[str, Any]:
+    receipt = {
+        "schema_version": 1,
+        "workspace_id": manifest["workspace_id"],
+        "source_plan_sha256": source_plan_sha256,
+        "writer_worktree": manifest["writer_worktree"],
+        "writer_branch": manifest["writer_branch"],
+        "archive_id": archive_id,
+        "checkout_cleanup_plan_id": checkout_cleanup_plan_id,
+        "checkout_cleanup_plan_sha256": checkout_cleanup_plan_sha256,
+        "applied_at_unix": applied_at_unix,
+        "historical_evidence_preserved": True,
+        "workspace_state_deleted": False,
+        "reconciled_after_missing_worktree": reconciled_after_missing_worktree,
+    }
+    receipt["receipt_sha256"] = _sha256_json(receipt)
+    _atomic_json(
+        _workspace_dir(str(manifest["workspace_id"])) / "cleanup-receipt.json",
+        receipt,
+    )
+    manifest["workspace_cleanup_receipt"] = receipt
+    manifest.pop("workspace_cleanup_intent", None)
+    _append_workspace_event(
+        manifest,
+        "workspace_cleanup_completed",
+        outcome="reconciled" if reconciled_after_missing_worktree else "complete",
+        evidence={
+            "receipt_sha256": receipt["receipt_sha256"],
+            "archive_id": archive_id,
+            "checkout_cleanup_plan_id": checkout_cleanup_plan_id,
+            "historical_evidence_preserved": True,
+        },
+    )
+    _write_manifest(manifest)
+    return receipt
+
+
+@mcp.tool(name="grabowski_agent_workspace_cleanup", annotations=MUTATING)
+def grabowski_agent_workspace_cleanup(
+    workspace_id: str,
+    expected_plan_sha256: str,
+    confirmation: str = "",
+) -> dict[str, Any]:
+    """Archive and remove one eligible closed writer checkout while preserving all workspace evidence."""
+    operator._require_operator_mutation("git_cli")
+    operator._require_operator_mutation("resource_lease")
+    identifier = _required_string(workspace_id, "workspace_id", max_length=80)
+    if WORKSPACE_ID_RE.fullmatch(identifier) is None:
+        raise AgentWorkspaceError(f"invalid workspace_id: {identifier}")
+    expected_hash = _required_string(
+        expected_plan_sha256, "expected_plan_sha256", max_length=64
+    )
+    if SHA256_RE.fullmatch(expected_hash) is None:
+        raise AgentWorkspaceError("expected_plan_sha256 must be a lowercase SHA-256")
+    if confirmation != "archive-and-remove-worktree":
+        raise AgentWorkspaceError(
+            "confirmation must be exactly 'archive-and-remove-worktree'"
+        )
+    owner = _workspace_cleanup_owner(identifier)
+    with _lock(identifier):
+        manifest = _manifest(identifier)
+        existing_receipt = manifest.get("workspace_cleanup_receipt")
+        cleanup_integrity = _workspace_cleanup_integrity_status(
+            manifest, existing_receipt
+        )
+        if cleanup_integrity["valid"]:
+            if existing_receipt.get("source_plan_sha256") != expected_hash:
+                raise AgentWorkspaceError("workspace was cleaned under a different plan")
+            if Path(str(manifest["writer_worktree"])).expanduser().exists():
+                return {
+                    "workspace_id": identifier,
+                    "state": "cleanup_receipt_drift",
+                    "idempotent": False,
+                    "cleanup_receipt": existing_receipt,
+                    "blocker": "writer_worktree_reappeared_after_cleanup",
+                }
+            return {
+                "workspace_id": identifier,
+                "state": "already_cleaned",
+                "idempotent": True,
+                "cleanup_receipt": existing_receipt,
+            }
+        if existing_receipt is not None or cleanup_integrity["receipt_present"]:
+            return {
+                "workspace_id": identifier,
+                "state": "cleanup_receipt_invalid",
+                "idempotent": False,
+                "integrity": cleanup_integrity,
+            }
+        reconciled = _workspace_cleanup_finalize_missing(manifest, expected_hash, owner)
+        if reconciled is not None:
+            receipt = _publish_workspace_cleanup_receipt(
+                manifest,
+                source_plan_sha256=expected_hash,
+                archive_id=reconciled["archive_id"],
+                checkout_cleanup_plan_id=reconciled["checkout_cleanup_plan_id"],
+                checkout_cleanup_plan_sha256=None,
+                applied_at_unix=int(reconciled["applied_at_unix"]),
+                reconciled_after_missing_worktree=True,
+            )
+            return {
+                "workspace_id": identifier,
+                "state": "cleanup_reconciled",
+                "idempotent": False,
+                "cleanup_receipt": receipt,
+            }
+        plan = _workspace_cleanup_plan_data(manifest)
+        if plan["plan_sha256"] != expected_hash:
+            raise AgentWorkspaceError("workspace cleanup plan is stale; rerun cleanup_plan")
+        if not plan["eligible"]:
+            return {
+                "workspace_id": identifier,
+                "state": "cleanup_blocked",
+                "plan": plan,
+                "idempotent": False,
+            }
+        prior_intent = manifest.get("workspace_cleanup_intent")
+        reusable_archive_id = None
+        if (
+            isinstance(prior_intent, dict)
+            and prior_intent.get("state") == "failed"
+            and prior_intent.get("writer_worktree") == plan["writer_worktree"]
+            and prior_intent.get("writer_branch") == plan["checkout"]["branch"]
+            and prior_intent.get("writer_head") == plan["checkout"]["head"]
+            and isinstance(prior_intent.get("archive_id"), str)
+        ):
+            reusable_archive_id = prior_intent["archive_id"]
+        intent = {
+            "schema_version": 1,
+            "intent_id": hashlib.sha256(
+                f"{identifier}:{expected_hash}:{time.time_ns()}".encode("utf-8")
+            ).hexdigest()[:24],
+            "state": "started",
+            "source_plan_sha256": expected_hash,
+            "owner_id": owner,
+            "writer_worktree": plan["writer_worktree"],
+            "writer_branch": plan["checkout"]["branch"],
+            "writer_head": plan["checkout"]["head"],
+            "archive_id": reusable_archive_id,
+            "started_at": _utc(),
+        }
+        manifest["workspace_cleanup_intent"] = intent
+        _append_workspace_event(
+            manifest,
+            "workspace_cleanup_requested",
+            outcome="started",
+            evidence={
+                "intent_id": intent["intent_id"],
+                "source_plan_sha256": expected_hash,
+                "historical_evidence_preserved": True,
+            },
+        )
+        _write_manifest(manifest)
+    archive_id = reusable_archive_id
+    try:
+        if archive_id is None:
+            archive_result = checkouts.grabowski_checkout_archive(
+                repo=plan["repository"],
+                checkout_path=plan["writer_worktree"],
+                owner_id=owner,
+                purpose=f"agent workspace cleanup {identifier}",
+                retention_until_unix=_now() + WORKSPACE_CLEANUP_RETENTION_SECONDS,
+                expected_head=str(plan["checkout"]["head"]),
+                expected_branch=str(plan["checkout"]["branch"]),
+            )
+            archive_id = str(archive_result["archive"]["archive_id"])
+            with _lock(identifier):
+                manifest = _manifest(identifier)
+                current_intent = manifest.get("workspace_cleanup_intent")
+                if not isinstance(current_intent, dict) or current_intent.get("intent_id") != intent["intent_id"]:
+                    raise AgentWorkspaceActionError("workspace cleanup intent changed after archive")
+                current_intent["archive_id"] = archive_id
+                manifest["workspace_cleanup_intent"] = current_intent
+                _write_manifest(manifest)
+        dry_run = checkouts.grabowski_checkout_cleanup(
+            repo=plan["repository"],
+            checkout_path=plan["writer_worktree"],
+            owner_id=owner,
+            dry_run=True,
+            archive_id=archive_id,
+            expected_head=str(plan["checkout"]["head"]),
+            expected_branch=str(plan["checkout"]["branch"]),
+        )
+        cleanup_plan = dry_run["plan"]
+        if not cleanup_plan.get("safe_to_apply"):
+            raise AgentWorkspaceActionError("checkout cleanup dry run acquired new blockers")
+        dry_run_record = dry_run["dry_run_record"]
+        applied = checkouts.grabowski_checkout_cleanup(
+            repo=plan["repository"],
+            checkout_path=plan["writer_worktree"],
+            owner_id=owner,
+            dry_run=False,
+            archive_id=archive_id,
+            plan_id=str(dry_run_record["plan_id"]),
+            expected_plan_sha256=str(cleanup_plan["plan_sha256"]),
+            confirmation="remove-linked-checkout",
+        )
+    except Exception as exc:
+        with _lock(identifier):
+            manifest = _manifest(identifier)
+            current_intent = manifest.get("workspace_cleanup_intent")
+            if isinstance(current_intent, dict) and current_intent.get("intent_id") == intent["intent_id"]:
+                current_intent.update(
+                    {
+                        "state": "failed",
+                        "archive_id": archive_id,
+                        "failed_at": _utc(),
+                        "error": _error_summary(exc),
+                    }
+                )
+                manifest["workspace_cleanup_intent"] = current_intent
+                _append_workspace_event(
+                    manifest,
+                    "workspace_cleanup_failed",
+                    outcome="failed",
+                    evidence={
+                        "intent_id": intent["intent_id"],
+                        "archive_id": archive_id,
+                        "error": _error_summary(exc),
+                    },
+                )
+                _write_manifest(manifest)
+        raise
+    with _lock(identifier):
+        manifest = _manifest(identifier)
+        current_intent = manifest.get("workspace_cleanup_intent")
+        if not isinstance(current_intent, dict) or current_intent.get("intent_id") != intent["intent_id"]:
+            raise AgentWorkspaceActionError("workspace cleanup intent changed before finalization")
+        receipt = _publish_workspace_cleanup_receipt(
+            manifest,
+            source_plan_sha256=expected_hash,
+            archive_id=str(archive_id),
+            checkout_cleanup_plan_id=str(dry_run_record["plan_id"]),
+            checkout_cleanup_plan_sha256=str(cleanup_plan["plan_sha256"]),
+            applied_at_unix=int(applied["applied_at_unix"]),
+            reconciled_after_missing_worktree=False,
+        )
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "agent-workspace-cleanup",
+            "workspace_id": identifier,
+            "source_plan_sha256": expected_hash,
+            "archive_id": archive_id,
+            "checkout_cleanup_plan_id": dry_run_record["plan_id"],
+            "historical_evidence_preserved": True,
+            "workspace_state_deleted": False,
+        }
+    )
+    return {
+        "workspace_id": identifier,
+        "state": "cleaned",
+        "idempotent": False,
+        "cleanup_receipt": receipt,
+        "archive": archive_result.get("archive") if archive_id != reusable_archive_id else None,
+        "checkout_cleanup": applied,
+    }
 
 
 def _pane_snapshot(workspace_id: str, role: str) -> str:
