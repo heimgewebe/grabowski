@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -78,6 +80,7 @@ def _source_server_marker(target: str) -> dict[str, object]:
         "valid": value["valid"],
         "timestamp_unix": value["generated_at_unix"],
         "age_seconds": value["age_seconds"],
+        "source_record_sha256": value["source_record_sha256"],
         "snapshot_id": value["snapshot_id"],
         "restore_probe_valid": value["restore_probe_valid"],
         "repository_check_valid": value["repository_check_valid"],
@@ -89,13 +92,37 @@ def _source_server_marker(target: str) -> dict[str, object]:
     }
 
 
-def _run_ready_recovery_status(server_marker: dict[str, object], *, host: str, target: str) -> dict[str, object]:
-    source_marker = _source_server_marker(target)
+def _run_ready_recovery_status(
+    server_marker: dict[str, object],
+    *,
+    host: str,
+    target: str,
+    source_marker: dict[str, object] | None = None,
+    kill_switch: dict[str, object] | None = None,
+    test_switch_recovery: dict[str, object] | None = None,
+) -> dict[str, object]:
+    resolved_source = source_marker or _source_server_marker(target)
+    resolved_kill_switch = kill_switch or {
+        "engaged": False,
+        "environment": False,
+        "path": "/tmp/operator-kill-switch",
+        "path_exists": False,
+    }
+    resolved_test_recovery = test_switch_recovery or {
+        "eligible": False,
+        "sha256": None,
+        "nonce": None,
+        "created_at_unix": None,
+        "expires_at_unix": None,
+        "error": "file kill switch is not engaged",
+    }
     with patch.object(recovery.base, "_verify_audit_log", return_value={"valid": True}), patch.object(
         recovery.base, "_deployment_metadata", return_value={"provenance_valid": True}
+    ), patch.object(recovery.base, "_kill_switch_state", return_value=resolved_kill_switch), patch.object(
+        recovery, "_test_kill_switch_recovery_status", return_value=resolved_test_recovery
     ), patch.object(recovery, "_fresh_text_marker", return_value={"valid": True}), patch.object(
         recovery, "_canonical_server_marker", return_value=server_marker
-    ), patch.object(recovery, "_server_source_marker", return_value=source_marker), patch.object(
+    ), patch.object(recovery, "_server_source_marker", return_value=resolved_source), patch.object(
         recovery, "_timer_probe", return_value={"ok": True}
     ), patch.object(
         recovery.privileged, "grabowski_privileged_broker_status", return_value={"ready": True}
@@ -252,6 +279,269 @@ class RecoveryToolTests(unittest.TestCase):
         self.assertTrue(boundary["target_matches_configured"])
         self.assertFalse(boundary["high_impact_actions_remain_blocked_until_fresh_server_evidence"])
 
+
+    def test_server_source_marker_reports_hash_of_exact_raw_record(self) -> None:
+        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        with tempfile.TemporaryDirectory() as raw:
+            marker_path = Path(raw) / "last-server-recovery.json"
+            encoded = (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "completed_at_unix": int(time.time()),
+                        "snapshot_id": "abc12345",
+                        "restore_probe_valid": True,
+                        "repository_check_valid": True,
+                        "target": target,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            marker_path.write_bytes(encoded)
+            marker_path.chmod(0o600)
+            with patch.object(recovery, "SERVER_RECOVERY", marker_path), patch.object(
+                recovery, "SERVER_RECOVERY_TARGET", target
+            ):
+                marker = recovery._server_source_marker()
+
+        self.assertTrue(marker["valid"])
+        self.assertEqual(marker["source_record_sha256"], hashlib.sha256(encoded).hexdigest())
+
+    def test_recovery_status_blocks_when_kill_switch_is_engaged(self) -> None:
+        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        result = _run_ready_recovery_status(
+            _fresh_server_marker(target),
+            host="wg-prod-1",
+            target=target,
+            kill_switch={
+                "engaged": True,
+                "environment": False,
+                "path": "/tmp/operator-kill-switch",
+                "path_exists": True,
+            },
+        )
+
+        self.assertFalse(result["checks"]["kill_switch_clear"])
+        self.assertFalse(result["ready_for_user_power_worker"])
+        self.assertFalse(result["ready_for_privileged_actions"])
+        self.assertEqual(result["effective_recovery_gate"]["reason"], "kill-switch-engaged")
+        self.assertIn(
+            "remove the operator kill switch through an external operator-authorized path",
+            result["required_actions"],
+        )
+
+    def test_recovery_status_blocks_unpublished_current_source(self) -> None:
+        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        source = _source_server_marker(target)
+        source["source_record_sha256"] = "c" * 64
+        source["timestamp_unix"] = int(source["timestamp_unix"]) + 1
+        result = _run_ready_recovery_status(
+            _fresh_server_marker(target),
+            host="wg-prod-1",
+            target=target,
+            source_marker=source,
+        )
+
+        self.assertTrue(result["checks"]["server_recovery_fresh"])
+        self.assertFalse(result["checks"]["server_recovery_source_current"])
+        self.assertFalse(result["ready_for_privileged_actions"])
+        self.assertEqual(
+            result["effective_recovery_gate"]["reason"],
+            "source-publication-pending",
+        )
+        self.assertIn(
+            "publish the fresh source evidence to the canonical root recovery record",
+            result["required_actions"],
+        )
+
+    def test_recovery_status_exposes_bound_test_switch_recovery(self) -> None:
+        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        result = _run_ready_recovery_status(
+            _fresh_server_marker(target),
+            host="wg-prod-1",
+            target=target,
+            kill_switch={
+                "engaged": True,
+                "environment": False,
+                "path": "/tmp/operator-kill-switch",
+                "path_exists": True,
+            },
+            test_switch_recovery={
+                "eligible": True,
+                "sha256": "d" * 64,
+                "nonce": "e" * 32,
+                "created_at_unix": 1,
+                "expires_at_unix": 2,
+                "error": None,
+            },
+        )
+
+        self.assertTrue(result["kill_switch"]["test_recovery"]["eligible"])
+        self.assertTrue(any("grabowski_recovery_server_probe" in action for action in result["required_actions"]))
+
+    def test_clear_test_kill_switch_requires_exact_audited_marker(self) -> None:
+        now = int(time.time())
+        nonce = "a" * 32
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state = root / "state"
+            state.mkdir()
+            marker = root / "operator-kill-switch"
+            payload = (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "kind": recovery.TEST_KILL_SWITCH_KIND,
+                        "nonce": nonce,
+                        "created_at_unix": now,
+                        "expires_at_unix": now + 60,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            marker.write_bytes(payload)
+            marker.chmod(0o600)
+            digest = hashlib.sha256(payload).hexdigest()
+            create_record = {
+                "operation": "create",
+                "path": str(marker),
+                "after_sha256": digest,
+                "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                "record_sha256": "f" * 64,
+            }
+            appended: list[dict[str, object]] = []
+            def audit_records() -> list[dict[str, object]]:
+                return [create_record, *appended]
+
+            with patch.object(recovery.base, "KILL_SWITCH_PATH", marker), patch.object(
+                recovery.base, "STATE_DIR", state
+            ), patch.object(recovery.base, "_audit_records", side_effect=audit_records), patch.object(
+                recovery.base, "_require_capability"
+            ) as require, patch.object(recovery.base, "_require_valid_audit_chain"), patch.object(
+                recovery.base, "_append_audit", side_effect=appended.append
+            ), patch.object(
+                recovery.base, "_verify_audit_log", return_value={"valid": True, "error": None}
+            ):
+                result = recovery._clear_test_kill_switch(
+                    expected_sha256=digest,
+                    expected_nonce=nonce,
+                )
+
+            require.assert_not_called()
+            self.assertTrue(result["success"])
+            self.assertFalse(marker.exists())
+            self.assertTrue(Path(result["quarantine_path"]).is_file())
+            self.assertEqual(appended[0]["operation"], "clear-recovery-test-kill-switch")
+
+    def test_clear_test_kill_switch_refuses_manual_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            marker = Path(raw) / "operator-kill-switch"
+            marker.write_text("stop\n", encoding="utf-8")
+            marker.chmod(0o600)
+            digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+            with patch.object(recovery.base, "KILL_SWITCH_PATH", marker), patch.object(
+                recovery.base, "_audit_records", return_value=[]
+            ), patch.object(recovery.base, "_require_capability"), patch.object(
+                recovery.base, "_require_valid_audit_chain"
+            ):
+                with self.assertRaisesRegex(ValueError, "eligible"):
+                    recovery._clear_test_kill_switch(
+                        expected_sha256=digest,
+                        expected_nonce="a" * 32,
+                    )
+
+            self.assertTrue(marker.exists())
+
+    def test_clear_test_kill_switch_restores_marker_when_audit_append_fails(self) -> None:
+        now = int(time.time())
+        nonce = "b" * 32
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state = root / "state"
+            state.mkdir()
+            marker = root / "operator-kill-switch"
+            payload = (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "kind": recovery.TEST_KILL_SWITCH_KIND,
+                        "nonce": nonce,
+                        "created_at_unix": now,
+                        "expires_at_unix": now + 60,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            marker.write_bytes(payload)
+            marker.chmod(0o600)
+            digest = hashlib.sha256(payload).hexdigest()
+            create_record = {
+                "operation": "create",
+                "path": str(marker),
+                "after_sha256": digest,
+                "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                "record_sha256": "c" * 64,
+            }
+            with patch.object(recovery.base, "KILL_SWITCH_PATH", marker), patch.object(
+                recovery.base, "STATE_DIR", state
+            ), patch.object(recovery.base, "_audit_records", return_value=[create_record]), patch.object(
+                recovery.base, "_require_capability"
+            ), patch.object(recovery.base, "_require_valid_audit_chain"), patch.object(
+                recovery.base, "_append_audit", side_effect=RuntimeError("audit failed")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "audit failed"):
+                    recovery._clear_test_kill_switch(
+                        expected_sha256=digest,
+                        expected_nonce=nonce,
+                    )
+
+            self.assertTrue(marker.is_file())
+            self.assertEqual(marker.read_bytes(), payload)
+
+    def test_probe_cleanup_mode_is_separate_from_backup_probe(self) -> None:
+        expected = {"success": True}
+        with patch.object(
+            recovery.base,
+            "_kill_switch_state",
+            return_value={"engaged": True, "environment": False, "path_exists": True},
+        ), patch.object(
+            recovery,
+            "_test_kill_switch_recovery_status",
+            return_value={"eligible": True, "sha256": "a" * 64, "nonce": "b" * 32},
+        ), patch.object(recovery, "_clear_test_kill_switch", return_value=expected) as clear, patch.object(
+            recovery, "server_recovery_probe"
+        ) as probe, patch.object(recovery.base, "_require_capability") as require:
+            result = recovery.grabowski_recovery_server_probe()
+
+        self.assertIs(result, expected)
+        clear.assert_called_once_with(expected_sha256="a" * 64, expected_nonce="b" * 32)
+        probe.assert_not_called()
+        self.assertEqual(
+            [call.args[0] for call in require.call_args_list],
+            ["secret_use", "file_write", "terminal_execute"],
+        )
+
+    def test_probe_refuses_manual_or_environment_kill_switch(self) -> None:
+        with patch.object(
+            recovery.base,
+            "_kill_switch_state",
+            return_value={"engaged": True, "environment": True, "path_exists": False},
+        ), patch.object(
+            recovery,
+            "_test_kill_switch_recovery_status",
+            return_value={"eligible": False, "error": "environment kill switch cannot be self-cleared"},
+        ), patch.object(recovery, "server_recovery_probe") as probe:
+            with self.assertRaisesRegex(PermissionError, "not an eligible"):
+                recovery.grabowski_recovery_server_probe()
+
+        probe.assert_not_called()
+
     def test_server_marker_rejects_matching_marker_when_configured_target_is_invalid(self) -> None:
         invalid_target = "heimserver"
         with tempfile.TemporaryDirectory() as raw:
@@ -270,6 +560,7 @@ class RecoveryToolTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            marker_path.chmod(0o600)
             with patch.object(recovery, "SERVER_RECOVERY", marker_path), patch.object(
                 recovery, "SERVER_RECOVERY_TARGET", invalid_target
             ):
@@ -297,6 +588,7 @@ class RecoveryToolTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            marker_path.chmod(0o600)
             with patch.object(recovery, "SERVER_RECOVERY", marker_path), patch.object(
                 recovery, "SERVER_RECOVERY_TARGET", "wg-prod-1:rest-server/grabowski-recovery-probe"
             ):

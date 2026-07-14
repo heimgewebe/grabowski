@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -65,6 +66,12 @@ RECOVERY_STATUS_BLOCKED_UNTIL_CONFIGURED_TARGET_PROBE_SUCCEEDS = "blocked_until_
 RECOVERY_STATUS_BLOCKED_TARGET_MISMATCH = "blocked_on_recovery_target_mismatch"
 RECOVERY_STATUS_BLOCKED_INVALID_TARGET = "blocked_on_invalid_recovery_target_configuration"
 RECOVERY_TARGET_RE = re.compile(r"^(?P<host>[A-Za-z0-9][A-Za-z0-9._-]{0,127}):rest-server/(?P<probe>[A-Za-z0-9][A-Za-z0-9._-]{0,127})$")
+TEST_KILL_SWITCH_KIND = "grabowski_operator_kill_switch_test"
+TEST_KILL_SWITCH_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+TEST_KILL_SWITCH_MAX_LIFETIME_SECONDS = 5 * 60
+TEST_KILL_SWITCH_CLEAR_MAX_AGE_SECONDS = 24 * 60 * 60
+TEST_KILL_SWITCH_CLOCK_SKEW_SECONDS = 15
+TEST_KILL_SWITCH_MAX_BYTES = 4096
 
 
 def _normalize_recovery_host(value: Any) -> str:
@@ -236,6 +243,7 @@ def _server_source_marker() -> dict[str, Any]:
     result: dict[str, Any] = {
         "path": str(SERVER_RECOVERY), "exists": SERVER_RECOVERY.exists(),
         "valid": False, "timestamp_unix": None, "age_seconds": None,
+        "source_record_sha256": None,
         "snapshot_id": None, "restore_probe_valid": False,
         "repository_check_valid": False, "target": None,
         "configured_target": SERVER_RECOVERY_TARGET,
@@ -243,12 +251,16 @@ def _server_source_marker() -> dict[str, Any]:
         "target_matches_configured": False,
         "error": None,
     }
-    if not _bounded_file(SERVER_RECOVERY):
-        result["error"] = "server marker is missing or invalid"
-        return result
     try:
-        value = json.loads(SERVER_RECOVERY.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        snapshot = base._read_bound_regular_bytes(SERVER_RECOVERY, 65536)
+        linked = os.stat(SERVER_RECOVERY, follow_symlinks=False)
+        if (linked.st_dev, linked.st_ino) != (snapshot["dev"], snapshot["ino"]):
+            raise RuntimeError("server marker changed during validation")
+        if linked.st_uid != os.getuid() or stat.S_IMODE(linked.st_mode) != 0o600:
+            raise PermissionError("server marker owner or mode is invalid")
+        raw = snapshot["data"]
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, PermissionError, RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
         result["error"] = str(exc)
         return result
     required = {"schema_version", "completed_at_unix", "snapshot_id", "restore_probe_valid", "repository_check_valid", "target"}
@@ -267,6 +279,7 @@ def _server_source_marker() -> dict[str, Any]:
     target_matches_configured = configured_target_valid and marker_target == SERVER_RECOVERY_TARGET
     result.update({
         "timestamp_unix": stamp, "age_seconds": age,
+        "source_record_sha256": hashlib.sha256(raw).hexdigest(),
         "snapshot_id": value["snapshot_id"],
         "restore_probe_valid": value["restore_probe_valid"] is True,
         "repository_check_valid": value["repository_check_valid"] is True,
@@ -301,6 +314,270 @@ def _canonical_server_marker() -> dict[str, Any]:
         expected_target=SERVER_RECOVERY_TARGET,
         require_root_owned=True,
     )
+
+
+def _source_publication_state(
+    canonical: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    source_digest = source.get("source_record_sha256")
+    canonical_digest = canonical.get("source_record_sha256")
+    source_valid = bool(source.get("valid"))
+    digest_valid = (
+        isinstance(source_digest, str)
+        and len(source_digest) == 64
+        and all(character in "0123456789abcdef" for character in source_digest)
+    )
+    aligned = (
+        source_valid
+        and digest_valid
+        and bool(canonical.get("valid"))
+        and source_digest == canonical_digest
+        and source.get("timestamp_unix") == canonical.get("generated_at_unix")
+        and source.get("snapshot_id") == canonical.get("snapshot_id")
+        and source.get("target") == canonical.get("target")
+    )
+    if aligned:
+        reason = "published-current-source"
+    elif not source_valid or not digest_valid:
+        reason = "source-evidence-unavailable"
+    elif not canonical.get("valid"):
+        reason = "canonical-record-not-ready"
+    else:
+        reason = "source-publication-pending"
+    return {
+        "current": aligned,
+        "reason": reason,
+        "source_record_sha256": source_digest,
+        "canonical_source_record_sha256": canonical_digest,
+        "source_generated_at_unix": source.get("timestamp_unix"),
+        "canonical_generated_at_unix": canonical.get("generated_at_unix"),
+        "source_snapshot_id": source.get("snapshot_id"),
+        "canonical_snapshot_id": canonical.get("snapshot_id"),
+    }
+
+
+def _audit_timestamp_unix(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return int(parsed.timestamp())
+
+
+def _test_kill_switch_snapshot(
+    *,
+    expected_sha256: str | None = None,
+    expected_nonce: str | None = None,
+    now: int | None = None,
+) -> dict[str, Any]:
+    path = base.KILL_SWITCH_PATH
+    checked_at = int(time.time()) if now is None else int(now)
+    snapshot = base._read_bound_regular_bytes(path, TEST_KILL_SWITCH_MAX_BYTES)
+    linked = os.stat(path, follow_symlinks=False)
+    if (linked.st_dev, linked.st_ino) != (snapshot["dev"], snapshot["ino"]):
+        raise RuntimeError("kill-switch path changed during validation")
+    if not stat.S_ISREG(linked.st_mode) or linked.st_nlink != 1:
+        raise PermissionError("test kill switch must be one regular single-link file")
+    if linked.st_uid != os.getuid() or stat.S_IMODE(linked.st_mode) != 0o600:
+        raise PermissionError("test kill switch owner or mode is invalid")
+    digest = snapshot["sha256"]
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise RuntimeError("test kill switch SHA-256 precondition failed")
+    try:
+        value = json.loads(snapshot["data"].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("kill switch is not an eligible Grabowski test marker") from exc
+    required = {
+        "schema_version",
+        "kind",
+        "nonce",
+        "created_at_unix",
+        "expires_at_unix",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("kill switch is not an eligible Grabowski test marker")
+    nonce = value.get("nonce")
+    created_at = value.get("created_at_unix")
+    expires_at = value.get("expires_at_unix")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != TEST_KILL_SWITCH_KIND
+        or not isinstance(nonce, str)
+        or TEST_KILL_SWITCH_NONCE_RE.fullmatch(nonce) is None
+        or not isinstance(created_at, int)
+        or isinstance(created_at, bool)
+        or not isinstance(expires_at, int)
+        or isinstance(expires_at, bool)
+    ):
+        raise ValueError("kill switch is not an eligible Grabowski test marker")
+    if expected_nonce is not None and nonce != expected_nonce:
+        raise RuntimeError("test kill switch nonce precondition failed")
+    if created_at > checked_at + TEST_KILL_SWITCH_CLOCK_SKEW_SECONDS:
+        raise ValueError("test kill switch is future-dated")
+    if expires_at < created_at or expires_at - created_at > TEST_KILL_SWITCH_MAX_LIFETIME_SECONDS:
+        raise ValueError("test kill switch lifetime is invalid")
+    if checked_at - created_at > TEST_KILL_SWITCH_CLEAR_MAX_AGE_SECONDS:
+        raise ValueError("test kill switch recovery window has expired")
+    ctime_unix = snapshot["ctime_ns"] // 1_000_000_000
+    if abs(ctime_unix - created_at) > TEST_KILL_SWITCH_CLOCK_SKEW_SECONDS:
+        raise PermissionError("test kill switch filesystem identity is not creation-bound")
+
+    latest_path_record: dict[str, Any] | None = None
+    for record in reversed(base._audit_records()):
+        if record.get("path") == str(path):
+            latest_path_record = record
+            break
+    if (
+        latest_path_record is None
+        or latest_path_record.get("operation") != "create"
+        or latest_path_record.get("after_sha256") != digest
+    ):
+        raise PermissionError("test kill switch has no matching latest Grabowski create receipt")
+    audit_timestamp = _audit_timestamp_unix(latest_path_record.get("timestamp"))
+    if audit_timestamp is None or abs(audit_timestamp - created_at) > TEST_KILL_SWITCH_CLOCK_SKEW_SECONDS:
+        raise PermissionError("test kill switch create receipt is not time-bound")
+    return {
+        "path": str(path),
+        "sha256": digest,
+        "nonce": nonce,
+        "created_at_unix": created_at,
+        "expires_at_unix": expires_at,
+        "age_seconds": max(0, checked_at - created_at),
+        "expired_for_test_execution": checked_at > expires_at,
+        "dev": snapshot["dev"],
+        "ino": snapshot["ino"],
+        "create_record_sha256": latest_path_record.get("record_sha256"),
+    }
+
+
+def _test_kill_switch_recovery_status() -> dict[str, Any]:
+    state = base._kill_switch_state()
+    result: dict[str, Any] = {
+        "eligible": False,
+        "sha256": None,
+        "nonce": None,
+        "created_at_unix": None,
+        "expires_at_unix": None,
+        "error": None,
+    }
+    if state.get("environment"):
+        result["error"] = "environment kill switch cannot be self-cleared"
+        return result
+    if not state.get("path_exists"):
+        result["error"] = "file kill switch is not engaged"
+        return result
+    try:
+        snapshot = _test_kill_switch_snapshot()
+    except Exception as exc:
+        result["error"] = str(exc)[:500]
+        return result
+    result.update({
+        "eligible": True,
+        "sha256": snapshot["sha256"],
+        "nonce": snapshot["nonce"],
+        "created_at_unix": snapshot["created_at_unix"],
+        "expires_at_unix": snapshot["expires_at_unix"],
+        "error": None,
+    })
+    return result
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _clear_test_kill_switch(*, expected_sha256: str, expected_nonce: str) -> dict[str, Any]:
+    base._require_valid_audit_chain()
+    state = base._kill_switch_state()
+    if state.get("environment"):
+        raise PermissionError("environment kill switch cannot be self-cleared")
+    snapshot = _test_kill_switch_snapshot(
+        expected_sha256=expected_sha256,
+        expected_nonce=expected_nonce,
+    )
+    path = base.KILL_SWITCH_PATH
+    quarantine_root = base._state_subdir(
+        base.STATE_DIR / "recovery" / "cleared-test-kill-switches"
+    )
+    quarantine_metadata = os.stat(quarantine_root, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(quarantine_metadata.st_mode)
+        or quarantine_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(quarantine_metadata.st_mode) & 0o077
+    ):
+        raise PermissionError("test kill switch quarantine directory is unsafe")
+    clear_id = os.urandom(16).hex()
+    quarantine = quarantine_root / f"{clear_id}.json"
+    if quarantine.exists() or quarantine.is_symlink():
+        raise FileExistsError("test kill switch quarantine target already exists")
+    os.replace(path, quarantine)
+    _fsync_directory(path.parent)
+    _fsync_directory(quarantine_root)
+    restored = False
+    try:
+        moved = base._read_bound_regular_bytes(quarantine, TEST_KILL_SWITCH_MAX_BYTES)
+        if (
+            moved["sha256"] != expected_sha256
+            or moved["dev"] != snapshot["dev"]
+            or moved["ino"] != snapshot["ino"]
+        ):
+            raise RuntimeError("test kill switch identity changed during quarantine")
+        record = {
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "operation": "clear-recovery-test-kill-switch",
+            "clear_id": clear_id,
+            "path": str(path),
+            "before_sha256": expected_sha256,
+            "after_sha256": None,
+            "quarantine_path": str(quarantine),
+            "create_record_sha256": snapshot["create_record_sha256"],
+        }
+        base._append_audit(record)
+        audit_status = base._verify_audit_log(base.AUDIT_LOG)
+        if not audit_status.get("valid"):
+            raise RuntimeError(
+                f"audit verification failed after test kill switch clear: {audit_status.get('error')}"
+            )
+        matching = [
+            item
+            for item in base._audit_records()
+            if item.get("operation") == "clear-recovery-test-kill-switch"
+            and item.get("clear_id") == clear_id
+            and item.get("path") == str(path)
+            and item.get("before_sha256") == expected_sha256
+            and item.get("create_record_sha256") == snapshot["create_record_sha256"]
+        ]
+        if len(matching) != 1:
+            raise RuntimeError("test kill switch clear receipt readback is missing or ambiguous")
+    except Exception:
+        if not path.exists() and not path.is_symlink() and quarantine.exists():
+            os.replace(quarantine, path)
+            _fsync_directory(path.parent)
+            _fsync_directory(quarantine_root)
+            restored = True
+        raise
+    return {
+        "schema_version": 1,
+        "success": True,
+        "path": str(path),
+        "cleared_sha256": expected_sha256,
+        "clear_id": clear_id,
+        "quarantine_path": str(quarantine),
+        "create_record_sha256": snapshot["create_record_sha256"],
+        "rollback_performed": restored,
+        "environment_kill_switch_clearable": False,
+        "manual_kill_switch_clearable": False,
+    }
+
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -667,6 +944,9 @@ def recovery_status() -> dict[str, Any]:
     local_backup = _fresh_text_marker(BACKUP_SUCCESS)
     server_backup = _canonical_server_marker()
     server_source = _server_source_marker()
+    source_publication = _source_publication_state(server_backup, server_source)
+    kill_switch = base._kill_switch_state()
+    test_switch_recovery = _test_kill_switch_recovery_status()
     timer_enabled = _timer_probe("is-enabled")
     timer_active = _timer_probe("is-active")
     broker = privileged.grabowski_privileged_broker_status()
@@ -677,14 +957,33 @@ def recovery_status() -> dict[str, Any]:
         "backup_timer_enabled": bool(timer_enabled["ok"]),
         "backup_timer_active": bool(timer_active["ok"]),
         "server_recovery_fresh": _server_recovery_evidence_fresh(server_backup),
+        "server_recovery_source_current": bool(source_publication["current"]),
+        "kill_switch_clear": not bool(kill_switch.get("engaged")),
         "privileged_broker_ready": bool(broker.get("ready")),
     }
     user_gate = all(checks[name] for name in (
         "audit_chain", "deployment_provenance", "local_backup_fresh",
         "backup_timer_enabled", "backup_timer_active",
-        "server_recovery_fresh",
+        "server_recovery_fresh", "server_recovery_source_current",
+        "kill_switch_clear",
     ))
+    if not checks["kill_switch_clear"]:
+        effective_reason = "kill-switch-engaged"
+    elif not checks["server_recovery_fresh"]:
+        effective_reason = str(server_backup.get("freshness_reason") or "canonical-record-not-ready")
+    elif not checks["server_recovery_source_current"]:
+        effective_reason = str(source_publication["reason"])
+    else:
+        effective_reason = "ready"
     actions: list[str] = []
+    if not checks["kill_switch_clear"]:
+        if test_switch_recovery.get("eligible"):
+            actions.append(
+                "clear the audit-bound Grabowski test kill switch through "
+                "grabowski_recovery_server_probe; the tool revalidates the reported SHA-256 and nonce"
+            )
+        else:
+            actions.append("remove the operator kill switch through an external operator-authorized path")
     if not checks["local_backup_fresh"]:
         actions.append("produce a fresh local backup and restore sentinel")
     if not checks["backup_timer_enabled"] or not checks["backup_timer_active"]:
@@ -701,6 +1000,11 @@ def recovery_status() -> dict[str, Any]:
             actions.append("configure and prove a non-heimserver recovery target, or restore fresh heimserver recovery evidence")
         else:
             actions.append(f"produce fresh server recovery evidence for configured target {SERVER_RECOVERY_TARGET}")
+    if checks["server_recovery_fresh"] and not checks["server_recovery_source_current"]:
+        if server_source.get("valid") and server_source.get("target") == SERVER_RECOVERY_TARGET:
+            actions.append("publish the fresh source evidence to the canonical root recovery record")
+        else:
+            actions.append(f"produce fresh server recovery evidence for configured target {SERVER_RECOVERY_TARGET}")
     if not checks["deployment_provenance"]:
         actions.append("repair deployment provenance")
     if not checks["privileged_broker_ready"]:
@@ -714,6 +1018,15 @@ def recovery_status() -> dict[str, Any]:
         "backup_timer": {"unit": BACKUP_TIMER, "enabled": timer_enabled, "active": timer_active},
         "server_recovery": server_backup,
         "server_recovery_source": server_source,
+        "server_recovery_source_publication": source_publication,
+        "kill_switch": {**kill_switch, "test_recovery": test_switch_recovery},
+        "effective_recovery_gate": {
+            "ready": user_gate,
+            "reason": effective_reason,
+            "canonical_record_sha256": server_backup.get("record_sha256"),
+            "canonical_source_record_sha256": server_backup.get("source_record_sha256"),
+            "current_source_record_sha256": server_source.get("source_record_sha256"),
+        },
         "canonical_recovery_record_identity": {
             "record_sha256": server_backup.get("record_sha256"),
             "source_record_sha256": server_backup.get("source_record_sha256"),
@@ -737,8 +1050,19 @@ def grabowski_recovery_status() -> dict[str, Any]:
 
 @mcp.tool(name="grabowski_recovery_server_probe", annotations=MUTATING)
 def grabowski_recovery_server_probe() -> dict[str, Any]:
-    """Produce fresh server recovery evidence through a fixed SSH-tunnelled restic probe."""
+    """Produce fresh server recovery evidence, or recover from one audit-bound Grabowski test kill switch."""
     base._require_capability("secret_use")
     base._require_capability("file_write")
     base._require_capability("terminal_execute")
+    kill_switch = base._kill_switch_state()
+    if kill_switch.get("engaged"):
+        test_recovery = _test_kill_switch_recovery_status()
+        if not test_recovery.get("eligible"):
+            raise PermissionError(
+                "operator kill switch is engaged and is not an eligible Grabowski test marker"
+            )
+        return _clear_test_kill_switch(
+            expected_sha256=str(test_recovery["sha256"]),
+            expected_nonce=str(test_recovery["nonce"]),
+        )
     return server_recovery_probe()

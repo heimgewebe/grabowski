@@ -998,7 +998,7 @@
     },
     {
       "category": "recovery",
-      "description": "Produce fresh server recovery evidence through a fixed SSH-tunnelled restic probe.",
+      "description": "Produce fresh server recovery evidence, or recover from one audit-bound Grabowski test kill switch.",
       "effects": [
         "recovery-marker-write"
       ],
