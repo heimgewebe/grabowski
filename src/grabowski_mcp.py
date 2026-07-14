@@ -4429,10 +4429,10 @@ def _rlens_validate_stem(stem: str) -> str:
 
 
 def _rlens_repo_from_stem(stem: str) -> str:
-    if "-max-" in stem:
-        return stem.split("-max-", 1)[0]
     if "-full-max-" in stem:
         return stem.split("-full-max-", 1)[0]
+    if "-max-" in stem:
+        return stem.split("-max-", 1)[0]
     return stem.split("-", 1)[0]
 
 

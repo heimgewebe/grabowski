@@ -136,6 +136,33 @@ class RlensBundleToolTests(unittest.TestCase):
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
         return repo, head
 
+    def test_full_max_stem_maps_to_base_repository(self) -> None:
+        stem = "demo-repo-full-max-260701-1200"
+        _repo, head = self._git_repo("demo-repo")
+        manifest = self._write_bundle(stem, commit=head)
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+        document["snapshotProvenance"]["repositories"][0]["repo"] = "demo-repo"
+        manifest.write_text(json.dumps(document), encoding="utf-8")
+
+        discovery = mcp.rlens_bundle_discover(repo="demo-repo")
+
+        self.assertEqual(discovery["candidate_count"], 1)
+        self.assertEqual(discovery["candidates"][0]["repo"], "demo-repo")
+
+        with patch.object(
+            mcp,
+            "_rlens_agent_preflight",
+            return_value={"status": "pass"},
+        ):
+            result = mcp.rlens_context_pack(
+                "demo-repo",
+                "basic_repo_question",
+                stem,
+            )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["context_ref"]["repo"], "demo-repo")
+
     def test_discover_reads_latest_bundle_metadata(self) -> None:
         self._write_bundle("demo-repo-max-260701-1200")
 
