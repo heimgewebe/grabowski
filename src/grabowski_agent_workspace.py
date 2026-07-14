@@ -2224,6 +2224,24 @@ def _role_start_intent_classification(
     return None
 
 
+def _cached_role_preflight_block(
+    manifest: dict[str, Any], role: str, command: list[str]
+) -> dict[str, Any] | None:
+    """Return the latest unchanged failed preflight instead of probing again."""
+    blocks = manifest.get("role_preflight_blocks", {})
+    role_blocks = blocks.get(role) if isinstance(blocks, dict) else None
+    if not isinstance(role_blocks, list) or not role_blocks:
+        return None
+    latest = role_blocks[-1]
+    if not isinstance(latest, dict):
+        return None
+    if latest.get("command_sha256") != _sha256_json(command):
+        return None
+    if latest.get("passed") is not False:
+        return None
+    return latest
+
+
 def _role_retry_classification(
     manifest: dict[str, Any], role: str, frozen: dict[str, Any]
 ) -> tuple[str, dict[str, Any]]:
@@ -3840,6 +3858,19 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
             }
         for role in READ_ONLY_ROLES:
             if tasks_map.get(role) is None:
+                cached_preflight = _cached_role_preflight_block(
+                    manifest, role, manifest["commands"][role]
+                )
+                if cached_preflight is not None:
+                    return {
+                        "workspace_id": identifier,
+                        "state": "role_toolchain_preflight_cached_failure",
+                        "role": role,
+                        "preflight": cached_preflight,
+                        "retry_required": True,
+                        "retry_tool": "grabowski_agent_workspace_role_retry",
+                        "receipt_status": "blocked",
+                    }
                 preflight = _role_toolchain_preflight(manifest, role, manifest["commands"][role])
                 _append_workspace_event(
                     manifest, "role_preflight", role=role,

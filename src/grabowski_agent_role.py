@@ -408,6 +408,24 @@ def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
     return result
 
 
+def _normalize_review_object(
+    review: Any,
+) -> tuple[str | None, list[dict[str, Any]] | None, str | None, bool]:
+    """Normalize only the historically common empty-object findings shape."""
+    if not isinstance(review, dict):
+        return None, None, "review stdout must be one JSON object", False
+    verdict = review.get("verdict")
+    findings = review.get("findings")
+    normalized_empty_object = findings == {}
+    if normalized_empty_object:
+        findings = []
+    if verdict not in {"PASS", "NEEDS_CHANGE", "BLOCK"}:
+        return None, None, "review object must contain a valid verdict", normalized_empty_object
+    if not isinstance(findings, list) or any(not isinstance(item, dict) for item in findings):
+        return None, None, "review findings must be a list of objects or an empty object", normalized_empty_object
+    return verdict, findings, None, normalized_empty_object
+
+
 def classify_result(role: str, command: list[str], repo: Path, payload: dict[str, Any]) -> str:
     """Classify one final role result without trusting user-controlled output text."""
     returncode = payload.get("returncode")
@@ -524,17 +542,13 @@ def main(argv: list[str] | None = None) -> int:
                 payload["findings"] = []
                 payload["error"] = f"review stdout is not one JSON object: {exc}"
             else:
-                verdict = review.get("verdict") if isinstance(review, dict) else None
-                findings = review.get("findings") if isinstance(review, dict) else None
-                if (
-                    verdict not in {"PASS", "NEEDS_CHANGE", "BLOCK"}
-                    or not isinstance(findings, list)
-                    or any(not isinstance(item, dict) for item in findings)
-                ):
+                verdict, findings, review_error, findings_normalized = _normalize_review_object(review)
+                payload["review_findings_normalized"] = findings_normalized
+                if review_error is not None or verdict is None or findings is None:
                     payload["returncode"] = 126
                     payload["verdict"] = "INVALID"
                     payload["findings"] = []
-                    payload["error"] = "review object must contain verdict and object findings"
+                    payload["error"] = review_error
                 else:
                     payload["verdict"] = verdict
                     payload["findings"] = findings

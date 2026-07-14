@@ -3094,6 +3094,32 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(persisted["role_preflight_blocks"]["tests"]), 1)
         self.assertFalse((self.state / manifest["workspace_id"] / "tests-receipt.json").exists())
 
+    def test_collect_reuses_unchanged_failed_preflight_without_reprobing(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        manifest["commands"]["tests"] = ["python3", "-m", "pytest"]
+        workspace._write_manifest(manifest)
+        with (
+            mock.patch.object(
+                workspace,
+                "_role_toolchain_preflight",
+                side_effect=missing_module_preflight,
+            ) as preflight,
+            mock.patch.object(workspace, "_task_public", return_value={"task_id": "writer-task", "state": "completed", "terminal": True}),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            first = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+            second = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual(first["state"], "role_toolchain_preflight_failed")
+        self.assertEqual(second["state"], "role_toolchain_preflight_cached_failure")
+        self.assertTrue(second["retry_required"])
+        self.assertEqual(second["retry_tool"], "grabowski_agent_workspace_role_retry")
+        self.assertEqual(preflight.call_count, 1)
+        start.assert_not_called()
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual(len(persisted["role_preflight_blocks"]["tests"]), 1)
+
     def test_role_retry_starts_with_replacement_command_after_preflight_block_and_preserves_attempt_one(
         self,
     ) -> None:
@@ -4284,6 +4310,55 @@ class AgentWorkspaceTests(unittest.TestCase):
             writer_terminal_failure=True,
         )
         self.assertEqual(action, "salvage_or_close_failed_writer")
+
+
+    def test_empty_review_findings_object_normalizes_to_empty_list(self) -> None:
+        verdict, findings, error, normalized = role._normalize_review_object(
+            {"verdict": "PASS", "findings": {}}
+        )
+        self.assertEqual(verdict, "PASS")
+        self.assertEqual(findings, [])
+        self.assertIsNone(error)
+        self.assertTrue(normalized)
+
+    def test_nonempty_review_findings_object_remains_invalid(self) -> None:
+        verdict, findings, error, normalized = role._normalize_review_object(
+            {"verdict": "PASS", "findings": {"summary": "hidden shape"}}
+        )
+        self.assertIsNone(verdict)
+        self.assertIsNone(findings)
+        self.assertIn("list of objects", str(error))
+        self.assertFalse(normalized)
+
+    def test_unchanged_failed_preflight_is_reused(self) -> None:
+        command = ["/missing/python", "-m", "pytest"]
+        failed = {
+            "passed": False,
+            "command_sha256": workspace._sha256_json(command),
+            "failure_classification": "toolchain_probe_error",
+        }
+        manifest = {"role_preflight_blocks": {"tests": [failed]}}
+        self.assertEqual(
+            workspace._cached_role_preflight_block(manifest, "tests", command),
+            failed,
+        )
+
+    def test_changed_preflight_command_is_not_reused(self) -> None:
+        failed_command = ["/missing/python", "-m", "pytest"]
+        manifest = {
+            "role_preflight_blocks": {
+                "tests": [{
+                    "passed": False,
+                    "command_sha256": workspace._sha256_json(failed_command),
+                    "failure_classification": "toolchain_probe_error",
+                }]
+            }
+        }
+        self.assertIsNone(
+            workspace._cached_role_preflight_block(
+                manifest, "tests", ["/usr/bin/python3", "-m", "unittest"]
+            )
+        )
 
 
 if __name__ == "__main__":

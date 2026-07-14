@@ -1973,9 +1973,9 @@
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c8c47bda693fbf40df69344aa527bf94ff1820cc5be86ea48b14f452100f9b54",
       "src/grabowski_agent_competition.py": "90617a0c5993f20dee5cfb3425e9f62877ef09b3330a10e38812c29f06e55282",
-      "src/grabowski_agent_role.py": "3c40cd84c9fbdd1a7f18c5c641ba4116f7074ddfc64c1196768323521e6fbaa4",
+      "src/grabowski_agent_role.py": "207c9e7389940c6e7491057701fb8c1c1534779e7ad799129d81038bbc1304fc",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "f1b2d59cce9a5329b1a8e83bb3c3999de33c28087a7e3f68b6b35e014d8354d5",
+      "src/grabowski_agent_workspace.py": "ce37a3c2cdfba15f25c083cb4388c7764f9cc632941727c8bf12a082e4f05cad",
       "src/grabowski_agent_workspace_observer.py": "7eadc3fa89005037ee38b4a425f96ed6b233392dc7f4596b75d016e2221aac78",
       "src/grabowski_agent_writer.py": "1ccf0168b78db145c36292397410eb8878b78ad004e1795cfe5a490763530b69",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
