@@ -81,6 +81,7 @@ class TaskTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        (self.root / ".git").write_text("gitdir: /tmp/test-worktree\n")
         self.database = self.root / "state" / "tasks.sqlite3"
         self.db_patch = patch.object(tasks, "TASK_DB", self.database)
         self.resource_database = self.root / "state" / "resources.sqlite3"
@@ -353,6 +354,177 @@ class TaskTests(unittest.TestCase):
                     "local", ["/usr/local/bin/sleep-heimserver"], cwd=str(self.root)
                 )
 
+
+    def test_mutating_codex_task_implicitly_leases_workspace(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 150}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        key = f"repo:{self.root}"
+        self.assertEqual(result["task"]["resource_keys"], [key])
+        self.assertEqual(result["audit"]["requested_resource_keys"], [])
+        self.assertEqual(result["audit"]["implicit_workspace_resource_key"], key)
+        lease = tasks.resources.inspect_resource(key)
+        self.assertEqual(lease["owner_id"], result["task"]["lease_owner_id"])
+
+    def test_mutating_agents_cannot_share_one_implicit_workspace(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch, patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 151}
+        ):
+            tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+            with self.assertRaises(tasks.resources.ResourceConflict):
+                tasks.grabowski_task_start(
+                    "local", argv, cwd=str(self.root), runtime_seconds=60
+                )
+        self.assertEqual(dispatch.call_count, 1)
+        self.assertEqual(tasks.grabowski_task_list()["count"], 1)
+
+    def test_explicit_path_scopes_allow_disjoint_agent_tasks(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        left = f"path:{self.root / 'left.py'}"
+        right = f"path:{self.root / 'right.py'}"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 152}
+        ):
+            first = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                resource_keys=[left],
+            )
+            second = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                resource_keys=[right],
+            )
+        self.assertEqual(first["task"]["resource_keys"], [left])
+        self.assertEqual(second["task"]["resource_keys"], [right])
+        self.assertIsNone(first["audit"]["implicit_workspace_resource_key"])
+        self.assertIsNone(second["audit"]["implicit_workspace_resource_key"])
+
+    def test_nested_agent_working_directories_share_git_root_guard(self) -> None:
+        repository = self.root / "repository"
+        nested = repository / "src" / "feature"
+        nested.mkdir(parents=True)
+        (repository / ".git").write_text("gitdir: /tmp/example\n")
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 159}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(nested), runtime_seconds=60
+            )
+        self.assertEqual(
+            result["audit"]["implicit_workspace_resource_key"],
+            f"repo:{repository}",
+        )
+
+    def test_codex_explicit_working_directory_is_the_guarded_workspace(self) -> None:
+        workspace = self.root / "writer-worktree"
+        workspace.mkdir()
+        argv = [
+            "/opt/codex", "exec", "-C", str(workspace),
+            "--sandbox", "workspace-write",
+        ]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 155}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        self.assertEqual(
+            result["audit"]["implicit_workspace_resource_key"],
+            f"repo:{self.root}",
+        )
+
+    def test_framework_writer_wrapper_keeps_workspace_owned_lease_contract(self) -> None:
+        argv = [
+            "/usr/bin/python3", "-m", "grabowski_agent_writer",
+            "--repository", str(self.root),
+        ]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 158}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        self.assertEqual(result["task"]["resource_keys"], [])
+        self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
+
+    def test_non_path_resource_does_not_disable_workspace_guard(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 157}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                resource_keys=["port:4567"],
+            )
+        self.assertEqual(
+            result["task"]["resource_keys"],
+            ["port:4567", f"repo:{self.root}"],
+        )
+
+    def test_read_only_codex_task_does_not_lease_workspace(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "read-only"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 153}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        self.assertEqual(result["task"]["resource_keys"], [])
+        self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
+
+    def test_launch_failure_releases_implicit_workspace_lease(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher(returncode=1)), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 154}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        self.assertEqual(result["task"]["state"], "failed")
+        self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
     def test_task_resource_lease_is_released_after_completion(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(

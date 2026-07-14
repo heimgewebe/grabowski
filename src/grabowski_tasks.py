@@ -51,6 +51,8 @@ TASK_STATES = {
     "outcome_unknown",
     "interrupted",
 }
+MUTATING_AGENT_EXECUTABLES = frozenset({"agy", "claude", "cline", "codex"})
+READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
 
 
 def _now() -> int:
@@ -342,6 +344,74 @@ def _resource_keys(values: list[str] | None) -> list[str]:
     return resources.normalize_resource_keys(values)
 
 
+def _argument_value(argv: list[str], *names: str) -> str | None:
+    for index, item in enumerate(argv):
+        if item in names:
+            if index + 1 >= len(argv):
+                return None
+            return argv[index + 1]
+        for name in names:
+            prefix = f"{name}="
+            if item.startswith(prefix):
+                return item[len(prefix):]
+    return None
+
+
+def _local_workspace_path(raw: str | None, *, cwd: str) -> str:
+    candidate = Path(cwd) if raw in {None, ""} else Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    resolved = Path(operator._resolve_cwd(str(candidate)))
+    for current in (resolved, *resolved.parents):
+        marker = current / ".git"
+        if marker.is_symlink():
+            continue
+        if marker.is_file() or marker.is_dir():
+            return str(current)
+    return str(resolved)
+
+
+def _mutating_agent_workspace(
+    host: str,
+    argv: list[str],
+    *,
+    cwd: str,
+) -> str | None:
+    if fleet.fleet_host(host)["transport"] != "local":
+        return None
+    executable = Path(argv[0]).name.lower()
+    if executable == "codex":
+        sandbox = _argument_value(argv, "--sandbox", "-s")
+        if sandbox in READ_ONLY_AGENT_MODES:
+            return None
+        return _local_workspace_path(_argument_value(argv, "-C", "--cd"), cwd=cwd)
+    if executable in MUTATING_AGENT_EXECUTABLES - {"codex"}:
+        permission_mode = _argument_value(argv, "--permission-mode")
+        if permission_mode in READ_ONLY_AGENT_MODES:
+            return None
+        return _local_workspace_path(None, cwd=cwd)
+    # Framework-managed writers already hold a workspace-level lease owned by
+    # their workspace lifecycle. Inferring a second task-owned lease here would
+    # make the formal workspace deadlock against itself.
+    return None
+
+
+def _task_resource_keys(
+    host: str,
+    argv: list[str],
+    *,
+    cwd: str,
+    requested: list[str],
+) -> tuple[list[str], str | None]:
+    workspace = _mutating_agent_workspace(host, argv, cwd=cwd)
+    if workspace is None:
+        return requested, None
+    if any(key.startswith(("path:", "repo:")) for key in requested):
+        return requested, None
+    implicit = resources.normalize_resource_key(f"repo:{workspace}")
+    return sorted({*requested, implicit}), implicit
+
+
 def _lease_owner(task_id: str) -> str:
     return f"task:{_validate_task_id(task_id)}"
 
@@ -605,7 +675,11 @@ def grabowski_task_start(
     chronik_outbox: bool = False,
     chronik_outbox_state_root: str | None = None,
 ) -> dict[str, Any]:
-    """Start one persistent local or fleet task in its own systemd unit."""
+    """Start one persistent local or fleet task in its own systemd unit.
+
+    Direct local write-capable agent CLIs receive an implicit repository lease
+    unless the caller supplies an explicit path or repository scope.
+    """
     operator._require_operator_mutation("durable_job")
     target = fleet.fleet_host(host)
     command = _validate_command(argv)
@@ -619,7 +693,13 @@ def grabowski_task_start(
         chronik_outbox,
         chronik_outbox_state_root,
     )
-    task_resources = _resource_keys(resource_keys)
+    requested_resources = _resource_keys(resource_keys)
+    task_resources, implicit_workspace_resource = _task_resource_keys(
+        host,
+        command,
+        cwd=working_directory,
+        requested=requested_resources,
+    )
     task_id = uuid.uuid4().hex[:24]
     lease_owner = _lease_owner(task_id)
     attempt = 1
@@ -658,7 +738,12 @@ def grabowski_task_start(
                 resources.MAX_TTL_SECONDS,
                 max(resources.MIN_TTL_SECONDS, runtime + 300),
             ),
-            metadata={"task_id": task_id, "host": host, "attempt": attempt},
+            metadata={
+                "task_id": task_id,
+                "host": host,
+                "attempt": attempt,
+                "implicit_workspace_resource_key": implicit_workspace_resource,
+            },
         )
     try:
         with _database() as connection:
@@ -704,6 +789,8 @@ def grabowski_task_start(
         "recovery_required": recovery_gate.get("required", False),
         "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),
         "resource_keys": task_resources,
+        "requested_resource_keys": requested_resources,
+        "implicit_workspace_resource_key": implicit_workspace_resource,
         "resource_lease_expires_at_unix": (
             lease_result["expires_at_unix"] if lease_result else None
         ),
