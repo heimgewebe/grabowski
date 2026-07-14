@@ -140,6 +140,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(task["argv"], ["/bin/echo", "ok"])
         self.assertFalse(task["chronik_outbox_enabled"])
         self.assertIsNone(task["chronik_outbox_state_root"])
+        self.assertIsNone(task["chronik_context"])
         self.assertTrue(self.database.is_file())
         self.assertEqual(self.database.stat().st_mode & 0o777, 0o600)
         listed = tasks.grabowski_task_list()
@@ -178,6 +179,7 @@ class TaskTests(unittest.TestCase):
                 runtime_seconds=60,
                 chronik_outbox=True,
                 chronik_outbox_state_root=str(outbox_root),
+                chronik_operation="review",
             )
         task = result["task"]
         self.assertTrue(task["chronik_outbox_enabled"])
@@ -186,6 +188,47 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(len(files), 1)
         event = json.loads(files[0].read_text().splitlines()[0])
         self.assertEqual(event["kind"], "agent.run.started")
+        self.assertEqual(event["data"]["operation"], "review")
+        self.assertEqual(event["data"]["task_class"], "review")
+
+    def test_chronik_context_derives_repository_from_canonical_repo_claim(self) -> None:
+        result = {"returncode": 0, "stdout": "git@github.com:heimgewebe/chronik.git\n", "stderr": "", "timed_out": False}
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(tasks.operator, "_run", return_value=result) as run:
+            context = json.loads(tasks._chronik_context("local", ["repo:/work/chronik"], "implement"))
+        self.assertEqual(context, {
+            "subject_scope": "repository", "repo": "heimgewebe/chronik",
+            "operation": "implement", "task_class": "coding",
+        })
+        self.assertEqual(run.call_args.args[0], ["git", "-C", "/work/chronik", "config", "--get", "remote.origin.url"])
+
+    def test_chronik_context_falls_back_to_host_for_ambiguous_or_foreign_claims(self) -> None:
+        remote = {"returncode": 0, "stdout": "git@github.com:other/private.git\n", "stderr": "", "timed_out": False}
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(tasks.operator, "_run", return_value=remote):
+            foreign = json.loads(tasks._chronik_context("heim-pc", ["repo:/work/private"], "recovery"))
+            ambiguous = json.loads(tasks._chronik_context("heim-pc", ["repo:/a", "repo:/b"], "recovery"))
+        expected = {"subject_scope": "host", "host": "heim-pc", "operation": "recovery", "task_class": "recovery"}
+        self.assertEqual(foreign, expected)
+        self.assertEqual(ambiguous, expected)
+
+    def test_start_rejects_chronik_operation_without_outbox(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 141}
+        ):
+            with self.assertRaisesRegex(ValueError, "chronik_operation requires chronik_outbox"):
+                tasks.grabowski_task_start(
+                    "local", ["/bin/true"], cwd=str(self.root), runtime_seconds=60,
+                    chronik_operation="implement",
+                )
+
+    def test_start_rejects_unknown_chronik_operation(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 141}
+        ):
+            with self.assertRaisesRegex(ValueError, "chronik_operation must be one of"):
+                tasks.grabowski_task_start(
+                    "local", ["/bin/true"], cwd=str(self.root), runtime_seconds=60,
+                    chronik_outbox=True, chronik_operation="shell-text",
+                )
 
     def test_start_rejects_chronik_state_root_without_opt_in(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(

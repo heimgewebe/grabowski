@@ -14,6 +14,7 @@ STATE_ROOT_ENV = "GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT"
 PLEXER_EVENTS_URL_ENV = "GRABOWSKI_PLEXER_EVENTS_URL"
 TASK_ENABLED_FIELD = "chronik_outbox_enabled"
 TASK_STATE_ROOT_FIELD = "chronik_outbox_state_root"
+TASK_CONTEXT_FIELD = "chronik_context_json"
 TRUTHY = {"1", "true", "yes", "on"}
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}
 
@@ -75,19 +76,47 @@ def classify(state: str) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
+def _context(record: dict[str, Any]) -> dict[str, Any]:
+    raw = record.get(TASK_CONTEXT_FIELD)
+    if isinstance(raw, str) and raw:
+        value = json.loads(raw)
+    elif isinstance(raw, dict):
+        value = dict(raw)
+    else:
+        value = {"subject_scope": "host", "host": record.get("host", "unknown"), "operation": "other", "task_class": "other"}
+    if not isinstance(value, dict):
+        raise ValueError("stored Chronik context must be an object")
+    return value
+
+
+def _subject(context: dict[str, Any]) -> dict[str, Any]:
+    scope = context.get("subject_scope")
+    if scope == "repository":
+        subject = {"scope": "repository", "repo": context["repo"]}
+        for key in ("branch", "head"):
+            if context.get(key):
+                subject[key] = context[key]
+        return subject
+    if scope == "host":
+        return {"scope": "host", "host": context["host"]}
+    raise ValueError("stored Chronik context has invalid subject scope")
+
+
 def build_event(record: dict[str, Any], state: str) -> dict[str, Any] | None:
     result = classify(state)
     if result is None:
         return None
     kind, data = result
     rid = run_id(record)
+    context = _context(record)
+    data = {**data, "operation": context["operation"], "task_class": context["task_class"]}
     return {
         "schema_version": "agent-run-event.v0",
         "event_id": event_id(kind, rid),
         "kind": kind,
         "ts": now_z(),
         "source": {"repo": "heimgewebe/grabowski", "component": "grabowski", "run_id": rid},
-        "subject": {"repo": "heimgewebe/grabowski"},
+        "subject": _subject(context),
         "trust_tier": "observed" if state in TERMINAL else "declared",
         "status": "active",
         "caused_by": [],

@@ -1982,7 +1982,7 @@
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
       "src/grabowski_capabilities.py": "8720755da0f19f397d1f9bfc80a48e7117b9d104a0fe10740032d1492e0ff7d5",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
-      "src/grabowski_chronik.py": "8f4ba1089013f60478e603b5d61d542661da7e834052f2a5736ef7532f0423a8",
+      "src/grabowski_chronik.py": "6a37342b5741763db16f2792dc5370fd9fe6e7e1dc7965b7f6a8c54f8c55ec62",
       "src/grabowski_command_identity.py": "03bf7193851846d1f5b4d1bfe71a787937e424804f875ba4e021233ddbc842c9",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_fleet.py": "5762406f7a87a7d4a0f8bcf888170daef1cd3060a86acb8ebecb628aa7715a65",
@@ -2007,7 +2007,7 @@
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "1c4a9517564c2b17c39a87a076e397f0bcb2f428467be782b1b48007b063a49a",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "c62d49d0606c4d4101d1edd4b36aeda2d29212380b9bb603589ff31608f43a0e",
+      "src/grabowski_tasks.py": "dea6da52f34847a71c42ca5ff84df10679f4f901d5a1b4c794ba7028643eac1b",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9051739e6d1d9b900181ecde39809845cb04578f5bf6960df6e51955ab6419ef",
       "src/grabowski_worktree_ensure.py": "21de94dedee1c4dfc10f33c35f5d6d4a954d738bc4c9b71ee0a858ceabccc5dd"

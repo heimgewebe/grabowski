@@ -40,6 +40,15 @@ EXTERNAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
 RESUME_POLICIES = {"never", "retry-safe", "verify-then-retry", "manual"}
+CHRONIK_OPERATION_TASK_CLASS = {
+    "implement": "coding",
+    "review": "review",
+    "merge": "merge",
+    "deploy": "deploy",
+    "runtime_verify": "runtime_verify",
+    "recovery": "recovery",
+    "other": "other",
+}
 TASK_STATES = {
     "launching",
     "running",
@@ -192,7 +201,8 @@ def _database() -> sqlite3.Connection:
             acceptance_json TEXT NOT NULL DEFAULT '[]',
             request_sha256 TEXT,
             chronik_outbox_enabled INTEGER NOT NULL DEFAULT 0,
-            chronik_outbox_state_root TEXT
+            chronik_outbox_state_root TEXT,
+            chronik_context_json TEXT
         )
         """
     )
@@ -230,6 +240,8 @@ def _database() -> sqlite3.Connection:
         )
     if "chronik_outbox_state_root" not in columns:
         connection.execute("ALTER TABLE tasks ADD COLUMN chronik_outbox_state_root TEXT")
+    if "chronik_context_json" not in columns:
+        connection.execute("ALTER TABLE tasks ADD COLUMN chronik_context_json TEXT")
     connection.commit()
     try:
         os.chmod(TASK_DB, 0o600)
@@ -332,6 +344,16 @@ def _validate_chronik_outbox(
     return 1, state_root
 
 
+def _validate_chronik_operation(value: str, *, enabled: bool) -> str:
+    if not isinstance(value, str) or value not in CHRONIK_OPERATION_TASK_CLASS:
+        raise ValueError(
+            f"chronik_operation must be one of {sorted(CHRONIK_OPERATION_TASK_CLASS)}"
+        )
+    if value != "other" and not enabled:
+        raise ValueError("chronik_operation requires chronik_outbox")
+    return value
+
+
 def _validate_resume_policy(value: str) -> str:
     if value not in RESUME_POLICIES:
         raise ValueError(f"resume_policy must be one of {sorted(RESUME_POLICIES)}")
@@ -410,6 +432,36 @@ def _task_resource_keys(
         return requested, None
     implicit = resources.normalize_resource_key(f"repo:{workspace}")
     return sorted({*requested, implicit}), implicit
+
+
+def _chronik_context(host: str, resource_keys: list[str], operation: str) -> str:
+    context: dict[str, str] = {
+        "subject_scope": "host",
+        "host": host,
+        "operation": operation,
+        "task_class": CHRONIK_OPERATION_TASK_CLASS[operation],
+    }
+    if fleet.fleet_host(host)["transport"] != "local":
+        return _canonical_json(context)
+    repositories = [key.removeprefix("repo:") for key in resource_keys if key.startswith("repo:")]
+    if len(repositories) != 1:
+        return _canonical_json(context)
+    result = operator._run(
+        ["git", "-C", repositories[0], "config", "--get", "remote.origin.url"],
+        cwd=operator.HOME, timeout_seconds=5, max_output_bytes=4096,
+    )
+    if result["returncode"] != 0:
+        return _canonical_json(context)
+    remote = result["stdout"].strip()
+    match = re.search(r"(?:github\.com[:/])(?P<slug>[^/\s]+/[^/\s]+?)(?:\.git)?$", remote)
+    if match is None or not match.group("slug").startswith("heimgewebe/"):
+        return _canonical_json(context)
+    return _canonical_json({
+        "subject_scope": "repository",
+        "repo": match.group("slug"),
+        "operation": operation,
+        "task_class": CHRONIK_OPERATION_TASK_CLASS[operation],
+    })
 
 
 def _lease_owner(task_id: str) -> str:
@@ -525,6 +577,7 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
         "lease_owner_id": record.get("lease_owner_id"),
         "chronik_outbox_enabled": bool(record.get("chronik_outbox_enabled")),
         "chronik_outbox_state_root": record.get("chronik_outbox_state_root"),
+        "chronik_context": json.loads(record["chronik_context_json"]) if record.get("chronik_context_json") else None,
     }
 
 
@@ -674,6 +727,7 @@ def grabowski_task_start(
     resource_keys: list[str] | None = None,
     chronik_outbox: bool = False,
     chronik_outbox_state_root: str | None = None,
+    chronik_operation: str = "other",
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -693,12 +747,20 @@ def grabowski_task_start(
         chronik_outbox,
         chronik_outbox_state_root,
     )
+    chronik_operation = _validate_chronik_operation(
+        chronik_operation, enabled=bool(chronik_enabled)
+    )
     requested_resources = _resource_keys(resource_keys)
     task_resources, implicit_workspace_resource = _task_resource_keys(
         host,
         command,
         cwd=working_directory,
         requested=requested_resources,
+    )
+    chronik_context_json = (
+        _chronik_context(host, task_resources, chronik_operation)
+        if chronik_enabled
+        else None
     )
     task_id = uuid.uuid4().hex[:24]
     lease_owner = _lease_owner(task_id)
@@ -727,6 +789,7 @@ def grabowski_task_start(
         "lease_owner_id": lease_owner,
         "chronik_outbox_enabled": chronik_enabled,
         "chronik_outbox_state_root": chronik_state_root,
+        "chronik_context_json": chronik_context_json,
     }
     lease_result = None
     if task_resources:
@@ -755,14 +818,16 @@ def grabowski_task_start(
                 cpu_weight, io_weight, memory_max_bytes,
                 created_at_unix, updated_at_unix, launcher_json,
                 last_observation_json, resource_keys_json, lease_owner_id,
-                chronik_outbox_enabled, chronik_outbox_state_root
+                chronik_outbox_enabled, chronik_outbox_state_root,
+                chronik_context_json
             ) VALUES(
                 :task_id, :host, :unit, :attempt, :state, :resume_policy,
                 :argv_json, :argv_sha256, :cwd, :runtime_seconds,
                 :cpu_weight, :io_weight, :memory_max_bytes,
                 :created_at_unix, :updated_at_unix, :launcher_json,
                 :last_observation_json, :resource_keys_json, :lease_owner_id,
-                :chronik_outbox_enabled, :chronik_outbox_state_root
+                :chronik_outbox_enabled, :chronik_outbox_state_root,
+                :chronik_context_json
             )
             """,
                 record,
