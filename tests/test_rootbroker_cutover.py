@@ -103,6 +103,7 @@ class FakeRunner:
         active: bool = True,
         fail_first_start: bool = False,
         active_instance_output: str = "",
+        is_active_returncode: int | None = None,
     ) -> None:
         self.head = head
         self.blobs = blobs or {
@@ -111,6 +112,7 @@ class FakeRunner:
         self.active = active
         self.fail_first_start = fail_first_start
         self.active_instance_output = active_instance_output
+        self.is_active_returncode = is_active_returncode
         self.start_failures = 0
         self.calls: list[list[str]] = []
 
@@ -125,7 +127,12 @@ class FakeRunner:
                 return _completed(argv, returncode=1, stderr="missing blob")
             return _completed(argv, stdout=self.blobs[relative_path])
         if argv[:3] == ["/usr/bin/systemctl", "is-active", "--quiet"]:
-            return _completed(argv, returncode=0 if self.active else 3)
+            returncode = (
+                self.is_active_returncode
+                if self.is_active_returncode is not None
+                else (0 if self.active else 3)
+            )
+            return _completed(argv, returncode=returncode)
         if argv[:2] == ["/usr/bin/systemctl", "stop"]:
             self.active = False
             return _completed(argv)
@@ -563,12 +570,13 @@ class RootbrokerCutoverTests(unittest.TestCase):
             self.assertTrue(failure["rollback_complete"])
             self.assertIn("receipt write failure", failure["error"])
 
-    def test_rollback_restores_originally_inactive_socket(self) -> None:
+    def test_inactive_socket_is_rejected_before_backup_or_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             layout = self._layout(Path(raw))
-            runner = FakeRunner(active=False, fail_first_start=True)
+            initial_config = layout["config_target"].read_bytes()
+            runner = FakeRunner(active=False)
 
-            with self.assertRaisesRegex(cutover.CutoverError, "injected start failure"):
+            with self.assertRaisesRegex(cutover.CutoverError, "must be active"):
                 cutover.apply_cutover(
                     repository=layout["repository"],
                     expected_head=HEAD,
@@ -582,11 +590,33 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 )
 
             self.assertFalse(runner.active)
-            receipts = list(Path(layout["receipt_root"]).glob("*.json"))
-            self.assertEqual(len(receipts), 1)
-            failure = json.loads(receipts[0].read_text())
-            self.assertFalse(failure["socket_was_active"])
-            self.assertTrue(failure["rollback_complete"])
+            self.assertEqual(layout["config_target"].read_bytes(), initial_config)
+            for path, (data, mode) in layout["originals"].items():
+                self.assertEqual(path.read_bytes(), data)
+                self.assertEqual(path.stat().st_mode & 0o777, mode)
+            self.assertFalse(Path(layout["backup_root"]).exists())
+            self.assertFalse(Path(layout["receipt_root"]).exists())
+
+    def test_socket_probe_failure_is_rejected_before_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            layout = self._layout(Path(raw))
+            runner = FakeRunner(active=True, is_active_returncode=1)
+
+            with self.assertRaisesRegex(cutover.CutoverError, "cannot determine"):
+                cutover.apply_cutover(
+                    repository=layout["repository"],
+                    expected_head=HEAD,
+                    backup_root=layout["backup_root"],
+                    receipt_root=layout["receipt_root"],
+                    config_target=layout["config_target"],
+                    artifact_targets=layout["artifacts"],
+                    lock_path=layout["lock_path"],
+                    runner=runner,
+                    require_root=False,
+                )
+
+            self.assertFalse(Path(layout["backup_root"]).exists())
+            self.assertFalse(Path(layout["receipt_root"]).exists())
 
     def test_apply_rejects_head_drift_before_backup_or_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
