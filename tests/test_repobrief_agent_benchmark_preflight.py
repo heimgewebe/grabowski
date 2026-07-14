@@ -112,6 +112,124 @@ def _fixture_kwargs(root: Path, environment: dict) -> dict:
 
 
 class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
+    def test_adapter_preserves_exact_core_claude_command(self) -> None:
+        adapter, remaining = support.preflight._adapter_arguments(
+            [
+                "--claude-command",
+                "/absolute/claude",
+                "--claude-command-sha256",
+                "a" * 64,
+                "--claude-credential-file",
+                "/private/credentials.json",
+            ]
+        )
+
+        self.assertEqual(adapter.claude_command_sha256, "a" * 64)
+        self.assertEqual(
+            adapter.claude_credential_file,
+            Path("/private/credentials.json"),
+        )
+        self.assertEqual(remaining, ["--claude-command", "/absolute/claude"])
+
+    def test_adapter_does_not_accept_prefix_abbreviations(self) -> None:
+        adapter, remaining = support.preflight._adapter_arguments(
+            [
+                "--claude-command-sha",
+                "a" * 64,
+                "--claude-credential",
+                "/private/credentials.json",
+            ]
+        )
+
+        self.assertIsNone(adapter.claude_command_sha256)
+        self.assertIsNone(adapter.claude_credential_file)
+        self.assertEqual(
+            remaining,
+            [
+                "--claude-command-sha",
+                "a" * 64,
+                "--claude-credential",
+                "/private/credentials.json",
+            ],
+        )
+
+    def test_core_parser_rejects_prefix_abbreviation(self) -> None:
+        argv = [
+            "--pair-id",
+            support.PAIR_ID,
+            "--request-root",
+            "/tmp/requests",
+            "--repository-map",
+            "/tmp/repository-map.json",
+            "--state-root",
+            "/tmp/state",
+            "--transcript-root",
+            "/tmp/transcripts",
+            "--evidence-root",
+            "/tmp/evidence",
+            "--report-out",
+            "/tmp/report.json",
+            "--validator-command",
+            "/tmp/validator-command.json",
+            "--claude-com",
+            "/absolute/claude",
+            "--max-cost-usd",
+            "0.20",
+        ]
+
+        with mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                support.preflight._core.build_parser().parse_args(argv)
+
+    def test_exact_live_argv_reaches_core_without_provider_start(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_core_main(argv: list[str]) -> int:
+            captured["argv"] = list(argv)
+            captured["credential"] = support.preflight._credential_file.get()
+            captured["command_sha256"] = support.preflight._command_sha256.get()
+            return 0
+
+        live_argv = [
+            "--pair-id",
+            support.PAIR_ID,
+            "--request-root",
+            "/tmp/requests",
+            "--repository-map",
+            "/tmp/repository-map.json",
+            "--state-root",
+            "/tmp/state",
+            "--transcript-root",
+            "/tmp/transcripts",
+            "--evidence-root",
+            "/tmp/evidence",
+            "--report-out",
+            "/tmp/report.json",
+            "--validator-command",
+            "/tmp/validator-command.json",
+            "--claude-command",
+            "/absolute/claude",
+            "--claude-command-sha256",
+            "a" * 64,
+            "--claude-credential-file",
+            "/private/credentials.json",
+            "--max-cost-usd",
+            "0.20",
+        ]
+
+        with mock.patch.object(support.preflight._core, "main", fake_core_main):
+            self.assertEqual(support.preflight.main(live_argv), 0)
+
+        forwarded = captured["argv"]
+        self.assertIsInstance(forwarded, list)
+        self.assertIn("--claude-command", forwarded)
+        command_index = forwarded.index("--claude-command")
+        self.assertEqual(forwarded[command_index + 1], "/absolute/claude")
+        self.assertNotIn("--claude-command-sha256", forwarded)
+        self.assertNotIn("--claude-credential-file", forwarded)
+        self.assertEqual(captured["credential"], Path("/private/credentials.json"))
+        self.assertEqual(captured["command_sha256"], "a" * 64)
+
     def test_live_call_requires_explicit_provider_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

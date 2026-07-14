@@ -231,7 +231,7 @@ def __dir__() -> list[str]:
 
 
 def _adapter_arguments(argv: list[str] | None) -> tuple[argparse.Namespace, list[str]]:
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--claude-credential-file", type=Path)
     parser.add_argument("--claude-command-sha256")
     return parser.parse_known_args(argv)

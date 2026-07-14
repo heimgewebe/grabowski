@@ -28,6 +28,7 @@ RECEIPT_KIND = "repobrief.agent_benchmark_run_receipt"
 FIXTURE_REPORT_KIND = "repobrief.agent_benchmark_fixture_report"
 VERSION = "1.0"
 PROVIDER = "anthropic-claude-code"
+EXECUTION_CONTRACT = "grabowski-claude-code-live-v1"
 MAX_REQUEST_BYTES = 1 * 1024 * 1024
 MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
@@ -431,8 +432,15 @@ def _validate_repository(request: Mapping[str, Any]) -> None:
 
 def _validate_runner(request: Mapping[str, Any]) -> None:
     runner = _mapping(request.get("runner"))
-    if set(runner) != {"provider", "model", "sampling"}:
+    legacy_fields = {"provider", "model", "sampling"}
+    contract_fields = legacy_fields | {"execution_contract"}
+    if frozenset(runner) not in {frozenset(legacy_fields), frozenset(contract_fields)}:
         raise RunnerError("runner contract mismatch")
+    execution_contract = runner.get("execution_contract")
+    if execution_contract is not None and execution_contract != EXECUTION_CONTRACT:
+        raise RunnerError(
+            f"runner.execution_contract must be {EXECUTION_CONTRACT}"
+        )
     if runner.get("provider") != PROVIDER:
         raise RunnerError(f"runner.provider must be {PROVIDER}")
     model = _require_string(runner.get("model"), "runner.model", maximum=200)

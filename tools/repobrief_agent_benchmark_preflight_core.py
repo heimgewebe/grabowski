@@ -1399,7 +1399,10 @@ def _command_array(path: Path) -> list[str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run one bounded RepoBrief live preflight pair.")
+    parser = argparse.ArgumentParser(
+        description="Run one bounded RepoBrief live preflight pair.",
+        allow_abbrev=False,
+    )
     parser.add_argument("--pair-id", required=True)
     parser.add_argument("--request-root", required=True, type=Path)
     parser.add_argument("--repository-map", required=True, type=Path)
