@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Iterable
 
@@ -78,6 +79,8 @@ MAX_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
 MAX_UNTRACKED_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_PATCH_BYTES = 128 * 1024 * 1024
 MAX_STATE_JSON_BYTES = 4 * 1024 * 1024
+MAX_INTEGRATION_PROBE_OUTPUT_CHARS = 4000
+MAX_INTEGRATION_PROBE_PATHS = 128
 WRITER_FREEZE_SETTLE_SECONDS = 0.1
 WORKSPACE_LOCK_TIMEOUT_SECONDS = 10.0
 WORKSPACE_LOCK_POLL_SECONDS = 0.05
@@ -136,8 +139,10 @@ def _task_argv_sha256(value: Any) -> str:
         raise AgentWorkspaceError(f"invalid task argv identity: {exc}") from exc
 
 
-def _bureau_result_payload(stdout: Any, label: str) -> dict[str, Any]:
-    """Accept legacy direct JSON and the current Bureau result envelope, fail closed otherwise."""
+def _bureau_result_envelope(
+    stdout: Any, label: str
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Parse Bureau direct JSON or a compatibility-checked result envelope."""
     try:
         payload = json.loads(str(stdout or ""))
     except json.JSONDecodeError as exc:
@@ -145,23 +150,77 @@ def _bureau_result_payload(stdout: Any, label: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise AgentWorkspaceError(f"{label} returned a non-object payload")
     has_envelope_keys = "result" in payload or "runtime_identity" in payload
-    if has_envelope_keys:
-        result = payload.get("result")
-        identity = payload.get("runtime_identity")
-        if not isinstance(result, dict) or not isinstance(identity, dict):
-            raise AgentWorkspaceError(f"{label} returned an invalid result envelope")
-        compatibility = identity.get("compatibility")
-        if not isinstance(compatibility, dict):
-            raise AgentWorkspaceError(f"{label} omitted Bureau runtime compatibility")
-        status = compatibility.get("status")
-        if status not in {"compatible", "canonical-read-only"}:
-            reasons = compatibility.get("reason_codes")
-            reason_text = ",".join(str(item) for item in reasons) if isinstance(reasons, list) else "unknown"
-            raise AgentWorkspaceError(
-                f"{label} Bureau runtime is not read-compatible: {status} ({reason_text})"
-            )
-        return result
-    return payload
+    if not has_envelope_keys:
+        return payload, None
+    result = payload.get("result")
+    identity = payload.get("runtime_identity")
+    if not isinstance(result, dict) or not isinstance(identity, dict):
+        raise AgentWorkspaceError(f"{label} returned an invalid result envelope")
+    compatibility = identity.get("compatibility")
+    if not isinstance(compatibility, dict):
+        raise AgentWorkspaceError(f"{label} omitted Bureau runtime compatibility")
+    status = compatibility.get("status")
+    if status not in {"compatible", "canonical-read-only"}:
+        reasons = compatibility.get("reason_codes")
+        reason_text = (
+            ",".join(str(item) for item in reasons)
+            if isinstance(reasons, list)
+            else "unknown"
+        )
+        raise AgentWorkspaceError(
+            f"{label} Bureau runtime is not read-compatible: {status} ({reason_text})"
+        )
+    return result, identity
+
+
+def _bureau_result_payload(stdout: Any, label: str) -> dict[str, Any]:
+    """Accept legacy direct JSON and the current Bureau result envelope."""
+    return _bureau_result_envelope(stdout, label)[0]
+
+
+def _bureau_command_cwd() -> Path:
+    try:
+        root = BUREAU.parent.resolve(strict=True)
+    except OSError as exc:
+        raise AgentWorkspaceError("Bureau executable directory is unavailable") from exc
+    if root.is_symlink() or not root.is_dir():
+        raise AgentWorkspaceError("Bureau executable directory is unsafe")
+    return root
+
+
+def _legacy_bureau_root() -> Path:
+    if BUREAU_ROOT.is_symlink() or not BUREAU_ROOT.is_dir():
+        raise AgentWorkspaceError(f"Bureau root unavailable or unsafe: {BUREAU_ROOT}")
+    return BUREAU_ROOT.resolve(strict=True)
+
+
+def _canonical_bureau_registry_root(
+    identity: dict[str, Any], label: str
+) -> Path:
+    manifest = identity.get("manifest")
+    canonical = manifest.get("canonical_registry") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(canonical, dict)
+        or canonical.get("available") is not True
+        or canonical.get("valid") is not True
+    ):
+        raise AgentWorkspaceError(f"{label} omitted a valid canonical Registry snapshot")
+    raw = canonical.get("root")
+    if not isinstance(raw, str) or not raw or len(raw) > 4096 or "\x00" in raw:
+        raise AgentWorkspaceError(f"{label} returned an invalid canonical Registry root")
+    root = Path(raw)
+    if not root.is_absolute() or root.is_symlink():
+        raise AgentWorkspaceError(f"{label} canonical Registry root is unsafe")
+    try:
+        resolved = root.resolve(strict=True)
+        metadata = root.stat()
+    except OSError as exc:
+        raise AgentWorkspaceError(
+            f"{label} canonical Registry root is unavailable"
+        ) from exc
+    if resolved != root or not root.is_dir() or stat.S_IMODE(metadata.st_mode) & 0o222:
+        raise AgentWorkspaceError(f"{label} canonical Registry root is not immutable")
+    return root
 
 
 def _required_string(value: Any, field: str, *, max_length: int = 4096) -> str:
@@ -946,6 +1005,78 @@ def _task_public(task_id: str | None) -> dict[str, Any]:
     }
 
 
+def _stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_bureau_task(
+    path: Path, *, require_immutable: bool
+) -> tuple[dict[str, Any], bytes]:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise AgentWorkspaceError(f"Bureau task is unavailable: {path.name}") from exc
+    if resolved != path or path.is_symlink():
+        raise AgentWorkspaceError(f"Bureau task path is unsafe: {path.name}")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise AgentWorkspaceError(f"Bureau task cannot be opened safely: {path.name}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        linked = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or opened.st_nlink != 1
+            or _stat_identity(opened) != _stat_identity(linked)
+            or opened.st_size > MAX_STATE_JSON_BYTES
+        ):
+            raise AgentWorkspaceError(f"Bureau task file is unsafe: {path.name}")
+        if require_immutable and stat.S_IMODE(opened.st_mode) & 0o222:
+            raise AgentWorkspaceError(f"Bureau canonical task file is not immutable: {path.name}")
+        chunks: list[bytes] = []
+        remaining = MAX_STATE_JSON_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_STATE_JSON_BYTES:
+            raise AgentWorkspaceError(f"Bureau task exceeds size limit: {path.name}")
+        after = os.fstat(descriptor)
+        rebound = path.lstat()
+        if (
+            _stat_identity(opened) != _stat_identity(after)
+            or _stat_identity(opened) != _stat_identity(rebound)
+        ):
+            raise AgentWorkspaceError(f"Bureau task changed while reading: {path.name}")
+    finally:
+        os.close(descriptor)
+    try:
+        task = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentWorkspaceError(f"Bureau task JSON is invalid: {path.stem}") from exc
+    if not isinstance(task, dict):
+        raise AgentWorkspaceError(f"Bureau task JSON is not an object: {path.stem}")
+    return task, raw
+
+
 def _verify_bureau_binding(
     binding_kind: str,
     binding_id: str,
@@ -954,15 +1085,13 @@ def _verify_bureau_binding(
 ) -> dict[str, Any]:
     if not BUREAU.is_file() or not os.access(BUREAU, os.X_OK):
         raise AgentWorkspaceError(f"Bureau executable unavailable: {BUREAU}")
-    if BUREAU_ROOT.is_symlink() or not BUREAU_ROOT.is_dir():
-        raise AgentWorkspaceError(f"Bureau root unavailable or unsafe: {BUREAU_ROOT}")
-    root = BUREAU_ROOT.resolve(strict=True)
+    command_cwd = _bureau_command_cwd()
     if binding_kind == "thread_focus":
         result = _checked(
             runner,
-            root,
+            command_cwd,
             [
-                str(BUREAU), "--root", str(root), "--json", "live-list",
+                str(BUREAU), "--json", "live-list",
                 "--kind", "thread_focus", "--thread-id", binding_id, "--limit", "50",
             ],
             label="Bureau thread focus lookup",
@@ -1004,31 +1133,40 @@ def _verify_bureau_binding(
             raise AgentWorkspaceError("bureau_task binding_id has an invalid format")
         truth = _checked(
             runner,
-            root,
+            command_cwd,
             [
-                str(BUREAU), "--root", str(root), "--json", "registry-truth",
+                str(BUREAU), "--json", "registry-truth",
                 "--strict", "--no-baseline-probe",
             ],
             label="Bureau registry truth",
         )
-        truth_payload = _bureau_result_payload(truth.get("stdout"), "Bureau registry truth")
+        truth_payload, runtime_identity = _bureau_result_envelope(
+            truth.get("stdout"), "Bureau registry truth"
+        )
         if not isinstance(truth_payload, dict) or truth_payload.get("healthy") is not True:
             raise AgentWorkspaceError("Bureau registry truth is not healthy")
+        if runtime_identity is None:
+            root = _legacy_bureau_root()
+            registry_source = "legacy-explicit-root"
+        else:
+            root = _canonical_bureau_registry_root(
+                runtime_identity, "Bureau registry truth"
+            )
+            registry_source = "canonical-runtime-snapshot"
         task_path = root / "registry" / "tasks" / f"{binding_id}.json"
-        if task_path.is_symlink() or not task_path.is_file() or task_path.stat().st_nlink != 1:
-            raise AgentWorkspaceError(f"Bureau task does not exist safely: {binding_id}")
-        try:
-            task = json.loads(task_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise AgentWorkspaceError(f"Bureau task JSON is invalid: {binding_id}") from exc
-        if not isinstance(task, dict) or task.get("id") != binding_id:
+        task, task_bytes = _read_bureau_task(
+            task_path,
+            require_immutable=runtime_identity is not None,
+        )
+        if task.get("id") != binding_id:
             raise AgentWorkspaceError("Bureau task identity mismatch")
         state = task.get("state")
         if state not in {"inbox", "planned", "ready"}:
             raise AgentWorkspaceError(f"Bureau task is not actionable: {binding_id} state={state}")
-        task_sha256 = hashlib.sha256(task_path.read_bytes()).hexdigest()
+        task_sha256 = hashlib.sha256(task_bytes).hexdigest()
         evidence = {
             "source": "bureau-task-registry",
+            "registry_source": registry_source,
             "kind": "bureau_task",
             "id": binding_id,
             "state": state,
@@ -1478,6 +1616,273 @@ def _writer_create_identity(manifest: dict[str, Any], runner: CommandRunner) -> 
     }
 
 
+def _bounded_probe_text(value: Any) -> str:
+    return str(value or "")[:MAX_INTEGRATION_PROBE_OUTPUT_CHARS]
+
+
+def _probe_error(
+    *,
+    mode: str,
+    stage: str,
+    result: dict[str, Any] | None = None,
+    fallback_reason: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "error",
+        "mode": mode,
+        "stage": stage,
+        "conflicting": None,
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+    }
+    if isinstance(result, dict):
+        returncode = result.get("returncode")
+        payload["returncode"] = (
+            returncode if isinstance(returncode, int) and not isinstance(returncode, bool) else None
+        )
+        payload["stdout"] = _bounded_probe_text(result.get("stdout"))
+        payload["stderr"] = _bounded_probe_text(result.get("stderr"))
+    if fallback_reason is not None:
+        payload["fallback_reason"] = fallback_reason
+    return payload
+
+
+def _valid_probe_result(result: Any) -> bool:
+    return (
+        isinstance(result, dict)
+        and isinstance(result.get("returncode"), int)
+        and not isinstance(result.get("returncode"), bool)
+    )
+
+
+def _write_tree_mode_unavailable(result: dict[str, Any]) -> bool:
+    if result.get("returncode") not in {128, 129}:
+        return False
+    detail = "\n".join(
+        (_bounded_probe_text(result.get("stdout")), _bounded_probe_text(result.get("stderr")))
+    ).lower()
+    return (
+        "unknown rev --write-tree" in detail
+        or ("unknown option" in detail and "write-tree" in detail)
+        or ("unrecognized option" in detail and "write-tree" in detail)
+    )
+
+
+def _source_object_directory(repo: Path, runner: CommandRunner) -> Path:
+    result = _checked(
+        runner,
+        repo,
+        ["git", "rev-parse", "--git-path", "objects"],
+        label="git object directory",
+    )
+    raw = str(result.get("stdout", "")).strip()
+    if not raw or "\n" in raw or "\r" in raw:
+        raise AgentWorkspaceActionError("git returned an invalid object directory")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = repo / path
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise AgentWorkspaceActionError("git object directory is unavailable") from exc
+    if "\n" in str(resolved) or "\r" in str(resolved):
+        raise AgentWorkspaceActionError("git object directory contains a line break")
+    if not resolved.is_dir():
+        raise AgentWorkspaceActionError("git object directory is not a directory")
+    return resolved
+
+
+def _initialize_isolated_git_repository(root: Path, source_objects: Path) -> None:
+    git_dir = root / ".git"
+    (git_dir / "objects" / "info").mkdir(parents=True, mode=0o700)
+    (git_dir / "objects" / "pack").mkdir(mode=0o700)
+    (git_dir / "refs" / "heads").mkdir(parents=True, mode=0o700)
+    (git_dir / "refs" / "tags").mkdir(parents=True, mode=0o700)
+    (git_dir / "HEAD").write_text(
+        "ref: refs/heads/grabowski-integration-probe\n", encoding="utf-8"
+    )
+    (git_dir / "config").write_text(
+        "[core]\n"
+        "\trepositoryformatversion = 0\n"
+        "\tbare = false\n"
+        "\tfilemode = true\n"
+        "\thooksPath = /dev/null\n",
+        encoding="utf-8",
+    )
+    (git_dir / "objects" / "info" / "alternates").write_text(
+        f"{source_objects}\n", encoding="utf-8"
+    )
+
+
+def _unmerged_path_summary(stdout: str) -> tuple[int, list[str]]:
+    paths: set[str] = set()
+    for entry in stdout.split("\x00"):
+        if not entry:
+            continue
+        if "\t" not in entry:
+            raise AgentWorkspaceActionError("git returned a malformed unmerged index entry")
+        path = entry.split("\t", 1)[1]
+        if not path:
+            raise AgentWorkspaceActionError("git returned an empty unmerged path")
+        paths.add(path)
+    ordered = sorted(paths)
+    bounded: list[str] = []
+    used = 0
+    for path in ordered[:MAX_INTEGRATION_PROBE_PATHS]:
+        size = len(path)
+        if used + size > MAX_INTEGRATION_PROBE_OUTPUT_CHARS:
+            break
+        bounded.append(path)
+        used += size
+    return len(ordered), bounded
+
+
+def _integration_probe(
+    repo: Path, canonical_head: str, writer_head: str, runner: CommandRunner
+) -> dict[str, Any]:
+    source_objects = _source_object_directory(repo, runner)
+    with tempfile.TemporaryDirectory(prefix="grabowski-agent-integration-") as raw_root:
+        isolated = Path(raw_root)
+        _initialize_isolated_git_repository(isolated, source_objects)
+
+        modern = runner(
+            isolated,
+            ["git", "merge-tree", "--write-tree", canonical_head, writer_head],
+        )
+        if not _valid_probe_result(modern):
+            return _probe_error(
+                mode="merge-tree-write-tree-isolated-v1",
+                stage="modern_result",
+            )
+        modern_returncode = int(modern["returncode"])
+        if modern_returncode in {0, 1}:
+            merge_tree = str(modern.get("stdout", "")).splitlines()[0:1]
+            merge_tree_oid = merge_tree[0].strip().lower() if merge_tree else ""
+            if SHA40_RE.fullmatch(merge_tree_oid) is None:
+                return _probe_error(
+                    mode="merge-tree-write-tree-isolated-v1",
+                    stage="modern_tree_identity",
+                    result=modern,
+                )
+            return {
+                "schema_version": 1,
+                "status": "conflicting" if modern_returncode == 1 else "clean",
+                "mode": "merge-tree-write-tree-isolated-v1",
+                "stage": "complete",
+                "merge_tree": merge_tree_oid,
+                "conflicting": modern_returncode == 1,
+                "returncode": modern_returncode,
+                "stdout": _bounded_probe_text(modern.get("stdout")),
+                "stderr": _bounded_probe_text(modern.get("stderr")),
+            }
+        if not _write_tree_mode_unavailable(modern):
+            return _probe_error(
+                mode="merge-tree-write-tree-isolated-v1",
+                stage="modern_probe",
+                result=modern,
+            )
+
+        fallback_reason = "merge_tree_write_tree_unavailable"
+        merge_base = runner(
+            isolated, ["git", "merge-base", canonical_head, writer_head]
+        )
+        if not _valid_probe_result(merge_base) or merge_base.get("returncode") != 0:
+            return _probe_error(
+                mode="merge-recursive-isolated-v1",
+                stage="merge_base",
+                result=merge_base if isinstance(merge_base, dict) else None,
+                fallback_reason=fallback_reason,
+            )
+        base_head = str(merge_base.get("stdout", "")).strip().lower()
+        if SHA40_RE.fullmatch(base_head) is None:
+            return _probe_error(
+                mode="merge-recursive-isolated-v1",
+                stage="merge_base_identity",
+                result=merge_base,
+                fallback_reason=fallback_reason,
+            )
+
+        initialize = runner(
+            isolated,
+            ["git", "read-tree", "--reset", "-u", canonical_head],
+        )
+        if not _valid_probe_result(initialize) or initialize.get("returncode") != 0:
+            return _probe_error(
+                mode="merge-recursive-isolated-v1",
+                stage="initialize",
+                result=initialize if isinstance(initialize, dict) else None,
+                fallback_reason=fallback_reason,
+            )
+
+        merge = runner(
+            isolated,
+            [
+                "git",
+                "merge-recursive",
+                base_head,
+                "--",
+                canonical_head,
+                writer_head,
+            ],
+        )
+        if not _valid_probe_result(merge):
+            return _probe_error(
+                mode="merge-recursive-isolated-v1",
+                stage="merge_result",
+                fallback_reason=fallback_reason,
+            )
+        unmerged = runner(isolated, ["git", "ls-files", "--unmerged", "-z"])
+        if not _valid_probe_result(unmerged) or unmerged.get("returncode") != 0:
+            return _probe_error(
+                mode="merge-recursive-isolated-v1",
+                stage="unmerged_index",
+                result=unmerged if isinstance(unmerged, dict) else None,
+                fallback_reason=fallback_reason,
+            )
+
+        try:
+            unmerged_path_count, paths = _unmerged_path_summary(
+                str(unmerged.get("stdout", ""))
+            )
+        except AgentWorkspaceActionError:
+            return _probe_error(
+                mode="merge-recursive-isolated-v1",
+                stage="unmerged_index_shape",
+                result=unmerged,
+                fallback_reason=fallback_reason,
+            )
+        merge_returncode = int(merge["returncode"])
+        if merge_returncode == 0 and unmerged_path_count == 0:
+            status = "clean"
+            conflicting = False
+        elif merge_returncode == 1 and unmerged_path_count > 0:
+            status = "conflicting"
+            conflicting = True
+        else:
+            return _probe_error(
+                mode="merge-recursive-isolated-v1",
+                stage="fallback_semantics",
+                result=merge,
+                fallback_reason=fallback_reason,
+            )
+        return {
+            "schema_version": 1,
+            "status": status,
+            "mode": "merge-recursive-isolated-v1",
+            "stage": "complete",
+            "fallback_reason": fallback_reason,
+            "merge_base": base_head,
+            "conflicting": conflicting,
+            "returncode": merge_returncode,
+            "unmerged_path_count": unmerged_path_count,
+            "unmerged_paths": paths,
+            "stdout": _bounded_probe_text(merge.get("stdout")),
+            "stderr": _bounded_probe_text(merge.get("stderr")),
+        }
+
+
 def _git_snapshot(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, Any]:
     worktree = Path(str(manifest["writer_worktree"]))
     repo = Path(str(manifest["repository"]))
@@ -1563,13 +1968,7 @@ def _git_snapshot(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, 
     canonical_head = _git_head(runner, repo)
     conflict = None
     if canonical_head != base_head:
-        probe = runner(repo, ["git", "merge-tree", "--write-tree", canonical_head, head])
-        conflict = {
-            "returncode": probe.get("returncode"),
-            "conflicting": int(probe.get("returncode", 1)) != 0,
-            "stdout": str(probe.get("stdout", ""))[:4000],
-            "stderr": str(probe.get("stderr", ""))[:4000],
-        }
+        conflict = _integration_probe(repo, canonical_head, head, runner)
     return {
         "expected_base_head": base_head,
         "canonical_head": canonical_head,

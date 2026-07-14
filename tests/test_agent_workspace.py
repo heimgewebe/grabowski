@@ -545,6 +545,199 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["state"], "base_drift")
         self.assertTrue(result["snapshot"]["base_drift"])
 
+    def _force_git234_merge_probe(self, cwd: Path, argv: list[str]) -> dict:
+        if argv[:3] == ["git", "merge-tree", "--write-tree"]:
+            return {
+                "returncode": 128,
+                "stdout": "",
+                "stderr": "fatal: unknown rev --write-tree\n",
+            }
+        return workspace._run(cwd, argv)
+
+    def _repository_probe_identity(self) -> dict:
+        git_dir = Path(run(self.git.repo, "git", "rev-parse", "--git-common-dir"))
+        if not git_dir.is_absolute():
+            git_dir = (self.git.repo / git_dir).resolve()
+        index = git_dir / "index"
+        objects = git_dir / "objects"
+        return {
+            "head": run(self.git.repo, "git", "rev-parse", "HEAD"),
+            "refs": run(
+                self.git.repo,
+                "git",
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+            ),
+            "repo_status": run(
+                self.git.repo, "git", "status", "--porcelain=v1", "--untracked-files=all"
+            ),
+            "writer_status": run(
+                self.git.writer,
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ),
+            "index_sha256": (
+                workspace.hashlib.sha256(index.read_bytes()).hexdigest()
+                if index.is_file()
+                else None
+            ),
+            "objects": sorted(
+                str(path.relative_to(objects))
+                for path in objects.rglob("*")
+                if path.is_file()
+            ),
+        }
+
+    def test_git234_fallback_reports_clean_without_source_mutation(self) -> None:
+        manifest = self.manifest()
+        writer_head = self.git.commit_writer(
+            "src/app.py", "writer = True\nvalue = 1\n"
+        )
+        (self.git.repo / "src" / "main.py").write_text(
+            "main = True\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "."], cwd=self.git.repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "main drift"],
+            cwd=self.git.repo,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        canonical_head = run(self.git.repo, "git", "rev-parse", "HEAD")
+        before = self._repository_probe_identity()
+        probe = workspace._integration_probe(
+            self.git.repo,
+            canonical_head,
+            writer_head,
+            self._force_git234_merge_probe,
+        )
+        after = self._repository_probe_identity()
+        self.assertEqual(probe["status"], "clean")
+        self.assertFalse(probe["conflicting"])
+        self.assertEqual(probe["mode"], "merge-recursive-isolated-v1")
+        self.assertEqual(
+            probe["fallback_reason"], "merge_tree_write_tree_unavailable"
+        )
+        self.assertEqual(before, after)
+        snapshot = workspace._git_snapshot(
+            manifest, self._force_git234_merge_probe
+        )
+        self.assertEqual(snapshot["integration_probe"]["status"], "clean")
+
+    def test_git234_fallback_reports_content_conflict_from_unmerged_index(self) -> None:
+        self.manifest()
+        writer_head = self.git.commit_writer("src/app.py", "writer = True\n")
+        (self.git.repo / "src" / "app.py").write_text(
+            "main = True\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "."], cwd=self.git.repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "main conflict"],
+            cwd=self.git.repo,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        canonical_head = run(self.git.repo, "git", "rev-parse", "HEAD")
+        before = self._repository_probe_identity()
+        probe = workspace._integration_probe(
+            self.git.repo,
+            canonical_head,
+            writer_head,
+            self._force_git234_merge_probe,
+        )
+        after = self._repository_probe_identity()
+        self.assertEqual(probe["status"], "conflicting")
+        self.assertTrue(probe["conflicting"])
+        self.assertEqual(probe["unmerged_paths"], ["src/app.py"])
+        self.assertGreaterEqual(probe["unmerged_path_count"], 1)
+        self.assertEqual(before, after)
+
+    def test_git234_fallback_reports_modify_delete_conflict(self) -> None:
+        self.manifest()
+        writer_head = self.git.commit_writer("src/app.py", "writer = True\n")
+        (self.git.repo / "src" / "app.py").unlink()
+        subprocess.run(["git", "add", "-A"], cwd=self.git.repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "main delete"],
+            cwd=self.git.repo,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        canonical_head = run(self.git.repo, "git", "rev-parse", "HEAD")
+        probe = workspace._integration_probe(
+            self.git.repo,
+            canonical_head,
+            writer_head,
+            self._force_git234_merge_probe,
+        )
+        self.assertEqual(probe["status"], "conflicting")
+        self.assertTrue(probe["conflicting"])
+        self.assertEqual(probe["unmerged_paths"], ["src/app.py"])
+
+    def test_missing_object_is_error_not_conflict(self) -> None:
+        self.manifest()
+        canonical_head = run(self.git.repo, "git", "rev-parse", "HEAD")
+        probe = workspace._integration_probe(
+            self.git.repo,
+            canonical_head,
+            "f" * 40,
+            self._force_git234_merge_probe,
+        )
+        self.assertEqual(probe["status"], "error")
+        self.assertIsNone(probe["conflicting"])
+        self.assertEqual(probe["stage"], "merge_base")
+
+    def test_modern_probe_internal_error_does_not_fall_back_or_claim_conflict(self) -> None:
+        self.manifest()
+        canonical_head = run(self.git.repo, "git", "rev-parse", "HEAD")
+
+        def runner(cwd: Path, argv: list[str]) -> dict:
+            if argv[:3] == ["git", "merge-tree", "--write-tree"]:
+                return {
+                    "returncode": 2,
+                    "stdout": "",
+                    "stderr": "fatal: internal merge failure",
+                }
+            return workspace._run(cwd, argv)
+
+        probe = workspace._integration_probe(
+            self.git.repo, canonical_head, self.git.base, runner
+        )
+        self.assertEqual(probe["status"], "error")
+        self.assertIsNone(probe["conflicting"])
+        self.assertEqual(probe["stage"], "modern_probe")
+        self.assertNotIn("fallback_reason", probe)
+
+    def test_newer_merge_tree_and_git234_fallback_are_semantically_consistent(self) -> None:
+        self.manifest()
+        writer_head = self.git.commit_writer("src/app.py", "writer = True\n")
+        (self.git.repo / "src" / "app.py").write_text(
+            "main = True\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "."], cwd=self.git.repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "main conflict"],
+            cwd=self.git.repo,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        canonical_head = run(self.git.repo, "git", "rev-parse", "HEAD")
+        modern = workspace._integration_probe(
+            self.git.repo, canonical_head, writer_head, workspace._run
+        )
+        if modern["mode"] != "merge-tree-write-tree-isolated-v1":
+            self.skipTest("installed Git does not provide merge-tree --write-tree")
+        fallback = workspace._integration_probe(
+            self.git.repo,
+            canonical_head,
+            writer_head,
+            self._force_git234_merge_probe,
+        )
+        self.assertEqual(modern["status"], fallback["status"])
+        self.assertEqual(modern["conflicting"], fallback["conflicting"])
+
     def test_pane_end_does_not_establish_success(self) -> None:
         manifest = self.manifest()
         self.git.commit_writer()
@@ -1650,8 +1843,6 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertNotEqual(workspace._task_argv_sha256(argv), workspace._sha256_json(argv))
 
     def test_live_thread_focus_binding_requires_one_active_record(self) -> None:
-        bureau_root = self.root / "bureau"
-        bureau_root.mkdir()
         bureau_bin = self.root / "bureau-bin"
         bureau_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         bureau_bin.chmod(0o755)
@@ -1685,17 +1876,23 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         with (
             mock.patch.object(workspace, "BUREAU", bureau_bin),
-            mock.patch.object(workspace, "BUREAU_ROOT", bureau_root),
+            mock.patch.object(workspace, "BUREAU_ROOT", self.root / "missing-dirty-root"),
         ):
             evidence = workspace._verify_bureau_binding("thread_focus", "thread-1", runner=runner)
+        call_cwd, call_argv = runner.call_args.args
+        self.assertEqual(call_cwd, bureau_bin.parent)
+        self.assertNotIn("--root", call_argv)
         self.assertEqual(evidence["event_id"], 42)
         self.assertEqual(evidence["status"], "active")
         self.assertEqual(evidence["id"], "thread-1")
         self.assertRegex(evidence["evidence_sha256"], workspace.SHA256_RE)
 
-    def test_bureau_task_binding_requires_healthy_actionable_registry_task(self) -> None:
-        bureau_root = self.root / "bureau"
-        task_dir = bureau_root / "registry" / "tasks"
+    def test_bureau_task_binding_uses_canonical_runtime_snapshot(self) -> None:
+        dirty_root = self.root / "dirty-bureau"
+        dirty_task_dir = dirty_root / "registry" / "tasks"
+        dirty_task_dir.mkdir(parents=True)
+        canonical_root = self.root / "canonical-bureau"
+        task_dir = canonical_root / "registry" / "tasks"
         task_dir.mkdir(parents=True)
         bureau_bin = self.root / "bureau-bin"
         bureau_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -1703,9 +1900,15 @@ class AgentWorkspaceTests(unittest.TestCase):
         task_id = "TEST-V1-T001"
         task_path = task_dir / f"{task_id}.json"
         task_path.write_text(
-            json.dumps({"schema_version": 1, "id": task_id, "title": "Test", "state": "ready"}),
+            json.dumps({"schema_version": 1, "id": task_id, "title": "Canonical", "state": "ready"}),
             encoding="utf-8",
         )
+        (dirty_task_dir / f"{task_id}.json").write_text(
+            json.dumps({"schema_version": 1, "id": task_id, "title": "Dirty", "state": "verified"}),
+            encoding="utf-8",
+        )
+        task_path.chmod(0o444)
+        canonical_root.chmod(0o555)
         runner = mock.Mock(
             return_value={
                 "returncode": 0,
@@ -1713,7 +1916,16 @@ class AgentWorkspaceTests(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "result": {"healthy": True},
-                        "runtime_identity": {"compatibility": {"status": "compatible"}},
+                        "runtime_identity": {
+                            "compatibility": {"status": "canonical-read-only"},
+                            "manifest": {
+                                "canonical_registry": {
+                                    "available": True,
+                                    "valid": True,
+                                    "root": str(canonical_root),
+                                }
+                            },
+                        },
                     }
                 ),
                 "stderr": "",
@@ -1721,17 +1933,118 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         with (
             mock.patch.object(workspace, "BUREAU", bureau_bin),
+            mock.patch.object(workspace, "BUREAU_ROOT", dirty_root),
+        ):
+            evidence = workspace._verify_bureau_binding("bureau_task", task_id, runner=runner)
+            task_path.chmod(0o644)
+            task_path.write_text(
+                json.dumps({"schema_version": 1, "id": task_id, "title": "Canonical", "state": "verified"}),
+                encoding="utf-8",
+            )
+            task_path.chmod(0o444)
+            with self.assertRaisesRegex(workspace.AgentWorkspaceError, "not actionable"):
+                workspace._verify_bureau_binding("bureau_task", task_id, runner=runner)
+        call_cwd, call_argv = runner.call_args.args
+        self.assertEqual(call_cwd, bureau_bin.parent)
+        self.assertNotIn("--root", call_argv)
+        self.assertEqual(evidence["state"], "ready")
+        self.assertEqual(evidence["title"], "Canonical")
+        self.assertEqual(evidence["registry_source"], "canonical-runtime-snapshot")
+        self.assertRegex(evidence["task_sha256"], workspace.SHA256_RE)
+
+    def test_bureau_task_legacy_direct_json_uses_explicit_root(self) -> None:
+        bureau_root = self.root / "legacy-bureau"
+        task_dir = bureau_root / "registry" / "tasks"
+        task_dir.mkdir(parents=True)
+        bureau_bin = self.root / "bureau-bin"
+        bureau_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        bureau_bin.chmod(0o755)
+        task_id = "TEST-V1-T002"
+        (task_dir / f"{task_id}.json").write_text(
+            json.dumps({"schema_version": 1, "id": task_id, "title": "Legacy", "state": "planned"}),
+            encoding="utf-8",
+        )
+        runner = mock.Mock(
+            return_value={"returncode": 0, "stdout": json.dumps({"healthy": True}), "stderr": ""}
+        )
+        with (
+            mock.patch.object(workspace, "BUREAU", bureau_bin),
             mock.patch.object(workspace, "BUREAU_ROOT", bureau_root),
         ):
             evidence = workspace._verify_bureau_binding("bureau_task", task_id, runner=runner)
-            task_path.write_text(
-                json.dumps({"schema_version": 1, "id": task_id, "title": "Test", "state": "verified"}),
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(workspace.AgentWorkspaceError, "not actionable"):
+        self.assertEqual(evidence["registry_source"], "legacy-explicit-root")
+        self.assertEqual(evidence["state"], "planned")
+
+    def test_bureau_task_rejects_writable_canonical_snapshot(self) -> None:
+        canonical_root = self.root / "writable-canonical"
+        (canonical_root / "registry" / "tasks").mkdir(parents=True)
+        bureau_bin = self.root / "bureau-bin"
+        bureau_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        bureau_bin.chmod(0o755)
+        runner = mock.Mock(
+            return_value={
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "schema_version": 1,
+                        "result": {"healthy": True},
+                        "runtime_identity": {
+                            "compatibility": {"status": "canonical-read-only"},
+                            "manifest": {
+                                "canonical_registry": {
+                                    "available": True,
+                                    "valid": True,
+                                    "root": str(canonical_root),
+                                }
+                            },
+                        },
+                    }
+                ),
+                "stderr": "",
+            }
+        )
+        with mock.patch.object(workspace, "BUREAU", bureau_bin):
+            with self.assertRaisesRegex(workspace.AgentWorkspaceError, "not immutable"):
+                workspace._verify_bureau_binding("bureau_task", "TEST-V1-T003", runner=runner)
+
+    def test_bureau_task_rejects_writable_file_in_immutable_snapshot(self) -> None:
+        canonical_root = self.root / "canonical-with-writable-task"
+        task_dir = canonical_root / "registry" / "tasks"
+        task_dir.mkdir(parents=True)
+        task_id = "TEST-V1-T004"
+        (task_dir / f"{task_id}.json").write_text(
+            json.dumps({"schema_version": 1, "id": task_id, "title": "Writable", "state": "ready"}),
+            encoding="utf-8",
+        )
+        canonical_root.chmod(0o555)
+        bureau_bin = self.root / "bureau-bin"
+        bureau_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        bureau_bin.chmod(0o755)
+        runner = mock.Mock(
+            return_value={
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "schema_version": 1,
+                        "result": {"healthy": True},
+                        "runtime_identity": {
+                            "compatibility": {"status": "canonical-read-only"},
+                            "manifest": {
+                                "canonical_registry": {
+                                    "available": True,
+                                    "valid": True,
+                                    "root": str(canonical_root),
+                                }
+                            },
+                        },
+                    }
+                ),
+                "stderr": "",
+            }
+        )
+        with mock.patch.object(workspace, "BUREAU", bureau_bin):
+            with self.assertRaisesRegex(workspace.AgentWorkspaceError, "task file is not immutable"):
                 workspace._verify_bureau_binding("bureau_task", task_id, runner=runner)
-        self.assertEqual(evidence["state"], "ready")
-        self.assertRegex(evidence["task_sha256"], workspace.SHA256_RE)
 
     def test_clean_writer_without_commit_is_not_a_result(self) -> None:
         manifest = self.manifest()
