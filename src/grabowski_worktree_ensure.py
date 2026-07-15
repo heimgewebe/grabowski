@@ -510,6 +510,9 @@ def _public_output(
 ) -> dict[str, Any]:
     result_state = record.get("result_state")
     receipt_status = "passed" if result_state in SUCCESS_STATES else ("blocked" if result_state in {"CONFLICT", "REJECTED_BY_LEASE"} else "failed")
+    stored_lifecycle = record.get("lifecycle")
+    lifecycle = lifecycle_override or stored_lifecycle
+    lifecycle_bound = isinstance(stored_lifecycle, dict) and lifecycle_override is None
     return {
         "receipt_status": receipt_status,
         "result_state": result_state,
@@ -522,7 +525,18 @@ def _public_output(
         "replayed": replayed,
         "recovered_after_interruption": recovered,
         "post_state": record.get("post_state"),
-        "lifecycle": lifecycle_override or record.get("lifecycle"),
+        "lifecycle": lifecycle,
+        "lifecycle_integrity": {
+            "sha256": _sha256_json(lifecycle) if isinstance(lifecycle, dict) else None,
+            "source": (
+                "durable_receipt"
+                if lifecycle_bound
+                else "checkout_retention_db"
+                if isinstance(lifecycle, dict)
+                else None
+            ),
+            "bound_to_durable_receipt": lifecycle_bound,
+        },
         "friction": record.get("friction"),
         "friction_closeout": record.get("friction_closeout"),
         "non_claims": [
@@ -530,6 +544,7 @@ def _public_output(
             "does not create or renew leases",
             "does not clean up conflicting worktrees or branches",
             "does not prove connector delivery of the response",
+            "a legacy lifecycle projection is not bound by the original receipt hash",
         ],
     }
 

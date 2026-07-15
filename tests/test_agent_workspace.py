@@ -388,6 +388,48 @@ class AgentWorkspaceTests(unittest.TestCase):
         stored = workspace.checkouts._retention_records([first["checkout_key"]])
         self.assertEqual(stored[first["checkout_key"]]["owner_id"], first["owner_id"])
 
+    def test_failed_creation_releases_only_the_exact_lifecycle_version(self) -> None:
+        manifest = self.manifest()
+        fixed_now = 1_800_000_000
+        with (
+            mock.patch.object(workspace, "_now", return_value=fixed_now),
+            mock.patch.object(workspace.checkouts, "_now", return_value=fixed_now),
+        ):
+            manifest["checkout_lifecycle"] = (
+                workspace._bind_writer_checkout_lifecycle(manifest)
+            )
+
+        self.assertTrue(workspace._release_failed_workspace_checkout_lifecycle(manifest))
+        self.assertEqual(
+            workspace.checkouts._retention_records(
+                [manifest["checkout_lifecycle"]["checkout_key"]]
+            ),
+            {},
+        )
+
+    def test_failed_creation_does_not_delete_concurrently_updated_retention(self) -> None:
+        manifest = self.manifest()
+        fixed_now = 1_800_000_000
+        with (
+            mock.patch.object(workspace, "_now", return_value=fixed_now),
+            mock.patch.object(workspace.checkouts, "_now", return_value=fixed_now),
+        ):
+            lifecycle = workspace._bind_writer_checkout_lifecycle(manifest)
+        manifest["checkout_lifecycle"] = lifecycle
+        with workspace.checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET updated_at_unix=? WHERE checkout_key=?",
+                (lifecycle["updated_at_unix"] + 1, lifecycle["checkout_key"]),
+            )
+            connection.commit()
+
+        self.assertFalse(workspace._release_failed_workspace_checkout_lifecycle(manifest))
+        stored = workspace.checkouts._retention_records([lifecycle["checkout_key"]])
+        self.assertEqual(
+            stored[lifecycle["checkout_key"]]["updated_at_unix"],
+            lifecycle["updated_at_unix"] + 1,
+        )
+
     def test_terminal_checkout_decision_retains_registered_checkout(self) -> None:
         manifest = self.manifest()
         fixed_now = 1_800_000_000

@@ -165,8 +165,44 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(lifecycle["terminal_decision"], "retain")
         self.assertFalse(lifecycle["automatic_cleanup_authorized"])
         self.assertEqual(replayed["lifecycle"]["checkout_key"], lifecycle["checkout_key"])
+        self.assertEqual(created["lifecycle_integrity"]["source"], "durable_receipt")
+        self.assertTrue(created["lifecycle_integrity"]["bound_to_durable_receipt"])
+        self.assertEqual(
+            created["lifecycle_integrity"]["sha256"],
+            worktree_ensure._sha256_json(lifecycle),
+        )
         stored = checkouts._retention_records([lifecycle["checkout_key"]])
         self.assertEqual(stored[lifecycle["checkout_key"]]["owner_id"], self.owner)
+
+    def test_legacy_success_replay_marks_lifecycle_as_unbound_projection(self) -> None:
+        parameters = self._parameters(key="legacy-success")
+        created = self._ensure(parameters)
+        receipt_path = Path(created["durable_receipt_path"])
+        record = json.loads(receipt_path.read_text(encoding="utf-8"))
+        record.pop("lifecycle")
+        worktree_ensure._write_receipt(receipt_path, record)
+        legacy_record = json.loads(receipt_path.read_text(encoding="utf-8"))
+        legacy_receipt_sha256 = legacy_record["receipt_sha256"]
+
+        replayed = self._ensure(parameters)
+
+        self.assertEqual(replayed["result_state"], "CREATED")
+        self.assertEqual(replayed["durable_receipt_sha256"], legacy_receipt_sha256)
+        self.assertEqual(
+            json.loads(receipt_path.read_text(encoding="utf-8"))["receipt_sha256"],
+            legacy_receipt_sha256,
+        )
+        self.assertEqual(
+            replayed["lifecycle_integrity"]["source"],
+            "checkout_retention_db",
+        )
+        self.assertFalse(
+            replayed["lifecycle_integrity"]["bound_to_durable_receipt"]
+        )
+        self.assertEqual(
+            replayed["lifecycle_integrity"]["sha256"],
+            worktree_ensure._sha256_json(replayed["lifecycle"]),
+        )
 
     def test_existing_exact_worktree_is_already_correct(self) -> None:
         first = self._parameters(key="create-first")

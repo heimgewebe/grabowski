@@ -3190,21 +3190,60 @@ def _release_failed_workspace_checkout_lifecycle(manifest: dict[str, Any]) -> bo
     owner_id = lifecycle.get("owner_id")
     if not isinstance(checkout_key, str) or not isinstance(owner_id, str):
         return False
+    created_at_unix = lifecycle.get("created_at_unix")
+    updated_at_unix = lifecycle.get("updated_at_unix")
+    expected_head = lifecycle.get("expected_head")
+    expected_branch = lifecycle.get("expected_branch")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (created_at_unix, updated_at_unix)
+    ):
+        return False
     with checkouts._database() as connection:
         row = connection.execute(
-            "SELECT owner_id FROM retention WHERE checkout_key=?",
+            """
+            SELECT owner_id, created_at_unix, updated_at_unix,
+                   expected_head, expected_branch
+            FROM retention WHERE checkout_key=?
+            """,
             (checkout_key,),
         ).fetchone()
         if row is None:
             return True
-        if row["owner_id"] != owner_id:
+        expected_identity = (
+            owner_id,
+            created_at_unix,
+            updated_at_unix,
+            expected_head,
+            expected_branch,
+        )
+        observed_identity = (
+            row["owner_id"],
+            row["created_at_unix"],
+            row["updated_at_unix"],
+            row["expected_head"],
+            row["expected_branch"],
+        )
+        if observed_identity != expected_identity:
             return False
-        connection.execute(
-            "DELETE FROM retention WHERE checkout_key=? AND owner_id=?",
-            (checkout_key, owner_id),
+        deleted = connection.execute(
+            """
+            DELETE FROM retention
+            WHERE checkout_key=? AND owner_id=?
+              AND created_at_unix=? AND updated_at_unix=?
+              AND expected_head IS ? AND expected_branch IS ?
+            """,
+            (
+                checkout_key,
+                owner_id,
+                created_at_unix,
+                updated_at_unix,
+                expected_head,
+                expected_branch,
+            ),
         )
         connection.commit()
-    return True
+    return deleted.rowcount == 1
 
 
 def _terminal_writer_checkout_decision(
