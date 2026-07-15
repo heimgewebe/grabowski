@@ -1,0 +1,1390 @@
+{
+  "schema_version": 1,
+  "contract_id": "grabowski-tool-surface-budget-v1",
+  "sources": {
+    "runtime_entrypoint": "config/runtime-entrypoint.json",
+    "capability_catalog": "contracts/capability-catalog.v1.json",
+    "operation_catalog": "config/operations.example.json",
+    "operation_metadata": "contracts/operation-catalog.v1.json"
+  },
+  "baseline": {
+    "tool_count": 122,
+    "tool_names_sha256": "a6f1330b4dd1fbdfa57ff2ee1489fdf4f15df53c5b7822a3a746938e6540333b",
+    "tool_semantics_sha256": "87bc1c80e20c9cf2e2b7370ee20cae9941e4154b5157af6da485e61296a7370d",
+    "tools": [
+      {
+        "tool": "grabowski_agent_bootstrap",
+        "category": "operations-observability",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_agent_competition_compare",
+        "category": "agent-workspace",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_agent_competition_start",
+        "category": "agent-workspace",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "durable-task-start",
+          "external-model-call",
+          "state-create"
+        ],
+        "reversibility": "task-cancel-and-state-retain"
+      },
+      {
+        "tool": "grabowski_agent_competition_status",
+        "category": "agent-workspace",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [
+          "task-state-refresh"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_agent_execution_route",
+        "category": "agent-workspace",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_agent_workspace_attach",
+        "category": "agent-workspace",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_agent_workspace_close",
+        "category": "agent-workspace",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "lease-release",
+          "possible-task-stop",
+          "receipt-create",
+          "tmux-session-remove"
+        ],
+        "reversibility": "preserved-worktree-and-branch"
+      },
+      {
+        "tool": "grabowski_agent_workspace_collect",
+        "category": "agent-workspace",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "receipt-create",
+          "task-start",
+          "task-state-refresh"
+        ],
+        "reversibility": "preserved-worktree-and-receipts"
+      },
+      {
+        "tool": "grabowski_agent_workspace_create",
+        "category": "agent-workspace",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "branch-create",
+          "lease-create",
+          "task-start",
+          "tmux-session-create",
+          "worktree-create"
+        ],
+        "reversibility": "close-and-preserved-worktree"
+      },
+      {
+        "tool": "grabowski_agent_workspace_observe",
+        "category": "agent-workspace",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [
+          "task-state-refresh"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_agent_workspace_optimize",
+        "category": "agent-workspace",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [
+          "task-state-refresh"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_agent_workspace_role_retry",
+        "category": "agent-workspace",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "receipt-create",
+          "task-start",
+          "task-state-refresh"
+        ],
+        "reversibility": "preserved-worktree-and-receipts"
+      },
+      {
+        "tool": "grabowski_agent_workspace_status",
+        "category": "agent-workspace",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [
+          "task-state-refresh"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_artifact_pull",
+        "category": "artifact",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "local-file-create-or-replace",
+          "temporary-file-create"
+        ],
+        "reversibility": "destination-preimage-dependent"
+      },
+      {
+        "tool": "grabowski_artifact_push",
+        "category": "artifact",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "remote-file-create-or-replace",
+          "temporary-file-create"
+        ],
+        "reversibility": "destination-preimage-dependent"
+      },
+      {
+        "tool": "grabowski_artifact_stat",
+        "category": "artifact",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_browser_profile_read",
+        "category": "secret",
+        "authority_class": "secret",
+        "risk_class": "high",
+        "read_only": true,
+        "effects": [
+          "profile-content-return"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_browser_worker_list",
+        "category": "browser-worker",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_browser_worker_start",
+        "category": "browser-worker",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "loopback-listener",
+          "process-start",
+          "profile-create-or-use"
+        ],
+        "reversibility": "worker-stop"
+      },
+      {
+        "tool": "grabowski_browser_worker_status",
+        "category": "browser-worker",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [
+          "possible-lease-release",
+          "state-refresh"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_browser_worker_stop",
+        "category": "browser-worker",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "ephemeral-state-remove",
+          "lease-release",
+          "process-stop"
+        ],
+        "reversibility": "worker-restart"
+      },
+      {
+        "tool": "grabowski_call_shape_check",
+        "category": "operations-observability",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_checkout_archive",
+        "category": "checkout-lifecycle",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "git-reference-create",
+          "resource-lease",
+          "state-create"
+        ],
+        "reversibility": "git-worktree-add-from-recovery-ref"
+      },
+      {
+        "tool": "grabowski_checkout_cleanup",
+        "category": "checkout-lifecycle",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "resource-lease",
+          "state-change",
+          "working-tree-remove"
+        ],
+        "reversibility": "git-worktree-add-from-recovery-ref"
+      },
+      {
+        "tool": "grabowski_checkout_inventory",
+        "category": "checkout-lifecycle",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_checkout_retain",
+        "category": "checkout-lifecycle",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "resource-lease",
+          "state-create"
+        ],
+        "reversibility": "retention-update"
+      },
+      {
+        "tool": "grabowski_checkout_summary",
+        "category": "version-control",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_connector_transport_diagnostics",
+        "category": "operations-observability",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_context",
+        "category": "context",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_contract_drift",
+        "category": "context",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_create_text",
+        "category": "filesystem",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "file-create"
+        ],
+        "reversibility": "manual-or-git"
+      },
+      {
+        "tool": "grabowski_deployment_identity",
+        "category": "context",
+        "authority_class": "deployment",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_destroy_path",
+        "category": "filesystem",
+        "authority_class": "destructive",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "directory-delete",
+          "file-delete"
+        ],
+        "reversibility": "irreversible"
+      },
+      {
+        "tool": "grabowski_execution_governor_summary",
+        "category": "operations-observability",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_execution_outcome_record",
+        "category": "operations-observability",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "audit-record",
+          "state-append"
+        ],
+        "reversibility": "append-only-observation"
+      },
+      {
+        "tool": "grabowski_execution_shape",
+        "category": "operations-observability",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_fleet_list",
+        "category": "fleet",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_fleet_run",
+        "category": "fleet",
+        "authority_class": "mutation",
+        "risk_class": "variable",
+        "read_only": false,
+        "effects": [
+          "remote-command-dependent"
+        ],
+        "reversibility": "command-dependent"
+      },
+      {
+        "tool": "grabowski_friction_record",
+        "category": "operations-observability",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "audit-record",
+          "state-append"
+        ],
+        "reversibility": "append-only-observation"
+      },
+      {
+        "tool": "grabowski_friction_resolve",
+        "category": "operations-observability",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "audit-record",
+          "state-append"
+        ],
+        "reversibility": "append-only-decision"
+      },
+      {
+        "tool": "grabowski_friction_summary",
+        "category": "operations-observability",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_git",
+        "category": "version-control",
+        "authority_class": "mutation",
+        "risk_class": "variable",
+        "read_only": false,
+        "effects": [
+          "git-dependent"
+        ],
+        "reversibility": "git-dependent"
+      },
+      {
+        "tool": "grabowski_git_branch",
+        "category": "version-control",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "git-reference-change",
+          "working-tree-switch"
+        ],
+        "reversibility": "git-branch-switch"
+      },
+      {
+        "tool": "grabowski_git_diff",
+        "category": "version-control",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_git_log",
+        "category": "version-control",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_git_show",
+        "category": "version-control",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_git_status",
+        "category": "version-control",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_github",
+        "category": "remote-version-control",
+        "authority_class": "mutation",
+        "risk_class": "variable",
+        "read_only": false,
+        "effects": [
+          "remote-dependent"
+        ],
+        "reversibility": "operation-dependent"
+      },
+      {
+        "tool": "grabowski_github_checks",
+        "category": "remote-version-control",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [
+          "remote-read"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_github_pr_view",
+        "category": "remote-version-control",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [
+          "remote-read"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_gui_worker_list",
+        "category": "gui-worker",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_gui_worker_start",
+        "category": "gui-worker",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "display-create",
+          "ephemeral-state-create",
+          "process-start"
+        ],
+        "reversibility": "worker-stop"
+      },
+      {
+        "tool": "grabowski_gui_worker_status",
+        "category": "gui-worker",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [
+          "possible-lease-release",
+          "state-refresh"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_gui_worker_stop",
+        "category": "gui-worker",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "ephemeral-state-remove",
+          "lease-release",
+          "process-stop"
+        ],
+        "reversibility": "worker-restart"
+      },
+      {
+        "tool": "grabowski_job_cancel",
+        "category": "command",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "process-stop"
+        ],
+        "reversibility": "restart-job"
+      },
+      {
+        "tool": "grabowski_job_logs",
+        "category": "command",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_job_notification_ack",
+        "category": "command",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "state-create"
+        ],
+        "reversibility": "receipt-retained"
+      },
+      {
+        "tool": "grabowski_job_notification_list",
+        "category": "command",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_job_start",
+        "category": "command",
+        "authority_class": "mutation",
+        "risk_class": "variable",
+        "read_only": false,
+        "effects": [
+          "command-dependent",
+          "process-start",
+          "state-create"
+        ],
+        "reversibility": "job-cancel-and-command-dependent"
+      },
+      {
+        "tool": "grabowski_job_status",
+        "category": "command",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_list_directory",
+        "category": "filesystem",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_operation_list",
+        "category": "operation",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_operation_plan",
+        "category": "operation",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_operation_run",
+        "category": "operation",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "multi-host-command-dependent",
+          "rollback-possible"
+        ],
+        "reversibility": "recipe-dependent"
+      },
+      {
+        "tool": "grabowski_operator_recall_export",
+        "category": "operations-observability",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_ports",
+        "category": "diagnostics",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_power_run",
+        "category": "privileged-execution",
+        "authority_class": "privileged",
+        "risk_class": "critical",
+        "read_only": false,
+        "effects": [
+          "host-state-change",
+          "root-command-dependent"
+        ],
+        "reversibility": "command-dependent-with-recovery-evidence"
+      },
+      {
+        "tool": "grabowski_privileged_action_reference",
+        "category": "privileged-reference",
+        "authority_class": "read",
+        "risk_class": "medium",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_privileged_broker_status",
+        "category": "privileged-reference",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_process_list",
+        "category": "process",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_process_signal",
+        "category": "process",
+        "authority_class": "process-control",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "possible-process-stop",
+          "process-signal"
+        ],
+        "reversibility": "usually-not-reversible"
+      },
+      {
+        "tool": "grabowski_read_text",
+        "category": "filesystem",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_recovery_server_probe",
+        "category": "recovery",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "recovery-marker-write"
+        ],
+        "reversibility": "new-snapshot-retained"
+      },
+      {
+        "tool": "grabowski_recovery_status",
+        "category": "recovery",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_remove_path",
+        "category": "filesystem",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "directory-remove",
+          "file-remove",
+          "quarantine-create"
+        ],
+        "reversibility": "quarantine-restore"
+      },
+      {
+        "tool": "grabowski_replace_text",
+        "category": "filesystem",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "backup-create",
+          "file-replace"
+        ],
+        "reversibility": "backup-and-git"
+      },
+      {
+        "tool": "grabowski_resource_acquire",
+        "category": "resource",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "lease-create",
+          "possible-expired-lease-reclaim"
+        ],
+        "reversibility": "resource-release"
+      },
+      {
+        "tool": "grabowski_resource_inspect",
+        "category": "resource",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_resource_list",
+        "category": "resource",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_resource_nonconflict_assess",
+        "category": "resource",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "audit-append",
+          "proof-issue"
+        ],
+        "reversibility": "proof-expiry"
+      },
+      {
+        "tool": "grabowski_resource_reconcile_obsolete_path_leases",
+        "category": "resource",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "audit-append",
+          "lease-remove",
+          "terminal-evidence-verify"
+        ],
+        "reversibility": "resource-reacquire"
+      },
+      {
+        "tool": "grabowski_resource_release",
+        "category": "resource",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "lease-remove",
+          "possible-force-release"
+        ],
+        "reversibility": "resource-reacquire"
+      },
+      {
+        "tool": "grabowski_resource_renew",
+        "category": "resource",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "lease-update"
+        ],
+        "reversibility": "lease-expiry-or-release"
+      },
+      {
+        "tool": "grabowski_restore_removed_path",
+        "category": "audit",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "directory-create",
+          "file-create"
+        ],
+        "reversibility": "new-remove-operation"
+      },
+      {
+        "tool": "grabowski_rollback_text",
+        "category": "audit",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "backup-create",
+          "file-replace"
+        ],
+        "reversibility": "audit-rollback"
+      },
+      {
+        "tool": "grabowski_runtime_deploy_schedule",
+        "category": "deployment",
+        "authority_class": "deployment",
+        "risk_class": "high",
+        "read_only": null,
+        "effects": [
+          "background-job-start",
+          "remote-package-read",
+          "runtime-deploy",
+          "service-restart"
+        ],
+        "reversibility": "deployment-rollback"
+      },
+      {
+        "tool": "grabowski_runtime_health",
+        "category": "context",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_secret_export",
+        "category": "secret",
+        "authority_class": "secret",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "secret-copy-create"
+        ],
+        "reversibility": "manual-delete"
+      },
+      {
+        "tool": "grabowski_secret_inspect",
+        "category": "secret",
+        "authority_class": "secret",
+        "risk_class": "medium",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_secret_reveal",
+        "category": "secret",
+        "authority_class": "secret",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "secret-content-return"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_secret_use",
+        "category": "secret",
+        "authority_class": "secret",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "command-dependent",
+          "process-start",
+          "secret-use"
+        ],
+        "reversibility": "command-dependent"
+      },
+      {
+        "tool": "grabowski_service_logs",
+        "category": "service",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_service_status",
+        "category": "service",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_stat",
+        "category": "filesystem",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_status",
+        "category": "context",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_task_cancel",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "process-stop",
+          "state-change"
+        ],
+        "reversibility": "resume-policy-dependent"
+      },
+      {
+        "tool": "grabowski_task_list",
+        "category": "task",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_task_logs",
+        "category": "task",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_task_reconcile",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "lease-release",
+          "state-refresh"
+        ],
+        "reversibility": "conditional"
+      },
+      {
+        "tool": "grabowski_task_reconcile_check",
+        "category": "task",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_task_reconcile_refresh",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "lease-release",
+          "state-refresh"
+        ],
+        "reversibility": "conditional"
+      },
+      {
+        "tool": "grabowski_task_reconcile_resume",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "lease-release",
+          "possible-process-start",
+          "state-refresh"
+        ],
+        "reversibility": "conditional"
+      },
+      {
+        "tool": "grabowski_task_resume",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "variable",
+        "read_only": false,
+        "effects": [
+          "command-dependent",
+          "process-start",
+          "state-change"
+        ],
+        "reversibility": "cancel-or-command-dependent"
+      },
+      {
+        "tool": "grabowski_task_start",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "variable",
+        "read_only": false,
+        "effects": [
+          "command-dependent",
+          "process-start",
+          "state-create"
+        ],
+        "reversibility": "cancel-or-command-dependent"
+      },
+      {
+        "tool": "grabowski_task_status",
+        "category": "task",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [
+          "state-refresh"
+        ],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_terminal_run",
+        "category": "command",
+        "authority_class": "mutation",
+        "risk_class": "variable",
+        "read_only": false,
+        "effects": [
+          "command-dependent"
+        ],
+        "reversibility": "command-dependent"
+      },
+      {
+        "tool": "grabowski_tmux_capture",
+        "category": "session",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_tmux_list",
+        "category": "session",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_tmux_send",
+        "category": "session",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "command-dependent",
+          "interactive-input"
+        ],
+        "reversibility": "command-dependent"
+      },
+      {
+        "tool": "grabowski_user_service",
+        "category": "service",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "service-state-change"
+        ],
+        "reversibility": "inverse-service-action"
+      },
+      {
+        "tool": "grabowski_verify_audit",
+        "category": "audit",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grip_list",
+        "category": "grip-surface",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grip_run",
+        "category": "grip-surface",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "command-dependent",
+          "grip-dispatch"
+        ],
+        "reversibility": "receipt-dependent"
+      },
+      {
+        "tool": "latest_complete_bundles",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "rlens_bundle_discover",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "rlens_bundle_status",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "rlens_context_pack",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "rlens_freshness_check",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "rlens_preflight",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "rlens_query",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "rlens_query_existing_index",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "rlens_range_get",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    ]
+  },
+  "accepted_additions": {},
+  "retired_tools": {},
+  "operation_catalog": {
+    "schema_version": 1,
+    "operation_count": 3,
+    "operations_sha256": "ce0069d9355db596c010508574aced054e157434ecafdcfd0a6ce31457aee3ab",
+    "operations": [
+      {
+        "operation": "inspect-user-service",
+        "description": "Inspect one user service without changing its state.",
+        "execution_authorities": [
+          "operator-mutation"
+        ],
+        "effects": [
+          "service-read"
+        ],
+        "reversibility": "not-applicable",
+        "parameter_names": [
+          "unit"
+        ],
+        "phases": [
+          "action"
+        ]
+      },
+      {
+        "operation": "probe-host",
+        "description": "Run a bounded hostname probe on one registered host.",
+        "execution_authorities": [
+          "fleet-run",
+          "operator-mutation"
+        ],
+        "effects": [
+          "host-read",
+          "remote-command"
+        ],
+        "reversibility": "command-dependent",
+        "parameter_names": [
+          "host"
+        ],
+        "phases": [
+          "action"
+        ]
+      },
+      {
+        "operation": "restart-user-service",
+        "description": "Restart one user service and verify that it becomes active.",
+        "execution_authorities": [
+          "operator-mutation"
+        ],
+        "effects": [
+          "service-restart"
+        ],
+        "reversibility": "command-dependent",
+        "parameter_names": [
+          "unit"
+        ],
+        "phases": [
+          "preflight",
+          "action",
+          "postflight",
+          "rollback"
+        ]
+      }
+    ]
+  },
+  "policy": {
+    "accepted_addition_kinds": [
+      "distinct_authority_boundary",
+      "material_call_shape",
+      "measured_selection_advantage"
+    ],
+    "legacy_baseline_is_closed": true,
+    "fixed_tool_cap": null,
+    "default_route": "typed-operation",
+    "security_boundaries_may_remain_tools": true
+  },
+  "migration_candidates": [],
+  "does_not_establish": [
+    "smaller_tool_count_is_always_better",
+    "client_tool_choice_improvement_without_measurement",
+    "permission_to_collapse_distinct_security_boundaries",
+    "runtime_client_snapshot_observability"
+  ]
+}
