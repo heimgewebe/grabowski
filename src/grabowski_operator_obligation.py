@@ -627,9 +627,10 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
         "blockers": close_record["blockers"],
         "delegation": close_record["delegation"],
         "next_action": close_record["next_action"],
-        "continuation_required": False,
+        "continuation_required": outcome != "completed",
         "response_may_end": True,
         "work_complete": outcome == "completed",
+        "follow_up_required": outcome != "completed",
         "open_file_sha256": open_file_sha256,
         "close_file_sha256": close_file_sha256,
         "recommended_next_action": (
@@ -653,10 +654,10 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
         required=set(),
         label="list parameters",
     )
-    state_filter = parameters.get("state", "open")
-    if not isinstance(state_filter, str) or state_filter not in TERMINAL_OUTCOMES | {"open", "all"}:
+    state_filter = parameters.get("state", "attention")
+    if not isinstance(state_filter, str) or state_filter not in TERMINAL_OUTCOMES | {"open", "attention", "all"}:
         raise OperatorObligationInputError(
-            "state must be open, completed, blocked, delegated, or all"
+            "state must be attention, open, completed, blocked, delegated, or all"
         )
     repo_filter = parameters.get("repo")
     if repo_filter is not None:
@@ -715,7 +716,10 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
                 {"obligation_id": child.name, "error": type(exc).__name__}
             )
             continue
-        if state_filter != "all" and status["state"] != state_filter:
+        if state_filter == "attention":
+            if status["work_complete"] is True:
+                continue
+        elif state_filter != "all" and status["state"] != state_filter:
             continue
         origin = status.get("origin")
         origin = origin if isinstance(origin, dict) else {}
@@ -752,11 +756,11 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
     if integrity_errors:
         next_action = "inspect integrity errors before relying on the affected obligations"
     elif any(item["continuation_required"] for item in records):
-        next_action = "resume the matching open obligation before starting unrelated work"
+        next_action = "resume or explicitly supersede the matching unfinished obligation before starting unrelated work"
     elif scan_truncated:
         next_action = "narrow the filters and list again"
     else:
-        next_action = "no matching open obligation requires continuation"
+        next_action = "no matching unfinished obligation requires continuation"
     return {
         "state_filter": state_filter,
         "repo_filter": repo_filter,

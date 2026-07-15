@@ -60,7 +60,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "operator-obligation-lifecycle",
-        "For nontrivial operator work, first call grip_run with operator-obligation-list to resume matching open work, then call operator-obligation-open or resume the matching obligation; before ending a response, call operator-obligation-status and end only after operator-obligation-close records completed, explicitly blocked, or durably delegated evidence.",
+        "For nontrivial operator work, first call grip_run with operator-obligation-list to resume matching unfinished work, including blocked or delegated records, then call operator-obligation-open or resume with a successor obligation that references the prior record; before ending a response, call operator-obligation-status and end only after operator-obligation-close records completed, explicitly blocked, or durably delegated evidence.",
     ),
     (
         "no-authority-escalation",

@@ -29,8 +29,8 @@ Die Antwort darf dann weder Abschluss behaupten noch die offene Arbeit verschwei
 `close.json` ist create-only und bindet den Hash der unveränderlichen Öffnung. Genau drei Ausgänge sind erlaubt:
 
 1. `completed`: Für jedes Akzeptanzkriterium liegt ein eindeutiger `passed`-Beleg mit SHA-256-Bindung vor. Erst dann gilt `work_complete=true`.
-2. `blocked`: Mindestens ein konkreter, SHA-256-gebundener Blocker und eine nächste sichere Aktion sind angegeben. Das Antwortende ist zulässig, behauptet aber keine Fertigstellung.
-3. `delegated`: Der öffentliche Abschluss-Grip beobachtet den angegebenen Grabowski-Task, Agent-Workspace oder systemd-Job selbst. Nur ein tatsächlich laufender, identitäts- und receipt-gebundener Zustand wird akzeptiert. Auch dies behauptet keine Fertigstellung.
+2. `blocked`: Mindestens ein konkreter, SHA-256-gebundener Blocker und eine nächste sichere Aktion sind angegeben. Das Antwortende ist zulässig, behauptet aber keine Fertigstellung; `continuation_required=true` hält den Folgearbeitsbedarf sichtbar.
+3. `delegated`: Der öffentliche Abschluss-Grip beobachtet den angegebenen Grabowski-Task, Agent-Workspace oder systemd-Job selbst. Nur ein tatsächlich laufender, identitäts- und receipt-gebundener Zustand wird akzeptiert. Auch dies behauptet keine Fertigstellung; die Verpflichtung bleibt im Standard-Listing sichtbar, bis eine Nachfolge-Verpflichtung die weitere Bearbeitung übernimmt.
 
 Ein fehlender Beleg, ein widersprüchlicher zweiter Abschluss, manipulierte Dateien, unsichere Dateirechte oder unbekannte Felder führen fail-closed.
 
@@ -50,7 +50,7 @@ Ein Interprozess-Lock serialisiert Öffnung und Abschluss. Wiederholung desselbe
 
 ## Grip-Oberfläche
 
-- `operator-obligation-list` – read-only; findet begrenzt und nach Repository oder Thread gefiltert offene Arbeit wieder.
+- `operator-obligation-list` – read-only; findet standardmäßig alle nicht abgeschlossenen Verpflichtungen (`open`, `blocked`, `delegated`) begrenzt und nach Repository oder Thread gefiltert wieder.
 - `operator-obligation-open` – mutierend; legt die unveränderliche Verpflichtung an.
 - `operator-obligation-status` – read-only; entscheidet, ob Fortsetzung erforderlich ist und ob die Antwort enden darf.
 - `operator-obligation-close` – mutierend; akzeptiert nur `completed`, `blocked` oder `delegated` unter den beschriebenen Evidenzregeln.
