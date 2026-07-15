@@ -4974,7 +4974,7 @@ def _workspace_cleanup_plan_data(
     else:
         checkout_state["exists"] = True
         try:
-            top_level, _common_dir, record = checkouts._worktree_for_path(
+            top_level, common_dir, record = checkouts._worktree_for_path(
                 checkouts._resolve_repo(repository), checkout_path
             )
             status = checkouts._worktree_status(record)
@@ -5021,6 +5021,7 @@ def _workspace_cleanup_plan_data(
             coordination = checkouts._linked_checkout_coordination(
                 checkout_path,
                 top_level,
+                common_dir,
                 owner_id=owner,
                 include_processes=True,
                 include_tasks=True,
