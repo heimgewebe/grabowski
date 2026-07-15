@@ -96,8 +96,8 @@ class CheckoutLifecycleTests(unittest.TestCase):
             text=True,
         )
 
-    def _archive(self) -> dict[str, object]:
-        return checkouts.grabowski_checkout_archive(
+    def _archive(self, *, aged: bool = True) -> dict[str, object]:
+        result = checkouts.grabowski_checkout_archive(
             str(self.repo),
             str(self.checkout),
             "owner-a",
@@ -106,6 +106,18 @@ class CheckoutLifecycleTests(unittest.TestCase):
             self.head,
             "topic",
         )
+        if aged:
+            archive = result["archive"]
+            assert isinstance(archive, dict)
+            created_at = int(time.time()) - checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
+            with checkouts._database() as connection:
+                connection.execute(
+                    "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
+                    (created_at, archive["archive_id"]),
+                )
+                connection.commit()
+            archive["created_at_unix"] = created_at
+        return result
 
     def _common_dir(self) -> Path:
         raw = Path(self._git("rev-parse", "--git-common-dir").stdout.strip())
@@ -188,6 +200,79 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertNotIn(f"repo:{self.repo.resolve()}", keys)
 
+    def test_archive_transaction_rolls_back_on_lifecycle_transition_failure(self) -> None:
+        common_dir = self._common_dir()
+        binding = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=self.checkout,
+            owner_id="owner-a",
+            purpose="transaction rollback fixture",
+            source_kind="bureau_task",
+            source_id="STORAGE-LIFECYCLE-V1-T003",
+            artifact_class="operator_worktree",
+            retention_until_unix=int(time.time()) + 3600,
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        with patch.object(
+            checkouts,
+            "_mark_checkout_archived_in_connection",
+            side_effect=RuntimeError("simulated lifecycle transition failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated lifecycle"):
+                self._archive(aged=False)
+
+        self.assertIsNone(
+            checkouts._latest_archive_for_key(binding["checkout_key"])
+        )
+        stored = checkouts._lifecycle_bindings([binding["checkout_key"]])
+        self.assertEqual(stored[binding["checkout_key"]]["phase"], "active")
+        self.assertEqual(checkouts._read_resource_leases(), [])
+
+    def test_archive_releases_operation_lease_when_manifest_write_fails(self) -> None:
+        with patch.object(
+            checkouts,
+            "_write_json_evidence",
+            side_effect=OSError("simulated manifest failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated manifest failure"):
+                self._archive(aged=False)
+
+        self.assertEqual(checkouts._read_resource_leases(), [])
+
+    def test_archive_preserves_committed_state_when_audit_append_fails(self) -> None:
+        common_dir = self._common_dir()
+        binding = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=self.checkout,
+            owner_id="owner-a",
+            purpose="audit failure recovery fixture",
+            source_kind="bureau_task",
+            source_id="STORAGE-LIFECYCLE-V1-T003",
+            artifact_class="operator_worktree",
+            retention_until_unix=int(time.time()) + 3600,
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        with patch.object(
+            checkouts.base,
+            "_append_audit",
+            side_effect=OSError("simulated audit failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated audit failure"):
+                self._archive(aged=False)
+
+        archive = checkouts._latest_archive_for_key(binding["checkout_key"])
+        self.assertIsNotNone(archive)
+        assert archive is not None
+        self.assertTrue(Path(archive["manifest_path"]).is_file())
+        self.assertTrue(all(item["ref"] for item in archive["recovery_refs"]))
+        stored = checkouts._lifecycle_bindings([binding["checkout_key"]])
+        self.assertEqual(stored[binding["checkout_key"]]["phase"], "archived")
+        self.assertEqual(checkouts._read_resource_leases(), [])
+
     def test_disjoint_source_file_lease_does_not_block_archive(self) -> None:
         checkouts.resources.acquire_resources(
             "foreign-source-owner",
@@ -199,6 +284,16 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(
             result["audit"]["coordination_checked"]["resource_leases"], 0
         )
+
+    def test_relevant_same_owner_lease_still_blocks_archive(self) -> None:
+        checkouts.resources.acquire_resources(
+            "owner-a",
+            [f"path:{self.checkout.resolve()}"],
+            purpose="active work still owns checkout path",
+            ttl_seconds=3600,
+        )
+        with self.assertRaisesRegex(RuntimeError, "resources=1"):
+            self._archive()
 
     def test_common_dir_lease_serializes_archive(self) -> None:
         checkouts.resources.acquire_resources(
@@ -328,8 +423,29 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertTrue(linked["lifecycle_decision"]["retention_active"])
         self.assertFalse(linked["cleanup_candidate"])
 
-    def test_inventory_marks_archived_checkout_as_cleanup_candidate(self) -> None:
-        self._archive()
+    def test_inventory_waits_for_archive_grace_before_cleanup_candidate(self) -> None:
+        archive_result = self._archive(aged=False)
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        self.assertEqual(linked["lifecycle_state"], "archived_grace")
+        self.assertFalse(linked["cleanup_candidate"])
+        self.assertFalse(linked["lifecycle_decision"]["archive_grace_elapsed"])
+        archive = archive_result["archive"]
+        assert isinstance(archive, dict)
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
+                (
+                    int(time.time()) - checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
+                    archive["archive_id"],
+                ),
+            )
+            connection.commit()
         inventory = checkouts.checkout_inventory(
             self.repo,
             include_processes=False,
@@ -341,6 +457,18 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(linked["hygiene_mark"], "obsolete")
         self.assertTrue(linked["cleanup_candidate"])
         self.assertTrue(linked["lifecycle_decision"]["requires_cleanup_dry_run"])
+
+    def test_cleanup_dry_run_rejects_fresh_archive(self) -> None:
+        archive = self._archive(aged=False)["archive"]
+        assert isinstance(archive, dict)
+        with self.assertRaisesRegex(RuntimeError, "grace has not elapsed"):
+            checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=True,
+                archive_id=str(archive["archive_id"]),
+            )
 
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         archive = self._archive()["archive"]
@@ -435,6 +563,72 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 expected_plan_sha256=dry_run["plan"]["plan_sha256"],
                 confirmation="remove-linked-checkout",
             )
+
+    def test_completed_retained_limit_blocks_transition_without_deleting_checkout(self) -> None:
+        common_dir = self._common_dir()
+        first_path = self.root / "worktrees" / "first-managed"
+        second_path = self.root / "worktrees" / "second-managed"
+        with patch.object(checkouts, "MAX_COMPLETED_RETAINED_CHECKOUTS_PER_REPO", 1):
+            first = checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=common_dir,
+                repo_path=self.repo,
+                checkout_path=first_path,
+                owner_id="owner-a",
+                purpose="first",
+                source_kind="bureau_task",
+                source_id="T1",
+                artifact_class="operator_worktree",
+                retention_until_unix=int(time.time()) + 3600,
+                expected_head=self.head,
+                expected_branch="topic-one",
+            )
+            second = checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=common_dir,
+                repo_path=self.repo,
+                checkout_path=second_path,
+                owner_id="owner-a",
+                purpose="second",
+                source_kind="bureau_task",
+                source_id="T2",
+                artifact_class="operator_worktree",
+                retention_until_unix=int(time.time()) + 3600,
+                expected_head=self.head,
+                expected_branch="topic-two",
+            )
+            for binding, purpose, branch in (
+                (first, "first", "topic-one"),
+                (second, "second", "topic-two"),
+            ):
+                checkouts._upsert_retention(
+                    checkout_key=binding["checkout_key"],
+                    repo_common_dir=common_dir,
+                    repo_path=self.repo,
+                    checkout_path=Path(binding["checkout_path"]),
+                    owner_id="owner-a",
+                    purpose=purpose,
+                    retention_until_unix=int(time.time()) + 3600,
+                    expected_head=self.head,
+                    expected_branch=branch,
+                )
+            checkouts._mark_checkout_completed_retained(
+                checkout_key=first["checkout_key"],
+                owner_id="owner-a",
+                expected_head=self.head,
+                expected_branch="topic-one",
+            )
+            with self.assertRaisesRegex(RuntimeError, "completed-retained checkout limit"):
+                checkouts._mark_checkout_completed_retained(
+                    checkout_key=second["checkout_key"],
+                    owner_id="owner-a",
+                    expected_head=self.head,
+                    expected_branch="topic-two",
+                )
+        bindings = checkouts._lifecycle_bindings(
+            [first["checkout_key"], second["checkout_key"]]
+        )
+        self.assertEqual(bindings[first["checkout_key"]]["phase"], "completed_retained")
+        self.assertEqual(bindings[second["checkout_key"]]["phase"], "active")
+        self.assertTrue(self.checkout.is_dir())
 
     def test_retention_can_protect_dirty_checkout_and_rejects_foreign_owner(self) -> None:
         (self.checkout / "untracked.txt").write_text("preserve me\n", encoding="utf-8")

@@ -3841,6 +3841,45 @@ def _writer_checkout_lifecycle_purpose(manifest: dict[str, Any]) -> str:
     return f"agent workspace {manifest['workspace_id']} for {kind}:{identifier}"
 
 
+def _writer_checkout_lifecycle_contract(manifest: dict[str, Any]) -> dict[str, Any]:
+    binding = manifest.get("binding")
+    if not isinstance(binding, dict):
+        raise AgentWorkspaceError("workspace checkout lifecycle requires a binding")
+    runtime_seconds = int(manifest["resources"]["runtime_seconds"] or 0)
+    return {
+        "owner_id": str(manifest["resources"]["owner_id"]),
+        "purpose": _writer_checkout_lifecycle_purpose(manifest),
+        "source_kind": str(binding["kind"]),
+        "source_id": str(binding["id"]),
+        "artifact_class": "agent_workspace_writer",
+        "retention_until_unix": _now()
+        + max(WORKSPACE_CLEANUP_RETENTION_SECONDS, runtime_seconds + 900),
+    }
+
+
+def _reserve_writer_checkout_lifecycle(manifest: dict[str, Any]) -> dict[str, Any]:
+    repo = Path(str(manifest["repository"]))
+    checkout = Path(str(manifest["writer_worktree"]))
+    top_level = checkouts._git_top_level(repo)
+    common_dir = checkouts._git_common_dir(repo)
+    contract = _writer_checkout_lifecycle_contract(manifest)
+    reservation = checkouts._reserve_checkout_lifecycle(
+        repo_common_dir=common_dir,
+        repo_path=top_level,
+        checkout_path=checkout,
+        owner_id=contract["owner_id"],
+        purpose=contract["purpose"],
+        source_kind=contract["source_kind"],
+        source_id=contract["source_id"],
+        artifact_class=contract["artifact_class"],
+        retention_until_unix=contract["retention_until_unix"],
+        expected_head=str(manifest["expected_base_head"]),
+        expected_branch=str(manifest["writer_branch"]),
+    )
+    manifest["checkout_lifecycle_reservation"] = reservation
+    return reservation
+
+
 def _bind_writer_checkout_lifecycle(manifest: dict[str, Any]) -> dict[str, Any]:
     repo = Path(str(manifest["repository"]))
     checkout = Path(str(manifest["writer_worktree"]))
@@ -3851,12 +3890,11 @@ def _bind_writer_checkout_lifecycle(manifest: dict[str, Any]) -> dict[str, Any]:
         str(manifest["expected_base_head"]),
         str(manifest["writer_branch"]),
     )
-    owner_id = checkouts._owner(str(manifest["resources"]["owner_id"]))
-    runtime_seconds = int(manifest["resources"]["runtime_seconds"] or 0)
-    retention_until_unix = _now() + max(
-        WORKSPACE_CLEANUP_RETENTION_SECONDS, runtime_seconds + 900
-    )
-    purpose = _writer_checkout_lifecycle_purpose(manifest)
+    contract = _writer_checkout_lifecycle_contract(manifest)
+    owner_id = checkouts._owner(str(contract["owner_id"]))
+    retention_until_unix = int(contract["retention_until_unix"])
+    purpose = str(contract["purpose"])
+    lifecycle_binding = _reserve_writer_checkout_lifecycle(manifest)
     retention = checkouts._upsert_retention(
         checkout_key=str(record["checkout_key"]),
         repo_common_dir=common_dir,
@@ -3876,6 +3914,10 @@ def _bind_writer_checkout_lifecycle(manifest: dict[str, Any]) -> dict[str, Any]:
         "checkout_path": retention["checkout_path"],
         "repo_common_dir": retention["repo_common_dir"],
         "owner_id": retention["owner_id"],
+        "source": lifecycle_binding["source"],
+        "artifact_class": lifecycle_binding["artifact_class"],
+        "phase": lifecycle_binding["phase"],
+        "limit": lifecycle_binding["limit"],
         "task": {
             "binding_kind": binding["kind"],
             "binding_id": binding["id"],
@@ -3892,9 +3934,16 @@ def _bind_writer_checkout_lifecycle(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def _release_failed_workspace_checkout_lifecycle(manifest: dict[str, Any]) -> bool:
+    checkout = Path(str(manifest.get("writer_worktree") or ""))
+    if os.path.lexists(checkout):
+        return False
+    reservation = manifest.get("checkout_lifecycle_reservation")
+    binding_released = True
+    if isinstance(reservation, dict):
+        binding_released = checkouts._release_checkout_lifecycle_exact(reservation)
     lifecycle = manifest.get("checkout_lifecycle")
     if not isinstance(lifecycle, dict):
-        return True
+        return binding_released
     checkout_key = lifecycle.get("checkout_key")
     owner_id = lifecycle.get("owner_id")
     if not isinstance(checkout_key, str) or not isinstance(owner_id, str):
@@ -3952,7 +4001,7 @@ def _release_failed_workspace_checkout_lifecycle(manifest: dict[str, Any]) -> bo
             ),
         )
         connection.commit()
-    return deleted.rowcount == 1
+    return binding_released and deleted.rowcount == 1
 
 
 def _terminal_writer_checkout_decision(
@@ -3974,6 +4023,13 @@ def _terminal_writer_checkout_decision(
             ],
         }
     dirty = bool(snapshot.get("dirty"))
+    observed_head = str(snapshot.get("writer_head") or "")
+    completed_binding = checkouts._mark_checkout_completed_retained(
+        checkout_key=str(lifecycle["checkout_key"]),
+        owner_id=str(lifecycle["owner_id"]),
+        expected_head=observed_head,
+        expected_branch=str(lifecycle["expected_branch"]),
+    )
     return {
         "schema_version": 1,
         "state": "terminal_decision_recorded",
@@ -3986,6 +4042,10 @@ def _terminal_writer_checkout_decision(
         "checkout_key": lifecycle.get("checkout_key"),
         "checkout_path": lifecycle.get("checkout_path"),
         "owner_id": lifecycle.get("owner_id"),
+        "source": completed_binding.get("source"),
+        "artifact_class": completed_binding.get("artifact_class"),
+        "lifecycle_phase": completed_binding.get("phase"),
+        "limit": completed_binding.get("limit"),
         "task": lifecycle.get("task"),
         "purpose": lifecycle.get("purpose"),
         "created_at_unix": lifecycle.get("created_at_unix"),
@@ -4339,6 +4399,20 @@ def grabowski_agent_workspace_create(
         )
         repo = Path(str(plan["repository"]))
         worktree = Path(str(plan["writer_worktree"]))
+        lifecycle_reservation = _reserve_writer_checkout_lifecycle(manifest)
+        _append_workspace_event(
+            manifest,
+            "writer_checkout_lifecycle_reserved",
+            role="writer",
+            outcome="reserved",
+            evidence={
+                "checkout_key": lifecycle_reservation["checkout_key"],
+                "source": lifecycle_reservation["source"],
+                "artifact_class": lifecycle_reservation["artifact_class"],
+                "limit": lifecycle_reservation["limit"],
+            },
+        )
+        _write_manifest(manifest)
         worktree_create_attempted = True
         _checked(
             _run,
@@ -5444,6 +5518,9 @@ def grabowski_agent_workspace_close(
             "abandon_failed_roles": abandon_failed_roles,
             "closure_outcome": "abandoned_failed_roles" if failed_roles else "successful",
         }
+        receipt["checkout_lifecycle_decision"] = (
+            _terminal_writer_checkout_decision(manifest, snapshot)
+        )
         _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
         if remove_tmux_session and _tmux_has_session(str(manifest["session_name"])):
             killed = _tmux_result(["kill-session", "-t", str(manifest["session_name"])])
@@ -5494,10 +5571,6 @@ def grabowski_agent_workspace_close(
         remaining_resource_keys = expected_resource_keys & observed_live_keys
         receipt["remaining_resource_keys"] = sorted(remaining_resource_keys)
         receipt["resources_released"] = not remaining_resource_keys
-        if not remaining_resource_keys:
-            receipt["checkout_lifecycle_decision"] = (
-                _terminal_writer_checkout_decision(manifest, snapshot)
-            )
         if remaining_resource_keys:
             receipt["state"] = "resource_release_incomplete"
             receipt["receipt_sha256"] = _sha256_json(receipt)
@@ -6603,7 +6676,7 @@ def grabowski_agent_workspace_cleanup(
         reusable_archive_id = None
         if (
             isinstance(prior_intent, dict)
-            and prior_intent.get("state") == "failed"
+            and prior_intent.get("state") in {"failed", "waiting_grace"}
             and prior_intent.get("writer_worktree") == plan["writer_worktree"]
             and prior_intent.get("writer_branch") == plan["checkout"]["branch"]
             and prior_intent.get("writer_head") == plan["checkout"]["head"]
@@ -6657,6 +6730,57 @@ def grabowski_agent_workspace_cleanup(
                 current_intent["archive_id"] = archive_id
                 manifest["workspace_cleanup_intent"] = current_intent
                 _write_manifest(manifest)
+        archive_record = checkouts._load_archive(archive_id)
+        archive_age_seconds = max(
+            0, _now() - int(archive_record["created_at_unix"])
+        )
+        if archive_age_seconds < checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS:
+            with _lock(identifier):
+                manifest = _manifest(identifier)
+                current_intent = manifest.get("workspace_cleanup_intent")
+                if (
+                    not isinstance(current_intent, dict)
+                    or current_intent.get("intent_id") != intent["intent_id"]
+                ):
+                    raise AgentWorkspaceActionError(
+                        "workspace cleanup intent changed during archive grace"
+                    )
+                current_intent.update(
+                    {
+                        "state": "waiting_grace",
+                        "archive_id": archive_id,
+                        "archive_created_at_unix": archive_record["created_at_unix"],
+                        "archive_age_seconds": archive_age_seconds,
+                        "archive_grace_seconds": (
+                            checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
+                        ),
+                        "updated_at": _utc(),
+                    }
+                )
+                manifest["workspace_cleanup_intent"] = current_intent
+                _append_workspace_event(
+                    manifest,
+                    "workspace_cleanup_archive_grace",
+                    outcome="waiting",
+                    evidence={
+                        "intent_id": intent["intent_id"],
+                        "archive_id": archive_id,
+                        "archive_age_seconds": archive_age_seconds,
+                        "archive_grace_seconds": (
+                            checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
+                        ),
+                    },
+                )
+                _write_manifest(manifest)
+            return {
+                "workspace_id": identifier,
+                "state": "archived_waiting_grace",
+                "idempotent": False,
+                "archive_id": archive_id,
+                "archive_age_seconds": archive_age_seconds,
+                "archive_grace_seconds": checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
+                "worktree_preserved": True,
+            }
         dry_run = checkouts.grabowski_checkout_cleanup(
             repo=plan["repository"],
             checkout_path=plan["writer_worktree"],
@@ -6737,7 +6861,7 @@ def grabowski_agent_workspace_cleanup(
         "state": "cleaned",
         "idempotent": False,
         "cleanup_receipt": receipt,
-        "archive": archive_result.get("archive") if archive_id != reusable_archive_id else None,
+        "archive": archive_record,
         "checkout_cleanup": applied,
     }
 

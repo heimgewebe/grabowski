@@ -102,6 +102,11 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "branch",
             "target_path",
             "lease_owner_id",
+            "purpose",
+            "retention_until_unix",
+            "source_kind",
+            "source_id",
+            "artifact_class",
             "idempotency_key",
         ),
         acceptance_ids=(

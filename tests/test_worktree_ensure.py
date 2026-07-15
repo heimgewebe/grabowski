@@ -70,6 +70,7 @@ class WorktreeEnsureTests(unittest.TestCase):
             checkout_patch.start()
             self.addCleanup(checkout_patch.stop)
         self.owner = "test-owner"
+        self.retention_until = int(time.time()) + 2 * 24 * 60 * 60
         self.friction_events: list[dict[str, object]] = []
         self.friction_closeouts: list[dict[str, object]] = []
 
@@ -92,13 +93,18 @@ class WorktreeEnsureTests(unittest.TestCase):
         branch: str = "feat/worktree-case",
         target: Path | None = None,
         owner: str | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         return {
             "repo": str(self.repo),
             "base_head": self.head,
             "branch": branch,
             "target_path": str(target or (self.worktree_root / "case")),
             "lease_owner_id": owner or self.owner,
+            "purpose": "implement the bound checkout test",
+            "retention_until_unix": self.retention_until,
+            "source_kind": "bureau_task",
+            "source_id": "STORAGE-LIFECYCLE-V1-T003",
+            "artifact_class": "operator_worktree",
             "idempotency_key": key,
         }
 
@@ -122,7 +128,7 @@ class WorktreeEnsureTests(unittest.TestCase):
 
     def _ensure(
         self,
-        parameters: dict[str, str],
+        parameters: dict[str, object],
         *,
         runner=grips._default_command_runner,
         inspect_lease=None,
@@ -138,6 +144,45 @@ class WorktreeEnsureTests(unittest.TestCase):
                 record_friction=self._record_friction,
                 resolve_friction=self._resolve_friction,
             )
+
+    def test_creation_contract_rejects_missing_explicit_lifecycle_fields(self) -> None:
+        for missing in (
+            "purpose",
+            "retention_until_unix",
+            "source_kind",
+            "source_id",
+            "artifact_class",
+        ):
+            parameters = self._parameters(key=f"missing-{missing}")
+            parameters.pop(missing)
+            with self.subTest(missing=missing):
+                with self.assertRaisesRegex(
+                    worktree_ensure.WorktreeEnsurePreflight, missing
+                ):
+                    self._ensure(parameters)
+                self.assertFalse(Path(str(parameters["target_path"])).exists())
+
+    def test_active_limit_blocks_new_growth_without_deleting_existing_checkout(self) -> None:
+        first = self._parameters(
+            key="limit-first",
+            branch="feat/limit-first",
+            target=self.worktree_root / "limit-first",
+        )
+        second = self._parameters(
+            key="limit-second",
+            branch="feat/limit-second",
+            target=self.worktree_root / "limit-second",
+        )
+        with patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1):
+            created = self._ensure(first)
+            blocked = self._ensure(second)
+
+        self.assertEqual(created["result_state"], "CREATED")
+        self.assertEqual(blocked["result_state"], "NOT_ACCEPTED")
+        self.assertEqual(blocked["error_class"], "CHECKOUT_LIFECYCLE_REJECTED")
+        self.assertIn("active checkout limit", blocked["error"])
+        self.assertTrue(Path(str(first["target_path"])).is_dir())
+        self.assertFalse(Path(str(second["target_path"])).exists())
 
     def test_creates_and_replays_same_durable_result(self) -> None:
         parameters = self._parameters()
@@ -159,7 +204,13 @@ class WorktreeEnsureTests(unittest.TestCase):
             lifecycle["task"],
             {"kind": "worktree_ensure", "id": "worktree-ensure:worktree-case-1"},
         )
-        self.assertIn("worktree-ensure:worktree-case-1", lifecycle["purpose"])
+        self.assertEqual(lifecycle["purpose"], "implement the bound checkout test")
+        self.assertEqual(
+            lifecycle["source"],
+            {"kind": "bureau_task", "id": "STORAGE-LIFECYCLE-V1-T003"},
+        )
+        self.assertEqual(lifecycle["artifact_class"], "operator_worktree")
+        self.assertEqual(lifecycle["limit"]["maximum"], 8)
         self.assertEqual(lifecycle["expected_head"], self.head)
         self.assertEqual(lifecycle["expected_branch"], "feat/worktree-case")
         self.assertEqual(lifecycle["terminal_decision"], "retain")
@@ -476,7 +527,42 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(result["result_state"], "NOT_ACCEPTED")
         self.assertEqual(result["error_class"], "GIT_WORKTREE_ADD_REJECTED")
         self.assertFalse(Path(parameters["target_path"]).exists())
+        common_dir = checkouts._git_common_dir(self.repo)
+        checkout_key = checkouts._checkout_key(
+            common_dir, Path(str(parameters["target_path"]))
+        )
+        self.assertEqual(checkouts._lifecycle_bindings([checkout_key]), {})
         self.assertEqual(len(self.friction_events), 1)
+
+    def test_partial_conflict_preserves_lifecycle_binding(self) -> None:
+        parameters = self._parameters(
+            key="partial-conflict",
+            branch="feat/partial-conflict",
+            target=self.worktree_root / "partial-conflict",
+        )
+
+        def dirtying_runner(repo: Path, argv: list[str]) -> dict[str, object]:
+            result = grips._default_command_runner(repo, argv)
+            if argv[:3] == ["worktree", "add", "-b"] and result["returncode"] == 0:
+                target = Path(str(parameters["target_path"]))
+                (target / "untracked.txt").write_text("partial\n", encoding="utf-8")
+            return result
+
+        result = self._ensure(parameters, runner=dirtying_runner)
+
+        self.assertEqual(result["result_state"], "CONFLICT")
+        self.assertEqual(result["error_class"], "POST_MUTATION_CONFLICT")
+        self.assertTrue(Path(str(parameters["target_path"])).is_dir())
+        reservation = result["lifecycle_reservation"]
+        self.assertTrue(reservation["preserved"])
+        self.assertFalse(reservation["released"])
+        binding = reservation["binding"]
+        self.assertEqual(binding["phase"], "active")
+        self.assertEqual(binding["source"]["id"], "STORAGE-LIFECYCLE-V1-T003")
+        self.assertIn(
+            binding["checkout_key"],
+            checkouts._lifecycle_bindings([binding["checkout_key"]]),
+        )
 
     def test_surface_dispatches_successful_worktree_ensure_receipt(self) -> None:
         parameters = self._parameters(key="surface-success")

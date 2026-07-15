@@ -11,9 +11,13 @@ The call binds these normalized values into one immutable idempotency identity:
 - branch name;
 - absolute target path below the repository parent;
 - lease owner;
+- explicit purpose;
+- exact retention deadline;
+- source kind and source identity (for example a Bureau task or PR);
+- artifact class;
 - caller-supplied idempotency key.
 
-Both `repo:<repo>` and `path:<target>` leases must be live and owned by the declared owner before a new mutation. The grip never creates, renews, steals or force-releases leases.
+Both `repo:<repo>` and `path:<target>` leases must be live and owned by the declared owner before a new mutation. The grip never creates, renews, steals or force-releases leases. Before `git worktree add`, it also reserves an owner-bound lifecycle record. Missing source/purpose/retention/artifact fields, a conflicting existing binding, or the per-repository active-checkout limit reject the request before Git mutation. Existing foreign or legacy checkouts are never removed to make room.
 
 ## Result states
 
@@ -21,9 +25,9 @@ Both `repo:<repo>` and `path:<target>` leases must be live and owned by the decl
 - `ALREADY_CORRECT`: a fresh call found the exact clean state already present.
 - `CONFLICT`: target, branch, current head, cleanliness or receipt binding disagrees with the request.
 - `REJECTED_BY_LEASE`: a new mutation lacks both required live owner-bound leases.
-- `NOT_ACCEPTED`: Git returned without producing the requested verified state.
+- `NOT_ACCEPTED`: Git returned without producing the requested verified state, or the lifecycle contract rejected new growth before Git mutation.
 
-Every terminal result is written atomically to an owner-only durable receipt. Receipt and lock files are bounded regular files opened without symlink following. The receipt carries an integrity digest, normalized-input digest, lease observation, bounded command outcome and exact post-state.
+Every terminal result is written atomically to an owner-only durable receipt. Receipt and lock files are bounded regular files opened without symlink following. The receipt carries an integrity digest, normalized-input digest, lease observation, lifecycle source/artifact/limit evidence, bounded command outcome and exact post-state.
 
 ## Interruption recovery
 
