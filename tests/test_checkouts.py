@@ -107,6 +107,10 @@ class CheckoutLifecycleTests(unittest.TestCase):
             "topic",
         )
 
+    def _common_dir(self) -> Path:
+        raw = Path(self._git("rev-parse", "--git-common-dir").stdout.strip())
+        return (self.repo / raw).resolve() if not raw.is_absolute() else raw.resolve()
+
     def test_parent_directory_is_not_a_checkout_process_scope(self) -> None:
         parent = self.root
         self.assertFalse(
@@ -171,6 +175,50 @@ class CheckoutLifecycleTests(unittest.TestCase):
 
         self.assertEqual(archive["audit"]["coordination_checked"]["processes"], 0)
 
+
+    def test_archive_uses_exact_checkout_and_common_dir_operation_leases(self) -> None:
+        result = self._archive()
+        keys = {item["resource_key"] for item in result["lease"]["leases"]}
+        self.assertEqual(
+            keys,
+            {
+                f"path:{self.checkout.resolve()}",
+                f"path:{self._common_dir()}",
+            },
+        )
+        self.assertNotIn(f"repo:{self.repo.resolve()}", keys)
+
+    def test_disjoint_source_file_lease_does_not_block_archive(self) -> None:
+        checkouts.resources.acquire_resources(
+            "foreign-source-owner",
+            [f"path:{self.repo / 'README.md'}"],
+            purpose="edit disjoint source file",
+            ttl_seconds=3600,
+        )
+        result = self._archive()
+        self.assertEqual(
+            result["audit"]["coordination_checked"]["resource_leases"], 0
+        )
+
+    def test_common_dir_lease_serializes_archive(self) -> None:
+        checkouts.resources.acquire_resources(
+            "foreign-git-owner",
+            [f"path:{self._common_dir()}"],
+            purpose="mutate shared Git metadata",
+            ttl_seconds=3600,
+        )
+        with self.assertRaisesRegex(RuntimeError, "resources=1"):
+            self._archive()
+
+    def test_broad_repo_lease_still_blocks_archive(self) -> None:
+        checkouts.resources.acquire_resources(
+            "foreign-broad-owner",
+            [f"repo:{self.repo}"],
+            purpose="unknown broad repository mutation",
+            ttl_seconds=3600,
+        )
+        with self.assertRaisesRegex(RuntimeError, "resources=1"):
+            self._archive()
 
     def test_archive_preserves_repo_scoped_task_blocker(self) -> None:
         with checkouts.tasks._database() as connection:
