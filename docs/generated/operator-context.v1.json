@@ -1464,6 +1464,48 @@
     },
     {
       "category": "agent-workspace",
+      "description": "Inventory cleanup eligibility without deleting workspace evidence or a checkout.",
+      "effects": [],
+      "id": "grabowski_agent_workspace_cleanup_plan",
+      "purpose": "Inventory closed workspace checkout cleanup eligibility while preserving manifests, receipts and event logs.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_agent_workspace_cleanup_plan"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Mark one provably inactive stale workspace abandoned without stopping or deleting anything.",
+      "effects": [
+        "receipt-create",
+        "workspace-event-append",
+        "audit-append"
+      ],
+      "id": "grabowski_agent_workspace_reconcile_stale",
+      "purpose": "Mark one provably inactive stale workspace abandoned without stopping tasks, releasing resources or removing its checkout.",
+      "read_only": false,
+      "reversibility": "historical-evidence-retained",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_reconcile_stale"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Archive and remove one eligible closed writer checkout while preserving all workspace evidence.",
+      "effects": [
+        "checkout-archive",
+        "recovery-ref-create",
+        "worktree-remove",
+        "receipt-create"
+      ],
+      "id": "grabowski_agent_workspace_cleanup",
+      "purpose": "Create durable recovery refs and remove one eligible closed writer checkout without deleting workspace evidence.",
+      "read_only": false,
+      "reversibility": "restore-from-checkout-archive",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_cleanup"
+    },
+    {
+      "category": "agent-workspace",
       "description": "Recommend direct, workspace, contrast or competition execution without authorizing it.",
       "effects": [],
       "id": "grabowski_agent_execution_route",
@@ -1784,6 +1826,9 @@
       "grabowski_agent_workspace_close",
       "grabowski_agent_workspace_observe",
       "grabowski_agent_workspace_optimize",
+      "grabowski_agent_workspace_cleanup_plan",
+      "grabowski_agent_workspace_reconcile_stale",
+      "grabowski_agent_workspace_cleanup",
       "grabowski_agent_execution_route",
       "grabowski_agent_competition_start",
       "grabowski_agent_competition_status",
@@ -1960,7 +2005,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "8720755da0f19f397d1f9bfc80a48e7117b9d104a0fe10740032d1492e0ff7d5"
+      "sha256": "1b8af322b8997fb1bed2ce2b718d53b29e76f890d40ac79953f90409ea69e600"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -1968,19 +2013,19 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "8afcc76b890ee0880fcf57d4bba8999d2166510715d2c981eb5c1595744537d7"
+      "sha256": "7a32c47858b1b19c0e51edc8ff4a5f9a40d7e22c40a8b7a036289dc7fc050321"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "c8c47bda693fbf40df69344aa527bf94ff1820cc5be86ea48b14f452100f9b54",
       "src/grabowski_agent_competition.py": "90617a0c5993f20dee5cfb3425e9f62877ef09b3330a10e38812c29f06e55282",
       "src/grabowski_agent_role.py": "207c9e7389940c6e7491057701fb8c1c1534779e7ad799129d81038bbc1304fc",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "ce37a3c2cdfba15f25c083cb4388c7764f9cc632941727c8bf12a082e4f05cad",
+      "src/grabowski_agent_workspace.py": "919f6842117402a1efb5ea61cf3f2c9802e306f6dbe2b1469c3ab22950d73179",
       "src/grabowski_agent_workspace_observer.py": "7eadc3fa89005037ee38b4a425f96ed6b233392dc7f4596b75d016e2221aac78",
       "src/grabowski_agent_writer.py": "1ccf0168b78db145c36292397410eb8878b78ad004e1795cfe5a490763530b69",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "8720755da0f19f397d1f9bfc80a48e7117b9d104a0fe10740032d1492e0ff7d5",
+      "src/grabowski_capabilities.py": "1b8af322b8997fb1bed2ce2b718d53b29e76f890d40ac79953f90409ea69e600",
       "src/grabowski_checkouts.py": "abb1a73e1c90c0ffdb47547b5df961547551d80d7bb034e2fbc27f05ae93504c",
       "src/grabowski_chronik.py": "6a37342b5741763db16f2792dc5370fd9fe6e7e1dc7965b7f6a8c54f8c55ec62",
       "src/grabowski_command_identity.py": "03bf7193851846d1f5b4d1bfe71a787937e424804f875ba4e021233ddbc842c9",
@@ -1991,7 +2036,7 @@
       "src/grabowski_grips.py": "4ad550de87a128361a7e67ce4683de9ada7020584d1873c20fcdf70c75829389",
       "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
-      "src/grabowski_mcp.py": "3900af7facd6889e44ec65f72c627d2694c0d0f442b1ddab4cf9cc47a577b847",
+      "src/grabowski_mcp.py": "865564b8f1cb1c29e58318909bb29df503dd43304919bff0522b838b299ac46e",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "214233836855c6c60c76d504e41467f04ddcbaa6a2a104c83eacb30a936cf6bd",

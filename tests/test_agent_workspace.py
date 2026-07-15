@@ -4361,5 +4361,688 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
 
 
+    def _closed_cleanup_manifest(self) -> dict:
+        manifest = self.manifest()
+        receipt = signed_receipt(
+            {
+                "schema_version": 1,
+                "state": "complete",
+                "workspace_id": manifest["workspace_id"],
+                "expected_head": self.git.base,
+                "expected_diff_sha256": "d" * 64,
+                "expected_result_sha256": "e" * 64,
+                "closed_at": "2026-01-01T00:00:00+00:00",
+                "task_states": {
+                    "writer": {"task_id": "writer-task", "state": "completed", "terminal": True},
+                    "tests": {"task_id": None, "state": "not_started", "terminal": False},
+                    "review": {"task_id": None, "state": "not_started", "terminal": False},
+                },
+                "cancelled_roles": [],
+                "writer_worktree": manifest["writer_worktree"],
+                "writer_branch": manifest["writer_branch"],
+                "worktree_preserved": True,
+                "branch_preserved": True,
+                "dirty": False,
+                "tmux_removed": False,
+                "resources_released": True,
+                "released_resource_keys": manifest["resources"]["lease_keys"],
+                "remaining_resource_keys": [],
+                "resource_release_error": None,
+                "no_unsecured_changes_discarded": True,
+                "failed_roles": [],
+                "abandon_failed_roles": False,
+                "closure_outcome": "successful",
+            }
+        )
+        manifest["close_receipt"] = receipt
+        workspace._atomic_json(
+            self.state / manifest["workspace_id"] / "close-receipt.json",
+            receipt,
+        )
+        workspace._write_manifest(manifest)
+        return manifest
+
+    def test_cleanup_plan_marks_closed_clean_linked_worktree_eligible(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+        ):
+            report = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )
+        plan = report["plans"][0]
+        self.assertTrue(plan["eligible"])
+        self.assertFalse(plan["execution_authorized"])
+        self.assertTrue(plan["historical_evidence_preserved"])
+        self.assertFalse(plan["workspace_state_deleted"])
+        self.assertEqual(report["summary"]["eligible_count"], 1)
+
+    def test_cleanup_plan_blocks_open_workspace(self) -> None:
+        manifest = self.manifest()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+        ):
+            report = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )
+        plan = report["plans"][0]
+        self.assertFalse(plan["eligible"])
+        self.assertIn("workspace_not_closed", {item["code"] for item in plan["blockers"]})
+
+    def test_cleanup_plan_blocks_shared_worktree_referenced_by_open_workspace(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        shared = dict(manifest)
+        shared["workspace_id"] = "gaw-shared-open-workspace-0001"
+        shared["close_receipt"] = None
+        shared_dir = self.state / shared["workspace_id"]
+        shared_dir.mkdir()
+        workspace._atomic_json(shared_dir / "manifest.json", shared)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+        ):
+            report = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )
+        plan = report["plans"][0]
+        blocker = next(
+            item
+            for item in plan["blockers"]
+            if item["code"] == "worktree_referenced_by_open_workspace"
+        )
+        self.assertEqual(blocker["workspace_ids"], [shared["workspace_id"]])
+        self.assertFalse(plan["eligible"])
+
+    def test_cleanup_plan_blocks_dirty_worktree(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        with mock.patch.object(workspace.operator, "_require_operator_capability"):
+            report = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )
+        plan = report["plans"][0]
+        self.assertFalse(plan["eligible"])
+        self.assertIn("checkout_not_clean_linked", {item["code"] for item in plan["blockers"]})
+        self.assertTrue(self.git.writer.exists())
+
+    def test_cleanup_archives_removes_and_preserves_workspace_evidence_idempotently(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        checkout_state = self.root / "checkout-state"
+        patches = [
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_state / "checkouts.sqlite3"),
+            mock.patch.object(workspace.checkouts, "ARCHIVE_ROOT", checkout_state / "archives"),
+            mock.patch.object(workspace.checkouts, "CHECKOUT_LOCK", checkout_state / "checkouts.lock"),
+            mock.patch.object(workspace.checkouts.resources, "RESOURCE_DB", checkout_state / "resources.sqlite3"),
+            mock.patch.object(workspace.checkouts.tasks, "TASK_DB", checkout_state / "tasks.sqlite3"),
+            mock.patch.object(workspace.checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.checkouts.base, "_append_audit"),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+        ]
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11]:
+            report = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )
+            plan = report["plans"][0]
+            self.assertTrue(plan["eligible"])
+            result = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "archive-and-remove-worktree",
+            )
+            replay = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "archive-and-remove-worktree",
+            )
+        self.assertEqual(result["state"], "cleaned")
+        self.assertEqual(replay["state"], "already_cleaned")
+        self.assertTrue(replay["idempotent"])
+        self.assertFalse(self.git.writer.exists())
+        workspace_dir = self.state / manifest["workspace_id"]
+        self.assertTrue((workspace_dir / "manifest.json").is_file())
+        self.assertTrue((workspace_dir / "writer-receipt.json").is_file())
+        self.assertTrue((workspace_dir / "cleanup-receipt.json").is_file())
+        persisted = workspace._manifest(manifest["workspace_id"])
+        receipt = persisted["workspace_cleanup_receipt"]
+        self.assertTrue(workspace._valid_workspace_cleanup_receipt(receipt))
+        self.assertTrue(receipt["historical_evidence_preserved"])
+        self.assertFalse(receipt["workspace_state_deleted"])
+        archive = result["archive"]
+        for item in archive["recovery_refs"]:
+            self.assertEqual(
+                run(self.git.repo, "git", "rev-parse", "--verify", f"{item['ref']}^{{commit}}"),
+                item["target"],
+            )
+
+
+    def test_cleanup_plan_blocks_invalid_close_receipt(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        manifest["close_receipt"]["closure_outcome"] = "tampered"
+        workspace._write_manifest(manifest)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+        ):
+            report = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )
+        plan = report["plans"][0]
+        self.assertFalse(plan["closed"])
+        self.assertFalse(plan["close_receipt_integrity"]["valid"])
+        self.assertFalse(plan["eligible"])
+        self.assertIn(
+            "workspace_close_receipt_invalid",
+            {item["code"] for item in plan["blockers"]},
+        )
+
+    def test_cleanup_plan_marks_closed_missing_worktree_already_absent(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        subprocess.run(
+            ["git", "worktree", "remove", str(self.git.writer)],
+            cwd=self.git.repo,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        with mock.patch.object(workspace.operator, "_require_operator_capability"):
+            report = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )
+        plan = report["plans"][0]
+        self.assertTrue(plan["closed"])
+        self.assertTrue(plan["already_absent"])
+        self.assertFalse(plan["already_cleaned"])
+        self.assertFalse(plan["eligible"])
+        self.assertEqual(plan["blockers"], [])
+        self.assertEqual(report["summary"]["already_absent_count"], 1)
+        self.assertEqual(report["summary"]["blocked_count"], 0)
+
+    def test_stale_plan_is_stable_and_reconcile_preserves_runtime_state(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        workspace._write_manifest(manifest)
+        writer_receipt = self.state / manifest["workspace_id"] / "writer-receipt.json"
+        writer_receipt_before = writer_receipt.read_bytes()
+
+        def task_public(task_id: str | None) -> dict:
+            if task_id is None:
+                return {"task_id": None, "state": "not_started", "terminal": False}
+            return {
+                "task_id": task_id,
+                "state": "completed",
+                "terminal": True,
+                "host": "heim-pc",
+                "unit": "test.service",
+            }
+
+        task_cancel = mock.Mock()
+        release_resources = mock.Mock()
+        archive = mock.Mock()
+        checkout_cleanup = mock.Mock()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace, "_task_public", side_effect=task_public),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace.resources, "release_resources", release_resources),
+            mock.patch.object(workspace.tasks, "grabowski_task_cancel", task_cancel),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace.checkouts, "grabowski_checkout_archive", archive),
+            mock.patch.object(workspace.checkouts, "grabowski_checkout_cleanup", checkout_cleanup),
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            first = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            second = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            result = workspace.grabowski_agent_workspace_reconcile_stale(
+                manifest["workspace_id"],
+                first["plan_sha256"],
+                "mark-stale-workspace-abandoned",
+            )
+            replay = workspace.grabowski_agent_workspace_reconcile_stale(
+                manifest["workspace_id"],
+                first["plan_sha256"],
+                "mark-stale-workspace-abandoned",
+            )
+
+        self.assertEqual(first["plan_sha256"], second["plan_sha256"])
+        self.assertTrue(first["stale_reconciliation"]["eligible"])
+        self.assertEqual(result["state"], "stale_workspace_reconciled")
+        self.assertEqual(replay["state"], "already_closed")
+        self.assertTrue(replay["idempotent"])
+        receipt = result["close_receipt"]
+        self.assertEqual(receipt["closure_outcome"], "abandoned_stale_workspace")
+        self.assertFalse(receipt["task_mutation_performed"])
+        self.assertFalse(receipt["resource_mutation_performed"])
+        self.assertFalse(receipt["worktree_mutation_performed"])
+        self.assertTrue(receipt["historical_evidence_preserved"])
+        self.assertFalse(self.git.writer.exists())
+        self.assertEqual(writer_receipt.read_bytes(), writer_receipt_before)
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertTrue(
+            workspace._close_integrity_status(
+                persisted, persisted["close_receipt"]
+            )["valid"]
+        )
+        events = [
+            json.loads(line)
+            for line in workspace._event_log_path(manifest["workspace_id"])
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line
+        ]
+        self.assertEqual(events[-1]["event_type"], "workspace_stale_reconciled")
+        task_cancel.assert_not_called()
+        release_resources.assert_not_called()
+        archive.assert_not_called()
+        checkout_cleanup.assert_not_called()
+
+    def test_stale_reconciliation_blocks_live_resources(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.resources,
+                "list_resources",
+                return_value=[{"resource_key": "path:/live"}],
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        stale = plan["stale_reconciliation"]
+        self.assertFalse(stale["eligible"])
+        self.assertIn(
+            "workspace_resources_live",
+            {item["code"] for item in stale["blockers"]},
+        )
+
+    def test_stale_reconciliation_blocks_shared_open_worktree_reference(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        shared = dict(manifest)
+        shared["workspace_id"] = "gaw-shared-stale-workspace-0001"
+        shared_dir = self.state / shared["workspace_id"]
+        shared_dir.mkdir()
+        workspace._atomic_json(shared_dir / "manifest.json", shared)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        stale = plan["stale_reconciliation"]
+        self.assertFalse(stale["eligible"])
+        blocker = next(
+            item
+            for item in stale["blockers"]
+            if item["code"] == "shared_worktree_open_reference"
+        )
+        self.assertEqual(blocker["workspace_ids"], [shared["workspace_id"]])
+
+
+    def test_cleanup_owner_is_derived_and_not_caller_controlled(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        observed: dict[str, str] = {}
+
+        def coordination(*args, **kwargs):
+            del args
+            observed["owner_id"] = kwargs["owner_id"]
+            return {"blocking": False, "blocking_counts": {}}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                side_effect=coordination,
+            ),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        expected = f"agent-workspace-cleanup:{manifest['workspace_id']}"
+        self.assertEqual(plan["owner_id"], expected)
+        self.assertEqual(observed["owner_id"], expected)
+
+    def test_cleanup_plan_blocks_incomplete_workspace_reference_inventory(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        broken_id = "gaw-broken-workspace-reference-0001"
+        broken_dir = self.state / broken_id
+        broken_dir.mkdir()
+        (broken_dir / "manifest.json").write_text("{broken", encoding="utf-8")
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        self.assertFalse(plan["eligible"])
+        self.assertIn(
+            "workspace_reference_inventory_incomplete",
+            {item["code"] for item in plan["blockers"]},
+        )
+        self.assertIn(
+            "workspace_reference_inventory_incomplete",
+            {
+                item["code"]
+                for item in plan["stale_reconciliation"]["blockers"]
+            },
+        )
+        self.assertEqual(
+            plan["workspace_reference_scan_errors"][0]["workspace_id"],
+            broken_id,
+        )
+
+    def test_cleanup_receipt_requires_file_manifest_identity(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        receipt = signed_receipt(
+            {
+                "schema_version": 1,
+                "workspace_id": manifest["workspace_id"],
+                "source_plan_sha256": "a" * 64,
+                "writer_worktree": manifest["writer_worktree"],
+                "writer_branch": manifest["writer_branch"],
+                "archive_id": "20260101T000000Z-000000000000",
+                "checkout_cleanup_plan_id": "plan-1",
+                "checkout_cleanup_plan_sha256": "b" * 64,
+                "applied_at_unix": 1,
+                "historical_evidence_preserved": True,
+                "workspace_state_deleted": False,
+                "reconciled_after_missing_worktree": False,
+            }
+        )
+        manifest["workspace_cleanup_receipt"] = receipt
+        workspace._write_manifest(manifest)
+        stored = dict(receipt)
+        stored["archive_id"] = "20260101T000000Z-111111111111"
+        workspace._atomic_json(
+            self.state / manifest["workspace_id"] / "cleanup-receipt.json",
+            stored,
+        )
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        self.assertFalse(plan["cleanup_receipt_integrity"]["valid"])
+        self.assertIn(
+            "cleanup_receipt_invalid",
+            {item["code"] for item in plan["blockers"]},
+        )
+
+    def test_stale_reconciliation_blocks_orphan_close_receipt(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        orphan = signed_receipt(
+            {
+                "schema_version": 1,
+                "state": "complete",
+                "workspace_id": manifest["workspace_id"],
+                "resources_released": True,
+            }
+        )
+        workspace._atomic_json(
+            self.state / manifest["workspace_id"] / "close-receipt.json",
+            orphan,
+        )
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        self.assertIn(
+            "workspace_close_outcome_unknown",
+            {item["code"] for item in plan["blockers"]},
+        )
+        self.assertIn(
+            "workspace_close_outcome_unknown",
+            {
+                item["code"]
+                for item in plan["stale_reconciliation"]["blockers"]
+            },
+        )
+
+    def test_dirty_workspace_still_checks_active_coordination(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        coordination = {
+            "blocking": True,
+            "blocking_counts": {
+                "resource_leases": 1,
+                "tasks": 0,
+                "processes": 1,
+            },
+        }
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value=coordination,
+            ) as check_coordination,
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        check_coordination.assert_called_once()
+        stale_codes = {
+            item["code"] for item in plan["stale_reconciliation"]["blockers"]
+        }
+        self.assertIn("stale_workspace_dirty_checkout", stale_codes)
+        self.assertIn("stale_workspace_checkout_coordination_active", stale_codes)
+
+    def test_cleanup_reconciles_exact_archive_after_checkout_removal(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        checkout_state = self.root / "checkout-reconcile-state"
+        patches = [
+            mock.patch.object(
+                workspace.checkouts,
+                "CHECKOUT_DB",
+                checkout_state / "checkouts.sqlite3",
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "ARCHIVE_ROOT",
+                checkout_state / "archives",
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "CHECKOUT_LOCK",
+                checkout_state / "checkouts.lock",
+            ),
+            mock.patch.object(
+                workspace.checkouts.resources,
+                "RESOURCE_DB",
+                checkout_state / "resources.sqlite3",
+            ),
+            mock.patch.object(
+                workspace.checkouts.tasks,
+                "TASK_DB",
+                checkout_state / "tasks.sqlite3",
+            ),
+            mock.patch.object(
+                workspace.checkouts.operator,
+                "_safe_environment",
+                return_value=os.environ.copy(),
+            ),
+            mock.patch.object(
+                workspace.checkouts.operator, "_require_operator_mutation"
+            ),
+            mock.patch.object(
+                workspace.checkouts.operator, "_require_operator_capability"
+            ),
+            mock.patch.object(workspace.checkouts.base, "_append_audit"),
+            mock.patch.object(
+                workspace.checkouts, "_processes_under", return_value=[]
+            ),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ]
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+            patches[8],
+            patches[9],
+            patches[10],
+            patches[11],
+            patches[12],
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            owner = workspace._workspace_cleanup_owner(manifest["workspace_id"])
+            archived = workspace.checkouts.grabowski_checkout_archive(
+                repo=plan["repository"],
+                checkout_path=plan["writer_worktree"],
+                owner_id=owner,
+                purpose="crash reconciliation proof",
+                retention_until_unix=workspace._now() + 3600,
+                expected_head=plan["checkout"]["head"],
+                expected_branch=plan["checkout"]["branch"],
+            )
+            archive = archived["archive"]
+            dry_run = workspace.checkouts.grabowski_checkout_cleanup(
+                repo=plan["repository"],
+                checkout_path=plan["writer_worktree"],
+                owner_id=owner,
+                dry_run=True,
+                archive_id=archive["archive_id"],
+                expected_head=plan["checkout"]["head"],
+                expected_branch=plan["checkout"]["branch"],
+            )
+            workspace.checkouts.grabowski_checkout_cleanup(
+                repo=plan["repository"],
+                checkout_path=plan["writer_worktree"],
+                owner_id=owner,
+                dry_run=False,
+                archive_id=archive["archive_id"],
+                plan_id=dry_run["dry_run_record"]["plan_id"],
+                expected_plan_sha256=dry_run["plan"]["plan_sha256"],
+                confirmation="remove-linked-checkout",
+            )
+            current = workspace._manifest(manifest["workspace_id"])
+            current["workspace_cleanup_intent"] = {
+                "schema_version": 1,
+                "intent_id": "crash-reconcile-proof",
+                "state": "started",
+                "source_plan_sha256": plan["plan_sha256"],
+                "owner_id": owner,
+                "writer_worktree": plan["writer_worktree"],
+                "writer_branch": plan["checkout"]["branch"],
+                "writer_head": plan["checkout"]["head"],
+                "archive_id": archive["archive_id"],
+                "started_at": "2026-01-01T00:00:00+00:00",
+            }
+            workspace._write_manifest(current)
+            result = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "archive-and-remove-worktree",
+            )
+        self.assertEqual(result["state"], "cleanup_reconciled")
+        self.assertTrue(
+            result["cleanup_receipt"]["reconciled_after_missing_worktree"]
+        )
+        self.assertFalse(self.git.writer.exists())
+
+    def test_cleanup_finalize_rejects_archive_owner_mismatch(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        expected_hash = "a" * 64
+        owner = workspace._workspace_cleanup_owner(manifest["workspace_id"])
+        manifest["workspace_cleanup_intent"] = {
+            "state": "started",
+            "source_plan_sha256": expected_hash,
+            "owner_id": owner,
+            "writer_worktree": manifest["writer_worktree"],
+            "writer_branch": manifest["writer_branch"],
+            "writer_head": self.git.base,
+            "archive_id": "20260101T000000Z-000000000000",
+        }
+        archive = {
+            "archive_id": manifest["workspace_cleanup_intent"]["archive_id"],
+            "checkout_path": manifest["writer_worktree"],
+            "head": self.git.base,
+            "branch": manifest["writer_branch"],
+            "owner_id": "foreign-owner",
+            "cleaned_at_unix": 1,
+            "cleanup_plan_id": "plan-1",
+        }
+        with mock.patch.object(
+            workspace.checkouts, "_load_archive", return_value=archive
+        ):
+            result = workspace._workspace_cleanup_finalize_missing(
+                manifest, expected_hash, owner
+            )
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()
