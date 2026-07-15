@@ -422,6 +422,27 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["recovery-marker-write"],
         "reversibility": "new-snapshot-retained",
     },
+    "grabowski_operator_blockade_status": {
+        "category": "recovery",
+        "purpose": "Evaluate scoped typed, legacy and environment blockades for one action context.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_operator_blockade_engage": {
+        "category": "recovery",
+        "purpose": "Create one canonical typed operator blockade through the dedicated create-only lifecycle.",
+        "risk_class": "high",
+        "effects": ["blockade-marker-create", "audit-record"],
+        "reversibility": "evidence-bound-disarm",
+    },
+    "grabowski_operator_blockade_disarm": {
+        "category": "recovery",
+        "purpose": "Quarantine one exact typed blockade after live audit, deployment, recovery and broker evidence passes.",
+        "risk_class": "high",
+        "effects": ["blockade-marker-quarantine", "audit-record"],
+        "reversibility": "hash-bound-restore-on-failure",
+    },
     "grabowski_friction_record": {
         "category": "operations-observability",
         "purpose": "Record one bounded operator-friction event for later analysis.",

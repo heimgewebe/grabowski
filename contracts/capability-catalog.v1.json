@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "1b8af322b8997fb1bed2ce2b718d53b29e76f890d40ac79953f90409ea69e600",
+  "capability_source_sha256": "63de035c85349e5539e751391f5520d382b0f2f6ed904d0273df4f05a5842813",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "7a32c47858b1b19c0e51edc8ff4a5f9a40d7e22c40a8b7a036289dc7fc050321",
+  "contract_sha256": "58a6ae924032f824c341dbfeab8943a1511b75df92add6eb0f310c068fb2f1d3",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1008,6 +1008,45 @@
       "reversibility": "new-snapshot-retained",
       "risk_class": "high",
       "tool": "grabowski_recovery_server_probe"
+    },
+    {
+      "category": "recovery",
+      "description": "Evaluate current typed, legacy and environment blockades for one action.",
+      "effects": [],
+      "id": "grabowski_operator_blockade_status",
+      "purpose": "Evaluate scoped typed, legacy and environment blockades for one action context.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_operator_blockade_status"
+    },
+    {
+      "category": "recovery",
+      "description": "Create one canonical typed blockade marker without replacing any entry.",
+      "effects": [
+        "blockade-marker-create",
+        "audit-record"
+      ],
+      "id": "grabowski_operator_blockade_engage",
+      "purpose": "Create one canonical typed operator blockade through the dedicated create-only lifecycle.",
+      "read_only": false,
+      "reversibility": "evidence-bound-disarm",
+      "risk_class": "high",
+      "tool": "grabowski_operator_blockade_engage"
+    },
+    {
+      "category": "recovery",
+      "description": "Quarantine one exact typed blockade after live recovery evidence passes.",
+      "effects": [
+        "blockade-marker-quarantine",
+        "audit-record"
+      ],
+      "id": "grabowski_operator_blockade_disarm",
+      "purpose": "Quarantine one exact typed blockade after live audit, deployment, recovery and broker evidence passes.",
+      "read_only": false,
+      "reversibility": "hash-bound-restore-on-failure",
+      "risk_class": "high",
+      "tool": "grabowski_operator_blockade_disarm"
     },
     {
       "category": "operations-observability",

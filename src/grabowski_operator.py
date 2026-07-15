@@ -355,13 +355,28 @@ def _require_operator_capability(capability: str) -> None:
         raise PermissionError(f"Operator capability is not enabled: {capability}")
 
 
-def _require_operator_mutation(capability: str) -> None:
+def _require_operator_mutation(
+    capability: str,
+    *,
+    path: str | None = None,
+    task_id: str | None = None,
+    owner_id: str | None = None,
+    repo: str | None = None,
+    service: str | None = None,
+    host: str | None = None,
+    fresh_preflight: bool = False,
+) -> None:
     _require_operator_capability(capability)
-    state = base._kill_switch_state()
-    if state["engaged"]:
-        raise PermissionError(
-            "Grabowski operator kill switch is engaged; mutating tools are disabled."
-        )
+    base._require_blockade_allows_mutation(
+        capability,
+        path=path,
+        task_id=task_id,
+        owner_id=owner_id,
+        repo=repo,
+        service=service,
+        host=host,
+        fresh_preflight=fresh_preflight,
+    )
     base._require_valid_audit_chain()
 
 
@@ -452,6 +467,29 @@ def _argument_targets_evidence(value: str, cwd: Path) -> bool:
     return False
 
 
+def _argument_targets_canonical_blockade_marker(value: str, cwd: Path) -> bool:
+    marker = base.KILL_SWITCH_PATH.resolve(strict=False)
+    expanded_value = _expand_home_references(value)
+    if str(marker) in expanded_value:
+        return True
+    for candidate in _argument_path_candidates(value):
+        candidate = _expand_home_references(candidate)
+        if str(marker) in candidate:
+            return True
+        if not _path_like_argument(candidate):
+            continue
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = cwd / path
+        try:
+            resolved = path.resolve(strict=False)
+        except OSError:
+            resolved = path.absolute()
+        if resolved == marker:
+            return True
+    return False
+
+
 def _validate_argv(argv: list[str], *, cwd: Path | None = None) -> list[str]:
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise ValueError("argv must be a non-empty list of non-empty strings")
@@ -468,12 +506,16 @@ def _validate_argv(argv: list[str], *, cwd: Path | None = None) -> list[str]:
     base._reject_forbidden_hosts_in_argv(argv, policy=policy)
 
     working_directory = HOME if cwd is None else cwd
-    if not trusted_owner:
-        for item in argv:
-            if _argument_targets_evidence(item, working_directory):
-                raise PermissionError(
-                    "Direct command arguments may not target immutable evidence."
-                )
+    for item in argv:
+        if _argument_targets_canonical_blockade_marker(item, working_directory):
+            raise PermissionError(
+                "Direct command arguments may not target the canonical operator "
+                "blockade marker; use the typed blockade lifecycle."
+            )
+        if not trusted_owner and _argument_targets_evidence(item, working_directory):
+            raise PermissionError(
+                "Direct command arguments may not target immutable evidence."
+            )
 
     return argv
 
@@ -2659,8 +2701,8 @@ def grabowski_terminal_run(
     cwd: str | None = None,
 ) -> dict[str, Any]:
     """Run one direct command with fixed server-owned synchronous limits."""
-    _require_operator_mutation("terminal_execute")
     working_directory = _resolve_cwd(cwd)
+    _require_operator_mutation("terminal_execute", path=str(working_directory))
     command = _validate_argv(argv, cwd=working_directory)
     timeout = SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS
     output_limit = SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES
@@ -2917,10 +2959,11 @@ def grabowski_job_start(
     notify_on_done: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Start a durable background command as a transient user systemd unit."""
-    _require_operator_mutation("durable_job")
+    working_directory = _resolve_cwd(cwd)
+    _require_operator_mutation("durable_job", path=str(working_directory))
     return _start_job(
         argv,
-        cwd=cwd,
+        cwd=str(working_directory),
         runtime_seconds=runtime_seconds,
         notify_on_done=notify_on_done,
     )
@@ -3061,8 +3104,8 @@ def grabowski_job_notification_ack(
     expected_receipt_sha256: str,
 ) -> dict[str, Any]:
     """Acknowledge one exact operator-outbox receipt idempotently."""
-    _require_operator_mutation("durable_job")
     name = _validate_unit(unit, job_only=True)
+    _require_operator_mutation("durable_job", task_id=name)
     if not re.fullmatch(r"[0-9a-f]{64}", expected_receipt_sha256):
         raise ValueError("expected_receipt_sha256 must be a SHA-256 digest")
     directory = _job_directory(name)
@@ -3161,8 +3204,8 @@ def grabowski_job_logs(
 @mcp.tool(name="grabowski_job_cancel", annotations=MUTATING)
 def grabowski_job_cancel(unit: str) -> dict[str, Any]:
     """Stop one Grabowski background job."""
-    _require_operator_mutation("durable_job")
     name = _validate_unit(unit, job_only=True)
+    _require_operator_mutation("durable_job", task_id=name)
     return _run(
         ["systemctl", "--user", "stop", name],
         cwd=HOME,
@@ -3178,8 +3221,8 @@ def grabowski_git(
     timeout_seconds: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     """Run Git with a fail-closed single-branch push subset."""
-    _require_operator_mutation("git_cli")
     path = Path(repo).expanduser().resolve(strict=True)
+    _require_operator_mutation("git_cli", path=str(path), repo=str(path))
     if not path.is_dir():
         raise ValueError(f"Repository path is not a directory: {path}")
     if (path == EVIDENCE_ROOT or EVIDENCE_ROOT in path.parents) and not _trusted_owner_mode():
@@ -3232,10 +3275,10 @@ def grabowski_github(
     timeout_seconds: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     """Run GitHub CLI with redacted output."""
-    _require_operator_mutation("github_cli")
     if not arguments:
         raise ValueError("GitHub CLI arguments must not be empty")
     working_directory = _resolve_cwd(cwd)
+    _require_operator_mutation("github_cli", path=str(working_directory))
     command = _validate_argv(["gh", *arguments], cwd=working_directory)
     return _run(
         command,
@@ -3266,7 +3309,7 @@ def grabowski_user_service(
     if action not in allowed:
         raise ValueError(f"action must be one of {sorted(allowed)}")
     if action not in {"status", "logs"}:
-        _require_operator_mutation("user_service_control")
+        _require_operator_mutation("user_service_control", service=name)
 
     if action == "logs":
         if max_lines < 1 or max_lines > 2000:

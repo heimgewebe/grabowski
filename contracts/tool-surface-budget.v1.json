@@ -1340,7 +1340,82 @@
       }
     ]
   },
-  "accepted_additions": {},
+  "accepted_additions": {
+    "grabowski_operator_blockade_status": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Blockade observation must remain available while ordinary mutation authority is frozen and therefore requires a separately reviewable immutable recovery surface.",
+      "evidence_refs": [
+        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
+        "tests:test_blockade_runtime.py"
+      ],
+      "operation_alternative_considered": "A typed operation was rejected because operation dispatch itself is mutation-gated and cannot guarantee the immutable status lane during a blockade.",
+      "exception_detail": {
+        "claim": "The tool owns only immutable blockade observation authority.",
+        "evidence": "Read-only annotation, empty effects, scoped decision tests and no filesystem mutation."
+      },
+      "tool_contract": {
+        "tool": "grabowski_operator_blockade_status",
+        "category": "recovery",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "grabowski_operator_blockade_engage": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "The canonical blockade marker must be creatable only through one create-only, schema-valid, audit-bound authority that generic file and command surfaces cannot inherit.",
+      "evidence_refs": [
+        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
+        "docs/proofs/operator-blockade-store-v1.md",
+        "tests:test_blockade_runtime.py"
+      ],
+      "operation_alternative_considered": "A typed operation was rejected because generic operation execution would inherit broader terminal or file authority and could not enforce the exact marker transaction contract.",
+      "exception_detail": {
+        "claim": "The tool exclusively owns canonical typed blockade engagement.",
+        "evidence": "Generic file and command paths reject the marker; create-only store and exact rollback tests bind the authority."
+      },
+      "tool_contract": {
+        "tool": "grabowski_operator_blockade_engage",
+        "category": "recovery",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "audit-record",
+          "blockade-marker-create"
+        ],
+        "reversibility": "evidence-bound-disarm"
+      }
+    },
+    "grabowski_operator_blockade_disarm": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Disarm must remain a narrowly evidence-bound recovery authority distinct from ordinary mutation and require exact hashes, fresh recovery evidence and reversible quarantine.",
+      "evidence_refs": [
+        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
+        "docs/proofs/operator-blockade-store-v1.md",
+        "tests:test_blockade_runtime.py"
+      ],
+      "operation_alternative_considered": "A typed operation was rejected because the generic operation authority cannot safely bypass a blockade while preserving exact marker identity, rollback and recovery-gate requirements.",
+      "exception_detail": {
+        "claim": "The tool exclusively owns exact in-band blockade disarm.",
+        "evidence": "Hash-bound preconditions, external-stop denial, recovery checks, quarantine receipts and restore-on-audit-failure tests."
+      },
+      "tool_contract": {
+        "tool": "grabowski_operator_blockade_disarm",
+        "category": "recovery",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "audit-record",
+          "blockade-marker-quarantine"
+        ],
+        "reversibility": "hash-bound-restore-on-failure"
+      }
+    }
+  },
   "retired_tools": {},
   "operation_catalog": {
     "schema_version": 1,

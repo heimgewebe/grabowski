@@ -31,6 +31,7 @@ from grabowski_blockade_store import (  # noqa: E402
     engage_blockade_marker,
     read_blockade_marker,
     restore_disarmed_marker,
+    rollback_engaged_marker,
 )
 
 
@@ -136,6 +137,54 @@ class BlockadeStoreTests(unittest.TestCase):
         self.assertEqual(receipt.record_sha256, self.item.sha256)
         self.assertEqual(receipt.transaction_id, "engage-1")
         self.assertTrue(receipt.to_mapping()["create_only"])
+
+    def test_exact_engage_rollback_removes_only_matching_marker(self) -> None:
+        receipt = self.engage()
+        result = rollback_engaged_marker(
+            receipt,
+            self.marker,
+            expected_marker_path=self.marker,
+        )
+        self.assertFalse(self.marker.exists())
+        self.assertTrue(result["source_absent_readback"])
+        self.assertEqual(
+            result["removed_marker_file_sha256"], receipt.marker_file_sha256
+        )
+        self.assertEqual(result["removed_record_sha256"], receipt.record_sha256)
+
+    def test_engage_rollback_rejects_identity_drift_before_mutation(self) -> None:
+        receipt = self.engage()
+        mismatched = blockade_store.EngageReceipt(
+            transaction_id=receipt.transaction_id,
+            created_at=receipt.created_at,
+            marker_path=receipt.marker_path,
+            marker_file_sha256="0" * 64,
+            record_sha256=receipt.record_sha256,
+            record=receipt.record,
+        )
+        with self.assertRaisesRegex(BlockadeRecoveryDenied, "does not match"):
+            rollback_engaged_marker(
+                mismatched,
+                self.marker,
+                expected_marker_path=self.marker,
+            )
+        self.assertTrue(self.marker.is_file())
+        self.assertEqual(
+            self.marker.read_bytes(), canonical_json(self.item.to_mapping())
+        )
+
+    def test_engage_rollback_surfaces_unverified_unlink(self) -> None:
+        receipt = self.engage()
+        with mock.patch(
+            "grabowski_blockade_store._unlink_same_inode", return_value=False
+        ):
+            with self.assertRaisesRegex(BlockadeRollbackError, "absence was verified"):
+                rollback_engaged_marker(
+                    receipt,
+                    self.marker,
+                    expected_marker_path=self.marker,
+                )
+        self.assertTrue(self.marker.is_file())
 
     def test_engage_rolls_back_if_post_publish_readback_fails(self) -> None:
         with mock.patch(

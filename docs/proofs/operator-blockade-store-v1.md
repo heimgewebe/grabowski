@@ -53,6 +53,15 @@ ordinary readback or publication error.
 No replacement path exists. If an existing file, symlink or other directory
 entry occupies the canonical name, engagement fails without changing it.
 
+If the caller cannot publish and verify the engagement audit record,
+`rollback_engaged_marker` may remove only the exact marker described by that
+in-memory `EngageReceipt`. It reopens the canonical marker through the trusted
+path, requires identical record and file hashes, unlinks the bound inode, fsyncs
+the parent and verifies absence. Identity drift is denied before mutation; an
+unverifiable unlink raises `BlockadeRollbackError`. This narrow rollback is for
+an uncommitted engagement only and does not replace the evidence-bound disarm
+path for an audited marker.
+
 ## Disarm
 
 `disarm_blockade_marker` first runs the pure evidence validator. It then binds
@@ -103,6 +112,7 @@ recovery failure behind the original exception.
 
 - create-only publication and winner preservation;
 - post-publication engage rollback and explicit unverified-rollback failure;
+- exact uncommitted-engage rollback, identity-drift denial and unlink failure;
 - trusted-path mismatch;
 - symlinked directory chains;
 - non-private parent or quarantine directories;

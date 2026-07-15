@@ -29,6 +29,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 import grabowski_consumer_surface as consumer_surface
+import grabowski_blockades as blockade_policy
+import grabowski_blockade_store as blockade_store
 
 import grabowski_grips
 
@@ -267,6 +269,9 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     'grabowski_task_reconcile_resume': ('durable_job',),
     'grabowski_recovery_status': ('audit_verify',),
     'grabowski_recovery_server_probe': ('file_write', 'secret_use', 'terminal_execute'),
+    'grabowski_operator_blockade_status': ('audit_verify',),
+    'grabowski_operator_blockade_engage': ('audit_verify', 'file_write'),
+    'grabowski_operator_blockade_disarm': ('audit_verify',),
     'grabowski_friction_record': ('friction_record',),
     'grabowski_friction_resolve': ('friction_record',),
     'grabowski_friction_summary': (),
@@ -1159,15 +1164,116 @@ def _require_capability(capability: str) -> None:
         raise PermissionError(f"Access capability is not enabled: {capability}")
 
 
-def _kill_switch_state() -> dict[str, Any]:
+def _operator_blockade_records() -> tuple[tuple[blockade_policy.BlockadeRecord, ...], dict[str, Any]]:
+    records: list[blockade_policy.BlockadeRecord] = []
+    diagnostics: dict[str, Any] = {"marker_error": None, "marker_source": None}
+    host = platform.node() or "unknown-host"
     env_value = os.environ.get("GRABOWSKI_OPERATOR_KILL_SWITCH", "")
     env_engaged = env_value.lower() in {"1", "true", "yes", "on"}
-    file_engaged = KILL_SWITCH_PATH.is_file()
+    if env_engaged:
+        records.append(
+            blockade_policy.environment_stop_record(
+                value_sha256=hashlib.sha256(env_value.encode("utf-8")).hexdigest(),
+                engaged_at=datetime.fromtimestamp(0, timezone.utc),
+                host=host,
+            )
+        )
+    marker_present = KILL_SWITCH_PATH.exists() or KILL_SWITCH_PATH.is_symlink()
+    if marker_present:
+        try:
+            snapshot = blockade_store.read_blockade_marker(
+                KILL_SWITCH_PATH,
+                expected_marker_path=KILL_SWITCH_PATH,
+            )
+            records.append(snapshot.record)
+            diagnostics["marker_source"] = "typed"
+            diagnostics["marker_file_sha256"] = snapshot.file_sha256
+            diagnostics["marker_record_sha256"] = snapshot.record_sha256
+        except Exception as exc:
+            try:
+                metadata = os.lstat(KILL_SWITCH_PATH)
+            except OSError as observation_error:
+                identity = {
+                    "strict_error": type(exc).__name__,
+                    "lstat_error": type(observation_error).__name__,
+                    "path": str(KILL_SWITCH_PATH),
+                }
+                digest = hashlib.sha256(
+                    json.dumps(
+                        identity, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                records.append(
+                    blockade_policy.legacy_marker_record(
+                        marker_path=str(KILL_SWITCH_PATH),
+                        marker_sha256=digest,
+                        engaged_at=datetime.fromtimestamp(0, timezone.utc),
+                        host=host,
+                    )
+                )
+                diagnostics["marker_source"] = "marker_observation_uncertain"
+                diagnostics["marker_error"] = (
+                    f"{type(exc).__name__}: {exc}; "
+                    f"{type(observation_error).__name__}: {observation_error}"
+                )[:500]
+                diagnostics["marker_file_sha256"] = digest
+            else:
+                identity = {
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "mode": metadata.st_mode,
+                    "nlink": metadata.st_nlink,
+                    "uid": metadata.st_uid,
+                    "gid": metadata.st_gid,
+                    "size": metadata.st_size,
+                    "mtime_ns": metadata.st_mtime_ns,
+                    "ctime_ns": metadata.st_ctime_ns,
+                }
+                digest = hashlib.sha256(
+                    json.dumps(
+                        identity, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                records.append(
+                    blockade_policy.legacy_marker_record(
+                        marker_path=str(KILL_SWITCH_PATH),
+                        marker_sha256=digest,
+                        engaged_at=datetime.fromtimestamp(
+                            metadata.st_ctime, timezone.utc
+                        ),
+                        host=host,
+                    )
+                )
+                diagnostics["marker_source"] = "legacy_file"
+                diagnostics["marker_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                diagnostics["marker_file_sha256"] = digest
+    return tuple(records), diagnostics
+
+
+def _kill_switch_state() -> dict[str, Any]:
+    records, diagnostics = _operator_blockade_records()
+    active = tuple(record for record in records if record.active_at())
+    postures = [record.posture for record in active]
+    effective = (
+        max(postures, key=blockade_policy.POSTURE_ORDER.__getitem__)
+        if postures
+        else None
+    )
+    globally_engaged = any(
+        record.scope.kind == "global"
+        and record.posture in {"mutation_freeze", "hard_stop"}
+        for record in active
+    )
     return {
-        "engaged": env_engaged or file_engaged,
-        "environment": env_engaged,
+        "engaged": globally_engaged,
+        "present": bool(active),
+        "environment": any(record.source == "environment" for record in active),
         "path": str(KILL_SWITCH_PATH),
-        "path_exists": file_engaged,
+        "path_exists": KILL_SWITCH_PATH.exists() or KILL_SWITCH_PATH.is_symlink(),
+        "effective_posture": effective,
+        "records": [record.to_mapping() for record in active],
+        "record_sha256s": [record.sha256 for record in active],
+        "diagnostics": diagnostics,
     }
 
 
@@ -1177,13 +1283,66 @@ def _require_valid_audit_chain() -> None:
         raise RuntimeError(f"Audit log verification failed: {audit['error']}")
 
 
-def _require_mutations_enabled(capability: str) -> None:
-    _require_capability(capability)
-    state = _kill_switch_state()
-    if state["engaged"]:
+def _require_blockade_allows_mutation(
+    capability: str,
+    *,
+    path: str | None = None,
+    task_id: str | None = None,
+    owner_id: str | None = None,
+    repo: str | None = None,
+    service: str | None = None,
+    host: str | None = None,
+    fresh_preflight: bool = False,
+    allow_blockade_lifecycle: bool = False,
+) -> None:
+    if allow_blockade_lifecycle and path != str(KILL_SWITCH_PATH):
+        raise PermissionError("blockade lifecycle authority is marker-path bound")
+    records, _diagnostics = _operator_blockade_records()
+    decision = blockade_policy.evaluate_blockades(
+        records,
+        blockade_policy.ActionContext(
+            action_class="mutate",
+            path=path,
+            capability=capability,
+            task_id=task_id,
+            owner_id=owner_id,
+            repo=repo,
+            service=service,
+            host=host or platform.node() or "unknown-host",
+            fresh_preflight=fresh_preflight,
+        ),
+    )
+    if not decision.allowed:
         raise PermissionError(
-            "Grabowski operator kill switch is engaged; mutating tools are disabled."
+            "Grabowski operator kill switch/blockade denies mutation: "
+            + ",".join(decision.reasons)
         )
+
+
+def _require_mutations_enabled(
+    capability: str,
+    *,
+    path: str | None = None,
+    task_id: str | None = None,
+    owner_id: str | None = None,
+    repo: str | None = None,
+    service: str | None = None,
+    host: str | None = None,
+    fresh_preflight: bool = False,
+    allow_blockade_lifecycle: bool = False,
+) -> None:
+    _require_capability(capability)
+    _require_blockade_allows_mutation(
+        capability,
+        path=path,
+        task_id=task_id,
+        owner_id=owner_id,
+        repo=repo,
+        service=service,
+        host=host,
+        fresh_preflight=fresh_preflight,
+        allow_blockade_lifecycle=allow_blockade_lifecycle,
+    )
     _require_valid_audit_chain()
 
 
@@ -1309,6 +1468,11 @@ def _resolve_write_target(raw_path: str) -> tuple[Path, bool]:
     if _path_is_sensitive(resolved) and not trusted_owner:
         raise PermissionError(
             "Path is inside configured secret/browser roots; use dedicated tools."
+        )
+
+    if _canonical_operator_marker_target(resolved):
+        raise PermissionError(
+            f"Canonical operator blockade marker requires typed lifecycle tools: {resolved}"
         )
 
     if _protected_generic_write_target(resolved) and not trusted_owner:
@@ -1460,6 +1624,10 @@ def _audit_quarantine_path(raw_path: Any, expected_type: str) -> Path:
     if not _path_inside(resolved, quarantine_root):
         raise PermissionError("Quarantine preimage is outside Grabowski state")
     return resolved
+
+
+def _canonical_operator_marker_target(path: Path) -> bool:
+    return path.resolve(strict=False) == KILL_SWITCH_PATH.resolve(strict=False)
 
 
 def _protected_generic_write_target(path: Path) -> bool:
@@ -4102,8 +4270,8 @@ def grabowski_browser_profile_read(
 @mcp.tool(name="grabowski_create_text", annotations=CREATE_ANNOTATIONS)
 def grabowski_create_text(path: str, content: str) -> dict[str, Any]:
     """Use this when a new UTF-8 text file must be created inside an allowed write root. It fails if the path already exists."""
-    _require_mutations_enabled("file_write")
     target, exists = _resolve_write_target(path)
+    _require_mutations_enabled("file_write", path=str(target))
     if exists:
         raise FileExistsError(f"Refusing to overwrite existing path: {target}")
 
@@ -4173,8 +4341,8 @@ def grabowski_create_text(path: str, content: str) -> dict[str, Any]:
 @mcp.tool(name="grabowski_replace_text", annotations=REPLACE_ANNOTATIONS)
 def grabowski_replace_text(path: str, content: str, expected_sha256: str) -> dict[str, Any]:
     """Use this when an existing allowed UTF-8 text file must be replaced atomically. The exact SHA-256 returned by grabowski_read_text or grabowski_stat is required."""
-    _require_mutations_enabled("file_write")
     target, exists = _resolve_write_target(path)
+    _require_mutations_enabled("file_write", path=str(target))
     if not exists:
         raise FileNotFoundError(f"Use grabowski_create_text for new files: {target}")
 
@@ -4267,8 +4435,8 @@ def grabowski_remove_path(
     expected_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Remove one allowed regular file or empty directory into quarantine for audit-backed restoration."""
-    _require_mutations_enabled("file_delete")
     target, exists = _resolve_write_target(path)
+    _require_mutations_enabled("file_delete", path=str(target))
     if not exists:
         raise FileNotFoundError(f"Removal target is missing: {target}")
     snapshot = _removal_snapshot(target, expected_type, expected_sha256)
@@ -4336,7 +4504,7 @@ def grabowski_remove_path(
 @mcp.tool(name="grabowski_restore_removed_path", annotations=REMOVE_ANNOTATIONS)
 def grabowski_restore_removed_path(transaction_id: str) -> dict[str, Any]:
     """Restore one path from a reversible audited filesystem removal transaction."""
-    _require_mutations_enabled("file_delete")
+    _require_capability("file_delete")
     source = _find_transaction_record(transaction_id)
     if source.get("operation") != "remove":
         raise ValueError("Only remove transactions can be restored")
@@ -4345,6 +4513,7 @@ def grabowski_restore_removed_path(transaction_id: str) -> dict[str, Any]:
     if not isinstance(raw_path, str):
         raise ValueError("Audit transaction has no target path")
     target, exists = _resolve_write_target(raw_path)
+    _require_mutations_enabled("file_delete", path=str(target))
     if exists:
         raise FileExistsError(f"Restore target already exists: {target}")
 
@@ -4452,10 +4621,11 @@ def grabowski_destroy_path(
     expected_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Irreversibly remove one allowed regular file or empty directory with a separate explicit capability."""
-    _require_mutations_enabled("file_destroy")
+    _require_capability("file_destroy")
     if confirmation != "permanently-delete":
         raise ValueError("confirmation must be exactly 'permanently-delete'")
     target, exists = _resolve_write_target(path)
+    _require_mutations_enabled("file_destroy", path=str(target))
     if not exists:
         raise FileNotFoundError(f"Destroy target is missing: {target}")
     snapshot = _removal_snapshot(target, expected_type, expected_sha256)
@@ -4515,7 +4685,7 @@ def grabowski_destroy_path(
 @mcp.tool(name="grabowski_rollback_text", annotations=REPLACE_ANNOTATIONS)
 def grabowski_rollback_text(transaction_id: str) -> dict[str, Any]:
     """Restore the quarantined preimage for one audited replace transaction."""
-    _require_mutations_enabled("rollback_text")
+    _require_capability("rollback_text")
     source = _find_transaction_record(transaction_id)
     if source.get("operation") != "replace":
         raise ValueError("Only replace transactions can be rolled back")
@@ -4524,6 +4694,7 @@ def grabowski_rollback_text(transaction_id: str) -> dict[str, Any]:
     if not isinstance(raw_path, str):
         raise ValueError("Audit transaction has no target path")
     target, exists = _resolve_write_target(raw_path)
+    _require_mutations_enabled("rollback_text", path=str(target))
     if not exists:
         raise FileNotFoundError(f"Rollback target is missing: {target}")
 
