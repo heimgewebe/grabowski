@@ -273,10 +273,114 @@ class AgentCompetitionTests(unittest.TestCase):
             risk_flags=["security", "concurrency"],
             user_requested_external=True,
             available_external_agents=["claude", "agy"],
+            decision_fork=True,
+            architecture_hypotheses=2,
         )
         self.assertEqual(competitive["execution_mode"], "workspace_with_competition")
+        self.assertEqual(competitive["risk_tier"], "R3")
+        self.assertEqual(competitive["route_policy_version"], "workspace-routing-v2.1")
         self.assertFalse(competitive["automatic_winner_selection"])
         self.assertEqual(len(competitive["external_candidates"]), 2)
+
+
+    def test_route_v21_keeps_routine_code_out_of_full_workspace(self) -> None:
+        four_files = competition.grabowski_agent_execution_route(
+            task_kind="code",
+            changed_file_estimate=4,
+            expected_duration_minutes=30,
+            novelty="low",
+            available_external_agents=["claude"],
+        )
+        six_files = competition.grabowski_agent_execution_route(
+            task_kind="code",
+            changed_file_estimate=6,
+            expected_duration_minutes=55,
+            novelty="low",
+            available_external_agents=["claude"],
+        )
+        self.assertEqual(four_files["execution_mode"], "isolated_worktree")
+        self.assertEqual(six_files["execution_mode"], "isolated_worktree")
+        self.assertEqual(four_files["risk_tier"], "R1")
+        self.assertFalse(four_files["full_workspace"])
+
+    def test_route_v21_contrast_and_competition_require_distinct_gates(self) -> None:
+        base = dict(
+            task_kind="code",
+            changed_file_estimate=18,
+            expected_duration_minutes=180,
+            novelty="high",
+            risk_flags=["schema"],
+            user_requested_external=True,
+            available_external_agents=["claude", "agy"],
+        )
+        contrast = competition.grabowski_agent_execution_route(**base)
+        competition_route = competition.grabowski_agent_execution_route(
+            **base,
+            decision_fork=True,
+            architecture_hypotheses=2,
+        )
+        self.assertEqual(contrast["execution_mode"], "workspace_with_contrast")
+        self.assertEqual(len(contrast["external_candidates"]), 1)
+        self.assertEqual(
+            competition_route["execution_mode"], "workspace_with_competition"
+        )
+        self.assertEqual(len(competition_route["external_candidates"]), 2)
+
+    def test_parallelization_candidate_does_not_authorize_or_change_live_route(self) -> None:
+        kwargs = dict(
+            task_kind="code",
+            changed_file_estimate=18,
+            expected_duration_minutes=240,
+            novelty="high",
+            risk_flags=["schema"],
+            available_external_agents=[],
+        )
+        baseline = competition.grabowski_agent_execution_route(**kwargs)
+        candidate = competition.grabowski_agent_execution_route(
+            **kwargs, parallelization_candidate=True
+        )
+        self.assertEqual(candidate["score"], baseline["score"])
+        self.assertEqual(candidate["execution_mode"], baseline["execution_mode"])
+        self.assertTrue(
+            candidate["parallel_writer_pilot"]["eligible_for_assessment"]
+        )
+        self.assertFalse(
+            candidate["parallel_writer_pilot"]["execution_authorized"]
+        )
+        self.assertFalse(
+            candidate["parallel_writer_pilot"]["workspace_group_implemented"]
+        )
+
+    def test_legacy_parallel_alias_is_safe_and_conflicts_fail_closed(self) -> None:
+        legacy = competition.grabowski_agent_execution_route(
+            task_kind="code",
+            changed_file_estimate=4,
+            expected_duration_minutes=30,
+            novelty="low",
+            parallel_work=True,
+            available_external_agents=[],
+        )
+        explicit = competition.grabowski_agent_execution_route(
+            task_kind="code",
+            changed_file_estimate=4,
+            expected_duration_minutes=30,
+            novelty="low",
+            concurrent_external_activity=True,
+            available_external_agents=[],
+        )
+        self.assertEqual(legacy["recommendation_id"], explicit["recommendation_id"])
+        with self.assertRaisesRegex(
+            competition.AgentCompetitionError, "disagree"
+        ):
+            competition.grabowski_agent_execution_route(
+                task_kind="code",
+                changed_file_estimate=4,
+                expected_duration_minutes=30,
+                novelty="low",
+                parallel_work=True,
+                concurrent_external_activity=False,
+                available_external_agents=[],
+            )
 
     def test_route_shadow_calibration_never_changes_live_route_or_recommendation_id(self) -> None:
         kwargs = dict(
@@ -314,14 +418,28 @@ class AgentCompetitionTests(unittest.TestCase):
         import grabowski_agent_workspace_observer as workspace_observer
 
         self.patchers.pop().stop()
+        input_facts = {
+            "task_kind": "code",
+            "changed_file_estimate": 7,
+            "expected_duration_minutes": 90,
+            "novelty": "medium",
+            "risk_flags": [],
+            "connector_instability": False,
+            "concurrent_external_activity": False,
+            "parallelization_candidate": False,
+            "decision_fork": False,
+            "architecture_hypotheses": 1,
+            "user_requested_external": False,
+            "available_external_agents": [],
+        }
+        risk_tier = competition.workspace._route_decision(input_facts)["risk_tier"]
         records = []
         for index in range(5):
             route_evidence = {
-                "input_facts": {
-                    "task_kind": "code",
-                    "novelty": "medium",
-                    "risk_flags": [],
-                },
+                "schema_version": 2,
+                "route_policy_version": competition.workspace.ROUTE_POLICY_VERSION,
+                "risk_tier": risk_tier,
+                "input_facts": dict(input_facts),
             }
             if index < 4:
                 route_evidence["actual_route"] = (
@@ -347,7 +465,7 @@ class AgentCompetitionTests(unittest.TestCase):
             workspace_observer, "workspace_metrics_snapshot", return_value=snapshot
         ):
             result = competition._workspace_route_shadow_calibration(
-                {"task_kind": "code", "novelty": "medium", "risk_flags": []},
+                input_facts,
                 "full_workspace",
             )
         self.assertEqual(result["comparable_workspace_count"], 4)
@@ -1292,6 +1410,7 @@ class AgentCompetitionTests(unittest.TestCase):
             "risk_flags": ["schema", "concurrency"],
             "connector_instability": True,
             "parallel_work": True,
+            "parallelization_candidate": True,
             "available_external_agents": [],
         }
         first = competition.grabowski_agent_execution_route(**kwargs)
@@ -1299,6 +1418,9 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(first["recommendation_id"], second["recommendation_id"])
         self.assertRegex(first["recommendation_id"], r"^[0-9a-f]{64}$")
         self.assertEqual(first["input_facts"]["changed_file_estimate"], 8)
+        self.assertTrue(first["input_facts"]["concurrent_external_activity"])
+        self.assertNotIn("parallel_work", first["input_facts"])
+        self.assertFalse(first["parallel_writer_pilot"]["execution_authorized"])
         self.assertFalse(first["trivial_work"])
         self.assertTrue(first["deviation_requires_reason"])
         trivial = competition.grabowski_agent_execution_route(

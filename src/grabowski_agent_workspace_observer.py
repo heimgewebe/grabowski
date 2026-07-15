@@ -424,21 +424,58 @@ def _event_recorded_unix(event: dict[str, Any]) -> float | None:
     return parsed.timestamp()
 
 
-def _event_timing_metrics(events: list[dict[str, Any]]) -> dict[str, float | None]:
+def _event_timing_metrics(
+    events: list[dict[str, Any]],
+) -> dict[str, float | int | None]:
     first: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    role_started: dict[str, list[float]] = {"writer": [], "tests": [], "review": []}
+    role_finished: dict[str, list[float]] = {"writer": [], "tests": [], "review": []}
     for event in events:
         event_type = event.get("event_type")
         observed = _event_recorded_unix(event)
-        if isinstance(event_type, str) and observed is not None:
-            first.setdefault(event_type, observed)
+        if not isinstance(event_type, str) or observed is None:
+            continue
+        first.setdefault(event_type, observed)
+        counts[event_type] = counts.get(event_type, 0) + 1
+        role = event.get("role")
+        if role in role_started and event_type == "role_started":
+            role_started[str(role)].append(observed)
+        if role in role_finished and event_type == "role_finished":
+            role_finished[str(role)].append(observed)
     start = first.get("plan_created")
 
     def elapsed(event_type: str) -> float | None:
         end = first.get(event_type)
-        return None if start is None or end is None or end < start else round(end - start, 6)
+        return (
+            None
+            if start is None or end is None or end < start
+            else round(end - start, 6)
+        )
+
+    def role_duration(role: str) -> float | None:
+        starts = role_started[role]
+        finishes = role_finished[role]
+        paired = [
+            finish - started
+            for started, finish in zip(starts, finishes, strict=False)
+            if finish >= started
+        ]
+        return round(sum(paired), 6) if paired else None
 
     collection_start = first.get("collection_requested")
     collection_end = first.get("collection_completed")
+    writer_started = role_started["writer"][0] if role_started["writer"] else None
+    writer_observed_seconds = (
+        round(collection_start - writer_started, 6)
+        if writer_started is not None
+        and collection_start is not None
+        and collection_start >= writer_started
+        else None
+    )
+    collect_requests = counts.get("collection_requested", 0)
+    close_requests = counts.get("close_requested", 0)
+    retry_decisions = counts.get("retry_decision", 0)
     return {
         "workspace_ready_seconds": elapsed("workspace_ready"),
         "collection_requested_seconds": elapsed("collection_requested"),
@@ -454,6 +491,24 @@ def _event_timing_metrics(events: list[dict[str, Any]]) -> dict[str, float | Non
             and collection_end is not None
             and collection_end >= collection_start
             else None
+        ),
+        "validation_wall_seconds": (
+            round(collection_end - collection_start, 6)
+            if collection_start is not None
+            and collection_end is not None
+            and collection_end >= collection_start
+            else None
+        ),
+        "writer_observed_seconds": writer_observed_seconds,
+        "tests_duration_seconds": role_duration("tests"),
+        "review_duration_seconds": role_duration("review"),
+        "collect_request_count": collect_requests,
+        "close_request_count": close_requests,
+        "role_retry_count": retry_decisions,
+        "operator_intervention_count": (
+            retry_decisions
+            + max(0, collect_requests - 1)
+            + max(0, close_requests - 1)
         ),
     }
 
@@ -534,11 +589,23 @@ def _cohort_metrics(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _metrics_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
     closed = sum(report["facts"].get("closed") is True for report in reports)
-    success = sum(report["facts"].get("closure_outcome") == "successful" for report in reports)
+    success = sum(
+        report["facts"].get("closure_outcome") == "successful"
+        for report in reports
+    )
     failed = sum(bool(report["facts"].get("failed_roles")) for report in reports)
-    platform_friction = sum(bool(report["facts"].get("workspace_friction_classes")) for report in reports)
-    quality_signals = sum(bool(report["facts"].get("quality_signal_classes")) for report in reports)
-    lifecycle_debt = sum(bool(report["facts"].get("lifecycle_debt_classes")) for report in reports)
+    platform_friction = sum(
+        bool(report["facts"].get("workspace_friction_classes"))
+        for report in reports
+    )
+    quality_signals = sum(
+        bool(report["facts"].get("quality_signal_classes"))
+        for report in reports
+    )
+    lifecycle_debt = sum(
+        bool(report["facts"].get("lifecycle_debt_classes"))
+        for report in reports
+    )
     cohorts = _cohort_metrics(reports)
     timing_fields = (
         "workspace_ready_seconds",
@@ -546,18 +613,83 @@ def _metrics_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
         "collection_complete_seconds",
         "close_complete_seconds",
         "collection_duration_seconds",
+        "validation_wall_seconds",
+        "writer_observed_seconds",
+        "tests_duration_seconds",
+        "review_duration_seconds",
+    )
+    intervention_fields = (
+        "collect_request_count",
+        "close_request_count",
+        "role_retry_count",
+        "operator_intervention_count",
     )
     timing_medians = {
-        field: _median([
-            float(value)
-            for report in reports
-            if isinstance((value := report["facts"].get("timing", {}).get(field)), (int, float))
-            and not isinstance(value, bool)
-        ])
+        field: _median(
+            [
+                float(value)
+                for report in reports
+                if isinstance(
+                    (value := report["facts"].get("timing", {}).get(field)),
+                    (int, float),
+                )
+                and not isinstance(value, bool)
+            ]
+        )
         for field in timing_fields
     }
+    intervention_medians = {
+        field: _median(
+            [
+                float(value)
+                for report in reports
+                if isinstance(
+                    (value := report["facts"].get("timing", {}).get(field)),
+                    int,
+                )
+                and not isinstance(value, bool)
+            ]
+        )
+        for field in intervention_fields
+    }
+    intervention_totals = {
+        field: sum(
+            int(value)
+            for report in reports
+            if isinstance(
+                (value := report["facts"].get("timing", {}).get(field)),
+                int,
+            )
+            and not isinstance(value, bool)
+        )
+        for field in intervention_fields
+    }
+    cost_values = [
+        float(value)
+        for report in reports
+        if isinstance(
+            (value := report["facts"].get("external_cost_usd")),
+            (int, float),
+        )
+        and not isinstance(value, bool)
+        and value >= 0
+    ]
+    integration_values = [
+        float(value)
+        for report in reports
+        if isinstance(
+            (value := report["facts"].get("integration_seconds")),
+            (int, float),
+        )
+        and not isinstance(value, bool)
+        and value >= 0
+    ]
+    parallel_writer_samples = sum(
+        report["facts"].get("parallel_writer_executed") is True
+        for report in reports
+    )
     body = {
-        "schema_version": 2,
+        "schema_version": 3,
         "sample_size": len(reports),
         "closed_count": closed,
         "successful_close_count": success,
@@ -570,16 +702,49 @@ def _metrics_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
         "closed_success_ratio": (success / closed) if closed else None,
         "success_ratio": (success / closed) if closed else None,
         "legacy_workspace_count": sum(
-            report["facts"].get("cohort", {}).get("kind", "legacy") == "legacy" for report in reports
+            report["facts"].get("cohort", {}).get("kind", "legacy")
+            == "legacy"
+            for report in reports
         ),
         "versioned_workspace_count": sum(
-            report["facts"].get("cohort", {}).get("kind") == "versioned" for report in reports
+            report["facts"].get("cohort", {}).get("kind") == "versioned"
+            for report in reports
         ),
         "cohorts": cohorts,
         "timing_median_seconds": timing_medians,
-        "source_report_sha256": [report["report_sha256"] for report in reports],
+        "intervention_median_count": intervention_medians,
+        "intervention_total_count": intervention_totals,
+        "cost_benefit_evidence": {
+            "external_cost_usd_available": len(cost_values) == len(reports)
+            and bool(reports),
+            "external_cost_usd_total": (
+                round(sum(cost_values), 6)
+                if len(cost_values) == len(reports) and reports
+                else None
+            ),
+            "integration_seconds_available": bool(integration_values),
+            "integration_seconds_total": (
+                round(sum(integration_values), 6) if integration_values else None
+            ),
+            "parallel_writer_sample_count": parallel_writer_samples,
+            "parallel_writer_outcome_comparison_eligible": False,
+            "minimum_current_cohort_comparable_runs": 5,
+            "does_not_establish": [
+                "parallel_writer_benefit",
+                "route_causality",
+                "cost_effectiveness",
+            ],
+        },
+        "source_report_sha256": [
+            report["report_sha256"] for report in reports
+        ],
         "read_only_projection": True,
-        "does_not_establish": ["causality", "global_workspace_population", "automatic_change_authority"],
+        "does_not_establish": [
+            "causality",
+            "global_workspace_population",
+            "automatic_change_authority",
+            "general_productivity_improvement",
+        ],
     }
     body["metrics_sha256"] = _sha256_json(body)
     return body
@@ -643,6 +808,9 @@ def _observer_report(
             else None
         ),
         "outcome_receipts": manifest.get("outcome_receipts", {}),
+        "external_cost_usd": None,
+        "integration_seconds": None,
+        "parallel_writer_executed": False,
     }
     inferences: list[dict[str, Any]] = []
     actionable = facts["workspace_friction_classes"]

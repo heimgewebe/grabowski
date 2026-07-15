@@ -884,7 +884,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_agent_execution_route": {
             "category": "agent-workspace",
-            "purpose": "Recommend direct, isolated, full-workspace, contrast or competition execution from typed risk and complexity inputs.",
+            "purpose": "Recommend a lean R0-R3 direct, isolated, full-workspace, contrast or explicitly fork-gated competition route while keeping parallel writers advisory-only.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",
