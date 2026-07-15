@@ -22,7 +22,7 @@ response_may_end = false
 work_complete = false
 ```
 
-Die Antwort darf dann weder Abschluss behaupten noch die offene Arbeit verschweigen. Der Operator arbeitet weiter oder erzeugt einen zulässigen terminalen Abschluss.
+Die Antwort darf dann weder Abschluss behaupten noch die offene Arbeit verschweigen. Der Operator arbeitet weiter oder erzeugt einen zulässigen terminalen Abschluss. `continuation_required` ist das autoritative Feld. `follow_up_required` wird vorläufig als veralteter Kompatibilitätsalias mit demselben Wert ausgegeben und darf von neuen Konsumenten nicht als eigene Semantik verwendet werden.
 
 ## Zulässige Terminalzustände
 
@@ -32,7 +32,7 @@ Die Antwort darf dann weder Abschluss behaupten noch die offene Arbeit verschwei
 2. `blocked`: Mindestens ein konkreter, SHA-256-gebundener Blocker und eine nächste sichere Aktion sind angegeben. Das Antwortende ist zulässig, behauptet aber keine Fertigstellung; `continuation_required=true` hält den Folgearbeitsbedarf sichtbar.
 3. `delegated`: Der öffentliche Abschluss-Grip beobachtet den angegebenen Grabowski-Task, Agent-Workspace oder systemd-Job selbst. Nur ein tatsächlich laufender, identitäts- und receipt-gebundener Zustand wird akzeptiert. Auch dies behauptet keine Fertigstellung; die Verpflichtung bleibt im Standard-Listing sichtbar, bis eine Nachfolge-Verpflichtung die weitere Bearbeitung übernimmt.
 
-Ein fehlender Beleg, ein widersprüchlicher zweiter Abschluss, manipulierte Dateien, unsichere Dateirechte oder unbekannte Felder führen fail-closed.
+Für jeden Zustand außer `completed` gilt `continuation_required=true`; nur `completed` liefert `work_complete=true`. Ein fehlender Beleg, ein widersprüchlicher zweiter Abschluss, manipulierte Dateien, unsichere Dateirechte, unbekannte Felder oder eine unvollständige beziehungsweise widersprüchliche Statusprojektion führen fail-closed. Projektionsfehler werden im Listenaufruf als Integritätsfehler ausgewiesen und setzen `attention_required=true`; sie dürfen unfertige Arbeit nicht still ausblenden.
 
 ## Speicher- und Integritätsmodell
 
@@ -50,7 +50,7 @@ Ein Interprozess-Lock serialisiert Öffnung und Abschluss. Wiederholung desselbe
 
 ## Grip-Oberfläche
 
-- `operator-obligation-list` – read-only; findet standardmäßig alle nicht abgeschlossenen Verpflichtungen (`open`, `blocked`, `delegated`) begrenzt und nach Repository oder Thread gefiltert wieder.
+- `operator-obligation-list` – read-only; verwendet standardmäßig den Filter `attention` und findet damit alle nicht abgeschlossenen Verpflichtungen (`open`, `blocked`, `delegated`) begrenzt und nach Repository oder Thread gefiltert wieder. Der frühere reine Open-Blick bleibt über die explizite Angabe `state="open"` unverändert verfügbar.
 - `operator-obligation-open` – mutierend; legt die unveränderliche Verpflichtung an.
 - `operator-obligation-status` – read-only; entscheidet, ob Fortsetzung erforderlich ist und ob die Antwort enden darf.
 - `operator-obligation-close` – mutierend; akzeptiert nur `completed`, `blocked` oder `delegated` unter den beschriebenen Evidenzregeln.

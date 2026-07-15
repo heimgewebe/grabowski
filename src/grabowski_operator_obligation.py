@@ -33,6 +33,7 @@ MAX_TEXT = 4_096
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.02
 TERMINAL_OUTCOMES = frozenset({"completed", "blocked", "delegated"})
+STATUS_STATES = TERMINAL_OUTCOMES | {"open"}
 EVIDENCE_STATUSES = frozenset({"passed", "failed", "partial", "not_run", "unknown"})
 EVIDENCE_SOURCES = frozenset(
     {
@@ -142,6 +143,47 @@ def _validate_exact_keys(value: dict[str, Any], *, allowed: set[str], required: 
         raise OperatorObligationInputError(f"{label} contains unknown keys: {unknown}")
     if missing:
         raise OperatorObligationInputError(f"{label} is missing keys: {missing}")
+
+
+def _status_projection_requires_attention(status: dict[str, Any]) -> bool:
+    state = status.get("state")
+    if not isinstance(state, str) or state not in STATUS_STATES:
+        raise OperatorObligationIntegrityError("operator obligation status projection has an invalid state")
+
+    boolean_fields: dict[str, bool] = {}
+    for field in ("continuation_required", "response_may_end", "work_complete"):
+        value = status.get(field)
+        if not isinstance(value, bool):
+            raise OperatorObligationIntegrityError(
+                f"operator obligation status projection is missing boolean field: {field}"
+            )
+        boolean_fields[field] = value
+
+    expected_complete = state == "completed"
+    if boolean_fields["work_complete"] is not expected_complete:
+        raise OperatorObligationIntegrityError(
+            "operator obligation status projection has inconsistent completion state"
+        )
+    expected_continuation = not expected_complete
+    if boolean_fields["continuation_required"] is not expected_continuation:
+        raise OperatorObligationIntegrityError(
+            "operator obligation status projection has inconsistent continuation state"
+        )
+    expected_response_may_end = state != "open"
+    if boolean_fields["response_may_end"] is not expected_response_may_end:
+        raise OperatorObligationIntegrityError(
+            "operator obligation status projection has inconsistent response-end state"
+        )
+
+    follow_up_required = status.get("follow_up_required")
+    if follow_up_required is not None and (
+        not isinstance(follow_up_required, bool)
+        or follow_up_required is not boolean_fields["continuation_required"]
+    ):
+        raise OperatorObligationIntegrityError(
+            "operator obligation status projection has an inconsistent compatibility alias"
+        )
+    return boolean_fields["continuation_required"]
 
 
 def _normalize_acceptance(value: Any) -> list[dict[str, str]]:
@@ -605,6 +647,7 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
             "continuation_required": True,
             "response_may_end": False,
             "work_complete": False,
+            "follow_up_required": True,
             "open_file_sha256": open_file_sha256,
             "close_file_sha256": None,
             "recommended_next_action": "continue work; the chat response must not imply completion",
@@ -711,13 +754,14 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
             continue
         try:
             status = status_obligation(child.name)
+            requires_attention = _status_projection_requires_attention(status)
         except (OSError, OperatorObligationError, OperatorObligationInputError) as exc:
             integrity_errors.append(
                 {"obligation_id": child.name, "error": type(exc).__name__}
             )
             continue
         if state_filter == "attention":
-            if status["work_complete"] is True:
+            if not requires_attention:
                 continue
         elif state_filter != "all" and status["state"] != state_filter:
             continue
@@ -735,7 +779,7 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
                 "origin": origin,
                 "created_at": status["created_at"],
                 "closed_at": status["closed_at"],
-                "continuation_required": status["continuation_required"],
+                "continuation_required": requires_attention,
                 "response_may_end": status["response_may_end"],
                 "work_complete": status["work_complete"],
                 "recommended_next_action": status["recommended_next_action"],
@@ -748,14 +792,11 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
             ) or scan_truncated
             break
 
-    attention_required = bool(
-        integrity_errors
-        or scan_truncated
-        or any(item["continuation_required"] for item in records)
-    )
+    matching_attention = any(item["continuation_required"] for item in records)
+    attention_required = bool(integrity_errors or scan_truncated or matching_attention)
     if integrity_errors:
         next_action = "inspect integrity errors before relying on the affected obligations"
-    elif any(item["continuation_required"] for item in records):
+    elif matching_attention:
         next_action = "resume or explicitly supersede the matching unfinished obligation before starting unrelated work"
     elif scan_truncated:
         next_action = "narrow the filters and list again"
