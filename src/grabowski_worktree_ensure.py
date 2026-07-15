@@ -197,6 +197,13 @@ def _write_receipt(path: Path, value: dict[str, Any]) -> dict[str, Any]:
     return material
 
 
+def _required_integer(parameters: dict[str, Any], name: str) -> int:
+    value = parameters.get(name)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise WorktreeEnsurePreflight(f"{name} must be an integer")
+    return value
+
+
 def _required_string(parameters: dict[str, Any], name: str) -> str:
     value = parameters.get(name)
     if not isinstance(value, str) or not value.strip() or value != value.strip():
@@ -210,11 +217,25 @@ def _normalize_inputs(parameters: dict[str, Any]) -> dict[str, Any]:
     branch = _required_string(parameters, "branch")
     base_head = _required_string(parameters, "base_head").lower()
     owner = _required_string(parameters, "lease_owner_id")
+    purpose = _required_string(parameters, "purpose")
+    source_kind = _required_string(parameters, "source_kind")
+    source_id = _required_string(parameters, "source_id")
+    artifact_class = _required_string(parameters, "artifact_class")
+    retention_until_unix = _required_integer(parameters, "retention_until_unix")
     idempotency_key = _required_string(parameters, "idempotency_key")
     if IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key) is None:
         raise WorktreeEnsurePreflight("idempotency_key contains unsupported characters or is too long")
     if SHA40_RE.fullmatch(base_head) is None:
         raise WorktreeEnsurePreflight("base_head must be an exact 40-character lowercase commit SHA")
+    try:
+        import grabowski_checkouts as checkouts
+
+        purpose = checkouts._purpose(purpose)
+        source_kind, source_id = checkouts._source_binding(source_kind, source_id)
+        artifact_class = checkouts._artifact_class(artifact_class)
+        retention_until_unix = checkouts._retention_until(retention_until_unix)
+    except ValueError as exc:
+        raise WorktreeEnsurePreflight(str(exc)) from exc
 
     repo = Path(repo_raw).expanduser().resolve(strict=True)
     if not repo.is_dir():
@@ -235,6 +256,11 @@ def _normalize_inputs(parameters: dict[str, Any]) -> dict[str, Any]:
         "branch": branch,
         "base_head": base_head,
         "lease_owner_id": owner,
+        "purpose": purpose,
+        "source_kind": source_kind,
+        "source_id": source_id,
+        "artifact_class": artifact_class,
+        "retention_until_unix": retention_until_unix,
         "idempotency_key": idempotency_key,
         "required_resource_keys": [f"path:{target}", f"repo:{repo}"],
     }
@@ -526,6 +552,7 @@ def _public_output(
         "recovered_after_interruption": recovered,
         "post_state": record.get("post_state"),
         "lifecycle": lifecycle,
+        "lifecycle_reservation": record.get("lifecycle_reservation"),
         "lifecycle_integrity": {
             "sha256": _sha256_json(lifecycle) if isinstance(lifecycle, dict) else None,
             "source": (
@@ -549,6 +576,28 @@ def _public_output(
     }
 
 
+def _reserve_input_lifecycle(inputs: dict[str, Any]) -> dict[str, Any]:
+    import grabowski_checkouts as checkouts
+
+    repo = Path(inputs["repo"])
+    checkout = Path(inputs["target_path"])
+    top_level = checkouts._git_top_level(repo)
+    common_dir = checkouts._git_common_dir(repo)
+    return checkouts._reserve_checkout_lifecycle(
+        repo_common_dir=common_dir,
+        repo_path=top_level,
+        checkout_path=checkout,
+        owner_id=str(inputs["lease_owner_id"]),
+        purpose=str(inputs["purpose"]),
+        source_kind=str(inputs["source_kind"]),
+        source_id=str(inputs["source_id"]),
+        artifact_class=str(inputs["artifact_class"]),
+        retention_until_unix=int(inputs["retention_until_unix"]),
+        expected_head=str(inputs["base_head"]),
+        expected_branch=str(inputs["branch"]),
+    )
+
+
 def _bind_checkout_lifecycle(
     inputs: dict[str, Any],
     post_state: dict[str, Any],
@@ -557,16 +606,9 @@ def _bind_checkout_lifecycle(
     import grabowski_checkouts as checkouts
 
     checked = lease.get("checked")
-    expiries = [
-        item.get("expires_at_unix")
-        for item in checked
-        if isinstance(item, dict)
-        and isinstance(item.get("expires_at_unix"), int)
-        and not isinstance(item.get("expires_at_unix"), bool)
-    ] if isinstance(checked, list) else []
-    if not expiries:
-        raise WorktreeEnsureAction("worktree lifecycle requires live lease expiry evidence")
-    retention_until_unix = max(min(expiries), int(time.time()) + 24 * 60 * 60)
+    if not isinstance(checked, list) or not checked:
+        raise WorktreeEnsureAction("worktree lifecycle requires live lease evidence")
+    retention_until_unix = int(inputs["retention_until_unix"])
     repo = Path(inputs["repo"])
     checkout = Path(inputs["target_path"])
     top_level, common_dir, record = checkouts._worktree_for_path(repo, checkout)
@@ -578,7 +620,8 @@ def _bind_checkout_lifecycle(
     )
     owner_id = checkouts._owner(str(inputs["lease_owner_id"]))
     task_id = f"worktree-ensure:{inputs['idempotency_key']}"
-    purpose = f"ensure exact worktree for {task_id}"
+    purpose = str(inputs["purpose"])
+    lifecycle_binding = _reserve_input_lifecycle(inputs)
     retention = checkouts._upsert_retention(
         checkout_key=str(record["checkout_key"]),
         repo_common_dir=common_dir,
@@ -597,6 +640,9 @@ def _bind_checkout_lifecycle(
         "checkout_path": retention["checkout_path"],
         "owner_id": retention["owner_id"],
         "task": {"kind": "worktree_ensure", "id": task_id},
+        "source": lifecycle_binding["source"],
+        "artifact_class": lifecycle_binding["artifact_class"],
+        "limit": lifecycle_binding["limit"],
         "purpose": retention["purpose"],
         "created_at_unix": retention["created_at_unix"],
         "updated_at_unix": retention["updated_at_unix"],
@@ -851,6 +897,28 @@ def ensure_worktree(
             return _public_output(written, receipt_path, replayed=recovering_intent, recovered=False)
 
         lease = pre_mutation_lease
+        try:
+            lifecycle_reservation = _reserve_input_lifecycle(inputs)
+        except (PermissionError, RuntimeError, ValueError) as exc:
+            record = _durable_record(
+                inputs=inputs,
+                parameters_sha256=parameters_sha256,
+                state="complete",
+                result_state="NOT_ACCEPTED",
+                post_state=observation,
+                error_class="CHECKOUT_LIFECYCLE_REJECTED",
+                error=str(exc),
+                friction=recovery_friction,
+                created_at_unix=existing.get("created_at_unix") if existing else None,
+            )
+            record["lease"] = lease
+            written = _write_receipt(receipt_path, record)
+            return _public_output(
+                written,
+                receipt_path,
+                replayed=recovering_intent,
+                recovered=False,
+            )
         mutation = _command(
             runner,
             Path(inputs["repo"]),
@@ -884,7 +952,17 @@ def ensure_worktree(
             written = _write_receipt(receipt_path, record)
             return _public_output(written, receipt_path, replayed=recovering_intent, recovered=recovering_intent)
 
+        import grabowski_checkouts as checkouts
+
+        lifecycle_released = False
+        lifecycle_preserved = post_state["classification"] != "ABSENT"
+        if not lifecycle_preserved:
+            lifecycle_released = checkouts._release_checkout_lifecycle_exact(
+                lifecycle_reservation
+            )
         error = _command_error(mutation)
+        if not lifecycle_preserved and not lifecycle_released:
+            error = f"{error}; lifecycle reservation could not be released exactly"
         result_state = "CONFLICT" if post_state["classification"] == "CONFLICT" else "NOT_ACCEPTED"
         error_class = "POST_MUTATION_CONFLICT" if result_state == "CONFLICT" else "GIT_WORKTREE_ADD_REJECTED"
         friction = recovery_friction or _record_friction(
@@ -905,6 +983,11 @@ def ensure_worktree(
             created_at_unix=existing.get("created_at_unix") if existing else None,
         )
         record["lease"] = lease
+        record["lifecycle_reservation"] = {
+            "preserved": lifecycle_preserved,
+            "released": lifecycle_released,
+            "binding": lifecycle_reservation if lifecycle_preserved else None,
+        }
         record["mutation"] = {
             "returncode": _returncode(mutation),
             "stdout": _bounded_text(_stdout(mutation)),

@@ -49,6 +49,13 @@ CHECKOUT_LOCK = Path(
 DRY_RUN_TTL_SECONDS = 15 * 60
 OPERATION_LEASE_TTL_SECONDS = 10 * 60
 MAX_RETENTION_SECONDS = 365 * 24 * 60 * 60
+CHECKOUT_CLEANUP_GRACE_SECONDS = 24 * 60 * 60
+MAX_ACTIVE_CHECKOUTS_PER_REPO = 8
+MAX_COMPLETED_RETAINED_CHECKOUTS_PER_REPO = 4
+LIFECYCLE_PHASES = frozenset({"active", "completed_retained", "archived"})
+ARTIFACT_CLASS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+SOURCE_KIND_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
+SOURCE_ID_RE = re.compile(r"[^\x00-\x1f\x7f]{1,256}\Z")
 OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 GIT_OBJECT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -97,6 +104,29 @@ def _purpose(value: str) -> str:
     if not normalized or len(normalized.encode("utf-8")) > 512 or "\x00" in normalized:
         raise ValueError("purpose is empty, too large or contains NUL")
     return normalized
+
+
+def _artifact_class(value: str) -> str:
+    if not isinstance(value, str) or ARTIFACT_CLASS_RE.fullmatch(value) is None:
+        raise ValueError("artifact_class must be a safe non-empty identifier")
+    return value
+
+
+def _source_binding(source_kind: str, source_id: str) -> tuple[str, str]:
+    if not isinstance(source_kind, str) or SOURCE_KIND_RE.fullmatch(source_kind) is None:
+        raise ValueError("source_kind must be a safe non-empty identifier")
+    if not isinstance(source_id, str) or SOURCE_ID_RE.fullmatch(source_id) is None:
+        raise ValueError("source_id must be non-empty, bounded text without NUL")
+    normalized = source_id.strip()
+    if not normalized or normalized != source_id:
+        raise ValueError("source_id must be trimmed non-empty text")
+    return source_kind, normalized
+
+
+def _lifecycle_phase(value: str) -> str:
+    if value not in LIFECYCLE_PHASES:
+        raise ValueError(f"lifecycle phase must be one of {sorted(LIFECYCLE_PHASES)}")
+    return value
 
 
 def _retention_until(value: int) -> int:
@@ -269,6 +299,33 @@ def _database() -> sqlite3.Connection:
     )
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS lifecycle_bindings (
+            checkout_key TEXT PRIMARY KEY,
+            repo_common_dir TEXT NOT NULL,
+            repo_path TEXT NOT NULL,
+            checkout_path TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            artifact_class TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            retention_until_unix INTEGER NOT NULL,
+            expected_head TEXT,
+            expected_branch TEXT,
+            created_at_unix INTEGER NOT NULL,
+            updated_at_unix INTEGER NOT NULL,
+            terminal_at_unix INTEGER,
+            archived_at_unix INTEGER
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS lifecycle_repo_phase_idx "
+        "ON lifecycle_bindings(repo_common_dir, phase, retention_until_unix)"
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS archives (
             archive_id TEXT PRIMARY KEY,
             checkout_key TEXT NOT NULL,
@@ -370,6 +427,351 @@ def _archive_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "cleaned_at_unix": record["cleaned_at_unix"],
         "cleanup_plan_id": record["cleanup_plan_id"],
     }
+
+
+def _lifecycle_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    record = dict(row)
+    return {
+        "checkout_key": record["checkout_key"],
+        "repo_common_dir": record["repo_common_dir"],
+        "repo_path": record["repo_path"],
+        "checkout_path": record["checkout_path"],
+        "owner_id": record["owner_id"],
+        "purpose": record["purpose"],
+        "source": {"kind": record["source_kind"], "id": record["source_id"]},
+        "artifact_class": record["artifact_class"],
+        "phase": record["phase"],
+        "retention_until_unix": record["retention_until_unix"],
+        "expected_head": record["expected_head"],
+        "expected_branch": record["expected_branch"],
+        "created_at_unix": record["created_at_unix"],
+        "updated_at_unix": record["updated_at_unix"],
+        "terminal_at_unix": record["terminal_at_unix"],
+        "archived_at_unix": record["archived_at_unix"],
+    }
+
+
+def _lifecycle_bindings(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
+    wanted = sorted(set(keys))
+    if not wanted:
+        return {}
+    connection = _readonly_connection(CHECKOUT_DB)
+    if connection is None:
+        return {}
+    try:
+        rows = connection.execute(
+            f"SELECT * FROM lifecycle_bindings WHERE checkout_key IN ({','.join('?' for _ in wanted)})",
+            wanted,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        connection.close()
+    return {row["checkout_key"]: _lifecycle_public(row) for row in rows}
+
+
+def _phase_limit(phase: str) -> int:
+    normalized = _lifecycle_phase(phase)
+    if normalized == "active":
+        return MAX_ACTIVE_CHECKOUTS_PER_REPO
+    if normalized == "completed_retained":
+        return MAX_COMPLETED_RETAINED_CHECKOUTS_PER_REPO
+    raise ValueError("archived checkouts do not consume an active retention limit")
+
+
+def _phase_count(
+    connection: sqlite3.Connection,
+    *,
+    repo_common_dir: Path,
+    phase: str,
+    exclude_checkout_key: str,
+) -> int:
+    row = connection.execute(
+        """
+        SELECT count(*) AS total
+        FROM lifecycle_bindings
+        WHERE repo_common_dir=? AND phase=? AND checkout_key<>?
+        """,
+        (str(repo_common_dir), phase, exclude_checkout_key),
+    ).fetchone()
+    return int(row["total"] if row is not None else 0)
+
+
+def _reserve_checkout_lifecycle(
+    *,
+    repo_common_dir: Path,
+    repo_path: Path,
+    checkout_path: Path,
+    owner_id: str,
+    purpose: str,
+    source_kind: str,
+    source_id: str,
+    artifact_class: str,
+    retention_until_unix: int,
+    expected_head: str | None,
+    expected_branch: str | None,
+) -> dict[str, Any]:
+    owner = _owner(owner_id)
+    normalized_purpose = _purpose(purpose)
+    source_kind, source_id = _source_binding(source_kind, source_id)
+    artifact = _artifact_class(artifact_class)
+    until = _retention_until(retention_until_unix)
+    common_dir = _safe_path(repo_common_dir, must_exist=True)
+    top_level = _resolve_repo(repo_path)
+    checkout = _safe_path(checkout_path, must_exist=False)
+    _reject_evidence_checkout(checkout)
+    head = (
+        _validate_git_object_id(expected_head, "expected_head")
+        if expected_head is not None
+        else None
+    )
+    branch = _expected_branch(expected_branch)
+    checkout_key = _checkout_key(common_dir, checkout)
+    now = _now()
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (checkout_key,),
+        ).fetchone()
+        if existing is not None and existing["owner_id"] != owner:
+            raise PermissionError("Checkout lifecycle binding is owned by another owner")
+        if existing is not None and existing["phase"] != "active":
+            raise RuntimeError("Completed or archived checkout lifecycle cannot be reopened")
+        if existing is not None:
+            expected_contract = (
+                normalized_purpose,
+                source_kind,
+                source_id,
+                artifact,
+                head,
+                branch,
+            )
+            observed_contract = (
+                existing["purpose"],
+                existing["source_kind"],
+                existing["source_id"],
+                existing["artifact_class"],
+                existing["expected_head"],
+                existing["expected_branch"],
+            )
+            if observed_contract != expected_contract:
+                raise RuntimeError("Checkout lifecycle source or identity binding conflicts")
+        count = _phase_count(
+            connection,
+            repo_common_dir=common_dir,
+            phase="active",
+            exclude_checkout_key=checkout_key,
+        )
+        limit = _phase_limit("active")
+        if count >= limit and existing is None:
+            raise RuntimeError(
+                f"Per-repository active checkout limit reached: active={count} limit={limit}"
+            )
+        created = now if existing is None else int(existing["created_at_unix"])
+        connection.execute(
+            """
+            INSERT INTO lifecycle_bindings(
+                checkout_key, repo_common_dir, repo_path, checkout_path,
+                owner_id, purpose, source_kind, source_id, artifact_class,
+                phase, retention_until_unix, expected_head, expected_branch,
+                created_at_unix, updated_at_unix, terminal_at_unix, archived_at_unix
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL, NULL)
+            ON CONFLICT(checkout_key) DO UPDATE SET
+                repo_common_dir=excluded.repo_common_dir,
+                repo_path=excluded.repo_path,
+                checkout_path=excluded.checkout_path,
+                owner_id=excluded.owner_id,
+                purpose=excluded.purpose,
+                source_kind=excluded.source_kind,
+                source_id=excluded.source_id,
+                artifact_class=excluded.artifact_class,
+                phase='active',
+                retention_until_unix=excluded.retention_until_unix,
+                expected_head=excluded.expected_head,
+                expected_branch=excluded.expected_branch,
+                updated_at_unix=excluded.updated_at_unix,
+                terminal_at_unix=NULL,
+                archived_at_unix=NULL
+            """,
+            (
+                checkout_key,
+                str(common_dir),
+                str(top_level),
+                str(checkout),
+                owner,
+                normalized_purpose,
+                source_kind,
+                source_id,
+                artifact,
+                until,
+                head,
+                branch,
+                created,
+                now,
+            ),
+        )
+        connection.commit()
+        row = connection.execute(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (checkout_key,),
+        ).fetchone()
+    assert row is not None
+    public = _lifecycle_public(row)
+    public["limit"] = {"phase": "active", "count_before": count, "maximum": limit}
+    return public
+
+
+def _release_checkout_lifecycle_exact(binding: dict[str, Any]) -> bool:
+    required = (
+        binding.get("checkout_key"),
+        binding.get("owner_id"),
+        binding.get("created_at_unix"),
+        binding.get("updated_at_unix"),
+    )
+    if not isinstance(required[0], str) or not isinstance(required[1], str):
+        return False
+    if not all(isinstance(value, int) and not isinstance(value, bool) for value in required[2:]):
+        return False
+    with _database() as connection:
+        deleted = connection.execute(
+            """
+            DELETE FROM lifecycle_bindings
+            WHERE checkout_key=? AND owner_id=?
+              AND created_at_unix=? AND updated_at_unix=? AND phase='active'
+            """,
+            required,
+        )
+        connection.commit()
+    return deleted.rowcount == 1
+
+
+def _mark_checkout_completed_retained(
+    *,
+    checkout_key: str,
+    owner_id: str,
+    expected_head: str,
+    expected_branch: str | None,
+) -> dict[str, Any]:
+    owner = _owner(owner_id)
+    head = _validate_git_object_id(expected_head, "expected_head")
+    branch = _expected_branch(expected_branch)
+    now = _now()
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (checkout_key,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Checkout lifecycle binding is missing")
+        if row["owner_id"] != owner:
+            raise PermissionError("Checkout lifecycle binding is owned by another owner")
+        if row["expected_branch"] != branch:
+            raise RuntimeError("Checkout branch changed before lifecycle completion")
+        if row["phase"] == "completed_retained":
+            if row["expected_head"] != head:
+                raise RuntimeError(
+                    "Completed-retained checkout head changed after terminal decision"
+                )
+            return _lifecycle_public(row)
+        if row["phase"] != "active":
+            raise RuntimeError("Only an active checkout may become completed-retained")
+        count = _phase_count(
+            connection,
+            repo_common_dir=Path(row["repo_common_dir"]),
+            phase="completed_retained",
+            exclude_checkout_key=checkout_key,
+        )
+        limit = _phase_limit("completed_retained")
+        if count >= limit:
+            raise RuntimeError(
+                "Per-repository completed-retained checkout limit reached: "
+                f"completed_retained={count} limit={limit}"
+            )
+        connection.execute(
+            """
+            UPDATE lifecycle_bindings
+            SET phase='completed_retained', expected_head=?,
+                terminal_at_unix=?, updated_at_unix=?
+            WHERE checkout_key=?
+            """,
+            (head, now, now, checkout_key),
+        )
+        retention_update = connection.execute(
+            """
+            UPDATE retention
+            SET expected_head=?, expected_branch=?, updated_at_unix=?
+            WHERE checkout_key=? AND owner_id=?
+            """,
+            (head, branch, now, checkout_key, owner),
+        )
+        if retention_update.rowcount != 1:
+            raise RuntimeError(
+                "Checkout retention binding is missing at terminal transition"
+            )
+        connection.commit()
+        updated = connection.execute(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (checkout_key,),
+        ).fetchone()
+    assert updated is not None
+    public = _lifecycle_public(updated)
+    public["limit"] = {
+        "phase": "completed_retained",
+        "count_before": count,
+        "maximum": limit,
+    }
+    return public
+
+
+def _mark_checkout_archived_in_connection(
+    connection: sqlite3.Connection,
+    checkout_key: str,
+    owner_id: str,
+    archived_at: int,
+) -> dict[str, Any] | None:
+    owner = _owner(owner_id)
+    row = connection.execute(
+        "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+        (checkout_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["owner_id"] != owner:
+        raise PermissionError("Checkout lifecycle binding is owned by another owner")
+    updated = connection.execute(
+        """
+        UPDATE lifecycle_bindings
+        SET phase='archived', archived_at_unix=?, updated_at_unix=?
+        WHERE checkout_key=? AND owner_id=?
+        """,
+        (archived_at, archived_at, checkout_key, owner),
+    )
+    if updated.rowcount != 1:
+        raise RuntimeError("Checkout lifecycle archive transition was not applied exactly")
+    row = connection.execute(
+        "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+        (checkout_key,),
+    ).fetchone()
+    return None if row is None else _lifecycle_public(row)
+
+
+def _mark_checkout_archived(
+    checkout_key: str,
+    owner_id: str,
+    archived_at: int,
+) -> dict[str, Any] | None:
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        lifecycle = _mark_checkout_archived_in_connection(
+            connection,
+            checkout_key,
+            owner_id,
+            archived_at,
+        )
+        connection.commit()
+    return lifecycle
 
 
 def _retention_records(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
@@ -799,13 +1201,14 @@ def _coordination(
     include_tasks: bool = True,
     include_resources: bool = True,
 ) -> dict[str, Any]:
-    owner = _owner(owner_id) if owner_id is not None else None
+    if owner_id is not None:
+        _owner(owner_id)
     resource_blockers: list[dict[str, Any]] = []
     if include_resources:
         for lease in _read_resource_leases():
             if not _resource_related(lease["resource_key"], paths):
                 continue
-            lease = {**lease, "blocking": owner is None or lease["owner_id"] != owner}
+            lease = {**lease, "blocking": True}
             resource_blockers.append(lease)
     task_blockers = _task_records(paths) if include_tasks else []
     process_blockers = _processes_under(paths) if include_processes else []
@@ -822,7 +1225,8 @@ def _linked_checkout_coordination(
     include_tasks: bool = True,
     include_resources: bool = True,
 ) -> dict[str, Any]:
-    owner = _owner(owner_id) if owner_id is not None else None
+    if owner_id is not None:
+        _owner(owner_id)
     resource_blockers: list[dict[str, Any]] = []
     if include_resources:
         for lease in _read_resource_leases():
@@ -830,7 +1234,7 @@ def _linked_checkout_coordination(
                 lease["resource_key"], [checkout_path, repo_common_dir]
             ):
                 continue
-            lease = {**lease, "blocking": owner is None or lease["owner_id"] != owner}
+            lease = {**lease, "blocking": True}
             resource_blockers.append(lease)
     task_blockers = _task_records([checkout_path, repo_path]) if include_tasks else []
     process_blockers = _processes_under([checkout_path]) if include_processes else []
@@ -885,6 +1289,15 @@ def _checkout_lifecycle_decision(
     archive_present = isinstance(archive, dict)
     archive_open = archive_present and archive.get("cleaned_at_unix") is None
     archive_matches = _archive_matches_checkout(record, lifecycle)
+    archive_age_seconds = (
+        max(0, now - int(archive["created_at_unix"]))
+        if archive_present and isinstance(archive.get("created_at_unix"), int)
+        else None
+    )
+    archive_grace_elapsed = bool(
+        archive_age_seconds is not None
+        and archive_age_seconds >= CHECKOUT_CLEANUP_GRACE_SECONDS
+    )
     blocking = bool(coordination.get("blocking"))
     reasons: list[str] = []
     cleanup_candidate = False
@@ -927,6 +1340,11 @@ def _checkout_lifecycle_decision(
         hygiene_mark = "unknown"
         next_step = "refresh_archive_or_retain_before_cleanup"
         reasons.append("latest archive does not match current checkout head or branch")
+    elif archive_present and not archive_grace_elapsed:
+        state = "archived_grace"
+        hygiene_mark = "archived"
+        next_step = "wait_for_checkout_cleanup_grace"
+        reasons.append("matching recovery archive is younger than the 24-hour cleanup grace")
     elif archive_present and blocking:
         state = "archived_blocked"
         hygiene_mark = "archived"
@@ -965,6 +1383,9 @@ def _checkout_lifecycle_decision(
         "archive_present": archive_present,
         "archive_open": bool(archive_open),
         "archive_matches_checkout": bool(archive_matches),
+        "archive_age_seconds": archive_age_seconds,
+        "archive_grace_seconds": CHECKOUT_CLEANUP_GRACE_SECONDS,
+        "archive_grace_elapsed": archive_grace_elapsed,
         "coordination_blocking": blocking,
         "cleanup_candidate": cleanup_candidate,
         "requires_cleanup_dry_run": requires_cleanup_dry_run,
@@ -989,6 +1410,7 @@ def checkout_inventory(
     top_level, common_dir, records = _worktree_records(repo_path)
     keys = [record["checkout_key"] for record in records]
     retention = _retention_records(keys)
+    bindings = _lifecycle_bindings(keys)
     archives = _latest_archives(keys)
     now = _now()
     worktrees: list[dict[str, Any]] = []
@@ -1005,6 +1427,7 @@ def checkout_inventory(
         )
         lifecycle = {
             "retention": retention.get(record["checkout_key"]),
+            "binding": bindings.get(record["checkout_key"]),
             "latest_archive": archives.get(record["checkout_key"]),
         }
         exists = checkout_path.exists()
@@ -1285,122 +1708,163 @@ def grabowski_checkout_archive(
             "branch": expected_branch,
         },
     )
-    retention = _upsert_retention(
-        checkout_key=record["checkout_key"],
-        repo_common_dir=common_dir,
-        repo_path=top_level,
-        checkout_path=checkout,
-        owner_id=owner,
-        purpose=archive_purpose,
-        retention_until_unix=until,
-        expected_head=expected_head,
-        expected_branch=expected_branch,
-    )
-    archive_id = _new_archive_id()
-    path_hash = record["checkout_key"][:16]
-    ref_base = f"{ARCHIVE_REF_ROOT}/{path_hash}/{archive_id}"
-    recovery_refs = [
-        _create_recovery_ref(top_level, f"{ref_base}/head", expected_head)
-    ]
-    branch_head = None
-    if record.get("branch"):
-        branch_ref = f"refs/heads/{record['branch']}"
-        branch_head = _git_read(
-            top_level,
-            ["rev-parse", "--verify", f"{branch_ref}^{{commit}}"],
-        ).stdout.strip()
-        recovery_refs.append(
-            _create_recovery_ref(top_level, f"{ref_base}/branch-head", branch_head)
+    result: dict[str, Any] | None = None
+    try:
+        retention = _upsert_retention(
+            checkout_key=record["checkout_key"],
+            repo_common_dir=common_dir,
+            repo_path=top_level,
+            checkout_path=checkout,
+            owner_id=owner,
+            purpose=archive_purpose,
+            retention_until_unix=until,
+            expected_head=expected_head,
+            expected_branch=expected_branch,
         )
-    manifest_dir = _archive_directory(archive_id)
-    public_refs = [
-        {"role": "head" if item["ref"].endswith("/head") else "branch-head", "ref": item["ref"], "target": item["target"]}
-        for item in recovery_refs
-    ]
-    manifest = {
-        "schema_version": 1,
-        "archive_id": archive_id,
-        "checkout_key": record["checkout_key"],
-        "repo": str(top_level),
-        "git_common_dir": str(common_dir),
-        "checkout_path": str(checkout),
-        "head": expected_head,
-        "branch": record.get("branch"),
-        "branch_head": branch_head,
-        "owner_id": owner,
-        "purpose": archive_purpose,
-        "retention_until_unix": until,
-        "created_at": _utc_timestamp(),
-        "recovery_refs": public_refs,
-        "cleanup": {
-            "requires_dry_run": True,
-            "tool": "grabowski_checkout_cleanup",
-        },
-        "rollback": {
-            "available": True,
-            "command": ["git", "-C", str(top_level), "worktree", "add", str(checkout), public_refs[0]["ref"]],
-            "branch_preserved": bool(record.get("branch")),
-        },
-    }
-    manifest_path = manifest_dir / "manifest.json"
-    _write_json_evidence(manifest_path, manifest)
-    created = _now()
-    with _database() as connection:
-        connection.execute(
-            """
-            INSERT INTO archives(
-                archive_id, checkout_key, repo_common_dir, repo_path,
-                checkout_path, head, branch, owner_id, purpose,
-                retention_until_unix, recovery_refs_json, manifest_path,
-                created_at_unix, cleaned_at_unix, cleanup_plan_id
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
-            """,
-            (
-                archive_id,
-                record["checkout_key"],
-                str(common_dir),
-                str(top_level),
-                str(checkout),
-                expected_head,
-                record.get("branch"),
-                owner,
-                archive_purpose,
-                until,
-                _canonical_json(public_refs),
-                str(manifest_path),
-                created,
-            ),
+        lifecycle = _lifecycle_bindings([record["checkout_key"]]).get(
+            record["checkout_key"]
         )
-        connection.commit()
-    archive = _load_archive(archive_id)
-    lease_release = _release_checkout_resources(lease)
-    audit = {
-        "timestamp_unix": created,
-        "operation": "checkout-archive",
-        "archive_id": archive_id,
-        "checkout_key": record["checkout_key"],
-        "repo": str(top_level),
-        "checkout_path": str(checkout),
-        "owner_id": owner,
-        "head": expected_head,
-        "branch": record.get("branch"),
-        "recovery_refs": public_refs,
-        "branch_preserved": bool(record.get("branch")),
-        "status": status,
-        "coordination_checked": coordination["blocking_counts"],
-        "resource_keys": [item["resource_key"] for item in lease["leases"]],
-        "rollback": manifest["rollback"],
-    }
-    base._append_audit(audit)
-    return {
-        "archive": archive,
-        "retention": retention,
-        "lease": lease,
-        "lease_release": lease_release,
-        "manifest": manifest,
-        "audit": audit,
-    }
+        if lifecycle is not None and lifecycle["owner_id"] != owner:
+            raise PermissionError(
+                "Checkout lifecycle binding is owned by another owner"
+            )
 
+        archive_id = _new_archive_id()
+        path_hash = record["checkout_key"][:16]
+        ref_base = f"{ARCHIVE_REF_ROOT}/{path_hash}/{archive_id}"
+        recovery_refs = [
+            _create_recovery_ref(top_level, f"{ref_base}/head", expected_head)
+        ]
+        branch_head = None
+        if record.get("branch"):
+            branch_ref = f"refs/heads/{record['branch']}"
+            branch_head = _git_read(
+                top_level,
+                ["rev-parse", "--verify", f"{branch_ref}^{{commit}}"],
+            ).stdout.strip()
+            recovery_refs.append(
+                _create_recovery_ref(
+                    top_level,
+                    f"{ref_base}/branch-head",
+                    branch_head,
+                )
+            )
+        manifest_dir = _archive_directory(archive_id)
+        public_refs = [
+            {
+                "role": (
+                    "head" if item["ref"].endswith("/head") else "branch-head"
+                ),
+                "ref": item["ref"],
+                "target": item["target"],
+            }
+            for item in recovery_refs
+        ]
+        manifest = {
+            "schema_version": 1,
+            "archive_id": archive_id,
+            "checkout_key": record["checkout_key"],
+            "repo": str(top_level),
+            "git_common_dir": str(common_dir),
+            "checkout_path": str(checkout),
+            "head": expected_head,
+            "branch": record.get("branch"),
+            "branch_head": branch_head,
+            "owner_id": owner,
+            "purpose": archive_purpose,
+            "retention_until_unix": until,
+            "created_at": _utc_timestamp(),
+            "recovery_refs": public_refs,
+            "cleanup": {
+                "requires_dry_run": True,
+                "tool": "grabowski_checkout_cleanup",
+            },
+            "rollback": {
+                "available": True,
+                "command": [
+                    "git",
+                    "-C",
+                    str(top_level),
+                    "worktree",
+                    "add",
+                    str(checkout),
+                    public_refs[0]["ref"],
+                ],
+                "branch_preserved": bool(record.get("branch")),
+            },
+        }
+        manifest_path = manifest_dir / "manifest.json"
+        _write_json_evidence(manifest_path, manifest)
+        created = _now()
+        with _database() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO archives(
+                    archive_id, checkout_key, repo_common_dir, repo_path,
+                    checkout_path, head, branch, owner_id, purpose,
+                    retention_until_unix, recovery_refs_json, manifest_path,
+                    created_at_unix, cleaned_at_unix, cleanup_plan_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    archive_id,
+                    record["checkout_key"],
+                    str(common_dir),
+                    str(top_level),
+                    str(checkout),
+                    expected_head,
+                    record.get("branch"),
+                    owner,
+                    archive_purpose,
+                    until,
+                    _canonical_json(public_refs),
+                    str(manifest_path),
+                    created,
+                ),
+            )
+            lifecycle_binding = _mark_checkout_archived_in_connection(
+                connection,
+                record["checkout_key"],
+                owner,
+                created,
+            )
+            connection.commit()
+        archive = _load_archive(archive_id)
+        audit = {
+            "timestamp_unix": created,
+            "operation": "checkout-archive",
+            "archive_id": archive_id,
+            "checkout_key": record["checkout_key"],
+            "repo": str(top_level),
+            "checkout_path": str(checkout),
+            "owner_id": owner,
+            "head": expected_head,
+            "branch": record.get("branch"),
+            "recovery_refs": public_refs,
+            "branch_preserved": bool(record.get("branch")),
+            "status": status,
+            "coordination_checked": coordination["blocking_counts"],
+            "resource_keys": [
+                item["resource_key"] for item in lease["leases"]
+            ],
+            "rollback": manifest["rollback"],
+        }
+        base._append_audit(audit)
+        result = {
+            "archive": archive,
+            "retention": retention,
+            "lifecycle_binding": lifecycle_binding,
+            "lease": lease,
+            "manifest": manifest,
+            "audit": audit,
+        }
+    finally:
+        lease_release = _release_checkout_resources(lease)
+    if result is None:
+        raise RuntimeError("Checkout archive did not produce a result")
+    result["lease_release"] = lease_release
+    return result
 
 def _cleanup_plan(
     *,
@@ -1424,9 +1888,15 @@ def _cleanup_plan(
         raise RuntimeError("Checkout archive has already been cleaned")
     if archive["head"] != record.get("head") or archive["branch"] != record.get("branch"):
         raise RuntimeError("Checkout no longer matches its archived recovery refs")
+    now = _now()
+    archive_age_seconds = max(0, now - int(archive["created_at_unix"]))
+    if archive_age_seconds < CHECKOUT_CLEANUP_GRACE_SECONDS:
+        raise RuntimeError(
+            "Checkout cleanup grace has not elapsed: "
+            f"age={archive_age_seconds} required={CHECKOUT_CLEANUP_GRACE_SECONDS}"
+        )
     owner = _owner(owner_id)
     retention = _retention_records([record["checkout_key"]]).get(record["checkout_key"])
-    now = _now()
     retention_active = bool(retention and retention["retention_until_unix"] > now)
     if retention_active and retention["owner_id"] != owner:
         raise PermissionError("Active checkout retention is owned by another owner")
@@ -1457,6 +1927,8 @@ def _cleanup_plan(
         "status": status,
         "retention": retention,
         "retention_active": retention_active,
+        "archive_age_seconds": archive_age_seconds,
+        "archive_grace_seconds": CHECKOUT_CLEANUP_GRACE_SECONDS,
         "recovery_refs": verified_refs,
         "coordination": coordination,
         "command": command,

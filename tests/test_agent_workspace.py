@@ -416,7 +416,10 @@ class AgentWorkspaceTests(unittest.TestCase):
                 workspace._bind_writer_checkout_lifecycle(manifest)
             )
 
-        self.assertTrue(workspace._release_failed_workspace_checkout_lifecycle(manifest))
+        with mock.patch.object(workspace.os.path, "lexists", return_value=False):
+            self.assertTrue(
+                workspace._release_failed_workspace_checkout_lifecycle(manifest)
+            )
         self.assertEqual(
             workspace.checkouts._retention_records(
                 [manifest["checkout_lifecycle"]["checkout_key"]]
@@ -440,7 +443,10 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
             connection.commit()
 
-        self.assertFalse(workspace._release_failed_workspace_checkout_lifecycle(manifest))
+        with mock.patch.object(workspace.os.path, "lexists", return_value=False):
+            self.assertFalse(
+                workspace._release_failed_workspace_checkout_lifecycle(manifest)
+            )
         stored = workspace.checkouts._retention_records([lifecycle["checkout_key"]])
         self.assertEqual(
             stored[lifecycle["checkout_key"]]["updated_at_unix"],
@@ -4778,14 +4784,36 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
             plan = report["plans"][0]
             self.assertTrue(plan["eligible"])
-            result = workspace.grabowski_agent_workspace_cleanup(
+            waiting = workspace.grabowski_agent_workspace_cleanup(
                 manifest["workspace_id"],
                 plan["plan_sha256"],
                 "archive-and-remove-worktree",
             )
+            self.assertEqual(waiting["state"], "archived_waiting_grace")
+            self.assertTrue(self.git.writer.exists())
+            with workspace.checkouts._database() as connection:
+                connection.execute(
+                    "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
+                    (
+                        int(time.time())
+                        - workspace.checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
+                        waiting["archive_id"],
+                    ),
+                )
+                connection.commit()
+            refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertTrue(refreshed["eligible"])
+            self.assertNotEqual(refreshed["plan_sha256"], plan["plan_sha256"])
+            result = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                refreshed["plan_sha256"],
+                "archive-and-remove-worktree",
+            )
             replay = workspace.grabowski_agent_workspace_cleanup(
                 manifest["workspace_id"],
-                plan["plan_sha256"],
+                refreshed["plan_sha256"],
                 "archive-and-remove-worktree",
             )
         self.assertEqual(result["state"], "cleaned")
@@ -5328,6 +5356,16 @@ class AgentWorkspaceTests(unittest.TestCase):
                 expected_branch=plan["checkout"]["branch"],
             )
             archive = archived["archive"]
+            with workspace.checkouts._database() as connection:
+                connection.execute(
+                    "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
+                    (
+                        workspace._now()
+                        - workspace.checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
+                        archive["archive_id"],
+                    ),
+                )
+                connection.commit()
             dry_run = workspace.checkouts.grabowski_checkout_cleanup(
                 repo=plan["repository"],
                 checkout_path=plan["writer_worktree"],
