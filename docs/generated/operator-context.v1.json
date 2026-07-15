@@ -2044,7 +2044,7 @@
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "214233836855c6c60c76d504e41467f04ddcbaa6a2a104c83eacb30a936cf6bd",
-      "src/grabowski_operator_obligation.py": "b20a90643ee795309be9e82196f2a571ca1647b9c66cade4ee6ed70d280b278c",
+      "src/grabowski_operator_obligation.py": "e13190ec27c06f0aa59a2972158f44ffddbd1d4257b32e02c21edf036114c5f7",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "f3446c8c6a09033fbdfad0a040e39bf7ca53bfcfa88c4ac0e5581d398c99b0d3",
       "src/grabowski_privileged_broker.py": "c3980a038d11e47a0d9b44fd5db3628ffd017036894f1b300cecd536debbb8cc",

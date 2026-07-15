@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Hardened operator-obligation attention projection with fail-closed status invariants, explicit mixed open/blocked/delegated coverage, and a documented deprecated `follow_up_required` compatibility alias while preserving explicit `state="open"` behavior.
 - Added a durable operator-obligation lifecycle with bounded discovery, create-only hash-bound open and terminal records, and close-time live observation for delegated Grabowski tasks, agent workspaces, and systemd jobs. Nontrivial work remains explicitly open with `response_may_end=false` until every acceptance criterion is evidenced as passed, a concrete blocker is recorded, or live durable work is receipt-bound.
 - Published deployment manifests atomically as owner-only regular files so workspace runtime cohorts retain exact release and repository identities under any process umask.
 - Added Workspace Routing v2.1 with lean R0-R3 thresholds, separate concurrent-activity and parallelization-assessment inputs, R3-only contrast, explicit decision-fork competition gating, schema-1 route-evidence compatibility, and cohort-bound cost/intervention metrics without enabling parallel writers.

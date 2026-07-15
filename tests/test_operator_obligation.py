@@ -85,6 +85,7 @@ class OperatorObligationTests(unittest.TestCase):
         self.assertTrue(first["created"])
         self.assertFalse(first["response_may_end"])
         self.assertTrue(first["continuation_required"])
+        self.assertTrue(first["follow_up_required"])
         self.assertFalse(first["work_complete"])
         self.assertTrue(second["replayed"])
         self.assertEqual(first["open_file_sha256"], second["open_file_sha256"])
@@ -119,11 +120,12 @@ class OperatorObligationTests(unittest.TestCase):
         self.assertFalse(result["records"][0]["response_may_end"])
         self.assertTrue(result["attention_required"])
 
-    def test_default_list_keeps_blocked_and_delegated_work_visible(self) -> None:
+    def test_default_list_keeps_all_unfinished_work_visible(self) -> None:
         blocked = self._open_parameters("goo-blocked-work-0002")
         delegated = self._open_parameters("goo-delegated-work-0003")
         completed = self._open_parameters("goo-completed-work-0004")
-        for parameters in (blocked, delegated, completed):
+        open_work = self._open_parameters("goo-open-work-0005")
+        for parameters in (blocked, delegated, completed, open_work):
             obligation.open_obligation(parameters)
         obligation.close_obligation(
             {
@@ -159,18 +161,54 @@ class OperatorObligationTests(unittest.TestCase):
         )
 
         result = obligation.list_obligations()
+        explicit_attention = obligation.list_obligations({"state": "attention"})
+        open_only = obligation.list_obligations({"state": "open"})
         states = {item["obligation_id"]: item["state"] for item in result["records"]}
 
         self.assertEqual("attention", result["state_filter"])
+        self.assertEqual(result["records"], explicit_attention["records"])
         self.assertEqual(
             {
                 "goo-blocked-work-0002": "blocked",
                 "goo-delegated-work-0003": "delegated",
+                "goo-open-work-0005": "open",
             },
             states,
         )
+        self.assertEqual(
+            ["goo-open-work-0005"],
+            [item["obligation_id"] for item in open_only["records"]],
+        )
         self.assertTrue(result["attention_required"])
         self.assertTrue(all(item["continuation_required"] for item in result["records"]))
+
+    def test_list_reports_projection_drift_as_attention_integrity_error(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        original_status = obligation.status_obligation
+
+        def incomplete_status(obligation_id: str) -> dict[str, object]:
+            status = original_status(obligation_id)
+            status.pop("work_complete")
+            return status
+
+        with patch.object(obligation, "status_obligation", side_effect=incomplete_status):
+            result = obligation.list_obligations()
+
+        self.assertEqual([], result["records"])
+        self.assertEqual(
+            [
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "error": "OperatorObligationIntegrityError",
+                }
+            ],
+            result["integrity_errors"],
+        )
+        self.assertTrue(result["attention_required"])
+        self.assertEqual(
+            "inspect integrity errors before relying on the affected obligations",
+            result["recommended_next_action"],
+        )
 
     def test_same_id_cannot_be_rebound_to_different_work(self) -> None:
         obligation.open_obligation(self._open_parameters())
