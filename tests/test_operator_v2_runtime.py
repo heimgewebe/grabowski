@@ -242,7 +242,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         secret.mkdir()
         browser.mkdir()
         export.mkdir()
-        state.mkdir()
+        state.mkdir(mode=0o700)
         policy = root / "access.json"
         self._policy(
             policy,
@@ -567,6 +567,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     json.dumps(legacy, sort_keys=True) + "\n",
                     encoding="utf-8",
                 )
+                audit.chmod(0o600)
                 grabowski_mcp._append_audit(
                     {"operation": "v2-transition", "path": "/test"}
                 )

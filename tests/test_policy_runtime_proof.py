@@ -17,7 +17,7 @@ class PolicyRuntimeProofTests(unittest.TestCase):
             fake_home = root / "home"
             state = root / "state"
             fake_home.mkdir()
-            state.mkdir()
+            state.mkdir(mode=0o700)
 
             dot_ssh = ".s" + "sh"
             dot_gnupg = ".g" + "nupg"
