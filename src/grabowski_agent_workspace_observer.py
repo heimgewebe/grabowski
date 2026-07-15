@@ -5,6 +5,7 @@ import json
 import os
 import re
 import stat
+from datetime import datetime, timezone
 from typing import Any
 
 import grabowski_agent_workspace as workspace
@@ -15,7 +16,7 @@ except ModuleNotFoundError:
 
 mcp = operator.mcp
 READ_ONLY = operator.READ_ONLY
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 MAX_REPORT_EVENTS = 512
 MAX_OPTIMIZER_WORKSPACES = 50
 SUCCESS_CLASSIFICATIONS = frozenset({
@@ -30,6 +31,26 @@ NON_ACTIONABLE_FAILURE_CLASSES = frozenset({
     "unknown_external_closeout",
     "role_running",
     "unknown_prior_outcome",
+})
+PLATFORM_FRICTION_CLASSES = frozenset({
+    "environment_toolchain_failure",
+    "toolchain_probe_error",
+    "preflight_probe_error",
+    "invalid_review_output",
+    "review_execution_failure",
+    "output_limit_exceeded",
+    "writer_binding_violation",
+})
+QUALITY_SIGNAL_CLASSES = frozenset({
+    "semantic_test_failure",
+    "review_verdict",
+    "review_verdict_blocks_retry",
+})
+LIFECYCLE_DEBT_CLASSES = frozenset({
+    "legacy_workspace_without_event_log",
+    "unknown_external_closeout",
+    "unknown_prior_outcome",
+    "role_running",
 })
 CLOSEOUT_SOURCES = {
     "pr_integration_truth": "git_github",
@@ -202,6 +223,8 @@ def _failure_classes(
     for role, value in status.get("role_retry", {}).items():
         if not isinstance(value, dict):
             continue
+        if role in specifically_classified_roles:
+            continue
         if legacy_receipt_classes.get(role):
             classes.append(str(legacy_receipt_classes[role]))
             specifically_classified_roles.add(role)
@@ -335,19 +358,44 @@ def _resolved_closeout(
     return resolved, sorted(unresolved)
 
 
+def _failure_category(value: str) -> str:
+    """Separate workspace/platform friction from useful quality and lifecycle signals."""
+    if value in NON_ACTIONABLE_FAILURE_CLASSES or value in LIFECYCLE_DEBT_CLASSES:
+        return "lifecycle_debt"
+    if (
+        value in QUALITY_SIGNAL_CLASSES
+        or value.endswith(":semantic_test_failure")
+        or value.endswith(":review_verdict")
+        or value.endswith(":review_verdict_blocks_retry")
+    ):
+        return "quality_signal"
+    if (
+        value in PLATFORM_FRICTION_CLASSES
+        or value.endswith(":invalid_receipt")
+        or value.endswith(":invalid_review_output")
+        or value.endswith(":preflight_probe_error")
+        or value.endswith(":toolchain_probe_error")
+        or value.startswith("role_finished:")
+    ):
+        return "platform_friction"
+    return "unclassified_failure"
+
+
+def _categorized_failures(values: list[str]) -> dict[str, list[str]]:
+    result = {
+        "platform_friction": [],
+        "quality_signal": [],
+        "lifecycle_debt": [],
+        "unclassified_failure": [],
+    }
+    for value in values:
+        result[_failure_category(value)].append(value)
+    return {key: sorted(set(items)) for key, items in result.items()}
+
+
 def _is_actionable_failure(value: str) -> bool:
-    if value in NON_ACTIONABLE_FAILURE_CLASSES:
-        return False
-    return not any(
-        marker in value
-        for marker in (
-            "already_succeeded",
-            "not_attempted",
-            "not_collected",
-            "role_running",
-            "unknown_prior_outcome",
-        )
-    )
+    """Compatibility name: only platform friction can drive workspace optimization."""
+    return _failure_category(value) == "platform_friction"
 
 
 def _closeout_handoff(closeout: list[dict[str, Any]], unresolved: list[str]) -> dict[str, Any]:
@@ -361,23 +409,178 @@ def _closeout_handoff(closeout: list[dict[str, Any]], unresolved: list[str]) -> 
     }
 
 
+def _event_recorded_unix(event: dict[str, Any]) -> float | None:
+    value = event.get("recorded_at")
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _event_timing_metrics(events: list[dict[str, Any]]) -> dict[str, float | None]:
+    first: dict[str, float] = {}
+    for event in events:
+        event_type = event.get("event_type")
+        observed = _event_recorded_unix(event)
+        if isinstance(event_type, str) and observed is not None:
+            first.setdefault(event_type, observed)
+    start = first.get("plan_created")
+
+    def elapsed(event_type: str) -> float | None:
+        end = first.get(event_type)
+        return None if start is None or end is None or end < start else round(end - start, 6)
+
+    collection_start = first.get("collection_requested")
+    collection_end = first.get("collection_completed")
+    return {
+        "workspace_ready_seconds": elapsed("workspace_ready"),
+        "writer_observed_terminal_seconds": elapsed("collection_requested"),
+        "collection_complete_seconds": elapsed("collection_completed"),
+        "close_complete_seconds": (
+            elapsed("workspace_closed")
+            if "workspace_closed" in first
+            else elapsed("workspace_stale_reconciled")
+        ),
+        "collection_duration_seconds": (
+            round(collection_end - collection_start, 6)
+            if collection_start is not None
+            and collection_end is not None
+            and collection_end >= collection_start
+            else None
+        ),
+    }
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _cohort_identity(manifest: dict[str, Any]) -> dict[str, Any]:
+    identity = manifest.get("runtime_identity")
+    if not isinstance(identity, dict):
+        return {
+            "kind": "legacy",
+            "cohort_key": "legacy:unversioned",
+            "runtime_release": None,
+            "runtime_repo_head": None,
+            "runtime_identity_sha256": None,
+        }
+    observed = identity.get("identity_sha256")
+    unsigned = {key: value for key, value in identity.items() if key != "identity_sha256"}
+    if not isinstance(observed, str) or observed != _sha256_json(unsigned):
+        return {
+            "kind": "invalid",
+            "cohort_key": "invalid:runtime-identity",
+            "runtime_release": None,
+            "runtime_repo_head": None,
+            "runtime_identity_sha256": None,
+        }
+    release = identity.get("runtime_release")
+    head = identity.get("runtime_repo_head")
+    cohort_key = f"release:{release}" if isinstance(release, str) and release else f"identity:{observed}"
+    return {
+        "kind": "versioned",
+        "cohort_key": cohort_key,
+        "runtime_release": release if isinstance(release, str) else None,
+        "runtime_repo_head": head if isinstance(head, str) else None,
+        "runtime_identity_sha256": observed,
+    }
+
+
+def _cohort_metrics(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for report in reports:
+        cohort = report["facts"].get("cohort", {})
+        key = str(cohort.get("cohort_key", "legacy:unversioned"))
+        grouped.setdefault(key, []).append(report)
+    result: list[dict[str, Any]] = []
+    for key, members in sorted(grouped.items()):
+        closed = sum(item["facts"].get("closed") is True for item in members)
+        success = sum(item["facts"].get("closure_outcome") == "successful" for item in members)
+        result.append({
+            "cohort_key": key,
+            "cohort_kind": members[0]["facts"].get("cohort", {}).get("kind"),
+            "sample_size": len(members),
+            "closed_count": closed,
+            "successful_close_count": success,
+            "completion_ratio": closed / len(members) if members else None,
+            "closed_success_ratio": success / closed if closed else None,
+            "platform_friction_workspace_count": sum(
+                bool(item["facts"].get("workspace_friction_classes")) for item in members
+            ),
+            "quality_signal_workspace_count": sum(
+                bool(item["facts"].get("quality_signal_classes")) for item in members
+            ),
+            "lifecycle_debt_workspace_count": sum(
+                bool(item["facts"].get("lifecycle_debt_classes")) for item in members
+            ),
+            "source_report_sha256": [item["report_sha256"] for item in members],
+        })
+    return result
+
+
 def _metrics_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
     closed = sum(report["facts"].get("closed") is True for report in reports)
     success = sum(report["facts"].get("closure_outcome") == "successful" for report in reports)
     failed = sum(bool(report["facts"].get("failed_roles")) for report in reports)
-    actionable = sum(bool(report["facts"].get("actionable_failure_classes")) for report in reports)
-    return {
-        "schema_version": 1,
+    platform_friction = sum(bool(report["facts"].get("workspace_friction_classes")) for report in reports)
+    quality_signals = sum(bool(report["facts"].get("quality_signal_classes")) for report in reports)
+    lifecycle_debt = sum(bool(report["facts"].get("lifecycle_debt_classes")) for report in reports)
+    cohorts = _cohort_metrics(reports)
+    timing_fields = (
+        "workspace_ready_seconds",
+        "writer_observed_terminal_seconds",
+        "collection_complete_seconds",
+        "close_complete_seconds",
+        "collection_duration_seconds",
+    )
+    timing_medians = {
+        field: _median([
+            float(value)
+            for report in reports
+            if isinstance((value := report["facts"].get("timing", {}).get(field)), (int, float))
+            and not isinstance(value, bool)
+        ])
+        for field in timing_fields
+    }
+    body = {
+        "schema_version": 2,
         "sample_size": len(reports),
         "closed_count": closed,
         "successful_close_count": success,
         "failed_role_workspace_count": failed,
-        "actionable_failure_workspace_count": actionable,
-        "success_ratio": (success / len(reports)) if reports else None,
+        "platform_friction_workspace_count": platform_friction,
+        "quality_signal_workspace_count": quality_signals,
+        "lifecycle_debt_workspace_count": lifecycle_debt,
+        "actionable_failure_workspace_count": platform_friction,
+        "completion_ratio": (closed / len(reports)) if reports else None,
+        "closed_success_ratio": (success / closed) if closed else None,
+        "success_ratio": (success / closed) if closed else None,
+        "legacy_workspace_count": sum(
+            report["facts"].get("cohort", {}).get("kind", "legacy") == "legacy" for report in reports
+        ),
+        "versioned_workspace_count": sum(
+            report["facts"].get("cohort", {}).get("kind") == "versioned" for report in reports
+        ),
+        "cohorts": cohorts,
+        "timing_median_seconds": timing_medians,
         "source_report_sha256": [report["report_sha256"] for report in reports],
         "read_only_projection": True,
         "does_not_establish": ["causality", "global_workspace_population", "automatic_change_authority"],
     }
+    body["metrics_sha256"] = _sha256_json(body)
+    return body
 
 
 def _observer_report(
@@ -390,20 +593,28 @@ def _observer_report(
     status = workspace._status_data(manifest)
     events, integrity = _read_events(workspace_id)
     failure_classes = _failure_classes(events, status, manifest)
+    categorized = _categorized_failures(failure_classes)
     typed_event_evidence = bool(
         integrity.get("present") and integrity.get("integrity_valid")
     )
-    actionable_failure_classes = (
-        [item for item in failure_classes if _is_actionable_failure(item)]
-        if typed_event_evidence
-        else []
+    workspace_friction_classes = (
+        categorized["platform_friction"] if typed_event_evidence else []
     )
+    quality_signal_classes = categorized["quality_signal"]
+    lifecycle_debt_classes = list(categorized["lifecycle_debt"])
+    if not typed_event_evidence:
+        lifecycle_debt_classes = sorted(set([*lifecycle_debt_classes, "legacy_workspace_without_event_log"]))
+    actionable_failure_classes = list(workspace_friction_classes)
     supplied = _validate_closeout_evidence(workspace_id, manifest, external_closeout_evidence)
     closeout, unresolved = _resolved_closeout(status, supplied)
     identity = _writer_identity(manifest, status)
     facts = {
         "workspace_id": workspace_id,
         "binding": manifest.get("binding"),
+        "created_at": manifest.get("created_at"),
+        "updated_at": manifest.get("updated_at"),
+        "route_evidence": manifest.get("route_evidence"),
+        "timing": _event_timing_metrics(events),
         **identity,
         "closed": status.get("closed"),
         "closure_outcome": status.get("closure_outcome"),
@@ -411,7 +622,13 @@ def _observer_report(
         "failed_roles": status.get("failed_roles", []),
         "event_log": integrity,
         "failure_classes": failure_classes,
+        "failure_taxonomy": categorized,
+        "workspace_friction_classes": workspace_friction_classes,
+        "quality_signal_classes": quality_signal_classes,
+        "lifecycle_debt_classes": lifecycle_debt_classes,
+        "unclassified_failure_classes": categorized["unclassified_failure"],
         "actionable_failure_classes": actionable_failure_classes,
+        "cohort": _cohort_identity(manifest),
         "legacy_diagnostic_failure_classes": (
             failure_classes if not typed_event_evidence else []
         ),
@@ -426,12 +643,18 @@ def _observer_report(
         "outcome_receipts": manifest.get("outcome_receipts", {}),
     }
     inferences: list[dict[str, Any]] = []
-    actionable = facts["actionable_failure_classes"]
+    actionable = facts["workspace_friction_classes"]
     if actionable:
         inferences.append({
-            "inference": "workspace experienced actionable classified friction",
+            "inference": "workspace experienced classified platform friction",
             "failure_classes": actionable,
             "confidence": "high" if integrity.get("integrity_valid") else "medium",
+        })
+    if quality_signal_classes:
+        inferences.append({
+            "inference": "workspace produced quality signals that must not be treated as platform friction",
+            "failure_classes": quality_signal_classes,
+            "confidence": "high",
         })
     if unresolved:
         inferences.append({
@@ -487,6 +710,106 @@ def _observer_report(
     return report
 
 
+def workspace_metrics_snapshot(limit: int = MAX_OPTIMIZER_WORKSPACES) -> dict[str, Any]:
+    """Return a bounded, current-cohort workspace evidence snapshot without authority."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_OPTIMIZER_WORKSPACES:
+        raise WorkspaceObserverError(
+            f"limit must be between 1 and {MAX_OPTIMIZER_WORKSPACES}"
+        )
+    root = workspace.WORKSPACE_ROOT
+    selected: list[str] = []
+    inventory_errors: list[dict[str, Any]] = []
+    if root.exists():
+        if root.is_symlink() or not root.is_dir():
+            raise WorkspaceObserverError("workspace root must be a real directory")
+        for directory in sorted(root.iterdir(), key=lambda item: item.name):
+            if len(selected) >= limit:
+                break
+            if (
+                directory.is_dir()
+                and not directory.is_symlink()
+                and workspace.WORKSPACE_ID_RE.fullmatch(directory.name) is not None
+            ):
+                selected.append(directory.name)
+    reports: list[dict[str, Any]] = []
+    for identifier in selected:
+        try:
+            reports.append(
+                _observer_report(
+                    identifier,
+                    activation_reason="workspace-metrics-snapshot",
+                )
+            )
+        except Exception as exc:
+            inventory_errors.append({
+                "workspace_id": identifier,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:500],
+            })
+    metrics = _metrics_summary(reports)
+    current_identity = workspace._workspace_runtime_identity()
+    current_cohort = _cohort_identity({"runtime_identity": current_identity})
+    current_reports = [
+        report
+        for report in reports
+        if report["facts"].get("cohort", {}).get("cohort_key")
+        == current_cohort["cohort_key"]
+    ]
+    current_metrics = _metrics_summary(current_reports)
+    current_source_hashes = [report["report_sha256"] for report in current_reports]
+    fingerprint_body = {
+        "schema_version": 1,
+        "cohort_key": current_cohort["cohort_key"],
+        "runtime_identity_sha256": current_cohort["runtime_identity_sha256"],
+        "source_report_sha256": current_source_hashes,
+        "metrics_sha256": current_metrics["metrics_sha256"],
+    }
+    fingerprint = _sha256_json(fingerprint_body) if current_reports else None
+    route_records = [
+        {
+            "workspace_id": report["workspace_id"],
+            "cohort_key": report["facts"].get("cohort", {}).get("cohort_key"),
+            "route_evidence": report["facts"].get("route_evidence"),
+            "closed": report["facts"].get("closed"),
+            "closure_outcome": report["facts"].get("closure_outcome"),
+            "workspace_friction_classes": report["facts"].get("workspace_friction_classes", []),
+            "quality_signal_classes": report["facts"].get("quality_signal_classes", []),
+            "timing": report["facts"].get("timing", {}),
+            "report_sha256": report["report_sha256"],
+        }
+        for report in current_reports
+    ]
+    body = {
+        "schema_version": 1,
+        "report_kind": "workspace_metrics_snapshot",
+        "workspace_limit": limit,
+        "selected_workspace_count": len(selected),
+        "observed_workspace_count": len(reports),
+        "inventory_errors": inventory_errors,
+        "inventory_complete": not inventory_errors and len(selected) < limit,
+        "current_cohort": current_cohort,
+        "current_cohort_sample_size": len(current_reports),
+        "current_cohort_metrics": current_metrics,
+        "all_cohort_metrics": metrics,
+        "route_records": route_records,
+        "friction_fingerprint_sha256": fingerprint,
+        "friction_fingerprint_unavailable_reason": (
+            None if fingerprint is not None else "no_current_runtime_cohort_workspaces"
+        ),
+        "integrity_valid": not inventory_errors,
+        "read_only_projection": True,
+        "execution_authorized": False,
+        "automatic_live_routing_enabled": False,
+        "does_not_establish": [
+            "causality",
+            "route_superiority",
+            "live_routing_promotion",
+            "automatic_change_authority",
+        ],
+    }
+    return {**body, "snapshot_sha256": _sha256_json(body)}
+
+
 @mcp.tool(name="grabowski_agent_workspace_observe", annotations=READ_ONLY)
 def grabowski_agent_workspace_observe(
     workspace_id: str,
@@ -515,22 +838,58 @@ def grabowski_agent_workspace_optimize(workspace_ids: list[str]) -> dict[str, An
     if len(set(identifiers)) != len(identifiers):
         raise WorkspaceObserverError("workspace_ids must be unique")
     reports = [_observer_report(identifier, activation_reason="cross_workspace_optimizer") for identifier in identifiers]
-    workspaces_by_class: dict[str, list[str]] = {}
+    workspaces_by_class: dict[tuple[str, str], list[str]] = {}
+    quality_by_class: dict[tuple[str, str], list[str]] = {}
+    lifecycle_by_class: dict[tuple[str, str], list[str]] = {}
+    cohort_counts: dict[str, int] = {}
     for report in reports:
         identifier = str(report["workspace_id"])
-        for failure_class in report["facts"]["actionable_failure_classes"]:
-            workspaces_by_class.setdefault(failure_class, []).append(identifier)
+        cohort_key = str(report["facts"].get("cohort", {}).get("cohort_key", "legacy:unversioned"))
+        cohort_counts[cohort_key] = cohort_counts.get(cohort_key, 0) + 1
+        for failure_class in report["facts"]["workspace_friction_classes"]:
+            workspaces_by_class.setdefault((cohort_key, failure_class), []).append(identifier)
+        for failure_class in report["facts"]["quality_signal_classes"]:
+            quality_by_class.setdefault((cohort_key, failure_class), []).append(identifier)
+        for failure_class in report["facts"]["lifecycle_debt_classes"]:
+            lifecycle_by_class.setdefault((cohort_key, failure_class), []).append(identifier)
     repeated = [
         {
+            "cohort_key": cohort_key,
             "failure_class": failure_class,
             "workspace_count": len(affected),
             "workspace_ids": affected,
         }
-        for failure_class, affected in sorted(
+        for (cohort_key, failure_class), affected in sorted(
             workspaces_by_class.items(),
-            key=lambda item: (-len(item[1]), item[0]),
+            key=lambda item: (-len(item[1]), item[0][0], item[0][1]),
         )
         if len(affected) >= 2
+    ]
+    quality_signals = [
+        {
+            "cohort_key": cohort_key,
+            "failure_class": failure_class,
+            "workspace_count": len(affected),
+            "workspace_ids": affected,
+            "drives_workspace_optimization": False,
+        }
+        for (cohort_key, failure_class), affected in sorted(
+            quality_by_class.items(),
+            key=lambda item: (-len(item[1]), item[0][0], item[0][1]),
+        )
+    ]
+    lifecycle_debt = [
+        {
+            "cohort_key": cohort_key,
+            "failure_class": failure_class,
+            "workspace_count": len(affected),
+            "workspace_ids": affected,
+            "drives_workspace_optimization": False,
+        }
+        for (cohort_key, failure_class), affected in sorted(
+            lifecycle_by_class.items(),
+            key=lambda item: (-len(item[1]), item[0][0], item[0][1]),
+        )
     ]
     proposals = []
     for item in repeated:
@@ -540,6 +899,8 @@ def grabowski_agent_workspace_optimize(workspace_ids: list[str]) -> dict[str, An
             "measured_baseline": {
                 "workspace_count": item["workspace_count"],
                 "sample_size": len(reports),
+                "cohort_key": item["cohort_key"],
+                "cohort_sample_size": cohort_counts[item["cohort_key"]],
                 "independent_workspace_ids": item["workspace_ids"],
             },
             "expected_benefit": "reduce repeated workspace friction for this actionable failure",
@@ -553,12 +914,16 @@ def grabowski_agent_workspace_optimize(workspace_ids: list[str]) -> dict[str, An
         "workspace_ids": identifiers,
         "sample_size": len(reports),
         "repeated_failure_classes": repeated,
+        "quality_signals": quality_signals,
+        "lifecycle_debt": lifecycle_debt,
         "metrics": _metrics_summary(reports),
         "proposals": proposals,
-        "minimum_evidence_met": len(reports) >= 2,
+        "minimum_evidence_met": any(count >= 2 for count in cohort_counts.values()),
         "proposal_threshold": {
             "minimum_independent_workspaces": 2,
+            "same_cohort_required": True,
             "success_states_counted_as_failures": False,
+            "quality_signals_counted_as_platform_friction": False,
             "unknown_closeout_counted_as_failure": False,
             "legacy_event_log_absence_counted_as_failure": False,
         },

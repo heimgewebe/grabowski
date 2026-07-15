@@ -399,6 +399,59 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         self.assertEqual(handoff["next_action"], "verify:bureau_task_reconciliation")
         self.assertFalse(handoff["mutation_authorized"])
 
+    def test_semantic_test_failure_is_quality_signal_not_platform_friction(self) -> None:
+        identifier = "gaw-observer-test-quality-signal"
+        manifest = self._manifest(identifier)
+        workspace._append_workspace_event(
+            manifest,
+            "role_finished",
+            role="tests",
+            outcome="failed",
+            evidence={"failure_classification": "semantic_test_failure"},
+        )
+        with (
+            mock.patch.object(workspace, "_manifest", return_value=manifest),
+            mock.patch.object(workspace, "_status_data", return_value=self._status(failure="semantic_test_failure")),
+        ):
+            report = observer.grabowski_agent_workspace_observe(identifier, "quality-signal")
+        self.assertEqual(report["facts"]["workspace_friction_classes"], [])
+        self.assertEqual(report["facts"]["actionable_failure_classes"], [])
+        self.assertEqual(report["facts"]["quality_signal_classes"], ["semantic_test_failure"])
+
+    def test_optimizer_does_not_propose_platform_change_for_quality_signals(self) -> None:
+        identifiers = ["gaw-observer-quality-opt-01", "gaw-observer-quality-opt-02"]
+        manifests = {identifier: self._manifest(identifier) for identifier in identifiers}
+        for manifest in manifests.values():
+            workspace._append_workspace_event(
+                manifest,
+                "role_finished",
+                role="tests",
+                outcome="failed",
+                evidence={"failure_classification": "semantic_test_failure"},
+            )
+        with (
+            mock.patch.object(workspace, "_manifest", side_effect=lambda identifier: manifests[identifier]),
+            mock.patch.object(workspace, "_status_data", return_value=self._status(failure="semantic_test_failure")),
+        ):
+            result = observer.grabowski_agent_workspace_optimize(identifiers)
+        self.assertEqual(result["repeated_failure_classes"], [])
+        self.assertEqual(result["proposals"], [])
+        self.assertEqual(result["quality_signals"][0]["workspace_count"], 2)
+        self.assertFalse(result["quality_signals"][0]["drives_workspace_optimization"])
+
+    def test_runtime_identity_creates_versioned_cohort_and_rejects_tampering(self) -> None:
+        body = {
+            "schema_version": 1,
+            "runtime_release": "release-1",
+            "runtime_repo_head": "a" * 40,
+        }
+        manifest = {"runtime_identity": {**body, "identity_sha256": observer._sha256_json(body)}}
+        cohort = observer._cohort_identity(manifest)
+        self.assertEqual(cohort["kind"], "versioned")
+        self.assertEqual(cohort["cohort_key"], "release:release-1")
+        manifest["runtime_identity"]["runtime_release"] = "tampered"
+        self.assertEqual(observer._cohort_identity(manifest)["kind"], "invalid")
+
     def test_metrics_summary_is_report_hash_bound_and_read_only(self) -> None:
         reports = [
             {"report_sha256": "a" * 64, "facts": {"closed": True, "closure_outcome": "successful", "failed_roles": [], "actionable_failure_classes": []}},
@@ -408,7 +461,10 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         self.assertEqual(metrics["sample_size"], 2)
         self.assertEqual(metrics["successful_close_count"], 1)
         self.assertEqual(metrics["failed_role_workspace_count"], 1)
-        self.assertEqual(metrics["success_ratio"], 0.5)
+        self.assertEqual(metrics["success_ratio"], 1.0)
+        self.assertEqual(metrics["completion_ratio"], 0.5)
+        self.assertEqual(metrics["closed_success_ratio"], 1.0)
+        self.assertEqual(metrics["legacy_workspace_count"], 2)
         self.assertTrue(metrics["read_only_projection"])
         self.assertEqual(metrics["source_report_sha256"], ["a" * 64, "b" * 64])
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -246,6 +247,12 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.root_patch = mock.patch.object(workspace, "WORKSPACE_ROOT", self.state)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
+        self.preflight_cache = self.root / "preflight-cache"
+        self.cache_patch = mock.patch.object(
+            workspace, "ROLE_PREFLIGHT_CACHE_ROOT", self.preflight_cache
+        )
+        self.cache_patch.start()
+        self.addCleanup(self.cache_patch.stop)
         self.real_role_toolchain_preflight = workspace._role_toolchain_preflight
         self.preflight_patch = mock.patch.object(
             workspace,
@@ -1415,6 +1422,47 @@ class AgentWorkspaceTests(unittest.TestCase):
                     runtime_seconds=600,
                 )
         start.assert_not_called()
+
+    def test_create_blocks_before_writer_when_read_only_role_preflight_fails(self) -> None:
+        calls: list[str] = []
+
+        def preflight(_manifest, role_name, _command):
+            calls.append(role_name)
+            result = passing_toolchain_preflight(_manifest, role_name, _command)
+            if role_name == "tests":
+                result.update({
+                    "passed": False,
+                    "failure_classification": "environment_toolchain_failure",
+                })
+            return result
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace, "_verify_bureau_binding", side_effect=binding_evidence),
+            mock.patch.object(workspace.resources, "acquire_resources", return_value={"leases": []}),
+            mock.patch.object(workspace.resources, "release_resources", return_value={"released": []}),
+            mock.patch.object(workspace, "_role_toolchain_preflight", side_effect=preflight),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+        ):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError, "tests toolchain preflight failed"
+            ):
+                workspace.grabowski_agent_workspace_create(
+                    binding_kind="thread_focus",
+                    binding_id="thread-tests-preflight",
+                    repository=str(self.git.repo),
+                    expected_base_head=self.git.base,
+                    writer_branch="feat/tests-preflight",
+                    writer_worktree=str(self.root / "tests-preflight"),
+                    allowed_paths=["src"],
+                    writer_argv=["true"],
+                    test_argv=["/usr/bin/python3", "-m", "missing_test_tool"],
+                    review_argv=["true"],
+                    runtime_seconds=600,
+                )
+        self.assertEqual(calls, ["writer", "tests"])
+        start.assert_not_called()
+        self.assertFalse((self.root / "tests-preflight").exists())
 
     def test_create_rollback_preserves_dirty_writer_worktree(self) -> None:
         plan_id, _ = workspace._workspace_identity("thread_focus", "thread-rollback", self.git.repo, self.git.base)
@@ -2607,6 +2655,45 @@ class AgentWorkspaceTests(unittest.TestCase):
         close_mock.assert_called_once_with(descriptor)
         with self.assertRaises(OSError):
             os.fstat(descriptor)
+
+    def test_role_preflight_cache_is_bound_to_exact_snapshot_and_command(self) -> None:
+        manifest = self.manifest()
+        command = ["/usr/bin/python3", "-m", "json"]
+        self.preflight_patch.stop()
+        with mock.patch.object(
+            workspace.agent_role,
+            "toolchain_probe",
+            return_value={
+                "passed": True,
+                "missing_executable": False,
+                "missing_python_module": False,
+                "failure_classification": "passed",
+                "external_agent_profile": None,
+            },
+        ) as probe:
+            first = self.real_role_toolchain_preflight(manifest, "tests", command)
+            second = self.real_role_toolchain_preflight(manifest, "tests", command)
+            changed = self.real_role_toolchain_preflight(
+                manifest, "tests", ["/usr/bin/python3", "-m", "pathlib"]
+            )
+        self.assertFalse(first["cache"]["hit"])
+        self.assertTrue(second["cache"]["hit"] )
+        self.assertFalse(changed["cache"]["hit"] )
+        self.assertEqual(probe.call_count, 2)
+
+    def test_review_document_wrapper_hashes_raw_output_and_records_normalization(self) -> None:
+        raw = b'{"verdict":"PASS","findings":{}}'
+        verdict, findings, error, metadata = role.parse_review_document(raw)
+        self.assertEqual(verdict, "PASS")
+        self.assertEqual(findings, [])
+        self.assertIsNone(error)
+        self.assertEqual(metadata["review_document_contract"], role.REVIEW_DOCUMENT_CONTRACT)
+        self.assertEqual(metadata["review_document_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(
+            metadata["review_document_normalizations"],
+            ["findings_empty_object_to_empty_list"],
+        )
+        self.assertEqual(metadata["review_receipt_generated_by"], "grabowski_agent_role")
 
     def test_role_receipt_writers_cleanup_descriptor_and_temporary_on_fdopen_failure(self) -> None:
         cases = (
@@ -4772,11 +4859,20 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(first["plan_sha256"], second["plan_sha256"])
         self.assertTrue(first["stale_reconciliation"]["eligible"])
-        self.assertEqual(result["state"], "stale_workspace_reconciled")
+        self.assertEqual(result["state"], "legacy_workspace_reconciled")
         self.assertEqual(replay["state"], "already_closed")
         self.assertTrue(replay["idempotent"])
         receipt = result["close_receipt"]
-        self.assertEqual(receipt["closure_outcome"], "abandoned_stale_workspace")
+        self.assertEqual(receipt["closure_outcome"], "abandoned_legacy_workspace")
+        self.assertEqual(receipt["reconciliation_kind"], "legacy_absence")
+        self.assertTrue(receipt["legacy_absence_reconciliation"])
+        legacy_receipt = result["legacy_absence_receipt"]
+        self.assertTrue(workspace._receipt_integrity(legacy_receipt))
+        self.assertTrue(legacy_receipt["observed_worktree_absent"])
+        self.assertEqual(
+            legacy_receipt["receipt_sha256"],
+            receipt["legacy_absence_receipt_sha256"],
+        )
         self.assertFalse(receipt["task_mutation_performed"])
         self.assertFalse(receipt["resource_mutation_performed"])
         self.assertFalse(receipt["worktree_mutation_performed"])
@@ -4801,6 +4897,80 @@ class AgentWorkspaceTests(unittest.TestCase):
         release_resources.assert_not_called()
         archive.assert_not_called()
         checkout_cleanup.assert_not_called()
+
+    def test_versioned_missing_workspace_uses_stale_not_legacy_outcome(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        identity_body = {
+            "schema_version": 1,
+            "runtime_release": "release-v2",
+            "runtime_repo_head": self.git.base,
+        }
+        manifest["runtime_identity"] = {
+            **identity_body,
+            "identity_sha256": workspace._sha256_json(identity_body),
+        }
+        workspace._write_manifest(manifest)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                side_effect=lambda task_id: (
+                    {"task_id": None, "state": "not_started", "terminal": False}
+                    if task_id is None
+                    else {"task_id": task_id, "state": "completed", "terminal": True}
+                ),
+            ),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            result = workspace.grabowski_agent_workspace_reconcile_stale(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "mark-stale-workspace-abandoned",
+            )
+        self.assertEqual(plan["stale_reconciliation"]["reconciliation_kind"], "stale_abandonment")
+        self.assertEqual(result["state"], "stale_workspace_reconciled")
+        self.assertEqual(result["close_receipt"]["closure_outcome"], "abandoned_stale_workspace")
+        self.assertIsNone(result["legacy_absence_receipt"])
+
+    def test_legacy_close_integrity_requires_bound_absence_receipt(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        legacy_body = {
+            "schema_version": 1,
+            "workspace_id": manifest["workspace_id"],
+            "writer_worktree": manifest["writer_worktree"],
+            "writer_branch": manifest["writer_branch"],
+            "observed_worktree_absent": True,
+        }
+        legacy = {**legacy_body, "receipt_sha256": workspace._sha256_json(legacy_body)}
+        workspace._atomic_json(
+            self.state / manifest["workspace_id"] / "legacy-absence-receipt.json", legacy
+        )
+        close_body = {
+            "schema_version": 1,
+            "state": "complete",
+            "workspace_id": manifest["workspace_id"],
+            "resources_released": True,
+            "closure_outcome": "abandoned_legacy_workspace",
+            "legacy_absence_receipt_sha256": "0" * 64,
+        }
+        close = {**close_body, "receipt_sha256": workspace._sha256_json(close_body)}
+        workspace._atomic_json(
+            self.state / manifest["workspace_id"] / "close-receipt.json", close
+        )
+        manifest["close_receipt"] = close
+        workspace._write_manifest(manifest)
+        status = workspace._close_integrity_status(manifest, close)
+        self.assertFalse(status["valid"])
+        self.assertFalse(status["legacy_absence_receipt"]["matches_close_receipt"])
 
     def test_stale_reconciliation_blocks_live_resources(self) -> None:
         manifest = self.manifest(with_writer=False)

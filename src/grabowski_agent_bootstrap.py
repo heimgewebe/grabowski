@@ -119,6 +119,26 @@ def call_shape_check(
     return result
 
 
+def _workspace_metrics_snapshot(limit: int) -> dict[str, Any]:
+    try:
+        import grabowski_agent_workspace_observer as workspace_observer
+
+        return workspace_observer.workspace_metrics_snapshot(limit=limit)
+    except Exception as exc:
+        body = {
+            "schema_version": 1,
+            "report_kind": "workspace_metrics_snapshot_unavailable",
+            "integrity_valid": False,
+            "friction_fingerprint_sha256": None,
+            "friction_fingerprint_unavailable_reason": "workspace_metrics_observation_failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:500],
+            "execution_authorized": False,
+            "automatic_live_routing_enabled": False,
+        }
+        return {**body, "snapshot_sha256": _stable_sha256(body)}
+
+
 def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> dict[str, Any]:
     if isinstance(friction_limit, bool) or not isinstance(friction_limit, int):
         raise ValueError("friction_limit must be an integer")
@@ -131,6 +151,9 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
 
     friction = grabowski_friction.friction_summary(limit=friction_limit)
     governor = grabowski_friction.execution_governor_summary(limit=outcome_limit)
+    workspace_metrics = _workspace_metrics_snapshot(
+        min(outcome_limit, 50)
+    )
     integrity_valid = bool(
         friction.get("event_log_integrity", {}).get("integrity_valid", True)
         and friction.get("decision_log", {}).get("integrity_valid", True)
@@ -139,6 +162,10 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
     adaptive_enabled = integrity_valid and not any(
         candidate.get("circuit_breaker_open") is True
         for candidate in governor.get("candidates", [])
+    )
+    friction_fingerprint = (
+        friction.get("fingerprint_sha256")
+        or workspace_metrics.get("friction_fingerprint_sha256")
     )
 
     capsule = {
@@ -187,7 +214,20 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
         "immutable_boundaries": list(IMMUTABLE_BOUNDARIES),
         "adaptive_evidence": {
             "integrity_valid": integrity_valid,
-            "friction_fingerprint_sha256": friction.get("fingerprint_sha256"),
+            "friction_fingerprint_sha256": friction_fingerprint,
+            "generic_friction_fingerprint_sha256": friction.get("fingerprint_sha256"),
+            "workspace_friction_fingerprint_sha256": workspace_metrics.get(
+                "friction_fingerprint_sha256"
+            ),
+            "workspace_metrics_snapshot_sha256": workspace_metrics.get("snapshot_sha256"),
+            "workspace_metrics_integrity_valid": workspace_metrics.get("integrity_valid") is True,
+            "workspace_current_cohort": workspace_metrics.get("current_cohort"),
+            "workspace_current_cohort_sample_size": workspace_metrics.get(
+                "current_cohort_sample_size", 0
+            ),
+            "workspace_fingerprint_unavailable_reason": workspace_metrics.get(
+                "friction_fingerprint_unavailable_reason"
+            ),
             "governor_summary_sha256": governor.get("summary_sha256"),
             "minimum_evidence": governor.get("minimum_evidence"),
             "time_decay_seconds": governor.get("decay_seconds"),
@@ -212,6 +252,9 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
             "promotion_requires_minimum_evidence": True,
             "promotion_requires_no_regression_signal": True,
             "promotion_is_reversible": True,
+            "workspace_outcomes_are_cohort_bound": True,
+            "quality_signals_do_not_count_as_platform_friction": True,
+            "workspace_route_calibration_mode": "shadow_only",
         },
         "does_not_establish": [
             "automatic_task_creation_authority",

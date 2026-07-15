@@ -68,6 +68,17 @@ class AgentCompetitionTests(unittest.TestCase):
             mock.patch.object(competition.operator, "_require_operator_mutation"),
             mock.patch.object(competition.operator, "_require_operator_capability"),
             mock.patch.object(competition.shutil, "which", side_effect=lambda provider: f"/usr/bin/{provider}"),
+            mock.patch.object(
+                competition,
+                "_workspace_route_shadow_calibration",
+                return_value={
+                    "schema_version": 1,
+                    "mode": "shadow_only",
+                    "eligible": False,
+                    "applied_to_live_route": False,
+                    "execution_authorized": False,
+                },
+            ),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -266,6 +277,38 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(competitive["execution_mode"], "workspace_with_competition")
         self.assertFalse(competitive["automatic_winner_selection"])
         self.assertEqual(len(competitive["external_candidates"]), 2)
+
+    def test_route_shadow_calibration_never_changes_live_route_or_recommendation_id(self) -> None:
+        kwargs = dict(
+            task_kind="code",
+            changed_file_estimate=5,
+            expected_duration_minutes=60,
+            novelty="medium",
+            risk_flags=[],
+            available_external_agents=["claude"],
+        )
+        baseline = competition.grabowski_agent_execution_route(**kwargs)
+        with mock.patch.object(
+            competition,
+            "_workspace_route_shadow_calibration",
+            return_value={
+                "schema_version": 1,
+                "mode": "shadow_only",
+                "eligible": True,
+                "route_summaries": [
+                    {"route": "isolated_worktree", "closed_success_ratio": 1.0},
+                    {"route": "full_workspace", "closed_success_ratio": 0.5},
+                ],
+                "applied_to_live_route": False,
+                "execution_authorized": False,
+            },
+        ):
+            calibrated = competition.grabowski_agent_execution_route(**kwargs)
+        self.assertEqual(calibrated["execution_mode"], baseline["execution_mode"])
+        self.assertEqual(calibrated["recommendation_id"], baseline["recommendation_id"])
+        self.assertTrue(calibrated["shadow_calibration"]["eligible"])
+        self.assertFalse(calibrated["shadow_calibration"]["applied_to_live_route"])
+        self.assertFalse(calibrated["shadow_calibration"]["execution_authorized"])
 
     def test_route_rejects_coercive_bools_and_unknown_agents(self) -> None:
         with self.assertRaisesRegex(competition.AgentCompetitionError, "must be boolean"):

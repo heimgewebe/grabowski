@@ -20,6 +20,8 @@ MAX_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
 MAX_UNTRACKED_TOTAL_BYTES = 64 * 1024 * 1024
 SANDBOX_LABEL = "bubblewrap-minimal-root-read-only-worktree-v1"
 TOOLCHAIN_PROBE_OUTPUT_LIMIT = 64 * 1024
+TOOLCHAIN_PROBE_CONTRACT = "role-toolchain-probe-v2"
+REVIEW_DOCUMENT_CONTRACT = "review-document-wrapper-v2"
 PYTHON_EXECUTABLE_NAMES = frozenset(
     {"python", "python3"} | {f"python3.{minor}" for minor in range(0, 20)}
 )
@@ -426,6 +428,35 @@ def _normalize_review_object(
     return verdict, findings, None, normalized_empty_object
 
 
+def parse_review_document(
+    raw: bytes,
+) -> tuple[str | None, list[dict[str, Any]] | None, str | None, dict[str, Any]]:
+    """Turn bounded agent output into a canonical Grabowski review document."""
+    metadata: dict[str, Any] = {
+        "review_document_contract": REVIEW_DOCUMENT_CONTRACT,
+        "review_document_bytes": len(raw),
+        "review_document_sha256": hashlib.sha256(raw).hexdigest(),
+        "review_document_normalizations": [],
+        "review_receipt_generated_by": "grabowski_agent_role",
+    }
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        return None, None, f"review stdout is not valid UTF-8: {exc}", metadata
+    try:
+        review = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, None, f"review stdout is not one JSON object: {exc}", metadata
+    verdict, findings, error, normalized_empty_object = _normalize_review_object(review)
+    if normalized_empty_object:
+        metadata["review_document_normalizations"] = [
+            "findings_empty_object_to_empty_list"
+        ]
+    metadata["review_findings_normalized"] = normalized_empty_object
+    metadata["review_document_object_sha256"] = digest(review) if isinstance(review, dict) else None
+    return verdict, findings, error, metadata
+
+
 def classify_result(role: str, command: list[str], repo: Path, payload: dict[str, Any]) -> str:
     """Classify one final role result without trusting user-controlled output text."""
     returncode = payload.get("returncode")
@@ -519,45 +550,38 @@ def main(argv: list[str] | None = None) -> int:
         payload["returncode"] = 125
         payload["error"] = "read-only role observed writer mutation"
     if args.role == "review":
-        review_stdout: str | None = None
-        review_decode_error: str | None = None
         if completed.stdout_content_exceeded or completed.stdout_content is None:
-            review_decode_error = f"review stdout exceeds {MAX_REVIEW_JSON_BYTES} bytes"
-        else:
-            try:
-                review_stdout = completed.stdout_content.decode("utf-8", errors="strict")
-            except UnicodeDecodeError as exc:
-                review_decode_error = str(exc)
-        if review_decode_error is not None or review_stdout is None:
+            payload.update({
+                "review_document_contract": REVIEW_DOCUMENT_CONTRACT,
+                "review_document_bytes": completed.stdout_bytes,
+                "review_document_sha256": completed.stdout_sha256,
+                "review_document_normalizations": [],
+                "review_findings_normalized": False,
+                "review_receipt_generated_by": "grabowski_agent_role",
+            })
             payload["returncode"] = 126
             payload["verdict"] = "INVALID"
             payload["findings"] = []
-            payload["error"] = f"review stdout is unavailable: {review_decode_error}"
+            payload["error"] = f"review stdout exceeds {MAX_REVIEW_JSON_BYTES} bytes"
         else:
-            try:
-                review = json.loads(review_stdout)
-            except json.JSONDecodeError as exc:
+            verdict, findings, review_error, document_metadata = parse_review_document(
+                completed.stdout_content
+            )
+            payload.update(document_metadata)
+            if review_error is not None or verdict is None or findings is None:
                 payload["returncode"] = 126
                 payload["verdict"] = "INVALID"
                 payload["findings"] = []
-                payload["error"] = f"review stdout is not one JSON object: {exc}"
+                payload["error"] = review_error
             else:
-                verdict, findings, review_error, findings_normalized = _normalize_review_object(review)
-                payload["review_findings_normalized"] = findings_normalized
-                if review_error is not None or verdict is None or findings is None:
+                payload["verdict"] = verdict
+                payload["findings"] = findings
+                if verdict == "PASS" and findings:
                     payload["returncode"] = 126
-                    payload["verdict"] = "INVALID"
-                    payload["findings"] = []
-                    payload["error"] = review_error
-                else:
-                    payload["verdict"] = verdict
-                    payload["findings"] = findings
-                    if verdict == "PASS" and findings:
-                        payload["returncode"] = 126
-                        payload["error"] = "PASS review may not contain findings"
-                    elif verdict != "PASS" and not findings:
-                        payload["returncode"] = 126
-                        payload["error"] = "non-PASS review must contain findings"
+                    payload["error"] = "PASS review may not contain findings"
+                elif verdict != "PASS" and not findings:
+                    payload["returncode"] = 126
+                    payload["error"] = "non-PASS review must contain findings"
     payload["failure_classification"] = classify_result(args.role, command, repo, payload)
     stable = dict(payload)
     payload["receipt_sha256"] = digest(stable)
