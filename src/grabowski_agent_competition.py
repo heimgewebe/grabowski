@@ -1379,6 +1379,7 @@ def _workspace_route_shadow_calibration(
 
     comparable: list[tuple[dict[str, Any], str]] = []
     discarded_record_count = 0
+    current_risk_tier = workspace._route_decision(input_facts).get("risk_tier")
     for record in snapshot.get("route_records", []):
         if not isinstance(record, dict):
             discarded_record_count += 1
@@ -1403,7 +1404,10 @@ def _workspace_route_shadow_calibration(
             discarded_record_count += 1
             continue
         if (
-            prior.get("task_kind") == input_facts["task_kind"]
+            route.get("schema_version") == 2
+            and route.get("route_policy_version") == workspace.ROUTE_POLICY_VERSION
+            and route.get("risk_tier") == current_risk_tier
+            and prior.get("task_kind") == input_facts["task_kind"]
             and prior.get("novelty") == input_facts["novelty"]
             and sorted(prior_risk_flags) == input_facts["risk_flags"]
         ):
@@ -1464,6 +1468,8 @@ def _workspace_route_shadow_calibration(
             snapshot.get("friction_fingerprint_sha256") if integrity_valid else None
         ),
         "comparison_key": {
+            "route_policy_version": workspace.ROUTE_POLICY_VERSION,
+            "risk_tier": workspace._route_decision(input_facts).get("risk_tier"),
             "task_kind": input_facts["task_kind"],
             "novelty": input_facts["novelty"],
             "risk_flags": input_facts["risk_flags"],
@@ -1499,42 +1505,130 @@ def grabowski_agent_execution_route(
     novelty: str,
     risk_flags: list[str] | None = None,
     connector_instability: bool = False,
-    parallel_work: bool = False,
+    parallel_work: bool | None = None,
     user_requested_external: bool = False,
     available_external_agents: list[str] | None = None,
+    concurrent_external_activity: bool | None = None,
+    parallelization_candidate: bool = False,
+    decision_fork: bool = False,
+    architecture_hypotheses: int = 1,
 ) -> dict[str, Any]:
-    """Recommend direct, workspace, contrast or competition execution without authorizing it."""
+    """Recommend a lean R0-R3 route without authorizing parallel writers."""
     kind = workspace._required_string(task_kind, "task_kind", max_length=32)
     if kind not in TASK_KINDS:
-        raise AgentCompetitionError(f"task_kind must be one of {sorted(TASK_KINDS)}")
-    if isinstance(changed_file_estimate, bool) or not isinstance(changed_file_estimate, int) or not 0 <= changed_file_estimate <= 10000:
-        raise AgentCompetitionError("changed_file_estimate must be an integer between 0 and 10000")
-    if isinstance(expected_duration_minutes, bool) or not isinstance(expected_duration_minutes, int) or not 0 <= expected_duration_minutes <= 10080:
-        raise AgentCompetitionError("expected_duration_minutes must be an integer between 0 and 10080")
-    novelty_value = workspace._required_string(novelty, "novelty", max_length=16)
+        raise AgentCompetitionError(
+            f"task_kind must be one of {sorted(TASK_KINDS)}"
+        )
+    if (
+        isinstance(changed_file_estimate, bool)
+        or not isinstance(changed_file_estimate, int)
+        or not 0 <= changed_file_estimate <= 10000
+    ):
+        raise AgentCompetitionError(
+            "changed_file_estimate must be an integer between 0 and 10000"
+        )
+    if (
+        isinstance(expected_duration_minutes, bool)
+        or not isinstance(expected_duration_minutes, int)
+        or not 0 <= expected_duration_minutes <= 10080
+    ):
+        raise AgentCompetitionError(
+            "expected_duration_minutes must be an integer between 0 and 10080"
+        )
+    novelty_value = workspace._required_string(
+        novelty, "novelty", max_length=16
+    )
     if novelty_value not in NOVELTY:
-        raise AgentCompetitionError(f"novelty must be one of {sorted(NOVELTY)}")
+        raise AgentCompetitionError(
+            f"novelty must be one of {sorted(NOVELTY)}"
+        )
     flags = [] if risk_flags is None else risk_flags
     if not isinstance(flags, list) or len(flags) > len(RISK_FLAGS):
         raise AgentCompetitionError("risk_flags is invalid")
-    normalized_flags = sorted(set(workspace._required_string(item, "risk_flag", max_length=32) for item in flags))
+    normalized_flags = sorted(
+        set(
+            workspace._required_string(
+                item, "risk_flag", max_length=32
+            )
+            for item in flags
+        )
+    )
     unknown_flags = sorted(set(normalized_flags) - RISK_FLAGS)
     if unknown_flags:
         raise AgentCompetitionError(f"unknown risk_flags: {unknown_flags}")
-    connector_flag = _strict_bool(connector_instability, "connector_instability")
-    parallel_flag = _strict_bool(parallel_work, "parallel_work")
-    external_requested = _strict_bool(user_requested_external, "user_requested_external")
+    connector_flag = _strict_bool(
+        connector_instability, "connector_instability"
+    )
+    legacy_parallel = (
+        None
+        if parallel_work is None
+        else _strict_bool(parallel_work, "parallel_work")
+    )
+    concurrent_flag = (
+        None
+        if concurrent_external_activity is None
+        else _strict_bool(
+            concurrent_external_activity, "concurrent_external_activity"
+        )
+    )
+    if (
+        legacy_parallel is not None
+        and concurrent_flag is not None
+        and legacy_parallel != concurrent_flag
+    ):
+        raise AgentCompetitionError(
+            "parallel_work and concurrent_external_activity disagree"
+        )
+    resolved_concurrent = bool(
+        concurrent_flag
+        if concurrent_flag is not None
+        else legacy_parallel
+        if legacy_parallel is not None
+        else False
+    )
+    parallel_candidate = _strict_bool(
+        parallelization_candidate, "parallelization_candidate"
+    )
+    decision_fork_flag = _strict_bool(decision_fork, "decision_fork")
+    external_requested = _strict_bool(
+        user_requested_external, "user_requested_external"
+    )
+    if (
+        isinstance(architecture_hypotheses, bool)
+        or not isinstance(architecture_hypotheses, int)
+        or not 1 <= architecture_hypotheses <= 4
+    ):
+        raise AgentCompetitionError(
+            "architecture_hypotheses must be between 1 and 4"
+        )
     if available_external_agents is None:
-        normalized_agents = [provider for provider in ("claude", "agy") if shutil.which(provider)]
+        normalized_agents = [
+            provider
+            for provider in ("claude", "agy")
+            if shutil.which(provider)
+        ]
     else:
         agents = available_external_agents
         if not isinstance(agents, list) or len(agents) > 10:
-            raise AgentCompetitionError("available_external_agents is invalid")
-        requested_agents = {workspace._required_string(item, "external_agent", max_length=32) for item in agents}
+            raise AgentCompetitionError(
+                "available_external_agents is invalid"
+            )
+        requested_agents = {
+            workspace._required_string(
+                item, "external_agent", max_length=32
+            )
+            for item in agents
+        }
         unsupported = sorted(requested_agents - PROVIDERS)
         if unsupported:
-            raise AgentCompetitionError(f"unsupported external agents: {unsupported}")
-        normalized_agents = [provider for provider in ("claude", "agy") if provider in requested_agents]
+            raise AgentCompetitionError(
+                f"unsupported external agents: {unsupported}"
+            )
+        normalized_agents = [
+            provider
+            for provider in ("claude", "agy")
+            if provider in requested_agents
+        ]
     input_facts = {
         "task_kind": kind,
         "changed_file_estimate": changed_file_estimate,
@@ -1542,7 +1636,10 @@ def grabowski_agent_execution_route(
         "novelty": novelty_value,
         "risk_flags": normalized_flags,
         "connector_instability": connector_flag,
-        "parallel_work": parallel_flag,
+        "concurrent_external_activity": resolved_concurrent,
+        "parallelization_candidate": parallel_candidate,
+        "decision_fork": decision_fork_flag,
+        "architecture_hypotheses": architecture_hypotheses,
         "user_requested_external": external_requested,
         "available_external_agents": normalized_agents,
     }
@@ -1554,10 +1651,13 @@ def grabowski_agent_execution_route(
     external_available = list(input_facts["available_external_agents"])
     trivial_work = bool(decision["trivial_work"])
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "route_policy_version": decision["route_policy_version"],
+        "risk_tier": decision["risk_tier"],
         "score": score,
         "execution_mode": mode,
-        "full_workspace": mode.startswith("full_workspace") or mode.startswith("workspace_with_"),
+        "full_workspace": mode.startswith("full_workspace")
+        or mode.startswith("workspace_with_"),
         "external_candidates": candidate_plan,
         "max_external_candidates": 2,
         "external_results_are_advisory": True,
@@ -1565,16 +1665,24 @@ def grabowski_agent_execution_route(
         "automatic_winner_selection": False,
         "operator_remains_integrator": True,
         "roles_remain_isolated": mode != "direct_operator",
+        "single_mutating_writer": True,
+        "parallel_writer_pilot": decision["parallel_writer_pilot"],
         "input_facts": input_facts,
         "trivial_work": trivial_work,
         "deviation_requires_reason": True,
         "rationale": {
             "task_kind": kind,
+            "risk_tier": decision["risk_tier"],
             "novelty": novelty_value,
             "risk_flags": normalized_flags,
             "connector_instability": connector_flag,
-            "parallel_work": parallel_flag,
+            "concurrent_external_activity": resolved_concurrent,
+            "parallelization_candidate": parallel_candidate,
+            "decision_fork": decision_fork_flag,
+            "architecture_hypotheses": architecture_hypotheses,
             "design_space_benefits_from_contrast": design_space,
+            "contrast_eligible": decision["contrast_eligible"],
+            "competition_eligible": decision["competition_eligible"],
             "external_agents_available": external_available,
         },
         "stop_conditions": [
@@ -1582,16 +1690,28 @@ def grabowski_agent_execution_route(
             "bound commit or exported context becomes unavailable or mismatched",
             "candidate attempts mutation or returns unstructured output",
             "additional candidate would repeat an already represented approach",
+            "parallel writer assessment lacks a two-shard conflict-domain proof",
         ],
-        "does_not_establish": ["execution_authority", "candidate_correctness", "merge_readiness", "need_for_external_agents"],
+        "does_not_establish": [
+            "execution_authority",
+            "candidate_correctness",
+            "merge_readiness",
+            "need_for_external_agents",
+            "parallel_writer_safety",
+            "workspace_group_availability",
+        ],
     }
-    result["recommendation_id"] = _sha256_json({
+    recommendation_contract = {
         "schema_version": result["schema_version"],
+        "route_policy_version": result["route_policy_version"],
+        "risk_tier": result["risk_tier"],
         "score": score,
         "execution_mode": mode,
         "input_facts": input_facts,
         "external_candidates": candidate_plan,
-    })
+        "parallel_writer_pilot": result["parallel_writer_pilot"],
+    }
+    result["recommendation_id"] = _sha256_json(recommendation_contract)
     result["shadow_calibration"] = _workspace_route_shadow_calibration(
         input_facts, mode
     )

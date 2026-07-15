@@ -458,6 +458,7 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
             {"report_sha256": "b" * 64, "facts": {"closed": False, "closure_outcome": "not_ready", "failed_roles": ["writer"], "actionable_failure_classes": ["writer:failed"]}},
         ]
         metrics = observer._metrics_summary(reports)
+        self.assertEqual(metrics["schema_version"], 3)
         self.assertEqual(metrics["sample_size"], 2)
         self.assertEqual(metrics["successful_close_count"], 1)
         self.assertEqual(metrics["failed_role_workspace_count"], 1)
@@ -467,6 +468,9 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         self.assertEqual(metrics["legacy_workspace_count"], 2)
         self.assertTrue(metrics["read_only_projection"])
         self.assertEqual(metrics["source_report_sha256"], ["a" * 64, "b" * 64])
+        self.assertFalse(metrics["cost_benefit_evidence"]["external_cost_usd_available"])
+        self.assertEqual(metrics["cost_benefit_evidence"]["parallel_writer_sample_count"], 0)
+        self.assertFalse(metrics["cost_benefit_evidence"]["parallel_writer_outcome_comparison_eligible"])
 
     def _snapshot_report(self, identifier: str, *, activation_reason: str) -> dict:
         manifest = workspace._manifest(identifier)
@@ -559,12 +563,56 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         events = [
             {"event_type": "plan_created", "recorded_at": "2026-07-15T10:00:00+00:00"},
             {
+                "event_type": "role_started",
+                "role": "writer",
+                "recorded_at": "2026-07-15T10:00:01+00:00",
+            },
+            {
                 "event_type": "collection_requested",
                 "recorded_at": "2026-07-15T10:00:05+00:00",
+            },
+            {
+                "event_type": "role_started",
+                "role": "tests",
+                "recorded_at": "2026-07-15T10:00:06+00:00",
+            },
+            {
+                "event_type": "role_started",
+                "role": "review",
+                "recorded_at": "2026-07-15T10:00:07+00:00",
+            },
+            {
+                "event_type": "role_finished",
+                "role": "tests",
+                "recorded_at": "2026-07-15T10:00:11+00:00",
+            },
+            {
+                "event_type": "role_finished",
+                "role": "review",
+                "recorded_at": "2026-07-15T10:00:13+00:00",
+            },
+            {
+                "event_type": "collection_completed",
+                "recorded_at": "2026-07-15T10:00:14+00:00",
+            },
+            {
+                "event_type": "collection_requested",
+                "recorded_at": "2026-07-15T10:00:15+00:00",
+            },
+            {
+                "event_type": "retry_decision",
+                "recorded_at": "2026-07-15T10:00:16+00:00",
             },
         ]
         timing = observer._event_timing_metrics(events)
         self.assertEqual(timing["collection_requested_seconds"], 5.0)
+        self.assertEqual(timing["writer_observed_seconds"], 4.0)
+        self.assertEqual(timing["tests_duration_seconds"], 5.0)
+        self.assertEqual(timing["review_duration_seconds"], 6.0)
+        self.assertEqual(timing["validation_wall_seconds"], 9.0)
+        self.assertEqual(timing["collect_request_count"], 2)
+        self.assertEqual(timing["role_retry_count"], 1)
+        self.assertEqual(timing["operator_intervention_count"], 2)
         self.assertNotIn("writer_observed_terminal_seconds", timing)
 
 

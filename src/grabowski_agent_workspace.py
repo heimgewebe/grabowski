@@ -116,6 +116,7 @@ ROUTE_RISK_FLAGS = frozenset({
     "destructive", "user_data",
 })
 ROUTE_EXTERNAL_AGENTS = frozenset({"claude", "agy"})
+ROUTE_POLICY_VERSION = "workspace-routing-v2.1"
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 BindingVerifier = Callable[[str, str], dict[str, Any]]
 
@@ -321,10 +322,12 @@ def _argv(value: Any, field: str) -> list[str]:
     return result
 
 
-def _normalize_route_input_facts(value: Any) -> dict[str, Any]:
+def _normalize_route_input_facts(
+    value: Any, *, schema_version: int | None = None
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AgentWorkspaceError("route_evidence.input_facts must be an object")
-    expected = {
+    expected_v1 = {
         "task_kind",
         "changed_file_estimate",
         "expected_duration_minutes",
@@ -335,38 +338,126 @@ def _normalize_route_input_facts(value: Any) -> dict[str, Any]:
         "user_requested_external",
         "available_external_agents",
     }
-    if set(value) != expected:
+    expected_v2 = {
+        "task_kind",
+        "changed_file_estimate",
+        "expected_duration_minutes",
+        "novelty",
+        "risk_flags",
+        "connector_instability",
+        "concurrent_external_activity",
+        "parallelization_candidate",
+        "decision_fork",
+        "architecture_hypotheses",
+        "user_requested_external",
+        "available_external_agents",
+    }
+    observed_fields = set(value)
+    resolved_schema = schema_version
+    if resolved_schema is None:
+        resolved_schema = (
+            1
+            if observed_fields == expected_v1
+            else 2
+            if observed_fields == expected_v2
+            else None
+        )
+    expected = (
+        expected_v1
+        if resolved_schema == 1
+        else expected_v2
+        if resolved_schema == 2
+        else set()
+    )
+    if observed_fields != expected:
         raise AgentWorkspaceError("route_evidence.input_facts shape is invalid")
-    task_kind = _required_string(value.get("task_kind"), "route_evidence.input_facts.task_kind", max_length=32)
+    task_kind = _required_string(
+        value.get("task_kind"),
+        "route_evidence.input_facts.task_kind",
+        max_length=32,
+    )
     if task_kind not in ROUTE_TASK_KINDS:
         raise AgentWorkspaceError("route_evidence task_kind is invalid")
     changed_files = value.get("changed_file_estimate")
     duration = value.get("expected_duration_minutes")
-    if isinstance(changed_files, bool) or not isinstance(changed_files, int) or not 0 <= changed_files <= 10000:
+    if (
+        isinstance(changed_files, bool)
+        or not isinstance(changed_files, int)
+        or not 0 <= changed_files <= 10000
+    ):
         raise AgentWorkspaceError("route_evidence changed_file_estimate is invalid")
-    if isinstance(duration, bool) or not isinstance(duration, int) or not 0 <= duration <= 10080:
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, int)
+        or not 0 <= duration <= 10080
+    ):
         raise AgentWorkspaceError("route_evidence expected_duration_minutes is invalid")
-    novelty = _required_string(value.get("novelty"), "route_evidence.input_facts.novelty", max_length=16)
+    novelty = _required_string(
+        value.get("novelty"),
+        "route_evidence.input_facts.novelty",
+        max_length=16,
+    )
     if novelty not in ROUTE_NOVELTY:
         raise AgentWorkspaceError("route_evidence novelty is invalid")
     raw_flags = value.get("risk_flags")
     if not isinstance(raw_flags, list) or len(raw_flags) > len(ROUTE_RISK_FLAGS):
         raise AgentWorkspaceError("route_evidence risk_flags are invalid")
-    flags = sorted({_required_string(item, "route_evidence.risk_flag", max_length=32) for item in raw_flags})
+    flags = sorted(
+        {
+            _required_string(
+                item, "route_evidence.risk_flag", max_length=32
+            )
+            for item in raw_flags
+        }
+    )
     if len(flags) != len(raw_flags) or set(flags) - ROUTE_RISK_FLAGS:
         raise AgentWorkspaceError("route_evidence risk_flags are invalid")
     booleans: dict[str, bool] = {}
-    for field in ("connector_instability", "parallel_work", "user_requested_external"):
+    boolean_fields = (
+        ("connector_instability", "parallel_work", "user_requested_external")
+        if resolved_schema == 1
+        else (
+            "connector_instability",
+            "concurrent_external_activity",
+            "parallelization_candidate",
+            "decision_fork",
+            "user_requested_external",
+        )
+    )
+    for field in boolean_fields:
         candidate = value.get(field)
         if not isinstance(candidate, bool):
             raise AgentWorkspaceError(f"route_evidence {field} must be boolean")
         booleans[field] = candidate
+    architecture_hypotheses = None
+    if resolved_schema == 2:
+        architecture_hypotheses = value.get("architecture_hypotheses")
+        if (
+            isinstance(architecture_hypotheses, bool)
+            or not isinstance(architecture_hypotheses, int)
+            or not 1 <= architecture_hypotheses <= 4
+        ):
+            raise AgentWorkspaceError(
+                "route_evidence architecture_hypotheses must be between 1 and 4"
+            )
     raw_agents = value.get("available_external_agents")
-    if not isinstance(raw_agents, list) or len(raw_agents) > len(ROUTE_EXTERNAL_AGENTS):
-        raise AgentWorkspaceError("route_evidence available_external_agents are invalid")
-    agents = [_required_string(item, "route_evidence.external_agent", max_length=32) for item in raw_agents]
+    if (
+        not isinstance(raw_agents, list)
+        or len(raw_agents) > len(ROUTE_EXTERNAL_AGENTS)
+    ):
+        raise AgentWorkspaceError(
+            "route_evidence available_external_agents are invalid"
+        )
+    agents = [
+        _required_string(
+            item, "route_evidence.external_agent", max_length=32
+        )
+        for item in raw_agents
+    ]
     if len(set(agents)) != len(agents) or set(agents) - ROUTE_EXTERNAL_AGENTS:
-        raise AgentWorkspaceError("route_evidence available_external_agents are invalid")
+        raise AgentWorkspaceError(
+            "route_evidence available_external_agents are invalid"
+        )
     return {
         "task_kind": task_kind,
         "changed_file_estimate": changed_files,
@@ -374,12 +465,17 @@ def _normalize_route_input_facts(value: Any) -> dict[str, Any]:
         "novelty": novelty,
         "risk_flags": flags,
         **booleans,
+        **(
+            {"architecture_hypotheses": architecture_hypotheses}
+            if resolved_schema == 2
+            else {}
+        ),
         "available_external_agents": agents,
     }
 
 
-def _route_decision(input_facts: dict[str, Any]) -> dict[str, Any]:
-    """Replay the deterministic routing policy from normalized input facts."""
+def _route_decision_v1(input_facts: dict[str, Any]) -> dict[str, Any]:
+    """Replay the original deterministic routing policy for legacy evidence."""
     kind = str(input_facts["task_kind"])
     changed_files = int(input_facts["changed_file_estimate"])
     duration = int(input_facts["expected_duration_minutes"])
@@ -434,12 +530,24 @@ def _route_decision(input_facts: dict[str, Any]) -> dict[str, Any]:
     candidates: list[dict[str, str]] = []
     if mode == "workspace_with_competition":
         candidates = [
-            {"provider": external_available[0], "mode": "competitor", "timing": "before_primary_writer"},
-            {"provider": external_available[1], "mode": "contrast", "timing": "after_primary_plan_or_candidate"},
+            {
+                "provider": external_available[0],
+                "mode": "competitor",
+                "timing": "before_primary_writer",
+            },
+            {
+                "provider": external_available[1],
+                "mode": "contrast",
+                "timing": "after_primary_plan_or_candidate",
+            },
         ]
     elif mode == "workspace_with_contrast":
         candidates = [
-            {"provider": external_available[0], "mode": "contrast", "timing": "after_primary_plan_or_candidate"}
+            {
+                "provider": external_available[0],
+                "mode": "contrast",
+                "timing": "after_primary_plan_or_candidate",
+            }
         ]
     trivial_work = bool(
         changed_files <= 1
@@ -458,6 +566,228 @@ def _route_decision(input_facts: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _route_decision_v2(input_facts: dict[str, Any]) -> dict[str, Any]:
+    """Route conservatively: one writer by default, contrast only for qualified R3 code."""
+    kind = str(input_facts["task_kind"])
+    changed_files = int(input_facts["changed_file_estimate"])
+    duration = int(input_facts["expected_duration_minutes"])
+    novelty = str(input_facts["novelty"])
+    risk_flags = list(input_facts["risk_flags"])
+    connector_instability = bool(input_facts["connector_instability"])
+    concurrent_activity = bool(input_facts["concurrent_external_activity"])
+    parallelization_candidate = bool(input_facts["parallelization_candidate"])
+    decision_fork = bool(input_facts["decision_fork"])
+    architecture_hypotheses = int(input_facts["architecture_hypotheses"])
+    external_requested = bool(input_facts["user_requested_external"])
+    external_available = list(input_facts["available_external_agents"])
+
+    critical_flags = {
+        "security",
+        "runtime",
+        "deployment",
+        "schema",
+        "concurrency",
+        "data_migration",
+        "privilege",
+        "cross_repo",
+        "destructive",
+        "user_data",
+    }
+    design_flags = {
+        "security",
+        "schema",
+        "concurrency",
+        "data_migration",
+        "cross_repo",
+    }
+    score = 0
+    if kind in {"code", "operations"}:
+        score += 1
+    if changed_files >= 7:
+        score += 1
+    if changed_files >= 15:
+        score += 1
+    if duration >= 60:
+        score += 1
+    if duration >= 180:
+        score += 1
+    score += {"low": 0, "medium": 1, "high": 2}[novelty]
+    score += min(4, len(risk_flags))
+    if connector_instability:
+        score += 1
+    if concurrent_activity:
+        score += 1
+
+    trivial_work = bool(
+        changed_files <= 1
+        and duration <= 15
+        and novelty == "low"
+        and not risk_flags
+        and not connector_instability
+        and not concurrent_activity
+    )
+    critical_risk = bool(set(risk_flags) & critical_flags)
+    r3_scale = bool(
+        kind == "code"
+        and novelty == "high"
+        and duration >= 120
+        and changed_files >= 8
+    )
+    if trivial_work:
+        risk_tier = "R0"
+    elif critical_risk or r3_scale:
+        risk_tier = "R3"
+    elif (
+        (
+            kind == "code"
+            and (
+                changed_files >= 7
+                or duration >= 90
+                or novelty == "high"
+                or bool(risk_flags)
+                or connector_instability
+                or concurrent_activity
+            )
+        )
+        or (
+            kind == "operations"
+            and (
+                duration >= 90
+                or bool(risk_flags)
+                or connector_instability
+                or concurrent_activity
+            )
+        )
+        or (kind == "analysis" and novelty == "high" and duration >= 90)
+    ):
+        risk_tier = "R2"
+    else:
+        risk_tier = "R1"
+
+    if risk_tier in {"R0", "R1"}:
+        mode = (
+            "direct_operator"
+            if kind in {"docs", "analysis"}
+            else "isolated_worktree"
+        )
+    elif risk_tier == "R2":
+        if kind == "code" and (
+            changed_files >= 7
+            or duration >= 90
+            or novelty == "high"
+            or bool(risk_flags)
+        ):
+            mode = "full_workspace"
+        elif kind == "operations" and (bool(risk_flags) or connector_instability):
+            mode = "full_workspace"
+        else:
+            mode = (
+                "direct_operator"
+                if kind in {"docs", "analysis"}
+                else "isolated_worktree"
+            )
+    else:
+        mode = "full_workspace"
+
+    design_space = bool(novelty == "high" or set(risk_flags) & design_flags)
+    contrast_eligible = bool(
+        kind == "code"
+        and risk_tier == "R3"
+        and design_space
+        and external_available
+        and (
+            external_requested
+            or (
+                novelty == "high"
+                and duration >= 120
+                and (
+                    bool(set(risk_flags) & design_flags)
+                    or changed_files >= 10
+                )
+            )
+        )
+    )
+    competition_eligible = bool(
+        contrast_eligible
+        and decision_fork
+        and architecture_hypotheses >= 2
+        and len(external_available) >= 2
+    )
+    candidates: list[dict[str, str]] = []
+    if competition_eligible:
+        mode = "workspace_with_competition"
+        candidates = [
+            {
+                "provider": external_available[0],
+                "mode": "competitor",
+                "timing": "before_primary_writer",
+            },
+            {
+                "provider": external_available[1],
+                "mode": "contrast",
+                "timing": "after_primary_plan_or_candidate",
+            },
+        ]
+    elif contrast_eligible:
+        mode = "workspace_with_contrast"
+        candidates = [
+            {
+                "provider": external_available[0],
+                "mode": "contrast",
+                "timing": "after_primary_plan_or_candidate",
+            }
+        ]
+
+    assessment_blockers: list[str] = []
+    if kind != "code" or risk_tier != "R3":
+        assessment_blockers.append("parallel writer pilot is restricted to R3 code")
+    if duration < 180:
+        assessment_blockers.append("expected duration is below 180 minutes")
+    if changed_files < 10:
+        assessment_blockers.append("changed file estimate is below 10")
+    eligible_for_assessment = bool(
+        parallelization_candidate
+        and kind == "code"
+        and risk_tier == "R3"
+        and duration >= 180
+        and changed_files >= 10
+    )
+    parallel_writer_pilot = {
+        "requested": parallelization_candidate,
+        "eligible_for_assessment": eligible_for_assessment,
+        "execution_authorized": False,
+        "workspace_group_implemented": False,
+        "required_shard_count": 2,
+        "minimum_estimated_minutes_per_shard": 90,
+        "assessment_blockers": assessment_blockers,
+        "implementation_blockers": [
+            "explicit two-shard scope and conflict-domain proof is required",
+            "integration workspace and cross-shard tests are not implemented",
+        ],
+    }
+    return {
+        "score": score,
+        "risk_tier": risk_tier,
+        "route_policy_version": ROUTE_POLICY_VERSION,
+        "execution_mode": mode,
+        "external_candidates": candidates,
+        "design_space": design_space,
+        "trivial_work": trivial_work,
+        "parallel_writer_pilot": parallel_writer_pilot,
+        "contrast_eligible": contrast_eligible,
+        "competition_eligible": competition_eligible,
+    }
+
+
+def _route_decision(input_facts: dict[str, Any]) -> dict[str, Any]:
+    """Replay the policy matching the exact route-input schema."""
+    return (
+        _route_decision_v1(input_facts)
+        if "parallel_work" in input_facts
+        else _route_decision_v2(input_facts)
+    )
+
+
 def _normalize_route_evidence(value: Any) -> dict[str, Any]:
     if value is None:
         return {
@@ -474,6 +804,7 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
         }
     if not isinstance(value, dict):
         raise AgentWorkspaceError("route_evidence must be an object")
+    schema_version = value.get("schema_version")
     expected = {
         "schema_version",
         "recommendation_id",
@@ -484,35 +815,96 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
         "external_candidates",
         "deviation_reason",
     }
-    if set(value) != expected or value.get("schema_version") != 1:
+    if schema_version == 2:
+        expected |= {
+            "route_policy_version",
+            "risk_tier",
+            "parallel_writer_pilot",
+        }
+    if set(value) != expected or schema_version not in {1, 2}:
         raise AgentWorkspaceError("route_evidence shape is invalid")
-    recommendation_id = _required_string(value.get("recommendation_id"), "route_evidence.recommendation_id", max_length=64).lower()
+    recommendation_id = _required_string(
+        value.get("recommendation_id"),
+        "route_evidence.recommendation_id",
+        max_length=64,
+    ).lower()
     if SHA256_RE.fullmatch(recommendation_id) is None:
         raise AgentWorkspaceError("route_evidence recommendation_id is invalid")
     score = value.get("score")
     if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 20:
         raise AgentWorkspaceError("route_evidence score is invalid")
-    recommended = _required_string(value.get("recommended_route"), "route_evidence.recommended_route", max_length=40)
-    actual = _required_string(value.get("actual_route"), "route_evidence.actual_route", max_length=40)
+    recommended = _required_string(
+        value.get("recommended_route"),
+        "route_evidence.recommended_route",
+        max_length=40,
+    )
+    actual = _required_string(
+        value.get("actual_route"),
+        "route_evidence.actual_route",
+        max_length=40,
+    )
     if recommended not in ROUTE_EXECUTION_MODES or actual not in ROUTE_EXECUTION_MODES:
         raise AgentWorkspaceError("route_evidence route is invalid")
-    if actual not in {"full_workspace", "workspace_with_contrast", "workspace_with_competition"}:
-        raise AgentWorkspaceError("agent workspace actual_route must be a workspace route")
-    facts = _normalize_route_input_facts(value.get("input_facts"))
+    if actual not in {
+        "full_workspace",
+        "workspace_with_contrast",
+        "workspace_with_competition",
+    }:
+        raise AgentWorkspaceError(
+            "agent workspace actual_route must be a workspace route"
+        )
+    facts = _normalize_route_input_facts(
+        value.get("input_facts"), schema_version=schema_version
+    )
     raw_candidates = value.get("external_candidates")
     if not isinstance(raw_candidates, list) or len(raw_candidates) > 2:
         raise AgentWorkspaceError("route_evidence external_candidates are invalid")
     candidates: list[dict[str, str]] = []
     for item in raw_candidates:
-        if not isinstance(item, dict) or set(item) != {"provider", "mode", "timing"}:
-            raise AgentWorkspaceError("route_evidence external candidate shape is invalid")
-        provider = _required_string(item.get("provider"), "route_evidence.external_candidate.provider", max_length=32)
-        mode = _required_string(item.get("mode"), "route_evidence.external_candidate.mode", max_length=32)
-        timing = _required_string(item.get("timing"), "route_evidence.external_candidate.timing", max_length=80)
-        if provider not in ROUTE_EXTERNAL_AGENTS or mode not in {"competitor", "contrast"}:
-            raise AgentWorkspaceError("route_evidence external candidate is invalid")
-        candidates.append({"provider": provider, "mode": mode, "timing": timing})
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"provider", "mode", "timing"}
+        ):
+            raise AgentWorkspaceError(
+                "route_evidence external candidate shape is invalid"
+            )
+        provider = _required_string(
+            item.get("provider"),
+            "route_evidence.external_candidate.provider",
+            max_length=32,
+        )
+        mode = _required_string(
+            item.get("mode"),
+            "route_evidence.external_candidate.mode",
+            max_length=32,
+        )
+        timing = _required_string(
+            item.get("timing"),
+            "route_evidence.external_candidate.timing",
+            max_length=80,
+        )
+        if provider not in ROUTE_EXTERNAL_AGENTS or mode not in {
+            "competitor",
+            "contrast",
+        }:
+            raise AgentWorkspaceError(
+                "route_evidence external candidate is invalid"
+            )
+        candidates.append(
+            {"provider": provider, "mode": mode, "timing": timing}
+        )
     decision = _route_decision(facts)
+    if schema_version == 2:
+        if value.get("route_policy_version") != decision["route_policy_version"]:
+            raise AgentWorkspaceError(
+                "route_evidence route policy version is invalid"
+            )
+        if value.get("risk_tier") != decision["risk_tier"]:
+            raise AgentWorkspaceError("route_evidence risk tier is invalid")
+        if value.get("parallel_writer_pilot") != decision["parallel_writer_pilot"]:
+            raise AgentWorkspaceError(
+                "route_evidence parallel writer pilot is invalid"
+            )
     if (
         score != decision["score"]
         or recommended != decision["execution_mode"]
@@ -521,24 +913,39 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
         raise AgentWorkspaceError(
             "route_evidence recommendation does not match deterministic policy replay"
         )
-    expected_id = _sha256_json({
-        "schema_version": 1,
+    recommendation_contract = {
+        "schema_version": schema_version,
         "score": score,
         "execution_mode": recommended,
         "input_facts": facts,
         "external_candidates": candidates,
-    })
+    }
+    if schema_version == 2:
+        recommendation_contract.update(
+            {
+                "route_policy_version": decision["route_policy_version"],
+                "risk_tier": decision["risk_tier"],
+                "parallel_writer_pilot": decision["parallel_writer_pilot"],
+            }
+        )
+    expected_id = _sha256_json(recommendation_contract)
     if recommendation_id != expected_id:
-        raise AgentWorkspaceError("route_evidence recommendation_id does not match its normalized recommendation")
+        raise AgentWorkspaceError(
+            "route_evidence recommendation_id does not match its normalized recommendation"
+        )
     reason = value.get("deviation_reason")
     if recommended == actual:
         if reason not in {None, ""}:
-            raise AgentWorkspaceError("route_evidence deviation_reason must be empty when routes match")
+            raise AgentWorkspaceError(
+                "route_evidence deviation_reason must be empty when routes match"
+            )
         clean_reason = None
     else:
-        clean_reason = _required_string(reason, "route_evidence.deviation_reason", max_length=1000)
-    return {
-        "schema_version": 1,
+        clean_reason = _required_string(
+            reason, "route_evidence.deviation_reason", max_length=1000
+        )
+    result = {
+        "schema_version": schema_version,
         "status": "verified",
         "recommendation_id": recommendation_id,
         "score": score,
@@ -549,6 +956,15 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
         "deviation_reason": clean_reason,
         "evidence_complete": True,
     }
+    if schema_version == 2:
+        result.update(
+            {
+                "route_policy_version": decision["route_policy_version"],
+                "risk_tier": decision["risk_tier"],
+                "parallel_writer_pilot": decision["parallel_writer_pilot"],
+            }
+        )
+    return result
 
 
 def _role_privilege_escalator(command: list[str]) -> str | None:

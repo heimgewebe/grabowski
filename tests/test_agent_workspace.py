@@ -71,25 +71,35 @@ def complete_route_evidence() -> dict:
         "novelty": "high",
         "risk_flags": ["concurrency", "schema"],
         "connector_instability": True,
-        "parallel_work": True,
+        "concurrent_external_activity": True,
+        "parallelization_candidate": False,
+        "decision_fork": False,
+        "architecture_hypotheses": 1,
         "user_requested_external": False,
         "available_external_agents": [],
     }
+    decision = workspace._route_decision(facts)
     recommendation = {
-        "schema_version": 1,
-        "score": 14,
-        "execution_mode": "full_workspace",
+        "schema_version": 2,
+        "route_policy_version": decision["route_policy_version"],
+        "risk_tier": decision["risk_tier"],
+        "score": decision["score"],
+        "execution_mode": decision["execution_mode"],
         "input_facts": facts,
-        "external_candidates": [],
+        "external_candidates": decision["external_candidates"],
+        "parallel_writer_pilot": decision["parallel_writer_pilot"],
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "route_policy_version": decision["route_policy_version"],
+        "risk_tier": decision["risk_tier"],
+        "parallel_writer_pilot": decision["parallel_writer_pilot"],
         "recommendation_id": workspace._sha256_json(recommendation),
         "score": recommendation["score"],
         "recommended_route": recommendation["execution_mode"],
         "actual_route": "full_workspace",
         "input_facts": facts,
-        "external_candidates": [],
+        "external_candidates": recommendation["external_candidates"],
         "deviation_reason": None,
     }
 
@@ -479,11 +489,14 @@ class AgentWorkspaceTests(unittest.TestCase):
         forged["score"] = 0
         forged["recommended_route"] = "direct_operator"
         forged["recommendation_id"] = workspace._sha256_json({
-            "schema_version": 1,
+            "schema_version": 2,
+            "route_policy_version": forged["route_policy_version"],
+            "risk_tier": forged["risk_tier"],
             "score": forged["score"],
             "execution_mode": forged["recommended_route"],
             "input_facts": forged["input_facts"],
             "external_candidates": forged["external_candidates"],
+            "parallel_writer_pilot": forged["parallel_writer_pilot"],
         })
         with self.assertRaisesRegex(workspace.AgentWorkspaceError, "policy replay"):
             workspace._normalize_route_evidence(forged)
@@ -491,6 +504,42 @@ class AgentWorkspaceTests(unittest.TestCase):
         deviated["actual_route"] = "workspace_with_contrast"
         with self.assertRaisesRegex(workspace.AgentWorkspaceError, "deviation_reason"):
             workspace._normalize_route_evidence(deviated)
+
+
+    def test_legacy_route_evidence_remains_readable_under_v2_policy(self) -> None:
+        facts = {
+            "task_kind": "code",
+            "changed_file_estimate": 4,
+            "expected_duration_minutes": 30,
+            "novelty": "low",
+            "risk_flags": [],
+            "connector_instability": False,
+            "parallel_work": False,
+            "user_requested_external": False,
+            "available_external_agents": [],
+        }
+        decision = workspace._route_decision_v1(facts)
+        recommendation = {
+            "schema_version": 1,
+            "score": decision["score"],
+            "execution_mode": decision["execution_mode"],
+            "input_facts": facts,
+            "external_candidates": decision["external_candidates"],
+        }
+        evidence = {
+            "schema_version": 1,
+            "recommendation_id": workspace._sha256_json(recommendation),
+            "score": decision["score"],
+            "recommended_route": decision["execution_mode"],
+            "actual_route": decision["execution_mode"],
+            "input_facts": facts,
+            "external_candidates": decision["external_candidates"],
+            "deviation_reason": None,
+        }
+        normalized = workspace._normalize_route_evidence(evidence)
+        self.assertEqual(normalized["schema_version"], 1)
+        self.assertEqual(normalized["recommended_route"], "full_workspace")
+        self.assertNotIn("risk_tier", normalized)
 
     def test_close_blocks_new_workspace_without_route_evidence(self) -> None:
         manifest = self.manifest()
