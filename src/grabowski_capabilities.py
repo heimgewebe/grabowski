@@ -861,6 +861,27 @@ TOOL_PROFILES.update(
             "effects": ["task-state-refresh"],
             "reversibility": "not-applicable",
         },
+        "grabowski_agent_workspace_cleanup_plan": {
+            "category": "agent-workspace",
+            "purpose": "Inventory closed workspace checkout cleanup eligibility while preserving manifests, receipts and event logs.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_agent_workspace_reconcile_stale": {
+            "category": "agent-workspace",
+            "purpose": "Mark one provably inactive stale workspace abandoned without stopping tasks, releasing resources or removing its checkout.",
+            "risk_class": "high",
+            "effects": ["receipt-create", "workspace-event-append", "audit-append"],
+            "reversibility": "historical-evidence-retained",
+        },
+        "grabowski_agent_workspace_cleanup": {
+            "category": "agent-workspace",
+            "purpose": "Create durable recovery refs and remove one eligible closed writer checkout without deleting workspace evidence.",
+            "risk_class": "high",
+            "effects": ["checkout-archive", "recovery-ref-create", "worktree-remove", "receipt-create"],
+            "reversibility": "restore-from-checkout-archive",
+        },
         "grabowski_agent_execution_route": {
             "category": "agent-workspace",
             "purpose": "Recommend direct, isolated, full-workspace, contrast or competition execution from typed risk and complexity inputs.",
