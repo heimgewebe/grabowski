@@ -39,10 +39,17 @@ WORKSPACE_ROOT = Path(
         str(operator.STATE_DIR / "agent-workspaces"),
     )
 ).expanduser()
+ROLE_PREFLIGHT_CACHE_ROOT = Path(
+    os.environ.get(
+        "GRABOWSKI_ROLE_PREFLIGHT_CACHE_ROOT",
+        str(operator.STATE_DIR / "agent-role-preflight-cache"),
+    )
+).expanduser()
 TMUX = Path(os.environ.get("GRABOWSKI_TMUX_BIN", shutil.which("tmux") or "/usr/bin/tmux"))
 BUREAU = Path(os.environ.get("GRABOWSKI_BUREAU_BIN", shutil.which("bureau") or str(Path.home() / ".local/bin/bureau")))
 BUREAU_ROOT = Path(os.environ.get("GRABOWSKI_BUREAU_ROOT", str(Path.home() / "repos/bureau"))).expanduser()
 SCHEMA_VERSION = 1
+WORKSPACE_RUNTIME_IDENTITY_SCHEMA_VERSION = 1
 WORKSPACE_ID_RE = re.compile(r"^gaw-[a-z0-9][a-z0-9-]{7,79}$")
 BUREAU_TASK_ID_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{2,127}$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
@@ -87,6 +94,7 @@ WORKSPACE_LOCK_TIMEOUT_SECONDS = 10.0
 WORKSPACE_LOCK_POLL_SECONDS = 0.05
 AGENT_WORKSPACE_TASK_HOST = "heim-pc"
 MAX_ROLE_RETRIES = 1
+ROLE_PREFLIGHT_CACHE_TTL_SECONDS = 300
 MAX_WORKSPACE_EVENTS = 512
 WORKSPACE_CLEANUP_RETENTION_SECONDS = 30 * 24 * 60 * 60
 MAX_CLEANUP_WORKSPACES = 100
@@ -134,6 +142,59 @@ def _canonical_json(value: Any) -> str:
 
 def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _source_file_sha256(path: Path) -> str | None:
+    descriptor = -1
+    try:
+        metadata = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return None
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+        ):
+            return None
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _workspace_runtime_identity() -> dict[str, Any]:
+    deployment: dict[str, Any] = {}
+    try:
+        deployment = _load_json(base.DEPLOYMENT_MANIFEST)
+    except (FileNotFoundError, OSError, ValueError, PermissionError, json.JSONDecodeError):
+        deployment = {}
+    body = {
+        "schema_version": WORKSPACE_RUNTIME_IDENTITY_SCHEMA_VERSION,
+        "workspace_schema_version": SCHEMA_VERSION,
+        "runtime_release": (
+            deployment.get("release_id") if isinstance(deployment.get("release_id"), str) else None
+        ),
+        "runtime_repo_head": (
+            deployment.get("repo_head") if isinstance(deployment.get("repo_head"), str) else None
+        ),
+        "python_implementation": sys.implementation.name,
+        "python_version": list(sys.version_info[:3]),
+        "sandbox_contract": agent_role.SANDBOX_LABEL,
+        "toolchain_probe_contract": getattr(agent_role, "TOOLCHAIN_PROBE_CONTRACT", "role-toolchain-probe-v1"),
+        "workspace_source_sha256": _source_file_sha256(Path(__file__)),
+        "role_source_sha256": _source_file_sha256(Path(agent_role.__file__)),
+    }
+    return {**body, "identity_sha256": _sha256_json(body)}
 
 
 def _task_argv_sha256(value: Any) -> str:
@@ -532,16 +593,171 @@ def _declared_python_module(command: list[str]) -> str | None:
     return agent_role.declared_python_module(command)
 
 
-def _role_toolchain_preflight(manifest: dict[str, Any], role: str, command: list[str]) -> dict[str, Any]:
-    """Validate role prerequisites inside the exact read-only role sandbox."""
+def _preflight_stat_identity(path: Path) -> dict[str, Any] | None:
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError:
+        return None
+    return {
+        "path": str(resolved),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def _role_preflight_environment(
+    manifest: dict[str, Any], command: list[str]
+) -> dict[str, Any]:
     worktree = Path(str(manifest["writer_worktree"]))
+    prepared = agent_role.prepare_external_agent_command(command)
+    executable = str(prepared.command[0])
+    if Path(executable).is_absolute():
+        resolved_executable = Path(executable)
+    else:
+        found = shutil.which(executable)
+        resolved_executable = Path(found) if found else Path(executable)
+    executable_identity = _preflight_stat_identity(resolved_executable)
+    environment_paths: list[dict[str, Any]] = []
+    candidate_roots: list[Path] = []
+    if executable_identity is not None:
+        resolved = Path(str(executable_identity["path"]))
+        candidate_roots.extend([resolved.parent.parent, Path("/usr/lib/python3/dist-packages")])
+    for source, _target in prepared.extra_read_only:
+        candidate_roots.append(Path(source))
+    seen: set[str] = set()
+    for candidate in candidate_roots:
+        identity = _preflight_stat_identity(candidate)
+        if identity is None or identity["path"] in seen:
+            continue
+        seen.add(str(identity["path"]))
+        environment_paths.append(identity)
+        root = Path(str(identity["path"]))
+        pyvenv = root / "pyvenv.cfg"
+        pyvenv_identity = _preflight_stat_identity(pyvenv)
+        pyvenv_sha256 = _source_file_sha256(pyvenv)
+        if pyvenv_identity is not None and pyvenv_sha256 is not None:
+            environment_paths.append({**pyvenv_identity, "sha256": pyvenv_sha256})
+        for site_packages in sorted(root.glob("lib/python*/site-packages")):
+            site_identity = _preflight_stat_identity(site_packages)
+            if site_identity is not None and site_identity["path"] not in seen:
+                seen.add(str(site_identity["path"]))
+                environment_paths.append(site_identity)
+    head, diff_identity, dirty = agent_role.current_binding(
+        worktree, str(manifest["expected_base_head"])
+    )
+    body = {
+        "schema_version": 1,
+        "probe_contract": agent_role.TOOLCHAIN_PROBE_CONTRACT,
+        "sandbox": agent_role.SANDBOX_LABEL,
+        "command_sha256": _sha256_json(command),
+        "prepared_command_sha256": _sha256_json(list(prepared.command)),
+        "external_agent_profile": prepared.profile,
+        "executable_identity": executable_identity,
+        "environment_paths": environment_paths,
+        "writer_head": head,
+        "writer_diff_identity": diff_identity,
+        "writer_dirty": dirty,
+        "role_source_sha256": _source_file_sha256(Path(agent_role.__file__)),
+    }
+    return {**body, "environment_sha256": _sha256_json(body)}
+
+
+def _preflight_cache_record_valid(record: Any, cache_key: str, now: int) -> bool:
+    if not isinstance(record, dict):
+        return False
+    observed = record.get("record_sha256")
+    unsigned = {key: value for key, value in record.items() if key != "record_sha256"}
+    created = record.get("created_at_unix")
+    return bool(
+        record.get("schema_version") == 1
+        and record.get("cache_key") == cache_key
+        and isinstance(created, int)
+        and not isinstance(created, bool)
+        and 0 <= now - created <= ROLE_PREFLIGHT_CACHE_TTL_SECONDS
+        and isinstance(record.get("probe"), dict)
+        and isinstance(observed, str)
+        and observed == _sha256_json(unsigned)
+    )
+
+
+def _role_toolchain_preflight(manifest: dict[str, Any], role: str, command: list[str]) -> dict[str, Any]:
+    """Validate exact role prerequisites with a short, snapshot-bound cross-workspace cache."""
+    worktree = Path(str(manifest["writer_worktree"]))
+    checked_at = _utc()
+    now = _now()
+    environment: dict[str, Any] | None = None
+    cache_error: str | None = None
+    try:
+        environment = _role_preflight_environment(manifest, command)
+    except Exception as exc:
+        cache_error = _error_summary(exc)
+    cache_key = (
+        _sha256_json({"role": role, "environment": environment})
+        if environment is not None
+        else None
+    )
+    if cache_key is not None:
+        cache_path = ROLE_PREFLIGHT_CACHE_ROOT / f"{cache_key}.json"
+        try:
+            record = _load_json(cache_path)
+        except FileNotFoundError:
+            record = None
+        except Exception as exc:
+            record = None
+            cache_error = _error_summary(exc)
+        if _preflight_cache_record_valid(record, cache_key, now):
+            return {
+                "role": role,
+                "command_sha256": _sha256_json(command),
+                "checked_at": checked_at,
+                "sandbox": agent_role.SANDBOX_LABEL,
+                **dict(record["probe"]),
+                "environment": environment,
+                "cache": {
+                    "eligible": True,
+                    "hit": True,
+                    "cache_key": cache_key,
+                    "created_at_unix": record["created_at_unix"],
+                    "ttl_seconds": ROLE_PREFLIGHT_CACHE_TTL_SECONDS,
+                },
+            }
     probe = agent_role.toolchain_probe(worktree, command)
+    if cache_key is not None:
+        try:
+            ROLE_PREFLIGHT_CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if ROLE_PREFLIGHT_CACHE_ROOT.is_symlink() or not ROLE_PREFLIGHT_CACHE_ROOT.is_dir():
+                raise PermissionError("role preflight cache root must be a real directory")
+            record_body = {
+                "schema_version": 1,
+                "cache_key": cache_key,
+                "created_at_unix": now,
+                "environment_sha256": environment["environment_sha256"],
+                "probe": probe,
+            }
+            _atomic_json(
+                ROLE_PREFLIGHT_CACHE_ROOT / f"{cache_key}.json",
+                {**record_body, "record_sha256": _sha256_json(record_body)},
+            )
+        except Exception as exc:
+            cache_error = _error_summary(exc)
     return {
         "role": role,
         "command_sha256": _sha256_json(command),
-        "checked_at": _utc(),
+        "checked_at": checked_at,
         "sandbox": agent_role.SANDBOX_LABEL,
         **probe,
+        "environment": environment,
+        "cache": {
+            "eligible": cache_key is not None,
+            "hit": False,
+            "cache_key": cache_key,
+            "ttl_seconds": ROLE_PREFLIGHT_CACHE_TTL_SECONDS,
+            "error": cache_error,
+        },
     }
 
 def _absolute_path(value: Any, field: str, *, must_exist: bool) -> Path:
@@ -2185,6 +2401,77 @@ def _collection_integrity_status(
     return result
 
 
+def _legacy_absence_receipt_valid(
+    manifest: dict[str, Any],
+    legacy: Any,
+    *,
+    expected_plan_sha256: str | None = None,
+) -> bool:
+    if not isinstance(legacy, dict) or not _receipt_integrity(legacy):
+        return False
+    source_plan_sha256 = legacy.get("source_plan_sha256")
+    if not isinstance(source_plan_sha256, str) or SHA256_RE.fullmatch(source_plan_sha256) is None:
+        return False
+    if expected_plan_sha256 is not None and source_plan_sha256 != expected_plan_sha256:
+        return False
+    required_hashes = ("liveness_sha256", "workspace_reference_inventory_sha256")
+    if any(
+        not isinstance(legacy.get(field), str)
+        or SHA256_RE.fullmatch(str(legacy.get(field))) is None
+        for field in required_hashes
+    ):
+        return False
+    return bool(
+        legacy.get("schema_version") == 1
+        and legacy.get("workspace_id") == manifest.get("workspace_id")
+        and legacy.get("repository") == manifest.get("repository")
+        and legacy.get("writer_worktree") == manifest.get("writer_worktree")
+        and legacy.get("writer_branch") == manifest.get("writer_branch")
+        and legacy.get("workspace_created_at") == manifest.get("created_at")
+        and legacy.get("observed_worktree_absent") is True
+        and legacy.get("task_mutation_performed") is False
+        and legacy.get("resource_mutation_performed") is False
+        and legacy.get("tmux_mutation_performed") is False
+        and legacy.get("worktree_mutation_performed") is False
+        and legacy.get("historical_evidence_preserved") is True
+        and isinstance(legacy.get("recorded_at"), str)
+        and bool(legacy.get("recorded_at"))
+    )
+
+
+def _legacy_absence_receipt_status(
+    manifest: dict[str, Any], close_receipt: dict[str, Any]
+) -> dict[str, Any]:
+    result = {
+        "required": close_receipt.get("closure_outcome") == "abandoned_legacy_workspace",
+        "present": False,
+        "valid": False,
+        "matches_close_receipt": False,
+    }
+    if not result["required"]:
+        result["valid"] = True
+        return result
+    path = _workspace_dir(str(manifest["workspace_id"])) / "legacy-absence-receipt.json"
+    try:
+        legacy = _load_json(path)
+    except FileNotFoundError:
+        return result
+    except Exception as exc:
+        result["error"] = _error_summary(exc)
+        return result
+    result["present"] = True
+    observed = legacy.get("receipt_sha256")
+    result["matches_close_receipt"] = bool(
+        isinstance(observed, str)
+        and observed == close_receipt.get("legacy_absence_receipt_sha256")
+    )
+    result["valid"] = bool(
+        _legacy_absence_receipt_valid(manifest, legacy)
+        and result["matches_close_receipt"]
+    )
+    return result
+
+
 def _close_integrity_status(manifest: dict[str, Any], receipt: Any) -> dict[str, Any]:
     result = {
         "valid": False,
@@ -2205,7 +2492,13 @@ def _close_integrity_status(manifest: dict[str, Any], receipt: Any) -> dict[str,
         return result
     result["receipt_present"] = True
     result["receipt_matches_manifest"] = stored == receipt
-    result["valid"] = bool(result["hash_valid"] and result["receipt_matches_manifest"])
+    legacy_absence = _legacy_absence_receipt_status(manifest, receipt)
+    result["legacy_absence_receipt"] = legacy_absence
+    result["valid"] = bool(
+        result["hash_valid"]
+        and result["receipt_matches_manifest"]
+        and legacy_absence["valid"]
+    )
     return result
 
 
@@ -3598,6 +3891,7 @@ def grabowski_agent_workspace_create(
         "collection": None,
         "close_receipt": None,
         "event_sequence": 0,
+        "runtime_identity": _workspace_runtime_identity(),
         "truth_model": {
             "bureau": "binding and ball truth",
             "git_github": "code, branch, diff, PR and merge truth",
@@ -3645,27 +3939,43 @@ def grabowski_agent_workspace_create(
             label="writer worktree creation",
         )
         worktree_created = True
-        writer_preflight = _role_toolchain_preflight(
-            manifest, "writer", list(plan["commands"]["writer"])
-        )
-        manifest["writer_toolchain_preflight"] = writer_preflight
-        _append_workspace_event(
-            manifest,
-            "role_preflight",
-            role="writer",
-            outcome="passed" if writer_preflight.get("passed") is True else "blocked",
-            evidence={
-                "command_sha256": writer_preflight.get("command_sha256"),
-                "external_agent_profile": writer_preflight.get("external_agent_profile"),
-                "failure_classification": writer_preflight.get("failure_classification"),
-            },
-        )
-        _write_manifest(manifest)
-        if writer_preflight.get("passed") is not True:
-            classification = writer_preflight.get("failure_classification") or "toolchain_probe_error"
-            raise AgentWorkspaceActionError(
-                f"writer toolchain preflight failed: {classification}"
+        initial_preflights: dict[str, Any] = {}
+        for preflight_role in ("writer", "tests", "review"):
+            role_preflight = _role_toolchain_preflight(
+                manifest, preflight_role, list(plan["commands"][preflight_role])
             )
+            initial_preflights[preflight_role] = role_preflight
+            manifest["initial_role_preflights"] = dict(initial_preflights)
+            if preflight_role == "writer":
+                manifest["writer_toolchain_preflight"] = role_preflight
+            _append_workspace_event(
+                manifest,
+                "role_preflight",
+                role=preflight_role,
+                outcome="passed" if role_preflight.get("passed") is True else "blocked",
+                evidence={
+                    "phase": "workspace_creation",
+                    "command_sha256": role_preflight.get("command_sha256"),
+                    "environment_sha256": (
+                        role_preflight.get("environment", {}).get("environment_sha256")
+                        if isinstance(role_preflight.get("environment"), dict)
+                        else None
+                    ),
+                    "cache_hit": (
+                        role_preflight.get("cache", {}).get("hit")
+                        if isinstance(role_preflight.get("cache"), dict)
+                        else None
+                    ),
+                    "external_agent_profile": role_preflight.get("external_agent_profile"),
+                    "failure_classification": role_preflight.get("failure_classification"),
+                },
+            )
+            _write_manifest(manifest)
+            if role_preflight.get("passed") is not True:
+                classification = role_preflight.get("failure_classification") or "toolchain_probe_error"
+                raise AgentWorkspaceActionError(
+                    f"{preflight_role} toolchain preflight failed: {classification}"
+                )
         manifest["checkout_lifecycle"] = _bind_writer_checkout_lifecycle(manifest)
         _append_workspace_event(
             manifest,
@@ -5300,10 +5610,25 @@ def _workspace_cleanup_plan_data(
                 "blocking_counts": coordination.get("blocking_counts", {}),
             }
         )
+    legacy_absence_reconciliation = bool(
+        not checkout_state["exists"]
+        and manifest.get("runtime_identity") is None
+        and cleanup_receipt is None
+        and cleanup_intent is None
+    )
     stale_reconciliation = {
         **stale_reconciliation,
         "eligible": not stale_blockers,
         "blockers": stale_blockers,
+        "reconciliation_kind": (
+            "legacy_absence" if legacy_absence_reconciliation else "stale_abandonment"
+        ),
+        "closure_outcome": (
+            "abandoned_legacy_workspace"
+            if legacy_absence_reconciliation
+            else "abandoned_stale_workspace"
+        ),
+        "legacy_absence_receipt_required": legacy_absence_reconciliation,
     }
     if cleanup_receipt_valid and checkout_state["exists"]:
         blockers.append({"code": "writer_worktree_reappeared_after_cleanup"})
@@ -5410,6 +5735,12 @@ def grabowski_agent_workspace_cleanup_plan(
         "stale_reconciliation_eligible_count": sum(
             1 for plan in plans if plan["stale_reconciliation"]["eligible"]
         ),
+        "legacy_absence_reconciliation_eligible_count": sum(
+            1
+            for plan in plans
+            if plan["stale_reconciliation"]["eligible"]
+            and plan["stale_reconciliation"].get("reconciliation_kind") == "legacy_absence"
+        ),
         "blocked_count": sum(
             1
             for plan in plans
@@ -5429,6 +5760,49 @@ def grabowski_agent_workspace_cleanup_plan(
     }
     return {**body, "inventory_sha256": _sha256_json(body)}
 
+
+
+def _load_or_create_legacy_absence_receipt(
+    manifest: dict[str, Any], plan: dict[str, Any]
+) -> dict[str, Any]:
+    path = _workspace_dir(str(manifest["workspace_id"])) / "legacy-absence-receipt.json"
+    if path.exists():
+        existing = _load_json(path)
+        if _legacy_absence_receipt_valid(
+            manifest,
+            existing,
+            expected_plan_sha256=plan.get("plan_sha256"),
+        ):
+            return existing
+        raise AgentWorkspaceError(
+            "existing legacy absence receipt is invalid or bound to another lifecycle plan"
+        )
+    body = {
+        "schema_version": 1,
+        "workspace_id": manifest["workspace_id"],
+        "source_plan_sha256": plan["plan_sha256"],
+        "repository": manifest["repository"],
+        "writer_worktree": manifest["writer_worktree"],
+        "writer_branch": manifest["writer_branch"],
+        "workspace_created_at": manifest.get("created_at"),
+        "observed_worktree_absent": True,
+        "liveness_sha256": _sha256_json(plan["liveness"]),
+        "workspace_reference_inventory_sha256": _sha256_json(
+            {
+                "references": plan["workspace_references"],
+                "errors": plan["workspace_reference_scan_errors"],
+            }
+        ),
+        "task_mutation_performed": False,
+        "resource_mutation_performed": False,
+        "tmux_mutation_performed": False,
+        "worktree_mutation_performed": False,
+        "historical_evidence_preserved": True,
+        "recorded_at": _utc(),
+    }
+    receipt = {**body, "receipt_sha256": _sha256_json(body)}
+    _atomic_json(path, receipt)
+    return receipt
 
 
 @mcp.tool(name="grabowski_agent_workspace_reconcile_stale", annotations=MUTATING)
@@ -5481,6 +5855,12 @@ def grabowski_agent_workspace_reconcile_stale(
             for role_name, task in task_states.items()
             if task.get("task_id") is not None and task.get("state") != "completed"
         )
+        closure_outcome = str(stale["closure_outcome"])
+        legacy_absence_receipt = (
+            _load_or_create_legacy_absence_receipt(manifest, plan)
+            if stale.get("reconciliation_kind") == "legacy_absence"
+            else None
+        )
         receipt = {
             "schema_version": 1,
             "state": "complete",
@@ -5503,8 +5883,15 @@ def grabowski_agent_workspace_reconcile_stale(
             "no_unsecured_changes_discarded": True,
             "failed_roles": failed_roles,
             "abandon_failed_roles": True,
-            "closure_outcome": "abandoned_stale_workspace",
+            "closure_outcome": closure_outcome,
             "stale_reconciliation": True,
+            "reconciliation_kind": stale["reconciliation_kind"],
+            "legacy_absence_reconciliation": legacy_absence_receipt is not None,
+            "legacy_absence_receipt_sha256": (
+                legacy_absence_receipt["receipt_sha256"]
+                if legacy_absence_receipt is not None
+                else None
+            ),
             "task_mutation_performed": False,
             "resource_mutation_performed": False,
             "worktree_mutation_performed": False,
@@ -5516,13 +5903,19 @@ def grabowski_agent_workspace_reconcile_stale(
         _append_workspace_event(
             manifest,
             "workspace_stale_reconciled",
-            outcome="abandoned_stale_workspace",
+            outcome=closure_outcome,
             evidence={
                 "receipt_sha256": receipt["receipt_sha256"],
                 "source_plan_sha256": expected_hash,
                 "task_mutation_performed": False,
                 "resource_mutation_performed": False,
                 "worktree_mutation_performed": False,
+                "reconciliation_kind": stale["reconciliation_kind"],
+                "legacy_absence_receipt_sha256": (
+                    legacy_absence_receipt["receipt_sha256"]
+                    if legacy_absence_receipt is not None
+                    else None
+                ),
             },
         )
         _write_manifest(manifest)
@@ -5532,7 +5925,13 @@ def grabowski_agent_workspace_reconcile_stale(
             "operation": "agent-workspace-stale-reconcile",
             "workspace_id": identifier,
             "source_plan_sha256": expected_hash,
-            "closure_outcome": "abandoned_stale_workspace",
+            "closure_outcome": closure_outcome,
+            "reconciliation_kind": stale["reconciliation_kind"],
+            "legacy_absence_receipt_sha256": (
+                legacy_absence_receipt["receipt_sha256"]
+                if legacy_absence_receipt is not None
+                else None
+            ),
             "task_mutation_performed": False,
             "resource_mutation_performed": False,
             "worktree_mutation_performed": False,
@@ -5541,9 +5940,14 @@ def grabowski_agent_workspace_reconcile_stale(
     )
     return {
         "workspace_id": identifier,
-        "state": "stale_workspace_reconciled",
+        "state": (
+            "legacy_workspace_reconciled"
+            if closure_outcome == "abandoned_legacy_workspace"
+            else "stale_workspace_reconciled"
+        ),
         "idempotent": False,
         "close_receipt": receipt,
+        "legacy_absence_receipt": legacy_absence_receipt,
         "worktree_preserved": receipt["worktree_preserved"],
         "historical_evidence_preserved": True,
     }

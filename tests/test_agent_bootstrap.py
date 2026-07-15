@@ -78,6 +78,14 @@ class AgentBootstrapTests(unittest.TestCase):
             "decision_log": {"integrity_valid": True},
             "fingerprint_sha256": "a" * 64,
         }
+        module._workspace_metrics_snapshot = lambda _limit: {
+            "integrity_valid": True,
+            "friction_fingerprint_sha256": "c" * 64,
+            "snapshot_sha256": "d" * 64,
+            "current_cohort": {"cohort_key": "release:test"},
+            "current_cohort_sample_size": 3,
+            "friction_fingerprint_unavailable_reason": None,
+        }
         module.grabowski_friction.execution_governor_summary = lambda **_: {
             "ledger_integrity_valid": False,
             "candidates": [],
@@ -91,12 +99,83 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertFalse(result["execution_authorized"])
         self.assertFalse(result["automatic_live_routing_enabled"])
 
+    def test_bootstrap_uses_current_workspace_cohort_fingerprint_when_generic_is_absent(self) -> None:
+        module = self.load_module()
+        module.grabowski_friction.friction_summary = lambda **_: {
+            "event_log_integrity": {"integrity_valid": True},
+            "decision_log": {"integrity_valid": True},
+            "fingerprint_sha256": None,
+        }
+        module.grabowski_friction.execution_governor_summary = lambda **_: {
+            "ledger_integrity_valid": True,
+            "candidates": [],
+            "minimum_evidence": 5,
+            "decay_seconds": 604800,
+            "live_promotions": [],
+            "summary_sha256": "b" * 64,
+        }
+        module._workspace_metrics_snapshot = lambda _limit: {
+            "integrity_valid": True,
+            "friction_fingerprint_sha256": "c" * 64,
+            "snapshot_sha256": "d" * 64,
+            "current_cohort": {"cohort_key": "release:test"},
+            "current_cohort_sample_size": 5,
+            "friction_fingerprint_unavailable_reason": None,
+        }
+        result = module.agent_bootstrap()
+        adaptive = result["adaptive_evidence"]
+        self.assertEqual(adaptive["friction_fingerprint_sha256"], "c" * 64)
+        self.assertEqual(adaptive["workspace_friction_fingerprint_sha256"], "c" * 64)
+        self.assertEqual(adaptive["workspace_current_cohort_sample_size"], 5)
+        self.assertEqual(result["learning_contract"]["workspace_route_calibration_mode"], "shadow_only")
+        self.assertFalse(result["automatic_live_routing_enabled"])
+
+    def test_bootstrap_rejects_workspace_fingerprint_when_snapshot_integrity_is_invalid(self) -> None:
+        module = self.load_module()
+        module.grabowski_friction.friction_summary = lambda **_: {
+            "event_log_integrity": {"integrity_valid": True},
+            "decision_log": {"integrity_valid": True},
+            "fingerprint_sha256": None,
+        }
+        module.grabowski_friction.execution_governor_summary = lambda **_: {
+            "ledger_integrity_valid": True,
+            "candidates": [],
+            "minimum_evidence": 5,
+            "decay_seconds": 604800,
+            "live_promotions": [],
+            "summary_sha256": "b" * 64,
+        }
+        module._workspace_metrics_snapshot = lambda _limit: {
+            "integrity_valid": False,
+            "friction_fingerprint_sha256": "c" * 64,
+            "snapshot_sha256": "d" * 64,
+            "current_cohort": {"cohort_key": "release:test"},
+            "current_cohort_sample_size": 5,
+            "friction_fingerprint_unavailable_reason": None,
+        }
+        adaptive = module.agent_bootstrap()["adaptive_evidence"]
+        self.assertIsNone(adaptive["friction_fingerprint_sha256"])
+        self.assertIsNone(adaptive["workspace_friction_fingerprint_sha256"])
+        self.assertFalse(adaptive["workspace_metrics_integrity_valid"])
+        self.assertEqual(
+            adaptive["workspace_fingerprint_unavailable_reason"],
+            "workspace_metrics_integrity_invalid",
+        )
+
     def test_bootstrap_preserves_immutable_boundaries(self) -> None:
         module = self.load_module()
         module.grabowski_friction.friction_summary = lambda **_: {
             "event_log_integrity": {"integrity_valid": True},
             "decision_log": {"integrity_valid": True},
             "fingerprint_sha256": "a" * 64,
+        }
+        module._workspace_metrics_snapshot = lambda _limit: {
+            "integrity_valid": True,
+            "friction_fingerprint_sha256": "c" * 64,
+            "snapshot_sha256": "d" * 64,
+            "current_cohort": {"cohort_key": "release:test"},
+            "current_cohort_sample_size": 5,
+            "friction_fingerprint_unavailable_reason": None,
         }
         module.grabowski_friction.execution_governor_summary = lambda **_: {
             "ledger_integrity_valid": True,

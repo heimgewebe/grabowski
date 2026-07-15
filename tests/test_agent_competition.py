@@ -68,6 +68,17 @@ class AgentCompetitionTests(unittest.TestCase):
             mock.patch.object(competition.operator, "_require_operator_mutation"),
             mock.patch.object(competition.operator, "_require_operator_capability"),
             mock.patch.object(competition.shutil, "which", side_effect=lambda provider: f"/usr/bin/{provider}"),
+            mock.patch.object(
+                competition,
+                "_workspace_route_shadow_calibration",
+                return_value={
+                    "schema_version": 1,
+                    "mode": "shadow_only",
+                    "eligible": False,
+                    "applied_to_live_route": False,
+                    "execution_authorized": False,
+                },
+            ),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -266,6 +277,84 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(competitive["execution_mode"], "workspace_with_competition")
         self.assertFalse(competitive["automatic_winner_selection"])
         self.assertEqual(len(competitive["external_candidates"]), 2)
+
+    def test_route_shadow_calibration_never_changes_live_route_or_recommendation_id(self) -> None:
+        kwargs = dict(
+            task_kind="code",
+            changed_file_estimate=5,
+            expected_duration_minutes=60,
+            novelty="medium",
+            risk_flags=[],
+            available_external_agents=["claude"],
+        )
+        baseline = competition.grabowski_agent_execution_route(**kwargs)
+        with mock.patch.object(
+            competition,
+            "_workspace_route_shadow_calibration",
+            return_value={
+                "schema_version": 1,
+                "mode": "shadow_only",
+                "eligible": True,
+                "route_summaries": [
+                    {"route": "isolated_worktree", "closed_success_ratio": 1.0},
+                    {"route": "full_workspace", "closed_success_ratio": 0.5},
+                ],
+                "applied_to_live_route": False,
+                "execution_authorized": False,
+            },
+        ):
+            calibrated = competition.grabowski_agent_execution_route(**kwargs)
+        self.assertEqual(calibrated["execution_mode"], baseline["execution_mode"])
+        self.assertEqual(calibrated["recommendation_id"], baseline["recommendation_id"])
+        self.assertTrue(calibrated["shadow_calibration"]["eligible"])
+        self.assertFalse(calibrated["shadow_calibration"]["applied_to_live_route"])
+        self.assertFalse(calibrated["shadow_calibration"]["execution_authorized"])
+
+    def test_route_shadow_calibration_counts_only_usable_route_records(self) -> None:
+        import grabowski_agent_workspace_observer as workspace_observer
+
+        self.patchers.pop().stop()
+        records = []
+        for index in range(5):
+            route_evidence = {
+                "input_facts": {
+                    "task_kind": "code",
+                    "novelty": "medium",
+                    "risk_flags": [],
+                },
+            }
+            if index < 4:
+                route_evidence["actual_route"] = (
+                    "full_workspace" if index < 2 else "workspace_with_contrast"
+                )
+            records.append({
+                "route_evidence": route_evidence,
+                "closed": True,
+                "closure_outcome": "successful",
+                "workspace_friction_classes": [],
+                "quality_signal_classes": [],
+                "timing": {"close_complete_seconds": float(index + 1)},
+                "report_sha256": f"{index + 1:064x}",
+            })
+        snapshot = {
+            "integrity_valid": True,
+            "snapshot_sha256": "a" * 64,
+            "current_cohort": {"cohort_key": "release:test"},
+            "friction_fingerprint_sha256": "b" * 64,
+            "route_records": records,
+        }
+        with mock.patch.object(
+            workspace_observer, "workspace_metrics_snapshot", return_value=snapshot
+        ):
+            result = competition._workspace_route_shadow_calibration(
+                {"task_kind": "code", "novelty": "medium", "risk_flags": []},
+                "full_workspace",
+            )
+        self.assertEqual(result["comparable_workspace_count"], 4)
+        self.assertEqual(result["discarded_record_count"], 1)
+        self.assertEqual(len(result["route_summaries"]), 2)
+        self.assertFalse(result["eligible"])
+        self.assertFalse(result["applied_to_live_route"])
 
     def test_route_rejects_coercive_bools_and_unknown_agents(self) -> None:
         with self.assertRaisesRegex(competition.AgentCompetitionError, "must be boolean"):

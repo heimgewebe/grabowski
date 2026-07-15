@@ -1346,6 +1346,151 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
 
 
 
+def _workspace_route_shadow_calibration(
+    input_facts: dict[str, Any], recommended_mode: str
+) -> dict[str, Any]:
+    """Compare current-cohort outcomes without changing the deterministic route."""
+    try:
+        import grabowski_agent_workspace_observer as observer
+
+        snapshot = observer.workspace_metrics_snapshot(limit=50)
+    except Exception as exc:
+        return {
+            "schema_version": 1,
+            "mode": "shadow_only",
+            "integrity_valid": False,
+            "eligible": False,
+            "reason": "workspace_metrics_unavailable",
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:500],
+            "recommended_mode": recommended_mode,
+            "applied_to_live_route": False,
+            "execution_authorized": False,
+        }
+
+    def median(values: list[float]) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2
+
+    comparable: list[tuple[dict[str, Any], str]] = []
+    discarded_record_count = 0
+    for record in snapshot.get("route_records", []):
+        if not isinstance(record, dict):
+            discarded_record_count += 1
+            continue
+        route = record.get("route_evidence")
+        if not isinstance(route, dict):
+            discarded_record_count += 1
+            continue
+        actual_route = route.get("actual_route")
+        prior = route.get("input_facts")
+        if not isinstance(actual_route, str) or not actual_route:
+            discarded_record_count += 1
+            continue
+        if not isinstance(prior, dict):
+            discarded_record_count += 1
+            continue
+        prior_risk_flags = prior.get("risk_flags")
+        if (
+            not isinstance(prior_risk_flags, list)
+            or any(not isinstance(item, str) for item in prior_risk_flags)
+        ):
+            discarded_record_count += 1
+            continue
+        if (
+            prior.get("task_kind") == input_facts["task_kind"]
+            and prior.get("novelty") == input_facts["novelty"]
+            and sorted(prior_risk_flags) == input_facts["risk_flags"]
+        ):
+            comparable.append((record, actual_route))
+    routes: dict[str, dict[str, Any]] = {}
+    for record, actual_route in comparable:
+        aggregate = routes.setdefault(
+            actual_route,
+            {
+                "route": actual_route,
+                "workspace_count": 0,
+                "closed_count": 0,
+                "successful_close_count": 0,
+                "platform_friction_workspace_count": 0,
+                "quality_signal_workspace_count": 0,
+                "close_seconds": [],
+                "source_report_sha256": [],
+            },
+        )
+        aggregate["workspace_count"] += 1
+        aggregate["closed_count"] += record.get("closed") is True
+        aggregate["successful_close_count"] += record.get("closure_outcome") == "successful"
+        aggregate["platform_friction_workspace_count"] += bool(
+            record.get("workspace_friction_classes")
+        )
+        aggregate["quality_signal_workspace_count"] += bool(
+            record.get("quality_signal_classes")
+        )
+        timing = record.get("timing")
+        close_seconds = timing.get("close_complete_seconds") if isinstance(timing, dict) else None
+        if isinstance(close_seconds, (int, float)) and not isinstance(close_seconds, bool):
+            aggregate["close_seconds"].append(float(close_seconds))
+        report_sha256 = record.get("report_sha256")
+        if isinstance(report_sha256, str):
+            aggregate["source_report_sha256"].append(report_sha256)
+    route_summaries: list[dict[str, Any]] = []
+    for route, aggregate in sorted(routes.items()):
+        closed = aggregate.pop("closed_count")
+        success = aggregate.pop("successful_close_count")
+        close_values = aggregate.pop("close_seconds")
+        route_summaries.append({
+            **aggregate,
+            "closed_count": closed,
+            "successful_close_count": success,
+            "completion_ratio": closed / aggregate["workspace_count"],
+            "closed_success_ratio": success / closed if closed else None,
+            "median_close_seconds": median(close_values),
+        })
+    minimum_evidence = 5
+    integrity_valid = snapshot.get("integrity_valid") is True
+    body = {
+        "schema_version": 1,
+        "mode": "shadow_only",
+        "integrity_valid": integrity_valid,
+        "snapshot_sha256": snapshot.get("snapshot_sha256"),
+        "cohort": snapshot.get("current_cohort"),
+        "friction_fingerprint_sha256": (
+            snapshot.get("friction_fingerprint_sha256") if integrity_valid else None
+        ),
+        "comparison_key": {
+            "task_kind": input_facts["task_kind"],
+            "novelty": input_facts["novelty"],
+            "risk_flags": input_facts["risk_flags"],
+        },
+        "recommended_mode": recommended_mode,
+        "comparable_workspace_count": len(comparable),
+        "discarded_record_count": discarded_record_count,
+        "minimum_evidence": minimum_evidence,
+        "eligible": bool(
+            integrity_valid
+            and len(comparable) >= minimum_evidence
+            and len(route_summaries) >= 2
+        ),
+        "route_summaries": route_summaries,
+        "applied_to_live_route": False,
+        "execution_authorized": False,
+        "automatic_promotion": False,
+        "does_not_establish": [
+            "causality",
+            "route_superiority",
+            "execution_authority",
+            "permission_to_change_route_thresholds",
+        ],
+    }
+    return {**body, "calibration_sha256": _sha256_json(body)}
+
+
 @mcp.tool(name="grabowski_agent_execution_route", annotations=READ_ONLY)
 def grabowski_agent_execution_route(
     task_kind: str,
@@ -1447,6 +1592,9 @@ def grabowski_agent_execution_route(
         "input_facts": input_facts,
         "external_candidates": candidate_plan,
     })
+    result["shadow_calibration"] = _workspace_route_shadow_calibration(
+        input_facts, mode
+    )
     return result
 
 

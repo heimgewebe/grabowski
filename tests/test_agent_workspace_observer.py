@@ -399,6 +399,59 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         self.assertEqual(handoff["next_action"], "verify:bureau_task_reconciliation")
         self.assertFalse(handoff["mutation_authorized"])
 
+    def test_semantic_test_failure_is_quality_signal_not_platform_friction(self) -> None:
+        identifier = "gaw-observer-test-quality-signal"
+        manifest = self._manifest(identifier)
+        workspace._append_workspace_event(
+            manifest,
+            "role_finished",
+            role="tests",
+            outcome="failed",
+            evidence={"failure_classification": "semantic_test_failure"},
+        )
+        with (
+            mock.patch.object(workspace, "_manifest", return_value=manifest),
+            mock.patch.object(workspace, "_status_data", return_value=self._status(failure="semantic_test_failure")),
+        ):
+            report = observer.grabowski_agent_workspace_observe(identifier, "quality-signal")
+        self.assertEqual(report["facts"]["workspace_friction_classes"], [])
+        self.assertEqual(report["facts"]["actionable_failure_classes"], [])
+        self.assertEqual(report["facts"]["quality_signal_classes"], ["semantic_test_failure"])
+
+    def test_optimizer_does_not_propose_platform_change_for_quality_signals(self) -> None:
+        identifiers = ["gaw-observer-quality-opt-01", "gaw-observer-quality-opt-02"]
+        manifests = {identifier: self._manifest(identifier) for identifier in identifiers}
+        for manifest in manifests.values():
+            workspace._append_workspace_event(
+                manifest,
+                "role_finished",
+                role="tests",
+                outcome="failed",
+                evidence={"failure_classification": "semantic_test_failure"},
+            )
+        with (
+            mock.patch.object(workspace, "_manifest", side_effect=lambda identifier: manifests[identifier]),
+            mock.patch.object(workspace, "_status_data", return_value=self._status(failure="semantic_test_failure")),
+        ):
+            result = observer.grabowski_agent_workspace_optimize(identifiers)
+        self.assertEqual(result["repeated_failure_classes"], [])
+        self.assertEqual(result["proposals"], [])
+        self.assertEqual(result["quality_signals"][0]["workspace_count"], 2)
+        self.assertFalse(result["quality_signals"][0]["drives_workspace_optimization"])
+
+    def test_runtime_identity_creates_versioned_cohort_and_rejects_tampering(self) -> None:
+        body = {
+            "schema_version": 1,
+            "runtime_release": "release-1",
+            "runtime_repo_head": "a" * 40,
+        }
+        manifest = {"runtime_identity": {**body, "identity_sha256": observer._sha256_json(body)}}
+        cohort = observer._cohort_identity(manifest)
+        self.assertEqual(cohort["kind"], "versioned")
+        self.assertEqual(cohort["cohort_key"], "release:release-1")
+        manifest["runtime_identity"]["runtime_release"] = "tampered"
+        self.assertEqual(observer._cohort_identity(manifest)["kind"], "invalid")
+
     def test_metrics_summary_is_report_hash_bound_and_read_only(self) -> None:
         reports = [
             {"report_sha256": "a" * 64, "facts": {"closed": True, "closure_outcome": "successful", "failed_roles": [], "actionable_failure_classes": []}},
@@ -408,9 +461,111 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         self.assertEqual(metrics["sample_size"], 2)
         self.assertEqual(metrics["successful_close_count"], 1)
         self.assertEqual(metrics["failed_role_workspace_count"], 1)
-        self.assertEqual(metrics["success_ratio"], 0.5)
+        self.assertEqual(metrics["success_ratio"], 1.0)
+        self.assertEqual(metrics["completion_ratio"], 0.5)
+        self.assertEqual(metrics["closed_success_ratio"], 1.0)
+        self.assertEqual(metrics["legacy_workspace_count"], 2)
         self.assertTrue(metrics["read_only_projection"])
         self.assertEqual(metrics["source_report_sha256"], ["a" * 64, "b" * 64])
+
+    def _snapshot_report(self, identifier: str, *, activation_reason: str) -> dict:
+        manifest = workspace._manifest(identifier)
+        cohort = observer._cohort_identity(manifest)
+        return {
+            "workspace_id": identifier,
+            "report_sha256": observer._sha256_json({"workspace_id": identifier}),
+            "facts": {
+                "closed": True,
+                "closure_outcome": "successful",
+                "failed_roles": [],
+                "workspace_friction_classes": [],
+                "quality_signal_classes": [],
+                "lifecycle_debt_classes": [],
+                "timing": {},
+                "cohort": cohort,
+                "route_evidence": None,
+                "event_log": {"integrity_valid": True},
+            },
+        }
+
+    def _write_snapshot_manifest(
+        self, identifier: str, runtime_identity: dict | None
+    ) -> None:
+        directory = self.root / identifier
+        directory.mkdir(mode=0o700)
+        manifest = {
+            "schema_version": workspace.SCHEMA_VERSION,
+            "workspace_id": identifier,
+        }
+        if runtime_identity is not None:
+            manifest["runtime_identity"] = runtime_identity
+        workspace._atomic_json(directory / "manifest.json", manifest)
+
+    def test_metrics_snapshot_prioritizes_complete_current_cohort(self) -> None:
+        identity_body = {
+            "schema_version": 1,
+            "runtime_release": "release-current",
+            "runtime_repo_head": "a" * 40,
+        }
+        identity = {
+            **identity_body,
+            "identity_sha256": observer._sha256_json(identity_body),
+        }
+        current = "gaw-snapshot-current-00000001"
+        legacy = "gaw-snapshot-legacy-00000001"
+        self._write_snapshot_manifest(current, identity)
+        self._write_snapshot_manifest(legacy, None)
+        with (
+            mock.patch.object(workspace, "_workspace_runtime_identity", return_value=identity),
+            mock.patch.object(observer, "_observer_report", side_effect=self._snapshot_report),
+        ):
+            snapshot = observer.workspace_metrics_snapshot(limit=1)
+        self.assertEqual(snapshot["selected_workspace_count"], 1)
+        self.assertEqual(snapshot["current_cohort_candidate_count"], 1)
+        self.assertEqual(snapshot["current_cohort_sample_size"], 1)
+        self.assertTrue(snapshot["current_cohort_complete"])
+        self.assertTrue(snapshot["integrity_valid"])
+        self.assertIsNotNone(snapshot["friction_fingerprint_sha256"])
+        self.assertFalse(snapshot["inventory_complete"])
+
+    def test_metrics_snapshot_with_truncated_current_cohort_has_no_fingerprint(self) -> None:
+        identity_body = {
+            "schema_version": 1,
+            "runtime_release": "release-current",
+            "runtime_repo_head": "a" * 40,
+        }
+        identity = {
+            **identity_body,
+            "identity_sha256": observer._sha256_json(identity_body),
+        }
+        self._write_snapshot_manifest("gaw-snapshot-current-00000002", identity)
+        self._write_snapshot_manifest("gaw-snapshot-current-00000003", identity)
+        with (
+            mock.patch.object(workspace, "_workspace_runtime_identity", return_value=identity),
+            mock.patch.object(observer, "_observer_report", side_effect=self._snapshot_report),
+        ):
+            snapshot = observer.workspace_metrics_snapshot(limit=1)
+        self.assertEqual(snapshot["current_cohort_candidate_count"], 2)
+        self.assertEqual(snapshot["current_cohort_sample_size"], 1)
+        self.assertFalse(snapshot["current_cohort_complete"])
+        self.assertFalse(snapshot["integrity_valid"])
+        self.assertIsNone(snapshot["friction_fingerprint_sha256"])
+        self.assertEqual(
+            snapshot["friction_fingerprint_unavailable_reason"],
+            "current_cohort_snapshot_incomplete_or_invalid",
+        )
+
+    def test_timing_metric_names_collection_request_truthfully(self) -> None:
+        events = [
+            {"event_type": "plan_created", "recorded_at": "2026-07-15T10:00:00+00:00"},
+            {
+                "event_type": "collection_requested",
+                "recorded_at": "2026-07-15T10:00:05+00:00",
+            },
+        ]
+        timing = observer._event_timing_metrics(events)
+        self.assertEqual(timing["collection_requested_seconds"], 5.0)
+        self.assertNotIn("writer_observed_terminal_seconds", timing)
 
 
 if __name__ == "__main__":
