@@ -9,9 +9,9 @@ GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python
 RETENTION_MIN_AGE_SECONDS ?= 86400
 RETENTION_MAX_ARCHIVE_JOBS ?= 128
 
-.PHONY: validate syntax test policy context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply runtime-legacy-status
+.PHONY: validate syntax test policy tool-surface-budget context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply runtime-legacy-status
 
-validate: syntax test policy context-check profiles-check runtime-lock deploy-tooling-check secrets
+validate: syntax test policy tool-surface-budget context-check profiles-check runtime-lock deploy-tooling-check secrets
 
 syntax:
 >$(PYTHON) -m py_compile tools/operator_patch_relay.py
@@ -22,6 +22,9 @@ test:
 
 policy:
 >$(PYTHON) tools/validate_access_policy.py
+
+tool-surface-budget:
+>PYTHONPATH=src $(PYTHON) -m grabowski_tool_surface_budget --check
 
 context-refresh:
 >$(PYTHON) tools/build_operator_context.py --write

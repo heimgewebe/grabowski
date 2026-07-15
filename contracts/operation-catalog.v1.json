@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "source": "config/operations.example.json",
+  "operations": {
+    "inspect-user-service": {
+      "execution_authorities": [
+        "operator-mutation"
+      ],
+      "effects": [
+        "service-read"
+      ],
+      "reversibility": "not-applicable"
+    },
+    "probe-host": {
+      "execution_authorities": [
+        "fleet-run",
+        "operator-mutation"
+      ],
+      "effects": [
+        "host-read",
+        "remote-command"
+      ],
+      "reversibility": "command-dependent"
+    },
+    "restart-user-service": {
+      "execution_authorities": [
+        "operator-mutation"
+      ],
+      "effects": [
+        "service-restart"
+      ],
+      "reversibility": "command-dependent"
+    }
+  }
+}

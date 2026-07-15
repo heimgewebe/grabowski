@@ -21,6 +21,15 @@
       "steps": [
         {"phase": "action", "target": "${host}", "argv": ["hostname"]}
       ]
+    },
+    "inspect-user-service": {
+      "description": "Inspect one user service without changing its state.",
+      "parameters": {
+        "unit": "[A-Za-z0-9_.@:-]{1,200}"
+      },
+      "steps": [
+        {"phase": "action", "target": "local", "argv": ["systemctl", "--user", "show", "${unit}", "--property=LoadState", "--property=ActiveState", "--property=SubState"]}
+      ]
     }
   }
 }

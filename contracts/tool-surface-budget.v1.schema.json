@@ -1,0 +1,408 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heimgewebe.org/contracts/grabowski-tool-surface-budget-v1.schema.json",
+  "title": "Grabowski Tool Surface Budget v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "sources",
+    "baseline",
+    "accepted_additions",
+    "retired_tools",
+    "operation_catalog",
+    "policy",
+    "migration_candidates",
+    "does_not_establish"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "contract_id": {
+      "const": "grabowski-tool-surface-budget-v1"
+    },
+    "sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime_entrypoint",
+        "capability_catalog",
+        "operation_catalog",
+        "operation_metadata"
+      ],
+      "properties": {
+        "runtime_entrypoint": {
+          "const": "config/runtime-entrypoint.json"
+        },
+        "capability_catalog": {
+          "const": "contracts/capability-catalog.v1.json"
+        },
+        "operation_catalog": {
+          "const": "config/operations.example.json"
+        },
+        "operation_metadata": {
+          "const": "contracts/operation-catalog.v1.json"
+        }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool_count",
+        "tool_names_sha256",
+        "tool_semantics_sha256",
+        "tools"
+      ],
+      "properties": {
+        "tool_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tool_names_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "tool_semantics_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tool_projection"
+          }
+        }
+      }
+    },
+    "accepted_additions": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,127}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/addition"
+      }
+    },
+    "retired_tools": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,127}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/retirement"
+      }
+    },
+    "operation_catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "operation_count",
+        "operations_sha256",
+        "operations"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "enum": [
+            1,
+            2
+          ]
+        },
+        "operation_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operations_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/operation_projection"
+          }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted_addition_kinds",
+        "legacy_baseline_is_closed",
+        "fixed_tool_cap",
+        "default_route",
+        "security_boundaries_may_remain_tools"
+      ],
+      "properties": {
+        "accepted_addition_kinds": {
+          "const": [
+            "distinct_authority_boundary",
+            "material_call_shape",
+            "measured_selection_advantage"
+          ]
+        },
+        "legacy_baseline_is_closed": {
+          "const": true
+        },
+        "fixed_tool_cap": {
+          "type": "null"
+        },
+        "default_route": {
+          "const": "typed-operation"
+        },
+        "security_boundaries_may_remain_tools": {
+          "const": true
+        }
+      }
+    },
+    "migration_candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/migration_candidate"
+      }
+    },
+    "does_not_establish": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "string_list": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512
+      }
+    },
+    "tool_projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "category",
+        "authority_class",
+        "risk_class",
+        "read_only",
+        "effects",
+        "reversibility"
+      ],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,127}$"
+        },
+        "category": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,63}$"
+        },
+        "authority_class": {
+          "type": "string",
+          "enum": [
+            "read",
+            "mutation",
+            "secret",
+            "destructive",
+            "privileged",
+            "process-control",
+            "deployment"
+          ]
+        },
+        "risk_class": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,63}$"
+        },
+        "read_only": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "effects": {
+          "$ref": "#/$defs/string_list"
+        },
+        "reversibility": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "addition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool_contract",
+        "justification_kind",
+        "rationale",
+        "evidence_refs",
+        "operation_alternative_considered",
+        "exception_detail"
+      ],
+      "properties": {
+        "tool_contract": {
+          "$ref": "#/$defs/tool_projection"
+        },
+        "justification_kind": {
+          "type": "string",
+          "enum": [
+            "distinct_authority_boundary",
+            "material_call_shape",
+            "measured_selection_advantage"
+          ]
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 24,
+          "maxLength": 4096
+        },
+        "evidence_refs": {
+          "$ref": "#/$defs/string_list"
+        },
+        "operation_alternative_considered": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 4096
+        },
+        "exception_detail": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "claim",
+            "evidence"
+          ],
+          "properties": {
+            "claim": {
+              "type": "string",
+              "minLength": 16,
+              "maxLength": 4096
+            },
+            "evidence": {
+              "type": "string",
+              "minLength": 8,
+              "maxLength": 4096
+            }
+          }
+        }
+      }
+    },
+    "retirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "evidence_refs",
+        "compatibility"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 4096
+        },
+        "evidence_refs": {
+          "$ref": "#/$defs/string_list"
+        },
+        "compatibility": {
+          "type": "string",
+          "minLength": 12,
+          "maxLength": 4096
+        }
+      }
+    },
+    "operation_projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "description",
+        "execution_authorities",
+        "effects",
+        "reversibility",
+        "parameter_names",
+        "phases"
+      ],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 12,
+          "maxLength": 4096
+        },
+        "effects": {
+          "$ref": "#/$defs/string_list"
+        },
+        "reversibility": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "parameter_names": {
+          "$ref": "#/$defs/string_list"
+        },
+        "phases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "preflight",
+              "action",
+              "postflight",
+              "rollback"
+            ]
+          }
+        },
+        "execution_authorities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      }
+    },
+    "migration_candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "reason",
+        "target_operation_family"
+      ],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,127}$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 4096
+        },
+        "target_operation_family": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,63}$"
+        }
+      }
+    }
+  }
+}
