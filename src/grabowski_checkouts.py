@@ -521,17 +521,18 @@ def _lease_ttl(retention_until_unix: int) -> int:
     return min(resources.MAX_TTL_SECONDS, remaining)
 
 
-def _checkout_resource_keys(repo_path: Path, checkout_path: Path) -> list[str]:
+def _checkout_resource_keys(repo_common_dir: Path, checkout_path: Path) -> list[str]:
+    """Return the exact checkout and shared Git-metadata serialization claims."""
     return [
         resources.normalize_resource_key(f"path:{checkout_path}"),
-        resources.normalize_resource_key(f"repo:{repo_path}"),
+        resources.normalize_resource_key(f"path:{repo_common_dir}"),
     ]
 
 
 def _acquire_checkout_resources(
     *,
     owner_id: str,
-    repo_path: Path,
+    repo_common_dir: Path,
     checkout_path: Path,
     purpose: str,
     retention_until_unix: int,
@@ -541,10 +542,14 @@ def _acquire_checkout_resources(
     lease_owner = f"checkout-op:{uuid.uuid4().hex[:20]}"
     return resources.acquire_resources(
         lease_owner,
-        _checkout_resource_keys(repo_path, checkout_path),
+        _checkout_resource_keys(repo_common_dir, checkout_path),
         purpose=purpose,
         ttl_seconds=OPERATION_LEASE_TTL_SECONDS,
-        metadata={**metadata, "durable_owner_id": durable_owner},
+        metadata={
+            **metadata,
+            "durable_owner_id": durable_owner,
+            "git_common_dir": str(repo_common_dir),
+        },
     )
 
 
@@ -740,7 +745,6 @@ def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
             )
     return results
 
-
 def _processes_under(paths: list[Path]) -> list[dict[str, Any]]:
     proc = Path("/proc")
     if not proc.is_dir():
@@ -811,6 +815,7 @@ def _coordination(
 def _linked_checkout_coordination(
     checkout_path: Path,
     repo_path: Path,
+    repo_common_dir: Path,
     *,
     owner_id: str | None = None,
     include_processes: bool = True,
@@ -821,7 +826,9 @@ def _linked_checkout_coordination(
     resource_blockers: list[dict[str, Any]] = []
     if include_resources:
         for lease in _read_resource_leases():
-            if not _resource_related(lease["resource_key"], [checkout_path, repo_path]):
+            if not _resource_related(
+                lease["resource_key"], [checkout_path, repo_common_dir]
+            ):
                 continue
             lease = {**lease, "blocking": owner is None or lease["owner_id"] != owner}
             resource_blockers.append(lease)
@@ -991,6 +998,7 @@ def checkout_inventory(
         coordination = _linked_checkout_coordination(
             checkout_path,
             top_level,
+            common_dir,
             include_processes=include_processes,
             include_tasks=include_tasks,
             include_resources=include_resources,
@@ -1191,7 +1199,7 @@ def grabowski_checkout_retain(
     _require_retention_owner(record["checkout_key"], owner)
     lease = _acquire_checkout_resources(
         owner_id=owner,
-        repo_path=top_level,
+        repo_common_dir=common_dir,
         checkout_path=checkout,
         purpose=f"retain linked checkout: {retain_purpose}",
         retention_until_unix=until,
@@ -1257,6 +1265,7 @@ def grabowski_checkout_archive(
     coordination = _linked_checkout_coordination(
         checkout,
         top_level,
+        common_dir,
         owner_id=owner,
         include_processes=True,
         include_tasks=True,
@@ -1265,7 +1274,7 @@ def grabowski_checkout_archive(
     _require_no_blockers(coordination)
     lease = _acquire_checkout_resources(
         owner_id=owner,
-        repo_path=top_level,
+        repo_common_dir=common_dir,
         checkout_path=checkout,
         purpose=f"archive linked checkout: {archive_purpose}",
         retention_until_unix=until,
@@ -1402,7 +1411,7 @@ def _cleanup_plan(
     expected_head: str | None,
     expected_branch: str | None,
 ) -> dict[str, Any]:
-    top_level, _common_dir, record = _worktree_for_path(repo_path, checkout)
+    top_level, common_dir, record = _worktree_for_path(repo_path, checkout)
     status = _require_clean_linked(record)
     if expected_head is not None or expected_branch is not None:
         _require_expected(record, expected_head or str(record.get("head")), expected_branch)
@@ -1427,6 +1436,7 @@ def _cleanup_plan(
     coordination = _linked_checkout_coordination(
         checkout,
         top_level,
+        common_dir,
         owner_id=owner,
         include_processes=True,
         include_tasks=True,
@@ -1437,6 +1447,7 @@ def _cleanup_plan(
         "schema_version": 1,
         "operation": "checkout-cleanup",
         "repo": str(top_level),
+        "git_common_dir": str(common_dir),
         "checkout_path": str(checkout),
         "checkout_key": record["checkout_key"],
         "archive_id": archive["archive_id"],
@@ -1577,7 +1588,7 @@ def grabowski_checkout_cleanup(
     retention_until_unix = _now() + DRY_RUN_TTL_SECONDS
     lease = _acquire_checkout_resources(
         owner_id=owner,
-        repo_path=Path(current_plan["repo"]),
+        repo_common_dir=Path(current_plan["git_common_dir"]),
         checkout_path=checkout,
         purpose="apply linked checkout cleanup",
         retention_until_unix=retention_until_unix,
