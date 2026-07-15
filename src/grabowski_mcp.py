@@ -6,6 +6,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 import base64
+import fcntl
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -120,6 +121,8 @@ MERGES_ROOT = HOME / "repos" / "merges"
 AUDIT_SCHEMA_VERSION = 2
 MAX_AUDIT_BYTES = 16 * 1024 * 1024
 AUDIT_APPEND_LOCK = threading.RLock()
+AUDIT_LOCK_TIMEOUT_SECONDS = 5.0
+AUDIT_LOCK_POLL_SECONDS = 0.02
 BASE_CAPABILITIES = (
     "file_read",
     "file_write",
@@ -2184,8 +2187,141 @@ def _raw_line_hash(line: bytes) -> str:
     return hashlib.sha256(line).hexdigest()
 
 
-def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
-    if not path.exists():
+def _audit_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+    )
+
+
+def _validate_audit_file_contract(
+    opened: os.stat_result,
+    linked: os.stat_result,
+) -> None:
+    if (
+        not statmod.S_ISREG(opened.st_mode)
+        or not statmod.S_ISREG(linked.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.getuid()
+        or opened.st_gid != os.getgid()
+        or opened.st_nlink != 1
+        or statmod.S_IMODE(opened.st_mode) != 0o600
+    ):
+        raise PermissionError("Audit log does not satisfy its file contract")
+    if opened.st_size > MAX_AUDIT_BYTES:
+        raise ValueError("audit-log-too-large")
+
+
+def _read_audit_descriptor(descriptor: int, path: Path) -> bytes:
+    before = os.fstat(descriptor)
+    linked_before = os.stat(path, follow_symlinks=False)
+    _validate_audit_file_contract(before, linked_before)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    after = os.fstat(descriptor)
+    linked_after = os.stat(path, follow_symlinks=False)
+    if (
+        len(data) != before.st_size
+        or _audit_file_identity(before) != _audit_file_identity(after)
+        or _audit_file_identity(before) != _audit_file_identity(linked_after)
+    ):
+        raise RuntimeError("Audit log changed while being read")
+    return data
+
+
+def _audit_parent(path: Path) -> Path:
+    parent = path.parent
+    if parent == STATE_DIR:
+        _state_root()
+    if parent.is_symlink():
+        raise PermissionError("Audit parent directory may not be a symlink")
+    metadata = os.stat(parent, follow_symlinks=False)
+    if (
+        not statmod.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_gid != os.getgid()
+        or statmod.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise PermissionError(
+            "Audit parent directory does not satisfy its file contract"
+        )
+    return parent
+
+
+def _acquire_audit_descriptor_lock(
+    descriptor: int,
+    path: Path,
+    *,
+    exclusive: bool,
+) -> None:
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    deadline = time.monotonic() + AUDIT_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            break
+        except BlockingIOError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Audit lock acquisition timed out") from exc
+            time.sleep(min(AUDIT_LOCK_POLL_SECONDS, remaining))
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(path, follow_symlinks=False)
+        _validate_audit_file_contract(opened, linked)
+    except BaseException:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        raise
+
+
+def _close_audit_descriptor(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _open_audit_read_target(path: Path) -> int | None:
+    _audit_parent(path)
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PermissionError(
+            "Audit log cannot be opened safely for verification"
+        ) from exc
+    try:
+        _acquire_audit_descriptor_lock(
+            descriptor,
+            path,
+            exclusive=False,
+        )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, Any]:
+    if not exists:
         return {
             "valid": True,
             "path": str(path),
@@ -2196,36 +2332,7 @@ def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
             "last_record_sha256": None,
             "error": None,
         }
-    if path.is_symlink():
-        return {
-            "valid": False,
-            "path": str(path),
-            "exists": True,
-            "records": 0,
-            "legacy_records": 0,
-            "v2_records": 0,
-            "last_record_sha256": None,
-            "error": "audit-log-is-symlink",
-        }
-    try:
-        info = path.stat()
-        if not statmod.S_ISREG(info.st_mode):
-            raise ValueError("audit-log-is-not-regular")
-        if info.st_size > MAX_AUDIT_BYTES:
-            raise ValueError("audit-log-too-large")
-        lines = path.read_bytes().splitlines()
-    except (OSError, ValueError) as exc:
-        return {
-            "valid": False,
-            "path": str(path),
-            "exists": True,
-            "records": 0,
-            "legacy_records": 0,
-            "v2_records": 0,
-            "last_record_sha256": None,
-            "error": str(exc),
-        }
-
+    lines = data.splitlines()
     previous: str | None = None
     legacy_records = 0
     v2_records = 0
@@ -2349,49 +2456,183 @@ def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
     }
 
 
+def _verify_audit_descriptor(path: Path, descriptor: int) -> dict[str, Any]:
+    try:
+        data = _read_audit_descriptor(descriptor, path)
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        return {
+            "valid": False,
+            "path": str(path),
+            "exists": True,
+            "records": 0,
+            "legacy_records": 0,
+            "v2_records": 0,
+            "last_record_sha256": None,
+            "error": str(exc),
+        }
+    return _verify_audit_bytes(path, data, exists=True)
+
+
+def _verify_audit_log_unlocked(path: Path = AUDIT_LOG) -> dict[str, Any]:
+    descriptor: int | None = None
+    try:
+        descriptor = _open_audit_read_target(path)
+        if descriptor is None:
+            return _verify_audit_bytes(path, b"", exists=False)
+        return _verify_audit_descriptor(path, descriptor)
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        return {
+            "valid": False,
+            "path": str(path),
+            "exists": path.exists(),
+            "records": 0,
+            "legacy_records": 0,
+            "v2_records": 0,
+            "last_record_sha256": None,
+            "error": str(exc),
+        }
+    finally:
+        if descriptor is not None:
+            _close_audit_descriptor(descriptor)
+
+
+def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
+    return _verify_audit_log_unlocked(path)
+
+
+def _open_audit_append_target(path: Path) -> tuple[int, bool]:
+    parent = _audit_parent(path)
+    flags = (
+        os.O_RDWR
+        | os.O_APPEND
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    created = False
+    try:
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(
+                    path,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                created = True
+            except FileExistsError:
+                descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise PermissionError("Audit log cannot be opened safely for append") from exc
+
+    try:
+        if created:
+            os.fchmod(descriptor, 0o600)
+        _acquire_audit_descriptor_lock(
+            descriptor,
+            path,
+            exclusive=True,
+        )
+        if created:
+            _fsync_directory(parent)
+        return descriptor, created
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _require_audit_descriptor_bound(descriptor: int, path: Path) -> None:
+    opened = os.fstat(descriptor)
+    try:
+        linked = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise PermissionError("Audit log path changed during append") from exc
+    _validate_audit_file_contract(opened, linked)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError("Audit append made no forward progress")
+        remaining = remaining[written:]
+
+
+def _rollback_audit_descriptor(descriptor: int, expected_size: int) -> None:
+    os.ftruncate(descriptor, expected_size)
+    os.fsync(descriptor)
+    if os.fstat(descriptor).st_size != expected_size:
+        raise RuntimeError("Audit append rollback size postflight mismatch")
+
+
 def _append_audit(record: dict[str, Any]) -> None:
     with AUDIT_APPEND_LOCK:
-        _state_root()
         if AUDIT_LOG.is_symlink():
             raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
-        status = _verify_audit_log(AUDIT_LOG)
-        if not status["valid"]:
-            raise RuntimeError(f"Audit log verification failed: {status['error']}")
-
-        enriched = {**record}
-        enriched.setdefault("timestamp", _utc_timestamp())
-        enriched["audit_schema_version"] = AUDIT_SCHEMA_VERSION
-        enriched["sequence"] = int(status["records"]) + 1
-        enriched["previous_record_sha256"] = status["last_record_sha256"]
-        enriched["record_sha256"] = _audit_record_hash(enriched)
-        payload = (
-            json.dumps(enriched, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-            + "\n"
-        )
-        fd = os.open(
-            AUDIT_LOG,
-            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC,
-            0o600,
-        )
+        descriptor, _created = _open_audit_append_target(AUDIT_LOG)
         try:
-            os.write(fd, payload.encode("utf-8"))
-            os.fsync(fd)
+            status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
+            if not status["valid"]:
+                raise RuntimeError(
+                    f"Audit log verification failed: {status['error']}"
+                )
+
+            enriched = {**record}
+            enriched.setdefault("timestamp", _utc_timestamp())
+            enriched["audit_schema_version"] = AUDIT_SCHEMA_VERSION
+            enriched["sequence"] = int(status["records"]) + 1
+            enriched["previous_record_sha256"] = status["last_record_sha256"]
+            enriched["record_sha256"] = _audit_record_hash(enriched)
+            payload = (
+                json.dumps(
+                    enriched,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+            current_size = os.fstat(descriptor).st_size
+            if current_size + len(payload) > MAX_AUDIT_BYTES:
+                raise ValueError("Audit log would exceed its byte limit")
+            _require_audit_descriptor_bound(descriptor, AUDIT_LOG)
+            try:
+                _write_all(descriptor, payload)
+                os.fsync(descriptor)
+                _require_audit_descriptor_bound(descriptor, AUDIT_LOG)
+                appended = os.fstat(descriptor)
+                if appended.st_size != current_size + len(payload):
+                    raise RuntimeError("Audit append size postflight mismatch")
+            except BaseException:
+                try:
+                    _rollback_audit_descriptor(descriptor, current_size)
+                except BaseException as rollback_error:
+                    raise RuntimeError(
+                        "Audit append failed and rollback did not complete"
+                    ) from rollback_error
+                raise
         finally:
-            os.close(fd)
+            _close_audit_descriptor(descriptor)
 
 
 def _audit_records() -> list[dict[str, Any]]:
-    status = _verify_audit_log(AUDIT_LOG)
-    if not status["valid"]:
-        raise RuntimeError(f"Audit log verification failed: {status['error']}")
-    if not AUDIT_LOG.exists():
+    descriptor = _open_audit_read_target(AUDIT_LOG)
+    if descriptor is None:
         return []
-    records = []
-    for line in AUDIT_LOG.read_bytes().splitlines():
-        parsed = json.loads(line.decode("utf-8"))
-        if isinstance(parsed, dict):
-            records.append(parsed)
-    return records
+    try:
+        data = _read_audit_descriptor(descriptor, AUDIT_LOG)
+        status = _verify_audit_bytes(AUDIT_LOG, data, exists=True)
+        if not status["valid"]:
+            raise RuntimeError(f"Audit log verification failed: {status['error']}")
+        records = []
+        for line in data.splitlines():
+            parsed = json.loads(line.decode("utf-8"))
+            if isinstance(parsed, dict):
+                records.append(parsed)
+        return records
+    finally:
+        _close_audit_descriptor(descriptor)
 
 
 def _find_transaction_record(transaction_id: str) -> dict[str, Any]:
