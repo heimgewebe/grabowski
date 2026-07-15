@@ -176,6 +176,20 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertTrue(any("tool_contract" in error for error in errors), errors)
 
+    def test_schema_hash_drift_is_rejected_before_validation(self) -> None:
+        schema = copy.deepcopy(self.schema)
+        schema["title"] = "Unreviewed replacement schema"
+        errors = budget.validate_schema(self.contract, schema)
+        self.assertEqual(
+            errors,
+            ["invalid tool-surface JSON schema: code-bound schema hash drift"],
+        )
+
+    def test_validator_has_no_third_party_runtime_dependency(self) -> None:
+        source = Path(budget.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("from jsonschema", source)
+        self.assertNotIn("import jsonschema", source)
+
     def test_typed_operation_adds_intent_without_public_tool_growth(self) -> None:
         operations_by_name = {
             item["operation"]: item

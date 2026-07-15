@@ -8,7 +8,6 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
-from jsonschema import Draft202012Validator
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "contracts" / "tool-surface-budget.v1.json"
@@ -22,6 +21,9 @@ CONTRACT_ID = "grabowski-tool-surface-budget-v1"
 BASELINE_TOOL_COUNT = 125
 BASELINE_TOOL_NAMES_SHA256 = "a84638ec397aa635aa55546d579f009c237f64ffed39eafe2bff525762f46418"
 BASELINE_TOOL_SEMANTICS_SHA256 = "29683f3dd745a9045bd4410b535abaa533a5ddc8aa7e177b72a60a5952a4e2f1"
+TOOL_SURFACE_SCHEMA_SHA256 = (
+    "44e47b96f6adc2d0015dfdf9fd65db18f05d150c1bf7436297e7d1247121f534"
+)
 ADDITION_KINDS = frozenset(
     {
         "distinct_authority_boundary",
@@ -597,20 +599,202 @@ def validate_contract(
         return {"valid": False, "errors": errors}
 
 
-def validate_schema(contract: Mapping[str, Any], schema: Mapping[str, Any]) -> list[str]:
+def _schema_location(path: tuple[str | int, ...]) -> str:
+    return "/".join(str(item) for item in path) or "<root>"
+
+
+def _schema_value_equal(left: Any, right: Any) -> bool:
     try:
-        Draft202012Validator.check_schema(schema)
-    except Exception as exc:
-        return [f"invalid tool-surface JSON schema: {type(exc).__name__}: {exc}"]
-    validator = Draft202012Validator(schema)
-    errors = sorted(
-        validator.iter_errors(contract),
-        key=lambda error: (list(error.absolute_path), error.message),
-    )
-    return [
-        f"schema:{'/'.join(str(item) for item in error.absolute_path) or '<root>'}: {error.message}"
-        for error in errors
-    ]
+        return _canonical_json(left) == _canonical_json(right)
+    except (TypeError, ValueError):
+        return False
+
+
+def _schema_type_matches(value: Any, expected: str) -> bool:
+    checks = {
+        "array": lambda item: isinstance(item, list),
+        "boolean": lambda item: isinstance(item, bool),
+        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+        "null": lambda item: item is None,
+        "object": lambda item: isinstance(item, dict),
+        "string": lambda item: isinstance(item, str),
+    }
+    check = checks.get(expected)
+    if check is None:
+        raise ToolSurfaceBudgetError(f"unsupported schema type: {expected}")
+    return check(value)
+
+
+def _resolve_schema_reference(
+    schema: Mapping[str, Any], reference: Any
+) -> Mapping[str, Any]:
+    if not isinstance(reference, str) or not reference.startswith("#/$defs/"):
+        raise ToolSurfaceBudgetError("schema reference must target one local definition")
+    name = reference.removeprefix("#/$defs/")
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict) or not isinstance(definitions.get(name), dict):
+        raise ToolSurfaceBudgetError(f"schema reference is unresolved: {reference}")
+    return definitions[name]
+
+
+def _validate_schema_value(
+    value: Any,
+    node: Mapping[str, Any],
+    root_schema: Mapping[str, Any],
+    path: tuple[str | int, ...],
+) -> list[str]:
+    errors: list[str] = []
+    location = _schema_location(path)
+    if "$ref" in node:
+        if set(node) != {"$ref"}:
+            return [f"schema:{location}: referenced node contains sibling keywords"]
+        try:
+            target = _resolve_schema_reference(root_schema, node["$ref"])
+        except ToolSurfaceBudgetError as exc:
+            return [f"schema:{location}: {exc}"]
+        return _validate_schema_value(value, target, root_schema, path)
+
+    if "const" in node and not _schema_value_equal(value, node["const"]):
+        errors.append(f"schema:{location}: value does not match const")
+    enum = node.get("enum")
+    if enum is not None:
+        if not isinstance(enum, list) or not any(
+            _schema_value_equal(value, candidate) for candidate in enum
+        ):
+            errors.append(f"schema:{location}: value is not in enum")
+
+    expected_types = node.get("type")
+    if expected_types is not None:
+        if isinstance(expected_types, str):
+            candidates = [expected_types]
+        elif isinstance(expected_types, list) and all(
+            isinstance(item, str) for item in expected_types
+        ):
+            candidates = expected_types
+        else:
+            return [f"schema:{location}: schema type declaration is invalid"]
+        try:
+            type_matches = any(
+                _schema_type_matches(value, candidate) for candidate in candidates
+            )
+        except ToolSurfaceBudgetError as exc:
+            return [f"schema:{location}: {exc}"]
+        if not type_matches:
+            return [f"schema:{location}: value has wrong type"]
+
+    if isinstance(value, str):
+        minimum = node.get("minLength")
+        maximum = node.get("maxLength")
+        if isinstance(minimum, int) and not isinstance(minimum, bool) and len(value) < minimum:
+            errors.append(f"schema:{location}: string is shorter than minLength")
+        if isinstance(maximum, int) and not isinstance(maximum, bool) and len(value) > maximum:
+            errors.append(f"schema:{location}: string exceeds maxLength")
+        pattern = node.get("pattern")
+        if pattern is not None:
+            try:
+                matches = isinstance(pattern, str) and re.search(pattern, value) is not None
+            except re.error:
+                matches = False
+            if not matches:
+                errors.append(f"schema:{location}: string does not match pattern")
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        minimum = node.get("minimum")
+        if isinstance(minimum, int) and not isinstance(minimum, bool) and value < minimum:
+            errors.append(f"schema:{location}: integer is below minimum")
+
+    if isinstance(value, list):
+        minimum_items = node.get("minItems")
+        if (
+            isinstance(minimum_items, int)
+            and not isinstance(minimum_items, bool)
+            and len(value) < minimum_items
+        ):
+            errors.append(f"schema:{location}: array has fewer than minItems")
+        if node.get("uniqueItems") is True:
+            identities = [_canonical_json(item) for item in value]
+            if len(identities) != len(set(identities)):
+                errors.append(f"schema:{location}: array items are not unique")
+        item_schema = node.get("items")
+        if item_schema is not None:
+            if not isinstance(item_schema, dict):
+                errors.append(f"schema:{location}: items schema is invalid")
+            else:
+                for index, item in enumerate(value):
+                    errors.extend(
+                        _validate_schema_value(
+                            item, item_schema, root_schema, (*path, index)
+                        )
+                    )
+
+    if isinstance(value, dict):
+        required = node.get("required", [])
+        if not isinstance(required, list) or not all(
+            isinstance(item, str) for item in required
+        ):
+            errors.append(f"schema:{location}: required declaration is invalid")
+        else:
+            for key in required:
+                if key not in value:
+                    errors.append(
+                        f"schema:{location}: missing required property: {key}"
+                    )
+        properties = node.get("properties", {})
+        if not isinstance(properties, dict):
+            errors.append(f"schema:{location}: properties declaration is invalid")
+            properties = {}
+        property_names = node.get("propertyNames")
+        if property_names is not None and not isinstance(property_names, dict):
+            errors.append(f"schema:{location}: propertyNames schema is invalid")
+            property_names = None
+        additional = node.get("additionalProperties", True)
+        if (
+            additional is not True
+            and additional is not False
+            and not isinstance(additional, dict)
+        ):
+            errors.append(f"schema:{location}: additionalProperties is invalid")
+            additional = False
+        for key, item in value.items():
+            if not isinstance(key, str):
+                errors.append(f"schema:{location}: object key is not text")
+                continue
+            if property_names is not None:
+                errors.extend(
+                    _validate_schema_value(
+                        key, property_names, root_schema, (*path, key, "<name>")
+                    )
+                )
+            child = properties.get(key)
+            if isinstance(child, dict):
+                errors.extend(
+                    _validate_schema_value(item, child, root_schema, (*path, key))
+                )
+            elif key not in properties:
+                if additional is False:
+                    errors.append(f"schema:{location}: additional property: {key}")
+                elif isinstance(additional, dict):
+                    errors.extend(
+                        _validate_schema_value(
+                            item, additional, root_schema, (*path, key)
+                        )
+                    )
+            elif child is not None:
+                errors.append(f"schema:{location}: property schema for {key} is invalid")
+    return errors
+
+
+def validate_schema(contract: Mapping[str, Any], schema: Mapping[str, Any]) -> list[str]:
+    """Validate this repository-bound schema without third-party dependencies."""
+    if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
+        return ["invalid tool-surface JSON schema dialect"]
+    if schema.get("$id") != (
+        "https://heimgewebe.org/contracts/grabowski-tool-surface-budget-v1.schema.json"
+    ):
+        return ["invalid tool-surface JSON schema identity"]
+    if _sha256(schema) != TOOL_SURFACE_SCHEMA_SHA256:
+        return ["invalid tool-surface JSON schema: code-bound schema hash drift"]
+    return sorted(_validate_schema_value(contract, schema, schema, ()))
 
 
 def validate_repository(root: Path = ROOT) -> dict[str, Any]:
