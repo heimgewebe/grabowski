@@ -738,6 +738,97 @@ def engage_blockade_marker(
         os.close(parent_fd)
 
 
+def rollback_engaged_marker(
+    receipt: EngageReceipt,
+    marker_path: Path | str,
+    *,
+    expected_marker_path: Path | str,
+    expected_uid: int | None = None,
+    max_bytes: int = MAX_MARKER_BYTES,
+) -> dict[str, Any]:
+    """Remove only the exact marker created by one uncommitted engagement."""
+
+    if not isinstance(receipt, EngageReceipt):
+        raise TypeError("receipt must be EngageReceipt")
+    path = _require_exact_runtime_path(
+        marker_path,
+        expected_path=expected_marker_path,
+        label="marker_path",
+    )
+    if receipt.marker_path != str(path):
+        raise BlockadeRecoveryDenied("engage receipt marker path mismatch")
+    uid = _expected_uid(expected_uid)
+    max_bytes = _positive_max_bytes(max_bytes)
+    parent_fd = _open_directory_chain(
+        path.parent,
+        expected_uid=uid,
+        require_private=True,
+        label="marker parent",
+    )
+    marker_name = _safe_component(path.name, label="marker name")
+    unlinked = False
+    try:
+        snapshot = _snapshot_from_open_file(
+            parent_fd,
+            marker_name,
+            path=path,
+            expected_uid=uid,
+            max_bytes=max_bytes,
+        )
+        if (
+            snapshot.file_sha256 != receipt.marker_file_sha256
+            or snapshot.record_sha256 != receipt.record_sha256
+            or snapshot.record != receipt.record
+        ):
+            raise BlockadeRecoveryDenied(
+                "live marker does not match the uncommitted engage receipt"
+            )
+        inode = (snapshot.device, snapshot.inode)
+        if not _unlink_same_inode(parent_fd, marker_name, inode):
+            raise BlockadeRollbackError(
+                "engage rollback could not unlink the exact marker inode"
+            )
+        unlinked = True
+        os.fsync(parent_fd)
+        if not _path_absent_at(parent_fd, marker_name):
+            raise BlockadeRollbackError(
+                "engage rollback marker remains after exact unlink"
+            )
+        _assert_directory_binding(
+            parent_fd,
+            path.parent,
+            expected_uid=uid,
+            require_private=True,
+            label="marker parent",
+        )
+        return {
+            "schema_version": STORE_SCHEMA_VERSION,
+            "operation": "rollback-engage",
+            "transaction_id": receipt.transaction_id,
+            "marker_path": str(path),
+            "removed_marker_file_sha256": receipt.marker_file_sha256,
+            "removed_record_sha256": receipt.record_sha256,
+            "source_absent_readback": True,
+            "does_not_establish": [
+                "audit_append_complete",
+                "future_mutation_authority",
+                "external_environment_stop_clear",
+            ],
+        }
+    except BlockadeRecoveryDenied:
+        raise
+    except BaseException as failure:
+        if unlinked and _path_absent_at(parent_fd, marker_name):
+            raise BlockadeRollbackError(
+                "engage rollback removed the marker but completion could not be fully verified"
+            ) from failure
+        raise BlockadeRollbackError(
+            "engage rollback failed before exact marker absence was verified"
+        ) from failure
+    finally:
+        os.close(parent_fd)
+
+
 def _create_private_transaction_directory(
     root_fd: int,
     root_path: Path,
