@@ -119,6 +119,59 @@ class OperatorObligationTests(unittest.TestCase):
         self.assertFalse(result["records"][0]["response_may_end"])
         self.assertTrue(result["attention_required"])
 
+    def test_default_list_keeps_blocked_and_delegated_work_visible(self) -> None:
+        blocked = self._open_parameters("goo-blocked-work-0002")
+        delegated = self._open_parameters("goo-delegated-work-0003")
+        completed = self._open_parameters("goo-completed-work-0004")
+        for parameters in (blocked, delegated, completed):
+            obligation.open_obligation(parameters)
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-blocked-work-0002",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "foreign-lease",
+                        "detail": "Exact overlap remains active.",
+                        "reference": "lease:owner-17",
+                        "sha256": "3" * 64,
+                    }
+                ],
+                "next_action": "Recheck the lease and open a successor obligation.",
+            }
+        )
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-delegated-work-0003",
+                "outcome": "delegated",
+                "evidence": [],
+                "delegation": self._delegation("running"),
+                "next_action": "Observe the durable job and open a successor obligation.",
+            }
+        )
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-completed-work-0004",
+                "outcome": "completed",
+                "evidence": self._passed_evidence(),
+            }
+        )
+
+        result = obligation.list_obligations()
+        states = {item["obligation_id"]: item["state"] for item in result["records"]}
+
+        self.assertEqual("attention", result["state_filter"])
+        self.assertEqual(
+            {
+                "goo-blocked-work-0002": "blocked",
+                "goo-delegated-work-0003": "delegated",
+            },
+            states,
+        )
+        self.assertTrue(result["attention_required"])
+        self.assertTrue(all(item["continuation_required"] for item in result["records"]))
+
     def test_same_id_cannot_be_rebound_to_different_work(self) -> None:
         obligation.open_obligation(self._open_parameters())
         changed = self._open_parameters()
@@ -243,6 +296,8 @@ class OperatorObligationTests(unittest.TestCase):
 
         self.assertEqual(result["state"], "blocked")
         self.assertTrue(result["response_may_end"])
+        self.assertTrue(result["continuation_required"])
+        self.assertTrue(result["follow_up_required"])
         self.assertFalse(result["work_complete"])
         self.assertIn("does not establish", result["non_claims"][0])
 
@@ -269,6 +324,8 @@ class OperatorObligationTests(unittest.TestCase):
             }
         )
         self.assertEqual(result["state"], "delegated")
+        self.assertTrue(result["continuation_required"])
+        self.assertTrue(result["follow_up_required"])
         self.assertFalse(result["work_complete"])
         self.assertEqual(result["delegation"]["status"], "running")
 
