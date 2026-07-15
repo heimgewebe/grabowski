@@ -666,7 +666,7 @@ class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}
-        self.assertEqual({"branch-publish", "captain-preflight", "captain-run", "mechanic-loop", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "runtime-deploy-check", "scout", "situation", "worktree-ensure", "worktree-orient"}, set(specs))
+        self.assertEqual({"branch-publish", "captain-preflight", "captain-run", "mechanic-loop", "operator-obligation-close", "operator-obligation-list", "operator-obligation-open", "operator-obligation-status", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "runtime-deploy-check", "scout", "situation", "worktree-ensure", "worktree-orient"}, set(specs))
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
@@ -694,7 +694,235 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(by_name["captain-preflight"]["availability"]["available"])
         self.assertFalse(by_name["captain-run"]["availability"]["available"])
         self.assertTrue(by_name["repo-orient"]["availability"]["available"])
+        self.assertTrue(by_name["operator-obligation-list"]["availability"]["available"])
+        self.assertTrue(by_name["operator-obligation-status"]["availability"]["available"])
+        self.assertFalse(by_name["operator-obligation-open"]["availability"]["available"])
+        self.assertFalse(by_name["operator-obligation-close"]["availability"]["available"])
         self.assertIn("does not expose generic shell execution", surface["non_claims"])
+
+    def test_operator_obligation_grips_enforce_response_end_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ",
+            {"GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(Path(tmp) / "obligations")},
+        ):
+            open_result = grips.grip_run(
+                "operator-obligation-open",
+                {
+                    "obligation_id": "goo-grip-contract-0001",
+                    "objective": "Complete an operator change.",
+                    "acceptance": [
+                        {"id": "implemented", "description": "The change exists."},
+                        {"id": "verified", "description": "Tests passed."},
+                    ],
+                    "origin": {"thread_id": "thread-17"},
+                },
+                allow_mutation=True,
+            )
+            list_open = grips.grip_run(
+                "operator-obligation-list",
+                {"thread_id": "thread-17"},
+            )
+            status_open = grips.grip_run(
+                "operator-obligation-status",
+                {"obligation_id": "goo-grip-contract-0001"},
+            )
+            invalid_close = grips.grip_run(
+                "operator-obligation-close",
+                {
+                    "obligation_id": "goo-grip-contract-0001",
+                    "outcome": "completed",
+                    "evidence": [
+                        {
+                            "acceptance_id": "implemented",
+                            "status": "passed",
+                            "source": "git",
+                            "reference": "commit:a",
+                        }
+                    ],
+                },
+                allow_mutation=True,
+            )
+            close_result = grips.grip_run(
+                "operator-obligation-close",
+                {
+                    "obligation_id": "goo-grip-contract-0001",
+                    "outcome": "completed",
+                    "evidence": [
+                        {
+                            "acceptance_id": "implemented",
+                            "status": "passed",
+                            "source": "git",
+                            "reference": "commit:a",
+                            "sha256": "a" * 64,
+                        },
+                        {
+                            "acceptance_id": "verified",
+                            "status": "passed",
+                            "source": "test",
+                            "reference": "unit:test",
+                            "sha256": "b" * 64,
+                        },
+                    ],
+                },
+                allow_mutation=True,
+            )
+
+        self.assertEqual("passed", open_result["receipt"]["status"])
+        self.assertFalse(open_result["output"]["response_may_end"])
+        self.assertEqual("passed", list_open["receipt"]["status"])
+        self.assertEqual(1, list_open["output"]["record_count"])
+        self.assertTrue(list_open["output"]["attention_required"])
+        self.assertEqual("passed", status_open["receipt"]["status"])
+        self.assertTrue(status_open["output"]["continuation_required"])
+        self.assertEqual("blocked", invalid_close["receipt"]["status"])
+        self.assertEqual("passed", close_result["receipt"]["status"])
+        self.assertTrue(close_result["output"]["response_may_end"])
+        self.assertTrue(close_result["output"]["work_complete"])
+
+    def test_operator_delegation_observer_uses_live_job_status(self) -> None:
+        live = {
+            "unit": "grabowski-job-live01",
+            "final_status": "running",
+            "metadata": {
+                "job_id": "live01",
+                "origin_sha256": "a" * 64,
+                "argv_sha256": "b" * 64,
+            },
+        }
+        with patch.object(grips, "_observe_operator_systemd_job", return_value=live):
+            result = grips._operator_delegation_observation(
+                {"kind": "systemd_job", "id": "grabowski-job-live01"}
+            )
+
+        material = {key: value for key, value in result.items() if key != "observation_receipt_sha256"}
+        self.assertEqual("grabowski_job_status", result["observation_tool"])
+        self.assertEqual("running", result["status"])
+        self.assertEqual(grips.sha256_json(material), result["observation_receipt_sha256"])
+
+        terminal = {**live, "final_status": "succeeded"}
+        with patch.object(grips, "_observe_operator_systemd_job", return_value=terminal):
+            with self.assertRaises(grips.GripPreflightError):
+                grips._operator_delegation_observation(
+                    {"kind": "systemd_job", "id": "grabowski-job-live01"}
+                )
+
+    def test_operator_delegation_observer_validates_task_and_workspace(self) -> None:
+        task = {
+            "task_id": "task-live01",
+            "unit": "grabowski-task-live01",
+            "attempt": 1,
+            "state": "running",
+            "argv_sha256": "c" * 64,
+            "updated_at_unix": 1784126804,
+        }
+        with patch.object(grips, "_observe_operator_task", return_value=task):
+            task_result = grips._operator_delegation_observation(
+                {"kind": "grabowski_task", "id": "task-live01"}
+            )
+        self.assertEqual("grabowski_task_status", task_result["observation_tool"])
+
+        workspace = {
+            "workspace_id": "gaw-live-workspace-01",
+            "creation_state": "ready",
+            "expected_base_head": "d" * 40,
+            "closed": False,
+            "writer_terminal_failure": False,
+            "tasks": {
+                "writer": {"task_id": "writer-1", "state": "running", "terminal": False},
+                "tests": {"task_id": None, "state": "not_started", "terminal": False},
+                "review": {"task_id": None, "state": "not_started", "terminal": False},
+            },
+        }
+        with patch.object(
+            grips,
+            "_observe_operator_workspace",
+            return_value=workspace,
+        ):
+            workspace_result = grips._operator_delegation_observation(
+                {"kind": "agent_workspace", "id": "gaw-live-workspace-01"}
+            )
+        self.assertEqual("grabowski_agent_workspace_status", workspace_result["observation_tool"])
+        self.assertEqual("running", workspace_result["status"])
+
+        workspace["tasks"]["writer"]["state"] = "failed"
+        workspace["tasks"]["writer"]["terminal"] = True
+        workspace["writer_terminal_failure"] = True
+        with patch.object(
+            grips,
+            "_observe_operator_workspace",
+            return_value=workspace,
+        ):
+            with self.assertRaises(grips.GripPreflightError):
+                grips._operator_delegation_observation(
+                    {"kind": "agent_workspace", "id": "gaw-live-workspace-01"}
+                )
+
+    def test_delegated_close_is_live_observed_or_remains_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ",
+            {"GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(Path(tmp) / "obligations")},
+        ):
+            for obligation_id in ("goo-delegated-live-0001", "goo-delegated-dead-0002"):
+                grips.grip_run(
+                    "operator-obligation-open",
+                    {
+                        "obligation_id": obligation_id,
+                        "objective": "Continue work durably.",
+                        "acceptance": [{"id": "done", "description": "Work is complete."}],
+                    },
+                    allow_mutation=True,
+                )
+            observation = {
+                "kind": "systemd_job",
+                "id": "grabowski-job-live01",
+                "observation_tool": "grabowski_job_status",
+                "status": "running",
+                "observed_at": "2026-07-15T14:00:00Z",
+                "identity_sha256": "e" * 64,
+            }
+            observed = {
+                **observation,
+                "observation_receipt_sha256": grips.sha256_json(observation),
+            }
+            with patch.object(grips, "_operator_delegation_observation", return_value=observed):
+                delegated = grips.grip_run(
+                    "operator-obligation-close",
+                    {
+                        "obligation_id": "goo-delegated-live-0001",
+                        "outcome": "delegated",
+                        "evidence": [],
+                        "delegation": {"kind": "systemd_job", "id": "grabowski-job-live01"},
+                        "next_action": "Observe the durable job.",
+                    },
+                    allow_mutation=True,
+                )
+            with patch.object(
+                grips,
+                "_operator_delegation_observation",
+                side_effect=grips.GripPreflightError("job is terminal"),
+            ):
+                blocked = grips.grip_run(
+                    "operator-obligation-close",
+                    {
+                        "obligation_id": "goo-delegated-dead-0002",
+                        "outcome": "delegated",
+                        "evidence": [],
+                        "delegation": {"kind": "systemd_job", "id": "grabowski-job-dead02"},
+                        "next_action": "Observe the durable job.",
+                    },
+                    allow_mutation=True,
+                )
+            remaining = grips.grip_run(
+                "operator-obligation-status",
+                {"obligation_id": "goo-delegated-dead-0002"},
+            )
+
+        self.assertEqual("passed", delegated["receipt"]["status"])
+        self.assertEqual("delegated", delegated["output"]["state"])
+        self.assertFalse(delegated["output"]["work_complete"])
+        self.assertEqual("blocked", blocked["receipt"]["status"])
+        self.assertFalse(blocked["output"]["response_may_end"])
+        self.assertEqual("open", remaining["output"]["state"])
 
     def test_grip_run_rejects_unknown_surface_grip(self) -> None:
         result = grips.grip_run("do-everything", {"repo": "."})

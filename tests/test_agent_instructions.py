@@ -99,6 +99,18 @@ class AgentInstructionsTests(unittest.TestCase):
         typed = rules["typed-operation-preference"].lower()
         for phrase in ("typed operations", "terminal", "git", "github"):
             self.assertIn(phrase, typed)
+        obligation = rules["operator-obligation-lifecycle"].lower()
+        for phrase in (
+            "grip_run",
+            "operator-obligation-list",
+            "operator-obligation-open",
+            "operator-obligation-status",
+            "operator-obligation-close",
+            "completed",
+            "explicitly blocked",
+            "durably delegated",
+        ):
+            self.assertIn(phrase, obligation)
         authority = rules["no-authority-escalation"].lower()
         for phrase in ("action", "merge", "deploy", "secret", "retry"):
             self.assertIn(phrase, authority)

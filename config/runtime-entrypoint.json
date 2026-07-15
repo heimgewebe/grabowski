@@ -144,6 +144,10 @@
       "source": "src/grabowski_grips.py"
     },
     {
+      "module": "grabowski_operator_obligation",
+      "source": "src/grabowski_operator_obligation.py"
+    },
+    {
       "module": "grabowski_worktree_ensure",
       "source": "src/grabowski_worktree_ensure.py"
     },
