@@ -562,6 +562,41 @@ class DeployRuntimeTests(unittest.TestCase):
             },
         )
 
+    def test_write_manifest_is_private_and_umask_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            snapshot = self._snapshot()
+            previous_umask = os.umask(0o022)
+            try:
+                self._write_manifest(release, snapshot, runtime)
+            finally:
+                os.umask(previous_umask)
+            manifest = release / deploy_runtime.MANIFEST_NAME
+            self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(manifest.stat().st_nlink, 1)
+            self.assertEqual(
+                json.loads(manifest.read_text(encoding="utf-8"))["repo_head"],
+                snapshot.repo_head,
+            )
+
+    def test_write_manifest_rejects_symlink_target_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runtime = root / "grabowski-mcp"
+            target = root / "target.json"
+            target.write_text("unchanged\n", encoding="utf-8")
+            (release / deploy_runtime.MANIFEST_NAME).symlink_to(target)
+            with self.assertRaisesRegex(
+                deploy_runtime.DeployError, "nicht sicher ersetzbar"
+            ):
+                self._write_manifest(release, self._snapshot(), runtime)
+            self.assertEqual(target.read_text(encoding="utf-8"), "unchanged\n")
+
     def _write_complete_release(
         self,
         release: Path,

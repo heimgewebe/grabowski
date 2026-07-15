@@ -1368,6 +1368,97 @@ def build_release(
         raise
 
 
+def _atomic_write_private_json(path: Path, value: dict[str, Any]) -> None:
+    parent = path.parent
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(parent, directory_flags)
+    except OSError as exc:
+        fail(f"Manifest-Verzeichnis ist nicht sicher verfügbar: {parent}")
+        raise AssertionError from exc
+    temporary_name = f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    descriptor = -1
+    published = False
+    try:
+        parent_info = os.fstat(directory_fd)
+        if (
+            not statmod.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != os.getuid()
+        ):
+            fail("Manifest-Verzeichnis muss ein eigenes reales Verzeichnis sein")
+        try:
+            existing = os.stat(
+                path.name, dir_fd=directory_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+            not statmod.S_ISREG(existing.st_mode)
+            or existing.st_uid != os.getuid()
+            or existing.st_nlink != 1
+        ):
+            fail("Deployment-Manifest-Ziel ist nicht sicher ersetzbar")
+
+        payload = (
+            json.dumps(value, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(
+            temporary_name, flags, 0o600, dir_fd=directory_fd
+        )
+        created = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(created.st_mode)
+            or created.st_uid != os.getuid()
+            or created.st_nlink != 1
+        ):
+            fail("Temporäres Deployment-Manifest ist nicht sicher")
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                fail("Deployment-Manifest konnte nicht vollständig geschrieben werden")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        published = True
+        os.fsync(directory_fd)
+        verified = os.stat(
+            path.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            not statmod.S_ISREG(verified.st_mode)
+            or verified.st_uid != os.getuid()
+            or verified.st_nlink != 1
+            or statmod.S_IMODE(verified.st_mode) != 0o600
+            or verified.st_size != len(payload)
+        ):
+            fail("Deployment-Manifest wurde nicht als private reguläre Datei publiziert")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not published:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
+
+
 def write_manifest(
     release_path: Path,
     *,
@@ -1406,10 +1497,7 @@ def write_manifest(
         **provenance,
     }
     path = release_path / MANIFEST_NAME
-    path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _atomic_write_private_json(path, manifest)
 
 
 def read_manifest(runtime_or_release: Path) -> dict[str, Any]:
