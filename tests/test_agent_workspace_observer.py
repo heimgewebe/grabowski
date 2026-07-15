@@ -468,6 +468,105 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         self.assertTrue(metrics["read_only_projection"])
         self.assertEqual(metrics["source_report_sha256"], ["a" * 64, "b" * 64])
 
+    def _snapshot_report(self, identifier: str, *, activation_reason: str) -> dict:
+        manifest = workspace._manifest(identifier)
+        cohort = observer._cohort_identity(manifest)
+        return {
+            "workspace_id": identifier,
+            "report_sha256": observer._sha256_json({"workspace_id": identifier}),
+            "facts": {
+                "closed": True,
+                "closure_outcome": "successful",
+                "failed_roles": [],
+                "workspace_friction_classes": [],
+                "quality_signal_classes": [],
+                "lifecycle_debt_classes": [],
+                "timing": {},
+                "cohort": cohort,
+                "route_evidence": None,
+                "event_log": {"integrity_valid": True},
+            },
+        }
+
+    def _write_snapshot_manifest(
+        self, identifier: str, runtime_identity: dict | None
+    ) -> None:
+        directory = self.root / identifier
+        directory.mkdir(mode=0o700)
+        manifest = {
+            "schema_version": workspace.SCHEMA_VERSION,
+            "workspace_id": identifier,
+        }
+        if runtime_identity is not None:
+            manifest["runtime_identity"] = runtime_identity
+        workspace._atomic_json(directory / "manifest.json", manifest)
+
+    def test_metrics_snapshot_prioritizes_complete_current_cohort(self) -> None:
+        identity_body = {
+            "schema_version": 1,
+            "runtime_release": "release-current",
+            "runtime_repo_head": "a" * 40,
+        }
+        identity = {
+            **identity_body,
+            "identity_sha256": observer._sha256_json(identity_body),
+        }
+        current = "gaw-snapshot-current-00000001"
+        legacy = "gaw-snapshot-legacy-00000001"
+        self._write_snapshot_manifest(current, identity)
+        self._write_snapshot_manifest(legacy, None)
+        with (
+            mock.patch.object(workspace, "_workspace_runtime_identity", return_value=identity),
+            mock.patch.object(observer, "_observer_report", side_effect=self._snapshot_report),
+        ):
+            snapshot = observer.workspace_metrics_snapshot(limit=1)
+        self.assertEqual(snapshot["selected_workspace_count"], 1)
+        self.assertEqual(snapshot["current_cohort_candidate_count"], 1)
+        self.assertEqual(snapshot["current_cohort_sample_size"], 1)
+        self.assertTrue(snapshot["current_cohort_complete"])
+        self.assertTrue(snapshot["integrity_valid"])
+        self.assertIsNotNone(snapshot["friction_fingerprint_sha256"])
+        self.assertFalse(snapshot["inventory_complete"])
+
+    def test_metrics_snapshot_with_truncated_current_cohort_has_no_fingerprint(self) -> None:
+        identity_body = {
+            "schema_version": 1,
+            "runtime_release": "release-current",
+            "runtime_repo_head": "a" * 40,
+        }
+        identity = {
+            **identity_body,
+            "identity_sha256": observer._sha256_json(identity_body),
+        }
+        self._write_snapshot_manifest("gaw-snapshot-current-00000002", identity)
+        self._write_snapshot_manifest("gaw-snapshot-current-00000003", identity)
+        with (
+            mock.patch.object(workspace, "_workspace_runtime_identity", return_value=identity),
+            mock.patch.object(observer, "_observer_report", side_effect=self._snapshot_report),
+        ):
+            snapshot = observer.workspace_metrics_snapshot(limit=1)
+        self.assertEqual(snapshot["current_cohort_candidate_count"], 2)
+        self.assertEqual(snapshot["current_cohort_sample_size"], 1)
+        self.assertFalse(snapshot["current_cohort_complete"])
+        self.assertFalse(snapshot["integrity_valid"])
+        self.assertIsNone(snapshot["friction_fingerprint_sha256"])
+        self.assertEqual(
+            snapshot["friction_fingerprint_unavailable_reason"],
+            "current_cohort_snapshot_incomplete_or_invalid",
+        )
+
+    def test_timing_metric_names_collection_request_truthfully(self) -> None:
+        events = [
+            {"event_type": "plan_created", "recorded_at": "2026-07-15T10:00:00+00:00"},
+            {
+                "event_type": "collection_requested",
+                "recorded_at": "2026-07-15T10:00:05+00:00",
+            },
+        ]
+        timing = observer._event_timing_metrics(events)
+        self.assertEqual(timing["collection_requested_seconds"], 5.0)
+        self.assertNotIn("writer_observed_terminal_seconds", timing)
+
 
 if __name__ == "__main__":
     unittest.main()

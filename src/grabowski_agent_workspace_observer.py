@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -19,6 +20,7 @@ READ_ONLY = operator.READ_ONLY
 REPORT_SCHEMA_VERSION = 3
 MAX_REPORT_EVENTS = 512
 MAX_OPTIMIZER_WORKSPACES = 50
+MAX_SNAPSHOT_INVENTORY = 500
 SUCCESS_CLASSIFICATIONS = frozenset({
     "already_succeeded",
     "eligible",
@@ -439,7 +441,7 @@ def _event_timing_metrics(events: list[dict[str, Any]]) -> dict[str, float | Non
     collection_end = first.get("collection_completed")
     return {
         "workspace_ready_seconds": elapsed("workspace_ready"),
-        "writer_observed_terminal_seconds": elapsed("collection_requested"),
+        "collection_requested_seconds": elapsed("collection_requested"),
         "collection_complete_seconds": elapsed("collection_completed"),
         "close_complete_seconds": (
             elapsed("workspace_closed")
@@ -540,7 +542,7 @@ def _metrics_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
     cohorts = _cohort_metrics(reports)
     timing_fields = (
         "workspace_ready_seconds",
-        "writer_observed_terminal_seconds",
+        "collection_requested_seconds",
         "collection_complete_seconds",
         "close_complete_seconds",
         "collection_duration_seconds",
@@ -717,20 +719,63 @@ def workspace_metrics_snapshot(limit: int = MAX_OPTIMIZER_WORKSPACES) -> dict[st
             f"limit must be between 1 and {MAX_OPTIMIZER_WORKSPACES}"
         )
     root = workspace.WORKSPACE_ROOT
-    selected: list[str] = []
     inventory_errors: list[dict[str, Any]] = []
+    candidates: list[tuple[int, str]] = []
+    inventory_scan_truncated = False
     if root.exists():
         if root.is_symlink() or not root.is_dir():
             raise WorkspaceObserverError("workspace root must be a real directory")
-        for directory in sorted(root.iterdir(), key=lambda item: item.name):
-            if len(selected) >= limit:
-                break
-            if (
-                directory.is_dir()
-                and not directory.is_symlink()
-                and workspace.WORKSPACE_ID_RE.fullmatch(directory.name) is not None
-            ):
-                selected.append(directory.name)
+
+        def candidate_entries() -> Any:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if workspace.WORKSPACE_ID_RE.fullmatch(entry.name) is None:
+                        continue
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        metadata = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        inventory_errors.append({
+                            "workspace_id": entry.name,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc)[:500],
+                        })
+                        continue
+                    yield metadata.st_mtime_ns, entry.name
+
+        newest = heapq.nlargest(MAX_SNAPSHOT_INVENTORY + 1, candidate_entries())
+        inventory_scan_truncated = len(newest) > MAX_SNAPSHOT_INVENTORY
+        candidates = newest[:MAX_SNAPSHOT_INVENTORY]
+
+    current_identity = workspace._workspace_runtime_identity()
+    current_cohort = _cohort_identity({"runtime_identity": current_identity})
+    ranked: list[dict[str, Any]] = []
+    for mtime_ns, identifier in candidates:
+        try:
+            manifest = workspace._manifest(identifier)
+            cohort = _cohort_identity(manifest)
+        except Exception as exc:
+            inventory_errors.append({
+                "workspace_id": identifier,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:500],
+            })
+            cohort = {"cohort_key": "invalid:unreadable-manifest"}
+        ranked.append({
+            "workspace_id": identifier,
+            "mtime_ns": mtime_ns,
+            "current_cohort": cohort.get("cohort_key") == current_cohort["cohort_key"],
+        })
+    ranked.sort(
+        key=lambda item: (
+            0 if item["current_cohort"] else 1,
+            -int(item["mtime_ns"]),
+            str(item["workspace_id"]),
+        )
+    )
+    selected_rows = ranked[:limit]
+    selected = [str(item["workspace_id"]) for item in selected_rows]
     reports: list[dict[str, Any]] = []
     for identifier in selected:
         try:
@@ -747,8 +792,6 @@ def workspace_metrics_snapshot(limit: int = MAX_OPTIMIZER_WORKSPACES) -> dict[st
                 "error": str(exc)[:500],
             })
     metrics = _metrics_summary(reports)
-    current_identity = workspace._workspace_runtime_identity()
-    current_cohort = _cohort_identity({"runtime_identity": current_identity})
     current_reports = [
         report
         for report in reports
@@ -756,6 +799,20 @@ def workspace_metrics_snapshot(limit: int = MAX_OPTIMIZER_WORKSPACES) -> dict[st
         == current_cohort["cohort_key"]
     ]
     current_metrics = _metrics_summary(current_reports)
+    current_candidate_count = sum(item["current_cohort"] is True for item in ranked)
+    current_selected_count = sum(item["current_cohort"] is True for item in selected_rows)
+    current_cohort_complete = bool(
+        not inventory_scan_truncated
+        and not inventory_errors
+        and current_candidate_count == current_selected_count
+    )
+    current_reports_integrity_valid = all(
+        report["facts"].get("event_log", {}).get("integrity_valid") is True
+        for report in current_reports
+    )
+    snapshot_integrity_valid = bool(
+        current_cohort_complete and current_reports_integrity_valid
+    )
     current_source_hashes = [report["report_sha256"] for report in current_reports]
     fingerprint_body = {
         "schema_version": 1,
@@ -764,7 +821,11 @@ def workspace_metrics_snapshot(limit: int = MAX_OPTIMIZER_WORKSPACES) -> dict[st
         "source_report_sha256": current_source_hashes,
         "metrics_sha256": current_metrics["metrics_sha256"],
     }
-    fingerprint = _sha256_json(fingerprint_body) if current_reports else None
+    fingerprint = (
+        _sha256_json(fingerprint_body)
+        if current_reports and snapshot_integrity_valid
+        else None
+    )
     route_records = [
         {
             "workspace_id": report["workspace_id"],
@@ -779,30 +840,45 @@ def workspace_metrics_snapshot(limit: int = MAX_OPTIMIZER_WORKSPACES) -> dict[st
         }
         for report in current_reports
     ]
+    if fingerprint is not None:
+        unavailable_reason = None
+    elif not current_reports:
+        unavailable_reason = "no_current_runtime_cohort_workspaces"
+    else:
+        unavailable_reason = "current_cohort_snapshot_incomplete_or_invalid"
     body = {
         "schema_version": 1,
         "report_kind": "workspace_metrics_snapshot",
         "workspace_limit": limit,
+        "inventory_scan_limit": MAX_SNAPSHOT_INVENTORY,
+        "inventory_candidate_count": len(ranked),
+        "inventory_scan_truncated": inventory_scan_truncated,
         "selected_workspace_count": len(selected),
         "observed_workspace_count": len(reports),
         "inventory_errors": inventory_errors,
-        "inventory_complete": not inventory_errors and len(selected) < limit,
+        "inventory_complete": bool(
+            not inventory_errors
+            and not inventory_scan_truncated
+            and len(ranked) <= limit
+        ),
+        "selection_strategy": "current_cohort_first_then_newest_mtime",
         "current_cohort": current_cohort,
+        "current_cohort_candidate_count": current_candidate_count,
         "current_cohort_sample_size": len(current_reports),
+        "current_cohort_complete": current_cohort_complete,
         "current_cohort_metrics": current_metrics,
         "all_cohort_metrics": metrics,
         "route_records": route_records,
         "friction_fingerprint_sha256": fingerprint,
-        "friction_fingerprint_unavailable_reason": (
-            None if fingerprint is not None else "no_current_runtime_cohort_workspaces"
-        ),
-        "integrity_valid": not inventory_errors,
+        "friction_fingerprint_unavailable_reason": unavailable_reason,
+        "integrity_valid": snapshot_integrity_valid,
         "read_only_projection": True,
         "execution_authorized": False,
         "automatic_live_routing_enabled": False,
         "does_not_establish": [
             "causality",
             "route_superiority",
+            "global_workspace_population",
             "live_routing_promotion",
             "automatic_change_authority",
         ],

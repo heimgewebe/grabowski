@@ -310,6 +310,52 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertFalse(calibrated["shadow_calibration"]["applied_to_live_route"])
         self.assertFalse(calibrated["shadow_calibration"]["execution_authorized"])
 
+    def test_route_shadow_calibration_counts_only_usable_route_records(self) -> None:
+        import grabowski_agent_workspace_observer as workspace_observer
+
+        self.patchers.pop().stop()
+        records = []
+        for index in range(5):
+            route_evidence = {
+                "input_facts": {
+                    "task_kind": "code",
+                    "novelty": "medium",
+                    "risk_flags": [],
+                },
+            }
+            if index < 4:
+                route_evidence["actual_route"] = (
+                    "full_workspace" if index < 2 else "workspace_with_contrast"
+                )
+            records.append({
+                "route_evidence": route_evidence,
+                "closed": True,
+                "closure_outcome": "successful",
+                "workspace_friction_classes": [],
+                "quality_signal_classes": [],
+                "timing": {"close_complete_seconds": float(index + 1)},
+                "report_sha256": f"{index + 1:064x}",
+            })
+        snapshot = {
+            "integrity_valid": True,
+            "snapshot_sha256": "a" * 64,
+            "current_cohort": {"cohort_key": "release:test"},
+            "friction_fingerprint_sha256": "b" * 64,
+            "route_records": records,
+        }
+        with mock.patch.object(
+            workspace_observer, "workspace_metrics_snapshot", return_value=snapshot
+        ):
+            result = competition._workspace_route_shadow_calibration(
+                {"task_kind": "code", "novelty": "medium", "risk_flags": []},
+                "full_workspace",
+            )
+        self.assertEqual(result["comparable_workspace_count"], 4)
+        self.assertEqual(result["discarded_record_count"], 1)
+        self.assertEqual(len(result["route_summaries"]), 2)
+        self.assertFalse(result["eligible"])
+        self.assertFalse(result["applied_to_live_route"])
+
     def test_route_rejects_coercive_bools_and_unknown_agents(self) -> None:
         with self.assertRaisesRegex(competition.AgentCompetitionError, "must be boolean"):
             competition.grabowski_agent_execution_route("code", 1, 1, "low", connector_instability="false")  # type: ignore[arg-type]

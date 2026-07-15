@@ -145,13 +145,31 @@ def _sha256_json(value: Any) -> str:
 
 
 def _source_file_sha256(path: Path) -> str | None:
+    descriptor = -1
     try:
         metadata = path.lstat()
         if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             return None
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+        ):
+            return None
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
     except OSError:
         return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _workspace_runtime_identity() -> dict[str, Any]:
@@ -619,11 +637,10 @@ def _role_preflight_environment(
         environment_paths.append(identity)
         root = Path(str(identity["path"]))
         pyvenv = root / "pyvenv.cfg"
-        if pyvenv.is_file():
-            environment_paths.append({
-                "path": str(pyvenv.resolve(strict=True)),
-                "sha256": hashlib.sha256(pyvenv.read_bytes()).hexdigest(),
-            })
+        pyvenv_identity = _preflight_stat_identity(pyvenv)
+        pyvenv_sha256 = _source_file_sha256(pyvenv)
+        if pyvenv_identity is not None and pyvenv_sha256 is not None:
+            environment_paths.append({**pyvenv_identity, "sha256": pyvenv_sha256})
         for site_packages in sorted(root.glob("lib/python*/site-packages")):
             site_identity = _preflight_stat_identity(site_packages)
             if site_identity is not None and site_identity["path"] not in seen:
@@ -2384,6 +2401,44 @@ def _collection_integrity_status(
     return result
 
 
+def _legacy_absence_receipt_valid(
+    manifest: dict[str, Any],
+    legacy: Any,
+    *,
+    expected_plan_sha256: str | None = None,
+) -> bool:
+    if not isinstance(legacy, dict) or not _receipt_integrity(legacy):
+        return False
+    source_plan_sha256 = legacy.get("source_plan_sha256")
+    if not isinstance(source_plan_sha256, str) or SHA256_RE.fullmatch(source_plan_sha256) is None:
+        return False
+    if expected_plan_sha256 is not None and source_plan_sha256 != expected_plan_sha256:
+        return False
+    required_hashes = ("liveness_sha256", "workspace_reference_inventory_sha256")
+    if any(
+        not isinstance(legacy.get(field), str)
+        or SHA256_RE.fullmatch(str(legacy.get(field))) is None
+        for field in required_hashes
+    ):
+        return False
+    return bool(
+        legacy.get("schema_version") == 1
+        and legacy.get("workspace_id") == manifest.get("workspace_id")
+        and legacy.get("repository") == manifest.get("repository")
+        and legacy.get("writer_worktree") == manifest.get("writer_worktree")
+        and legacy.get("writer_branch") == manifest.get("writer_branch")
+        and legacy.get("workspace_created_at") == manifest.get("created_at")
+        and legacy.get("observed_worktree_absent") is True
+        and legacy.get("task_mutation_performed") is False
+        and legacy.get("resource_mutation_performed") is False
+        and legacy.get("tmux_mutation_performed") is False
+        and legacy.get("worktree_mutation_performed") is False
+        and legacy.get("historical_evidence_preserved") is True
+        and isinstance(legacy.get("recorded_at"), str)
+        and bool(legacy.get("recorded_at"))
+    )
+
+
 def _legacy_absence_receipt_status(
     manifest: dict[str, Any], close_receipt: dict[str, Any]
 ) -> dict[str, Any]:
@@ -2411,11 +2466,7 @@ def _legacy_absence_receipt_status(
         and observed == close_receipt.get("legacy_absence_receipt_sha256")
     )
     result["valid"] = bool(
-        _receipt_integrity(legacy)
-        and legacy.get("workspace_id") == manifest.get("workspace_id")
-        and legacy.get("writer_worktree") == manifest.get("writer_worktree")
-        and legacy.get("writer_branch") == manifest.get("writer_branch")
-        and legacy.get("observed_worktree_absent") is True
+        _legacy_absence_receipt_valid(manifest, legacy)
         and result["matches_close_receipt"]
     )
     return result
@@ -5717,13 +5768,10 @@ def _load_or_create_legacy_absence_receipt(
     path = _workspace_dir(str(manifest["workspace_id"])) / "legacy-absence-receipt.json"
     if path.exists():
         existing = _load_json(path)
-        if (
-            _receipt_integrity(existing)
-            and existing.get("workspace_id") == manifest.get("workspace_id")
-            and existing.get("source_plan_sha256") == plan.get("plan_sha256")
-            and existing.get("writer_worktree") == manifest.get("writer_worktree")
-            and existing.get("writer_branch") == manifest.get("writer_branch")
-            and existing.get("observed_worktree_absent") is True
+        if _legacy_absence_receipt_valid(
+            manifest,
+            existing,
+            expected_plan_sha256=plan.get("plan_sha256"),
         ):
             return existing
         raise AgentWorkspaceError(

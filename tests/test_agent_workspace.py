@@ -5353,6 +5353,52 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
         self.assertIsNone(result)
 
+    def test_legacy_absence_receipt_requires_full_no_mutation_contract(self) -> None:
+        manifest = {
+            "workspace_id": "gaw-legacy-receipt-contract-00000001",
+            "repository": "/repo",
+            "writer_worktree": "/repo-worktree",
+            "writer_branch": "legacy-branch",
+            "created_at": "2026-07-15T10:00:00+00:00",
+        }
+        body = {
+            "schema_version": 1,
+            "workspace_id": manifest["workspace_id"],
+            "source_plan_sha256": "a" * 64,
+            "repository": manifest["repository"],
+            "writer_worktree": manifest["writer_worktree"],
+            "writer_branch": manifest["writer_branch"],
+            "workspace_created_at": manifest["created_at"],
+            "observed_worktree_absent": True,
+            "liveness_sha256": "b" * 64,
+            "workspace_reference_inventory_sha256": "c" * 64,
+            "task_mutation_performed": False,
+            "resource_mutation_performed": False,
+            "tmux_mutation_performed": False,
+            "worktree_mutation_performed": False,
+            "historical_evidence_preserved": True,
+            "recorded_at": "2026-07-15T10:01:00+00:00",
+        }
+        receipt = {**body, "receipt_sha256": workspace._sha256_json(body)}
+        self.assertTrue(
+            workspace._legacy_absence_receipt_valid(
+                manifest, receipt, expected_plan_sha256="a" * 64
+            )
+        )
+        mutated_body = {**body, "task_mutation_performed": True}
+        mutated = {
+            **mutated_body,
+            "receipt_sha256": workspace._sha256_json(mutated_body),
+        }
+        self.assertFalse(workspace._legacy_absence_receipt_valid(manifest, mutated))
+        incomplete_body = dict(body)
+        incomplete_body.pop("liveness_sha256")
+        incomplete = {
+            **incomplete_body,
+            "receipt_sha256": workspace._sha256_json(incomplete_body),
+        }
+        self.assertFalse(workspace._legacy_absence_receipt_valid(manifest, incomplete))
+
 
 if __name__ == "__main__":
     unittest.main()

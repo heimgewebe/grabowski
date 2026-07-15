@@ -163,10 +163,13 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
         candidate.get("circuit_breaker_open") is True
         for candidate in governor.get("candidates", [])
     )
-    friction_fingerprint = (
-        friction.get("fingerprint_sha256")
-        or workspace_metrics.get("friction_fingerprint_sha256")
+    workspace_metrics_integrity_valid = workspace_metrics.get("integrity_valid") is True
+    workspace_fingerprint = (
+        workspace_metrics.get("friction_fingerprint_sha256")
+        if workspace_metrics_integrity_valid
+        else None
     )
+    friction_fingerprint = friction.get("fingerprint_sha256") or workspace_fingerprint
 
     capsule = {
         "schema_version": 1,
@@ -216,17 +219,17 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
             "integrity_valid": integrity_valid,
             "friction_fingerprint_sha256": friction_fingerprint,
             "generic_friction_fingerprint_sha256": friction.get("fingerprint_sha256"),
-            "workspace_friction_fingerprint_sha256": workspace_metrics.get(
-                "friction_fingerprint_sha256"
-            ),
+            "workspace_friction_fingerprint_sha256": workspace_fingerprint,
             "workspace_metrics_snapshot_sha256": workspace_metrics.get("snapshot_sha256"),
-            "workspace_metrics_integrity_valid": workspace_metrics.get("integrity_valid") is True,
+            "workspace_metrics_integrity_valid": workspace_metrics_integrity_valid,
             "workspace_current_cohort": workspace_metrics.get("current_cohort"),
             "workspace_current_cohort_sample_size": workspace_metrics.get(
                 "current_cohort_sample_size", 0
             ),
-            "workspace_fingerprint_unavailable_reason": workspace_metrics.get(
-                "friction_fingerprint_unavailable_reason"
+            "workspace_fingerprint_unavailable_reason": (
+                workspace_metrics.get("friction_fingerprint_unavailable_reason")
+                if workspace_metrics_integrity_valid
+                else "workspace_metrics_integrity_invalid"
             ),
             "governor_summary_sha256": governor.get("summary_sha256"),
             "minimum_evidence": governor.get("minimum_evidence"),

@@ -1367,28 +1367,49 @@ def _workspace_route_shadow_calibration(
             "applied_to_live_route": False,
             "execution_authorized": False,
         }
-    comparable: list[dict[str, Any]] = []
+
+    def median(values: list[float]) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2
+
+    comparable: list[tuple[dict[str, Any], str]] = []
+    discarded_record_count = 0
     for record in snapshot.get("route_records", []):
         if not isinstance(record, dict):
+            discarded_record_count += 1
             continue
         route = record.get("route_evidence")
         if not isinstance(route, dict):
+            discarded_record_count += 1
             continue
+        actual_route = route.get("actual_route")
         prior = route.get("input_facts")
+        if not isinstance(actual_route, str) or not actual_route:
+            discarded_record_count += 1
+            continue
         if not isinstance(prior, dict):
+            discarded_record_count += 1
+            continue
+        prior_risk_flags = prior.get("risk_flags")
+        if (
+            not isinstance(prior_risk_flags, list)
+            or any(not isinstance(item, str) for item in prior_risk_flags)
+        ):
+            discarded_record_count += 1
             continue
         if (
             prior.get("task_kind") == input_facts["task_kind"]
             and prior.get("novelty") == input_facts["novelty"]
-            and sorted(prior.get("risk_flags", [])) == input_facts["risk_flags"]
+            and sorted(prior_risk_flags) == input_facts["risk_flags"]
         ):
-            comparable.append(record)
+            comparable.append((record, actual_route))
     routes: dict[str, dict[str, Any]] = {}
-    for record in comparable:
-        route_evidence = record["route_evidence"]
-        actual_route = route_evidence.get("actual_route")
-        if not isinstance(actual_route, str):
-            continue
+    for record, actual_route in comparable:
         aggregate = routes.setdefault(
             actual_route,
             {
@@ -1411,10 +1432,13 @@ def _workspace_route_shadow_calibration(
         aggregate["quality_signal_workspace_count"] += bool(
             record.get("quality_signal_classes")
         )
-        close_seconds = record.get("timing", {}).get("close_complete_seconds")
+        timing = record.get("timing")
+        close_seconds = timing.get("close_complete_seconds") if isinstance(timing, dict) else None
         if isinstance(close_seconds, (int, float)) and not isinstance(close_seconds, bool):
             aggregate["close_seconds"].append(float(close_seconds))
-        aggregate["source_report_sha256"].append(record.get("report_sha256"))
+        report_sha256 = record.get("report_sha256")
+        if isinstance(report_sha256, str):
+            aggregate["source_report_sha256"].append(report_sha256)
     route_summaries: list[dict[str, Any]] = []
     for route, aggregate in sorted(routes.items()):
         closed = aggregate.pop("closed_count")
@@ -1426,16 +1450,19 @@ def _workspace_route_shadow_calibration(
             "successful_close_count": success,
             "completion_ratio": closed / aggregate["workspace_count"],
             "closed_success_ratio": success / closed if closed else None,
-            "median_close_seconds": observer._median(close_values),
+            "median_close_seconds": median(close_values),
         })
     minimum_evidence = 5
+    integrity_valid = snapshot.get("integrity_valid") is True
     body = {
         "schema_version": 1,
         "mode": "shadow_only",
-        "integrity_valid": snapshot.get("integrity_valid") is True,
+        "integrity_valid": integrity_valid,
         "snapshot_sha256": snapshot.get("snapshot_sha256"),
         "cohort": snapshot.get("current_cohort"),
-        "friction_fingerprint_sha256": snapshot.get("friction_fingerprint_sha256"),
+        "friction_fingerprint_sha256": (
+            snapshot.get("friction_fingerprint_sha256") if integrity_valid else None
+        ),
         "comparison_key": {
             "task_kind": input_facts["task_kind"],
             "novelty": input_facts["novelty"],
@@ -1443,9 +1470,10 @@ def _workspace_route_shadow_calibration(
         },
         "recommended_mode": recommended_mode,
         "comparable_workspace_count": len(comparable),
+        "discarded_record_count": discarded_record_count,
         "minimum_evidence": minimum_evidence,
         "eligible": bool(
-            snapshot.get("integrity_valid") is True
+            integrity_valid
             and len(comparable) >= minimum_evidence
             and len(route_summaries) >= 2
         ),
