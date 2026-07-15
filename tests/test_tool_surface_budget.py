@@ -49,8 +49,8 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         report = budget.validate_repository()
         self.assertTrue(report["valid"], report)
         self.assertTrue(report["schema_valid"])
-        self.assertEqual(report["baseline_tool_count"], 122)
-        self.assertEqual(report["current_tool_count"], 122)
+        self.assertEqual(report["baseline_tool_count"], 125)
+        self.assertEqual(report["current_tool_count"], 125)
         self.assertEqual(report["growth"], 0)
         self.assertEqual(report["operation_count"], 3)
 
@@ -131,7 +131,7 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
 
     def test_arbitrary_fixed_cap_is_rejected(self) -> None:
         contract = copy.deepcopy(self.contract)
-        contract["policy"]["fixed_tool_cap"] = 122
+        contract["policy"]["fixed_tool_cap"] = 125
         report = self._validate(contract)
         self.assertFalse(report["valid"])
         self.assertIn("fixed_tool_cap", report["errors"][0])

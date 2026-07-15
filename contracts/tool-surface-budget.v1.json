@@ -8,9 +8,9 @@
     "operation_metadata": "contracts/operation-catalog.v1.json"
   },
   "baseline": {
-    "tool_count": 122,
-    "tool_names_sha256": "a6f1330b4dd1fbdfa57ff2ee1489fdf4f15df53c5b7822a3a746938e6540333b",
-    "tool_semantics_sha256": "87bc1c80e20c9cf2e2b7370ee20cae9941e4154b5157af6da485e61296a7370d",
+    "tool_count": 125,
+    "tool_names_sha256": "a84638ec397aa635aa55546d579f009c237f64ffed39eafe2bff525762f46418",
+    "tool_semantics_sha256": "29683f3dd745a9045bd4410b535abaa533a5ddc8aa7e177b72a60a5952a4e2f1",
     "tools": [
       {
         "tool": "grabowski_agent_bootstrap",
@@ -65,6 +65,29 @@
       },
       {
         "tool": "grabowski_agent_workspace_attach",
+        "category": "agent-workspace",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_agent_workspace_cleanup",
+        "category": "agent-workspace",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "checkout-archive",
+          "receipt-create",
+          "recovery-ref-create",
+          "worktree-remove"
+        ],
+        "reversibility": "restore-from-checkout-archive"
+      },
+      {
+        "tool": "grabowski_agent_workspace_cleanup_plan",
         "category": "agent-workspace",
         "authority_class": "read",
         "risk_class": "low",
@@ -135,6 +158,19 @@
           "task-state-refresh"
         ],
         "reversibility": "not-applicable"
+      },
+      {
+        "tool": "grabowski_agent_workspace_reconcile_stale",
+        "category": "agent-workspace",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "audit-append",
+          "receipt-create",
+          "workspace-event-append"
+        ],
+        "reversibility": "historical-evidence-retained"
       },
       {
         "tool": "grabowski_agent_workspace_role_retry",
