@@ -50,6 +50,8 @@ DRY_RUN_TTL_SECONDS = 15 * 60
 OPERATION_LEASE_TTL_SECONDS = 10 * 60
 MAX_RETENTION_SECONDS = 365 * 24 * 60 * 60
 CHECKOUT_CLEANUP_GRACE_SECONDS = 24 * 60 * 60
+CLEANUP_PLAN_SCHEMA_VERSION = 2
+CLEANUP_PLAN_HASH_EXCLUDED_FIELDS = ("archive_age_seconds",)
 MAX_ACTIVE_CHECKOUTS_PER_REPO = 8
 MAX_COMPLETED_RETAINED_CHECKOUTS_PER_REPO = 4
 LIFECYCLE_PHASES = frozenset({"active", "completed_retained", "archived"})
@@ -1866,6 +1868,22 @@ def grabowski_checkout_archive(
     result["lease_release"] = lease_release
     return result
 
+
+def _cleanup_plan_sha256(body: dict[str, Any]) -> str:
+    excluded = body.get("plan_hash_excludes")
+    expected_excluded = list(CLEANUP_PLAN_HASH_EXCLUDED_FIELDS)
+    if excluded != expected_excluded:
+        raise RuntimeError("Checkout cleanup plan hash exclusions are invalid")
+    if any(field not in body for field in CLEANUP_PLAN_HASH_EXCLUDED_FIELDS):
+        raise RuntimeError("Checkout cleanup plan is missing an excluded observation field")
+    authorization_material = {
+        key: value
+        for key, value in body.items()
+        if key not in CLEANUP_PLAN_HASH_EXCLUDED_FIELDS
+    }
+    return _sha256_json(authorization_material)
+
+
 def _cleanup_plan(
     *,
     repo_path: Path,
@@ -1889,7 +1907,8 @@ def _cleanup_plan(
     if archive["head"] != record.get("head") or archive["branch"] != record.get("branch"):
         raise RuntimeError("Checkout no longer matches its archived recovery refs")
     now = _now()
-    archive_age_seconds = max(0, now - int(archive["created_at_unix"]))
+    archive_created_at_unix = int(archive["created_at_unix"])
+    archive_age_seconds = max(0, now - archive_created_at_unix)
     if archive_age_seconds < CHECKOUT_CLEANUP_GRACE_SECONDS:
         raise RuntimeError(
             "Checkout cleanup grace has not elapsed: "
@@ -1914,7 +1933,7 @@ def _cleanup_plan(
     )
     command = ["git", "-C", str(top_level), "worktree", "remove", str(checkout)]
     body = {
-        "schema_version": 1,
+        "schema_version": CLEANUP_PLAN_SCHEMA_VERSION,
         "operation": "checkout-cleanup",
         "repo": str(top_level),
         "git_common_dir": str(common_dir),
@@ -1927,8 +1946,10 @@ def _cleanup_plan(
         "status": status,
         "retention": retention,
         "retention_active": retention_active,
+        "archive_created_at_unix": archive_created_at_unix,
         "archive_age_seconds": archive_age_seconds,
         "archive_grace_seconds": CHECKOUT_CLEANUP_GRACE_SECONDS,
+        "plan_hash_excludes": list(CLEANUP_PLAN_HASH_EXCLUDED_FIELDS),
         "recovery_refs": verified_refs,
         "coordination": coordination,
         "command": command,
@@ -1939,7 +1960,7 @@ def _cleanup_plan(
             "branch_preserved": archive["branch"] is not None,
         },
     }
-    return {**body, "plan_sha256": _sha256_json(body)}
+    return {**body, "plan_sha256": _cleanup_plan_sha256(body)}
 
 
 def _persist_dry_run(plan: dict[str, Any]) -> dict[str, Any]:

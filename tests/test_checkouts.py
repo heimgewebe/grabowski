@@ -508,6 +508,135 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertNotIn("--force", applied["result"]["argv"])
 
+    def test_cleanup_plan_remains_valid_when_only_archive_age_advances(self) -> None:
+        archive = self._archive()["archive"]
+        assert isinstance(archive, dict)
+        base = (
+            int(archive["created_at_unix"])
+            + checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
+            + 100
+        )
+        current_time = [base]
+
+        with patch.object(checkouts, "_now", side_effect=lambda: current_time[0]):
+            dry_run = checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=True,
+                archive_id=archive["archive_id"],
+                expected_head=self.head,
+                expected_branch="topic",
+            )
+            current_time[0] = base + 1
+            applied = checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=False,
+                plan_id=dry_run["dry_run_record"]["plan_id"],
+                expected_plan_sha256=dry_run["plan"]["plan_sha256"],
+                confirmation="remove-linked-checkout",
+            )
+
+        self.assertEqual(dry_run["plan"]["schema_version"], 2)
+        self.assertEqual(
+            dry_run["plan"]["archive_created_at_unix"],
+            archive["created_at_unix"],
+        )
+        self.assertEqual(
+            dry_run["plan"]["plan_hash_excludes"],
+            ["archive_age_seconds"],
+        )
+        self.assertEqual(dry_run["plan"]["archive_age_seconds"], 86_500)
+        self.assertEqual(applied["plan"]["archive_age_seconds"], 86_501)
+        self.assertEqual(
+            dry_run["plan"]["plan_sha256"],
+            applied["plan"]["plan_sha256"],
+        )
+        self.assertFalse(self.checkout.exists())
+
+    def test_schema_one_cleanup_dry_run_is_intentionally_stale(self) -> None:
+        archive = self._archive()["archive"]
+        assert isinstance(archive, dict)
+        dry_run = checkouts.grabowski_checkout_cleanup(
+            str(self.repo),
+            str(self.checkout),
+            "owner-a",
+            dry_run=True,
+            archive_id=archive["archive_id"],
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        legacy_plan = dict(dry_run["plan"])
+        legacy_plan.pop("plan_sha256")
+        legacy_plan.pop("archive_created_at_unix")
+        legacy_plan.pop("plan_hash_excludes")
+        legacy_plan["schema_version"] = 1
+        legacy_hash = checkouts._sha256_json(legacy_plan)
+        plan_id = dry_run["dry_run_record"]["plan_id"]
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE dry_runs SET plan_sha256=?, plan_json=? WHERE plan_id=?",
+                (legacy_hash, checkouts._canonical_json(legacy_plan), plan_id),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "dry-run is stale"):
+            checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=False,
+                plan_id=plan_id,
+                expected_plan_sha256=legacy_hash,
+                confirmation="remove-linked-checkout",
+            )
+
+        self.assertTrue(self.checkout.exists())
+
+    def test_cleanup_plan_still_rejects_new_coordination_blocker(self) -> None:
+        archive = self._archive()["archive"]
+        assert isinstance(archive, dict)
+        clear = checkouts._coordination_result([], [], [])
+        blocked = checkouts._coordination_result(
+            [
+                {
+                    "resource_key": f"path:{self.checkout}",
+                    "owner_id": "foreign-owner",
+                    "blocking": True,
+                }
+            ],
+            [],
+            [],
+        )
+        with patch.object(
+            checkouts,
+            "_linked_checkout_coordination",
+            side_effect=[clear, blocked],
+        ):
+            dry_run = checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=True,
+                archive_id=archive["archive_id"],
+                expected_head=self.head,
+                expected_branch="topic",
+            )
+            with self.assertRaisesRegex(RuntimeError, "dry-run is stale"):
+                checkouts.grabowski_checkout_cleanup(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    dry_run=False,
+                    plan_id=dry_run["dry_run_record"]["plan_id"],
+                    expected_plan_sha256=dry_run["plan"]["plan_sha256"],
+                    confirmation="remove-linked-checkout",
+                )
+
+        self.assertTrue(self.checkout.exists())
+
     def test_running_task_blocks_cleanup_apply(self) -> None:
         archive = self._archive()["archive"]
         with checkouts.tasks._database() as connection:

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Stabilized checkout-cleanup dry-run authorization across clock progress by binding the immutable archive creation time while excluding only the explicitly declared observational `archive_age_seconds` field from the schema-2 plan hash; real checkout, recovery, retention, and coordination drift remains fail-closed.
 - Hardened operator-obligation attention projection with fail-closed status invariants, explicit mixed open/blocked/delegated coverage, and a documented deprecated `follow_up_required` compatibility alias while preserving explicit `state="open"` behavior.
 - Added a durable operator-obligation lifecycle with bounded discovery, create-only hash-bound open and terminal records, and close-time live observation for delegated Grabowski tasks, agent workspaces, and systemd jobs. Nontrivial work remains explicitly open with `response_may_end=false` until every acceptance criterion is evidenced as passed, a concrete blocker is recorded, or live durable work is receipt-bound.
 - Published deployment manifests atomically as owner-only regular files so workspace runtime cohorts retain exact release and repository identities under any process umask.

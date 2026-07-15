@@ -36,6 +36,8 @@ Cleanup is two-stage:
 
 A fresh archive is reported as `archived_grace`, not as a cleanup candidate. The 24-hour rule is enforced both in inventory projection and in the cleanup planner, so direct callers and recovery paths cannot bypass it.
 
+Cleanup-plan schema 2 keeps `archive_age_seconds` visible as a current observation but does not treat the continuously changing age as authorization material. The plan hash instead binds the immutable `archive_created_at_unix`, the declared exclusion list and every other plan field, including checkout identity, archive, recovery refs, retention, coordination blockers, command and rollback data. Any change outside the single declared observational age field invalidates the dry-run. Schema-1 dry-runs are intentionally stale after the upgrade and must be recreated.
+
 ## Hard blockers
 
 Cleanup remains blocked by:
