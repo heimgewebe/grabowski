@@ -2504,6 +2504,18 @@ def _external_closeout_checklist(manifest: dict[str, Any]) -> list[dict[str, Any
         and close_receipt.get("resources_released") is True
         and not close_receipt.get("remaining_resource_keys")
     )
+    checkout_decision = (
+        close_receipt.get("checkout_lifecycle_decision")
+        if isinstance(close_receipt, dict)
+        else None
+    )
+    checkout_decision_verified = bool(
+        close_valid
+        and isinstance(checkout_decision, dict)
+        and checkout_decision.get("automatic_cleanup_authorized") is False
+        and checkout_decision.get("selected_action")
+        in {"retain", "register_or_retain", "archive", "cleanup_dry_run"}
+    )
     return [
         {
             "item": "pr_integration_truth",
@@ -2544,11 +2556,12 @@ def _external_closeout_checklist(manifest: dict[str, Any]) -> list[dict[str, Any
         {
             "item": "writer_worktree_archive_or_cleanup",
             "description": (
-                "Archive or remove the preserved writer worktree and branch with the checkout tools; "
-                "close never deletes them."
+                "Use the recorded lifecycle decision for the preserved writer checkout; "
+                "close never deletes it and external GitHub/Bureau truth remains authoritative."
             ),
-            "status": "unknown",
+            "status": "verified" if checkout_decision_verified else "unknown",
             "source_of_truth": "grabowski_checkouts",
+            "evidence": checkout_decision if checkout_decision_verified else None,
         },
         {
             "item": "operator_final_summary",
@@ -3110,6 +3123,178 @@ def _start_role_task(manifest: dict[str, Any], role: str, snapshot: dict[str, An
         expected_cwd=cwd,
     )
 
+def _writer_checkout_lifecycle_purpose(manifest: dict[str, Any]) -> str:
+    binding = manifest.get("binding")
+    if not isinstance(binding, dict):
+        raise AgentWorkspaceError("workspace checkout lifecycle requires a binding")
+    kind = _required_string(binding.get("kind"), "binding.kind", max_length=32)
+    identifier = _required_string(binding.get("id"), "binding.id", max_length=256)
+    return f"agent workspace {manifest['workspace_id']} for {kind}:{identifier}"
+
+
+def _bind_writer_checkout_lifecycle(manifest: dict[str, Any]) -> dict[str, Any]:
+    repo = Path(str(manifest["repository"]))
+    checkout = Path(str(manifest["writer_worktree"]))
+    top_level, common_dir, record = checkouts._worktree_for_path(repo, checkout)
+    checkouts._require_linked(record)
+    checkouts._require_expected(
+        record,
+        str(manifest["expected_base_head"]),
+        str(manifest["writer_branch"]),
+    )
+    owner_id = checkouts._owner(str(manifest["resources"]["owner_id"]))
+    runtime_seconds = int(manifest["resources"]["runtime_seconds"] or 0)
+    retention_until_unix = _now() + max(
+        WORKSPACE_CLEANUP_RETENTION_SECONDS, runtime_seconds + 900
+    )
+    purpose = _writer_checkout_lifecycle_purpose(manifest)
+    retention = checkouts._upsert_retention(
+        checkout_key=str(record["checkout_key"]),
+        repo_common_dir=common_dir,
+        repo_path=top_level,
+        checkout_path=checkout,
+        owner_id=owner_id,
+        purpose=purpose,
+        retention_until_unix=retention_until_unix,
+        expected_head=str(manifest["expected_base_head"]),
+        expected_branch=str(manifest["writer_branch"]),
+    )
+    binding = manifest["binding"]
+    return {
+        "schema_version": 1,
+        "state": "retained",
+        "checkout_key": retention["checkout_key"],
+        "checkout_path": retention["checkout_path"],
+        "repo_common_dir": retention["repo_common_dir"],
+        "owner_id": retention["owner_id"],
+        "task": {
+            "binding_kind": binding["kind"],
+            "binding_id": binding["id"],
+            "writer_task_id": None,
+        },
+        "purpose": retention["purpose"],
+        "created_at_unix": retention["created_at_unix"],
+        "updated_at_unix": retention["updated_at_unix"],
+        "expires_at_unix": retention["retention_until_unix"],
+        "expected_head": retention["expected_head"],
+        "expected_branch": retention["expected_branch"],
+        "automatic_cleanup_authorized": False,
+    }
+
+
+def _release_failed_workspace_checkout_lifecycle(manifest: dict[str, Any]) -> bool:
+    lifecycle = manifest.get("checkout_lifecycle")
+    if not isinstance(lifecycle, dict):
+        return True
+    checkout_key = lifecycle.get("checkout_key")
+    owner_id = lifecycle.get("owner_id")
+    if not isinstance(checkout_key, str) or not isinstance(owner_id, str):
+        return False
+    created_at_unix = lifecycle.get("created_at_unix")
+    updated_at_unix = lifecycle.get("updated_at_unix")
+    expected_head = lifecycle.get("expected_head")
+    expected_branch = lifecycle.get("expected_branch")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (created_at_unix, updated_at_unix)
+    ):
+        return False
+    with checkouts._database() as connection:
+        row = connection.execute(
+            """
+            SELECT owner_id, created_at_unix, updated_at_unix,
+                   expected_head, expected_branch
+            FROM retention WHERE checkout_key=?
+            """,
+            (checkout_key,),
+        ).fetchone()
+        if row is None:
+            return True
+        expected_identity = (
+            owner_id,
+            created_at_unix,
+            updated_at_unix,
+            expected_head,
+            expected_branch,
+        )
+        observed_identity = (
+            row["owner_id"],
+            row["created_at_unix"],
+            row["updated_at_unix"],
+            row["expected_head"],
+            row["expected_branch"],
+        )
+        if observed_identity != expected_identity:
+            return False
+        deleted = connection.execute(
+            """
+            DELETE FROM retention
+            WHERE checkout_key=? AND owner_id=?
+              AND created_at_unix=? AND updated_at_unix=?
+              AND expected_head IS ? AND expected_branch IS ?
+            """,
+            (
+                checkout_key,
+                owner_id,
+                created_at_unix,
+                updated_at_unix,
+                expected_head,
+                expected_branch,
+            ),
+        )
+        connection.commit()
+    return deleted.rowcount == 1
+
+
+def _terminal_writer_checkout_decision(
+    manifest: dict[str, Any], snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    lifecycle = manifest.get("checkout_lifecycle")
+    if not isinstance(lifecycle, dict):
+        return {
+            "schema_version": 1,
+            "state": "unregistered",
+            "selected_action": "register_or_retain",
+            "reason": "workspace predates checkout lifecycle binding",
+            "checkout_path": manifest["writer_worktree"],
+            "automatic_cleanup_authorized": False,
+            "does_not_establish": [
+                "permission_to_delete_checkout",
+                "pull_request_integration_truth",
+                "bureau_task_completion",
+            ],
+        }
+    dirty = bool(snapshot.get("dirty"))
+    return {
+        "schema_version": 1,
+        "state": "terminal_decision_recorded",
+        "selected_action": "retain",
+        "reason": (
+            "writer checkout is dirty and requires owner review"
+            if dirty
+            else "GitHub integration and Bureau completion remain external truth"
+        ),
+        "checkout_key": lifecycle.get("checkout_key"),
+        "checkout_path": lifecycle.get("checkout_path"),
+        "owner_id": lifecycle.get("owner_id"),
+        "task": lifecycle.get("task"),
+        "purpose": lifecycle.get("purpose"),
+        "created_at_unix": lifecycle.get("created_at_unix"),
+        "expires_at_unix": lifecycle.get("expires_at_unix"),
+        "expected_head": lifecycle.get("expected_head"),
+        "expected_branch": lifecycle.get("expected_branch"),
+        "observed_head": snapshot.get("writer_head"),
+        "observed_dirty": dirty,
+        "next_action": "archive_after_external_truth_reconciliation",
+        "automatic_cleanup_authorized": False,
+        "does_not_establish": [
+            "permission_to_delete_checkout",
+            "pull_request_integration_truth",
+            "bureau_task_completion",
+        ],
+    }
+
+
 def _validate_new_workspace_collisions(plan: dict[str, Any], runner: CommandRunner) -> None:
     worktree = Path(str(plan["writer_worktree"]))
     if worktree.exists():
@@ -3481,6 +3666,23 @@ def grabowski_agent_workspace_create(
             raise AgentWorkspaceActionError(
                 f"writer toolchain preflight failed: {classification}"
             )
+        manifest["checkout_lifecycle"] = _bind_writer_checkout_lifecycle(manifest)
+        _append_workspace_event(
+            manifest,
+            "writer_checkout_lifecycle_bound",
+            role="writer",
+            outcome="retained",
+            evidence={
+                "checkout_key": manifest["checkout_lifecycle"]["checkout_key"],
+                "owner_id": manifest["checkout_lifecycle"]["owner_id"],
+                "task": manifest["checkout_lifecycle"]["task"],
+                "expires_at_unix": manifest["checkout_lifecycle"]["expires_at_unix"],
+                "expected_head": manifest["checkout_lifecycle"]["expected_head"],
+                "expected_branch": manifest["checkout_lifecycle"]["expected_branch"],
+                "automatic_cleanup_authorized": False,
+            },
+        )
+        _write_manifest(manifest)
         writer_intents = dict(manifest.get("task_start_intents", {}))
         writer_intents["writer"] = {
             "role": "writer",
@@ -3518,6 +3720,13 @@ def grabowski_agent_workspace_create(
             expected_cwd=str(worktree),
         )
         manifest["tasks"]["writer"] = writer_task["task_id"]
+        checkout_lifecycle = manifest.get("checkout_lifecycle")
+        if isinstance(checkout_lifecycle, dict):
+            task_binding = dict(checkout_lifecycle.get("task") or {})
+            task_binding["writer_task_id"] = writer_task["task_id"]
+            checkout_lifecycle["task"] = task_binding
+            checkout_lifecycle["updated_at_unix"] = _now()
+            manifest["checkout_lifecycle"] = checkout_lifecycle
         _append_workspace_event(
             manifest, "role_started", role="writer", outcome="started",
             evidence={"task_id": writer_task["task_id"], "command_sha256": plan["commands"] and _sha256_json(plan["commands"]["writer"])},
@@ -3587,9 +3796,22 @@ def grabowski_agent_workspace_create(
             except Exception as cleanup_exc:
                 worktree_cleanup_confirmed = False
                 worktree_cleanup_error = _error_summary(cleanup_exc)
+        checkout_lifecycle_released = True
+        if worktree_cleanup_confirmed and not writer_start_attempted:
+            try:
+                checkout_lifecycle_released = _release_failed_workspace_checkout_lifecycle(
+                    manifest
+                )
+            except Exception:
+                checkout_lifecycle_released = False
         lease_released = False
         lease_release_error: str | None = None
-        if lease is not None and writer_cancel_confirmed and worktree_cleanup_confirmed:
+        if (
+            lease is not None
+            and writer_cancel_confirmed
+            and worktree_cleanup_confirmed
+            and checkout_lifecycle_released
+        ):
             try:
                 resources.release_resources(
                     str(plan["resources"]["owner_id"]),
@@ -3616,6 +3838,7 @@ def grabowski_agent_workspace_create(
             "worktree_created": worktree_created,
             "worktree_cleanup_confirmed": worktree_cleanup_confirmed,
             "worktree_cleanup_error": worktree_cleanup_error,
+            "checkout_lifecycle_released": checkout_lifecycle_released,
             "lease_released": lease_released,
             "lease_retained": lease is not None and not lease_released,
             "lease_release_error": lease_release_error,
@@ -4545,6 +4768,10 @@ def grabowski_agent_workspace_close(
         remaining_resource_keys = expected_resource_keys & observed_live_keys
         receipt["remaining_resource_keys"] = sorted(remaining_resource_keys)
         receipt["resources_released"] = not remaining_resource_keys
+        if not remaining_resource_keys:
+            receipt["checkout_lifecycle_decision"] = (
+                _terminal_writer_checkout_decision(manifest, snapshot)
+            )
         if remaining_resource_keys:
             receipt["state"] = "resource_release_incomplete"
             receipt["receipt_sha256"] = _sha256_json(receipt)

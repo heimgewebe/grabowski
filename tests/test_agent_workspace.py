@@ -222,6 +222,27 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.git = GitFixture(self.root)
         self.state = self.root / "state"
         self.state.mkdir()
+        self.checkout_state = self.root / "checkout-state"
+        self.checkout_patches = [
+            mock.patch.object(
+                workspace.checkouts,
+                "CHECKOUT_DB",
+                self.checkout_state / "checkouts.sqlite3",
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "CHECKOUT_LOCK",
+                self.checkout_state / "checkouts.lock",
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "ARCHIVE_ROOT",
+                self.checkout_state / "archives",
+            ),
+        ]
+        for checkout_patch in self.checkout_patches:
+            checkout_patch.start()
+            self.addCleanup(checkout_patch.stop)
         self.root_patch = mock.patch.object(workspace, "WORKSPACE_ROOT", self.state)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
@@ -334,6 +355,108 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(any(key.startswith("service:repo-writer-") for key in plan["resources"]["lease_keys"]))
         self.assertEqual(plan["resources"]["task_host"], workspace.AGENT_WORKSPACE_TASK_HOST)
         self.assertEqual(set(plan), set(workspace.PLAN_FIELDS))
+
+    def test_writer_checkout_lifecycle_binding_is_explicit_and_idempotent(self) -> None:
+        manifest = self.manifest()
+        fixed_now = 1_800_000_000
+        with (
+            mock.patch.object(workspace, "_now", return_value=fixed_now),
+            mock.patch.object(workspace.checkouts, "_now", return_value=fixed_now),
+        ):
+            first = workspace._bind_writer_checkout_lifecycle(manifest)
+            second = workspace._bind_writer_checkout_lifecycle(manifest)
+
+        self.assertEqual(first["checkout_key"], second["checkout_key"])
+        self.assertEqual(first["created_at_unix"], second["created_at_unix"])
+        self.assertEqual(first["owner_id"], manifest["resources"]["owner_id"])
+        self.assertEqual(
+            first["task"],
+            {
+                "binding_kind": "thread_focus",
+                "binding_id": "thread-1",
+                "writer_task_id": None,
+            },
+        )
+        self.assertIn(manifest["workspace_id"], first["purpose"])
+        self.assertEqual(first["expected_head"], self.git.base)
+        self.assertEqual(first["expected_branch"], "feat/writer")
+        self.assertEqual(
+            first["expires_at_unix"],
+            fixed_now + workspace.WORKSPACE_CLEANUP_RETENTION_SECONDS,
+        )
+        self.assertFalse(first["automatic_cleanup_authorized"])
+        stored = workspace.checkouts._retention_records([first["checkout_key"]])
+        self.assertEqual(stored[first["checkout_key"]]["owner_id"], first["owner_id"])
+
+    def test_failed_creation_releases_only_the_exact_lifecycle_version(self) -> None:
+        manifest = self.manifest()
+        fixed_now = 1_800_000_000
+        with (
+            mock.patch.object(workspace, "_now", return_value=fixed_now),
+            mock.patch.object(workspace.checkouts, "_now", return_value=fixed_now),
+        ):
+            manifest["checkout_lifecycle"] = (
+                workspace._bind_writer_checkout_lifecycle(manifest)
+            )
+
+        self.assertTrue(workspace._release_failed_workspace_checkout_lifecycle(manifest))
+        self.assertEqual(
+            workspace.checkouts._retention_records(
+                [manifest["checkout_lifecycle"]["checkout_key"]]
+            ),
+            {},
+        )
+
+    def test_failed_creation_does_not_delete_concurrently_updated_retention(self) -> None:
+        manifest = self.manifest()
+        fixed_now = 1_800_000_000
+        with (
+            mock.patch.object(workspace, "_now", return_value=fixed_now),
+            mock.patch.object(workspace.checkouts, "_now", return_value=fixed_now),
+        ):
+            lifecycle = workspace._bind_writer_checkout_lifecycle(manifest)
+        manifest["checkout_lifecycle"] = lifecycle
+        with workspace.checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET updated_at_unix=? WHERE checkout_key=?",
+                (lifecycle["updated_at_unix"] + 1, lifecycle["checkout_key"]),
+            )
+            connection.commit()
+
+        self.assertFalse(workspace._release_failed_workspace_checkout_lifecycle(manifest))
+        stored = workspace.checkouts._retention_records([lifecycle["checkout_key"]])
+        self.assertEqual(
+            stored[lifecycle["checkout_key"]]["updated_at_unix"],
+            lifecycle["updated_at_unix"] + 1,
+        )
+
+    def test_terminal_checkout_decision_retains_registered_checkout(self) -> None:
+        manifest = self.manifest()
+        fixed_now = 1_800_000_000
+        with (
+            mock.patch.object(workspace, "_now", return_value=fixed_now),
+            mock.patch.object(workspace.checkouts, "_now", return_value=fixed_now),
+        ):
+            manifest["checkout_lifecycle"] = (
+                workspace._bind_writer_checkout_lifecycle(manifest)
+            )
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        decision = workspace._terminal_writer_checkout_decision(manifest, snapshot)
+
+        self.assertEqual(decision["selected_action"], "retain")
+        self.assertEqual(decision["checkout_key"], manifest["checkout_lifecycle"]["checkout_key"])
+        self.assertFalse(decision["automatic_cleanup_authorized"])
+        self.assertIn("permission_to_delete_checkout", decision["does_not_establish"])
+
+    def test_terminal_checkout_decision_reports_legacy_unregistered_checkout(self) -> None:
+        manifest = self.manifest()
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        decision = workspace._terminal_writer_checkout_decision(manifest, snapshot)
+
+        self.assertEqual(decision["state"], "unregistered")
+        self.assertEqual(decision["selected_action"], "register_or_retain")
+        self.assertFalse(decision["automatic_cleanup_authorized"])
+        self.assertTrue(self.git.writer.exists())
 
     def test_route_evidence_is_hash_bound_and_missing_evidence_fails_closed(self) -> None:
         normalized = workspace._normalize_route_evidence(complete_route_evidence())
@@ -3735,11 +3858,28 @@ class AgentWorkspaceTests(unittest.TestCase):
         lease_item = next(item for item in checklist if item["item"] == "workspace_lease_release")
         self.assertEqual(lease_item["status"], "verified")
         self.assertTrue(lease_item["evidence"]["resources_released"])
+        checkout_item = next(
+            item
+            for item in checklist
+            if item["item"] == "writer_worktree_archive_or_cleanup"
+        )
+        self.assertEqual(checkout_item["status"], "verified")
+        self.assertEqual(
+            checkout_item["evidence"]["selected_action"],
+            "register_or_retain",
+        )
+        self.assertFalse(
+            checkout_item["evidence"]["automatic_cleanup_authorized"]
+        )
         self.assertTrue(
             all(
                 item["status"] == "unknown"
                 for item in checklist
-                if item["item"] != "workspace_lease_release"
+                if item["item"]
+                not in {
+                    "workspace_lease_release",
+                    "writer_worktree_archive_or_cleanup",
+                }
             )
         )
         bureau_item = next(item for item in checklist if item["item"] == "bureau_task_reconciliation")

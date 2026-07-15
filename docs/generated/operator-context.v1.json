@@ -2020,7 +2020,7 @@
       "src/grabowski_agent_competition.py": "90617a0c5993f20dee5cfb3425e9f62877ef09b3330a10e38812c29f06e55282",
       "src/grabowski_agent_role.py": "207c9e7389940c6e7491057701fb8c1c1534779e7ad799129d81038bbc1304fc",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "feb5fadeee48f7faf8a4c70638618ee071ced1f19e4cf3cbae075b300c8a72bf",
+      "src/grabowski_agent_workspace.py": "df0b98f903b7cc905456a42751853ba3ad94f46a3dfdddb4797067b79664b76b",
       "src/grabowski_agent_workspace_observer.py": "7eadc3fa89005037ee38b4a425f96ed6b233392dc7f4596b75d016e2221aac78",
       "src/grabowski_agent_writer.py": "1ccf0168b78db145c36292397410eb8878b78ad004e1795cfe5a490763530b69",
       "src/grabowski_artifacts.py": "f1d17f5f8a85a8b4b0fdbd64e9a8cc4c137d0ad591fcc0dba8c01160b74dcc01",
@@ -2055,7 +2055,7 @@
       "src/grabowski_tasks.py": "dea6da52f34847a71c42ca5ff84df10679f4f901d5a1b4c794ba7028643eac1b",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9051739e6d1d9b900181ecde39809845cb04578f5bf6960df6e51955ab6419ef",
-      "src/grabowski_worktree_ensure.py": "21de94dedee1c4dfc10f33c35f5d6d4a954d738bc4c9b71ee0a858ceabccc5dd"
+      "src/grabowski_worktree_ensure.py": "22fa28dcbe88517efc833f409c1d1f6f1de2e4e32af9c48f856fe7e32f57a36f"
     }
   }
 }

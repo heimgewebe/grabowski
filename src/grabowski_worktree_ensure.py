@@ -126,6 +126,14 @@ def _validate_receipt_shape(value: dict[str, Any], path: Path) -> None:
         raise WorktreeEnsureAction(f"durable receipt post_state is invalid: {path}")
     if not isinstance(value.get("lease"), dict):
         raise WorktreeEnsureAction(f"durable receipt lease evidence is missing: {path}")
+    lifecycle = value.get("lifecycle")
+    if lifecycle is not None:
+        if not isinstance(lifecycle, dict):
+            raise WorktreeEnsureAction(f"durable receipt lifecycle evidence is invalid: {path}")
+        if lifecycle.get("automatic_cleanup_authorized") is not False:
+            raise WorktreeEnsureAction(f"durable receipt lifecycle cleanup authority is invalid: {path}")
+        if lifecycle.get("terminal_decision") != "retain":
+            raise WorktreeEnsureAction(f"durable receipt lifecycle decision is invalid: {path}")
     for field in ("created_at_unix", "updated_at_unix"):
         timestamp = value.get(field)
         if not isinstance(timestamp, int) or isinstance(timestamp, bool) or timestamp < 0:
@@ -492,9 +500,19 @@ def _durable_record(
     }
 
 
-def _public_output(record: dict[str, Any], receipt_path: Path, *, replayed: bool, recovered: bool) -> dict[str, Any]:
+def _public_output(
+    record: dict[str, Any],
+    receipt_path: Path,
+    *,
+    replayed: bool,
+    recovered: bool,
+    lifecycle_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     result_state = record.get("result_state")
     receipt_status = "passed" if result_state in SUCCESS_STATES else ("blocked" if result_state in {"CONFLICT", "REJECTED_BY_LEASE"} else "failed")
+    stored_lifecycle = record.get("lifecycle")
+    lifecycle = lifecycle_override or stored_lifecycle
+    lifecycle_bound = isinstance(stored_lifecycle, dict) and lifecycle_override is None
     return {
         "receipt_status": receipt_status,
         "result_state": result_state,
@@ -507,6 +525,18 @@ def _public_output(record: dict[str, Any], receipt_path: Path, *, replayed: bool
         "replayed": replayed,
         "recovered_after_interruption": recovered,
         "post_state": record.get("post_state"),
+        "lifecycle": lifecycle,
+        "lifecycle_integrity": {
+            "sha256": _sha256_json(lifecycle) if isinstance(lifecycle, dict) else None,
+            "source": (
+                "durable_receipt"
+                if lifecycle_bound
+                else "checkout_retention_db"
+                if isinstance(lifecycle, dict)
+                else None
+            ),
+            "bound_to_durable_receipt": lifecycle_bound,
+        },
         "friction": record.get("friction"),
         "friction_closeout": record.get("friction_closeout"),
         "non_claims": [
@@ -514,6 +544,72 @@ def _public_output(record: dict[str, Any], receipt_path: Path, *, replayed: bool
             "does not create or renew leases",
             "does not clean up conflicting worktrees or branches",
             "does not prove connector delivery of the response",
+            "a legacy lifecycle projection is not bound by the original receipt hash",
+        ],
+    }
+
+
+def _bind_checkout_lifecycle(
+    inputs: dict[str, Any],
+    post_state: dict[str, Any],
+    lease: dict[str, Any],
+) -> dict[str, Any]:
+    import grabowski_checkouts as checkouts
+
+    checked = lease.get("checked")
+    expiries = [
+        item.get("expires_at_unix")
+        for item in checked
+        if isinstance(item, dict)
+        and isinstance(item.get("expires_at_unix"), int)
+        and not isinstance(item.get("expires_at_unix"), bool)
+    ] if isinstance(checked, list) else []
+    if not expiries:
+        raise WorktreeEnsureAction("worktree lifecycle requires live lease expiry evidence")
+    retention_until_unix = max(min(expiries), int(time.time()) + 24 * 60 * 60)
+    repo = Path(inputs["repo"])
+    checkout = Path(inputs["target_path"])
+    top_level, common_dir, record = checkouts._worktree_for_path(repo, checkout)
+    checkouts._require_linked(record)
+    checkouts._require_expected(
+        record,
+        str(post_state["actual_head"]),
+        str(inputs["branch"]),
+    )
+    owner_id = checkouts._owner(str(inputs["lease_owner_id"]))
+    task_id = f"worktree-ensure:{inputs['idempotency_key']}"
+    purpose = f"ensure exact worktree for {task_id}"
+    retention = checkouts._upsert_retention(
+        checkout_key=str(record["checkout_key"]),
+        repo_common_dir=common_dir,
+        repo_path=top_level,
+        checkout_path=checkout,
+        owner_id=owner_id,
+        purpose=purpose,
+        retention_until_unix=retention_until_unix,
+        expected_head=str(post_state["actual_head"]),
+        expected_branch=str(inputs["branch"]),
+    )
+    return {
+        "schema_version": 1,
+        "state": "retained",
+        "checkout_key": retention["checkout_key"],
+        "checkout_path": retention["checkout_path"],
+        "owner_id": retention["owner_id"],
+        "task": {"kind": "worktree_ensure", "id": task_id},
+        "purpose": retention["purpose"],
+        "created_at_unix": retention["created_at_unix"],
+        "updated_at_unix": retention["updated_at_unix"],
+        "expires_at_unix": retention["retention_until_unix"],
+        "expected_head": retention["expected_head"],
+        "expected_branch": retention["expected_branch"],
+        "terminal_decision": "retain",
+        "terminal_reason": "external GitHub and Bureau truth require later reconciliation",
+        "automatic_cleanup_authorized": False,
+        "does_not_establish": [
+            "permission_to_delete_checkout",
+            "pull_request_integration_truth",
+            "bureau_task_completion",
         ],
     }
 
@@ -575,7 +671,17 @@ def ensure_worktree(
                         "friction_closeout": existing.get("friction_closeout"),
                         "non_claims": ["the prior durable receipt remains immutable evidence of the earlier result"],
                     }
-            return _public_output(existing, receipt_path, replayed=True, recovered=False)
+            lifecycle = existing.get("lifecycle")
+            if result_state in SUCCESS_STATES and not isinstance(lifecycle, dict):
+                assert observation is not None
+                lifecycle = _bind_checkout_lifecycle(inputs, observation, existing["lease"])
+            return _public_output(
+                existing,
+                receipt_path,
+                replayed=True,
+                recovered=False,
+                lifecycle_override=lifecycle if isinstance(lifecycle, dict) else None,
+            )
 
         recovering_intent = existing is not None and existing.get("state") == "intent"
         recovery_friction: dict[str, Any] | None = None
@@ -609,6 +715,7 @@ def ensure_worktree(
                 )
                 record["lease"] = lease
                 record["recovery_without_live_lease"] = not lease["valid"]
+                record["lifecycle"] = _bind_checkout_lifecycle(inputs, observation, lease)
                 written = _write_receipt(receipt_path, record)
                 return _public_output(written, receipt_path, replayed=True, recovered=True)
 
@@ -677,6 +784,7 @@ def ensure_worktree(
                 error="",
             )
             record["lease"] = lease
+            record["lifecycle"] = _bind_checkout_lifecycle(inputs, observation, lease)
             written = _write_receipt(receipt_path, record)
             return _public_output(written, receipt_path, replayed=False, recovered=False)
 
@@ -767,6 +875,7 @@ def ensure_worktree(
                 created_at_unix=existing.get("created_at_unix") if existing else None,
             )
             record["lease"] = lease
+            record["lifecycle"] = _bind_checkout_lifecycle(inputs, post_state, lease)
             record["mutation"] = {
                 "returncode": _returncode(mutation),
                 "stdout": _bounded_text(_stdout(mutation)),

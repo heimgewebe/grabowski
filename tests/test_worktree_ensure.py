@@ -13,6 +13,33 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+
+class _FakeFastMCP:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def tool(self, *args, **kwargs):
+        return lambda function: function
+
+
+class _FakeToolAnnotations:
+    def __init__(self, **kwargs):
+        self.values = kwargs
+
+
+if "mcp" not in sys.modules:
+    fake_mcp = types.ModuleType("mcp")
+    fake_server = types.ModuleType("mcp.server")
+    fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+    fake_types = types.ModuleType("mcp.types")
+    fake_fastmcp.FastMCP = _FakeFastMCP
+    fake_types.ToolAnnotations = _FakeToolAnnotations
+    sys.modules["mcp"] = fake_mcp
+    sys.modules["mcp.server"] = fake_server
+    sys.modules["mcp.server.fastmcp"] = fake_fastmcp
+    sys.modules["mcp.types"] = fake_types
+
+import grabowski_checkouts as checkouts
 import grabowski_grips as grips
 import grabowski_worktree_ensure as worktree_ensure
 
@@ -33,6 +60,15 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.worktree_root = self.root / "worktrees"
         self.worktree_root.mkdir()
         self.receipt_root = self.root / "receipts"
+        self.checkout_state = self.root / "checkout-state"
+        self.checkout_patches = [
+            patch.object(checkouts, "CHECKOUT_DB", self.checkout_state / "checkouts.sqlite3"),
+            patch.object(checkouts, "CHECKOUT_LOCK", self.checkout_state / "checkouts.lock"),
+            patch.object(checkouts, "ARCHIVE_ROOT", self.checkout_state / "archives"),
+        ]
+        for checkout_patch in self.checkout_patches:
+            checkout_patch.start()
+            self.addCleanup(checkout_patch.stop)
         self.owner = "test-owner"
         self.friction_events: list[dict[str, object]] = []
         self.friction_closeouts: list[dict[str, object]] = []
@@ -117,6 +153,56 @@ class WorktreeEnsureTests(unittest.TestCase):
         )
         self.assertEqual(self._git(Path(parameters["target_path"]), "rev-parse", "HEAD").stdout.strip(), self.head)
         self.assertEqual(self.friction_events, [])
+        lifecycle = created["lifecycle"]
+        self.assertEqual(lifecycle["owner_id"], self.owner)
+        self.assertEqual(
+            lifecycle["task"],
+            {"kind": "worktree_ensure", "id": "worktree-ensure:worktree-case-1"},
+        )
+        self.assertIn("worktree-ensure:worktree-case-1", lifecycle["purpose"])
+        self.assertEqual(lifecycle["expected_head"], self.head)
+        self.assertEqual(lifecycle["expected_branch"], "feat/worktree-case")
+        self.assertEqual(lifecycle["terminal_decision"], "retain")
+        self.assertFalse(lifecycle["automatic_cleanup_authorized"])
+        self.assertEqual(replayed["lifecycle"]["checkout_key"], lifecycle["checkout_key"])
+        self.assertEqual(created["lifecycle_integrity"]["source"], "durable_receipt")
+        self.assertTrue(created["lifecycle_integrity"]["bound_to_durable_receipt"])
+        self.assertEqual(
+            created["lifecycle_integrity"]["sha256"],
+            worktree_ensure._sha256_json(lifecycle),
+        )
+        stored = checkouts._retention_records([lifecycle["checkout_key"]])
+        self.assertEqual(stored[lifecycle["checkout_key"]]["owner_id"], self.owner)
+
+    def test_legacy_success_replay_marks_lifecycle_as_unbound_projection(self) -> None:
+        parameters = self._parameters(key="legacy-success")
+        created = self._ensure(parameters)
+        receipt_path = Path(created["durable_receipt_path"])
+        record = json.loads(receipt_path.read_text(encoding="utf-8"))
+        record.pop("lifecycle")
+        worktree_ensure._write_receipt(receipt_path, record)
+        legacy_record = json.loads(receipt_path.read_text(encoding="utf-8"))
+        legacy_receipt_sha256 = legacy_record["receipt_sha256"]
+
+        replayed = self._ensure(parameters)
+
+        self.assertEqual(replayed["result_state"], "CREATED")
+        self.assertEqual(replayed["durable_receipt_sha256"], legacy_receipt_sha256)
+        self.assertEqual(
+            json.loads(receipt_path.read_text(encoding="utf-8"))["receipt_sha256"],
+            legacy_receipt_sha256,
+        )
+        self.assertEqual(
+            replayed["lifecycle_integrity"]["source"],
+            "checkout_retention_db",
+        )
+        self.assertFalse(
+            replayed["lifecycle_integrity"]["bound_to_durable_receipt"]
+        )
+        self.assertEqual(
+            replayed["lifecycle_integrity"]["sha256"],
+            worktree_ensure._sha256_json(replayed["lifecycle"]),
+        )
 
     def test_existing_exact_worktree_is_already_correct(self) -> None:
         first = self._parameters(key="create-first")
@@ -127,6 +213,8 @@ class WorktreeEnsureTests(unittest.TestCase):
 
         self.assertEqual(result["result_state"], "ALREADY_CORRECT")
         self.assertFalse(result["replayed"])
+        self.assertEqual(result["lifecycle"]["terminal_decision"], "retain")
+        self.assertFalse(result["lifecycle"]["automatic_cleanup_authorized"])
 
     def test_conflicting_target_fails_closed_and_records_friction(self) -> None:
         target = self.worktree_root / "occupied"
@@ -264,6 +352,8 @@ class WorktreeEnsureTests(unittest.TestCase):
         receipt = json.loads(Path(recovered["durable_receipt_path"]).read_text())
         self.assertTrue(receipt["recovery_without_live_lease"])
         self.assertFalse(receipt["lease"]["valid"])
+        self.assertEqual(recovered["lifecycle"]["terminal_decision"], "retain")
+        self.assertGreater(recovered["lifecycle"]["expires_at_unix"], int(time.time()))
 
     def test_replay_detects_post_state_drift(self) -> None:
         parameters = self._parameters(key="drift")
@@ -309,6 +399,48 @@ class WorktreeEnsureTests(unittest.TestCase):
         with self.assertRaises(worktree_ensure.WorktreeEnsureAction):
             self._ensure(parameters)
         self.assertFalse(Path(parameters["target_path"]).exists())
+
+    def test_receipt_rejects_lifecycle_cleanup_authority(self) -> None:
+        parameters = self._parameters(key="unsafe-lifecycle")
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root)},
+        ):
+            self.receipt_root.mkdir(mode=0o700)
+            receipt_path, _lock_path = worktree_ensure._receipt_paths(
+                parameters["idempotency_key"]
+            )
+            inputs = worktree_ensure._normalize_inputs(parameters)
+            worktree_ensure._write_receipt(
+                receipt_path,
+                {
+                    "kind": worktree_ensure.RECEIPT_KIND,
+                    "schema_version": 1,
+                    "state": "complete",
+                    "result_state": "CREATED",
+                    "parameters_sha256": worktree_ensure._sha256_json(inputs),
+                    "idempotency_key_sha256": "b" * 64,
+                    "inputs": {k: v for k, v in inputs.items() if k != "idempotency_key"},
+                    "post_state": {},
+                    "lease": {},
+                    "lifecycle": {
+                        "automatic_cleanup_authorized": True,
+                        "terminal_decision": "retain",
+                    },
+                    "error_class": None,
+                    "error": "",
+                    "friction": None,
+                    "friction_closeout": None,
+                    "created_at_unix": 1,
+                    "updated_at_unix": 1,
+                },
+            )
+
+        with self.assertRaisesRegex(
+            worktree_ensure.WorktreeEnsureAction,
+            "cleanup authority",
+        ):
+            self._ensure(parameters)
 
     def test_receipt_lock_symlink_is_rejected_without_touching_target(self) -> None:
         parameters = self._parameters(key="symlink-lock")
