@@ -143,6 +143,14 @@
       "source": "src/grabowski_mcp.py"
     },
     {
+      "module": "grabowski_blockades",
+      "source": "src/grabowski_blockades.py"
+    },
+    {
+      "module": "grabowski_blockade_store",
+      "source": "src/grabowski_blockade_store.py"
+    },
+    {
       "module": "grabowski_grips",
       "source": "src/grabowski_grips.py"
     },
