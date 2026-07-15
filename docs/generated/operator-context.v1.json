@@ -1852,6 +1852,10 @@
         "source": "src/grabowski_grips.py"
       },
       {
+        "module": "grabowski_operator_obligation",
+        "source": "src/grabowski_operator_obligation.py"
+      },
+      {
         "module": "grabowski_worktree_ensure",
         "source": "src/grabowski_worktree_ensure.py"
       },
@@ -2013,7 +2017,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "7a32c47858b1b19c0e51edc8ff4a5f9a40d7e22c40a8b7a036289dc7fc050321"
+      "sha256": "b5a98d5aa4ca95a3ead1912f96705823e5421099b515b7fd5f1d9a7191bc1922"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2033,13 +2037,14 @@
       "src/grabowski_fleet.py": "5762406f7a87a7d4a0f8bcf888170daef1cd3060a86acb8ebecb628aa7715a65",
       "src/grabowski_friction.py": "3391e7f42cb7c7ea65969eadd97938ff2325d65e7cc6ac6d484db2c89e69d8ce",
       "src/grabowski_grip_orchestration.py": "be3def7d9e24c316ef73bf247e78d1d1ff50a5d6e9d6f609f7f1221329c3159d",
-      "src/grabowski_grips.py": "4ad550de87a128361a7e67ce4683de9ada7020584d1873c20fcdf70c75829389",
+      "src/grabowski_grips.py": "7d0a0c973cf210672ce369f26e6208d3e048b559a4869c6b3293543e8b510610",
       "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
-      "src/grabowski_mcp.py": "d812c2c96e7a570edc78bebcd99b75d1fcad5ee50a7cc75635c27601d693d8fa",
+      "src/grabowski_mcp.py": "fddcde598ca209058ab4eb7e4bd842953425a7702a64b48ea5c318e780eed5c7",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "c4842194bd4d45a55e953a9ef75aa9c64b4689858c2ff82ed4c5516bb7f02d39",
       "src/grabowski_operator.py": "214233836855c6c60c76d504e41467f04ddcbaa6a2a104c83eacb30a936cf6bd",
+      "src/grabowski_operator_obligation.py": "35bbbab19ca80908df43a116087e8ea03294729c4d412673e7e4e4391ae5fe63",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "f3446c8c6a09033fbdfad0a040e39bf7ca53bfcfa88c4ac0e5581d398c99b0d3",
       "src/grabowski_privileged_broker.py": "c3980a038d11e47a0d9b44fd5db3628ffd017036894f1b300cecd536debbb8cc",

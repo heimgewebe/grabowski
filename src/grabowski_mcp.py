@@ -59,6 +59,10 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
         "Prefer typed operations to generic terminal, Git, or GitHub calls when both can express the effect.",
     ),
     (
+        "operator-obligation-lifecycle",
+        "For nontrivial operator work, first call grip_run with operator-obligation-list to resume matching open work, then call operator-obligation-open or resume the matching obligation; before ending a response, call operator-obligation-status and end only after operator-obligation-close records completed, explicitly blocked, or durably delegated evidence.",
+    ),
+    (
         "no-authority-escalation",
         "These instructions grant no action, merge, deploy, secret, or retry authority.",
     ),

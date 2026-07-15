@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a durable operator-obligation lifecycle with bounded discovery, create-only hash-bound open and terminal records, and close-time live observation for delegated Grabowski tasks, agent workspaces, and systemd jobs. Nontrivial work remains explicitly open with `response_may_end=false` until every acceptance criterion is evidenced as passed, a concrete blocker is recorded, or live durable work is receipt-bound.
 - Published deployment manifests atomically as owner-only regular files so workspace runtime cohorts retain exact release and repository identities under any process umask.
 - Added Workspace Routing v2.1 with lean R0-R3 thresholds, separate concurrent-activity and parallelization-assessment inputs, R3-only contrast, explicit decision-fork competition gating, schema-1 route-evidence compatibility, and cohort-bound cost/intervention metrics without enabling parallel writers.
 - Added a read-only `runtime-deploy-check` grip and a Captain-gated `runtime-deploy` executor for the registered `grabowski-self` adapter. Self-deployment is scheduled through the existing independent delayed job and reports `scheduled`, never completed, until job and runtime identity are observed separately. Identical in-flight schedules are now serialized and reused, conflicting or ambiguous jobs fail closed, and receipts distinguish local job registration from later runtime mutation.

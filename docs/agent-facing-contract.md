@@ -38,11 +38,23 @@ The rendered contract requires the agent to:
    avoid unchanged retries without state evidence;
 5. prefer typed operations to generic terminal, Git or GitHub calls when both can
    express the effect;
-6. treat the instructions as non-authoritative: they grant no action, merge,
+6. for nontrivial operator work, first call `operator-obligation-list` through
+   `grip_run` to find matching interrupted work, then call
+   `operator-obligation-open` or resume the matching obligation, read
+   `operator-obligation-status` before ending the response, and end only after
+   `operator-obligation-close` records `completed`, explicitly `blocked`, or
+   durably `delegated`;
+7. treat the instructions as non-authoritative: they grant no action, merge,
    deploy, secret or retry authority.
 
 The executable rules in `AGENT_INSTRUCTION_RULES` are the source of truth if
 this explanatory list drifts.
+
+The obligation lifecycle is durable server-side state, not proof that a client
+actually followed the rule. An open obligation reports `response_may_end=false`;
+completed and blocked evidence is SHA-256-bound, while the close grip itself
+live-observes and binds a durable task, workspace or job before delegation. See
+`docs/operator-obligation-contract-v1.md`.
 
 ## Rendering invariants
 

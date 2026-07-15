@@ -188,7 +188,7 @@ class RepositoryContractTests(unittest.TestCase):
             "src/grabowski_privileged_broker.py",
         )
         self.assertEqual(supporting["grabowski_grip_orchestration"], "src/grabowski_grip_orchestration.py")
-        for module in ("grabowski_mcp", "grabowski_grips", "grabowski_grip_orchestration", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_privileged_broker", "grabowski_tasks", "grabowski_recovery", "grabowski_friction", "grabowski_agent_bootstrap", "grabowski_recall", "grabowski_consumer_surface", "grabowski_private_io", "grabowski_job_origin", "grabowski_job_finalizer"):
+        for module in ("grabowski_mcp", "grabowski_grips", "grabowski_grip_orchestration", "grabowski_operator_obligation", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_privileged_broker", "grabowski_tasks", "grabowski_recovery", "grabowski_friction", "grabowski_agent_bootstrap", "grabowski_recall", "grabowski_consumer_surface", "grabowski_private_io", "grabowski_job_origin", "grabowski_job_finalizer"):
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
 
