@@ -85,6 +85,7 @@ def provision_pairing_secret(
     secret_path: Path,
     *,
     replace_secret: bool,
+    consent_code: str,
 ) -> Any:
     target = secret_path.expanduser()
     pending = target.with_name(f".{target.name}.pairing-pending")
@@ -93,7 +94,7 @@ def provision_pairing_secret(
         secret = read_private_secret(target, label="bestehende Schlüsseldatei")
         if len(secret) != 32:
             raise RuntimeError("Bestehender Pairing-Schlüssel muss exakt 32 Byte lang sein")
-        return client.pair(secret)
+        return client.pair(secret, consent_code)
     if target_exists:
         read_private_secret(target, label="bestehende Schlüsseldatei")
     if pending.exists():
@@ -104,7 +105,7 @@ def provision_pairing_secret(
         fsync_directory(pending.parent)
     if len(secret) != 32:
         raise RuntimeError("Pairing-Pending-Schlüssel muss exakt 32 Byte lang sein")
-    response = client.pair(secret)
+    response = client.pair(secret, consent_code)
     os.replace(pending, target)
     os.chmod(target, 0o600)
     fsync_directory(target.parent)
@@ -200,14 +201,20 @@ class AgentClient:
     def health(self) -> Any:
         return self.request("GET", "/health", authenticated=False)[1]
 
-    def pair(self, secret: bytes) -> Any:
+    def pair(self, secret: bytes, consent_code: str) -> Any:
         if len(secret) != 32:
             raise ValueError("Pairing-Schlüssel muss exakt 32 Byte lang sein")
+        if not (len(consent_code) == 6 and consent_code.isdigit()):
+            raise ValueError("Kopplungscode muss aus sechs Ziffern bestehen")
         encoded = base64.urlsafe_b64encode(secret).decode("ascii").rstrip("=")
         return self.request(
             "POST",
             "/v1/pair",
-            {"schema_version": SCHEMA_VERSION, "secret_b64": encoded},
+            {
+                "schema_version": SCHEMA_VERSION,
+                "secret_b64": encoded,
+                "consent_code": consent_code,
+            },
             authenticated=False,
         )[1]
 
@@ -273,6 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pair_parser = subparsers.add_parser("pair")
     pair_parser.add_argument("--replace-secret", action="store_true")
+    pair_parser.add_argument("--consent-code", required=True)
 
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("code_file", type=Path)
@@ -305,6 +313,7 @@ def main(argv: list[str] | None = None) -> int:
                 client,
                 args.secret_file,
                 replace_secret=args.replace_secret,
+                consent_code=args.consent_code,
             )
             print_json(response)
             return 0

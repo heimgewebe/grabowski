@@ -808,6 +808,47 @@
       "tool": "grabowski_fleet_run"
     },
     {
+      "category": "device-worker",
+      "description": "Read the Juno iPad agent health or one authenticated job receipt.",
+      "effects": [],
+      "id": "grabowski_juno_status",
+      "purpose": "Read bounded health and job evidence from the paired Juno device worker.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_juno_status"
+    },
+    {
+      "category": "device-worker",
+      "description": "Pair the locally consented Juno iPad agent without exposing its secret.",
+      "effects": [
+        "device-key-create",
+        "local-secret-create-or-replace",
+        "receipt-create"
+      ],
+      "id": "grabowski_juno_pair",
+      "purpose": "Pair one exact Juno session after local consent and explicit escalation.",
+      "read_only": false,
+      "reversibility": "remove-both-pairing-files-and-restart",
+      "risk_class": "high",
+      "tool": "grabowski_juno_pair"
+    },
+    {
+      "category": "device-worker",
+      "description": "Run one locally consented, hash-bound Python job inside the Juno process.",
+      "effects": [
+        "device-job-execute",
+        "device-state-change",
+        "receipt-create"
+      ],
+      "id": "grabowski_juno_run",
+      "purpose": "Run one bounded digest-bound job on the paired Juno device worker.",
+      "read_only": false,
+      "reversibility": "job-dependent-with-local-stop-switch",
+      "risk_class": "high",
+      "tool": "grabowski_juno_run"
+    },
+    {
       "category": "operation",
       "description": "List validated named operations.",
       "effects": [],
@@ -1815,6 +1856,9 @@
       "grabowski_power_run",
       "grabowski_fleet_list",
       "grabowski_fleet_run",
+      "grabowski_juno_status",
+      "grabowski_juno_pair",
+      "grabowski_juno_run",
       "grabowski_operation_list",
       "grabowski_operation_plan",
       "grabowski_operation_run",
@@ -2052,6 +2096,10 @@
       {
         "module": "grabowski_job_finalizer",
         "source": "src/grabowski_job_finalizer.py"
+      },
+      {
+        "module": "grabowski_juno",
+        "source": "src/grabowski_juno.py"
       }
     ]
   },
@@ -2063,7 +2111,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "9358d922928c7478e47df46901da8a585e716199fa86fb869efa8b23b968721e"
+      "sha256": "2af841f219be0bd69d2b86312e88e1e011ba33ac8912a7636629d0385e1bb899"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2071,7 +2119,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "51062bb6992c6a849781b39b08d9fa1924b90c996b9a77b661b36fa6c521d6b4"
+      "sha256": "e3369e74b5d7d23c958eca66bc17f12755f44409390774ed45de6a8822819694"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2086,7 +2134,7 @@
       "src/grabowski_blockade_store.py": "a726bc14df0889086db29fd6be94ea5e028e5bcde3d4f08cf199ece1bbae2dfe",
       "src/grabowski_blockades.py": "8eaecba9ddfc9e5007183ccfc30301560860fd243e8782283d5a4722bca72120",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "9358d922928c7478e47df46901da8a585e716199fa86fb869efa8b23b968721e",
+      "src/grabowski_capabilities.py": "2af841f219be0bd69d2b86312e88e1e011ba33ac8912a7636629d0385e1bb899",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "6a37342b5741763db16f2792dc5370fd9fe6e7e1dc7965b7f6a8c54f8c55ec62",
       "src/grabowski_command_identity.py": "03bf7193851846d1f5b4d1bfe71a787937e424804f875ba4e021233ddbc842c9",
@@ -2097,7 +2145,8 @@
       "src/grabowski_grips.py": "da9472bff22a2db84d1f141f5f4e218f94d0731a99991af6c05f9d3b5c56982a",
       "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
-      "src/grabowski_mcp.py": "36a279af21caecc1777050460aaa45becfc300a8255b2762705e96f017204c54",
+      "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
+      "src/grabowski_mcp.py": "a8e63e96e2dd37a4799b651ee641ba5b61eeddf50979d5eee49780c66ca888de",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
       "src/grabowski_operator.py": "674c070df71d3538e6dd8edc6e373a57563650015a6d8bedae91133e4b486666",
@@ -2110,7 +2159,7 @@
       "src/grabowski_recovery.py": "1c5b0843345f5aa7d1da7f3f0c5831e647f652c83eba7733b4a2c998d291c16d",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
       "src/grabowski_resources.py": "d6e464295cd263c2cfe0b3ad1c96af6deecc961d0bd58e9f7e76825aa2a6b7e0",
-      "src/grabowski_runtime.py": "5f982b1886cad82ca39dca828b06806bc0f5a07ef59782887c175268659f206b",
+      "src/grabowski_runtime.py": "ae0ebbba0f80fce3f8a51659d872915d3a6eba834168e8bcd67b890b4a3e836c",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "1c4a9517564c2b17c39a87a076e397f0bcb2f428467be782b1b48007b063a49a",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",

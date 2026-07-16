@@ -31,19 +31,24 @@ Worker, Testknoten und Sensorzugang.
 1. `juno_ipad_agent.py` auf dem iPad in einen eigenen Ordner legen.
 2. Den Agent in Juno öffnen und starten.
 3. Die Tailscale-Verbindung aktiv lassen.
-4. Beim ersten Start wartet der Agent einmalig auf die Kopplung vom heim-pc.
-5. Auf dem heim-pc den Client mit `pair` ausführen.
+4. Beim ersten Start zeigt der Agent einen sechsstelligen lokalen Kopplungscode.
+5. Den Code innerhalb von zehn Minuten über `grabowski_juno_pair` oder den
+   lokalen Client an den wartenden Agenten übermitteln.
 
 Der Schlüssel wird dabei im Arbeitsspeicher erzeugt und über den verschlüsselten
 Tailscale-Pfad an den ungekoppelten Agenten übermittelt. Auf beiden Geräten wird
 er anschließend als private Datei gespeichert. Eine Schlüsseldatei muss nicht
-über Chat, Taildrop oder Zwischenablage transportiert werden.
+über Chat, Taildrop oder Zwischenablage transportiert werden. Der lokale
+Kopplungscode existiert nur im Arbeitsspeicher des laufenden Agenten, wird nicht
+im Health-Dokument ausgegeben und nach erfolgreicher Kopplung verworfen. Ein
+abgelaufener Code erfordert einen sichtbaren Neustart des Agenten in Juno.
 
 Juno kann ein über den Dateien- oder Dokumentanbieter geöffnetes Skript lesen,
 ohne in dessen Ordner neue Dateien anlegen zu dürfen. Der Agent prüft deshalb
 seine State-Pfade vor dem Start und verwendet in dieser Reihenfolge den
-Skriptordner, das aktuelle Arbeitsverzeichnis, den app-eigenen
-`Library/Application Support`-Bereich und zuletzt ein temporäres Verzeichnis.
+Skriptordner, den app-eigenen `Library/Application Support`-Bereich, das
+aktuelle Arbeitsverzeichnis und zuletzt ein temporäres Verzeichnis. Cache- und
+Temp-Pfade werden ausdrücklich nicht als persistent ausgewiesen.
 Die gewählte Quelle und ihre Persistenzeigenschaft erscheinen in der
 Startausgabe und im Health-Dokument. Der Pairing-Schlüssel wird im gewählten
 beschreibbaren State-Verzeichnis gespeichert, sofern keine lesbare alte
@@ -85,12 +90,29 @@ Beispiele:
 
 ```bash
 python3 tools/juno/juno_job_client.py health
-python3 tools/juno/juno_job_client.py pair
+python3 tools/juno/juno_job_client.py pair --consent-code 123456
 python3 tools/juno/juno_job_client.py run /pfad/auftrag.py --timeout 60
 python3 tools/juno/juno_job_client.py list --limit 20
 python3 tools/juno/juno_job_client.py status job-...
 python3 tools/juno/juno_job_client.py shutdown
 ```
+
+## Typisierte Grabowski-Werkzeuge
+
+Der produktive Operatorpfad verwendet keine generischen Terminal- oder
+`curl`-Aufrufe, sondern drei eigene Werkzeuge:
+
+- `grabowski_juno_status`: liest Health und optional einen signierten Jobbeleg,
+- `grabowski_juno_pair`: koppelt nur mit lokal sichtbarem Code, exakter
+  `started_at`-Bindung und frischer Sitzungseskalation,
+- `grabowski_juno_run`: führt genau einen Auftrag mit passendem Code-SHA-256,
+  exakter Agent-Instanz und lokalem Receipt aus.
+
+Pairing und Aufträge bleiben Hochrisikoaktionen. Sie benötigen eine kurze, auf
+`ipad-10th-gen-wifi` beziehungsweise `100.111.206.65` gebundene
+`session_escalation`. Weder Schlüssel noch Kopplungscode erscheinen in den
+Werkzeugantworten oder Receipts. Die lokale Juno-Stopptaste bleibt der harte
+Abbruchpfad.
 
 Ein Auftrag kann ein JSON-kompatibles Ergebnis über die vorbelegte Variable
 `GRABOWSKI_RESULT` liefern:
@@ -120,9 +142,13 @@ Vorbelegte Namen:
 
 Der Health-Endpunkt enthält keine Geheimnisse. Er belegt nur Laufzeit,
 Plattform, Arbeitsbereich, Kopplungszustand und den ausdrücklich aktivierten
-Ausführungsmodus. `POST /v1/pair` akzeptiert exakt einen 32-Byte-Schlüssel. Eine
-Wiederholung mit demselben Schlüssel ist idempotent; ein anderer Schlüssel wird
-nach erfolgreicher Kopplung abgewiesen.
+Ausführungsmodus und die Ablaufzeit der lokalen Zustimmung. Der Code selbst wird
+nie über HTTP ausgegeben. `POST /v1/pair` akzeptiert exakt einen
+32-Byte-Schlüssel zusammen mit dem sechsstelligen, zehn Minuten gültigen Code.
+Nach fünf falschen Codes wird die lokale Zustimmung gesperrt und ein sichtbarer
+Agent-Neustart erforderlich. Eine Wiederholung mit demselben Schlüssel ist
+idempotent; ein anderer Schlüssel
+wird nach erfolgreicher Kopplung abgewiesen.
 
 Ist bereits eine private kanonische heim-pc-Schlüsseldatei vorhanden, verwendet
 der Client sie für die Kopplung und verändert sie nicht. Andernfalls schreibt er
