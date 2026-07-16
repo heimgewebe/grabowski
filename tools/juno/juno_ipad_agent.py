@@ -25,6 +25,7 @@ import signal
 import sys
 import threading
 import time
+import tempfile
 import traceback
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -123,21 +124,107 @@ def read_json(path: Path) -> Any:
         return json.load(handle)
 
 
-def load_secret(script_path: Path) -> tuple[bytes | None, str, Path]:
-    key_path = script_path.with_name("juno_ipad_agent.key")
+def probe_writable_directory(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    probe = path / f".grabowski-write-probe-{os.getpid()}-{threading.get_ident()}"
+    fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(b"ok")
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            probe.unlink()
+    return path.resolve()
+
+
+def default_state_root_candidates(script_path: Path) -> list[tuple[str, Path, bool]]:
+    candidates = [
+        ("script_sibling", script_path.with_name("grabowski_workspace"), True),
+    ]
+    with contextlib.suppress(OSError):
+        candidates.append(
+            ("working_directory", Path.cwd() / "grabowski_workspace", True)
+        )
+    with contextlib.suppress(OSError):
+        candidates.append(
+            (
+                "application_support",
+                Path.home()
+                / "Library"
+                / "Application Support"
+                / "GrabowskiJunoAgent",
+                True,
+            )
+        )
+    candidates.append(
+        (
+            "temporary_directory",
+            Path(tempfile.gettempdir()) / "grabowski-juno-agent",
+            False,
+        )
+    )
+    unique: list[tuple[str, Path, bool]] = []
+    seen: set[str] = set()
+    for source, candidate, persistent in candidates:
+        marker = os.path.abspath(os.fspath(candidate))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append((source, candidate, persistent))
+    return unique
+
+
+def select_state_root(
+    script_path: Path,
+    explicit_root: Path | None,
+) -> tuple[Path, str, bool, list[str]]:
+    if explicit_root is not None:
+        selected = probe_writable_directory(explicit_root.expanduser())
+        return selected, "explicit", True, []
+    failures: list[str] = []
+    for source, candidate, persistent in default_state_root_candidates(script_path):
+        try:
+            selected = probe_writable_directory(candidate)
+        except OSError as exc:
+            failures.append(f"{source}:{type(exc).__name__}:{exc.errno}")
+            continue
+        return selected, source, persistent, failures
+    raise RuntimeError(
+        "Kein beschreibbares Arbeitsverzeichnis gefunden: " + ", ".join(failures)
+    )
+
+
+def load_secret(
+    script_path: Path,
+    state_root: Path,
+) -> tuple[bytes | None, str, Path]:
     environment_secret = os.environ.get("GRABOWSKI_JUNO_SECRET")
     if environment_secret is not None:
         secret = environment_secret.encode("utf-8")
-        source = "environment"
-    else:
+        if len(secret) < PAIRING_SECRET_BYTES:
+            raise RuntimeError("Agent-Schlüssel muss mindestens 32 Byte lang sein")
+        return secret, "environment", state_root / "juno_ipad_agent.key"
+    script_key = script_path.with_name("juno_ipad_agent.key")
+    state_key = state_root / "juno_ipad_agent.key"
+    key_candidates = [script_key]
+    if state_key != script_key:
+        key_candidates.append(state_key)
+    for key_path in key_candidates:
         try:
             secret = key_path.read_bytes()
         except FileNotFoundError:
-            return None, "unpaired", key_path
-        source = key_path.name
-    if len(secret) < PAIRING_SECRET_BYTES:
-        raise RuntimeError("Agent-Schlüssel muss mindestens 32 Byte lang sein")
-    return secret, source, key_path
+            continue
+        except OSError:
+            if key_path == script_key and state_key != script_key:
+                continue
+            raise
+        if len(secret) < PAIRING_SECRET_BYTES:
+            raise RuntimeError("Agent-Schlüssel muss mindestens 32 Byte lang sein")
+        return secret, str(key_path), key_path
+    return None, "unpaired", state_key
 
 
 class AuthenticationError(ValueError):
@@ -276,8 +363,12 @@ class AgentState:
         root: Path,
         *,
         start_worker: bool = True,
+        storage_source: str = "explicit",
+        storage_persistent: bool = True,
     ) -> None:
         self.root = root.resolve()
+        self.storage_source = storage_source
+        self.storage_persistent = storage_persistent
         self.jobs_root = self.root / "jobs"
         self.workspace = self.root / "workspace"
         self.audit_path = self.root / "audit.jsonl"
@@ -729,6 +820,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                     "python": platform.python_version(),
                     "platform": platform.platform(),
                     "workspace": str(self.agent_server.state.workspace),
+                    "state_root": str(self.agent_server.state.root),
+                    "state_storage_source": self.agent_server.state.storage_source,
+                    "state_persistent": self.agent_server.state.storage_persistent,
                     "secret_source": self.agent_server.secret_source,
                     "paired": self.agent_server.is_paired(),
                     "pairing_peer": self.agent_server.pairing_peer,
@@ -932,19 +1026,22 @@ def main(argv: list[str] | None = None) -> int:
     if not 1 <= args.port <= 65535:
         raise SystemExit("Port muss zwischen 1 und 65535 liegen")
     script_path = Path(__file__).resolve()
-    secret, secret_source, key_path = load_secret(script_path)
     try:
         pairing_peer = str(ipaddress.ip_address(args.pairing_peer.split("%", 1)[0]))
     except ValueError as exc:
         raise SystemExit("--pairing-peer muss eine gültige IP-Adresse sein") from exc
     if not client_address_allowed(pairing_peer):
         raise SystemExit("--pairing-peer muss Loopback oder eine Tailscale-IP sein")
-    state_root = (
-        args.state_root.resolve()
-        if args.state_root is not None
-        else script_path.with_name("grabowski_workspace")
+    state_root, state_source, state_persistent, state_fallbacks = select_state_root(
+        script_path,
+        args.state_root,
     )
-    state = AgentState(state_root)
+    secret, secret_source, key_path = load_secret(script_path, state_root)
+    state = AgentState(
+        state_root,
+        storage_source=state_source,
+        storage_persistent=state_persistent,
+    )
     started_at = utc_now()
     server = AgentHTTPServer(
         (args.host, args.port),
@@ -969,6 +1066,15 @@ def main(argv: list[str] | None = None) -> int:
     print("Grabowski Juno iPad Agent läuft.")
     print(f"Bind: {args.host}:{args.port}")
     print(f"State: {state_root}")
+    print(
+        f"State-Modus: {state_source}; "
+        f"{'persistent' if state_persistent else 'temporär'}"
+    )
+    if state_fallbacks:
+        print(
+            "Hinweis: frühere Standardpfade waren nicht beschreibbar; "
+            "ein zulässiger Ersatzpfad wurde automatisch gewählt."
+        )
     print(f"Schlüsselquelle: {secret_source}")
     if secret is None:
         print(f"Kopplung: wartet einmalig auf {pairing_peer}")
