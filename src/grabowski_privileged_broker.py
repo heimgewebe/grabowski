@@ -11,6 +11,8 @@ import tempfile
 import time
 from typing import Any
 
+from grabowski_blockade_authority import resolve_lifecycle
+
 MAX_INPUT_BYTES = 64 * 1024
 MAX_CONFIG_BYTES = 512 * 1024
 MAX_TTL_SECONDS = 900
@@ -569,14 +571,29 @@ def _resolve_recovery_marker_publish_action(
         "expected_source_uid", "max_recovery_age_seconds", "configured_target",
         "kill_switch_path", "require_root_owned_destination",
     }
-    if not isinstance(candidate, dict) or set(candidate) != required or candidate.get("enabled") is not True:
+    optional = {"legacy_kill_switch_path"}
+    candidate_keys = set(candidate) if isinstance(candidate, dict) else set()
+    if (
+        not isinstance(candidate, dict)
+        or not required.issubset(candidate_keys)
+        or candidate_keys - required - optional
+        or candidate.get("enabled") is not True
+    ):
         raise PermissionError("recovery marker publisher is disabled or malformed")
     if candidate.get("mode") != "recovery-marker-publish":
         raise PermissionError("recovery marker publisher mode is invalid")
     source_path = _validate_gate_path(candidate["source_path"], label="source_path")
     destination_path = _validate_gate_path(candidate["destination_path"], label="destination_path")
     kill_switch = _validate_gate_path(candidate["kill_switch_path"], label="kill_switch_path")
-    if kill_switch.exists():
+    legacy_switch = (
+        _validate_gate_path(
+            candidate["legacy_kill_switch_path"],
+            label="legacy_kill_switch_path",
+        )
+        if candidate.get("legacy_kill_switch_path") is not None
+        else None
+    )
+    if kill_switch.exists() or (legacy_switch is not None and legacy_switch.exists()):
         raise PermissionError("power kill-switch is engaged")
     expected_uid = candidate["expected_source_uid"]
     max_age = candidate["max_recovery_age_seconds"]
@@ -825,10 +842,23 @@ def _validate_power_gate(value: Any, *, now: int | None = None) -> dict[str, Any
         "require_root_owned_gate_files",
         "configured_target",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    optional = {"legacy_kill_switch_path"}
+    if (
+        not isinstance(value, dict)
+        or not required.issubset(value)
+        or set(value) - required - optional
+    ):
         raise PermissionError("power gate is disabled or malformed")
     kill_switch = _validate_gate_path(value["kill_switch_path"], label="kill_switch_path")
-    if kill_switch.exists():
+    legacy_switch = (
+        _validate_gate_path(
+            value["legacy_kill_switch_path"],
+            label="legacy_kill_switch_path",
+        )
+        if value.get("legacy_kill_switch_path") is not None
+        else None
+    )
+    if kill_switch.exists() or (legacy_switch is not None and legacy_switch.exists()):
         raise PermissionError("power kill-switch is engaged")
     marker = _validate_gate_path(value["recovery_marker_path"], label="recovery_marker_path")
     max_age = value["max_recovery_age_seconds"]
@@ -874,6 +904,47 @@ def _validate_power_gate(value: Any, *, now: int | None = None) -> dict[str, Any
         "recovery_marker_freshness_reason": inspected["freshness_reason"],
         "recovery_marker_configured_target": inspected["configured_target"],
     }
+
+def _validate_recovery_gate(value: Any, *, now: int | None = None) -> dict[str, Any]:
+    required = {
+        "recovery_marker_path",
+        "max_recovery_age_seconds",
+        "require_root_owned_gate_files",
+        "configured_target",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise PermissionError("recovery gate is disabled or malformed")
+    marker = _validate_gate_path(value["recovery_marker_path"], label="recovery_marker_path")
+    max_age = value["max_recovery_age_seconds"]
+    if isinstance(max_age, bool) or not isinstance(max_age, int) or not 1 <= max_age <= MAX_RECOVERY_AGE_SECONDS:
+        raise ValueError("recovery max_recovery_age_seconds is invalid")
+    require_root_owned = value["require_root_owned_gate_files"]
+    if not isinstance(require_root_owned, bool):
+        raise ValueError("recovery require_root_owned_gate_files is invalid")
+    configured_target = value["configured_target"]
+    if not isinstance(configured_target, str) or not configured_target:
+        raise ValueError("recovery configured_target is invalid")
+    inspected = inspect_canonical_recovery_record(
+        marker,
+        now=now,
+        expected_max_age_seconds=max_age,
+        expected_target=configured_target,
+        require_root_owned=require_root_owned,
+    )
+    if not inspected.get("valid"):
+        reason = str(inspected.get("freshness_reason") or "not-ready")
+        raise PermissionError(f"recovery gate is not ready: {reason}")
+    return {
+        "recovery_marker_path": str(marker),
+        "recovery_marker_sha256": inspected["record_sha256"],
+        "recovery_marker_source_sha256": inspected["source_record_sha256"],
+        "recovery_marker_timestamp_unix": inspected["generated_at_unix"],
+        "recovery_marker_age_seconds": inspected["age_seconds"],
+        "recovery_marker_max_age_seconds": inspected["max_age_seconds"],
+        "recovery_marker_freshness_reason": inspected["freshness_reason"],
+        "recovery_marker_configured_target": inspected["configured_target"],
+    }
+
 
 def _validate_power_timeout(value: Any, *, configured_max: int) -> int:
     if not isinstance(value, int) or not 1 <= value <= 3600:
@@ -972,6 +1043,12 @@ def resolve_execution(config: dict[str, Any], reference: dict[str, Any]) -> dict
         return _resolve_power_argv_action(candidate, reference)
     if mode == "recovery-marker-publish":
         return _resolve_recovery_marker_publish_action(candidate, reference)
+    if mode == "blockade-marker-lifecycle":
+        return resolve_lifecycle(
+            candidate,
+            reference["target"],
+            recovery_gate_validator=_validate_recovery_gate,
+        )
     raise PermissionError("privileged action mode is disabled or malformed")
 
 

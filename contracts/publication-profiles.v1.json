@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "8bf1d561e5b2623ced96fbcc5fdcb640400f9a35a7cbf118da07fca39dca2d86"
+    "sha256": "9e55cb5edf43e7f7ce254d28a027f73e5a1f575f19887e2cc8444239b329d454"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "c0d1e4379d6ef2561cb24fe4b5a7fe662842c41683abc83a5e11bd7d8b4eb05a"
+    "sha256": "70ec634cade77c8d24058ad3f7475520c77d5a9eecdfa043e054e58680298447"
   },
   "counts": {
     "core": 21,
-    "full": 140,
-    "operator": 125
+    "full": 141,
+    "operator": 126
   },
   "profiles": {
     "core": [
@@ -132,6 +132,7 @@
       "grabowski_recovery_server_probe",
       "grabowski_operator_blockade_status",
       "grabowski_operator_blockade_engage",
+      "grabowski_operator_blockade_migrate_legacy",
       "grabowski_operator_blockade_disarm",
       "grabowski_friction_record",
       "grabowski_friction_resolve",
@@ -259,6 +260,7 @@
       "grabowski_recovery_server_probe",
       "grabowski_operator_blockade_status",
       "grabowski_operator_blockade_engage",
+      "grabowski_operator_blockade_migrate_legacy",
       "grabowski_operator_blockade_disarm",
       "grabowski_friction_record",
       "grabowski_friction_resolve",

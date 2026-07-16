@@ -95,6 +95,7 @@
     "grabowski_recovery_server_probe",
     "grabowski_operator_blockade_status",
     "grabowski_operator_blockade_engage",
+    "grabowski_operator_blockade_migrate_legacy",
     "grabowski_operator_blockade_disarm",
     "grabowski_friction_record",
     "grabowski_friction_resolve",
@@ -161,6 +162,10 @@
     {
       "module": "grabowski_blockade_store",
       "source": "src/grabowski_blockade_store.py"
+    },
+    {
+      "module": "grabowski_blockade_authority",
+      "source": "src/grabowski_blockade_authority.py"
     },
     {
       "module": "grabowski_grips",

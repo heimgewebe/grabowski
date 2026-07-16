@@ -803,6 +803,7 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             "BindReadOnlyPaths=-/home/alex/.local/state/grabowski/operator-kill-switch",
             service_unit,
         )
+        self.assertNotIn("BindPaths=/home/alex", service_unit)
         self.assertNotIn("ProtectHome=yes", service_unit)
         self.assertIn("ExecStart=/usr/local/libexec/grabowski-privileged-broker", service_unit)
         self.assertNotIn("SuccessExitStatus=", service_unit)

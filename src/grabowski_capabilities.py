@@ -527,6 +527,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["blockade-marker-quarantine", "audit-record"],
         "reversibility": "hash-bound-restore-on-failure",
     },
+    "grabowski_operator_blockade_migrate_legacy": {
+        "category": "recovery",
+        "purpose": "Migrate one exact typed legacy blockade into the root-owned authority domain without opening a mutation gap.",
+        "risk_class": "high",
+        "effects": ["blockade-marker-create", "blockade-marker-remove", "audit-record"],
+        "reversibility": "create-first-fail-closed-dual-marker",
+    },
     "grabowski_friction_record": {
         "category": "operations-observability",
         "purpose": "Record one bounded operator-friction event for later analysis.",

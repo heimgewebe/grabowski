@@ -118,7 +118,7 @@ may mutate state:
 - observed marker path equal to an expected canonical path supplied separately
   by the trusted runtime adapter, not by the evidence payload;
 - marker present, regular and single-link;
-- mode `0600` and expected owner;
+- mode `0600` for an isolated user fixture or `0644` for the root-owned production marker, with the expected owner;
 - external environment stop absent;
 - valid audit history;
 - valid deployed provenance;
@@ -130,12 +130,24 @@ create-only or quarantine transaction, directory fsync, absence readback and
 audit receipt. No generic write, terminal or indirect execution surface may
 create or clear the canonical record.
 
-## Legacy compatibility
+## Root authority and legacy compatibility
 
-A legacy canonical marker is adapted to a global `hard_stop` record with an
-in-band recovery policy. An external environment stop is adapted to a global
-`hard_stop` with `external_only` recovery. These adapters are deterministic and
-do not mutate state.
+The production marker is root-owned beneath a non-operator-writable authority
+directory. Engage, disarm and exact transaction recovery are handled by the
+internal root-broker lifecycle documented in
+`docs/operator-blockade-authority-v2.md`. Migration is deliberately split: the
+root broker publishes and verifies the canonical marker, then the operator
+runtime removes only the exact operator-owned legacy preimage. Generic file and
+command surfaces reserve both paths outside this typed flow.
+
+Canonical and legacy markers are observed independently during cutover. A typed
+legacy marker remains a global `hard_stop` until an exact create-first migration
+has published and verified the root-owned marker and removed the unchanged
+legacy preimage. A cleanup failure leaves both markers present and therefore
+fail-closed. Unsafe, malformed or uncertain marker observations remain
+fail-closed. An external environment stop is adapted to a global `hard_stop`
+with `external_only` recovery. These read adapters are deterministic and do not
+mutate state.
 
 ## Test isolation
 
@@ -144,8 +156,7 @@ Blockade and denial proofs must run against a transient process with temporary
 reject the canonical production path. Success, exceptions and signal cleanup
 must leave production state byte-for-byte unchanged.
 
-The initial core intentionally does not modify `src/grabowski_mcp.py`,
-`src/grabowski_capabilities.py`, generated contracts or runtime entrypoints.
-Those files were held by an independent workspace lease when this phase began.
-Runtime integration follows only after authoritative release of those exact
-resources.
+The runtime integration now observes both marker domains, exposes an exact
+legacy migration tool and binds the root-authority module into deployment source
+identity. Tests continue to use temporary state and must never set the production
+marker merely to prove denial behavior.

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "97aa1f67e5d937e35796c2d7db9e99bb074fa9dd8e51b0fc9104e605ea5dca62",
+  "capability_source_sha256": "c6a8526262f4eb0ba792d01ff063628f62fa9b3198815541a2881868d3bc3d13",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "8bf1d561e5b2623ced96fbcc5fdcb640400f9a35a7cbf118da07fca39dca2d86",
+  "contract_sha256": "9e55cb5edf43e7f7ce254d28a027f73e5a1f575f19887e2cc8444239b329d454",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1193,7 +1193,7 @@
     },
     {
       "category": "recovery",
-      "description": "Create one canonical typed blockade marker without replacing any entry.",
+      "description": "Create one root-owned typed blockade through the narrow broker.",
       "effects": [
         "blockade-marker-create",
         "audit-record"
@@ -1207,7 +1207,22 @@
     },
     {
       "category": "recovery",
-      "description": "Quarantine one exact typed blockade after live recovery evidence passes.",
+      "description": "Move one exact typed legacy marker into the root-owned authority domain.",
+      "effects": [
+        "blockade-marker-create",
+        "blockade-marker-remove",
+        "audit-record"
+      ],
+      "id": "grabowski_operator_blockade_migrate_legacy",
+      "purpose": "Migrate one exact typed legacy blockade into the root-owned authority domain without opening a mutation gap.",
+      "read_only": false,
+      "reversibility": "create-first-fail-closed-dual-marker",
+      "risk_class": "high",
+      "tool": "grabowski_operator_blockade_migrate_legacy"
+    },
+    {
+      "category": "recovery",
+      "description": "Quarantine one exact root-owned blockade after recovery evidence passes.",
       "effects": [
         "blockade-marker-quarantine",
         "audit-record"

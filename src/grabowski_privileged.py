@@ -101,6 +101,7 @@ def grabowski_privileged_broker_status() -> dict[str, Any]:
 
 POWER_ACTION = "operator_power_argv"
 RECOVERY_PUBLISH_ACTION = "publish_recovery_marker"
+BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 POWER_REFERENCE_TTL_SECONDS = 900
 POWER_MAX_TARGET_BYTES = 48 * 1024
 POWER_REFERENCE_DIR = Path(os.environ.get(
@@ -355,6 +356,128 @@ def publish_recovery_marker_reference(
         "failure_reason": failure_reason,
         "broker_response": parsed,
         "publication": publication,
+        "stderr": stderr,
+    }
+
+
+def run_blockade_lifecycle_reference(
+    payload: dict[str, Any],
+    *,
+    justification: str,
+) -> dict[str, Any]:
+    """Submit one marker lifecycle operation without automatic retry.
+
+    A timeout or malformed broker response is ``unknown`` because the root
+    mutation may already have committed. The caller must classify that state
+    through exact marker readback.
+    """
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("blockade lifecycle payload must be a non-empty object")
+    reason = _normalize_power_justification(justification)
+    broker = grabowski_privileged_broker_status()
+    if not broker.get("ready"):
+        raise PermissionError("privileged broker is not ready")
+    target = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    reference = _create_privileged_reference(
+        action=BLOCKADE_LIFECYCLE_ACTION,
+        target=target,
+        justification=reason,
+    )
+    reference_path = _write_power_reference(reference)
+    client = str(broker["request_client"])
+    timed_out = False
+    returncode: int | None
+    try:
+        completed = subprocess.run(
+            [client, str(reference_path)],
+            cwd="/",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=45,
+            check=False,
+            env={
+                "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            },
+        )
+        returncode = completed.returncode
+        stdout_raw = completed.stdout
+        stderr_raw = completed.stderr
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        returncode = None
+        stdout_raw = exc.stdout or b""
+        stderr_raw = exc.stderr or b"privileged broker client timed out"
+    finally:
+        try:
+            reference_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    stdout = _redact_text(stdout_raw.decode("utf-8", errors="replace"))
+    stderr = _redact_text(stderr_raw.decode("utf-8", errors="replace"))
+    try:
+        parsed = json.loads(stdout) if stdout.strip() else None
+    except json.JSONDecodeError:
+        parsed = None
+    lifecycle = parsed.get("lifecycle") if isinstance(parsed, dict) else None
+    success = bool(
+        returncode == 0
+        and not timed_out
+        and isinstance(parsed, dict)
+        and parsed.get("returncode") == 0
+        and isinstance(lifecycle, dict)
+    )
+    if success:
+        outcome = "succeeded"
+        failure_reason = None
+    else:
+        # The root broker claims the request before entering the internal
+        # lifecycle and may mutate before its own audit or response fails. No
+        # client-visible error shape proves that the filesystem is unchanged.
+        outcome = "unknown"
+        if timed_out:
+            failure_reason = "privileged broker client timed out"
+        elif isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+            failure_reason = parsed["error"]
+        elif returncode not in {0, None}:
+            failure_reason = f"privileged broker client exited with {returncode}"
+        else:
+            failure_reason = (
+                stderr.strip()
+                or "privileged broker outcome requires exact root readback"
+            )
+    audit_record = {
+        "tool": "run_blockade_lifecycle_reference",
+        "action": BLOCKADE_LIFECYCLE_ACTION,
+        "operation": payload.get("operation"),
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+        "target_sha256": hashlib.sha256(target.encode("utf-8")).hexdigest(),
+        "broker_client_returncode": returncode,
+        "broker_client_timed_out": timed_out,
+        "outcome": outcome,
+        "failure_reason": failure_reason,
+    }
+    _append_operator_audit(audit_record)
+    return {
+        "success": success,
+        "outcome": outcome,
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+        "target_sha256": audit_record["target_sha256"],
+        "broker_client_returncode": returncode,
+        "broker_client_timed_out": timed_out,
+        "failure_reason": failure_reason,
+        "broker_response": parsed,
+        "lifecycle": lifecycle,
         "stderr": stderr,
     }
 

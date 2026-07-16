@@ -1415,6 +1415,34 @@
         "reversibility": "hash-bound-restore-on-failure"
       }
     },
+    "grabowski_operator_blockade_migrate_legacy": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Legacy migration must remain a dedicated create-first authority that can operate while the legacy hard stop is active, bind exact preimage hashes, publish the root-owned marker before locally removing the unchanged legacy record and retain both markers fail-closed if cleanup cannot be proven.",
+      "evidence_refs": [
+        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T002",
+        "docs:operator-blockade-authority-v2.md",
+        "tests:test_blockade_authority.py",
+        "tests:test_blockade_runtime.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because ordinary mutation is correctly blocked by the legacy marker and cannot obtain the root-owned parent, peer-cgroup, create-first and exact rollback invariants.",
+      "exception_detail": {
+        "claim": "The tool exclusively owns exact typed legacy-to-root blockade migration.",
+        "evidence": "Exact ID and hash preconditions, migration-intent and completion audits, create-only root publication, operator-local exact legacy removal, dual-marker retention on cleanup failure and post-state readback tests."
+      },
+      "tool_contract": {
+        "tool": "grabowski_operator_blockade_migrate_legacy",
+        "category": "recovery",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "audit-record",
+          "blockade-marker-create",
+          "blockade-marker-remove"
+        ],
+        "reversibility": "create-first-fail-closed-dual-marker"
+      }
+    },
     "grabowski_juno_status": {
       "justification_kind": "distinct_authority_boundary",
       "rationale": "Provide bounded observation of the private Juno device worker without generic command access.",

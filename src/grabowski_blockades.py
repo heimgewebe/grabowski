@@ -607,7 +607,7 @@ def validate_disarm(
         (evidence.marker_present, "marker_absent"),
         (evidence.marker_regular, "marker_not_regular"),
         (evidence.marker_nlink == 1, "marker_link_count_invalid"),
-        (evidence.marker_mode == 0o600, "marker_mode_invalid"),
+        (evidence.marker_mode in {0o600, 0o644}, "marker_mode_invalid"),
         (evidence.marker_owner_matches, "marker_owner_mismatch"),
         (evidence.environment_switch_off, "environment_switch_engaged"),
         (evidence.audit_valid, "audit_invalid"),
