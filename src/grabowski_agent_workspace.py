@@ -3632,6 +3632,302 @@ def _publish_workspace_outcome(
     return receipt
 
 
+WORKSPACE_RISK_LEVEL_BY_TIER = {
+    "R0": "low",
+    "R1": "medium",
+    "R2": "high",
+    "R3": "critical",
+}
+
+
+def _workspace_execution_outcome_binding_path(
+    manifest: dict[str, Any], workspace_outcome_sha256: str
+) -> Path:
+    if SHA256_RE.fullmatch(workspace_outcome_sha256) is None:
+        raise AgentWorkspaceError("workspace outcome hash is invalid")
+    return (
+        _workspace_dir(str(manifest["workspace_id"]))
+        / f"execution-outcome-binding.close.{workspace_outcome_sha256}.json"
+    )
+
+
+def _workspace_retry_measurement(manifest: dict[str, Any]) -> dict[str, int]:
+    unchanged = 0
+    changed = 0
+    total = 0
+    retries = manifest.get("role_retries", {})
+    if not isinstance(retries, dict):
+        raise AgentWorkspaceError("workspace role retry state is invalid")
+    for role in READ_ONLY_ROLES:
+        state = retries.get(role)
+        if state is None:
+            continue
+        if not isinstance(state, dict):
+            raise AgentWorkspaceError("workspace role retry state is invalid")
+        count = state.get("count")
+        attempts = state.get("attempts")
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            or count > MAX_ROLE_RETRIES
+            or not isinstance(attempts, list)
+            or len(attempts) != count
+        ):
+            raise AgentWorkspaceError("workspace role retry state is invalid")
+        for attempt in attempts:
+            if not isinstance(attempt, dict):
+                raise AgentWorkspaceError("workspace role retry attempt is invalid")
+            old_hash = attempt.get("old_command_sha256")
+            new_hash = attempt.get("new_command_sha256")
+            if (
+                not isinstance(old_hash, str)
+                or SHA256_RE.fullmatch(old_hash) is None
+                or not isinstance(new_hash, str)
+                or SHA256_RE.fullmatch(new_hash) is None
+            ):
+                raise AgentWorkspaceError("workspace role retry command identity is invalid")
+            total += 1
+            if old_hash == new_hash:
+                unchanged += 1
+            else:
+                changed += 1
+    return {"total": total, "unchanged": unchanged, "changed": changed}
+
+
+def _workspace_first_pass_success(outcome: dict[str, Any]) -> bool:
+    results = outcome.get("first_pass_role_results")
+    if not isinstance(results, dict):
+        return False
+    writer = results.get("writer")
+    tests_result = results.get("tests")
+    review = results.get("review")
+    return bool(
+        isinstance(writer, dict)
+        and writer.get("state") == "completed"
+        and isinstance(tests_result, dict)
+        and tests_result.get("status") == "passed"
+        and isinstance(review, dict)
+        and review.get("status") == "passed"
+        and review.get("verdict") == "PASS"
+    )
+
+
+def _workspace_risk_level(route: dict[str, Any]) -> str:
+    tier = route.get("risk_tier")
+    if tier is None:
+        facts = route.get("input_facts")
+        if not isinstance(facts, dict):
+            raise AgentWorkspaceError("workspace route risk evidence is unavailable")
+        tier = _route_decision(facts).get("risk_tier")
+    risk = WORKSPACE_RISK_LEVEL_BY_TIER.get(tier)
+    if risk is None:
+        raise AgentWorkspaceError("workspace route risk tier is invalid")
+    return risk
+
+
+def _bind_workspace_execution_outcome(
+    manifest: dict[str, Any], outcome: dict[str, Any]
+) -> dict[str, Any]:
+    if outcome.get("phase") != "close":
+        raise AgentWorkspaceError("execution outcome binding requires close phase")
+    if outcome.get("workspace_id") != manifest.get("workspace_id"):
+        raise AgentWorkspaceActionError("workspace outcome belongs to another workspace")
+    close_receipt = manifest.get("close_receipt")
+    close_integrity = _close_integrity_status(manifest, close_receipt)
+    if (
+        not isinstance(close_receipt, dict)
+        or close_receipt.get("state") != "complete"
+        or close_receipt.get("resources_released") is not True
+        or close_receipt.get("remaining_resource_keys") != []
+        or close_integrity.get("valid") is not True
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace execution outcome requires a valid complete close receipt"
+        )
+    workspace_outcome_sha256 = outcome.get("outcome_sha256")
+    unsigned_outcome = {
+        key: value for key, value in outcome.items() if key != "outcome_sha256"
+    }
+    if (
+        not isinstance(workspace_outcome_sha256, str)
+        or SHA256_RE.fullmatch(workspace_outcome_sha256) is None
+        or _sha256_json(unsigned_outcome) != workspace_outcome_sha256
+    ):
+        raise AgentWorkspaceActionError("workspace outcome hash is invalid")
+    route = outcome.get("route_evidence")
+    if not isinstance(route, dict):
+        raise AgentWorkspaceError("workspace route evidence is unavailable")
+    if outcome.get("route_legacy_compatibility") is True:
+        return {
+            "schema_version": 1,
+            "kind": "agent_workspace_execution_outcome_binding",
+            "workspace_id": manifest["workspace_id"],
+            "phase": "close",
+            "state": "not_applicable_legacy_route",
+            "recorded": False,
+            "does_not_establish": ["execution governor outcome"],
+        }
+    if outcome.get("evidence_complete") is not True:
+        missing = outcome.get("missing_fields")
+        raise AgentWorkspaceActionError(
+            "workspace execution outcome evidence is incomplete: "
+            + ", ".join(str(item) for item in missing if isinstance(item, str))
+        )
+    if route.get("status") != "verified" or route.get("evidence_complete") is not True:
+        raise AgentWorkspaceActionError("workspace route evidence is not verified")
+    recommendation_id = route.get("recommendation_id")
+    recommended_route = route.get("recommended_route")
+    actual_route = route.get("actual_route")
+    if (
+        not isinstance(recommendation_id, str)
+        or SHA256_RE.fullmatch(recommendation_id) is None
+        or recommended_route not in ROUTE_EXECUTION_MODES
+        or actual_route not in ROUTE_EXECUTION_MODES
+    ):
+        raise AgentWorkspaceActionError("workspace route binding is invalid")
+    elapsed_seconds = outcome.get("elapsed_seconds")
+    if (
+        isinstance(elapsed_seconds, bool)
+        or not isinstance(elapsed_seconds, int)
+        or elapsed_seconds < 0
+        or elapsed_seconds > 86_400
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace elapsed time is outside the execution governor bound"
+        )
+    tool_calls = outcome.get("tool_calls")
+    tool_call_count = (
+        tool_calls.get("known_mutating_call_count")
+        if isinstance(tool_calls, dict)
+        else None
+    )
+    if (
+        not isinstance(tool_calls, dict)
+        or tool_calls.get("event_log_integrity_bound") is not True
+        or tool_calls.get("counting_basis")
+        != "integrity_valid_workspace_event_log"
+        or isinstance(tool_call_count, bool)
+        or not isinstance(tool_call_count, int)
+        or tool_call_count < 1
+        or tool_call_count > 1000
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace tool-call evidence is not integrity-bound"
+        )
+    retry_measurement = _workspace_retry_measurement(manifest)
+    first_pass_success = _workspace_first_pass_success(outcome)
+    mapped = {
+        "recommendation_id": recommendation_id,
+        "operation_class": "long_running",
+        "risk_level": _workspace_risk_level(route),
+        "recommended_route": recommended_route,
+        "actual_route": actual_route,
+        "first_pass_success": first_pass_success,
+        "unchanged_retries": retry_measurement["unchanged"],
+        "ambiguous_mutation_outcomes": 0,
+        "tool_call_count": tool_call_count,
+        "elapsed_ms": elapsed_seconds * 1000,
+        "evidence_ref": (
+            f"artifact:agent-workspace:{manifest['workspace_id']}:"
+            f"close:{workspace_outcome_sha256}"
+        ),
+        "regression_signal": not first_pass_success,
+        "friction_event_ids": [],
+    }
+    binding_material = {
+        "schema_version": 1,
+        "kind": "agent_workspace_execution_outcome_binding",
+        "workspace_id": manifest["workspace_id"],
+        "phase": "close",
+        "workspace_outcome_sha256": workspace_outcome_sha256,
+        "mapped_outcome": mapped,
+    }
+    binding_id = _sha256_json(binding_material)
+    import grabowski_friction as friction
+
+    ledger = friction.record_execution_outcome_once(
+        binding_id=binding_id,
+        **mapped,
+    )
+    receipt = {
+        **binding_material,
+        "binding_id": binding_id,
+        "state": "recorded",
+        "recorded": True,
+        "execution_outcome_id": ledger["outcome_id"],
+        "shadow_mode": ledger["shadow_mode"],
+        "measurement_basis": {
+            "operation_class": "agent workspace is a durable multi-role execution",
+            "risk_level": "deterministic route-policy risk tier mapping",
+            "first_pass_success": "writer completed and tests/review first attempts passed with review verdict PASS",
+            "unchanged_retries": "only retry attempts whose old and new command SHA-256 values are identical",
+            "changed_retries_excluded": retry_measurement["changed"],
+            "total_role_retries_observed": retry_measurement["total"],
+            "ambiguous_mutation_outcomes": "zero only after a valid complete close receipt, frozen Git readback and verified resource release",
+            "tool_call_count": tool_calls.get("counting_basis"),
+            "read_only_tool_calls_counted": False,
+            "elapsed_ms": "exact whole elapsed seconds from workspace creation to close",
+        },
+        "does_not_establish": [
+            "general productivity improvement",
+            "read-only tool call count",
+            "live routing promotion",
+            "merge or deployment success",
+        ],
+    }
+    receipt["receipt_sha256"] = _sha256_json(receipt)
+    receipt_path = _workspace_execution_outcome_binding_path(
+        manifest, workspace_outcome_sha256
+    )
+    if receipt_path.exists():
+        existing = _load_json(receipt_path)
+        if existing != receipt:
+            raise AgentWorkspaceActionError(
+                "existing workspace execution outcome binding differs"
+            )
+    else:
+        _atomic_json(receipt_path, receipt)
+    references = dict(manifest.get("execution_outcome_bindings", {}))
+    references["close"] = {
+        "path": str(receipt_path),
+        "binding_id": binding_id,
+        "execution_outcome_id": ledger["outcome_id"],
+        "receipt_sha256": receipt["receipt_sha256"],
+    }
+    manifest["execution_outcome_bindings"] = references
+    return receipt
+
+
+def _ensure_workspace_closed_event(
+    manifest: dict[str, Any],
+    close_receipt: dict[str, Any],
+    execution_outcome_binding: dict[str, Any],
+) -> None:
+    counts, _integrity_bound = _workspace_event_type_counts(manifest)
+    count = counts.get("workspace_closed", 0)
+    if count > 1:
+        raise AgentWorkspaceActionError(
+            "workspace event log contains duplicate close events"
+        )
+    if count == 0:
+        _append_workspace_event(
+            manifest,
+            "workspace_closed",
+            outcome=str(close_receipt["closure_outcome"]),
+            evidence={
+                "receipt_sha256": close_receipt["receipt_sha256"],
+                "resources_released": close_receipt["resources_released"],
+                "execution_outcome_binding_state": execution_outcome_binding.get(
+                    "state"
+                ),
+                "execution_outcome_binding_id": execution_outcome_binding.get(
+                    "binding_id"
+                ),
+            },
+        )
+
+
 def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict[str, Any]:
     snapshot: dict[str, Any]
     try:
@@ -5414,15 +5710,64 @@ def grabowski_agent_workspace_close(
                 raise AgentWorkspaceError("existing close receipt integrity is invalid")
             if existing.get("expected_head") != head or existing.get("expected_diff_sha256") != diff_sha or existing.get("expected_result_sha256") != result_sha:
                 raise AgentWorkspaceError("workspace was closed with different bindings")
+            outcome_path = _outcome_receipt_path(manifest, "close")
+            if outcome_path.is_file():
+                outcome_receipt = _load_json(outcome_path)
+                observed_outcome_sha256 = outcome_receipt.get("outcome_sha256")
+                unsigned_outcome = {
+                    key: value
+                    for key, value in outcome_receipt.items()
+                    if key != "outcome_sha256"
+                }
+                if (
+                    not isinstance(observed_outcome_sha256, str)
+                    or SHA256_RE.fullmatch(observed_outcome_sha256) is None
+                    or _sha256_json(unsigned_outcome) != observed_outcome_sha256
+                    or outcome_receipt.get("workspace_id") != identifier
+                    or outcome_receipt.get("phase") != "close"
+                    or outcome_receipt.get("outcome_identity")
+                    != _outcome_identity(manifest, "close")
+                ):
+                    raise AgentWorkspaceActionError(
+                        "existing workspace outcome receipt integrity is invalid"
+                    )
+                references = dict(manifest.get("outcome_receipts", {}))
+                current = references.get("close")
+                history = (
+                    list(current.get("history", []))
+                    if isinstance(current, dict)
+                    and isinstance(current.get("history"), list)
+                    else []
+                )
+                reference = {
+                    "path": str(outcome_path),
+                    "outcome_identity": outcome_receipt["outcome_identity"],
+                    "outcome_sha256": observed_outcome_sha256,
+                }
+                if not any(
+                    isinstance(item, dict)
+                    and item.get("outcome_sha256") == observed_outcome_sha256
+                    for item in history
+                ):
+                    history.append(reference)
+                references["close"] = {**reference, "history": history}
+                manifest["outcome_receipts"] = references
+            else:
+                outcome_receipt = _publish_workspace_outcome(manifest, "close")
+            _write_manifest(manifest)
+            execution_outcome_binding = _bind_workspace_execution_outcome(
+                manifest, outcome_receipt
+            )
+            _ensure_workspace_closed_event(
+                manifest, existing, execution_outcome_binding
+            )
+            _write_manifest(manifest)
             return {
                 "workspace_id": identifier,
                 "close_receipt": existing,
                 "idempotent": True,
-                "outcome_receipt": (
-                    _load_json(_outcome_receipt_path(manifest, "close"))
-                    if _outcome_receipt_path(manifest, "close").is_file()
-                    else None
-                ),
+                "outcome_receipt": outcome_receipt,
+                "execution_outcome_binding": execution_outcome_binding,
                 "external_closeout_checklist": _external_closeout_checklist(manifest),
             }
         collection = manifest.get("collection")
@@ -5588,10 +5933,14 @@ def grabowski_agent_workspace_close(
         receipt["receipt_sha256"] = _sha256_json(receipt)
         _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
         manifest["close_receipt"] = receipt
+        _write_manifest(manifest)
         outcome_receipt = _publish_workspace_outcome(manifest, "close")
-        _append_workspace_event(
-            manifest, "workspace_closed", outcome=receipt["closure_outcome"],
-            evidence={"receipt_sha256": receipt["receipt_sha256"], "resources_released": receipt["resources_released"]},
+        _write_manifest(manifest)
+        execution_outcome_binding = _bind_workspace_execution_outcome(
+            manifest, outcome_receipt
+        )
+        _ensure_workspace_closed_event(
+            manifest, receipt, execution_outcome_binding
         )
         _write_manifest(manifest)
         base._append_audit(
@@ -5610,6 +5959,7 @@ def grabowski_agent_workspace_close(
             "close_receipt": receipt,
             "idempotent": False,
             "outcome_receipt": outcome_receipt,
+            "execution_outcome_binding": execution_outcome_binding,
             "external_closeout_checklist": _external_closeout_checklist(manifest),
         }
 

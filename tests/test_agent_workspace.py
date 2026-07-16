@@ -48,6 +48,7 @@ import grabowski_agent_sandbox as sandbox
 import grabowski_agent_workspace as workspace
 import grabowski_agent_writer as writer
 import grabowski_command_identity as command_identity
+import grabowski_friction as friction
 
 
 def run(cwd: Path, *argv: str) -> str:
@@ -233,6 +234,16 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.git = GitFixture(self.root)
         self.state = self.root / "state"
         self.state.mkdir()
+        self.outcome_log_patch = mock.patch.object(
+            friction, "EXECUTION_OUTCOME_LOG", self.state / "execution-outcomes.jsonl"
+        )
+        self.outcome_log_patch.start()
+        self.addCleanup(self.outcome_log_patch.stop)
+        self.outcome_audit_patch = mock.patch.object(
+            friction.base, "_append_audit", return_value=None
+        )
+        self.outcome_audit_patch.start()
+        self.addCleanup(self.outcome_audit_patch.stop)
         self.checkout_state = self.root / "checkout-state"
         self.checkout_patches = [
             mock.patch.object(
@@ -4440,6 +4451,133 @@ class AgentWorkspaceTests(unittest.TestCase):
 
 
 
+
+    def persist_complete_close_receipt(self, manifest: dict) -> dict:
+        receipt = signed_receipt(
+            {
+                "schema_version": 1,
+                "state": "complete",
+                "workspace_id": manifest["workspace_id"],
+                "resources_released": True,
+                "remaining_resource_keys": [],
+                "closure_outcome": "successful",
+            }
+        )
+        manifest["close_receipt"] = receipt
+        workspace._atomic_json(
+            workspace._workspace_dir(manifest["workspace_id"]) / "close-receipt.json",
+            receipt,
+        )
+        return receipt
+
+    def test_complete_workspace_close_outcome_binds_governor_once(self) -> None:
+        manifest = self.manifest()
+        self.persist_complete_close_receipt(manifest)
+        manifest["route_evidence"] = workspace._normalize_route_evidence(
+            complete_route_evidence()
+        )
+        same = "1" * 64
+        changed = "2" * 64
+        manifest["role_retries"] = {
+            "tests": {
+                "count": 1,
+                "attempts": [
+                    {
+                        "old_command_sha256": same,
+                        "new_command_sha256": same,
+                    }
+                ],
+            },
+            "review": {
+                "count": 1,
+                "attempts": [
+                    {
+                        "old_command_sha256": same,
+                        "new_command_sha256": changed,
+                    }
+                ],
+            },
+        }
+        outcome = {
+            "workspace_id": manifest["workspace_id"],
+            "phase": "close",
+            "route_evidence": manifest["route_evidence"],
+            "route_legacy_compatibility": False,
+            "evidence_complete": True,
+            "missing_fields": [],
+            "first_pass_role_results": {
+                "writer": {"state": "completed", "receipt_sha256": "d" * 64},
+                "tests": {"status": "passed", "returncode": 0, "receipt_sha256": "e" * 64},
+                "review": {
+                    "status": "passed",
+                    "returncode": 0,
+                    "verdict": "PASS",
+                    "receipt_sha256": "f" * 64,
+                },
+            },
+            "elapsed_seconds": 600,
+            "tool_calls": {
+                "known_mutating_call_count": 5,
+                "counting_basis": "integrity_valid_workspace_event_log",
+                "event_log_integrity_bound": True,
+            },
+        }
+        outcome["outcome_sha256"] = workspace._sha256_json(outcome)
+        first = workspace._bind_workspace_execution_outcome(manifest, outcome)
+        second = workspace._bind_workspace_execution_outcome(manifest, outcome)
+        self.assertEqual(first, second)
+        self.assertEqual(first["state"], "recorded")
+        self.assertEqual(first["mapped_outcome"]["unchanged_retries"], 1)
+        self.assertEqual(
+            first["measurement_basis"]["changed_retries_excluded"], 1
+        )
+        self.assertEqual(first["mapped_outcome"]["ambiguous_mutation_outcomes"], 0)
+        self.assertEqual(first["mapped_outcome"]["actual_route"], "full_workspace")
+        self.assertEqual(
+            len(friction.EXECUTION_OUTCOME_LOG.read_text(encoding="utf-8").splitlines()),
+            1,
+        )
+        reference = manifest["execution_outcome_bindings"]["close"]
+        self.assertEqual(reference["binding_id"], first["binding_id"])
+        self.assertTrue(Path(reference["path"]).is_file())
+
+    def test_workspace_outcome_binding_fails_closed_on_incomplete_evidence(self) -> None:
+        manifest = self.manifest()
+        self.persist_complete_close_receipt(manifest)
+        manifest["route_evidence"] = workspace._normalize_route_evidence(
+            complete_route_evidence()
+        )
+        outcome = {
+            "workspace_id": manifest["workspace_id"],
+            "phase": "close",
+            "route_evidence": manifest["route_evidence"],
+            "route_legacy_compatibility": False,
+            "evidence_complete": False,
+            "missing_fields": ["elapsed_seconds"],
+        }
+        outcome["outcome_sha256"] = workspace._sha256_json(outcome)
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceActionError, "elapsed_seconds"
+        ):
+            workspace._bind_workspace_execution_outcome(manifest, outcome)
+        self.assertFalse(friction.EXECUTION_OUTCOME_LOG.exists())
+
+    def test_legacy_workspace_outcome_is_explicitly_not_bound(self) -> None:
+        manifest = self.manifest()
+        self.persist_complete_close_receipt(manifest)
+        route, _complete, _legacy = workspace._route_gate(manifest)
+        outcome = {
+            "workspace_id": manifest["workspace_id"],
+            "phase": "close",
+            "route_evidence": route,
+            "route_legacy_compatibility": True,
+            "evidence_complete": True,
+        }
+        outcome["outcome_sha256"] = workspace._sha256_json(outcome)
+        result = workspace._bind_workspace_execution_outcome(manifest, outcome)
+        self.assertEqual(result["state"], "not_applicable_legacy_route")
+        self.assertFalse(result["recorded"])
+        self.assertFalse(friction.EXECUTION_OUTCOME_LOG.exists())
 
     def test_workspace_outcome_receipt_is_phase_bound_and_idempotent(self) -> None:
         manifest = self.manifest()

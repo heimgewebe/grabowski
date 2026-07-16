@@ -2257,6 +2257,11 @@ EXECUTION_ROUTES = frozenset({
     "operator_stop",
     "state_readback",
     "manual_fallback",
+    "direct_operator",
+    "isolated_worktree",
+    "full_workspace",
+    "workspace_with_contrast",
+    "workspace_with_competition",
 })
 EXECUTION_GOVERNOR_MIN_EVIDENCE = 5
 EXECUTION_GOVERNOR_DECAY_SECONDS = 7 * 24 * 60 * 60
@@ -2871,6 +2876,187 @@ def _execution_load_outcomes(*, limit: int) -> dict[str, Any]:
         "integrity_valid": not invalid_lines and not duplicate_outcome_ids,
     }
 
+def _execution_outcome_fields(
+    *,
+    recommendation_id: str,
+    operation_class: str,
+    risk_level: str,
+    recommended_route: str,
+    actual_route: str,
+    first_pass_success: bool,
+    unchanged_retries: int,
+    ambiguous_mutation_outcomes: int,
+    tool_call_count: int,
+    elapsed_ms: int,
+    evidence_ref: str,
+    regression_signal: bool,
+    friction_event_ids: list[str] | None,
+) -> dict[str, Any]:
+    if not isinstance(recommendation_id, str) or not EXECUTION_RECOMMENDATION_ID_RE.fullmatch(
+        recommendation_id
+    ):
+        raise ValueError("recommendation_id must be a lowercase SHA-256 hex digest")
+    return {
+        "recommendation_id": recommendation_id,
+        "operation_class": _execution_enum(
+            operation_class, label="operation_class", allowed=EXECUTION_OPERATION_CLASSES
+        ),
+        "risk_level": _execution_enum(
+            risk_level, label="risk_level", allowed=EXECUTION_RISK_LEVELS
+        ),
+        "recommended_route": _execution_enum(
+            recommended_route, label="recommended_route", allowed=EXECUTION_ROUTES
+        ),
+        "actual_route": _execution_enum(
+            actual_route, label="actual_route", allowed=EXECUTION_ROUTES
+        ),
+        "first_pass_success": _execution_bool(
+            first_pass_success, label="first_pass_success"
+        ),
+        "unchanged_retries": _execution_int(
+            unchanged_retries, label="unchanged_retries", minimum=0, maximum=20
+        ),
+        "ambiguous_mutation_outcomes": _execution_int(
+            ambiguous_mutation_outcomes,
+            label="ambiguous_mutation_outcomes",
+            minimum=0,
+            maximum=20,
+        ),
+        "tool_call_count": _execution_int(
+            tool_call_count, label="tool_call_count", minimum=1, maximum=1000
+        ),
+        "elapsed_ms": _execution_int(
+            elapsed_ms, label="elapsed_ms", minimum=0, maximum=86_400_000
+        ),
+        "regression_signal": _execution_bool(
+            regression_signal, label="regression_signal"
+        ),
+        "friction_event_ids": _execution_event_ids(friction_event_ids),
+        "evidence_ref": _execution_evidence_ref(evidence_ref),
+    }
+
+
+def _record_execution_outcome_with_id(
+    *,
+    outcome_id: str,
+    binding_id: str | None,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(outcome_id, str) or not EXECUTION_OUTCOME_ID_RE.fullmatch(outcome_id):
+        raise ValueError("outcome_id must be a lowercase 128-bit hex identifier")
+    if binding_id is not None and (
+        not isinstance(binding_id, str)
+        or not EXECUTION_RECOMMENDATION_ID_RE.fullmatch(binding_id)
+    ):
+        raise ValueError("binding_id must be a lowercase SHA-256 hex digest")
+    record = {
+        "schema_version": 1,
+        "outcome_id": outcome_id,
+        "recorded_at_unix": 0,
+        **fields,
+    }
+    idempotent = False
+    with _execution_outcome_log_lock(exclusive=True):
+        now = int(time.time())
+        existing = _execution_load_outcomes(limit=EXECUTION_GOVERNOR_MAX_RECORDS)
+        if existing["integrity_valid"] is not True:
+            raise RuntimeError("execution outcome ledger integrity is invalid")
+        matches = [
+            item for item in existing["records"]
+            if item.get("outcome_id") == outcome_id
+        ]
+        if matches:
+            if len(matches) != 1:
+                raise RuntimeError("execution outcome ledger integrity is invalid")
+            existing_record = matches[0]
+            expected = dict(record)
+            expected["recorded_at_unix"] = existing_record["recorded_at_unix"]
+            if existing_record != expected:
+                raise RuntimeError(
+                    "execution outcome binding already exists with different evidence"
+                )
+            record = existing_record
+            idempotent = True
+        else:
+            record["recorded_at_unix"] = now
+            if any(
+                recorded_at_unix > now + 60
+                for recorded_at_unix in existing["recorded_at_unix_values"]
+            ):
+                raise RuntimeError("execution outcome ledger integrity is invalid")
+            if existing["valid_records_total"] >= EXECUTION_GOVERNOR_MAX_RECORDS:
+                raise RuntimeError("execution outcome ledger record limit reached")
+            _append_jsonl(EXECUTION_OUTCOME_LOG, record)
+    if not idempotent:
+        base._append_audit({
+            "timestamp_unix": record["recorded_at_unix"],
+            "operation": "execution-governor-outcome-record",
+            "outcome_id": record["outcome_id"],
+            "recommendation_id": record["recommendation_id"],
+            "risk_level": record["risk_level"],
+            "recommended_route": record["recommended_route"],
+            "actual_route": record["actual_route"],
+            "regression_signal": record["regression_signal"],
+            "binding_id": binding_id,
+        })
+    return {
+        "recorded": True,
+        "idempotent": idempotent,
+        "outcome_id": record["outcome_id"],
+        "recommendation_id": record["recommendation_id"],
+        "binding_id": binding_id,
+        "path": str(EXECUTION_OUTCOME_LOG),
+        "shadow_mode": True,
+        "promotion_applied": False,
+    }
+
+
+def record_execution_outcome_once(
+    *,
+    binding_id: str,
+    recommendation_id: str,
+    operation_class: str,
+    risk_level: str,
+    recommended_route: str,
+    actual_route: str,
+    first_pass_success: bool,
+    unchanged_retries: int,
+    ambiguous_mutation_outcomes: int,
+    tool_call_count: int,
+    elapsed_ms: int,
+    evidence_ref: str,
+    regression_signal: bool = False,
+    friction_event_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(binding_id, str) or not EXECUTION_RECOMMENDATION_ID_RE.fullmatch(
+        binding_id
+    ):
+        raise ValueError("binding_id must be a lowercase SHA-256 hex digest")
+    outcome_id = hashlib.sha256(
+        f"execution-outcome-binding-v1:{binding_id}".encode("utf-8")
+    ).hexdigest()[:32]
+    fields = _execution_outcome_fields(
+        recommendation_id=recommendation_id,
+        operation_class=operation_class,
+        risk_level=risk_level,
+        recommended_route=recommended_route,
+        actual_route=actual_route,
+        first_pass_success=first_pass_success,
+        unchanged_retries=unchanged_retries,
+        ambiguous_mutation_outcomes=ambiguous_mutation_outcomes,
+        tool_call_count=tool_call_count,
+        elapsed_ms=elapsed_ms,
+        evidence_ref=evidence_ref,
+        regression_signal=regression_signal,
+        friction_event_ids=friction_event_ids,
+    )
+    return _record_execution_outcome_with_id(
+        outcome_id=outcome_id,
+        binding_id=binding_id,
+        fields=fields,
+    )
+
+
 def record_execution_outcome(
     *,
     recommendation_id: str,
@@ -2887,113 +3073,26 @@ def record_execution_outcome(
     regression_signal: bool = False,
     friction_event_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    if not isinstance(recommendation_id, str) or not EXECUTION_RECOMMENDATION_ID_RE.fullmatch(
-        recommendation_id
-    ):
-        raise ValueError("recommendation_id must be a lowercase SHA-256 hex digest")
-    operation_class = _execution_enum(
-        operation_class,
-        label="operation_class",
-        allowed=EXECUTION_OPERATION_CLASSES,
+    fields = _execution_outcome_fields(
+        recommendation_id=recommendation_id,
+        operation_class=operation_class,
+        risk_level=risk_level,
+        recommended_route=recommended_route,
+        actual_route=actual_route,
+        first_pass_success=first_pass_success,
+        unchanged_retries=unchanged_retries,
+        ambiguous_mutation_outcomes=ambiguous_mutation_outcomes,
+        tool_call_count=tool_call_count,
+        elapsed_ms=elapsed_ms,
+        evidence_ref=evidence_ref,
+        regression_signal=regression_signal,
+        friction_event_ids=friction_event_ids,
     )
-    risk_level = _execution_enum(
-        risk_level,
-        label="risk_level",
-        allowed=EXECUTION_RISK_LEVELS,
+    return _record_execution_outcome_with_id(
+        outcome_id=uuid.uuid4().hex,
+        binding_id=None,
+        fields=fields,
     )
-    recommended_route = _execution_enum(
-        recommended_route,
-        label="recommended_route",
-        allowed=EXECUTION_ROUTES,
-    )
-    actual_route = _execution_enum(
-        actual_route,
-        label="actual_route",
-        allowed=EXECUTION_ROUTES,
-    )
-    first_pass_success = _execution_bool(
-        first_pass_success,
-        label="first_pass_success",
-    )
-    regression_signal = _execution_bool(
-        regression_signal,
-        label="regression_signal",
-    )
-    unchanged_retries = _execution_int(
-        unchanged_retries,
-        label="unchanged_retries",
-        minimum=0,
-        maximum=20,
-    )
-    ambiguous_mutation_outcomes = _execution_int(
-        ambiguous_mutation_outcomes,
-        label="ambiguous_mutation_outcomes",
-        minimum=0,
-        maximum=20,
-    )
-    tool_call_count = _execution_int(
-        tool_call_count,
-        label="tool_call_count",
-        minimum=1,
-        maximum=1000,
-    )
-    elapsed_ms = _execution_int(
-        elapsed_ms,
-        label="elapsed_ms",
-        minimum=0,
-        maximum=86_400_000,
-    )
-    event_ids = _execution_event_ids(friction_event_ids)
-    evidence_ref = _execution_evidence_ref(evidence_ref)
-    record = {
-        "schema_version": 1,
-        "outcome_id": uuid.uuid4().hex,
-        "recorded_at_unix": 0,
-        "recommendation_id": recommendation_id,
-        "operation_class": operation_class,
-        "risk_level": risk_level,
-        "recommended_route": recommended_route,
-        "actual_route": actual_route,
-        "first_pass_success": first_pass_success,
-        "unchanged_retries": unchanged_retries,
-        "ambiguous_mutation_outcomes": ambiguous_mutation_outcomes,
-        "tool_call_count": tool_call_count,
-        "elapsed_ms": elapsed_ms,
-        "regression_signal": regression_signal,
-        "friction_event_ids": event_ids,
-        "evidence_ref": evidence_ref,
-    }
-    with _execution_outcome_log_lock(exclusive=True):
-        record["recorded_at_unix"] = int(time.time())
-        existing = _execution_load_outcomes(limit=EXECUTION_GOVERNOR_MAX_RECORDS)
-        if existing["integrity_valid"] is not True:
-            raise RuntimeError("execution outcome ledger integrity is invalid")
-        if any(
-            recorded_at_unix > record["recorded_at_unix"] + 60
-            for recorded_at_unix in existing["recorded_at_unix_values"]
-        ):
-            raise RuntimeError("execution outcome ledger integrity is invalid")
-        if existing["valid_records_total"] >= EXECUTION_GOVERNOR_MAX_RECORDS:
-            raise RuntimeError("execution outcome ledger record limit reached")
-        _append_jsonl(EXECUTION_OUTCOME_LOG, record)
-    base._append_audit({
-        "timestamp_unix": record["recorded_at_unix"],
-        "operation": "execution-governor-outcome-record",
-        "outcome_id": record["outcome_id"],
-        "recommendation_id": recommendation_id,
-        "risk_level": risk_level,
-        "recommended_route": recommended_route,
-        "actual_route": actual_route,
-        "regression_signal": regression_signal,
-    })
-    return {
-        "recorded": True,
-        "outcome_id": record["outcome_id"],
-        "recommendation_id": recommendation_id,
-        "path": str(EXECUTION_OUTCOME_LOG),
-        "shadow_mode": True,
-        "promotion_applied": False,
-    }
 
 
 def execution_governor_summary(
