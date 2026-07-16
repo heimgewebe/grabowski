@@ -599,6 +599,74 @@ class ResourceTests(unittest.TestCase):
                 },
             )
 
+    def test_merge_guard_binds_repository_paths_containing_scope_markers(self) -> None:
+        keys = [
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+        ]
+        metadata = {
+            "merge_guard": {
+                "head_sha": "a" * 40,
+                "base_branch": "main",
+                "head_branch": "feat/work",
+            }
+        }
+        for marker_name in ("branch", "operation"):
+            with self.subTest(marker=marker_name, direction="existing-lease"):
+                self.database.unlink(missing_ok=True)
+                repository = self.root / f"repo:{marker_name}:literal"
+                repository.mkdir(exist_ok=True)
+                changed_path = repository / "src" / "target.py"
+                repo_key = f"repo:{repository}"
+                resources.acquire_resources(
+                    "foreign-owner",
+                    [repo_key],
+                    purpose="broad repository task",
+                    ttl_seconds=120,
+                )
+                with self.assertRaises(resources.ResourceConflict):
+                    resources.acquire_merge_guard_resources(
+                        f"captain-merge:{marker_name}-path-existing",
+                        "task-owner",
+                        keys,
+                        repository=str(repository),
+                        changed_paths=[str(changed_path)],
+                        purpose="atomic merge guard",
+                        ttl_seconds=60,
+                        metadata=metadata,
+                    )
+
+            with self.subTest(marker=marker_name, direction="late-lease"):
+                self.database.unlink(missing_ok=True)
+                repository = self.root / f"repo:{marker_name}:literal"
+                changed_path = repository / "src" / "target.py"
+                repo_key = f"repo:{repository}"
+                guard = resources.acquire_merge_guard_resources(
+                    f"captain-merge:{marker_name}-path-active",
+                    "task-owner",
+                    keys,
+                    repository=str(repository),
+                    changed_paths=[str(changed_path)],
+                    purpose="atomic merge guard",
+                    ttl_seconds=60,
+                    metadata=metadata,
+                )
+                with self.assertRaises(resources.ResourceConflict):
+                    resources.acquire_resources(
+                        "late-owner",
+                        [repo_key],
+                        purpose="late broad repository task",
+                        ttl_seconds=60,
+                    )
+                resources.release_resources(
+                    f"captain-merge:{marker_name}-path-active",
+                    guard["held_resource_keys"],
+                )
+
     def test_merge_guard_binds_base_and_head_branch_leases(self) -> None:
         repository = self.root / "repo"
         repository.mkdir()

@@ -1237,26 +1237,28 @@ def _resource_path_value(resource_key: str) -> str | None:
     return resource_key.split(":", 1)[1]
 
 
-def _repository_resource_scope(resource_key: str) -> dict[str, str | None] | None:
-    if not resource_key.startswith("repo:"):
-        return None
-    value = resource_key.split(":", 1)[1]
-    for marker, scope_kind in ((":branch:", "branch"), (":operation:", "operation")):
-        repository, separator, scope_value = value.partition(marker)
-        if not separator:
-            continue
-        if not repository:
-            return None
+def _repository_resource_scope(
+    resource_key: str, *, repository: str
+) -> dict[str, str | None] | None:
+    canonical_repository = os.path.normpath(repository)
+    prefix = f"repo:{canonical_repository}"
+    if resource_key == prefix:
         return {
-            "repository": os.path.normpath(repository),
+            "repository": canonical_repository,
+            "scope_kind": "repository",
+            "scope_value": None,
+        }
+    for marker, scope_kind in ((":branch:", "branch"), (":operation:", "operation")):
+        scoped_prefix = prefix + marker
+        if not resource_key.startswith(scoped_prefix):
+            continue
+        scope_value = resource_key[len(scoped_prefix) :]
+        return {
+            "repository": canonical_repository,
             "scope_kind": scope_kind if scope_value else "invalid",
             "scope_value": scope_value or None,
         }
-    return {
-        "repository": os.path.normpath(value),
-        "scope_kind": "repository",
-        "scope_value": None,
-    }
+    return None
 
 
 def _merge_guard_branch_names(metadata: dict[str, Any]) -> set[str] | None:
@@ -1309,7 +1311,7 @@ def _repository_resource_overlaps_merge_guard(
     repository: str,
     guarded_branches: set[str] | None,
 ) -> bool:
-    scope = _repository_resource_scope(resource_key)
+    scope = _repository_resource_scope(resource_key, repository=repository)
     if scope is None or scope["repository"] != repository:
         return False
     if scope["scope_kind"] == "branch" and guarded_branches is not None:
@@ -1339,11 +1341,6 @@ def _check_active_merge_guard_conflicts(
     now: int,
 ) -> None:
     requested_scope = _scope_manifest_from_metadata(metadata, required=False)
-    requested_repo_scopes = [
-        scope
-        for key in keys
-        if (scope := _repository_resource_scope(key)) is not None
-    ]
     requested_paths = [
         path for key in keys if (path := _resource_path_value(key)) is not None
     ]
@@ -1381,9 +1378,17 @@ def _check_active_merge_guard_conflicts(
             raise ResourceConflict(
                 row["resource_key"], row["owner_id"], row["expires_at_unix"]
             )
-        repo_scope_same_repository = any(
-            scope["repository"] == repository for scope in requested_repo_scopes
-        )
+        requested_repo_scopes = [
+            scope
+            for key in keys
+            if (
+                scope := _repository_resource_scope(
+                    key, repository=repository
+                )
+            )
+            is not None
+        ]
+        repo_scope_same_repository = bool(requested_repo_scopes)
         repo_scope_overlap = any(
             _repository_resource_overlaps_merge_guard(
                 key,
@@ -1519,7 +1524,9 @@ def acquire_merge_guard_resources(
                     )
                 row_scope = _scope_manifest_from_metadata(row_metadata, required=False)
                 row_path = _resource_path_value(row_key)
-                row_repo_scope = _repository_resource_scope(row_key)
+                row_repo_scope = _repository_resource_scope(
+                    row_key, repository=canonical_repository
+                )
                 repo_resource_relevant = (
                     row_repo_scope is not None
                     and row_repo_scope["repository"] == canonical_repository
