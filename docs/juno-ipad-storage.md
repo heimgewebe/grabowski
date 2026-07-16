@@ -101,9 +101,11 @@ Mutation, weil sie einen Juno-Job und lokale Receipts erzeugen.
 - `ipad_directory_list`: nur unmittelbare Einträge, keine Rekursion; Ausgabe
   und tatsächlich durchlaufene Provider-Einträge sind getrennt hart begrenzt.
   Eine am Scan-Limit abgeschnittene Teilansicht wird ausdrücklich markiert.
-- `ipad_file_read`: eine reguläre Datei bis **176 KiB**, mit SHA-256. Diese
-  Grenze lässt nach Base64-Kodierung und Ergebnis-Metadaten Reserve unter dem
-  256-KiB-Ergebnisvertrag des Juno-Agenten.
+- `ipad_file_read`: eine reguläre Datei bis **176 KiB**, mit SHA-256. Die
+  Rohdaten werden zu 240.300 Base64-Bytes; selbst bei maximal erlaubten
+  Provider- und Pfadmetadaten bleiben mindestens 16 KiB Reserve unter dem
+  256-KiB-Ergebnisvertrag des Juno-Agenten. 220–240 KiB Rohdaten wären deshalb
+  gerade nicht transportsicher.
 - `ipad_file_create`: nur create-only; Vorzustand muss `absent` sein; Payload
   wird vor und nach der Übertragung gehasht und ist auf **176 KiB** begrenzt.
 - `ipad_file_replace`: gleichverzeichnisgebundener Ersatz bis **176 KiB** nur bei passendem
@@ -111,8 +113,16 @@ Mutation, weil sie einen Juno-Job und lokale Receipts erzeugen.
   wird unmittelbar vor dem Umschalten erneut geprüft. Der Grant-Wurzelpfad und
   alle Elternverzeichnisse bleiben während Stat, List, Read, Create und Replace
   über Dateideskriptoren festgehalten; ein nachträglicher Symlink-Tausch ändert
-  daher nicht das Operationsziel. Dokumentanbieter können dennoch abweichende
-  Atomaritäts- und Dauerhaftigkeitsgarantien haben.
+  daher nicht das Operationsziel. Root-Öffnungen vergleichen vor und nach dem
+  Öffnen Geräte-, Inode-, Typ-, Eigentümer-, Link- und Änderungsidentität und
+  brechen bei Abweichung ab. Ein nicht unterstütztes descriptor-gebundenes
+  `replace` fällt nicht auf pfadbasierte Semantik zurück. Nach einem fehlgeschlagenen
+  Create oder Replace wird ein verbliebener Eintrag identifiziert und mit einer
+  `cleanup_reference` gemeldet, aber nicht automatisch per Namen gelöscht: POSIX und
+  die Python-API bieten kein atomisches "unlink nur bei identischer Inode". Ein
+  `stat`-geprüftes anschließendes `unlink` hätte selbst wieder ein TOCTOU-Fenster und
+  könnte eine inzwischen fremde Datei entfernen. Dokumentanbieter können außerdem
+  abweichende Atomaritäts- und Dauerhaftigkeitsgarantien haben.
 
 Nicht freigeschaltet:
 

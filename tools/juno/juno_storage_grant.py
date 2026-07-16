@@ -39,6 +39,8 @@ from juno.objc import (
 SCHEMA_VERSION = 1
 BOOKMARK_CREATION_WITH_SECURITY_SCOPE = 1 << 11
 BOOKMARK_RESOLUTION_WITH_SECURITY_SCOPE = 1 << 10
+# UIKit declares UIDocumentPickerModeOpen as the C-enum value 1. Juno's
+# Objective-C bridge exposes the initializer but not a Swift enum wrapper.
 PICKER_MODE_OPEN = 1
 MAX_GRANT_RECORD_BYTES = 128 * 1024
 GRANT_CLASS_PREFIX = "GrabowskiJunoFolderGrantDelegateV1"

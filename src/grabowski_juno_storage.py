@@ -24,9 +24,15 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_RELATIVE_PATH_BYTES = 2_048
 MAX_PROVIDER_BYTES = 256
 MAX_PATH_SEGMENTS = 64
+# 176 KiB raw data expands to 240,300 Base64 bytes. Under the maximum
+# provider/path metadata bounds, the canonical file-read result remains at
+# least 16 KiB below the 256 KiB Juno result transport ceiling.
 MAX_READ_BYTES = 176 * 1024
 MAX_WRITE_BYTES = 176 * 1024
 MAX_DEVICE_RESULT_BYTES = 256 * 1024
+MIN_DEVICE_RESULT_HEADROOM_BYTES = 16 * 1024
+# Agent instance timestamps are ISO-8601 today; 128 bytes deliberately leaves
+# room for future bounded opaque instance identifiers.
 MAX_EXPECTED_STARTED_AT_BYTES = 128
 MAX_DIRECTORY_ENTRIES = 500
 MAX_DIRECTORY_SCAN_ENTRIES = 4_096
@@ -37,6 +43,7 @@ _STORAGE_JOB_SOURCE = r"""
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -307,8 +314,17 @@ def _relative_parts(relative_path: str) -> tuple[str, ...]:
     return tuple(path.parts)
 
 
-def _identity(metadata: os.stat_result) -> tuple[int, int, int]:
-    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+def _directory_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_ctime_ns,
+    )
 
 
 def _required_os_flag(name: str) -> int:
@@ -323,18 +339,30 @@ def _directory_open_flags() -> int:
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
         | _required_os_flag("O_NOFOLLOW")
-        | getattr(os, "O_DIRECTORY", 0)
+        | _required_os_flag("O_DIRECTORY")
     )
 
 
 def _open_root_directory(root: Path) -> int:
     before = os.stat(root, follow_symlinks=False)
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
-        raise PermissionError("granted root is a symlink or non-directory")
-    descriptor = os.open(root, _directory_open_flags())
+    if stat.S_ISLNK(before.st_mode):
+        raise PermissionError("granted root is a symlink")
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError("target is not a directory")
+    try:
+        descriptor = os.open(root, _directory_open_flags())
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PermissionError("granted root is a symlink") from exc
+        if exc.errno == errno.ENOTDIR:
+            raise ValueError("target is not a directory") from exc
+        raise
     try:
         after = os.fstat(descriptor)
-        if not stat.S_ISDIR(after.st_mode) or _identity(before) != _identity(after):
+        if (
+            not stat.S_ISDIR(after.st_mode)
+            or _directory_identity(before) != _directory_identity(after)
+        ):
             raise RuntimeError("granted root changed while it was opened")
         return descriptor
     except Exception:
@@ -350,15 +378,15 @@ def _open_child_directory(parent_descriptor: int, name: str) -> int:
             dir_fd=parent_descriptor,
         )
     except OSError as exc:
-        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-            raise PermissionError(
-                "relative path crosses a symlink or non-directory"
-            ) from exc
+        if exc.errno == errno.ELOOP:
+            raise PermissionError("relative path crosses a symlink") from exc
+        if exc.errno == errno.ENOTDIR:
+            raise ValueError("target is not a directory") from exc
         raise
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISDIR(metadata.st_mode):
-            raise PermissionError("relative path crosses a non-directory")
+            raise ValueError("target is not a directory")
         return descriptor
     except Exception:
         os.close(descriptor)
@@ -393,6 +421,27 @@ def _open_parent_directory(root: Path, relative_path: str) -> tuple[int, str]:
     except Exception:
         os.close(current)
         raise
+
+
+@contextmanager
+def _closing_descriptor(descriptor: int):
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _opened_directory(root: Path, relative_path: str):
+    with _closing_descriptor(_open_directory(root, relative_path)) as descriptor:
+        yield descriptor
+
+
+@contextmanager
+def _opened_parent_directory(root: Path, relative_path: str):
+    descriptor, name = _open_parent_directory(root, relative_path)
+    with _closing_descriptor(descriptor):
+        yield descriptor, name
 
 
 def _access_at(directory_descriptor: int, name: str, mode: int) -> bool:
@@ -529,11 +578,10 @@ def _read_file_at(
     name: str,
     max_bytes: int,
 ) -> tuple[bytes, dict[str, Any]]:
-    descriptor = _open_regular_file_at(parent_descriptor, name)
-    try:
+    with _closing_descriptor(
+        _open_regular_file_at(parent_descriptor, name)
+    ) as descriptor:
         return _read_open_file(descriptor, max_bytes)
-    finally:
-        os.close(descriptor)
 
 
 def _decode_payload(request: dict[str, Any]) -> bytes:
@@ -564,40 +612,201 @@ def _write_all(descriptor: int, payload: bytes) -> None:
     os.fsync(descriptor)
 
 
-def _create_file_at(
+def _cleanup_file_state(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _preserve_failed_created_entry(
     parent_descriptor: int,
     name: str,
-    payload: bytes,
-) -> dict[str, Any]:
+    expected_state: tuple[int, int, int, int, int, int, int],
+    *,
+    operation: str,
+    original_error: Exception,
+) -> None:
     try:
-        existing = os.stat(
+        current = os.stat(
             name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
     except FileNotFoundError:
-        existing = None
-    if existing is not None:
-        if stat.S_ISLNK(existing.st_mode):
-            raise PermissionError("target path is a symlink")
-        raise FileExistsError("target already exists")
+        return
+    except Exception as verification_error:
+        raise RuntimeError(
+            f"{operation} failed; residue identity verification failed and "
+            "automatic cleanup was skipped: "
+            f"{type(verification_error).__name__}: {verification_error}"
+        ) from original_error
+    if _cleanup_file_state(current) != expected_state:
+        raise RuntimeError(
+            f"{operation} failed; cleanup target changed and automatic cleanup "
+            "was skipped"
+        ) from original_error
+    cleanup_reference = _sha256_bytes(
+        _canonical_json_bytes(
+            {
+                "entry": name,
+                "state": list(expected_state),
+            }
+        )
+    )
+    raise RuntimeError(
+        f"{operation} failed; automatic cleanup was skipped because the "
+        "platform has no atomic identity-conditional unlink; residue preserved; "
+        f"entry={name}; cleanup_reference={cleanup_reference}"
+    ) from original_error
+
+
+def _combined_failure(
+    primary: Exception,
+    secondary: Exception,
+    *,
+    secondary_label: str,
+) -> RuntimeError:
+    combined = RuntimeError(
+        f"{type(primary).__name__}: {primary}; {secondary_label}: "
+        f"{type(secondary).__name__}: {secondary}"
+    )
+    combined.__cause__ = primary
+    return combined
+
+
+def _write_and_close_created_file(
+    descriptor: int,
+    payload: bytes,
+) -> tuple[
+    tuple[int, int, int, int, int, int, int] | None,
+    Exception | None,
+]:
+    state = None
+    failure = None
+    try:
+        try:
+            _write_all(descriptor, payload)
+        except Exception as write_error:
+            failure = write_error
+        try:
+            state = _cleanup_file_state(os.fstat(descriptor))
+        except Exception as state_error:
+            if failure is None:
+                failure = state_error
+            else:
+                failure = _combined_failure(
+                    failure,
+                    state_error,
+                    secondary_label="created-file identity read failed",
+                )
+    finally:
+        try:
+            os.close(descriptor)
+        except Exception as close_error:
+            if failure is None:
+                failure = close_error
+            else:
+                failure = _combined_failure(
+                    failure,
+                    close_error,
+                    secondary_label="descriptor close failed",
+                )
+    return state, failure
+
+
+def _create_file_at(
+    parent_descriptor: int,
+    name: str,
+    payload: bytes,
+) -> dict[str, Any]:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= _required_os_flag("O_NOFOLLOW")
-    descriptor = os.open(
-        name,
-        flags,
-        0o600,
-        dir_fd=parent_descriptor,
-    )
     try:
-        _write_all(descriptor, payload)
-    finally:
-        os.close(descriptor)
-    readback, metadata = _read_file_at(parent_descriptor, name, len(payload))
-    if readback != payload:
-        raise RuntimeError("create readback differs from payload")
+        descriptor = os.open(
+            name,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    except FileExistsError as exc:
+        try:
+            existing = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            raise RuntimeError("create target changed during collision check") from exc
+        if stat.S_ISLNK(existing.st_mode):
+            raise PermissionError("target path is a symlink") from exc
+        raise FileExistsError("target already exists") from exc
+    created_state, write_error = _write_and_close_created_file(descriptor, payload)
+    if created_state is None:
+        raise RuntimeError(
+            "create failed; created-file identity is unavailable and automatic "
+            f"cleanup was skipped; entry={name}"
+        ) from write_error
+    if write_error is not None:
+        _preserve_failed_created_entry(
+            parent_descriptor,
+            name,
+            created_state,
+            operation="create",
+            original_error=write_error,
+        )
+        raise write_error
+    # Re-open through the pinned parent so the receipt proves the provider-visible
+    # path, not merely the now-closed object that O_EXCL originally created.
+    try:
+        readback, metadata = _read_file_at(parent_descriptor, name, len(payload))
+        if readback != payload:
+            raise RuntimeError("create readback differs from payload")
+    except Exception as readback_error:
+        _preserve_failed_created_entry(
+            parent_descriptor,
+            name,
+            created_state,
+            operation="create readback",
+            original_error=readback_error,
+        )
+        raise
     return metadata
+
+
+def _replace_at(
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    try:
+        os.replace(
+            source_name,
+            destination_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+    except (NotImplementedError, TypeError) as exc:
+        raise RuntimeError(
+            "descriptor-bound same-directory replace is unavailable"
+        ) from exc
+    except OSError as exc:
+        unsupported = {errno.ENOTSUP}
+        if hasattr(errno, "EOPNOTSUPP"):
+            unsupported.add(errno.EOPNOTSUPP)
+        if exc.errno in unsupported:
+            raise RuntimeError(
+                "descriptor-bound same-directory replace is unsupported by the provider"
+            ) from exc
+        raise
 
 
 def _replace_file_at(
@@ -617,17 +826,25 @@ def _replace_file_at(
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= _required_os_flag("O_NOFOLLOW")
-    descriptor = os.open(
-        temporary,
-        flags,
-        0o600,
-        dir_fd=parent_descriptor,
-    )
+    temporary_state = None
     try:
-        _write_all(descriptor, payload)
-    finally:
-        os.close(descriptor)
-    try:
+        descriptor = os.open(
+            temporary,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        temporary_state, write_error = _write_and_close_created_file(
+            descriptor,
+            payload,
+        )
+        if temporary_state is None:
+            raise RuntimeError(
+                "replace failed; temporary identity is unavailable and automatic "
+                f"cleanup was skipped; entry={temporary}"
+            ) from write_error
+        if write_error is not None:
+            raise write_error
         _pre_replace_payload, pre_replace = _read_file_at(
             parent_descriptor,
             name,
@@ -635,17 +852,17 @@ def _replace_file_at(
         )
         if pre_replace["sha256"] != expected_sha256:
             raise RuntimeError("existing file changed before replace")
-        os.replace(
-            temporary,
-            name,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
-        )
-    except Exception:
-        try:
-            os.unlink(temporary, dir_fd=parent_descriptor)
-        except Exception:
-            pass
+        _replace_at(parent_descriptor, temporary, name)
+        temporary_state = None
+    except Exception as exc:
+        if temporary_state is not None:
+            _preserve_failed_created_entry(
+                parent_descriptor,
+                temporary,
+                temporary_state,
+                operation="replace temporary",
+                original_error=exc,
+            )
         raise
     durability = {"directory_fsync": False, "error_type": None}
     try:
@@ -670,15 +887,12 @@ def _replace_file_at(
 
 
 def _probe_root_directory(root: Path) -> dict[str, bool]:
-    descriptor = _open_root_directory(root)
-    try:
+    with _opened_directory(root, "") as descriptor:
         return {
             "exists": True,
             "readable": True,
             "writable": _access_at(descriptor, ".", os.W_OK),
         }
-    finally:
-        os.close(descriptor)
 
 
 def _grant_context(request: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
@@ -965,20 +1179,15 @@ def _run(request: dict[str, Any]) -> dict[str, Any]:
         def stat_action(record, root, stale):
             relative_path = request.get("relative_path", "")
             if relative_path == "":
-                descriptor = _open_directory(root, "")
-                try:
+                with _opened_directory(root, "") as descriptor:
                     entry = _stat_open_directory(
                         descriptor,
                         name=root.name or str(root),
                     )
-                finally:
-                    os.close(descriptor)
             else:
-                parent_descriptor, name = _open_parent_directory(root, relative_path)
-                try:
+                with _opened_parent_directory(root, relative_path) as opened:
+                    parent_descriptor, name = opened
                     entry = _stat_entry_at(parent_descriptor, name)
-                finally:
-                    os.close(parent_descriptor)
             return {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "ipad_file_stat",
@@ -1000,26 +1209,27 @@ def _run(request: dict[str, Any]) -> dict[str, Any]:
             max_scan_entries = int(request.get("max_scan_entries", 0))
             if not 1 <= limit <= max_scan_entries <= MAX_DIRECTORY_SCAN_ENTRIES:
                 raise ValueError("directory scan bounds are invalid")
-            descriptor = _open_directory(root, relative_path)
-            try:
+            with _opened_directory(root, relative_path) as descriptor:
                 with os.scandir(descriptor) as iterator:
-                    scanned = [
-                        entry.name
-                        for entry in itertools.islice(
+                    scanned = list(
+                        itertools.islice(
                             iterator,
                             max_scan_entries + 1,
                         )
-                    ]
+                    )
                 scan_truncated = len(scanned) > max_scan_entries
                 scanned = scanned[:max_scan_entries]
-                selected = sorted(scanned)[: limit + 1]
+                selected = sorted(scanned, key=lambda entry: entry.name)[: limit + 1]
                 output_truncated = len(selected) > limit
                 entries = [
-                    _stat_entry_at(descriptor, name)
-                    for name in selected[:limit]
+                    _stat_entry_from_metadata(
+                        name=entry.name,
+                        metadata=entry.stat(follow_symlinks=False),
+                        readable=_access_at(descriptor, entry.name, os.R_OK),
+                        writable=_access_at(descriptor, entry.name, os.W_OK),
+                    )
+                    for entry in selected[:limit]
                 ]
-            finally:
-                os.close(descriptor)
             return {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "ipad_directory_list",
@@ -1046,15 +1256,13 @@ def _run(request: dict[str, Any]) -> dict[str, Any]:
     if operation == "file_read":
         def read_action(record, root, stale):
             relative_path = request.get("relative_path", "")
-            parent_descriptor, name = _open_parent_directory(root, relative_path)
-            try:
+            with _opened_parent_directory(root, relative_path) as opened:
+                parent_descriptor, name = opened
                 payload, metadata = _read_file_at(
                     parent_descriptor,
                     name,
                     int(request.get("max_bytes", 0)),
                 )
-            finally:
-                os.close(parent_descriptor)
             return {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "ipad_file_read",
@@ -1074,11 +1282,9 @@ def _run(request: dict[str, Any]) -> dict[str, Any]:
         payload = _decode_payload(request)
         def create_action(record, root, stale):
             relative_path = request.get("relative_path", "")
-            parent_descriptor, name = _open_parent_directory(root, relative_path)
-            try:
+            with _opened_parent_directory(root, relative_path) as opened:
+                parent_descriptor, name = opened
                 metadata = _create_file_at(parent_descriptor, name, payload)
-            finally:
-                os.close(parent_descriptor)
             return {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "ipad_file_create",
@@ -1102,16 +1308,14 @@ def _run(request: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("expected_sha256 is invalid")
         def replace_action(record, root, stale):
             relative_path = request.get("relative_path", "")
-            parent_descriptor, name = _open_parent_directory(root, relative_path)
-            try:
+            with _opened_parent_directory(root, relative_path) as opened:
+                parent_descriptor, name = opened
                 metadata = _replace_file_at(
                     parent_descriptor,
                     name,
                     payload,
                     expected_sha256,
                 )
-            finally:
-                os.close(parent_descriptor)
             return {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "ipad_file_replace",
