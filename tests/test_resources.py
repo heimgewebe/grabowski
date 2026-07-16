@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sys
 import tempfile
 import time
@@ -75,6 +76,14 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(resources.normalize_resource_key("port:09222"), "port:9222")
         self.assertEqual(resources.normalize_resource_key("display::17"), "display:17")
         self.assertEqual(
+            resources.normalize_resource_key(
+                "component:github-branch:heimgewebe-grabowski:feat/captain"
+            ),
+            "component:github-branch:heimgewebe-grabowski:feat/captain",
+        )
+        with self.assertRaises(ValueError):
+            resources.normalize_resource_key("service:github-branch:feat/captain")
+        self.assertEqual(
             resources.normalize_resource_key(f"path:{self.root}/a/../b"),
             f"path:{self.root}/b",
         )
@@ -139,6 +148,8 @@ class ResourceTests(unittest.TestCase):
                 "merge_guard": {
                     "head_sha": "a" * 40,
                     "diff_sha256": "b" * 64,
+                    "base_branch": "main",
+                    "head_branch": "feat/work",
                 }
             },
         )
@@ -186,6 +197,8 @@ class ResourceTests(unittest.TestCase):
                 "merge_guard": {
                     "head_sha": "a" * 40,
                     "diff_sha256": "b" * 64,
+                    "base_branch": "main",
+                    "head_branch": "feat/work",
                 }
             },
         )
@@ -241,6 +254,8 @@ class ResourceTests(unittest.TestCase):
                 "merge_guard": {
                     "head_sha": "a" * 40,
                     "diff_sha256": "b" * 64,
+                    "base_branch": "main",
+                    "head_branch": "feat/work",
                 }
             },
         )
@@ -286,7 +301,13 @@ class ResourceTests(unittest.TestCase):
             changed_paths=[str(changed_path)],
             purpose="atomic merge guard",
             ttl_seconds=60,
-            metadata={"merge_guard": {"head_sha": "a" * 40}},
+            metadata={
+                    "merge_guard": {
+                        "head_sha": "a" * 40,
+                        "base_branch": "main",
+                        "head_branch": "feat/work",
+                    }
+                },
         )
         scope = self.scope_manifest(
             repository, name="disjoint", path=disjoint_path
@@ -348,7 +369,13 @@ class ResourceTests(unittest.TestCase):
                 changed_paths=[str(changed_path)],
                 purpose="atomic merge guard",
                 ttl_seconds=60,
-                metadata={"merge_guard": {"head_sha": "a" * 40}},
+                metadata={
+                    "merge_guard": {
+                        "head_sha": "a" * 40,
+                        "base_branch": "main",
+                        "head_branch": "feat/work",
+                    }
+                },
             )
 
     def test_merge_guard_rejects_foreign_repo_or_changed_path_lease(self) -> None:
@@ -378,7 +405,13 @@ class ResourceTests(unittest.TestCase):
                 changed_paths=[str(changed_path)],
                 purpose="atomic merge guard",
                 ttl_seconds=60,
-                metadata={"merge_guard": {"head_sha": "a" * 40}},
+                metadata={
+                    "merge_guard": {
+                        "head_sha": "a" * 40,
+                        "base_branch": "main",
+                        "head_branch": "feat/work",
+                    }
+                },
             )
         resources.release_resources(
             "foreign-owner", [f"path:{changed_path}"]
@@ -398,7 +431,13 @@ class ResourceTests(unittest.TestCase):
                 changed_paths=[str(changed_path)],
                 purpose="atomic merge guard",
                 ttl_seconds=60,
-                metadata={"merge_guard": {"head_sha": "a" * 40}},
+                metadata={
+                    "merge_guard": {
+                        "head_sha": "a" * 40,
+                        "base_branch": "main",
+                        "head_branch": "feat/work",
+                    }
+                },
             )
 
     def test_merge_guard_binds_base_and_head_branch_leases(self) -> None:
@@ -520,6 +559,56 @@ class ResourceTests(unittest.TestCase):
         resources.release_resources(
             "captain-merge:active-branch-guard", guard["held_resource_keys"]
         )
+
+    def test_active_merge_guard_with_tampered_effect_key_binding_fails_closed(self) -> None:
+        repository = self.root / "repo"
+        repository.mkdir()
+        changed_path = repository / "src" / "target.py"
+        keys = [
+            "component:github-repository:heimgewebe-grabowski",
+            "component:github-branch:heimgewebe-grabowski:main",
+            "component:github-branch:heimgewebe-grabowski:feat/work",
+            "service:github-main:heimgewebe-grabowski",
+            "service:github-pr:heimgewebe-grabowski-57",
+            "gate:github-merge:heimgewebe-grabowski:main",
+            "deployment:github:heimgewebe-grabowski:main",
+        ]
+        resources.acquire_merge_guard_resources(
+            "captain-merge:tamper-guard",
+            "task-owner",
+            keys,
+            repository=str(repository),
+            changed_paths=[str(changed_path)],
+            purpose="atomic merge guard",
+            ttl_seconds=60,
+            metadata={
+                "merge_guard": {
+                    "head_sha": "a" * 40,
+                    "base_branch": "main",
+                    "head_branch": "feat/work",
+                }
+            },
+        )
+        gate = "gate:github-merge:heimgewebe-grabowski:main"
+        with resources._database() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (gate,)
+            ).fetchone()
+            self.assertIsNotNone(row)
+            metadata = json.loads(row["metadata_json"])
+            metadata["merge_guard"]["effect_resource_keys_sha256"] = "0" * 64
+            connection.execute(
+                "UPDATE leases SET metadata_json=? WHERE resource_key=?",
+                (resources._canonical_json(metadata), gate),
+            )
+            connection.commit()
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "late-owner",
+                ["component:unrelated-but-cooperating"],
+                purpose="must not proceed past malformed active merge guard",
+                ttl_seconds=60,
+            )
 
     def test_expired_lease_is_reclaimed(self) -> None:
         resources.acquire_resources(

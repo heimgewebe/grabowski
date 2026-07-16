@@ -64,12 +64,20 @@ def merge_guard_repository_root(repo_path: Path) -> Path:
     return repository
 
 
-def merge_guard_resource_keys(repo_path: Path, *, repo_slug: str, pr_number: int, base: str) -> list[str]:
+def merge_guard_resource_keys(
+    repo_path: Path,
+    *,
+    repo_slug: str,
+    pr_number: int,
+    base: str,
+    head: str,
+) -> list[str]:
     slug = _merge_guard_slug(repo_slug)
     return sorted(
         {
             f"component:github-repository:{slug}",
             f"component:github-branch:{slug}:{base}",
+            f"component:github-branch:{slug}:{head}",
             f"service:github-main:{slug}",
             f"service:github-pr:{slug}-{pr_number}",
             f"gate:github-merge:{slug}:{base}",
@@ -318,6 +326,7 @@ class CaptainMergeGuardRunner:
             repo_slug=str(target["repo"]),
             pr_number=int(target["pr"]),
             base=str(target["base"]),
+            head=str(bindings["head_branch"]),
         )
         self.owner_id = "captain-merge:" + hashlib.sha256(
             f"{self.execution_intent_sha256}:{time.time_ns()}".encode("utf-8")

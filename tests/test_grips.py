@@ -5004,7 +5004,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             guard["bindings"]["changed_paths_sha256"],
             guard["changed_paths_sha256"],
         )
-        self.assertEqual(6, len(guard["resource_keys"]))
+        self.assertEqual(7, len(guard["resource_keys"]))
         self.assertLessEqual(
             guard["observed_at_unix_ns"],
             guard["lease_snapshot_observed_at_unix_ns"],
@@ -5160,6 +5160,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                     repo_slug="heimgewebe/grabowski",
                     pr_number=96,
                     base="main",
+                    head="feat/captain",
                 )
                 if mode == "legacy-repo":
                     resources.acquire_resources(
@@ -5183,6 +5184,93 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 execution = result["output"]["executions"][0]
                 self.assertEqual("blocked_by_live_lease", execution["merge_lease_guard"]["status"])
                 self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_serializes_head_branch_component(self) -> None:
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        head_component = "component:github-branch:heimgewebe-grabowski:feat/captain"
+        parameters = authorized_captain_run_parameters()
+
+        resources.acquire_resources(
+            "foreign-head-component",
+            [head_component],
+            purpose="foreign pull request head branch mutation",
+            ttl_seconds=60,
+        )
+        blocked = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=FakeGh(view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": "e" * 40,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }),
+        )
+        blocked_execution = blocked["output"]["executions"][0]
+        self.assertEqual(
+            "blocked_by_live_lease", blocked_execution["merge_lease_guard"]["status"]
+        )
+
+        resources.RESOURCE_DB.unlink(missing_ok=True)
+        resources.acquire_resources(
+            "captain-test-owner",
+            [head_component],
+            purpose="authorized task owns pull request head branch",
+            ttl_seconds=60,
+        )
+        gh = FakeGh(view={
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": "e" * 40,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        })
+        late_component_blocked = False
+
+        def assert_guard_held(repo: Path, argv: list[str]) -> dict[str, object]:
+            nonlocal late_component_blocked
+            if argv[:2] == ["pr", "merge"]:
+                released = resources.release_resources(
+                    "captain-test-owner", [head_component], force=False
+                )
+                self.assertEqual(
+                    [head_component],
+                    [item["resource_key"] for item in released["released"]],
+                )
+                with self.assertRaises(resources.ResourceConflict):
+                    resources.acquire_resources(
+                        "late-head-component",
+                        [head_component],
+                        purpose="late pull request head branch mutation",
+                        ttl_seconds=60,
+                    )
+                late_component_blocked = True
+            return gh(repo, argv)
+
+        passed = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=assert_guard_held,
+        )
+        execution = passed["output"]["executions"][0]
+        self.assertEqual("passed", passed["receipt"]["status"])
+        self.assertTrue(late_component_blocked)
+        self.assertIn(head_component, execution["merge_lease_guard"]["resource_keys"])
 
     def test_atomic_merge_guard_allows_exact_nonoverlap(self) -> None:
         local_repo = merge_guard.merge_guard_repository_root(Path.cwd())

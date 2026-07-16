@@ -44,6 +44,7 @@ RESOURCE_KINDS = {
 }
 OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 SERVICE_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,255}\Z")
+COMPONENT_RE = re.compile(r"[A-Za-z0-9_.:@/-]{1,255}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -212,6 +213,9 @@ def normalize_resource_key(raw: str) -> str:
         if not 1 <= display <= 4095:
             raise ValueError("display resource must be between 1 and 4095")
         value = str(display)
+    elif kind == "component":
+        if COMPONENT_RE.fullmatch(value) is None:
+            raise ValueError("component resource contains unsupported characters")
     elif SERVICE_RE.fullmatch(value) is None:
         raise ValueError(f"{kind} resource contains unsupported characters")
     return f"{kind}:{value}"
@@ -1273,6 +1277,32 @@ def _merge_guard_branch_names(metadata: dict[str, Any]) -> set[str] | None:
     return names
 
 
+def _merge_guard_effect_resource_keys(
+    metadata: dict[str, Any],
+) -> set[str] | None:
+    guard = metadata.get("merge_guard")
+    if not isinstance(guard, dict):
+        return None
+    raw_keys = guard.get("effect_resource_keys")
+    expected_sha256 = guard.get("effect_resource_keys_sha256")
+    if not isinstance(raw_keys, list) or any(
+        not isinstance(item, str) for item in raw_keys
+    ):
+        return None
+    try:
+        normalized = normalize_resource_keys(raw_keys)
+    except ValueError:
+        return None
+    if normalized != raw_keys:
+        return None
+    observed_sha256 = hashlib.sha256(
+        _canonical_json(normalized).encode("utf-8")
+    ).hexdigest()
+    if expected_sha256 != observed_sha256:
+        return None
+    return set(normalized)
+
+
 def _repository_resource_overlaps_merge_guard(
     resource_key: str,
     *,
@@ -1332,7 +1362,17 @@ def _check_active_merge_guard_conflicts(
             else _merge_guard_changed_paths_from_row(row, repository=repository)
         )
         guarded_branches = _merge_guard_branch_names(row_metadata)
-        if repository is None or changed_paths is None:
+        effect_resource_keys = _merge_guard_effect_resource_keys(row_metadata)
+        if (
+            repository is None
+            or changed_paths is None
+            or guarded_branches is None
+            or effect_resource_keys is None
+        ):
+            raise ResourceConflict(
+                row["resource_key"], row["owner_id"], row["expires_at_unix"]
+            )
+        if set(keys).intersection(effect_resource_keys):
             raise ResourceConflict(
                 row["resource_key"], row["owner_id"], row["expires_at_unix"]
             )
@@ -1432,10 +1472,18 @@ def acquire_merge_guard_resources(
     if not isinstance(guard_metadata, dict):
         raise ValueError("merge guard metadata is required")
     guard_metadata = dict(guard_metadata)
+    guard_metadata["effect_resource_keys"] = keys
+    guard_metadata["effect_resource_keys_sha256"] = hashlib.sha256(
+        _canonical_json(keys).encode("utf-8")
+    ).hexdigest()
     guard_metadata["local_resource_repository"] = canonical_repository
     guard_metadata["local_changed_paths"] = relative_changed_paths
     normalized_metadata["merge_guard"] = guard_metadata
     guarded_branches = _merge_guard_branch_names(normalized_metadata)
+    if guarded_branches is None:
+        raise ValueError(
+            "merge guard metadata must bind valid base_branch and head_branch"
+        )
     if "scope_manifest" in normalized_metadata:
         normalized_metadata["scope_manifest"] = nonconflict.normalize_scope_manifest(
             normalized_metadata["scope_manifest"]
