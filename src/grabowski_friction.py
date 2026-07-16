@@ -2987,18 +2987,23 @@ def _record_execution_outcome_with_id(
             if existing["valid_records_total"] >= EXECUTION_GOVERNOR_MAX_RECORDS:
                 raise RuntimeError("execution outcome ledger record limit reached")
             _append_jsonl(EXECUTION_OUTCOME_LOG, record)
-    if not idempotent:
-        base._append_audit({
-            "timestamp_unix": record["recorded_at_unix"],
-            "operation": "execution-governor-outcome-record",
-            "outcome_id": record["outcome_id"],
-            "recommendation_id": record["recommendation_id"],
-            "risk_level": record["risk_level"],
-            "recommended_route": record["recommended_route"],
-            "actual_route": record["actual_route"],
-            "regression_signal": record["regression_signal"],
-            "binding_id": binding_id,
-        })
+    base._append_audit({
+        "timestamp_unix": int(time.time()),
+        "operation": (
+            "execution-governor-outcome-readback"
+            if idempotent
+            else "execution-governor-outcome-record"
+        ),
+        "recorded_at_unix": record["recorded_at_unix"],
+        "outcome_id": record["outcome_id"],
+        "recommendation_id": record["recommendation_id"],
+        "risk_level": record["risk_level"],
+        "recommended_route": record["recommended_route"],
+        "actual_route": record["actual_route"],
+        "regression_signal": record["regression_signal"],
+        "binding_id": binding_id,
+        "idempotent": idempotent,
+    })
     return {
         "recorded": True,
         "idempotent": idempotent,

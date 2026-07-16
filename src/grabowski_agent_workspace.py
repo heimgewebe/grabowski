@@ -3556,7 +3556,7 @@ def _publish_workspace_outcome(
         if not isinstance(receipt_hash, str) or SHA256_RE.fullmatch(receipt_hash) is None:
             missing_fields.append(f"first_pass_role_results.{role}.receipt_sha256")
     receipt = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "agent_workspace_outcome",
         "workspace_id": manifest["workspace_id"],
         "phase": phase,
@@ -3572,6 +3572,7 @@ def _publish_workspace_outcome(
             "review": dict(collection.get("review", {})) if isinstance(collection.get("review"), dict) else {},
         },
         "role_attempts": _role_attempt_summary(manifest),
+        "retry_measurement": _workspace_retry_measurement(manifest),
         "elapsed_seconds": elapsed,
         "tool_calls": _known_workspace_tool_calls(manifest, phase),
         "frozen_result_identity": frozen_identity,
@@ -3768,6 +3769,16 @@ def _bind_workspace_execution_outcome(
             "recorded": False,
             "does_not_establish": ["execution governor outcome"],
         }
+    if outcome.get("schema_version") != 3:
+        return {
+            "schema_version": 1,
+            "kind": "agent_workspace_execution_outcome_binding",
+            "workspace_id": manifest["workspace_id"],
+            "phase": "close",
+            "state": "not_applicable_legacy_outcome_schema",
+            "recorded": False,
+            "does_not_establish": ["execution governor outcome"],
+        }
     if outcome.get("evidence_complete") is not True:
         missing = outcome.get("missing_fields")
         raise AgentWorkspaceActionError(
@@ -3815,7 +3826,23 @@ def _bind_workspace_execution_outcome(
         raise AgentWorkspaceActionError(
             "workspace tool-call evidence is not integrity-bound"
         )
-    retry_measurement = _workspace_retry_measurement(manifest)
+    retry_measurement = outcome.get("retry_measurement")
+    if (
+        not isinstance(retry_measurement, dict)
+        or set(retry_measurement) != {"total", "unchanged", "changed"}
+        or any(
+            isinstance(retry_measurement.get(key), bool)
+            or not isinstance(retry_measurement.get(key), int)
+            or retry_measurement.get(key) < 0
+            for key in ("total", "unchanged", "changed")
+        )
+        or retry_measurement["total"]
+        != retry_measurement["unchanged"] + retry_measurement["changed"]
+        or retry_measurement["total"] > len(READ_ONLY_ROLES) * MAX_ROLE_RETRIES
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace retry measurement is invalid or unbound"
+        )
     first_pass_success = _workspace_first_pass_success(outcome)
     mapped = {
         "recommendation_id": recommendation_id,
@@ -5762,6 +5789,20 @@ def grabowski_agent_workspace_close(
                 manifest, existing, execution_outcome_binding
             )
             _write_manifest(manifest)
+            base._append_audit(
+                {
+                    "timestamp_unix": _now(),
+                    "operation": "agent-workspace-close-readback",
+                    "workspace_id": identifier,
+                    "writer_head": head,
+                    "diff_sha256": diff_sha,
+                    "result_sha256": result_sha,
+                    "execution_outcome_binding_state": (
+                        execution_outcome_binding.get("state")
+                    ),
+                    "idempotent": True,
+                }
+            )
             return {
                 "workspace_id": identifier,
                 "close_receipt": existing,

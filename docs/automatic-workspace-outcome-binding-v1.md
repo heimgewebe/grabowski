@@ -4,15 +4,16 @@ Agent Workspace closeout now binds complete, verified workspace evidence into th
 
 ## Contract
 
-A new workspace close may record one governor outcome only when all of the following are true:
+A new schema-v3 workspace close may record one governor outcome only when all of the following are true:
 
 - the close receipt is complete, hash-valid, present on disk and identical to the manifest reference;
 - all workspace resources are verified released;
 - the close-phase workspace outcome is hash-valid and belongs to the same workspace;
 - route evidence is verified and deterministically replayable;
+- retry command-identity measurement is frozen inside the hash-bound workspace outcome;
 - elapsed time and known mutating call count fit the governor's bounded schema.
 
-Legacy workspaces without route evidence remain closeable, but their outcome binding is explicitly `not_applicable_legacy_route`. No historical recommendation, risk level or route is invented.
+Legacy workspaces without route evidence remain closeable, but their outcome binding is explicitly `not_applicable_legacy_route`. Older outcome schemas remain closeable as `not_applicable_legacy_outcome_schema`. No historical recommendation, risk level, route or retry identity is invented.
 
 ## Deterministic idempotency
 

@@ -4499,12 +4499,14 @@ class AgentWorkspaceTests(unittest.TestCase):
             },
         }
         outcome = {
+            "schema_version": 3,
             "workspace_id": manifest["workspace_id"],
             "phase": "close",
             "route_evidence": manifest["route_evidence"],
             "route_legacy_compatibility": False,
             "evidence_complete": True,
             "missing_fields": [],
+            "retry_measurement": {"total": 2, "unchanged": 1, "changed": 1},
             "first_pass_role_results": {
                 "writer": {"state": "completed", "receipt_sha256": "d" * 64},
                 "tests": {"status": "passed", "returncode": 0, "receipt_sha256": "e" * 64},
@@ -4548,12 +4550,14 @@ class AgentWorkspaceTests(unittest.TestCase):
             complete_route_evidence()
         )
         outcome = {
+            "schema_version": 3,
             "workspace_id": manifest["workspace_id"],
             "phase": "close",
             "route_evidence": manifest["route_evidence"],
             "route_legacy_compatibility": False,
             "evidence_complete": False,
             "missing_fields": ["elapsed_seconds"],
+            "retry_measurement": {"total": 0, "unchanged": 0, "changed": 0},
         }
         outcome["outcome_sha256"] = workspace._sha256_json(outcome)
         with self.assertRaisesRegex(
@@ -4567,6 +4571,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.persist_complete_close_receipt(manifest)
         route, _complete, _legacy = workspace._route_gate(manifest)
         outcome = {
+            "schema_version": 3,
             "workspace_id": manifest["workspace_id"],
             "phase": "close",
             "route_evidence": route,

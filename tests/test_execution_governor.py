@@ -437,9 +437,18 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
             "elapsed_ms": 120000,
             "evidence_ref": "artifact:agent-workspace:gaw-test:close:" + "c" * 64,
         }
+        audit = Mock()
+        module.base._append_audit = audit
         with patch.object(module.time, "time", return_value=1_783_773_600):
             first = module.record_execution_outcome_once(**kwargs)
             second = module.record_execution_outcome_once(**kwargs)
+        self.assertEqual(
+            [call.args[0]["operation"] for call in audit.call_args_list],
+            [
+                "execution-governor-outcome-record",
+                "execution-governor-outcome-readback",
+            ],
+        )
         self.assertFalse(first["idempotent"])
         self.assertTrue(second["idempotent"])
         self.assertEqual(first["outcome_id"], second["outcome_id"])
