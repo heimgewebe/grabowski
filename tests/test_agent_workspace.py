@@ -4543,6 +4543,21 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(reference["binding_id"], first["binding_id"])
         self.assertTrue(Path(reference["path"]).is_file())
 
+    def test_workspace_closed_event_readback_recovers_manifest_sequence(self) -> None:
+        manifest = self.manifest()
+        close_receipt = self.persist_complete_close_receipt(manifest)
+        binding = {"state": "recorded", "binding_id": "b" * 64}
+        workspace._ensure_workspace_closed_event(manifest, close_receipt, binding)
+        observed_sequence = manifest["event_sequence"]
+        manifest["event_sequence"] = observed_sequence - 1
+
+        workspace._ensure_workspace_closed_event(manifest, close_receipt, binding)
+
+        self.assertEqual(manifest["event_sequence"], observed_sequence)
+        counts, integrity_bound = workspace._workspace_event_type_counts(manifest)
+        self.assertTrue(integrity_bound)
+        self.assertEqual(counts["workspace_closed"], 1)
+
     def test_workspace_outcome_binding_fails_closed_on_incomplete_evidence(self) -> None:
         manifest = self.manifest()
         self.persist_complete_close_receipt(manifest)

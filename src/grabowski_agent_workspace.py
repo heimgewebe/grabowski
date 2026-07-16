@@ -3953,6 +3953,24 @@ def _ensure_workspace_closed_event(
                 ),
             },
         )
+        return
+    workspace_id = _required_string(
+        manifest.get("workspace_id"), "workspace_id", max_length=80
+    )
+    observed_sequence = _event_log_sequence(
+        _event_log_path(workspace_id), workspace_id
+    )
+    manifest_sequence = manifest.get("event_sequence", 0)
+    if (
+        isinstance(manifest_sequence, bool)
+        or not isinstance(manifest_sequence, int)
+        or manifest_sequence < 0
+        or manifest_sequence > observed_sequence
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace manifest event sequence is invalid during close readback"
+        )
+    manifest["event_sequence"] = observed_sequence
 
 
 def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict[str, Any]:
