@@ -606,7 +606,21 @@ class ResourceTests(unittest.TestCase):
             resources.acquire_resources(
                 "late-owner",
                 ["component:unrelated-but-cooperating"],
-                purpose="must not proceed past malformed active merge guard",
+                purpose="must not proceed past tampered outer metadata",
+                ttl_seconds=60,
+            )
+        _, tampered_metadata_sha256 = resources._metadata(metadata)
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET metadata_sha256=? WHERE resource_key=?",
+                (tampered_metadata_sha256, gate),
+            )
+            connection.commit()
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "late-owner",
+                ["component:still-unrelated-but-cooperating"],
+                purpose="must not proceed past invalid inner effect binding",
                 ttl_seconds=60,
             )
 

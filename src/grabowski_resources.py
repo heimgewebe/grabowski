@@ -1356,6 +1356,11 @@ def _check_active_merge_guard_conflicts(
     for row in rows:
         repository = _merge_guard_repository_from_row(row)
         row_metadata = _row_metadata(row)
+        _, observed_metadata_sha256 = _metadata(row_metadata)
+        if row["metadata_sha256"] != observed_metadata_sha256:
+            raise ResourceConflict(
+                row["resource_key"], row["owner_id"], row["expires_at_unix"]
+            )
         changed_paths = (
             None
             if repository is None
