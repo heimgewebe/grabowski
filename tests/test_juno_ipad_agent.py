@@ -80,6 +80,18 @@ class StateRootSelectionTests(unittest.TestCase):
             self.assertEqual(source, "unpaired")
             self.assertEqual(key_path, state_root / "juno_ipad_agent.key")
 
+    def test_cache_directories_are_not_reported_as_persistent(self) -> None:
+        self.assertFalse(
+            agent.directory_is_persistent(
+                Path("/private/var/mobile/App/Library/Caches/grabowski_workspace")
+            )
+        )
+        self.assertTrue(
+            agent.directory_is_persistent(
+                Path("/private/var/mobile/App/Library/Application Support/Grabowski")
+            )
+        )
+
 
 class NetworkPolicyTests(unittest.TestCase):
     def test_only_loopback_and_tailscale_sources_are_allowed(self) -> None:
@@ -273,8 +285,9 @@ class ClientPairingTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.secret = b""
 
-            def pair(self, secret: bytes) -> dict[str, object]:
+            def pair(self, secret: bytes, consent_code: str) -> dict[str, object]:
                 self.secret = secret
+                self.consent_code = consent_code
                 return {"status": "paired", "paired": True}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -286,6 +299,7 @@ class ClientPairingTests(unittest.TestCase):
                 fake,
                 target,
                 replace_secret=True,
+                consent_code="123456",
             )
             self.assertEqual(response["status"], "paired")
             self.assertEqual(len(fake.secret), 32)
@@ -300,8 +314,9 @@ class ClientPairingTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.secret = b""
 
-            def pair(self, secret: bytes) -> dict[str, object]:
+            def pair(self, secret: bytes, consent_code: str) -> dict[str, object]:
                 self.secret = secret
+                self.consent_code = consent_code
                 return {"status": "paired", "paired": True}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -314,6 +329,7 @@ class ClientPairingTests(unittest.TestCase):
                 fake,
                 target,
                 replace_secret=False,
+                consent_code="123456",
             )
             self.assertEqual(response["status"], "paired")
             self.assertEqual(fake.secret, existing)
@@ -321,7 +337,8 @@ class ClientPairingTests(unittest.TestCase):
 
     def test_pairing_failure_preserves_private_pending_secret(self) -> None:
         class FailingClient:
-            def pair(self, secret: bytes) -> dict[str, object]:
+            def pair(self, secret: bytes, consent_code: str) -> dict[str, object]:
+                del secret, consent_code
                 raise RuntimeError("transport unknown")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -331,6 +348,7 @@ class ClientPairingTests(unittest.TestCase):
                     FailingClient(),
                     target,
                     replace_secret=False,
+                    consent_code="123456",
                 )
             pending = target.with_name(f".{target.name}.pairing-pending")
             self.assertFalse(target.exists())
@@ -340,6 +358,41 @@ class ClientPairingTests(unittest.TestCase):
 
 
 class PairingIntegrationTests(unittest.TestCase):
+    def test_pairing_consent_locks_after_repeated_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = agent.AgentState(root / "state", start_worker=False)
+            server = agent.AgentHTTPServer(
+                ("127.0.0.1", 0),
+                agent.AgentHandler,
+                authenticator=None,
+                state=state,
+                secret_source="unpaired",
+                key_path=root / "juno_ipad_agent.key",
+                pairing_peer="127.0.0.1",
+                started_at=agent.utc_now(),
+                pairing_consent_code="123456",
+                pairing_consent_expires_at_unix=int(time.time()) + 600,
+            )
+            try:
+                for _ in range(agent.PAIRING_CONSENT_MAX_ATTEMPTS - 1):
+                    with self.assertRaisesRegex(
+                        PermissionError, "pairing_consent_mismatch"
+                    ):
+                        server.pair(b"p" * 32, "654321")
+                with self.assertRaisesRegex(
+                    PermissionError, "pairing_consent_locked"
+                ):
+                    server.pair(b"p" * 32, "654321")
+                self.assertIsNone(server.pairing_consent_code)
+                with self.assertRaisesRegex(
+                    PermissionError, "pairing_consent_expired"
+                ):
+                    server.pair(b"p" * 32, "123456")
+            finally:
+                server.server_close()
+                state.stop()
+
     def test_unpaired_agent_pairs_once_and_accepts_authenticated_job(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -354,22 +407,33 @@ class PairingIntegrationTests(unittest.TestCase):
                 key_path=key_path,
                 pairing_peer="127.0.0.1",
                 started_at=agent.utc_now(),
+                pairing_consent_code="123456",
+                pairing_consent_expires_at_unix=int(time.time()) + 600,
             )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
                 base_url = f"http://127.0.0.1:{server.server_address[1]}"
                 pairing_client = client_module.AgentClient(base_url, b"", 3.0)
-                self.assertFalse(pairing_client.health()["paired"])
+                health = pairing_client.health()
+                self.assertFalse(health["paired"])
+                self.assertTrue(health["pairing_consent_required"])
+                self.assertNotIn("pairing_consent_code", health)
                 secret = b"p" * 32
-                paired = pairing_client.pair(secret)
+                with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
+                    pairing_client.pair(secret, "654321")
+                self.assertEqual(
+                    pairing_client.health()["pairing_consent_attempts_remaining"],
+                    4,
+                )
+                paired = pairing_client.pair(secret, "123456")
                 self.assertEqual(paired["status"], "paired")
                 self.assertEqual(key_path.read_bytes(), secret)
                 self.assertTrue(pairing_client.health()["paired"])
-                replayed = pairing_client.pair(secret)
+                replayed = pairing_client.pair(secret, "000000")
                 self.assertEqual(replayed["status"], "already_paired_same_secret")
                 with self.assertRaisesRegex(RuntimeError, "HTTP 409"):
-                    pairing_client.pair(b"q" * 32)
+                    pairing_client.pair(b"q" * 32, "123456")
                 authenticated = client_module.AgentClient(base_url, secret, 3.0)
                 submitted = authenticated.submit(
                     "GRABOWSKI_RESULT = {'paired': True}",
@@ -399,6 +463,8 @@ class HTTPIntegrationTests(unittest.TestCase):
                 key_path=Path(directory) / "agent.key",
                 pairing_peer="127.0.0.1",
                 started_at=agent.utc_now(),
+                pairing_consent_code=None,
+                pairing_consent_expires_at_unix=None,
             )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()

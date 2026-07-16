@@ -380,6 +380,27 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["remote-command-dependent"],
         "reversibility": "command-dependent",
     },
+    "grabowski_juno_status": {
+        "category": "device-worker",
+        "purpose": "Read bounded health and job evidence from the paired Juno device worker.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_juno_pair": {
+        "category": "device-worker",
+        "purpose": "Pair one exact Juno session after local consent and explicit escalation.",
+        "risk_class": "high",
+        "effects": ["device-key-create", "local-secret-create-or-replace", "receipt-create"],
+        "reversibility": "remove-both-pairing-files-and-restart",
+    },
+    "grabowski_juno_run": {
+        "category": "device-worker",
+        "purpose": "Run one bounded digest-bound job on the paired Juno device worker.",
+        "risk_class": "high",
+        "effects": ["device-job-execute", "device-state-change", "receipt-create"],
+        "reversibility": "job-dependent-with-local-stop-switch",
+    },
     "grabowski_operation_list": {
         "category": "operation",
         "purpose": "List validated named multi-step operations.",

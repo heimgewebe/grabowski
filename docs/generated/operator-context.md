@@ -95,6 +95,9 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_power_run` | privileged-execution | no | critical | Run one audited root command through the recovery-gated power broker. |
 | `grabowski_fleet_list` | fleet | yes | low | Return the validated local and SSH host registry. |
 | `grabowski_fleet_run` | fleet | no | variable | Run one bounded argv command on one registered local or SSH host. |
+| `grabowski_juno_status` | device-worker | yes | low | Read bounded health and job evidence from the paired Juno device worker. |
+| `grabowski_juno_pair` | device-worker | no | high | Pair one exact Juno session after local consent and explicit escalation. |
+| `grabowski_juno_run` | device-worker | no | high | Run one bounded digest-bound job on the paired Juno device worker. |
 | `grabowski_operation_list` | operation | yes | low | List validated named multi-step operations. |
 | `grabowski_operation_plan` | operation | yes | low | Render a named operation and rollback path without executing it. |
 | `grabowski_operation_run` | operation | no | high | Run a named preflight/action/postflight operation with rollback after failure. |
