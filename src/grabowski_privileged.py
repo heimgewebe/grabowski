@@ -77,10 +77,7 @@ def _socket(path: Path) -> dict[str, Any]:
     return result
 
 
-@mcp.tool(name="grabowski_privileged_broker_status", annotations=READ_ONLY)
-def grabowski_privileged_broker_status() -> dict[str, Any]:
-    """Inspect the fail-closed root-owned privileged broker installation."""
-    operator._require_operator_capability("privileged_reference")
+def _privileged_broker_status() -> dict[str, Any]:
     broker = _root_file(BROKER, True)
     config = _root_file(BROKER_CONFIG, False)
     broker_socket = _socket(BROKER_SOCKET)
@@ -99,9 +96,17 @@ def grabowski_privileged_broker_status() -> dict[str, Any]:
         "fail_closed": True,
     }
 
+
+@mcp.tool(name="grabowski_privileged_broker_status", annotations=READ_ONLY)
+def grabowski_privileged_broker_status() -> dict[str, Any]:
+    """Inspect the fail-closed root-owned privileged broker installation."""
+    operator._require_operator_capability("privileged_reference")
+    return _privileged_broker_status()
+
 POWER_ACTION = "operator_power_argv"
 RECOVERY_PUBLISH_ACTION = "publish_recovery_marker"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
+ROOT_TASK_SYSTEMD_ACTION = "operator_root_task_systemd_unit"
 POWER_REFERENCE_TTL_SECONDS = 900
 POWER_MAX_TARGET_BYTES = 48 * 1024
 POWER_REFERENCE_DIR = Path(os.environ.get(
@@ -248,6 +253,129 @@ def _write_power_reference(reference: dict[str, Any]) -> Path:
     path = Path(name)
     path.chmod(0o600)
     return path
+
+
+def _invoke_privileged_reference(
+    *,
+    action: str,
+    target: str,
+    justification: str,
+    timeout_seconds: int,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    broker = _privileged_broker_status()
+    if not broker.get("ready"):
+        raise PermissionError("privileged broker is not ready")
+    reference = _create_privileged_reference(
+        action=action,
+        target=target,
+        justification=justification,
+    )
+    reference_path = _write_power_reference(reference)
+    client = str(broker["request_client"])
+    client_timed_out = False
+    broker_client_returncode: int | None
+    try:
+        completed = subprocess.run(
+            [client, str(reference_path)],
+            cwd="/",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds + 15,
+            check=False,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        )
+        broker_client_returncode = completed.returncode
+        stdout_raw = completed.stdout
+        stderr_raw = completed.stderr
+    except subprocess.TimeoutExpired as exc:
+        client_timed_out = True
+        broker_client_returncode = None
+        stdout_raw = exc.stdout or b""
+        stderr_raw = exc.stderr or b"privileged broker client timed out"
+    finally:
+        try:
+            reference_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    stdout_full = _redact_text(stdout_raw.decode("utf-8", errors="replace"))
+    stderr_full = _redact_text(stderr_raw.decode("utf-8", errors="replace"))
+    stdout, stdout_truncated = _limit_text(stdout_full, max_output_bytes)
+    stderr, stderr_truncated = _limit_text(stderr_full, max_output_bytes)
+    try:
+        parsed = json.loads(stdout_full) if stdout_full.strip() else None
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in ("stdout", "stderr"):
+            if isinstance(parsed.get(key), str):
+                parsed[key], parsed[f"{key}_truncated_by_client"] = _limit_text(
+                    _redact_text(parsed[key]),
+                    max_output_bytes,
+                )
+    return {
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+        "broker_client_returncode": broker_client_returncode,
+        "broker_client_timed_out": client_timed_out,
+        "broker_response": parsed,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+    }
+
+
+def root_task_systemd_request(
+    payload: dict[str, Any],
+    *,
+    timeout_seconds: int = 60,
+    max_output_bytes: int = 250_000,
+) -> dict[str, Any]:
+    target = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    invoked = _invoke_privileged_reference(
+        action=ROOT_TASK_SYSTEMD_ACTION,
+        target=target,
+        justification="Operate one Grabowski root-owned systemd task unit",
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=max_output_bytes,
+    )
+    parsed = invoked["broker_response"]
+    broker_returncode = parsed.get("returncode") if isinstance(parsed, dict) else None
+    broker_timed_out = bool(parsed.get("timed_out")) if isinstance(parsed, dict) else False
+    root_truth_observable = (
+        not invoked["broker_client_timed_out"]
+        and not broker_timed_out
+        and isinstance(broker_returncode, int)
+    )
+    stdout = parsed.get("stdout") if isinstance(parsed, dict) and isinstance(parsed.get("stdout"), str) else invoked["stdout"]
+    stderr = parsed.get("stderr") if isinstance(parsed, dict) and isinstance(parsed.get("stderr"), str) else invoked["stderr"]
+    return {
+        "returncode": broker_returncode if isinstance(broker_returncode, int) else 1,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": bool(invoked["broker_client_timed_out"] or broker_timed_out),
+        "stdout_truncated": bool(
+            invoked["stdout_truncated"]
+            or (isinstance(parsed, dict) and parsed.get("stdout_truncated"))
+            or (isinstance(parsed, dict) and parsed.get("stdout_truncated_by_client"))
+        ),
+        "stderr_truncated": bool(
+            invoked["stderr_truncated"]
+            or (isinstance(parsed, dict) and parsed.get("stderr_truncated"))
+            or (isinstance(parsed, dict) and parsed.get("stderr_truncated_by_client"))
+        ),
+        "root_truth_observable": root_truth_observable,
+        "outcome_unknown": not root_truth_observable,
+        "privileged_broker": invoked,
+    }
 
 
 def publish_recovery_marker_reference(
