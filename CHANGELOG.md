@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added the read-only `convergence-assess` grip as the first operational consumer of `heimgewebe/konvergenzregelkreis` v1.0.0. It binds the request SHA-256, exact protocol Git head, clean protocol checkout, evaluator identity, status/exit-code consistency and a post-evaluation identity readback; only `terminally_closed` permits completion, while missing, stale, blocked or conflicting evidence fails closed without mutation.
 - Stabilized checkout-cleanup dry-run authorization across clock progress by binding the immutable archive creation time while excluding only the explicitly declared observational `archive_age_seconds` field from the schema-2 plan hash; real checkout, recovery, retention, and coordination drift remains fail-closed.
 - Hardened operator-obligation attention projection with fail-closed status invariants, explicit mixed open/blocked/delegated coverage, and a documented deprecated `follow_up_required` compatibility alias while preserving explicit `state="open"` behavior.
 - Added a durable operator-obligation lifecycle with bounded discovery, create-only hash-bound open and terminal records, and close-time live observation for delegated Grabowski tasks, agent workspaces, and systemd jobs. Nontrivial work remains explicitly open with `response_may_end=false` until every acceptance criterion is evidenced as passed, a concrete blocker is recorded, or live durable work is receipt-bound.

@@ -1946,6 +1946,10 @@
         "source": "src/grabowski_grips.py"
       },
       {
+        "module": "grabowski_convergence",
+        "source": "src/grabowski_convergence.py"
+      },
+      {
         "module": "grabowski_operator_obligation",
         "source": "src/grabowski_operator_obligation.py"
       },
@@ -2119,7 +2123,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "e3369e74b5d7d23c958eca66bc17f12755f44409390774ed45de6a8822819694"
+      "sha256": "f450350a5eccaa674f0872715e01fa44648b32ccbc647aa3e2cfb3e6a41787cb"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2139,14 +2143,15 @@
       "src/grabowski_chronik.py": "6a37342b5741763db16f2792dc5370fd9fe6e7e1dc7965b7f6a8c54f8c55ec62",
       "src/grabowski_command_identity.py": "03bf7193851846d1f5b4d1bfe71a787937e424804f875ba4e021233ddbc842c9",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
+      "src/grabowski_convergence.py": "03ea75eb190ac08f29c4ec6c5ab1a14a631ce7c0cce4956ed6f437c492a6a635",
       "src/grabowski_fleet.py": "0daf060517bde7b17caf7dd1f684e29521fb7b7457d1bfd79b32cf28a15c3beb",
       "src/grabowski_friction.py": "3391e7f42cb7c7ea65969eadd97938ff2325d65e7cc6ac6d484db2c89e69d8ce",
       "src/grabowski_grip_orchestration.py": "be3def7d9e24c316ef73bf247e78d1d1ff50a5d6e9d6f609f7f1221329c3159d",
-      "src/grabowski_grips.py": "da9472bff22a2db84d1f141f5f4e218f94d0731a99991af6c05f9d3b5c56982a",
+      "src/grabowski_grips.py": "e3708ee7e5a58fc3013b9b6c48b0734779e0fa4e4014874233fc20095900295d",
       "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
-      "src/grabowski_mcp.py": "a8e63e96e2dd37a4799b651ee641ba5b61eeddf50979d5eee49780c66ca888de",
+      "src/grabowski_mcp.py": "1f81ffc7ef46a3f40070b0c1d9e6993700120026d0912c256f2df77c5eb0d746",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
       "src/grabowski_operator.py": "674c070df71d3538e6dd8edc6e373a57563650015a6d8bedae91133e4b486666",

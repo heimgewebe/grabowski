@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import grabowski_repobrief
 import grabowski_grip_orchestration
+import grabowski_convergence
 import grabowski_operator_obligation
 import grabowski_worktree_ensure
 
@@ -156,6 +157,20 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=("registered-adapter", "expected-head-bound", "deploy-preflight-readonly"),
         runner="runtime_deploy_check",
     ),
+    "convergence-assess": GripSpec(
+        name="convergence-assess",
+        version="1.0",
+        summary="Evaluate one hash-bound convergence request with the pinned external protocol before closure.",
+        effect=READ_ONLY,
+        required_parameters=("request_path", "expected_request_sha256", "expected_protocol_head"),
+        acceptance_ids=(
+            "protocol-identity-bound",
+            "request-hash-bound",
+            "deterministic-assessment",
+            "terminal-closure-gate",
+        ),
+        runner="convergence_assess",
+    ),
     "mechanic-loop": GripSpec(
         name="mechanic-loop",
         version="1.0",
@@ -257,6 +272,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "situation",
         "scout",
         "runtime-deploy-check",
+        "convergence-assess",
         "mechanic-loop",
         "captain-preflight",
         "captain-run",
@@ -279,6 +295,7 @@ GRIP_SURFACE_TARGETS = {
     "situation": "repository and PR situation snapshot",
     "scout": "change-only repository, PR and runtime drift signal",
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
+    "convergence-assess": "one hash-bound convergence closure assessment",
     "mechanic-loop": "bounded normal grip action sequence",
     "captain-preflight": "high-impact Captain action preflight only",
     "captain-run": "action-specific high-impact Captain execution",
@@ -303,6 +320,7 @@ MECHANIC_NORMAL_GRIPS = frozenset(
         "situation",
         "scout",
         "runtime-deploy-check",
+        "convergence-assess",
         "pr-check-readiness",
         "post-merge-sync",
         "branch-publish",
@@ -1871,6 +1889,39 @@ def _runtime_deploy_self_expected_argv_sha256(
         delay_seconds,
     )
     return grabowski_self_deploy._deploy_command_sha256(command)
+
+
+def _run_convergence_assess(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    try:
+        output = grabowski_convergence.assess(parameters, runner)
+    except grabowski_convergence.ConvergenceInputError as exc:
+        _check(receipt, "protocol-identity-bound", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except grabowski_convergence.ConvergenceExecutionError as exc:
+        _check(receipt, "deterministic-assessment", "fail", str(exc))
+        raise GripActionError(str(exc)) from exc
+    _check(receipt, "protocol-identity-bound", "pass", output["protocol_head"])
+    _check(receipt, "request-hash-bound", "pass", output["request_sha256"])
+    assessment = output["assessment"]
+    _check(
+        receipt,
+        "deterministic-assessment",
+        "pass",
+        f"assessment_id={assessment['assessment_id']}; status={assessment['status']}",
+    )
+    closure_allowed = output["closure_allowed"] is True
+    _check(
+        receipt,
+        "terminal-closure-gate",
+        "pass" if closure_allowed else "fail",
+        assessment["status"],
+    )
+    return {**output, "receipt_status": "passed" if closure_allowed else "blocked"}
 
 
 def _run_runtime_deploy_check(
@@ -4959,6 +5010,7 @@ _RUNNERS = {
     "situation": _run_situation,
     "scout": _run_scout,
     "runtime_deploy_check": _run_runtime_deploy_check,
+    "convergence_assess": _run_convergence_assess,
     "operator_obligation_open": _run_operator_obligation_open,
     "operator_obligation_list": _run_operator_obligation_list,
     "operator_obligation_status": _run_operator_obligation_status,
