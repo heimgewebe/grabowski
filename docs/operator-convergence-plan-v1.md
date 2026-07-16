@@ -25,7 +25,7 @@ Expose named task projections through the existing `grabowski_task_list` surface
 - `attention`: interrupted, outcome-unknown, failed, timed-out, or signalled tasks;
 - `terminal`: completed, failed, cancelled, timed-out, signalled, or outcome-unknown tasks.
 
-Every response also returns exact state counts and projection counts. Projections intentionally overlap and must not be summed. Unknown legacy states are counted explicitly and make the exact-state projection incomplete instead of disappearing silently. Historical rows remain in the task database.
+Every response also returns exact state counts and projection counts from one SQLite read snapshot. Projections intentionally overlap and must not be summed. Unknown legacy states are counted explicitly and make the exact-state projection incomplete instead of disappearing silently. Historical rows remain in the task database.
 
 ### P1 — Gate evidence preparation
 

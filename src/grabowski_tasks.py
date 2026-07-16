@@ -1412,6 +1412,7 @@ def grabowski_task_list(
         parameters.extend([cursor_created_at, cursor_created_at, cursor_task_id])
     where_sql = f" WHERE {' AND '.join(where)}" if where else ""
     with _database() as connection:
+        connection.execute("BEGIN")
         rows = connection.execute(
             f"SELECT * FROM tasks{where_sql} "
             "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",

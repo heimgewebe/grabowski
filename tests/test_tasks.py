@@ -199,6 +199,40 @@ class TaskTests(unittest.TestCase):
             "inspect unknown task states before relying on projections",
         )
 
+    def test_task_list_reads_rows_and_counts_from_one_snapshot(self) -> None:
+        task = self._start()["task"]
+        original_state_counts = tasks._task_state_counts
+
+        def mutate_then_count(
+            connection: sqlite3.Connection,
+        ) -> tuple[dict[str, int], dict[str, int], int]:
+            with sqlite3.connect(self.database) as writer:
+                writer.execute(
+                    "UPDATE tasks SET state='failed' WHERE task_id=?",
+                    (task["task_id"],),
+                )
+                writer.commit()
+            return original_state_counts(connection)
+
+        with patch.object(
+            tasks,
+            "_task_state_counts",
+            side_effect=mutate_then_count,
+        ):
+            listed = tasks.grabowski_task_list(state="running")
+
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(listed["total_matching"], 1)
+        self.assertEqual(listed["tasks"][0]["state"], "running")
+        self.assertEqual(listed["state_counts"]["running"], 1)
+        self.assertEqual(listed["state_counts"]["failed"], 0)
+        with sqlite3.connect(self.database) as connection:
+            stored_state = connection.execute(
+                "SELECT state FROM tasks WHERE task_id=?",
+                (task["task_id"],),
+            ).fetchone()[0]
+        self.assertEqual(stored_state, "failed")
+
     def test_start_uses_shared_unicode_argv_identity(self) -> None:
         argv = ["/bin/echo", "Grüße"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
