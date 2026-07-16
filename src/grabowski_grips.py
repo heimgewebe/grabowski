@@ -193,6 +193,42 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="convergence_assess",
     ),
+    "gate-evidence-preflight": GripSpec(
+        name="gate-evidence-preflight",
+        version="1.0",
+        summary="Prepare bounded evidence for one fail-closed gate without granting execution authority.",
+        effect=READ_ONLY,
+        required_parameters=(
+            "gate_owner",
+            "policy_boundary",
+            "target",
+            "scope",
+            "expected_identity",
+            "evidence",
+            "attempt",
+        ),
+        acceptance_ids=(
+            "typed-gate-input",
+            "required-evidence-visible",
+            "changed-retry-bound",
+            "no-policy-authority",
+        ),
+        runner="gate_evidence_preflight",
+    ),
+    "convergence-state-classify": GripSpec(
+        name="convergence-state-classify",
+        version="1.0",
+        summary="Classify bounded historical states from explicit evidence without rewriting history.",
+        effect=READ_ONLY,
+        required_parameters=("records",),
+        acceptance_ids=(
+            "bounded-records",
+            "evidence-only-classification",
+            "contradictions-visible",
+            "no-history-mutation",
+        ),
+        runner="convergence_state_classify",
+    ),
     "mechanic-loop": GripSpec(
         name="mechanic-loop",
         version="1.0",
@@ -296,6 +332,8 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "runtime-deploy-check",
         "connector-snapshot-bind",
         "convergence-assess",
+        "gate-evidence-preflight",
+        "convergence-state-classify",
         "mechanic-loop",
         "captain-preflight",
         "captain-run",
@@ -320,6 +358,8 @@ GRIP_SURFACE_TARGETS = {
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
     "connector-snapshot-bind": "one connector client snapshot receipt",
     "convergence-assess": "one hash-bound convergence closure assessment",
+    "gate-evidence-preflight": "one fail-closed gate evidence preparation",
+    "convergence-state-classify": "bounded historical convergence state records",
     "mechanic-loop": "bounded normal grip action sequence",
     "captain-preflight": "high-impact Captain action preflight only",
     "captain-run": "action-specific high-impact Captain execution",
@@ -345,6 +385,8 @@ MECHANIC_NORMAL_GRIPS = frozenset(
         "scout",
         "runtime-deploy-check",
         "convergence-assess",
+        "gate-evidence-preflight",
+        "convergence-state-classify",
         "pr-check-readiness",
         "post-merge-sync",
         "branch-publish",
@@ -2006,6 +2048,294 @@ def _run_convergence_assess(
         assessment["status"],
     )
     return {**output, "receipt_status": "passed" if closure_allowed else "blocked"}
+
+
+_GATE_EVIDENCE_CATEGORIES = (
+    "leases",
+    "dirty_state",
+    "running_work",
+    "receipt",
+    "acceptance",
+    "post_state_readback",
+)
+_GATE_EVIDENCE_STATES = frozenset({"satisfied", "missing", "not_required", "unknown"})
+_CONVERGENCE_RECORD_KEYS = frozenset({
+    "record_id",
+    "observed_state",
+    "failure_evidence",
+    "expected_evidence",
+    "blocking_evidence",
+    "superseding_evidence",
+    "resolution_evidence",
+})
+_CONVERGENCE_SIGNAL_FIELDS = (
+    ("failure_evidence", "defect"),
+    ("expected_evidence", "expected"),
+    ("blocking_evidence", "blocked"),
+    ("superseding_evidence", "superseded"),
+    ("resolution_evidence", "resolved"),
+)
+
+
+def _bounded_contract_text(value: Any, *, field: str, maximum: int = 512) -> str:
+    if not isinstance(value, str):
+        raise GripPreflightError(f"{field} must be a string")
+    normalized = value.strip()
+    if not normalized or len(normalized) > maximum or "\x00" in normalized:
+        raise GripPreflightError(f"{field} must be non-empty and at most {maximum} characters")
+    return normalized
+
+
+def _strict_contract_object(
+    value: Any,
+    *,
+    field: str,
+    required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise GripPreflightError(f"{field} must be an object")
+    keys = set(value)
+    missing = sorted(required - keys)
+    extra = sorted(keys - required - optional)
+    if missing or extra:
+        raise GripPreflightError(f"{field} has invalid keys: missing={missing}; extra={extra}")
+    return dict(value)
+
+
+def _gate_identity_object(parameters: dict[str, Any], field: str) -> dict[str, Any]:
+    value = parameters[field]
+    if not isinstance(value, dict) or not value or len(value) > 16:
+        raise GripPreflightError(f"{field} must be a non-empty object with at most 16 fields")
+    normalized: dict[str, str] = {}
+    for key, item in sorted(value.items()):
+        normalized[_bounded_contract_text(key, field=f"{field} key", maximum=64)] = _bounded_contract_text(
+            item, field=f"{field}.{key}", maximum=512
+        )
+    return normalized
+
+
+def _run_gate_evidence_preflight(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    gate_owner = _bounded_contract_text(parameters["gate_owner"], field="gate_owner", maximum=256)
+    policy_boundary = _bounded_contract_text(parameters["policy_boundary"], field="policy_boundary")
+    target = _gate_identity_object(parameters, "target")
+    scope = _gate_identity_object(parameters, "scope")
+    expected_identity = _gate_identity_object(parameters, "expected_identity")
+    evidence = _strict_contract_object(
+        parameters["evidence"],
+        field="evidence",
+        required=frozenset(_GATE_EVIDENCE_CATEGORIES),
+    )
+    normalized_evidence: list[dict[str, str]] = []
+    missing: list[str] = []
+    for category in _GATE_EVIDENCE_CATEGORIES:
+        item = _strict_contract_object(
+            evidence[category],
+            field=f"evidence.{category}",
+            required=frozenset({"status", "reference"}),
+        )
+        status = _bounded_contract_text(item["status"], field=f"evidence.{category}.status", maximum=32)
+        if status not in _GATE_EVIDENCE_STATES:
+            raise GripPreflightError(f"evidence.{category}.status is invalid")
+        reference = _bounded_contract_text(
+            item["reference"], field=f"evidence.{category}.reference", maximum=1024
+        )
+        normalized_evidence.append({
+            "category": category,
+            "status": status,
+            "reference_sha256": hashlib.sha256(reference.encode("utf-8")).hexdigest(),
+        })
+        if status in {"missing", "unknown"}:
+            missing.append(category)
+
+    attempt = _strict_contract_object(
+        parameters["attempt"],
+        field="attempt",
+        required=frozenset({"prior_attempt", "evidence_changed", "change_reference"}),
+    )
+    prior_attempt = attempt["prior_attempt"]
+    evidence_changed = attempt["evidence_changed"]
+    if not isinstance(prior_attempt, bool) or not isinstance(evidence_changed, bool):
+        raise GripPreflightError("attempt prior_attempt and evidence_changed must be booleans")
+    change_reference = attempt["change_reference"]
+    if evidence_changed:
+        change_reference = _bounded_contract_text(
+            change_reference, field="attempt.change_reference", maximum=1024
+        )
+        change_reference_sha256: str | None = hashlib.sha256(change_reference.encode("utf-8")).hexdigest()
+    else:
+        if change_reference is not None and change_reference != "":
+            raise GripPreflightError("attempt.change_reference must be empty when evidence_changed is false")
+        change_reference_sha256 = None
+    unchanged_retry = prior_attempt and not evidence_changed
+    ready = not missing and not unchanged_retry
+
+    _check(receipt, "typed-gate-input", "pass", sha256_json({
+        "gate_owner": gate_owner,
+        "policy_boundary": policy_boundary,
+        "target": target,
+        "scope": scope,
+        "expected_identity": expected_identity,
+    }))
+    _check(
+        receipt,
+        "required-evidence-visible",
+        "pass" if not missing else "fail",
+        "complete" if not missing else ",".join(missing),
+    )
+    _check(
+        receipt,
+        "changed-retry-bound",
+        "pass" if not unchanged_retry else "fail",
+        "first_attempt_or_evidence_changed" if not unchanged_retry else "unchanged_retry_rejected",
+    )
+    _check(receipt, "no-policy-authority", "pass", "evidence_preparation_only")
+
+    blocked_reasons = [f"missing_evidence:{item}" for item in missing]
+    if unchanged_retry:
+        blocked_reasons.append("unchanged_retry_rejected")
+    return {
+        "schema_version": 1,
+        "authority": "evidence_preparation_only",
+        "decision": "evidence_prepared" if ready else "blocked",
+        "ready_for_gate_evaluation": ready,
+        "gate_owner": gate_owner,
+        "policy_boundary": policy_boundary,
+        "target_sha256": sha256_json(target),
+        "scope_sha256": sha256_json(scope),
+        "expected_identity_sha256": sha256_json(expected_identity),
+        "evidence": normalized_evidence,
+        "missing_evidence": missing,
+        "attempt": {
+            "prior_attempt": prior_attempt,
+            "evidence_changed": evidence_changed,
+            "change_reference_sha256": change_reference_sha256,
+        },
+        "blocked_reasons": blocked_reasons,
+        "preparation_steps": [
+            "run the narrow read-only preflight for each missing or unknown evidence category",
+            "collect only named evidence references and bind them to the same target identity",
+            "re-read leases, dirty state and running work immediately before any effect",
+            "define a post-state readback bound to the same target identity",
+        ],
+        "retry_policy": "no unchanged retry; retry only after a named evidence or target-state change",
+        "does_not_establish": [
+            "execution_authority",
+            "policy_bypass",
+            "safe_mutation_retry",
+            "root_cause",
+            "gate_pass",
+        ],
+        "receipt_status": "passed" if ready else "blocked",
+    }
+
+
+def _optional_evidence_reference(value: Any, *, field: str) -> str | None:
+    if value is None:
+        return None
+    return _bounded_contract_text(value, field=field, maximum=1024)
+
+
+def _classify_convergence_signals(signals: set[str]) -> tuple[str, str]:
+    if not signals:
+        return "unknown", "no decisive evidence reference was supplied"
+    if "resolved" in signals:
+        if "superseded" in signals:
+            return "conflicted", "both resolved and superseded terminal evidence are present"
+        return "resolved", "resolution evidence closes earlier nonterminal signals"
+    if "superseded" in signals:
+        if "expected" in signals:
+            return "conflicted", "expected and superseded evidence express different meanings"
+        return "superseded", "a replacing issue, pull request or receipt is evidenced"
+    if "expected" in signals and "blocked" in signals:
+        return "conflicted", "expected-red and policy-block evidence are both present"
+    if "expected" in signals:
+        return "expected", "expected-red evidence explains any accompanying failure signal"
+    if "blocked" in signals:
+        return "blocked", "policy or environmental gate evidence explains any accompanying failure signal"
+    return "defect", "failure evidence remains without a stronger explanatory or terminal signal"
+
+
+def _run_convergence_state_classify(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    records = parameters["records"]
+    if not isinstance(records, list) or not 1 <= len(records) <= 100:
+        raise GripPreflightError("records must contain between 1 and 100 objects")
+    seen: set[str] = set()
+    classified: list[dict[str, Any]] = []
+    counts: Counter[str] = Counter()
+    for index, raw in enumerate(records):
+        record = _strict_contract_object(
+            raw,
+            field=f"records[{index}]",
+            required=_CONVERGENCE_RECORD_KEYS,
+        )
+        record_id = _bounded_contract_text(record["record_id"], field=f"records[{index}].record_id", maximum=256)
+        if record_id in seen:
+            raise GripPreflightError(f"duplicate record_id: {record_id}")
+        seen.add(record_id)
+        observed_state = _bounded_contract_text(
+            record["observed_state"], field=f"records[{index}].observed_state", maximum=128
+        )
+        signals: set[str] = set()
+        evidence_digests: dict[str, str] = {}
+        for field, signal in _CONVERGENCE_SIGNAL_FIELDS:
+            reference = _optional_evidence_reference(record[field], field=f"records[{index}].{field}")
+            if reference is not None:
+                signals.add(signal)
+                evidence_digests[field] = hashlib.sha256(reference.encode("utf-8")).hexdigest()
+        classification, reason = _classify_convergence_signals(signals)
+        counts[classification] += 1
+        classified.append({
+            "record_id": record_id,
+            "observed_state": observed_state,
+            "classification": classification,
+            "reason": reason,
+            "signals": sorted(signals),
+            "evidence_sha256s": dict(sorted(evidence_digests.items())),
+            "requires_decision": classification in {"unknown", "conflicted", "defect", "blocked"},
+        })
+
+    conflicted = counts["conflicted"]
+    _check(receipt, "bounded-records", "pass", f"count={len(classified)}")
+    _check(receipt, "evidence-only-classification", "pass", sha256_json(classified))
+    _check(
+        receipt,
+        "contradictions-visible",
+        "pass",
+        f"conflicted={conflicted}",
+    )
+    _check(receipt, "no-history-mutation", "pass", "read_only_projection")
+    return {
+        "schema_version": 1,
+        "authority": "read_only_evidence_projection",
+        "records": classified,
+        "counts": {key: counts.get(key, 0) for key in (
+            "defect", "expected", "blocked", "superseded", "resolved", "unknown", "conflicted"
+        )},
+        "decision_required_count": sum(
+            1 for item in classified if item["requires_decision"]
+        ),
+        "does_not_establish": [
+            "task_completion",
+            "history_rewrite",
+            "automatic_closeout",
+            "root_cause",
+            "priority_change",
+        ],
+        "receipt_status": "passed",
+    }
 
 
 def _run_runtime_deploy_check(
@@ -5152,6 +5482,8 @@ _RUNNERS = {
     "runtime_deploy_check": _run_runtime_deploy_check,
     "connector_snapshot_bind": _run_connector_snapshot_bind,
     "convergence_assess": _run_convergence_assess,
+    "gate_evidence_preflight": _run_gate_evidence_preflight,
+    "convergence_state_classify": _run_convergence_state_classify,
     "operator_obligation_open": _run_operator_obligation_open,
     "operator_obligation_list": _run_operator_obligation_list,
     "operator_obligation_status": _run_operator_obligation_status,

@@ -690,6 +690,8 @@ class GripFoundationTests(unittest.TestCase):
                 "captain-run",
                 "connector-snapshot-bind",
                 "convergence-assess",
+                "convergence-state-classify",
+                "gate-evidence-preflight",
                 "mechanic-loop",
                 "operator-obligation-close",
                 "operator-obligation-list",
@@ -6156,3 +6158,143 @@ class CaptainExecutionIntentTests(unittest.TestCase):
                     self.assertEqual([], gh.calls)
                 else:
                     self.assertEqual("passed", result["receipt"]["status"])
+
+
+class GateEvidenceConvergenceGripTests(unittest.TestCase):
+    @staticmethod
+    def complete_gate_parameters() -> dict[str, object]:
+        return {
+            "gate_owner": "merge-guard",
+            "policy_boundary": "fresh leases and exact target identity are mandatory",
+            "target": {"kind": "pull_request", "identifier": "heimgewebe/grabowski#257"},
+            "scope": {"operation": "merge", "resource": "repo:heimgewebe/grabowski"},
+            "expected_identity": {"head": "a" * 40, "base": "b" * 40},
+            "evidence": {
+                category: {"status": "satisfied", "reference": f"SECRET-REF-{category}"}
+                for category in (
+                    "leases",
+                    "dirty_state",
+                    "running_work",
+                    "receipt",
+                    "acceptance",
+                    "post_state_readback",
+                )
+            },
+            "attempt": {
+                "prior_attempt": False,
+                "evidence_changed": False,
+                "change_reference": "",
+            },
+        }
+
+    def test_gate_evidence_preflight_prepares_without_granting_authority(self) -> None:
+        parameters = self.complete_gate_parameters()
+        result = grips.grip_run("gate-evidence-preflight", parameters)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        output = result["output"]
+        self.assertTrue(output["ready_for_gate_evaluation"])
+        self.assertEqual("evidence_prepared", output["decision"])
+        self.assertIn("execution_authority", output["does_not_establish"])
+        serialized = grips.canonical_json(result)
+        self.assertNotIn("SECRET-REF", serialized)
+        self.assertTrue(all(len(item["reference_sha256"]) == 64 for item in output["evidence"]))
+
+    def test_gate_evidence_preflight_blocks_missing_and_unchanged_retry(self) -> None:
+        parameters = self.complete_gate_parameters()
+        parameters["evidence"]["receipt"] = {"status": "missing", "reference": "receipt absent"}
+        parameters["attempt"] = {
+            "prior_attempt": True,
+            "evidence_changed": False,
+            "change_reference": None,
+        }
+
+        result = grips.grip_run("gate-evidence-preflight", parameters)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual(
+            ["missing_evidence:receipt", "unchanged_retry_rejected"],
+            result["output"]["blocked_reasons"],
+        )
+        self.assertFalse(result["output"]["ready_for_gate_evaluation"])
+
+    def test_gate_evidence_preflight_rejects_nonempty_nonscalar_unchanged_reference(self) -> None:
+        parameters = self.complete_gate_parameters()
+        parameters["attempt"] = {
+            "prior_attempt": True,
+            "evidence_changed": False,
+            "change_reference": {"unexpected": "object"},
+        }
+
+        result = grips.grip_run("gate-evidence-preflight", parameters)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("attempt.change_reference", result["output"]["error"])
+        self.assertNotIn("unhashable", result["output"]["error"])
+
+    def test_gate_evidence_preflight_requires_named_change_reference(self) -> None:
+        parameters = self.complete_gate_parameters()
+        parameters["attempt"] = {
+            "prior_attempt": True,
+            "evidence_changed": True,
+            "change_reference": "",
+        }
+
+        result = grips.grip_run("gate-evidence-preflight", parameters)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("attempt.change_reference", result["output"]["error"])
+
+    def test_convergence_state_classify_preserves_meaning_and_conflicts(self) -> None:
+        def record(record_id: str, **evidence: object) -> dict[str, object]:
+            value = {
+                "record_id": record_id,
+                "observed_state": "failed",
+                "failure_evidence": None,
+                "expected_evidence": None,
+                "blocking_evidence": None,
+                "superseding_evidence": None,
+                "resolution_evidence": None,
+            }
+            value.update(evidence)
+            return value
+
+        result = grips.grip_run(
+            "convergence-state-classify",
+            {
+                "records": [
+                    record("defect", failure_evidence="SECRET-defect"),
+                    record("expected", failure_evidence="failure", expected_evidence="expected-red"),
+                    record("blocked", failure_evidence="failure", blocking_evidence="policy-gate"),
+                    record("superseded", failure_evidence="failure", superseding_evidence="pr-243"),
+                    record("resolved", failure_evidence="failure", resolution_evidence="receipt-17"),
+                    record("unknown"),
+                    record("conflicted", expected_evidence="red", blocking_evidence="gate"),
+                ]
+            },
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        by_id = {item["record_id"]: item for item in result["output"]["records"]}
+        for record_id in ("defect", "expected", "blocked", "superseded", "resolved", "unknown", "conflicted"):
+            self.assertEqual(record_id, by_id[record_id]["classification"])
+        self.assertEqual(1, result["output"]["counts"]["conflicted"])
+        self.assertNotIn("SECRET-defect", grips.canonical_json(result))
+        self.assertIn("automatic_closeout", result["output"]["does_not_establish"])
+
+    def test_convergence_state_classify_rejects_duplicate_ids(self) -> None:
+        duplicate = {
+            "record_id": "same",
+            "observed_state": "failed",
+            "failure_evidence": "failure",
+            "expected_evidence": None,
+            "blocking_evidence": None,
+            "superseding_evidence": None,
+            "resolution_evidence": None,
+        }
+        result = grips.grip_run(
+            "convergence-state-classify",
+            {"records": [duplicate, dict(duplicate)]},
+        )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("duplicate record_id", result["output"]["error"])
