@@ -683,7 +683,30 @@ class GripFoundationTests(unittest.TestCase):
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}
-        self.assertEqual({"branch-publish", "captain-preflight", "captain-run", "convergence-assess", "mechanic-loop", "operator-obligation-close", "operator-obligation-list", "operator-obligation-open", "operator-obligation-status", "post-merge-sync", "pr-check-readiness", "pr-create-or-update", "repo-orient", "runtime-deploy-check", "scout", "situation", "worktree-ensure", "worktree-orient"}, set(specs))
+        self.assertEqual(
+            {
+                "branch-publish",
+                "captain-preflight",
+                "captain-run",
+                "connector-snapshot-bind",
+                "convergence-assess",
+                "mechanic-loop",
+                "operator-obligation-close",
+                "operator-obligation-list",
+                "operator-obligation-open",
+                "operator-obligation-status",
+                "post-merge-sync",
+                "pr-check-readiness",
+                "pr-create-or-update",
+                "repo-orient",
+                "runtime-deploy-check",
+                "scout",
+                "situation",
+                "worktree-ensure",
+                "worktree-orient",
+            },
+            set(specs),
+        )
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
@@ -2633,6 +2656,122 @@ class RuntimeDeployGripTests(unittest.TestCase):
         self.assertEqual("blocked", blocked["receipt"]["status"])
         self.assertIn("canonical checkout is dirty", blocked["output"]["blocking_reasons"])
         self.assertFalse(blocked["output"]["mutation_attempted"])
+
+
+class ConnectorSnapshotGripTests(unittest.TestCase):
+    def parameters(self) -> dict[str, object]:
+        return {
+            "client_id": "chatgpt-api-tool",
+            "session_id": "session-1",
+            "observed_tool_count": 140,
+            "observed_names_sha256": "a" * 64,
+            "observed_release_id": "release-test",
+            "observed_agent_instructions_sha256": "b" * 64,
+            "_server_tool_contract": {
+                "registered_tool_count": 140,
+                "registered_names_sha256": "a" * 64,
+                "runtime_matches_deployment_contract": True,
+            },
+            "_server_runtime": {
+                "release_id": "release-test",
+                "repo_head": "c" * 40,
+            },
+            "_server_agent_instructions_sha256": "b" * 64,
+        }
+
+    def test_connector_snapshot_bind_is_mutating_and_profile_bound(self) -> None:
+        observer = {
+            item["name"]: item for item in grips.list_grips("observer")
+        }
+        operator = {
+            item["name"]: item for item in grips.list_grips("operator")
+        }
+        self.assertEqual(
+            grips.MUTATING,
+            operator["connector-snapshot-bind"]["effect"],
+        )
+        self.assertFalse(
+            observer["connector-snapshot-bind"]["availability"]["available"]
+        )
+        self.assertTrue(
+            operator["connector-snapshot-bind"]["availability"]["available"]
+        )
+
+    def test_connector_snapshot_bind_requires_explicit_mutation(self) -> None:
+        result = grips.run_grip(
+            "connector-snapshot-bind",
+            self.parameters(),
+            allow_mutation=False,
+        )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual(
+            ["mutation_permission_missing"],
+            result["output"]["blocked_reasons"],
+        )
+
+    def test_connector_snapshot_bind_returns_receipt_bound_match(self) -> None:
+        output = {
+            "state": "matched",
+            "verified": True,
+            "mismatches": [],
+            "client_declaration_sha256": "d" * 64,
+            "receipt_sha256": "e" * 64,
+        }
+        with patch.object(
+            grips.grabowski_client_snapshot,
+            "bind_snapshot",
+            return_value=output,
+        ) as bind:
+            result = grips.run_grip(
+                "connector-snapshot-bind",
+                self.parameters(),
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["verified"])
+        bind.assert_called_once()
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["server-tool-contract-bound"])
+        self.assertEqual("pass", checks["private-receipt-persisted"])
+
+    def test_connector_snapshot_persistence_failure_is_bounded(self) -> None:
+        with patch.object(
+            grips.grabowski_client_snapshot,
+            "bind_snapshot",
+            side_effect=OSError("disk unavailable"),
+        ):
+            result = grips.run_grip(
+                "connector-snapshot-bind",
+                self.parameters(),
+                allow_mutation=True,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("persistence failed", result["output"]["error"])
+        self.assertNotIn("disk unavailable", result["output"]["error"])
+
+    def test_connector_snapshot_mismatch_blocks_completion(self) -> None:
+        output = {
+            "state": "mismatch",
+            "verified": False,
+            "mismatches": ["tool_count"],
+            "client_declaration_sha256": "d" * 64,
+            "receipt_sha256": "e" * 64,
+        }
+        with patch.object(
+            grips.grabowski_client_snapshot,
+            "bind_snapshot",
+            return_value=output,
+        ):
+            result = grips.run_grip(
+                "connector-snapshot-bind",
+                self.parameters(),
+                allow_mutation=True,
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual(
+            ["connector_snapshot_mismatch"],
+            result["output"]["blocked_reasons"],
+        )
 
 
 CAPTAIN_HEAD = "b" * 40

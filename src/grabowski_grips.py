@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 import grabowski_repobrief
 import grabowski_grip_orchestration
 import grabowski_convergence
+import grabowski_client_snapshot
 import grabowski_operator_obligation
 import grabowski_worktree_ensure
 
@@ -157,6 +158,27 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=("registered-adapter", "expected-head-bound", "deploy-preflight-readonly"),
         runner="runtime_deploy_check",
     ),
+    "connector-snapshot-bind": GripSpec(
+        name="connector-snapshot-bind",
+        version="1.0",
+        summary="Bind one client-declared connector tool snapshot to the current server release and tool contract.",
+        effect=MUTATING,
+        required_parameters=(
+            "client_id",
+            "session_id",
+            "observed_tool_count",
+            "observed_names_sha256",
+            "observed_release_id",
+            "observed_agent_instructions_sha256",
+        ),
+        acceptance_ids=(
+            "client-declaration-bounded",
+            "server-tool-contract-bound",
+            "release-bound",
+            "private-receipt-persisted",
+        ),
+        runner="connector_snapshot_bind",
+    ),
     "convergence-assess": GripSpec(
         name="convergence-assess",
         version="1.0",
@@ -272,6 +294,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "situation",
         "scout",
         "runtime-deploy-check",
+        "connector-snapshot-bind",
         "convergence-assess",
         "mechanic-loop",
         "captain-preflight",
@@ -295,6 +318,7 @@ GRIP_SURFACE_TARGETS = {
     "situation": "repository and PR situation snapshot",
     "scout": "change-only repository, PR and runtime drift signal",
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
+    "connector-snapshot-bind": "one connector client snapshot receipt",
     "convergence-assess": "one hash-bound convergence closure assessment",
     "mechanic-loop": "bounded normal grip action sequence",
     "captain-preflight": "high-impact Captain action preflight only",
@@ -1889,6 +1913,42 @@ def _runtime_deploy_self_expected_argv_sha256(
         delay_seconds,
     )
     return grabowski_self_deploy._deploy_command_sha256(command)
+
+
+def _run_connector_snapshot_bind(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    try:
+        output = grabowski_client_snapshot.bind_snapshot(parameters)
+    except grabowski_client_snapshot.ClientSnapshotError as exc:
+        _check(receipt, "client-declaration-bounded", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except OSError as exc:
+        _check(
+            receipt,
+            "private-receipt-persisted",
+            "fail",
+            type(exc).__name__,
+        )
+        raise GripActionError("client snapshot persistence failed") from exc
+    _check(receipt, "client-declaration-bounded", "pass", output["client_declaration_sha256"])
+    _check(
+        receipt,
+        "server-tool-contract-bound",
+        "pass" if output["verified"] else "fail",
+        output["state"],
+    )
+    _check(receipt, "release-bound", "pass" if output["verified"] else "fail", output["state"])
+    _check(receipt, "private-receipt-persisted", "pass", output["receipt_sha256"])
+    if not output["verified"]:
+        output["receipt_status"] = "blocked"
+        output["decision"] = "blocked"
+        output["blocked_reasons"] = ["connector_snapshot_mismatch"]
+    return output
 
 
 def _run_convergence_assess(
@@ -5010,6 +5070,7 @@ _RUNNERS = {
     "situation": _run_situation,
     "scout": _run_scout,
     "runtime_deploy_check": _run_runtime_deploy_check,
+    "connector_snapshot_bind": _run_connector_snapshot_bind,
     "convergence_assess": _run_convergence_assess,
     "operator_obligation_open": _run_operator_obligation_open,
     "operator_obligation_list": _run_operator_obligation_list,

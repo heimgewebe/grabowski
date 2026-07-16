@@ -1,6 +1,6 @@
 # Grabowski Consumer Surface v1
 
-Stand: 2026-07-13
+Stand: 2026-07-16
 
 ## Zweck
 
@@ -96,6 +96,12 @@ Der Standardmodus reduziert die gemessenen Median-JSON-Bytes auf allen fünf gro
 
 Der kompatible Migrationsvertrag liegt unter `docs/consumer-surface-migration-v2.md`.
 
-## Betriebsgrenze
+## Connector-Snapshot und Systemübersicht
 
-Serverseitiger Werkzeugvertrag und Client-Snapshot sind getrennte Wahrheiten. Ein Runtime-Deploy kann 120 Werkzeuge serverseitig belegen, ohne einen bereits geöffneten Client-Snapshot automatisch zu erneuern.
+Serverseitiger Werkzeugvertrag und Client-Snapshot sind getrennte Wahrheiten. Ein Runtime-Deploy kann 141 Werkzeuge serverseitig belegen, ohne einen bereits geöffneten Client-Snapshot automatisch zu erneuern.
+
+Der mutierende Grip `connector-snapshot-bind` vergleicht eine begrenzte clientseitige Erklärung mit dem aktuellen serverseitigen Werkzeug-, Release- und Instruktionsvertrag. Das Receipt ist privat, selbsthashgebunden und eine Stunde gültig. Der Vertrauensmodus lautet `client-declared-server-compared-v1`; er ist keine plattformseitige Attestierung des Clientprozesses.
+
+Die Sichten `standard` und `evidence` enthalten zusätzlich `system_overview`. Diese kompakte Projektion liest Runtime-Integrität, Connector-Zustand, Task-Projektionen, aktive Leases und Operator-Verpflichtungen aus ihren bestehenden Quellen. Sie speichert keinen zweiten Status und setzt `operator_ready=false`, wenn eine notwendige Komponente nicht beobachtbar oder nur abgeschnitten lesbar ist. Bureau, GitHub/CI, RepoBrief, Systemkatalog und Chronik erscheinen als Quellenkarte mit ihrer Autorität und benötigten Zielbindung; ohne Zielidentität wird ihre Aktualität nicht behauptet.
+
+Der vollständige Vertrag ist in `docs/connector-snapshot-handshake-v1.md` beschrieben.

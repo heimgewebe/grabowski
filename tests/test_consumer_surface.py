@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -134,8 +135,19 @@ class ConsumerSurfaceTests(unittest.TestCase):
         contract = {
             "expected_tool_count": 120,
             "registered_tool_count": 120,
+            "name_hash_contract": "sha256-json-sorted-utf8-v1",
+            "expected_names_sha256": "c" * 64,
+            "registered_names_sha256": "c" * 64,
             "runtime_matches_deployment_contract": True,
             "client_snapshot_observable": False,
+            "client_snapshot": {
+                "state": "missing",
+                "observable": False,
+                "fresh": False,
+                "matched": False,
+                "verification_model": "client-declared-server-compared-v1",
+                "recommended_next_action": "bind the current connector snapshot",
+            },
             "refresh_required_when_client_count_or_hash_differs": True,
         }
         values = {
@@ -159,6 +171,41 @@ class ConsumerSurfaceTests(unittest.TestCase):
                     grabowski_mcp,
                     "_runtime_tool_contract_summary",
                     return_value=contract,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    grabowski_mcp,
+                    "_operator_system_overview",
+                    return_value={
+                        "schema_version": 1,
+                        "operator_ready": False,
+                        "readiness": {
+                            "runtime_ready": True,
+                            "connector_snapshot_ready": False,
+                            "truth_model_ready": True,
+                        },
+                        "runtime": {"healthy": True},
+                        "connector": {
+                            "state": "missing",
+                            "observable": False,
+                            "fresh": False,
+                            "matched": False,
+                            "verification_model": "client-declared-server-compared-v1",
+                        },
+                        "tasks": {"available": True, "unknown_state_count": 0},
+                        "leases": {"available": True, "active_count": 2},
+                        "operator_obligations": {
+                            "available": True,
+                            "attention_count": 1,
+                            "integrity_error_count": 0,
+                        },
+                        "component_errors": [],
+                        "recommended_next_action": "bind the current connector snapshot",
+                        "does_not_establish": [
+                            "platform-enforced client snapshot identity"
+                        ],
+                    },
                 )
             )
             stack.enter_context(
@@ -235,7 +282,13 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertEqual(concise["view"], "minimal")
         self.assertEqual(full["view"], "evidence")
         warning_codes = {item["code"] for item in minimal["warnings"]}
-        self.assertIn("client_snapshot_unobservable", warning_codes)
+        self.assertIn("client_snapshot_missing", warning_codes)
+        self.assertIn("system_overview", standard)
+        self.assertFalse(standard["system_overview"]["operator_ready"])
+        self.assertEqual(
+            "client-declared-server-compared-v1",
+            minimal["tool_contract"]["client_snapshot"]["verification_model"],
+        )
         self.assertTrue(minimal["healthy"])
         self.assertEqual(projected["service"], "grabowski-mcp")
         self.assertIn("warnings", projected)
@@ -244,6 +297,131 @@ class ConsumerSurfaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown response field"):
             with mock.patch.object(grabowski_mcp, "_load_policy", return_value=policy):
                 grabowski_mcp._project_status_fields(minimal, ["missing"])
+
+    def test_minimal_status_does_not_query_consolidated_overview(self) -> None:
+        policy = {
+            "mode": "bounded-read-write",
+            "active_profile": "trusted-owner",
+            "profiles": {"trusted-owner": {}},
+            "forbidden_capabilities": [],
+        }
+        deployment = {
+            "release_id": "release-1",
+            "repo_head": "a" * 40,
+            "completion_status": "complete",
+            "manifest_parse_valid": True,
+            "manifest_schema_valid": True,
+            "repo_head_valid": True,
+            "agent_instructions_identity_valid": True,
+            "runtime_binding_valid": True,
+            "environment_compatibility_valid": True,
+            "provenance_valid": True,
+            "artifact_integrity_valid": True,
+        }
+        contract = {
+            "expected_tool_count": 140,
+            "registered_tool_count": 140,
+            "runtime_matches_deployment_contract": True,
+            "client_snapshot_observable": False,
+            "client_snapshot": {
+                "state": "missing",
+                "observable": False,
+                "recommended_next_action": "bind snapshot",
+            },
+        }
+        with mock.patch.object(
+            grabowski_mcp, "_load_policy", return_value=policy
+        ), mock.patch.object(
+            grabowski_mcp,
+            "_active_profile",
+            return_value={"name": "trusted-owner"},
+        ), mock.patch.object(
+            grabowski_mcp, "_deployment_metadata", return_value=deployment
+        ), mock.patch.object(
+            grabowski_mcp,
+            "_runtime_tool_contract_summary",
+            return_value=contract,
+        ), mock.patch.object(
+            grabowski_mcp,
+            "_verify_audit_log",
+            return_value={
+                "valid": True,
+                "records": 1,
+                "last_record_sha256": "b" * 64,
+                "error": None,
+            },
+        ), mock.patch.object(
+            grabowski_mcp, "_kill_switch_state", return_value={"engaged": False}
+        ), mock.patch.object(
+            grabowski_mcp, "_operator_system_overview"
+        ) as overview:
+            result = grabowski_mcp.grabowski_status(view="minimal")
+
+        overview.assert_not_called()
+        self.assertEqual("bind snapshot", result["recommended_next_action"])
+        self.assertNotIn("system_overview", result)
+
+    def test_operator_system_overview_prioritizes_connector_and_compacts_components(self) -> None:
+        fake_tasks = SimpleNamespace(
+            grabowski_task_list=lambda **_kwargs: {
+                "state_counts": {"running": 1, "failed": 2},
+                "projection_counts": {
+                    "active": 1,
+                    "attention": 2,
+                    "terminal": 2,
+                },
+                "projection_counts_overlap": True,
+                "unknown_state_count": 0,
+                "state_counts_complete": True,
+            }
+        )
+        fake_resources = SimpleNamespace(
+            grabowski_resource_list=lambda **_kwargs: {
+                "count": 3,
+                "leases": [{}, {}, {}],
+            }
+        )
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _parameters: {
+                "record_count": 1,
+                "integrity_errors": [],
+                "scan_truncated": False,
+            }
+        )
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "grabowski_tasks": fake_tasks,
+                "grabowski_resources": fake_resources,
+                "grabowski_operator_obligation": fake_obligations,
+            },
+        ):
+            overview = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                client_snapshot={
+                    "state": "missing",
+                    "observable": False,
+                    "fresh": False,
+                    "matched": False,
+                    "verification_model": "client-declared-server-compared-v1",
+                    "recommended_next_action": "bind snapshot",
+                },
+            )
+
+        self.assertFalse(overview["operator_ready"])
+        self.assertEqual("bind snapshot", overview["recommended_next_action"])
+        self.assertEqual(2, overview["tasks"]["projection_counts"]["attention"])
+        self.assertEqual(3, overview["leases"]["active_count"])
+        self.assertEqual(1, overview["operator_obligations"]["attention_count"])
+        self.assertEqual([], overview["component_errors"])
+        self.assertEqual(
+            "target_required",
+            overview["source_registry"]["github_ci"]["observation_state"],
+        )
+        self.assertEqual(
+            "target_required",
+            overview["source_registry"]["systemkatalog"]["observation_state"],
+        )
 
     def test_task_pagination_has_no_duplicates_and_cursor_is_view_filter_bound(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
