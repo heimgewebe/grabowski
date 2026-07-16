@@ -1512,6 +1512,11 @@ def acquire_merge_guard_resources(
             for row in rows:
                 row_key = row["resource_key"]
                 row_metadata = _row_metadata(row)
+                _, observed_metadata_sha256 = _metadata(row_metadata)
+                if row["metadata_sha256"] != observed_metadata_sha256:
+                    raise ResourceConflict(
+                        row_key, row["owner_id"], row["expires_at_unix"]
+                    )
                 row_scope = _scope_manifest_from_metadata(row_metadata, required=False)
                 row_path = _resource_path_value(row_key)
                 row_repo_scope = _repository_resource_scope(row_key)

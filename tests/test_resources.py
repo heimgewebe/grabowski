@@ -383,6 +383,160 @@ class ResourceTests(unittest.TestCase):
                 },
             )
 
+    def test_merge_guard_rejects_tampered_preexisting_foreign_scope_metadata(self) -> None:
+        repository = self.root / "repo"
+        repository.mkdir()
+        changed_path = repository / "src" / "target.py"
+        scope = {
+            "schema_version": 1,
+            "repository": str(repository),
+            "task_id": "TASK-FOREIGN-TAMPER",
+            "base_head": "0" * 40,
+            "head": "a" * 40,
+            "branch": "feat/foreign-tamper",
+            "worktree": str(self.root / "worktrees" / "foreign-tamper"),
+            "effects": ["write"],
+            "paths": [],
+            "components": ["preexisting-foreign-scope"],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        resource_key = "component:preexisting-foreign-scope"
+        resources.acquire_resources(
+            "foreign-owner",
+            [resource_key],
+            purpose="preexisting foreign scoped writer",
+            ttl_seconds=60,
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+        )
+        with resources._database() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?",
+                (resource_key,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            metadata = json.loads(row["metadata_json"])
+            metadata["scope_manifest"]["repository"] = str(self.root / "other-repo")
+            connection.execute(
+                "UPDATE leases SET metadata_json=? WHERE resource_key=?",
+                (resources._canonical_json(metadata), resource_key),
+            )
+            connection.commit()
+        keys = [
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+        ]
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_merge_guard_resources(
+                "captain-merge:tampered-foreign-scope",
+                "task-owner",
+                keys,
+                repository=str(repository),
+                changed_paths=[str(changed_path)],
+                purpose="atomic merge guard",
+                ttl_seconds=60,
+                metadata={
+                    "merge_guard": {
+                        "head_sha": "a" * 40,
+                        "base_branch": "main",
+                        "head_branch": "feat/work",
+                    }
+                },
+            )
+        self.assertIsNone(
+            resources.inspect_resource(
+                f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}"
+            )
+        )
+
+    def test_merge_guard_rejects_tampered_preexisting_owner_scope_metadata(self) -> None:
+        repository = self.root / "repo"
+        repository.mkdir()
+        changed_path = repository / "src" / "target.py"
+        scope = {
+            "schema_version": 1,
+            "repository": str(repository),
+            "task_id": "TASK-OWNER-TAMPER",
+            "base_head": "0" * 40,
+            "head": "a" * 40,
+            "branch": "feat/owner-tamper",
+            "worktree": str(self.root / "worktrees" / "owner-tamper"),
+            "effects": ["write"],
+            "paths": [],
+            "components": ["preexisting-owner-scope"],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        resource_key = "component:preexisting-owner-scope"
+        resources.acquire_resources(
+            "task-owner",
+            [resource_key],
+            purpose="preexisting owner scoped writer",
+            ttl_seconds=60,
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+        )
+        with resources._database() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?",
+                (resource_key,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            metadata = json.loads(row["metadata_json"])
+            metadata["scope_manifest"]["repository"] = str(self.root / "other-repo")
+            connection.execute(
+                "UPDATE leases SET metadata_json=? WHERE resource_key=?",
+                (resources._canonical_json(metadata), resource_key),
+            )
+            connection.commit()
+        keys = [
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+        ]
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_merge_guard_resources(
+                "captain-merge:tampered-owner-scope",
+                "task-owner",
+                keys,
+                repository=str(repository),
+                changed_paths=[str(changed_path)],
+                purpose="atomic merge guard",
+                ttl_seconds=60,
+                metadata={
+                    "merge_guard": {
+                        "head_sha": "a" * 40,
+                        "base_branch": "main",
+                        "head_branch": "feat/work",
+                    }
+                },
+            )
+        self.assertIsNone(
+            resources.inspect_resource(
+                f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}"
+            )
+        )
+
     def test_merge_guard_rejects_foreign_repo_or_changed_path_lease(self) -> None:
         repository = self.root / "repo"
         repository.mkdir()
