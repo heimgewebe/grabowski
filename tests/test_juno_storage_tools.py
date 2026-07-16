@@ -235,9 +235,10 @@ class JunoStorageDeviceRuntimeTests(unittest.TestCase):
         self.assertTrue(limited["truncated"])
         self.assertFalse(limited["scan_truncated"])
 
-        scan_limited = self.run_device(
-            {**request, "limit": 1, "max_scan_entries": 1}
-        )
+        with patch.object(os, "listdir", side_effect=AssertionError("unbounded listdir")):
+            scan_limited = self.run_device(
+                {**request, "limit": 1, "max_scan_entries": 1}
+            )
         self.assertEqual(len(scan_limited["entries"]), 1)
         self.assertTrue(scan_limited["truncated"])
         self.assertTrue(scan_limited["scan_truncated"])
@@ -538,6 +539,19 @@ class JunoStorageHostValidationTests(unittest.TestCase):
             storage._validate_expected_started_at(
                 "x" * (storage.MAX_EXPECTED_STARTED_AT_BYTES + 1)
             )
+
+    def test_file_read_default_matches_transport_safe_maximum(self) -> None:
+        with patch.object(storage, "_read_request", return_value={"ok": True}) as request:
+            result = storage.ipad_file_read(
+                grant_id=GRANT_ID,
+                expected_grant_evidence_hash=EVIDENCE_HASH,
+                expected_provider=PROVIDER,
+                relative_path="file.bin",
+                expected_started_at="agent-start",
+                session_escalation={"target": {"device": "ipad"}},
+            )
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(request.call_args.kwargs["max_bytes"], storage.MAX_READ_BYTES)
 
     def test_payload_hash_is_checked_before_device_submission(self) -> None:
         with patch.object(storage.bridge, "grabowski_juno_run") as run:

@@ -1002,12 +1002,14 @@ def _run(request: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("directory scan bounds are invalid")
             descriptor = _open_directory(root, relative_path)
             try:
-                scanned = list(
-                    itertools.islice(
-                        os.listdir(descriptor),
-                        max_scan_entries + 1,
-                    )
-                )
+                with os.scandir(descriptor) as iterator:
+                    scanned = [
+                        entry.name
+                        for entry in itertools.islice(
+                            iterator,
+                            max_scan_entries + 1,
+                        )
+                    ]
                 scan_truncated = len(scanned) > max_scan_entries
                 scanned = scanned[:max_scan_entries]
                 selected = sorted(scanned)[: limit + 1]
@@ -1714,7 +1716,7 @@ def ipad_file_read(
     relative_path: str,
     expected_started_at: str,
     session_escalation: dict[str, Any],
-    max_bytes: int = 256 * 1024,
+    max_bytes: int = MAX_READ_BYTES,
 ) -> dict[str, Any]:
     """Read one bounded regular file from one exact locally granted path."""
     operator._require_operator_capability("terminal_execute")
