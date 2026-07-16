@@ -252,6 +252,12 @@ def _expected_uid(value: int | None) -> int:
     return value
 
 
+def _expected_mode(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0o777:
+        raise ValueError("expected_mode must be a permission mode")
+    return value
+
+
 def _sha256_value(value: str, *, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -407,7 +413,8 @@ def _snapshot_from_open_file(
     *,
     path: Path,
     expected_uid: int,
-    max_bytes: int,
+    expected_mode: int = 0o600,
+    max_bytes: int = MAX_MARKER_BYTES,
 ) -> MarkerSnapshot:
     descriptor = os.open(name, _file_flags(), dir_fd=directory_fd)
     try:
@@ -416,8 +423,8 @@ def _snapshot_from_open_file(
             raise PermissionError("blockade marker is not a regular file")
         if before.st_uid != expected_uid:
             raise PermissionError("blockade marker owner is unexpected")
-        if stat.S_IMODE(before.st_mode) != 0o600:
-            raise PermissionError("blockade marker mode must be 0600")
+        if stat.S_IMODE(before.st_mode) != expected_mode:
+            raise PermissionError(f"blockade marker mode must be {expected_mode:04o}")
         if before.st_nlink != 1:
             raise PermissionError("blockade marker must be single-link")
         data = _read_all(descriptor, max_bytes=max_bytes)
@@ -455,7 +462,9 @@ def _publish_create_only_bytes_at(
     data: bytes,
     *,
     label: str,
+    file_mode: int = 0o600,
 ) -> tuple[int, int]:
+    file_mode = _expected_mode(file_mode)
     target_name = _safe_component(target_name, label=f"{label} target")
     temporary_name = _safe_component(
         f".{target_name}.{os.getpid()}.{secrets.token_hex(16)}.tmp",
@@ -466,6 +475,8 @@ def _publish_create_only_bytes_at(
     target_linked = False
     temporary_inode: tuple[int, int] | None = None
     try:
+        # Create privately regardless of the final publication mode. This
+        # prevents umask drift and keeps partially written bytes unreadable.
         descriptor = os.open(
             temporary_name, _create_flags(), 0o600, dir_fd=directory_fd
         )
@@ -484,10 +495,13 @@ def _publish_create_only_bytes_at(
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+            if file_mode != 0o600:
+                os.fchmod(handle.fileno(), file_mode)
+                os.fsync(handle.fileno())
         temporary = _stat_at(directory_fd, temporary_name)
         if (
             not stat.S_ISREG(temporary.st_mode)
-            or stat.S_IMODE(temporary.st_mode) != 0o600
+            or stat.S_IMODE(temporary.st_mode) != file_mode
             or temporary.st_nlink != 1
             or _identity(temporary) != temporary_inode
         ):
@@ -508,7 +522,7 @@ def _publish_create_only_bytes_at(
         published = _stat_at(directory_fd, target_name)
         if (
             not stat.S_ISREG(published.st_mode)
-            or stat.S_IMODE(published.st_mode) != 0o600
+            or stat.S_IMODE(published.st_mode) != file_mode
             or published.st_nlink != 1
             or _identity(published) != temporary_inode
         ):
@@ -601,6 +615,8 @@ def read_blockade_marker(
     *,
     expected_marker_path: Path | str,
     expected_uid: int | None = None,
+    expected_mode: int = 0o600,
+    require_private_parent: bool = True,
     max_bytes: int = MAX_MARKER_BYTES,
 ) -> MarkerSnapshot:
     """Read and strictly validate one canonical blockade marker."""
@@ -611,11 +627,14 @@ def read_blockade_marker(
         label="marker_path",
     )
     uid = _expected_uid(expected_uid)
+    mode = _expected_mode(expected_mode)
+    if not isinstance(require_private_parent, bool):
+        raise ValueError("require_private_parent must be boolean")
     max_bytes = _positive_max_bytes(max_bytes)
     parent_fd = _open_directory_chain(
         path.parent,
         expected_uid=uid,
-        require_private=True,
+        require_private=require_private_parent,
         label="marker parent",
     )
     try:
@@ -624,13 +643,14 @@ def read_blockade_marker(
             _safe_component(path.name, label="marker name"),
             path=path,
             expected_uid=uid,
+            expected_mode=mode,
             max_bytes=max_bytes,
         )
         _assert_directory_binding(
             parent_fd,
             path.parent,
             expected_uid=uid,
-            require_private=True,
+            require_private=require_private_parent,
             label="marker parent",
         )
         return snapshot
@@ -644,6 +664,8 @@ def engage_blockade_marker(
     *,
     expected_marker_path: Path | str,
     expected_uid: int | None = None,
+    marker_mode: int = 0o600,
+    require_private_parent: bool = True,
     transaction_id: str | None = None,
     now: datetime | None = None,
     max_bytes: int = MAX_MARKER_BYTES,
@@ -658,6 +680,9 @@ def engage_blockade_marker(
         label="marker_path",
     )
     uid = _expected_uid(expected_uid)
+    mode = _expected_mode(marker_mode)
+    if not isinstance(require_private_parent, bool):
+        raise ValueError("require_private_parent must be boolean")
     max_bytes = _positive_max_bytes(max_bytes)
     payload = canonical_json(record.to_mapping())
     if len(payload) > max_bytes:
@@ -667,7 +692,7 @@ def engage_blockade_marker(
     parent_fd = _open_directory_chain(
         path.parent,
         expected_uid=uid,
-        require_private=True,
+        require_private=require_private_parent,
         label="marker parent",
     )
     published_inode: tuple[int, int] | None = None
@@ -678,12 +703,14 @@ def engage_blockade_marker(
             marker_name,
             payload,
             label="blockade marker",
+            file_mode=mode,
         )
         snapshot = _snapshot_from_open_file(
             parent_fd,
             marker_name,
             path=path,
             expected_uid=uid,
+            expected_mode=mode,
             max_bytes=max_bytes,
         )
         if snapshot.record != record or snapshot.record_sha256 != record.sha256:
@@ -694,7 +721,7 @@ def engage_blockade_marker(
             parent_fd,
             path.parent,
             expected_uid=uid,
-            require_private=True,
+            require_private=require_private_parent,
             label="marker parent",
         )
         return EngageReceipt(
@@ -744,6 +771,8 @@ def rollback_engaged_marker(
     *,
     expected_marker_path: Path | str,
     expected_uid: int | None = None,
+    marker_mode: int = 0o600,
+    require_private_parent: bool = True,
     max_bytes: int = MAX_MARKER_BYTES,
 ) -> dict[str, Any]:
     """Remove only the exact marker created by one uncommitted engagement."""
@@ -758,11 +787,14 @@ def rollback_engaged_marker(
     if receipt.marker_path != str(path):
         raise BlockadeRecoveryDenied("engage receipt marker path mismatch")
     uid = _expected_uid(expected_uid)
+    mode = _expected_mode(marker_mode)
+    if not isinstance(require_private_parent, bool):
+        raise ValueError("require_private_parent must be boolean")
     max_bytes = _positive_max_bytes(max_bytes)
     parent_fd = _open_directory_chain(
         path.parent,
         expected_uid=uid,
-        require_private=True,
+        require_private=require_private_parent,
         label="marker parent",
     )
     marker_name = _safe_component(path.name, label="marker name")
@@ -773,6 +805,7 @@ def rollback_engaged_marker(
             marker_name,
             path=path,
             expected_uid=uid,
+            expected_mode=mode,
             max_bytes=max_bytes,
         )
         if (
@@ -798,7 +831,7 @@ def rollback_engaged_marker(
             parent_fd,
             path.parent,
             expected_uid=uid,
-            require_private=True,
+            require_private=require_private_parent,
             label="marker parent",
         )
         return {
@@ -880,6 +913,8 @@ def disarm_blockade_marker(
     expected_marker_path: Path | str,
     expected_quarantine_root: Path | str,
     expected_uid: int | None = None,
+    marker_mode: int = 0o600,
+    require_private_marker_parent: bool = True,
     transaction_id: str | None = None,
     now: datetime | None = None,
     max_bytes: int = MAX_MARKER_BYTES,
@@ -914,13 +949,16 @@ def disarm_blockade_marker(
             "blockade disarm denied: " + ",".join(validation.reasons)
         )
     uid = _expected_uid(expected_uid)
+    mode = _expected_mode(marker_mode)
+    if not isinstance(require_private_marker_parent, bool):
+        raise ValueError("require_private_marker_parent must be boolean")
     max_bytes = _positive_max_bytes(max_bytes)
     txid = _transaction_id(transaction_id, now=now)
     created_at = _timestamp(now)
     marker_parent_fd = _open_directory_chain(
         path.parent,
         expected_uid=uid,
-        require_private=True,
+        require_private=require_private_marker_parent,
         label="marker parent",
     )
     quarantine_root_fd = -1
@@ -945,6 +983,7 @@ def disarm_blockade_marker(
             marker_name,
             path=path,
             expected_uid=uid,
+            expected_mode=mode,
             max_bytes=max_bytes,
         )
         source_snapshot = snapshot
@@ -991,6 +1030,7 @@ def disarm_blockade_marker(
             preimage_name,
             path=preimage_path,
             expected_uid=uid,
+            expected_mode=mode,
             max_bytes=max_bytes,
         )
         if moved.file_sha256 != snapshot.file_sha256 or moved.record != record:
@@ -1028,7 +1068,7 @@ def disarm_blockade_marker(
             marker_parent_fd,
             path.parent,
             expected_uid=uid,
-            require_private=True,
+            require_private=require_private_marker_parent,
             label="marker parent",
         )
         _assert_directory_binding(
@@ -1045,6 +1085,7 @@ def disarm_blockade_marker(
             preimage_name,
             path=preimage_path,
             expected_uid=uid,
+            expected_mode=mode,
             max_bytes=max_bytes,
         )
         if final_preimage.file_sha256 != snapshot.file_sha256:
@@ -1179,6 +1220,86 @@ def _read_receipt_at(directory_fd: int, name: str) -> tuple[Mapping[str, Any], s
     return payload, hashlib.sha256(data).hexdigest()
 
 
+
+def read_disarm_receipt(
+    transaction_id: str,
+    quarantine_root: Path | str,
+    *,
+    expected_quarantine_root: Path | str,
+    expected_marker_path: Path | str,
+    expected_record_sha256: str,
+    expected_marker_file_sha256: str,
+    expected_uid: int | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Read one exact root- or user-owned disarm receipt without mutation."""
+
+    quarantine = _require_exact_runtime_path(
+        quarantine_root,
+        expected_path=expected_quarantine_root,
+        label="quarantine_root",
+    )
+    marker_path = _require_exact_runtime_path(
+        expected_marker_path,
+        expected_path=expected_marker_path,
+        label="expected_marker_path",
+    )
+    txid = _safe_component(transaction_id, label="transaction_id")
+    record_sha256 = _sha256_value(
+        expected_record_sha256, label="expected_record_sha256"
+    )
+    marker_file_sha256 = _sha256_value(
+        expected_marker_file_sha256, label="expected_marker_file_sha256"
+    )
+    uid = _expected_uid(expected_uid)
+    quarantine_fd = _open_directory_chain(
+        quarantine,
+        expected_uid=uid,
+        require_private=True,
+        label="quarantine root",
+    )
+    transaction_fd = -1
+    try:
+        transaction_path = quarantine / txid
+        transaction_fd = os.open(txid, _directory_flags(), dir_fd=quarantine_fd)
+        _assert_directory_binding(
+            transaction_fd,
+            transaction_path,
+            expected_uid=uid,
+            require_private=True,
+            label="transaction",
+        )
+        receipt, receipt_sha256 = _read_receipt_at(
+            transaction_fd, _MARKER_RECEIPT_NAME
+        )
+        if receipt.get("schema_version") != STORE_SCHEMA_VERSION:
+            raise BlockadeRecoveryDenied("disarm receipt schema is invalid")
+        required = {
+            "operation": "disarm",
+            "transaction_id": txid,
+            "marker_path": str(marker_path),
+            "quarantine_directory": str(transaction_path),
+            "quarantine_path": str(transaction_path / _PREIMAGE_NAME),
+            "receipt_path": str(transaction_path / _MARKER_RECEIPT_NAME),
+            "marker_file_sha256": marker_file_sha256,
+            "record_sha256": record_sha256,
+            "source_absent_readback": True,
+            "quarantine_readback_valid": True,
+        }
+        for key, expected in required.items():
+            if receipt.get(key) != expected:
+                raise BlockadeRecoveryDenied(f"disarm receipt mismatch: {key}")
+        try:
+            record = BlockadeRecord.from_mapping(receipt.get("record"))
+        except (TypeError, ValueError) as exc:
+            raise BlockadeRecoveryDenied("disarm receipt record is invalid") from exc
+        if record.sha256 != record_sha256:
+            raise BlockadeRecoveryDenied("disarm receipt record hash mismatch")
+        return dict(receipt), receipt_sha256
+    finally:
+        if transaction_fd >= 0:
+            os.close(transaction_fd)
+        os.close(quarantine_fd)
+
 def restore_disarmed_marker(
     transaction_id: str,
     marker_path: Path | str,
@@ -1190,6 +1311,9 @@ def restore_disarmed_marker(
     expected_marker_file_sha256: str,
     expected_disarm_receipt_sha256: str,
     expected_uid: int | None = None,
+    marker_mode: int = 0o600,
+    require_private_marker_parent: bool = True,
+    require_private_quarantine_root: bool = True,
     now: datetime | None = None,
     max_bytes: int = MAX_MARKER_BYTES,
 ) -> RestoreReceipt:
@@ -1216,11 +1340,16 @@ def restore_disarmed_marker(
         expected_disarm_receipt_sha256, label="expected_disarm_receipt_sha256"
     )
     uid = _expected_uid(expected_uid)
+    mode = _expected_mode(marker_mode)
+    if not isinstance(require_private_marker_parent, bool):
+        raise ValueError("require_private_marker_parent must be boolean")
+    if not isinstance(require_private_quarantine_root, bool):
+        raise ValueError("require_private_quarantine_root must be boolean")
     max_bytes = _positive_max_bytes(max_bytes)
     marker_parent_fd = _open_directory_chain(
         path.parent,
         expected_uid=uid,
-        require_private=True,
+        require_private=require_private_marker_parent,
         label="marker parent",
     )
     quarantine_root_fd = -1
@@ -1233,7 +1362,7 @@ def restore_disarmed_marker(
         quarantine_root_fd = _open_directory_chain(
             quarantine,
             expected_uid=uid,
-            require_private=True,
+            require_private=require_private_quarantine_root,
             label="quarantine root",
         )
         if os.fstat(marker_parent_fd).st_dev != os.fstat(quarantine_root_fd).st_dev:
@@ -1312,6 +1441,7 @@ def restore_disarmed_marker(
             _PREIMAGE_NAME,
             path=preimage_path,
             expected_uid=uid,
+            expected_mode=mode,
             max_bytes=max_bytes,
         )
         preimage_snapshot = preimage
@@ -1343,6 +1473,7 @@ def restore_disarmed_marker(
             marker_name,
             path=path,
             expected_uid=uid,
+            expected_mode=mode,
             max_bytes=max_bytes,
         )
         if (

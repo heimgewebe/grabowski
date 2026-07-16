@@ -1181,7 +1181,7 @@
     },
     {
       "category": "recovery",
-      "description": "Create one canonical typed blockade marker without replacing any entry.",
+      "description": "Create one root-owned typed blockade through the narrow broker.",
       "effects": [
         "blockade-marker-create",
         "audit-record"
@@ -1195,7 +1195,22 @@
     },
     {
       "category": "recovery",
-      "description": "Quarantine one exact typed blockade after live recovery evidence passes.",
+      "description": "Move one exact typed legacy marker into the root-owned authority domain.",
+      "effects": [
+        "blockade-marker-create",
+        "blockade-marker-remove",
+        "audit-record"
+      ],
+      "id": "grabowski_operator_blockade_migrate_legacy",
+      "purpose": "Migrate one exact typed legacy blockade into the root-owned authority domain without opening a mutation gap.",
+      "read_only": false,
+      "reversibility": "create-first-fail-closed-dual-marker",
+      "risk_class": "high",
+      "tool": "grabowski_operator_blockade_migrate_legacy"
+    },
+    {
+      "category": "recovery",
+      "description": "Quarantine one exact root-owned blockade after recovery evidence passes.",
       "effects": [
         "blockade-marker-quarantine",
         "audit-record"
@@ -2015,6 +2030,7 @@
       "grabowski_recovery_server_probe",
       "grabowski_operator_blockade_status",
       "grabowski_operator_blockade_engage",
+      "grabowski_operator_blockade_migrate_legacy",
       "grabowski_operator_blockade_disarm",
       "grabowski_friction_record",
       "grabowski_friction_resolve",
@@ -2079,6 +2095,10 @@
       {
         "module": "grabowski_blockade_store",
         "source": "src/grabowski_blockade_store.py"
+      },
+      {
+        "module": "grabowski_blockade_authority",
+        "source": "src/grabowski_blockade_authority.py"
       },
       {
         "module": "grabowski_grips",
@@ -2262,7 +2282,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "97aa1f67e5d937e35796c2d7db9e99bb074fa9dd8e51b0fc9104e605ea5dca62"
+      "sha256": "c6a8526262f4eb0ba792d01ff063628f62fa9b3198815541a2881868d3bc3d13"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2270,7 +2290,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "8bf1d561e5b2623ced96fbcc5fdcb640400f9a35a7cbf118da07fca39dca2d86"
+      "sha256": "9e55cb5edf43e7f7ce254d28a027f73e5a1f575f19887e2cc8444239b329d454"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2281,11 +2301,12 @@
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "1ccf0168b78db145c36292397410eb8878b78ad004e1795cfe5a490763530b69",
       "src/grabowski_artifacts.py": "d9b18fbef0aa2bfae78030d9826b493e18f581d2a32915a50d34d2e0b843883c",
-      "src/grabowski_blockade_runtime.py": "1342e19c825bd757554e52010cb72ea746d0f22f4a7decc04dee5ba8375b8af0",
-      "src/grabowski_blockade_store.py": "a726bc14df0889086db29fd6be94ea5e028e5bcde3d4f08cf199ece1bbae2dfe",
-      "src/grabowski_blockades.py": "8eaecba9ddfc9e5007183ccfc30301560860fd243e8782283d5a4722bca72120",
+      "src/grabowski_blockade_authority.py": "f4f5d5260b8f88a01eb176b25427de4726c57a926982cb446b54ccb6e1dbadcd",
+      "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
+      "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
+      "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "97aa1f67e5d937e35796c2d7db9e99bb074fa9dd8e51b0fc9104e605ea5dca62",
+      "src/grabowski_capabilities.py": "c6a8526262f4eb0ba792d01ff063628f62fa9b3198815541a2881868d3bc3d13",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "6a37342b5741763db16f2792dc5370fd9fe6e7e1dc7965b7f6a8c54f8c55ec62",
       "src/grabowski_command_identity.py": "03bf7193851846d1f5b4d1bfe71a787937e424804f875ba4e021233ddbc842c9",
@@ -2299,15 +2320,15 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "4242341bd1127b924c205781e52579119ff940725933bc3b04e4367296014aa1",
+      "src/grabowski_mcp.py": "a4af9326db9757a3477741bcba39faaba045b8ccdfe7441b844c00266104dde8",
       "src/grabowski_merge_guard.py": "111b3a1512d7b0420d512570b2b7fda288f4ce070e3cd926b10a59008079b83a",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
       "src/grabowski_operator.py": "674c070df71d3538e6dd8edc6e373a57563650015a6d8bedae91133e4b486666",
       "src/grabowski_operator_obligation.py": "e13190ec27c06f0aa59a2972158f44ffddbd1d4257b32e02c21edf036114c5f7",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
-      "src/grabowski_privileged.py": "f3446c8c6a09033fbdfad0a040e39bf7ca53bfcfa88c4ac0e5581d398c99b0d3",
-      "src/grabowski_privileged_broker.py": "c3980a038d11e47a0d9b44fd5db3628ffd017036894f1b300cecd536debbb8cc",
+      "src/grabowski_privileged.py": "2c33ccfc907ea3d1985c25bf821a6916ea1cfbbcc86c03aa8d2b5993d27c06be",
+      "src/grabowski_privileged_broker.py": "e9d77810cc2256ac2b0b33fee515bdf09b319b5eadafe7ae1d864fd33fd7001f",
       "src/grabowski_read_surface.py": "c4f633a3303d08ac4916c034dc6d5c86d872daa7628704f3e1ba5b4d070917ac",
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
       "src/grabowski_recovery.py": "1c5b0843345f5aa7d1da7f3f0c5831e647f652c83eba7733b4a2c998d291c16d",

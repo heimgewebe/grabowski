@@ -125,7 +125,11 @@ STATE_DIR = HOME / ".local" / "state" / "grabowski"
 POLICY_PATH = HOME / ".config" / "grabowski" / "access.json"
 AUDIT_LOG = STATE_DIR / "write-audit.jsonl"
 QUARANTINE_DIR = STATE_DIR / "quarantine"
-KILL_SWITCH_PATH = STATE_DIR / "operator-kill-switch"
+CANONICAL_KILL_SWITCH_PATH = Path("/var/lib/grabowski/operator-blockade/operator-kill-switch")
+KILL_SWITCH_PATH = CANONICAL_KILL_SWITCH_PATH
+LEGACY_KILL_SWITCH_PATH = STATE_DIR / "operator-kill-switch"
+BLOCKADE_AUTHORITY_UID = 0
+BLOCKADE_MARKER_MODE = 0o644
 BUNDLE_REGISTRY = STATE_DIR / "rlens-latest-complete-bundles.tsv"
 MERGES_ROOT = HOME / "repos" / "merges"
 AUDIT_SCHEMA_VERSION = 2
@@ -292,6 +296,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     'grabowski_operator_blockade_status': ('audit_verify',),
     'grabowski_operator_blockade_engage': ('audit_verify', 'file_write'),
     'grabowski_operator_blockade_disarm': ('audit_verify', 'file_move'),
+    'grabowski_operator_blockade_migrate_legacy': ('audit_verify', 'file_move'),
     'grabowski_friction_record': ('friction_record',),
     'grabowski_friction_resolve': ('friction_record',),
     'grabowski_friction_summary': (),
@@ -1196,9 +1201,111 @@ def _require_capability(capability: str) -> None:
         raise PermissionError(f"Access capability is not enabled: {capability}")
 
 
+def _canonical_marker_contract() -> tuple[int, int, bool]:
+    # Tests may bind the canonical path to an owner-private fixture. Production
+    # always uses the immutable absolute constant and therefore the root-owned
+    # authority contract.
+    if KILL_SWITCH_PATH == CANONICAL_KILL_SWITCH_PATH:
+        return BLOCKADE_AUTHORITY_UID, BLOCKADE_MARKER_MODE, False
+    return os.getuid(), 0o600, True
+
+
+def _observe_blockade_marker(
+    marker_path: Path,
+    *,
+    label: str,
+    expected_uid: int,
+    expected_mode: int,
+    require_private_parent: bool,
+    host: str,
+) -> tuple[list[blockade_policy.BlockadeRecord], dict[str, Any]]:
+    records: list[blockade_policy.BlockadeRecord] = []
+    diagnostic: dict[str, Any] = {
+        "label": label,
+        "path": str(marker_path),
+        "present": marker_path.exists() or marker_path.is_symlink(),
+        "source": None,
+        "error": None,
+        "marker_file_sha256": None,
+        "marker_record_sha256": None,
+    }
+    if not diagnostic["present"]:
+        return records, diagnostic
+    try:
+        snapshot = blockade_store.read_blockade_marker(
+            marker_path,
+            expected_marker_path=marker_path,
+            expected_uid=expected_uid,
+            expected_mode=expected_mode,
+            require_private_parent=require_private_parent,
+        )
+    except Exception as exc:
+        try:
+            metadata = os.lstat(marker_path)
+        except OSError as observation_error:
+            identity = {
+                "strict_error": type(exc).__name__,
+                "lstat_error": type(observation_error).__name__,
+                "path": str(marker_path),
+                "label": label,
+            }
+            digest = hashlib.sha256(
+                json.dumps(
+                    identity, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            engaged_at = datetime.fromtimestamp(0, timezone.utc)
+            diagnostic["source"] = f"{label}_observation_uncertain"
+            diagnostic["error"] = (
+                f"{type(exc).__name__}: {exc}; "
+                f"{type(observation_error).__name__}: {observation_error}"
+            )[:500]
+        else:
+            identity = {
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "mode": metadata.st_mode,
+                "nlink": metadata.st_nlink,
+                "uid": metadata.st_uid,
+                "gid": metadata.st_gid,
+                "size": metadata.st_size,
+                "mtime_ns": metadata.st_mtime_ns,
+                "ctime_ns": metadata.st_ctime_ns,
+                "label": label,
+            }
+            digest = hashlib.sha256(
+                json.dumps(
+                    identity, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            engaged_at = datetime.fromtimestamp(metadata.st_ctime, timezone.utc)
+            diagnostic["source"] = f"{label}_unsafe_file"
+            diagnostic["error"] = f"{type(exc).__name__}: {exc}"[:500]
+        records.append(
+            blockade_policy.legacy_marker_record(
+                marker_path=str(marker_path),
+                marker_sha256=digest,
+                engaged_at=engaged_at,
+                host=host,
+            )
+        )
+        diagnostic["marker_file_sha256"] = digest
+        return records, diagnostic
+    records.append(snapshot.record)
+    diagnostic["source"] = f"{label}_typed"
+    diagnostic["marker_file_sha256"] = snapshot.file_sha256
+    diagnostic["marker_record_sha256"] = snapshot.record_sha256
+    return records, diagnostic
+
+
 def _operator_blockade_records() -> tuple[tuple[blockade_policy.BlockadeRecord, ...], dict[str, Any]]:
     records: list[blockade_policy.BlockadeRecord] = []
-    diagnostics: dict[str, Any] = {"marker_error": None, "marker_source": None}
+    diagnostics: dict[str, Any] = {
+        "marker_error": None,
+        "marker_source": None,
+        "canonical": None,
+        "legacy": None,
+    }
     host = platform.node() or "unknown-host"
     env_value = os.environ.get("GRABOWSKI_OPERATOR_KILL_SWITCH", "")
     env_engaged = env_value.lower() in {"1", "true", "yes", "on"}
@@ -1210,77 +1317,49 @@ def _operator_blockade_records() -> tuple[tuple[blockade_policy.BlockadeRecord, 
                 host=host,
             )
         )
-    marker_present = KILL_SWITCH_PATH.exists() or KILL_SWITCH_PATH.is_symlink()
-    if marker_present:
-        try:
-            snapshot = blockade_store.read_blockade_marker(
-                KILL_SWITCH_PATH,
-                expected_marker_path=KILL_SWITCH_PATH,
-            )
-            records.append(snapshot.record)
-            diagnostics["marker_source"] = "typed"
-            diagnostics["marker_file_sha256"] = snapshot.file_sha256
-            diagnostics["marker_record_sha256"] = snapshot.record_sha256
-        except Exception as exc:
-            try:
-                metadata = os.lstat(KILL_SWITCH_PATH)
-            except OSError as observation_error:
-                identity = {
-                    "strict_error": type(exc).__name__,
-                    "lstat_error": type(observation_error).__name__,
-                    "path": str(KILL_SWITCH_PATH),
-                }
-                digest = hashlib.sha256(
-                    json.dumps(
-                        identity, sort_keys=True, separators=(",", ":")
-                    ).encode("utf-8")
-                ).hexdigest()
-                records.append(
-                    blockade_policy.legacy_marker_record(
-                        marker_path=str(KILL_SWITCH_PATH),
-                        marker_sha256=digest,
-                        engaged_at=datetime.fromtimestamp(0, timezone.utc),
-                        host=host,
-                    )
-                )
-                diagnostics["marker_source"] = "marker_observation_uncertain"
-                diagnostics["marker_error"] = (
-                    f"{type(exc).__name__}: {exc}; "
-                    f"{type(observation_error).__name__}: {observation_error}"
-                )[:500]
-                diagnostics["marker_file_sha256"] = digest
-            else:
-                identity = {
-                    "device": metadata.st_dev,
-                    "inode": metadata.st_ino,
-                    "mode": metadata.st_mode,
-                    "nlink": metadata.st_nlink,
-                    "uid": metadata.st_uid,
-                    "gid": metadata.st_gid,
-                    "size": metadata.st_size,
-                    "mtime_ns": metadata.st_mtime_ns,
-                    "ctime_ns": metadata.st_ctime_ns,
-                }
-                digest = hashlib.sha256(
-                    json.dumps(
-                        identity, sort_keys=True, separators=(",", ":")
-                    ).encode("utf-8")
-                ).hexdigest()
-                records.append(
-                    blockade_policy.legacy_marker_record(
-                        marker_path=str(KILL_SWITCH_PATH),
-                        marker_sha256=digest,
-                        engaged_at=datetime.fromtimestamp(
-                            metadata.st_ctime, timezone.utc
-                        ),
-                        host=host,
-                    )
-                )
-                diagnostics["marker_source"] = "legacy_file"
-                diagnostics["marker_error"] = f"{type(exc).__name__}: {exc}"[:500]
-                diagnostics["marker_file_sha256"] = digest
-    return tuple(records), diagnostics
 
+    canonical_uid, canonical_mode, canonical_private = _canonical_marker_contract()
+    canonical_records, canonical_diagnostic = _observe_blockade_marker(
+        KILL_SWITCH_PATH,
+        label="canonical",
+        expected_uid=canonical_uid,
+        expected_mode=canonical_mode,
+        require_private_parent=canonical_private,
+        host=host,
+    )
+    records.extend(canonical_records)
+    diagnostics["canonical"] = canonical_diagnostic
+
+    if LEGACY_KILL_SWITCH_PATH != KILL_SWITCH_PATH:
+        legacy_records, legacy_diagnostic = _observe_blockade_marker(
+            LEGACY_KILL_SWITCH_PATH,
+            label="legacy",
+            expected_uid=os.getuid(),
+            expected_mode=0o600,
+            require_private_parent=True,
+            host=host,
+        )
+        records.extend(legacy_records)
+        diagnostics["legacy"] = legacy_diagnostic
+    else:
+        diagnostics["legacy"] = {
+            "label": "legacy",
+            "path": str(LEGACY_KILL_SWITCH_PATH),
+            "present": False,
+            "source": "same_as_canonical",
+            "error": None,
+        }
+
+    observed = [
+        item
+        for item in (diagnostics["canonical"], diagnostics["legacy"])
+        if isinstance(item, dict) and item.get("present")
+    ]
+    sources = [str(item.get("source")) for item in observed if item.get("source")]
+    errors = [str(item.get("error")) for item in observed if item.get("error")]
+    diagnostics["marker_source"] = "+".join(sources) if sources else None
+    diagnostics["marker_error"] = "; ".join(errors)[:1000] if errors else None
+    return tuple(records), diagnostics
 
 def _kill_switch_state() -> dict[str, Any]:
     records, diagnostics = _operator_blockade_records()
@@ -1302,6 +1381,12 @@ def _kill_switch_state() -> dict[str, Any]:
         "environment": any(record.source == "environment" for record in active),
         "path": str(KILL_SWITCH_PATH),
         "path_exists": KILL_SWITCH_PATH.exists() or KILL_SWITCH_PATH.is_symlink(),
+        "canonical_path": str(KILL_SWITCH_PATH),
+        "canonical_path_exists": KILL_SWITCH_PATH.exists() or KILL_SWITCH_PATH.is_symlink(),
+        "legacy_path": str(LEGACY_KILL_SWITCH_PATH),
+        "legacy_path_exists": (
+            LEGACY_KILL_SWITCH_PATH.exists() or LEGACY_KILL_SWITCH_PATH.is_symlink()
+        ),
         "effective_posture": effective,
         "records": [record.to_mapping() for record in active],
         "record_sha256s": [record.sha256 for record in active],
@@ -1330,7 +1415,10 @@ def _require_blockade_allows_mutation(
 ) -> None:
     if not isinstance(opaque_command, bool):
         raise ValueError("opaque_command must be boolean")
-    if allow_blockade_lifecycle and path != str(KILL_SWITCH_PATH):
+    if allow_blockade_lifecycle and path not in {
+        str(KILL_SWITCH_PATH),
+        str(LEGACY_KILL_SWITCH_PATH),
+    }:
         raise PermissionError("blockade lifecycle authority is marker-path bound")
     records, _diagnostics = _operator_blockade_records()
     if opaque_command:
@@ -1681,12 +1769,18 @@ def _audit_quarantine_path(raw_path: Any, expected_type: str) -> Path:
 
 
 def _canonical_operator_marker_target(path: Path) -> bool:
-    return path.resolve(strict=False) == KILL_SWITCH_PATH.resolve(strict=False)
+    candidate = path.resolve(strict=False)
+    return candidate in {
+        KILL_SWITCH_PATH.resolve(strict=False),
+        LEGACY_KILL_SWITCH_PATH.resolve(strict=False),
+    }
 
 
 def _protected_generic_write_target(path: Path) -> bool:
     protected = [
         POLICY_PATH,
+        KILL_SWITCH_PATH,
+        LEGACY_KILL_SWITCH_PATH,
         STATE_DIR,
         AUDIT_LOG,
         QUARANTINE_DIR,

@@ -29,8 +29,9 @@
       "expected_source_uid": 1000,
       "max_recovery_age_seconds": 86400,
       "configured_target": "heimberry:rest-server/grabowski-recovery-probe",
-      "kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
-      "require_root_owned_destination": true
+      "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "require_root_owned_destination": true,
+      "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
     },
     "operator_power_argv": {
       "enabled": false,
@@ -42,24 +43,69 @@
       "allow_shell": false,
       "policy_intent": "trusted-owner-high-power-admin-catalog",
       "allowed_argv_prefixes": [
-        ["/usr/bin/systemctl", "is-active"],
-        ["/usr/bin/systemctl", "status"],
-        ["/usr/bin/systemctl", "reset-failed"],
-        ["/usr/bin/apt-get", "update"],
-        ["/usr/bin/apt-get", "install", "-y"],
-        ["/usr/bin/docker", "compose"],
-        ["/usr/bin/chown"],
-        ["/usr/bin/chmod"],
-        ["/usr/bin/mount"],
-        ["/usr/bin/umount"]
+        [
+          "/usr/bin/systemctl",
+          "is-active"
+        ],
+        [
+          "/usr/bin/systemctl",
+          "status"
+        ],
+        [
+          "/usr/bin/systemctl",
+          "reset-failed"
+        ],
+        [
+          "/usr/bin/apt-get",
+          "update"
+        ],
+        [
+          "/usr/bin/apt-get",
+          "install",
+          "-y"
+        ],
+        [
+          "/usr/bin/docker",
+          "compose"
+        ],
+        [
+          "/usr/bin/chown"
+        ],
+        [
+          "/usr/bin/chmod"
+        ],
+        [
+          "/usr/bin/mount"
+        ],
+        [
+          "/usr/bin/umount"
+        ]
       ],
       "gate": {
-        "kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+        "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+        "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
+        "max_recovery_age_seconds": 86400,
+        "require_root_owned_gate_files": true,
+        "configured_target": "heimberry:rest-server/grabowski-recovery-probe",
+        "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
+      }
+    },
+    "operator_blockade_marker_lifecycle": {
+      "enabled": true,
+      "mode": "blockade-marker-lifecycle",
+      "marker_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "legacy_marker_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+      "quarantine_root": "/var/lib/grabowski/operator-blockade/quarantine",
+      "authority_uid": 0,
+      "legacy_uid": 1000,
+      "recovery_gate": {
         "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
         "max_recovery_age_seconds": 86400,
         "require_root_owned_gate_files": true,
         "configured_target": "heimberry:rest-server/grabowski-recovery-probe"
-      }
+      },
+      "allowed_peer_unit": "grabowski-operator.service",
+      "allowed_peer_uid": 1000
     }
   }
 }

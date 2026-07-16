@@ -17,10 +17,14 @@ from typing import Any, Callable
 
 
 CONFIG_TARGET = Path("/etc/grabowski/privileged-actions.json")
+BLOCKADES_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockades.py")
+BLOCKADE_STORE_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_store.py")
+BLOCKADE_AUTHORITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_authority.py")
 BROKER_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
 BROKER_WRAPPER_TARGET = Path("/usr/local/libexec/grabowski-privileged-broker")
 REQUEST_CLIENT_TARGET = Path("/usr/local/bin/grabowski-privileged-request")
 CUTOVER_HELPER_TARGET = Path("/usr/local/libexec/grabowski-rootbroker-cutover")
+BROKER_SERVICE_TARGET = Path("/etc/systemd/system/grabowski-privileged-broker@.service")
 RECOVERY_SOURCE_DROPIN_TARGET = Path(
     "/etc/systemd/system/grabowski-privileged-broker@.service.d/recovery-source.conf"
 )
@@ -31,6 +35,7 @@ SOCKET_UNIT = "grabowski-privileged-broker.socket"
 CONFIGURED_TARGET = "heimberry:rest-server/grabowski-recovery-probe"
 PUBLISH_ACTION = "publish_recovery_marker"
 POWER_ACTION = "operator_power_argv"
+BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 
 
 class CutoverError(RuntimeError):
@@ -46,6 +51,24 @@ class Artifact:
 
 
 ARTIFACTS = (
+    Artifact(
+        "src/grabowski_blockades.py",
+        BLOCKADES_MODULE_TARGET,
+        0o644,
+        True,
+    ),
+    Artifact(
+        "src/grabowski_blockade_store.py",
+        BLOCKADE_STORE_MODULE_TARGET,
+        0o644,
+        True,
+    ),
+    Artifact(
+        "src/grabowski_blockade_authority.py",
+        BLOCKADE_AUTHORITY_MODULE_TARGET,
+        0o644,
+        True,
+    ),
     Artifact(
         "src/grabowski_privileged_broker.py",
         BROKER_MODULE_TARGET,
@@ -69,6 +92,11 @@ ARTIFACTS = (
         CUTOVER_HELPER_TARGET,
         0o755,
         True,
+    ),
+    Artifact(
+        "systemd/grabowski-privileged-broker@.service",
+        BROKER_SERVICE_TARGET,
+        0o644,
     ),
     Artifact(
         "systemd/grabowski-privileged-broker@.service.d/recovery-source.conf",
@@ -453,7 +481,8 @@ def _publisher_from_repository(
         "kill_switch_path",
         "require_root_owned_destination",
     }
-    if set(publisher) != required:
+    optional = {"legacy_kill_switch_path"}
+    if not required.issubset(publisher) or set(publisher) - required - optional:
         raise CutoverError("recovery publisher contract keys are invalid")
     if publisher.get("enabled") is not True:
         raise CutoverError("recovery publisher must be enabled")
@@ -464,10 +493,77 @@ def _publisher_from_repository(
     return json.loads(json.dumps(publisher))
 
 
+def _lifecycle_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any] | None:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    lifecycle = actions.get(BLOCKADE_LIFECYCLE_ACTION)
+    if lifecycle is None:
+        return None
+    if not isinstance(lifecycle, dict):
+        raise CutoverError("example blockade lifecycle is malformed")
+    required = {
+        "enabled",
+        "mode",
+        "marker_path",
+        "legacy_marker_path",
+        "quarantine_root",
+        "authority_uid",
+        "legacy_uid",
+        "allowed_peer_unit",
+        "allowed_peer_uid",
+        "recovery_gate",
+    }
+    if set(lifecycle) != required:
+        raise CutoverError("blockade lifecycle contract keys are invalid")
+    if lifecycle.get("enabled") is not True:
+        raise CutoverError("blockade lifecycle must be enabled")
+    if lifecycle.get("mode") != "blockade-marker-lifecycle":
+        raise CutoverError("blockade lifecycle mode is invalid")
+    marker = lifecycle.get("marker_path")
+    legacy = lifecycle.get("legacy_marker_path")
+    quarantine = lifecycle.get("quarantine_root")
+    if not all(isinstance(item, str) and item.startswith("/") for item in (marker, legacy, quarantine)):
+        raise CutoverError("blockade lifecycle paths are invalid")
+    if Path(marker).parent != Path(quarantine).parent:
+        raise CutoverError("blockade marker and quarantine authority roots differ")
+    if lifecycle.get("authority_uid") != 0:
+        raise CutoverError("blockade lifecycle authority_uid must be root")
+    if lifecycle.get("allowed_peer_unit") != "grabowski-operator.service":
+        raise CutoverError("blockade lifecycle peer unit is invalid")
+    if lifecycle.get("allowed_peer_uid") != lifecycle.get("legacy_uid"):
+        raise CutoverError("blockade lifecycle peer UID differs from operator UID")
+    gate = lifecycle.get("recovery_gate")
+    if not isinstance(gate, dict) or set(gate) != {
+        "recovery_marker_path",
+        "max_recovery_age_seconds",
+        "require_root_owned_gate_files",
+        "configured_target",
+    }:
+        raise CutoverError("blockade lifecycle recovery gate is invalid")
+    if gate.get("configured_target") != CONFIGURED_TARGET:
+        raise CutoverError("blockade lifecycle target differs from host contract")
+    return json.loads(json.dumps(lifecycle))
+
+
 def merge_privileged_config(
     current: dict[str, Any],
     *,
     publisher: dict[str, Any],
+    lifecycle: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if set(current) != {"schema_version", "actions"}:
         raise CutoverError("installed privileged config has invalid top-level keys")
@@ -484,36 +580,90 @@ def merge_privileged_config(
     gate_before = power_before.get("gate")
     if not isinstance(gate_before, dict):
         raise CutoverError("installed operator power gate is malformed")
-    coherence = {
-        "kill_switch_path": "kill_switch_path",
-        "recovery_marker_path": "destination_path",
-        "max_recovery_age_seconds": "max_recovery_age_seconds",
-        "require_root_owned_gate_files": "require_root_owned_destination",
-    }
-    for gate_key, publisher_key in coherence.items():
-        if gate_before.get(gate_key) != publisher.get(publisher_key):
-            raise CutoverError(
-                f"installed power gate differs from publisher contract: {gate_key}"
-            )
 
     merged = json.loads(json.dumps(current))
     merged_actions = merged["actions"]
     merged_actions[PUBLISH_ACTION] = json.loads(json.dumps(publisher))
     merged_power = merged_actions[POWER_ACTION]
     merged_gate = merged_power["gate"]
-    merged_gate["configured_target"] = CONFIGURED_TARGET
+    if lifecycle is None:
+        # Backward-compatible unit-test and recovery seam for an unchanged
+        # authority model. Production cutover always supplies lifecycle.
+        coherence = {
+            "kill_switch_path": "kill_switch_path",
+            "recovery_marker_path": "destination_path",
+            "max_recovery_age_seconds": "max_recovery_age_seconds",
+            "require_root_owned_gate_files": "require_root_owned_destination",
+        }
+        for gate_key, publisher_key in coherence.items():
+            if gate_before.get(gate_key) != publisher.get(publisher_key):
+                raise CutoverError(
+                    f"installed power gate differs from publisher contract: {gate_key}"
+                )
+        merged_gate["configured_target"] = CONFIGURED_TARGET
+    else:
+        legacy_path = publisher.get("legacy_kill_switch_path")
+        if not isinstance(legacy_path, str) or not legacy_path.startswith("/"):
+            raise CutoverError(
+                "lifecycle cutover requires publisher legacy_kill_switch_path"
+            )
+        gate_updates = {
+            "kill_switch_path": publisher["kill_switch_path"],
+            "legacy_kill_switch_path": legacy_path,
+            "recovery_marker_path": publisher["destination_path"],
+            "max_recovery_age_seconds": publisher["max_recovery_age_seconds"],
+            "require_root_owned_gate_files": publisher[
+                "require_root_owned_destination"
+            ],
+            "configured_target": CONFIGURED_TARGET,
+        }
+        for key, value in gate_updates.items():
+            merged_gate[key] = value
+        merged_actions[BLOCKADE_LIFECYCLE_ACTION] = json.loads(
+            json.dumps(lifecycle)
+        )
+        if lifecycle.get("marker_path") != publisher.get("kill_switch_path"):
+            raise CutoverError("lifecycle marker differs from publisher gate")
+        if lifecycle.get("legacy_marker_path") != publisher.get(
+            "legacy_kill_switch_path"
+        ):
+            raise CutoverError("lifecycle legacy marker differs from publisher gate")
+        if lifecycle.get("legacy_uid") != publisher.get("expected_source_uid"):
+            raise CutoverError("lifecycle legacy UID differs from publisher source UID")
+        lifecycle_gate = lifecycle.get("recovery_gate")
+        if not isinstance(lifecycle_gate, dict):
+            raise CutoverError("lifecycle recovery gate is malformed")
+        expected_lifecycle_gate = {
+            "recovery_marker_path": publisher["destination_path"],
+            "max_recovery_age_seconds": publisher["max_recovery_age_seconds"],
+            "require_root_owned_gate_files": publisher[
+                "require_root_owned_destination"
+            ],
+            "configured_target": CONFIGURED_TARGET,
+        }
+        if lifecycle_gate != expected_lifecycle_gate:
+            raise CutoverError("lifecycle recovery gate differs from publisher")
 
     expected_power = json.loads(json.dumps(power_before))
-    expected_power["gate"]["configured_target"] = CONFIGURED_TARGET
+    if lifecycle is None:
+        expected_power["gate"]["configured_target"] = CONFIGURED_TARGET
+    else:
+        expected_power["gate"].update(gate_updates)
     if merged_power != expected_power:
-        raise CutoverError("operator power action changed beyond target binding")
+        raise CutoverError("operator power action changed beyond gate migration")
 
+    controlled = {PUBLISH_ACTION, POWER_ACTION}
+    if lifecycle is not None:
+        controlled.add(BLOCKADE_LIFECYCLE_ACTION)
     evidence = {
         "operator_power_before_sha256": _sha256(_canonical_json(power_before)),
         "operator_power_after_sha256": _sha256(_canonical_json(merged_power)),
         "publisher_sha256": _sha256(_canonical_json(publisher)),
+        "lifecycle_sha256": (
+            _sha256(_canonical_json(lifecycle)) if lifecycle is not None else None
+        ),
         "unrelated_action_names": sorted(
-            name for name in actions if name not in {PUBLISH_ACTION, POWER_ACTION}
+            name for name in actions if name not in controlled
         ),
     }
     for name in evidence["unrelated_action_names"]:
@@ -850,6 +1000,11 @@ def _apply_cutover_locked(
         expected_head=expected_head,
         runner=runner,
     )
+    lifecycle = _lifecycle_from_repository(
+        repository,
+        expected_head=expected_head,
+        runner=runner,
+    )
     if artifact_targets is None:
         _validate_recovery_source_dropin(
             source_artifacts,
@@ -863,6 +1018,7 @@ def _apply_cutover_locked(
     merged_config, merge_evidence = merge_privileged_config(
         current_config,
         publisher=publisher,
+        lifecycle=lifecycle,
     )
     merged_config_data = _canonical_json(merged_config)
 
@@ -1067,13 +1223,22 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         expected_head=expected_head,
         runner=runner,
     )
+    lifecycle = _lifecycle_from_repository(
+        repository,
+        expected_head=expected_head,
+        runner=runner,
+    )
     _validate_recovery_source_dropin(
         source_artifacts,
         publisher=publisher,
     )
     current_data, metadata = _read_regular_file(CONFIG_TARGET, require_root_owned=True)
     current = _decode_json_object(current_data, label=str(CONFIG_TARGET))
-    merged, merge_evidence = merge_privileged_config(current, publisher=publisher)
+    merged, merge_evidence = merge_privileged_config(
+        current,
+        publisher=publisher,
+        lifecycle=lifecycle,
+    )
     return {
         "schema_version": 1,
         "kind": "grabowski_rootbroker_cutover_plan",

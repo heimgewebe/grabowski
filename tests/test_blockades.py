@@ -459,6 +459,16 @@ class BlockadeTests(unittest.TestCase):
         self.assertTrue(result.allowed)
         self.assertEqual(result.reasons, ())
 
+    def test_disarm_validation_accepts_root_readable_marker_mode(self) -> None:
+        item = record(posture="hard_stop", scope=Scope("global", "*"))
+        result = validate_disarm(
+            item,
+            evidence_for(item, marker_mode=0o644),
+            expected_marker_path=CANONICAL_MARKER,
+        )
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.reasons, ())
+
     def test_disarm_validation_fails_closed(self) -> None:
         item = record(posture="hard_stop", scope=Scope("global", "*"))
         cases: tuple[tuple[dict[str, object], str], ...] = (
@@ -469,7 +479,7 @@ class BlockadeTests(unittest.TestCase):
             ({"marker_present": False}, "marker_absent"),
             ({"marker_regular": False}, "marker_not_regular"),
             ({"marker_nlink": 2}, "marker_link_count_invalid"),
-            ({"marker_mode": 0o644}, "marker_mode_invalid"),
+            ({"marker_mode": 0o666}, "marker_mode_invalid"),
             ({"marker_owner_matches": False}, "marker_owner_mismatch"),
             ({"environment_switch_off": False}, "environment_switch_engaged"),
             ({"audit_valid": False}, "audit_invalid"),
