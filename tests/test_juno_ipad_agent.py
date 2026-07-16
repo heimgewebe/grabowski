@@ -216,6 +216,124 @@ class AgentStateTests(unittest.TestCase):
             self.assertIn("job_recovered", events)
 
 
+class ClientPairingTests(unittest.TestCase):
+    def test_pairing_secret_is_promoted_only_after_pair_success(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.secret = b""
+
+            def pair(self, secret: bytes) -> dict[str, object]:
+                self.secret = secret
+                return {"status": "paired", "paired": True}
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "juno-ipad-agent.key"
+            target.write_bytes(b"old-secret-that-will-be-replaced")
+            target.chmod(0o600)
+            fake = FakeClient()
+            response = client_module.provision_pairing_secret(
+                fake,
+                target,
+                replace_secret=True,
+            )
+            self.assertEqual(response["status"], "paired")
+            self.assertEqual(len(fake.secret), 32)
+            self.assertEqual(target.read_bytes(), fake.secret)
+            self.assertFalse(
+                target.with_name(f".{target.name}.pairing-pending").exists()
+            )
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_existing_private_secret_is_reused_without_replacement(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.secret = b""
+
+            def pair(self, secret: bytes) -> dict[str, object]:
+                self.secret = secret
+                return {"status": "paired", "paired": True}
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "juno-ipad-agent.key"
+            existing = b"e" * 32
+            target.write_bytes(existing)
+            target.chmod(0o600)
+            fake = FakeClient()
+            response = client_module.provision_pairing_secret(
+                fake,
+                target,
+                replace_secret=False,
+            )
+            self.assertEqual(response["status"], "paired")
+            self.assertEqual(fake.secret, existing)
+            self.assertEqual(target.read_bytes(), existing)
+
+    def test_pairing_failure_preserves_private_pending_secret(self) -> None:
+        class FailingClient:
+            def pair(self, secret: bytes) -> dict[str, object]:
+                raise RuntimeError("transport unknown")
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "juno-ipad-agent.key"
+            with self.assertRaisesRegex(RuntimeError, "transport unknown"):
+                client_module.provision_pairing_secret(
+                    FailingClient(),
+                    target,
+                    replace_secret=False,
+                )
+            pending = target.with_name(f".{target.name}.pairing-pending")
+            self.assertFalse(target.exists())
+            self.assertTrue(pending.is_file())
+            self.assertEqual(len(pending.read_bytes()), 32)
+            self.assertEqual(pending.stat().st_mode & 0o777, 0o600)
+
+
+class PairingIntegrationTests(unittest.TestCase):
+    def test_unpaired_agent_pairs_once_and_accepts_authenticated_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key_path = root / "juno_ipad_agent.key"
+            state = agent.AgentState(root / "state")
+            server = agent.AgentHTTPServer(
+                ("127.0.0.1", 0),
+                agent.AgentHandler,
+                authenticator=None,
+                state=state,
+                secret_source="unpaired",
+                key_path=key_path,
+                pairing_peer="127.0.0.1",
+                started_at=agent.utc_now(),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                pairing_client = client_module.AgentClient(base_url, b"", 3.0)
+                self.assertFalse(pairing_client.health()["paired"])
+                secret = b"p" * 32
+                paired = pairing_client.pair(secret)
+                self.assertEqual(paired["status"], "paired")
+                self.assertEqual(key_path.read_bytes(), secret)
+                self.assertTrue(pairing_client.health()["paired"])
+                replayed = pairing_client.pair(secret)
+                self.assertEqual(replayed["status"], "already_paired_same_secret")
+                with self.assertRaisesRegex(RuntimeError, "HTTP 409"):
+                    pairing_client.pair(b"q" * 32)
+                authenticated = client_module.AgentClient(base_url, secret, 3.0)
+                submitted = authenticated.submit(
+                    "GRABOWSKI_RESULT = {'paired': True}",
+                    timeout_seconds=5,
+                    metadata={},
+                    job_id="job-paired-0001",
+                )
+                self.assertIn(submitted["state"], {"queued", "running", "succeeded"})
+            finally:
+                server.shutdown()
+                server.server_close()
+                state.stop()
+                thread.join(timeout=3)
+
+
 class HTTPIntegrationTests(unittest.TestCase):
     def test_authenticated_job_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -227,6 +345,8 @@ class HTTPIntegrationTests(unittest.TestCase):
                 authenticator=agent.RequestAuthenticator(secret),
                 state=state,
                 secret_source="test",
+                key_path=Path(directory) / "agent.key",
+                pairing_peer="127.0.0.1",
                 started_at=agent.utc_now(),
             )
             thread = threading.Thread(target=server.serve_forever, daemon=True)

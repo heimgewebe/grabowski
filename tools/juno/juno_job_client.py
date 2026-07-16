@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import json
 import os
 import secrets
+import stat
 import sys
 import time
 import uuid
@@ -38,8 +40,81 @@ def canonical_json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+
+def atomic_create_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+
+
+def fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_private_secret(path: Path, *, label: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"{label} ist keine reguläre Datei")
+        if metadata.st_nlink != 1:
+            raise RuntimeError(f"{label} hat nicht genau einen Hardlink")
+        if metadata.st_uid != os.getuid():
+            raise RuntimeError(f"{label} gehört nicht dem aktuellen Benutzer")
+        if metadata.st_mode & 0o077:
+            raise RuntimeError(f"{label} ist für Gruppe oder andere lesbar")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(fd)
+
+
+def provision_pairing_secret(
+    client: "AgentClient",
+    secret_path: Path,
+    *,
+    replace_secret: bool,
+) -> Any:
+    target = secret_path.expanduser()
+    pending = target.with_name(f".{target.name}.pairing-pending")
+    target_exists = os.path.lexists(target)
+    if target_exists and not replace_secret:
+        secret = read_private_secret(target, label="bestehende Schlüsseldatei")
+        if len(secret) != 32:
+            raise RuntimeError("Bestehender Pairing-Schlüssel muss exakt 32 Byte lang sein")
+        return client.pair(secret)
+    if target_exists:
+        read_private_secret(target, label="bestehende Schlüsseldatei")
+    if pending.exists():
+        secret = read_private_secret(pending, label="Pairing-Pending-Datei")
+    else:
+        secret = secrets.token_bytes(32)
+        atomic_create_bytes(pending, secret)
+        fsync_directory(pending.parent)
+    if len(secret) != 32:
+        raise RuntimeError("Pairing-Pending-Schlüssel muss exakt 32 Byte lang sein")
+    response = client.pair(secret)
+    os.replace(pending, target)
+    os.chmod(target, 0o600)
+    fsync_directory(target.parent)
+    return response
+
 def load_secret(path: Path) -> bytes:
-    secret = path.expanduser().read_bytes()
+    secret = read_private_secret(
+        path.expanduser(),
+        label="Agent-Schlüsseldatei",
+    )
     if len(secret) < 32:
         raise ValueError("Agent-Schlüssel muss mindestens 32 Byte lang sein")
     return secret
@@ -125,6 +200,17 @@ class AgentClient:
     def health(self) -> Any:
         return self.request("GET", "/health", authenticated=False)[1]
 
+    def pair(self, secret: bytes) -> Any:
+        if len(secret) != 32:
+            raise ValueError("Pairing-Schlüssel muss exakt 32 Byte lang sein")
+        encoded = base64.urlsafe_b64encode(secret).decode("ascii").rstrip("=")
+        return self.request(
+            "POST",
+            "/v1/pair",
+            {"schema_version": SCHEMA_VERSION, "secret_b64": encoded},
+            authenticated=False,
+        )[1]
+
     def submit(
         self,
         code: str,
@@ -185,6 +271,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("health")
 
+    pair_parser = subparsers.add_parser("pair")
+    pair_parser.add_argument("--replace-secret", action="store_true")
+
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("code_file", type=Path)
     run_parser.add_argument("--job-id")
@@ -209,6 +298,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "health":
             client = AgentClient(args.url, b"", args.network_timeout)
             print_json(client.health())
+            return 0
+        if args.command == "pair":
+            client = AgentClient(args.url, b"", args.network_timeout)
+            response = provision_pairing_secret(
+                client,
+                args.secret_file,
+                replace_secret=args.replace_secret,
+            )
+            print_json(response)
             return 0
         secret = load_secret(args.secret_file)
         client = AgentClient(args.url, secret, args.network_timeout)

@@ -23,15 +23,21 @@ Worker, Testknoten und Sensorzugang.
 
 - `tools/juno/juno_ipad_agent.py`: Agent für Juno auf dem iPad
 - `tools/juno/juno_job_client.py`: signierender Client auf dem heim-pc
-- `juno_ipad_agent.key`: privater gemeinsamer Schlüssel, niemals einchecken
+- `juno_ipad_agent.key`: bei der einmaligen Kopplung lokal erzeugter gemeinsamer Schlüssel, niemals einchecken
 - `grabowski_workspace/`: lokaler Arbeits-, Job- und Auditbereich auf dem iPad
 
 ## Start auf dem iPad
 
-1. `juno_ipad_agent.py` und `juno_ipad_agent.key` in denselben Ordner legen.
-2. Den Agent in Juno öffnen.
-3. Das Skript starten.
-4. Die Tailscale-Verbindung aktiv lassen.
+1. `juno_ipad_agent.py` auf dem iPad in einen eigenen Ordner legen.
+2. Den Agent in Juno öffnen und starten.
+3. Die Tailscale-Verbindung aktiv lassen.
+4. Beim ersten Start wartet der Agent einmalig auf die Kopplung vom heim-pc.
+5. Auf dem heim-pc den Client mit `pair` ausführen.
+
+Der Schlüssel wird dabei im Arbeitsspeicher erzeugt und über den verschlüsselten
+Tailscale-Pfad an den ungekoppelten Agenten übermittelt. Auf beiden Geräten wird
+er anschließend als private Datei gespeichert. Eine Schlüsseldatei muss nicht
+über Chat, Taildrop oder Zwischenablage transportiert werden.
 
 Standardbindung:
 
@@ -42,7 +48,9 @@ Standardbindung:
 Unabhängig von dieser Socket-Bindung akzeptiert der Handler nur Quelladressen
 aus dem Tailscale-IPv4-/IPv6-Bereich sowie Loopback für lokale Tests. Direkte
 Anfragen aus WLAN oder öffentlichem Internet werden vor Health- und
-Authentifizierungslogik mit HTTP 403 abgewiesen.
+Authentifizierungslogik mit HTTP 403 abgewiesen. Die einmalige Kopplung wird
+zusätzlich nur von der fest gebundenen heim-pc-Tailscale-IP `100.68.88.111`
+akzeptiert.
 
 Der lokale Stoppschalter bleibt die Stopptaste in Juno. Zusätzlich existiert
 ein signierter Shutdown-Endpunkt.
@@ -65,6 +73,7 @@ Beispiele:
 
 ```bash
 python3 tools/juno/juno_job_client.py health
+python3 tools/juno/juno_job_client.py pair
 python3 tools/juno/juno_job_client.py run /pfad/auftrag.py --timeout 60
 python3 tools/juno/juno_job_client.py list --limit 20
 python3 tools/juno/juno_job_client.py status job-...
@@ -92,12 +101,24 @@ Vorbelegte Namen:
 
 ## Protokoll
 
-### Offen
+### Offen beziehungsweise einmalig gekoppelt
 
 - `GET /health`
+- `POST /v1/pair` nur im ungekoppelten Zustand und nur von `100.68.88.111`
 
 Der Health-Endpunkt enthält keine Geheimnisse. Er belegt nur Laufzeit,
-Plattform, Arbeitsbereich und den ausdrücklich aktivierten Ausführungsmodus.
+Plattform, Arbeitsbereich, Kopplungszustand und den ausdrücklich aktivierten
+Ausführungsmodus. `POST /v1/pair` akzeptiert exakt einen 32-Byte-Schlüssel. Eine
+Wiederholung mit demselben Schlüssel ist idempotent; ein anderer Schlüssel wird
+nach erfolgreicher Kopplung abgewiesen.
+
+Ist bereits eine private kanonische heim-pc-Schlüsseldatei vorhanden, verwendet
+der Client sie für die Kopplung und verändert sie nicht. Andernfalls schreibt er
+den neuen Schlüssel zuerst create-only in eine private Pending-Datei. Erst nach
+erfolgreicher oder idempotent bestätigter Kopplung wird diese atomar zur
+kanonischen Schlüsseldatei befördert. Bei einem unklaren Transportausgang bleibt
+die Pending-Datei für einen identischen Retry erhalten. `--replace-secret` ist
+ausschließlich für einen bewusst vorbereiteten Schlüsselwechsel vorgesehen.
 
 ### Signiert
 
@@ -164,11 +185,11 @@ Juno-Stopptaste der harte Abbruchpfad.
 ## Schlüsselwechsel
 
 1. Agent stoppen.
-2. Neuen mindestens 32 Byte langen Zufallsschlüssel erzeugen.
-3. Schlüsseldatei auf heim-pc und iPad atomar ersetzen.
-4. Agent neu starten.
+2. `juno_ipad_agent.key` auf dem iPad kontrolliert entfernen.
+3. Agent neu starten; er wechselt in den ungekoppelten Zustand.
+4. Auf dem heim-pc `pair --replace-secret` ausführen.
 5. Einen signierten Testjob ausführen.
-6. Alten Schlüssel sicher entfernen.
+6. Eventuelle alte Pending-Dateien nur nach erfolgreichem Readback entfernen.
 
 Der Schlüssel darf nicht in Repository, Kommandozeile, URL, Chat, Log oder
 Screenshot erscheinen.

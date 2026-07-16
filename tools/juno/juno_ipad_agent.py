@@ -9,6 +9,8 @@ Juno's sandbox and explicitly selected document-provider locations.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import contextlib
 import hashlib
 import hmac
@@ -34,6 +36,8 @@ from urllib.parse import parse_qs, urlparse
 SCHEMA_VERSION = 1
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
+DEFAULT_PAIRING_PEER = "100.68.88.111"
+PAIRING_SECRET_BYTES = 32
 MAX_BODY_BYTES = 512 * 1024
 MAX_CODE_BYTES = 384 * 1024
 MAX_OUTPUT_CHARS = 256 * 1024
@@ -79,9 +83,8 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def atomic_create_json(path: Path, value: Any) -> None:
+def atomic_create_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = canonical_json_bytes(value) + b"\n"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     fd = os.open(path, flags, 0o600)
     try:
@@ -91,6 +94,10 @@ def atomic_create_json(path: Path, value: Any) -> None:
             os.fsync(handle.fileno())
     finally:
         os.close(fd)
+
+
+def atomic_create_json(path: Path, value: Any) -> None:
+    atomic_create_bytes(path, canonical_json_bytes(value) + b"\n")
 
 
 def atomic_replace_json(path: Path, value: Any) -> None:
@@ -116,23 +123,21 @@ def read_json(path: Path) -> Any:
         return json.load(handle)
 
 
-def load_secret(script_path: Path) -> tuple[bytes, str]:
+def load_secret(script_path: Path) -> tuple[bytes | None, str, Path]:
+    key_path = script_path.with_name("juno_ipad_agent.key")
     environment_secret = os.environ.get("GRABOWSKI_JUNO_SECRET")
     if environment_secret is not None:
         secret = environment_secret.encode("utf-8")
         source = "environment"
     else:
-        key_path = script_path.with_name("juno_ipad_agent.key")
         try:
             secret = key_path.read_bytes()
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Schlüssel fehlt: {key_path.name} muss neben dem Agent-Skript liegen"
-            ) from exc
+        except FileNotFoundError:
+            return None, "unpaired", key_path
         source = key_path.name
-    if len(secret) < 32:
+    if len(secret) < PAIRING_SECRET_BYTES:
         raise RuntimeError("Agent-Schlüssel muss mindestens 32 Byte lang sein")
-    return secret, source
+    return secret, source, key_path
 
 
 class AuthenticationError(ValueError):
@@ -145,6 +150,9 @@ class RequestAuthenticator:
         self._skew_seconds = skew_seconds
         self._seen_nonces: dict[str, int] = {}
         self._lock = threading.Lock()
+
+    def matches_secret(self, candidate: bytes) -> bool:
+        return hmac.compare_digest(self._secret, candidate)
 
     @staticmethod
     def canonical_message(
@@ -588,16 +596,42 @@ class AgentHTTPServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         handler_class: type[BaseHTTPRequestHandler],
         *,
-        authenticator: RequestAuthenticator,
+        authenticator: RequestAuthenticator | None,
         state: AgentState,
         secret_source: str,
+        key_path: Path,
+        pairing_peer: str,
         started_at: str,
     ) -> None:
         super().__init__(server_address, handler_class)
         self.authenticator = authenticator
         self.state = state
         self.secret_source = secret_source
+        self.key_path = key_path
+        self.pairing_peer = pairing_peer
         self.started_at = started_at
+        self.auth_lock = threading.Lock()
+
+    def is_paired(self) -> bool:
+        with self.auth_lock:
+            return self.authenticator is not None
+
+    def current_authenticator(self) -> RequestAuthenticator | None:
+        with self.auth_lock:
+            return self.authenticator
+
+    def pair(self, secret: bytes) -> str:
+        if len(secret) != PAIRING_SECRET_BYTES:
+            raise ValueError("pairing_secret_must_be_32_bytes")
+        with self.auth_lock:
+            if self.authenticator is not None:
+                if self.authenticator.matches_secret(secret):
+                    return "already_paired_same_secret"
+                raise FileExistsError("agent_already_paired")
+            atomic_create_bytes(self.key_path, secret)
+            self.authenticator = RequestAuthenticator(secret)
+            self.secret_source = self.key_path.name
+            return "paired"
 
 
 class AgentHandler(BaseHTTPRequestHandler):
@@ -655,8 +689,15 @@ class AgentHandler(BaseHTTPRequestHandler):
         return body
 
     def _authenticate(self, body: bytes) -> bool:
+        authenticator = self.agent_server.current_authenticator()
+        if authenticator is None:
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"schema_version": SCHEMA_VERSION, "error": "agent_unpaired"},
+            )
+            return False
         try:
-            self.agent_server.authenticator.verify(
+            authenticator.verify(
                 self.command,
                 self.path,
                 body,
@@ -689,6 +730,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                     "platform": platform.platform(),
                     "workspace": str(self.agent_server.state.workspace),
                     "secret_source": self.agent_server.secret_source,
+                    "paired": self.agent_server.is_paired(),
+                    "pairing_peer": self.agent_server.pairing_peer,
                     "timeout_contract": "cooperative_python_only",
                     "network_policy": "tailscale_or_loopback_source",
                 },
@@ -753,9 +796,60 @@ class AgentHandler(BaseHTTPRequestHandler):
                 {"schema_version": SCHEMA_VERSION, "error": str(exc)},
             )
             return
+        parsed = urlparse(self.path)
+        if parsed.path == "/v1/pair" and parsed.query == "":
+            if self.client_address[0].split("%", 1)[0] != self.agent_server.pairing_peer:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"schema_version": SCHEMA_VERSION, "error": "pairing_peer_required"},
+                )
+                return
+            try:
+                document = json.loads(body.decode("utf-8"))
+                if not isinstance(document, dict):
+                    raise ValueError("request_must_be_object")
+                if document.get("schema_version") != SCHEMA_VERSION:
+                    raise ValueError("unsupported_schema_version")
+                encoded_secret = document.get("secret_b64")
+                if not isinstance(encoded_secret, str):
+                    raise ValueError("secret_b64_must_be_string")
+                padding = "=" * (-len(encoded_secret) % 4)
+                secret = base64.b64decode(
+                    encoded_secret + padding,
+                    altchars=b"-_",
+                    validate=True,
+                )
+                outcome = self.agent_server.pair(secret)
+            except UnicodeDecodeError:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"schema_version": SCHEMA_VERSION, "error": "body_not_utf8"},
+                )
+                return
+            except FileExistsError:
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {"schema_version": SCHEMA_VERSION, "error": "agent_already_paired"},
+                )
+                return
+            except (json.JSONDecodeError, binascii.Error, ValueError, OSError) as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"schema_version": SCHEMA_VERSION, "error": str(exc)},
+                )
+                return
+            self._send_json(
+                HTTPStatus.CREATED if outcome == "paired" else HTTPStatus.OK,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "status": outcome,
+                    "paired": True,
+                    "secret_source": self.agent_server.secret_source,
+                },
+            )
+            return
         if not self._authenticate(body):
             return
-        parsed = urlparse(self.path)
         if parsed.path == "/v1/jobs" and parsed.query == "":
             try:
                 document = json.loads(body.decode("utf-8"))
@@ -824,6 +918,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--pairing-peer", default=DEFAULT_PAIRING_PEER)
     parser.add_argument(
         "--state-root",
         type=Path,
@@ -837,7 +932,13 @@ def main(argv: list[str] | None = None) -> int:
     if not 1 <= args.port <= 65535:
         raise SystemExit("Port muss zwischen 1 und 65535 liegen")
     script_path = Path(__file__).resolve()
-    secret, secret_source = load_secret(script_path)
+    secret, secret_source, key_path = load_secret(script_path)
+    try:
+        pairing_peer = str(ipaddress.ip_address(args.pairing_peer.split("%", 1)[0]))
+    except ValueError as exc:
+        raise SystemExit("--pairing-peer muss eine gültige IP-Adresse sein") from exc
+    if not client_address_allowed(pairing_peer):
+        raise SystemExit("--pairing-peer muss Loopback oder eine Tailscale-IP sein")
     state_root = (
         args.state_root.resolve()
         if args.state_root is not None
@@ -848,9 +949,11 @@ def main(argv: list[str] | None = None) -> int:
     server = AgentHTTPServer(
         (args.host, args.port),
         AgentHandler,
-        authenticator=RequestAuthenticator(secret),
+        authenticator=RequestAuthenticator(secret) if secret is not None else None,
         state=state,
         secret_source=secret_source,
+        key_path=key_path,
+        pairing_peer=pairing_peer,
         started_at=started_at,
     )
 
@@ -867,6 +970,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Bind: {args.host}:{args.port}")
     print(f"State: {state_root}")
     print(f"Schlüsselquelle: {secret_source}")
+    if secret is None:
+        print(f"Kopplung: wartet einmalig auf {pairing_peer}")
+    else:
+        print("Kopplung: aktiv")
     print("Rechte: beliebiges Python mit den Rechten des Juno-Prozesses")
     print("Stop: Juno-Stopptaste, Ctrl-C oder signiertes POST /v1/shutdown")
     try:
