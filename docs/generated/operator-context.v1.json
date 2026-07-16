@@ -2294,7 +2294,7 @@
       "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
-      "src/grabowski_juno_storage.py": "371eea77d58f1c288ebc92867619da29f2400f49c0cdbec9be46e2c578b94849",
+      "src/grabowski_juno_storage.py": "0c715f669450d966e7ecfa6581c1b7a1ea1c45f7feff7befc5243413ec975fe2",
       "src/grabowski_mcp.py": "4242341bd1127b924c205781e52579119ff940725933bc3b04e4367296014aa1",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
