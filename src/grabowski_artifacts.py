@@ -481,7 +481,9 @@ def grabowski_artifact_push(
     expected_destination_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Push one hash-bound local regular file to a registered SSH fleet host."""
-    operator._require_operator_mutation("artifact_transfer")
+    operator._require_operator_mutation(
+        "artifact_transfer", path=destination_path, host=host
+    )
     result = artifact_push(
         host,
         source_path,
@@ -504,7 +506,9 @@ def grabowski_artifact_pull(
     expected_destination_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Pull one hash-bound regular file from a registered SSH fleet host."""
-    operator._require_operator_mutation("artifact_transfer")
+    operator._require_operator_mutation(
+        "artifact_transfer", path=destination_path, host=host
+    )
     result = artifact_pull(
         host,
         source_path,

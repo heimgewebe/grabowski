@@ -401,8 +401,15 @@ class OperatorContractTests(unittest.TestCase):
         parameters = inspect.signature(operator.grabowski_terminal_run).parameters
         self.assertEqual(list(parameters), ["argv", "cwd"])
         self.assertEqual(operator.grabowski_terminal_run.__defaults__, (None,))
-        with patch.object(operator, "_run", return_value={"returncode": 0}) as run:
+        with patch.object(operator, "_require_operator_mutation") as require, patch.object(
+            operator, "_run", return_value={"returncode": 0}
+        ) as run:
             result = operator.grabowski_terminal_run(["printf", "ok"])
+        require.assert_called_once_with(
+            "terminal_execute",
+            path=str(operator.HOME),
+            opaque_command=True,
+        )
         self.assertEqual(run.call_args.kwargs["timeout_seconds"], 30)
         self.assertEqual(run.call_args.kwargs["max_output_bytes"], 64 * 1024)
         contract = result["synchronous_contract"]

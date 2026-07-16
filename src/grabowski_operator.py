@@ -365,6 +365,7 @@ def _require_operator_mutation(
     service: str | None = None,
     host: str | None = None,
     fresh_preflight: bool = False,
+    opaque_command: bool = False,
 ) -> None:
     _require_operator_capability(capability)
     base._require_blockade_allows_mutation(
@@ -376,6 +377,7 @@ def _require_operator_mutation(
         service=service,
         host=host,
         fresh_preflight=fresh_preflight,
+        opaque_command=opaque_command,
     )
     base._require_valid_audit_chain()
 
@@ -2702,7 +2704,11 @@ def grabowski_terminal_run(
 ) -> dict[str, Any]:
     """Run one direct command with fixed server-owned synchronous limits."""
     working_directory = _resolve_cwd(cwd)
-    _require_operator_mutation("terminal_execute", path=str(working_directory))
+    _require_operator_mutation(
+        "terminal_execute",
+        path=str(working_directory),
+        opaque_command=True,
+    )
     command = _validate_argv(argv, cwd=working_directory)
     timeout = SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS
     output_limit = SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES
@@ -2960,7 +2966,11 @@ def grabowski_job_start(
 ) -> dict[str, Any]:
     """Start a durable background command as a transient user systemd unit."""
     working_directory = _resolve_cwd(cwd)
-    _require_operator_mutation("durable_job", path=str(working_directory))
+    _require_operator_mutation(
+        "durable_job",
+        path=str(working_directory),
+        opaque_command=True,
+    )
     return _start_job(
         argv,
         cwd=str(working_directory),

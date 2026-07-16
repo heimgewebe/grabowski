@@ -189,8 +189,13 @@ def grabowski_operation_plan(operation: str,
 def grabowski_operation_run(operation: str,
                              parameters: dict[str, str] | None = None) -> dict[str, Any]:
     """Run preflight, action and postflight, then rollback after a failure."""
-    operator._require_operator_mutation("terminal_execute")
     plan = _render(operation, parameters)
+    for target in sorted({step["target"] for step in plan["steps"]}):
+        operator._require_operator_mutation(
+            "terminal_execute",
+            host=(target if target != "local" else None),
+            opaque_command=True,
+        )
     forward = [step for step in plan["steps"] if step["phase"] != "rollback"]
     rollback = [step for step in plan["steps"] if step["phase"] == "rollback"]
     results = []

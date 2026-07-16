@@ -275,7 +275,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     'grabowski_recovery_server_probe': ('file_write', 'secret_use', 'terminal_execute'),
     'grabowski_operator_blockade_status': ('audit_verify',),
     'grabowski_operator_blockade_engage': ('audit_verify', 'file_write'),
-    'grabowski_operator_blockade_disarm': ('audit_verify',),
+    'grabowski_operator_blockade_disarm': ('audit_verify', 'file_move'),
     'grabowski_friction_record': ('friction_record',),
     'grabowski_friction_resolve': ('friction_record',),
     'grabowski_friction_summary': (),
@@ -1298,10 +1298,30 @@ def _require_blockade_allows_mutation(
     host: str | None = None,
     fresh_preflight: bool = False,
     allow_blockade_lifecycle: bool = False,
+    opaque_command: bool = False,
 ) -> None:
+    if not isinstance(opaque_command, bool):
+        raise ValueError("opaque_command must be boolean")
     if allow_blockade_lifecycle and path != str(KILL_SWITCH_PATH):
         raise PermissionError("blockade lifecycle authority is marker-path bound")
     records, _diagnostics = _operator_blockade_records()
+    if opaque_command:
+        strong_opaque_scopes = sorted(
+            {
+                f"{record.scope.kind}:{record.scope.value}"
+                for record in records
+                if record.active_at()
+                and record.scope.kind in {"path", "repo"}
+                and record.posture
+                in {"preflight_required", "mutation_freeze", "hard_stop"}
+            }
+        )
+        if strong_opaque_scopes:
+            raise PermissionError(
+                "opaque command execution cannot prove isolation from active "
+                "path/repo blockades: "
+                + ",".join(strong_opaque_scopes)
+            )
     decision = blockade_policy.evaluate_blockades(
         records,
         blockade_policy.ActionContext(
@@ -1334,6 +1354,7 @@ def _require_mutations_enabled(
     host: str | None = None,
     fresh_preflight: bool = False,
     allow_blockade_lifecycle: bool = False,
+    opaque_command: bool = False,
 ) -> None:
     _require_capability(capability)
     _require_blockade_allows_mutation(
@@ -1346,6 +1367,7 @@ def _require_mutations_enabled(
         host=host,
         fresh_preflight=fresh_preflight,
         allow_blockade_lifecycle=allow_blockade_lifecycle,
+        opaque_command=opaque_command,
     )
     _require_valid_audit_chain()
 

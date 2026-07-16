@@ -271,6 +271,7 @@ def grabowski_operator_blockade_disarm(
 ) -> dict[str, Any]:
     """Quarantine one exact typed blockade after live recovery evidence passes."""
     base._require_capability("audit_verify")
+    base._require_capability("file_move")
     base._require_valid_audit_chain()
     snapshot = store.read_blockade_marker(
         base.KILL_SWITCH_PATH,

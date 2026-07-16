@@ -54,7 +54,7 @@ def _load_fleet_module(root: Path):
     fake._redact_argv = lambda argv: list(argv)
     fake._timeout = lambda value: value
     fake._output_limit = lambda value: value
-    fake._require_operator_mutation = lambda capability: None
+    fake._require_operator_mutation = Mock()
     fake._require_operator_capability = lambda capability: None
     fake._enforce_synchronous_call_shape = Mock()
     fake._synchronous_public_contract = lambda *, surface: {

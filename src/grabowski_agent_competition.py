@@ -1735,7 +1735,6 @@ def grabowski_agent_competition_start(
     require_hard_budget: bool = False,
 ) -> dict[str, Any]:
     """Start one durable advisory-only external competitor or contrast programmer."""
-    operator._require_operator_mutation("durable_job")
     operator._require_operator_capability("git_cli")
     request_value = workspace._required_string(request_id, "request_id", max_length=80)
     if REQUEST_ID_RE.fullmatch(request_value) is None:
@@ -1755,6 +1754,9 @@ def grabowski_agent_competition_start(
         hard_limit_required=hard_budget_required,
     )
     repo, head = _repository(repository, expected_head)
+    operator._require_operator_mutation(
+        "durable_job", path=str(repo), repo=str(repo)
+    )
     task_value = workspace._required_string(task, "task", max_length=16000)
     if not isinstance(primary_summary, str) or len(primary_summary.encode("utf-8")) > 32000 or "\x00" in primary_summary:
         raise AgentCompetitionError("primary_summary is invalid")

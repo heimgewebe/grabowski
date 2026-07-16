@@ -252,7 +252,10 @@ def grabowski_fleet_run(
     argv: list[str],
 ) -> dict[str, Any]:
     """Run one fleet command with fixed server-owned synchronous limits."""
-    operator._require_operator_mutation("terminal_execute")
+    fleet_host(host)
+    operator._require_operator_mutation(
+        "terminal_execute", host=host, opaque_command=True
+    )
     return run_public_fleet_host(
         host,
         argv,
@@ -275,7 +278,10 @@ def main() -> int:
         else:
             if not args.argv:
                 raise ValueError("run requires an argv after the host")
-            operator._require_operator_mutation("terminal_execute")
+            fleet_host(args.host)
+            operator._require_operator_mutation(
+                "terminal_execute", host=args.host, opaque_command=True
+            )
             result = run_public_fleet_host(
                 args.host,
                 args.argv,

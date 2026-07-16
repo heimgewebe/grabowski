@@ -655,6 +655,7 @@ def evaluate_blockades(
     reasons: list[str] = []
     requires_preflight = False
     disarm_validation: DisarmValidation | None = None
+    target: BlockadeRecord | None = None
 
     if action.action_class in {"read", "status", "audit_read"}:
         allowed = True
@@ -680,8 +681,9 @@ def evaluate_blockades(
         target = next(
             (
                 record
-                for record in matching
+                for record in items
                 if record.blockade_id == evidence.blockade_id
+                and scope_matches(record.scope, action)
             ),
             None,
         )
@@ -719,6 +721,20 @@ def evaluate_blockades(
         reasons.extend(disarm_validation.reasons)
         if allowed:
             reasons.append("evidence_bound_recovery_allowed")
+
+    reported_matching = list(matching)
+    if (
+        action.action_class == "recovery_disarm"
+        and target is not None
+        and target not in reported_matching
+    ):
+        reported_matching.append(target)
+        reported_matching.sort(key=lambda record: record.blockade_id)
+        matched_ids = tuple(record.blockade_id for record in reported_matching)
+        matched_hashes = tuple(record.sha256 for record in reported_matching)
+        evidence_refs = tuple(
+            sorted({ref for record in reported_matching for ref in record.evidence_refs})
+        )
 
     return BlockadeDecision(
         allowed=allowed,

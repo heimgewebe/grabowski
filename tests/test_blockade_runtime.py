@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import stat
@@ -174,6 +175,98 @@ class BlockadeRuntimeTests(unittest.TestCase):
         )
         self.assertFalse(base._kill_switch_state()["engaged"])
         self.assertTrue(base._kill_switch_state()["present"])
+
+    def test_opaque_command_fails_closed_for_active_path_scope(self) -> None:
+        blocked_root = self.root / "repo"
+        blocked_root.mkdir()
+        self.engage(
+            posture="mutation_freeze",
+            scope_kind="path",
+            scope_value=str(blocked_root),
+            trigger_class="manual_path_freeze",
+        )
+
+        with self.assertRaisesRegex(
+            PermissionError, "opaque command execution cannot prove isolation"
+        ):
+            base._require_blockade_allows_mutation(
+                "terminal_execute",
+                path=str(self.root / "outside"),
+                opaque_command=True,
+            )
+
+        base._require_blockade_allows_mutation(
+            "file_write", path=str(self.root / "outside.txt")
+        )
+
+    def test_disarm_requires_file_move_authority(self) -> None:
+        self.engage()
+        snapshot = self.snapshot()
+
+        def require(capability: str) -> None:
+            if capability == "file_move":
+                raise PermissionError("Access capability is not enabled: file_move")
+
+        with mock.patch.object(base, "_require_capability", side_effect=require):
+            with self.assertRaisesRegex(PermissionError, "file_move"):
+                self.disarm(snapshot)
+
+        self.assertTrue(self.marker.is_file())
+        self.assertEqual(len(base._audit_records()), 1)
+
+    def test_expired_typed_marker_can_be_collected_by_exact_disarm(self) -> None:
+        now = datetime.now(timezone.utc)
+        record = runtime.policy.BlockadeRecord(
+            blockade_id="expired-observe-1",
+            posture="observe",
+            scope=runtime.policy.Scope("path", str(self.root / "repo")),
+            reason="Expired observation marker.",
+            trigger_class="manual_observation",
+            engaged_at=now - timedelta(hours=2),
+            expires_at=now - timedelta(hours=1),
+            evidence_refs=("test:expired-marker",),
+            provenance=runtime.policy.Provenance(
+                tool="grabowski_operator_blockade_engage",
+                request_id="request-expired",
+                session_id="session-expired",
+                task_id="TASK-EXPIRED",
+                owner_id="owner-expired",
+            ),
+        )
+        receipt = store.engage_blockade_marker(
+            record,
+            self.marker,
+            expected_marker_path=self.marker,
+        )
+        runtime._append_verified_audit(
+            {
+                "timestamp": now.isoformat(),
+                "operation": "operator-blockade-engage",
+                "transaction_id": receipt.transaction_id,
+                "path": str(self.marker),
+                "before_sha256": None,
+                "after_sha256": receipt.marker_file_sha256,
+                "blockade_id": record.blockade_id,
+                "blockade_record_sha256": record.sha256,
+                "posture": record.posture,
+                "scope": record.scope.to_mapping(),
+                "evidence_refs": list(record.evidence_refs),
+                "provenance": record.provenance.to_mapping(),
+            }
+        )
+        snapshot = self.snapshot()
+        self.assertFalse(snapshot.record.active_at())
+
+        result = self.disarm(snapshot)
+
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(
+            result["decision"]["matched_blockade_ids"],
+            ["expired-observe-1"],
+        )
+        self.assertIn(
+            "evidence_bound_recovery_allowed", result["decision"]["reasons"]
+        )
 
     def test_disarm_is_hash_bound_and_audit_verified(self) -> None:
         self.engage()
