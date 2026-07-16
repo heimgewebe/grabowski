@@ -10,6 +10,8 @@ venv/
 .env
 .env.*
 access.json
+juno_ipad_agent.key
+grabowski_workspace/
 
 *.log
 logs/

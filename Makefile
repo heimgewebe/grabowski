@@ -15,7 +15,7 @@ validate: syntax test policy tool-surface-budget context-check profiles-check ru
 
 syntax:
 >$(PYTHON) -m py_compile tools/operator_patch_relay.py
->$(PYTHON) -m py_compile $(wildcard src/*.py) $(wildcard tools/*.py)
+>$(PYTHON) -m py_compile $(wildcard src/*.py) $(wildcard tools/*.py) $(wildcard tools/juno/*.py)
 
 test:
 >set -eu; install -d -m 700 "$(CURDIR)/build"; test_home="$$(mktemp -d "$(CURDIR)/build/test-home.XXXXXX")"; trap 'rm -rf "$$test_home"' EXIT; install -d -m 700 "$$test_home/.config/grabowski"; install -m 600 config/access.home-wide-operator.example.json "$$test_home/.config/grabowski/access.json"; HOME="$$test_home" $(PYTHON) -m unittest discover -s tests -v
