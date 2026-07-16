@@ -1075,10 +1075,39 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(recommendations["blocked_gates"]["unresolved"], 2)
         self.assertEqual(recommendations["blocked_gates"]["evidence_threshold"], 2)
         self.assertTrue(recommendations["blocked_gates"]["inherits_does_not_establish"])
+        repair = recommendations["blocked_gates"]["repair_contract"]
+        self.assertEqual(repair["schema_version"], 1)
+        self.assertEqual(repair["authority"], "evidence_preparation_only")
+        self.assertEqual(repair["preferred_route"], "explicit_preflight")
+        self.assertIn("live leases, dirty state and running work", repair["required_evidence"])
+        self.assertIn("no unchanged retry", repair["retry_policy"])
+        self.assertEqual(
+            repair["post_state_readback"],
+            "mandatory and bound to the same target identity",
+        )
+        self.assertIn("policy_bypass", repair["does_not_establish"])
         self.assertEqual(
             recommendations["blocked_gates"]["evidence_event_ids"],
             ["gate-1", "gate-2"],
         )
+        minimal = module.friction_summary(view="minimal", limit=10)
+        compact = {
+            item["pattern"]: item
+            for item in minimal["next_grip_proposals"]["recommendations"]
+        }
+        self.assertEqual(
+            compact["blocked_gates"]["repair_contract"]["preferred_route"],
+            "explicit_preflight",
+        )
+        repair["required_evidence"].append("caller mutation")
+        repair["preparation_steps"].clear()
+        repeated = module.friction_summary(view="evidence", limit=10)["next_grip_proposals"]
+        repeated_repair = {
+            item["pattern"]: item
+            for item in repeated["recommendations"]
+        }["blocked_gates"]["repair_contract"]
+        self.assertNotIn("caller mutation", repeated_repair["required_evidence"])
+        self.assertTrue(repeated_repair["preparation_steps"])
         self.assertEqual(
             recommendations["missing_receipt_fields"]["recommendation_type"],
             "small_bureau_task",
