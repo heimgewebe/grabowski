@@ -146,6 +146,92 @@ class TaskTests(unittest.TestCase):
         listed = tasks.grabowski_task_list()
         self.assertEqual(listed["count"], 1)
         self.assertEqual(listed["tasks"][0]["task_id"], task["task_id"])
+        self.assertEqual(listed["state_filter_kind"], "all")
+        self.assertEqual(listed["projection_counts"]["active"], 1)
+
+    def test_task_list_supports_compact_state_projections(self) -> None:
+        task = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET state='failed' WHERE task_id=?",
+                (task["task_id"],),
+            )
+            connection.commit()
+
+        attention = tasks.grabowski_task_list(state="attention")
+
+        self.assertEqual(attention["state_filter_kind"], "projection")
+        self.assertEqual(
+            attention["state_filter_states"],
+            ["interrupted", "outcome_unknown", "failed", "timed_out", "signalled"],
+        )
+        self.assertEqual(attention["total_matching"], 1)
+        self.assertEqual(attention["tasks"][0]["state"], "failed")
+        self.assertEqual(attention["state_counts"]["failed"], 1)
+        self.assertEqual(attention["state_counts_scope"], "all_tasks")
+        self.assertEqual(attention["projection_counts"]["attention"], 1)
+        self.assertEqual(attention["projection_counts_scope"], "all_tasks")
+        self.assertEqual(attention["projection_counts"]["terminal"], 1)
+        self.assertEqual(attention["projection_counts"]["active"], 0)
+        self.assertTrue(attention["projection_counts_overlap"])
+        self.assertTrue(attention["state_counts_complete"])
+        self.assertEqual(attention["unknown_state_count"], 0)
+        self.assertEqual(tasks.grabowski_task_list(state="active")["count"], 0)
+        self.assertEqual(
+            tasks.grabowski_task_list(state="failed")["state_filter_kind"],
+            "exact",
+        )
+        with self.assertRaisesRegex(ValueError, "state must be one of"):
+            tasks.grabowski_task_list(state="stale")
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET state='legacy_unknown' WHERE task_id=?",
+                (task["task_id"],),
+            )
+            connection.commit()
+        unknown = tasks.grabowski_task_list()
+        self.assertFalse(unknown["state_counts_complete"])
+        self.assertEqual(unknown["unknown_state_count"], 1)
+        self.assertEqual(unknown["warnings"][0]["code"], "unknown_task_states")
+        self.assertEqual(
+            unknown["recommended_next_action"],
+            "inspect unknown task states before relying on projections",
+        )
+
+    def test_task_list_reads_rows_and_counts_from_one_snapshot(self) -> None:
+        task = self._start()["task"]
+        original_state_counts = tasks._task_state_counts
+
+        def mutate_then_count(
+            connection: sqlite3.Connection,
+        ) -> tuple[dict[str, int], dict[str, int], int]:
+            with sqlite3.connect(self.database) as writer:
+                writer.execute(
+                    "UPDATE tasks SET state='failed' WHERE task_id=?",
+                    (task["task_id"],),
+                )
+                writer.commit()
+            return original_state_counts(connection)
+
+        with patch.object(
+            tasks,
+            "_task_state_counts",
+            side_effect=mutate_then_count,
+        ):
+            listed = tasks.grabowski_task_list(state="running")
+
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(listed["total_matching"], 1)
+        self.assertEqual(listed["tasks"][0]["state"], "running")
+        self.assertEqual(listed["state_counts"]["running"], 1)
+        self.assertEqual(listed["state_counts"]["failed"], 0)
+        with sqlite3.connect(self.database) as connection:
+            stored_state = connection.execute(
+                "SELECT state FROM tasks WHERE task_id=?",
+                (task["task_id"],),
+            ).fetchone()[0]
+        self.assertEqual(stored_state, "failed")
 
     def test_start_uses_shared_unicode_argv_identity(self) -> None:
         argv = ["/bin/echo", "Grüße"]
@@ -924,11 +1010,13 @@ class TaskTests(unittest.TestCase):
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()[0]
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(tasks)")}
+            indexes = {row[1] for row in migrated.execute("PRAGMA index_list(tasks)")}
         self.assertEqual(version, "2")
         self.assertIn("resource_keys_json", columns)
         self.assertIn("lease_owner_id", columns)
         self.assertIn("chronik_outbox_enabled", columns)
         self.assertIn("chronik_outbox_state_root", columns)
+        self.assertIn("tasks_state_created_task_idx", indexes)
 
     def test_database_rejects_symlink(self) -> None:
         target = self.root / "real.sqlite3"

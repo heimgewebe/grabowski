@@ -60,6 +60,11 @@ TASK_STATES = {
     "outcome_unknown",
     "interrupted",
 }
+TASK_STATE_PROJECTIONS: dict[str, tuple[str, ...]] = {
+    "active": ("launching", "running", "interrupted"),
+    "attention": ("interrupted", "outcome_unknown", "failed", "timed_out", "signalled"),
+    "terminal": ("completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"),
+}
 MUTATING_AGENT_EXECUTABLES = frozenset({"agy", "claude", "cline", "codex"})
 READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
 
@@ -205,6 +210,10 @@ def _database() -> sqlite3.Connection:
             chronik_context_json TEXT
         )
         """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS tasks_state_created_task_idx "
+        "ON tasks(state, created_at_unix DESC, task_id DESC)"
     )
     current = connection.execute(
         "SELECT value FROM metadata WHERE key='schema_version'"
@@ -579,6 +588,40 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
         "chronik_outbox_state_root": record.get("chronik_outbox_state_root"),
         "chronik_context": json.loads(record["chronik_context_json"]) if record.get("chronik_context_json") else None,
     }
+
+
+def _task_filter_states(state: str | None) -> tuple[str, ...] | None:
+    if state is None:
+        return None
+    if state in TASK_STATES:
+        return (state,)
+    projection = TASK_STATE_PROJECTIONS.get(state)
+    if projection is None:
+        allowed = sorted(TASK_STATES | set(TASK_STATE_PROJECTIONS))
+        raise ValueError(f"state must be one of {allowed}")
+    return projection
+
+
+def _task_state_counts(
+    connection: sqlite3.Connection,
+) -> tuple[dict[str, int], dict[str, int], int]:
+    rows = connection.execute(
+        "SELECT state, COUNT(*) AS count FROM tasks GROUP BY state"
+    ).fetchall()
+    exact = {state: 0 for state in sorted(TASK_STATES)}
+    unknown_state_count = 0
+    for row in rows:
+        state = str(row["state"])
+        count = int(row["count"])
+        if state in exact:
+            exact[state] = count
+        else:
+            unknown_state_count += count
+    projections = {
+        name: sum(exact[state] for state in states)
+        for name, states in sorted(TASK_STATE_PROJECTIONS.items())
+    }
+    return exact, projections, unknown_state_count
 
 
 def _task_recommended_next_action(state: str) -> str:
@@ -1342,8 +1385,7 @@ def grabowski_task_list(
     selected_view = consumer_surface.normalize_view(view)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
-    if state is not None and state not in TASK_STATES:
-        raise ValueError(f"state must be one of {sorted(TASK_STATES)}")
+    filter_states = _task_filter_states(state)
     scope = f"task-list:{selected_view}:{state or 'all'}"
     position = consumer_surface.decode_cursor(cursor, scope)
     cursor_created_at: int | None = None
@@ -1361,27 +1403,32 @@ def grabowski_task_list(
             raise ValueError("cursor position is invalid")
     where: list[str] = []
     parameters: list[Any] = []
-    if state is not None:
-        where.append("state=?")
-        parameters.append(state)
+    if filter_states is not None:
+        placeholders = ",".join("?" for _ in filter_states)
+        where.append(f"state IN ({placeholders})")
+        parameters.extend(filter_states)
     if cursor_created_at is not None and cursor_task_id is not None:
         where.append("(created_at_unix < ? OR (created_at_unix = ? AND task_id < ?))")
         parameters.extend([cursor_created_at, cursor_created_at, cursor_task_id])
     where_sql = f" WHERE {' AND '.join(where)}" if where else ""
     with _database() as connection:
+        connection.execute("BEGIN")
         rows = connection.execute(
             f"SELECT * FROM tasks{where_sql} "
             "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
             (*parameters, limit + 1),
         ).fetchall()
-        if state is None:
+        if filter_states is None:
             total_matching = int(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
         else:
+            placeholders = ",".join("?" for _ in filter_states)
             total_matching = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE state=?", (state,)
+                    f"SELECT COUNT(*) FROM tasks WHERE state IN ({placeholders})",
+                    filter_states,
                 ).fetchone()[0]
             )
+        state_counts, projection_counts, unknown_state_count = _task_state_counts(connection)
     has_more = len(rows) > limit
     page_rows = rows[:limit]
     tasks = [_public_for_view(dict(row), selected_view) for row in page_rows]
@@ -1395,8 +1442,20 @@ def grabowski_task_list(
                 "task_id": str(last["task_id"]),
             },
         )
-    warning_states = {"failed", "timed_out", "signalled", "outcome_unknown"}
-    warnings = [
+    warning_states = {
+        "interrupted",
+        "failed",
+        "timed_out",
+        "signalled",
+        "outcome_unknown",
+    }
+    warnings: list[dict[str, Any]] = []
+    if unknown_state_count:
+        warnings.append({
+            "code": "unknown_task_states",
+            "count": unknown_state_count,
+        })
+    warnings.extend(
         {
             "code": "task_requires_attention",
             "task_id": task["task_id"],
@@ -1404,13 +1463,24 @@ def grabowski_task_list(
         }
         for task in tasks
         if task.get("state") in warning_states
-    ]
+    )
     payload: dict[str, Any] = {
         "schema_version": 2,
         "view": selected_view,
         "count": len(tasks),
         "total_matching": total_matching,
         "state_filter": state,
+        "state_filter_kind": (
+            "all" if state is None else "projection" if state in TASK_STATE_PROJECTIONS else "exact"
+        ),
+        "state_filter_states": list(filter_states or ()),
+        "state_counts": state_counts,
+        "state_counts_scope": "all_tasks",
+        "state_counts_complete": unknown_state_count == 0,
+        "unknown_state_count": unknown_state_count,
+        "projection_counts": projection_counts,
+        "projection_counts_scope": "all_tasks",
+        "projection_counts_overlap": True,
         "tasks": tasks,
         "pagination": {
             "limit": limit,
@@ -1421,7 +1491,9 @@ def grabowski_task_list(
         },
         "warnings": warnings,
         "recommended_next_action": (
-            "inspect attention tasks before retry" if warnings else "none"
+            "inspect unknown task states before relying on projections"
+            if unknown_state_count
+            else "inspect attention tasks before retry" if warnings else "none"
         ),
         "does_not_establish": [
             "task_output_correctness",
