@@ -5149,6 +5149,34 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 self.assertTrue(any(expected in item for item in execution["merge_lease_guard"]["errors"]))
                 self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
+    def test_atomic_merge_guard_rejects_empty_live_diff(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        parameters["diff_sha256"] = hashlib.sha256(b"").hexdigest()
+        gh = FakeGh(diff_text="")
+        gh.view.update({
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": "e" * 40,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        })
+        runner = merge_guard.CaptainMergeGuardRunner(
+            repo_path=Path.cwd(),
+            action=parameters["actions"][0],
+            parameters=parameters,
+            github_runner=gh,
+            execution_intent_sha256="f" * 64,
+            lease_owner_id="captain-test-owner",
+        )
+        bindings, errors = runner._live_bindings()
+        self.assertIsNotNone(bindings)
+        self.assertIn("merge_guard_live_diff_empty", errors)
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
     def test_atomic_merge_guard_blocks_legacy_repo_lease_and_same_owner_concurrent_gate(self) -> None:
         for mode in ("legacy-repo", "same-owner-gate"):
             with self.subTest(mode=mode):
@@ -5321,6 +5349,22 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 for key in first
             )
         )
+
+        canonical_case = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=96,
+            base="main",
+            head="feat/captain",
+        )
+        display_case = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="Heimgewebe/Grabowski",
+            pr_number=96,
+            base="main",
+            head="feat/captain",
+        )
+        self.assertEqual(canonical_case, display_case)
 
     def test_atomic_merge_guard_allows_exact_nonoverlap(self) -> None:
         local_repo = merge_guard.merge_guard_repository_root(Path.cwd())

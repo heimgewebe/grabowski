@@ -79,7 +79,7 @@ def merge_guard_resource_keys(
     base: str,
     head: str,
 ) -> list[str]:
-    repository_id = _merge_guard_identifier("repository", repo_slug)
+    repository_id = _merge_guard_identifier("repository", repo_slug.lower())
     base_branch_id = _merge_guard_identifier("branch", base)
     head_branch_id = _merge_guard_identifier("branch", head)
     return sorted(
@@ -285,6 +285,8 @@ class CaptainMergeGuardRunner:
         }
         if diff_info["returncode"] != 0:
             errors.append("merge_guard_live_diff_failed")
+        elif not live_diff_bytes:
+            errors.append("merge_guard_live_diff_empty")
         elif live_diff_sha256 != expected_diff:
             errors.append("merge_guard_diff_drift")
         bindings = {
