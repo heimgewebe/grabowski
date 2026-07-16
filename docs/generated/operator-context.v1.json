@@ -1902,6 +1902,10 @@
         "source": "src/grabowski_grips.py"
       },
       {
+        "module": "grabowski_convergence",
+        "source": "src/grabowski_convergence.py"
+      },
+      {
         "module": "grabowski_operator_obligation",
         "source": "src/grabowski_operator_obligation.py"
       },
@@ -2071,7 +2075,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "51062bb6992c6a849781b39b08d9fa1924b90c996b9a77b661b36fa6c521d6b4"
+      "sha256": "6f2d8065c782f9676aa71d5a68f189bb05f9a226cfc62b5b9ea6409f72cb99bb"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2091,6 +2095,7 @@
       "src/grabowski_chronik.py": "6a37342b5741763db16f2792dc5370fd9fe6e7e1dc7965b7f6a8c54f8c55ec62",
       "src/grabowski_command_identity.py": "03bf7193851846d1f5b4d1bfe71a787937e424804f875ba4e021233ddbc842c9",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
+      "src/grabowski_convergence.py": "03ea75eb190ac08f29c4ec6c5ab1a14a631ce7c0cce4956ed6f437c492a6a635",
       "src/grabowski_fleet.py": "0daf060517bde7b17caf7dd1f684e29521fb7b7457d1bfd79b32cf28a15c3beb",
       "src/grabowski_friction.py": "3391e7f42cb7c7ea65969eadd97938ff2325d65e7cc6ac6d484db2c89e69d8ce",
       "src/grabowski_grip_orchestration.py": "be3def7d9e24c316ef73bf247e78d1d1ff50a5d6e9d6f609f7f1221329c3159d",

@@ -155,6 +155,10 @@
       "source": "src/grabowski_grips.py"
     },
     {
+      "module": "grabowski_convergence",
+      "source": "src/grabowski_convergence.py"
+    },
+    {
       "module": "grabowski_operator_obligation",
       "source": "src/grabowski_operator_obligation.py"
     },
