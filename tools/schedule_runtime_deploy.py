@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -57,12 +58,26 @@ def schedule(
     if not isinstance(result, dict):
         raise RuntimeError("runtime deploy scheduler returned a non-object receipt")
     identity = result.get("source_identity")
+    identity_sha256 = result.get("source_identity_sha256")
+    if not isinstance(identity, dict):
+        raise RuntimeError("runtime deploy scheduler returned an unbound receipt")
+    identity_material = {
+        key: value for key, value in identity.items() if key != "identity_sha256"
+    }
+    computed_identity_sha256 = hashlib.sha256(
+        json.dumps(
+            identity_material,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
     if (
         result.get("scheduled") is not True
         or result.get("expected_head") != expected_head
-        or not isinstance(identity, dict)
         or identity.get("head") != expected_head
-        or identity.get("identity_sha256") != result.get("source_identity_sha256")
+        or identity.get("identity_sha256") != identity_sha256
+        or computed_identity_sha256 != identity_sha256
     ):
         raise RuntimeError("runtime deploy scheduler returned an unbound receipt")
     if source_repository is not None and identity.get("repository") != source_repository:

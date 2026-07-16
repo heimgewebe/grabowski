@@ -1169,6 +1169,22 @@ class RuntimeDeploySchedulerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unbound receipt"):
                 SCHEDULER.schedule(head, 8)
 
+    def test_schedule_rejects_tampered_source_identity(self) -> None:
+        head = "a" * 40
+        repo = Path("/home/alex/repos/grabowski")
+        identity = _source_identity(repo, head)
+        identity["repository"] = "/tmp/tampered"
+        receipt = {
+            "scheduled": True,
+            "expected_head": head,
+            "source_identity": identity,
+            "source_identity_sha256": identity["identity_sha256"],
+        }
+        shared = Mock(return_value=receipt)
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            with self.assertRaisesRegex(RuntimeError, "unbound receipt"):
+                SCHEDULER.schedule(head, 8)
+
     def test_schedule_bounds_head_and_delay_seconds(self) -> None:
         with self.assertRaises(ValueError):
             SCHEDULER.schedule("not-a-head", 8)
