@@ -1488,6 +1488,235 @@
         ],
         "reversibility": "job-dependent-with-local-stop-switch"
       }
+    },
+    "ipad_capability_manifest": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_capability_manifest owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_capability_manifest",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "ipad_storage_inventory": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_storage_inventory owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_storage_inventory",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "ipad_storage_grant_status": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_storage_grant_status owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_storage_grant_status",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "ipad_permission_probe": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_permission_probe owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_permission_probe",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "ipad_file_stat": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_file_stat owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_file_stat",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "ipad_directory_list": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_directory_list owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_directory_list",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "ipad_file_read": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_file_read owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_file_read",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "device-file-content-return",
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "ipad_file_create": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_file_create owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_file_create",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "device-file-create",
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "manual-exact-file-removal-not-exposed"
+      }
+    },
+    "ipad_file_replace": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_file_replace owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_file_replace",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "device-file-replace",
+          "device-job-execute",
+          "receipt-create",
+          "temporary-file-create"
+        ],
+        "reversibility": "preimage-dependent-not-automatically-retained"
+      }
     }
   },
   "retired_tools": {},

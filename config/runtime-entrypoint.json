@@ -69,6 +69,15 @@
     "grabowski_juno_status",
     "grabowski_juno_pair",
     "grabowski_juno_run",
+    "ipad_capability_manifest",
+    "ipad_storage_inventory",
+    "ipad_storage_grant_status",
+    "ipad_permission_probe",
+    "ipad_file_stat",
+    "ipad_directory_list",
+    "ipad_file_read",
+    "ipad_file_create",
+    "ipad_file_replace",
     "grabowski_operation_list",
     "grabowski_operation_plan",
     "grabowski_operation_run",
@@ -316,6 +325,10 @@
     {
       "module": "grabowski_juno",
       "source": "src/grabowski_juno.py"
+    },
+    {
+      "module": "grabowski_juno_storage",
+      "source": "src/grabowski_juno_storage.py"
     }
   ]
 }

@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "f450350a5eccaa674f0872715e01fa44648b32ccbc647aa3e2cfb3e6a41787cb"
+    "sha256": "66d76cac7479d37b932666dbc5b4bc82a9afaaefddb7648d802d2ec62d41058b"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "94563b9bcc6a8bc81c6a9f51646f53d6343433b41f41fe1d7a3d7d329f841626"
+    "sha256": "749389b368518bc70cc9ad9cc114b4fd8a81fc1ff352627f547c71505d6cc366"
   },
   "counts": {
     "core": 21,
-    "full": 131,
-    "operator": 116
+    "full": 140,
+    "operator": 125
   },
   "profiles": {
     "core": [
@@ -106,6 +106,15 @@
       "grabowski_juno_status",
       "grabowski_juno_pair",
       "grabowski_juno_run",
+      "ipad_capability_manifest",
+      "ipad_storage_inventory",
+      "ipad_storage_grant_status",
+      "ipad_permission_probe",
+      "ipad_file_stat",
+      "ipad_directory_list",
+      "ipad_file_read",
+      "ipad_file_create",
+      "ipad_file_replace",
       "grabowski_operation_list",
       "grabowski_operation_plan",
       "grabowski_operation_run",
@@ -226,6 +235,15 @@
       "grabowski_juno_status",
       "grabowski_juno_pair",
       "grabowski_juno_run",
+      "ipad_capability_manifest",
+      "ipad_storage_inventory",
+      "ipad_storage_grant_status",
+      "ipad_permission_probe",
+      "ipad_file_stat",
+      "ipad_directory_list",
+      "ipad_file_read",
+      "ipad_file_create",
+      "ipad_file_replace",
       "grabowski_operation_list",
       "grabowski_operation_plan",
       "grabowski_operation_run",

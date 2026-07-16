@@ -849,6 +849,136 @@
       "tool": "grabowski_juno_run"
     },
     {
+      "category": "device-storage",
+      "description": "Read a bounded manifest of Juno sandbox paths and locally granted folders.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_capability_manifest",
+      "purpose": "Return the bounded iPad/Juno storage capability manifest without exposing bookmark bytes.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_capability_manifest"
+    },
+    {
+      "category": "device-storage",
+      "description": "Resolve all private grant records and return current bounded storage access.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_storage_inventory",
+      "purpose": "Inventory current Juno sandbox paths and user-granted document-provider scopes.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_storage_inventory"
+    },
+    {
+      "category": "device-storage",
+      "description": "Read one or all private grant records without exposing bookmark bytes.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_storage_grant_status",
+      "purpose": "Observe exact grant identity, provider hint, path evidence and recorded limitations.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_storage_grant_status"
+    },
+    {
+      "category": "device-storage",
+      "description": "Resolve one exact grant and check current read/write access without writing.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_permission_probe",
+      "purpose": "Verify that one exact grant, evidence hash, provider and agent instance still resolve.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_permission_probe"
+    },
+    {
+      "category": "device-storage",
+      "description": "Read metadata for one exact path under one locally granted folder.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_file_stat",
+      "purpose": "Stat one exact granted iPad path without reading file contents.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_file_stat"
+    },
+    {
+      "category": "device-storage",
+      "description": "List bounded immediate metadata under one exact granted directory.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_directory_list",
+      "purpose": "List one granted directory without recursive traversal or content transfer.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_directory_list"
+    },
+    {
+      "category": "device-storage",
+      "description": "Read one bounded regular file from one exact locally granted path.",
+      "effects": [
+        "device-job-execute",
+        "device-file-content-return",
+        "receipt-create"
+      ],
+      "id": "ipad_file_read",
+      "purpose": "Read one exact granted iPad file with size and SHA-256 evidence.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "high",
+      "tool": "ipad_file_read"
+    },
+    {
+      "category": "device-storage",
+      "description": "Create one absent regular file and verify its exact payload hash.",
+      "effects": [
+        "device-job-execute",
+        "device-file-create",
+        "receipt-create"
+      ],
+      "id": "ipad_file_create",
+      "purpose": "Create one create-only file bound to agent instance, grant evidence, provider, path and payload hash.",
+      "read_only": false,
+      "reversibility": "manual-exact-file-removal-not-exposed",
+      "risk_class": "high",
+      "tool": "ipad_file_create"
+    },
+    {
+      "category": "device-storage",
+      "description": "Replace one regular file only when its exact preimage hash matches.",
+      "effects": [
+        "device-job-execute",
+        "device-file-replace",
+        "temporary-file-create",
+        "receipt-create"
+      ],
+      "id": "ipad_file_replace",
+      "purpose": "Perform one hash-bound same-directory replace with immediate preimage recheck and post-readback inside one exact locally granted scope.",
+      "read_only": false,
+      "reversibility": "preimage-dependent-not-automatically-retained",
+      "risk_class": "high",
+      "tool": "ipad_file_replace"
+    },
+    {
       "category": "operation",
       "description": "List validated named operations.",
       "effects": [],
@@ -1859,6 +1989,15 @@
       "grabowski_juno_status",
       "grabowski_juno_pair",
       "grabowski_juno_run",
+      "ipad_capability_manifest",
+      "ipad_storage_inventory",
+      "ipad_storage_grant_status",
+      "ipad_permission_probe",
+      "ipad_file_stat",
+      "ipad_directory_list",
+      "ipad_file_read",
+      "ipad_file_create",
+      "ipad_file_replace",
       "grabowski_operation_list",
       "grabowski_operation_plan",
       "grabowski_operation_run",
@@ -2104,6 +2243,10 @@
       {
         "module": "grabowski_juno",
         "source": "src/grabowski_juno.py"
+      },
+      {
+        "module": "grabowski_juno_storage",
+        "source": "src/grabowski_juno_storage.py"
       }
     ]
   },
@@ -2115,7 +2258,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "2af841f219be0bd69d2b86312e88e1e011ba33ac8912a7636629d0385e1bb899"
+      "sha256": "97aa1f67e5d937e35796c2d7db9e99bb074fa9dd8e51b0fc9104e605ea5dca62"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2123,7 +2266,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "f450350a5eccaa674f0872715e01fa44648b32ccbc647aa3e2cfb3e6a41787cb"
+      "sha256": "66d76cac7479d37b932666dbc5b4bc82a9afaaefddb7648d802d2ec62d41058b"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2138,7 +2281,7 @@
       "src/grabowski_blockade_store.py": "a726bc14df0889086db29fd6be94ea5e028e5bcde3d4f08cf199ece1bbae2dfe",
       "src/grabowski_blockades.py": "8eaecba9ddfc9e5007183ccfc30301560860fd243e8782283d5a4722bca72120",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "2af841f219be0bd69d2b86312e88e1e011ba33ac8912a7636629d0385e1bb899",
+      "src/grabowski_capabilities.py": "97aa1f67e5d937e35796c2d7db9e99bb074fa9dd8e51b0fc9104e605ea5dca62",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "6a37342b5741763db16f2792dc5370fd9fe6e7e1dc7965b7f6a8c54f8c55ec62",
       "src/grabowski_command_identity.py": "03bf7193851846d1f5b4d1bfe71a787937e424804f875ba4e021233ddbc842c9",
@@ -2151,7 +2294,8 @@
       "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
-      "src/grabowski_mcp.py": "1f81ffc7ef46a3f40070b0c1d9e6993700120026d0912c256f2df77c5eb0d746",
+      "src/grabowski_juno_storage.py": "371eea77d58f1c288ebc92867619da29f2400f49c0cdbec9be46e2c578b94849",
+      "src/grabowski_mcp.py": "4242341bd1127b924c205781e52579119ff940725933bc3b04e4367296014aa1",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
       "src/grabowski_operator.py": "674c070df71d3538e6dd8edc6e373a57563650015a6d8bedae91133e4b486666",
@@ -2164,7 +2308,7 @@
       "src/grabowski_recovery.py": "1c5b0843345f5aa7d1da7f3f0c5831e647f652c83eba7733b4a2c998d291c16d",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
       "src/grabowski_resources.py": "d6e464295cd263c2cfe0b3ad1c96af6deecc961d0bd58e9f7e76825aa2a6b7e0",
-      "src/grabowski_runtime.py": "ae0ebbba0f80fce3f8a51659d872915d3a6eba834168e8bcd67b890b4a3e836c",
+      "src/grabowski_runtime.py": "aeda349023314b1ce8690ab034c161d659be146b1c80569e409b2ad57680f98e",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "1c4a9517564c2b17c39a87a076e397f0bcb2f428467be782b1b48007b063a49a",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
