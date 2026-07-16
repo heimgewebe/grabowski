@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "b5a98d5aa4ca95a3ead1912f96705823e5421099b515b7fd5f1d9a7191bc1922"
+    "sha256": "51062bb6992c6a849781b39b08d9fa1924b90c996b9a77b661b36fa6c521d6b4"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "fcaacf547454f2b99dc41253056c03a36308da51b0a2cf690754ba87d86112cf"
+    "sha256": "3fdd0107944cc72379b3c7288afc8c879d524198da3028a52e506b3563db9125"
   },
   "counts": {
     "core": 21,
-    "full": 125,
-    "operator": 110
+    "full": 128,
+    "operator": 113
   },
   "profiles": {
     "core": [
@@ -118,6 +118,9 @@
       "grabowski_task_reconcile_resume",
       "grabowski_recovery_status",
       "grabowski_recovery_server_probe",
+      "grabowski_operator_blockade_status",
+      "grabowski_operator_blockade_engage",
+      "grabowski_operator_blockade_disarm",
       "grabowski_friction_record",
       "grabowski_friction_resolve",
       "grabowski_friction_summary",
@@ -230,6 +233,9 @@
       "grabowski_task_reconcile_refresh",
       "grabowski_task_reconcile_resume",
       "grabowski_recovery_server_probe",
+      "grabowski_operator_blockade_status",
+      "grabowski_operator_blockade_engage",
+      "grabowski_operator_blockade_disarm",
       "grabowski_friction_record",
       "grabowski_friction_resolve",
       "grabowski_friction_summary",

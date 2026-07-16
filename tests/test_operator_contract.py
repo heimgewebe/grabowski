@@ -72,6 +72,10 @@ def _load_operator_module():
     fake_base._load_policy = load_policy
     fake_base._active_profile = active_profile
     fake_base._kill_switch_state = lambda: {"engaged": False}
+    fake_base.KILL_SWITCH_PATH = Path(
+        "/home/alex/.local/state/grabowski/operator-kill-switch"
+    )
+    fake_base._require_blockade_allows_mutation = lambda capability, **kwargs: None
     fake_base._require_valid_audit_chain = lambda: None
     fake_base._reject_forbidden_hosts_in_argv = lambda argv, *, policy=None: None
 
@@ -397,8 +401,15 @@ class OperatorContractTests(unittest.TestCase):
         parameters = inspect.signature(operator.grabowski_terminal_run).parameters
         self.assertEqual(list(parameters), ["argv", "cwd"])
         self.assertEqual(operator.grabowski_terminal_run.__defaults__, (None,))
-        with patch.object(operator, "_run", return_value={"returncode": 0}) as run:
+        with patch.object(operator, "_require_operator_mutation") as require, patch.object(
+            operator, "_run", return_value={"returncode": 0}
+        ) as run:
             result = operator.grabowski_terminal_run(["printf", "ok"])
+        require.assert_called_once_with(
+            "terminal_execute",
+            path=str(operator.HOME),
+            opaque_command=True,
+        )
         self.assertEqual(run.call_args.kwargs["timeout_seconds"], 30)
         self.assertEqual(run.call_args.kwargs["max_output_bytes"], 64 * 1024)
         contract = result["synchronous_contract"]
@@ -1037,7 +1048,7 @@ class OperatorContractTests(unittest.TestCase):
         source = SOURCE.read_text(encoding="utf-8")
         self.assertIn("OPERATOR_CAPABILITIES", source)
         self.assertIn("def _require_operator_mutation", source)
-        self.assertIn("base._kill_switch_state()", source)
+        self.assertIn("base._require_blockade_allows_mutation(", source)
         self.assertIn("base._require_valid_audit_chain()", source)
 
     def test_operator_mutations_require_valid_audit_chain(self) -> None:
@@ -1168,6 +1179,44 @@ class OperatorContractTests(unittest.TestCase):
         delattr(operator.base, "_reject_forbidden_hosts_in_argv")
         with self.assertRaises(AttributeError):
             operator._validate_argv(["echo", "unguarded"])
+
+    def test_explicit_direct_command_arguments_cannot_target_canonical_blockade_marker(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "state" / "operator-kill-switch"
+            marker.parent.mkdir()
+            with (
+                patch.object(operator, "HOME", root),
+                patch.object(operator.base, "KILL_SWITCH_PATH", marker),
+                patch.object(
+                    operator.base,
+                    "_trusted_owner_enabled",
+                    return_value=True,
+                    create=True,
+                ),
+                patch.dict("os.environ", {"HOME": str(root)}),
+            ):
+                blocked = (
+                    ["touch", str(marker)],
+                    ["tool", f"--output={marker}"],
+                    ["python3", "-c", f"open({str(marker)!r}, 'w').close()"],
+                    ["sh", "-c", "touch $HOME/state/operator-kill-switch"],
+                    ["touch", "state/operator-kill-switch"],
+                )
+                for argv in blocked:
+                    with self.subTest(argv=argv):
+                        with self.assertRaisesRegex(
+                            PermissionError, "typed blockade lifecycle"
+                        ):
+                            operator._validate_argv(argv, cwd=root)
+
+                self.assertEqual(
+                    operator._validate_argv(
+                        ["touch", "state/operator-kill-switch-note"], cwd=root
+                    ),
+                    ["touch", "state/operator-kill-switch-note"],
+                )
 
     def test_relative_command_arguments_may_not_target_merges(self) -> None:
         operator = _load_operator_module()

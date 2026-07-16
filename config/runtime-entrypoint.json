@@ -81,6 +81,9 @@
     "grabowski_task_reconcile_resume",
     "grabowski_recovery_status",
     "grabowski_recovery_server_probe",
+    "grabowski_operator_blockade_status",
+    "grabowski_operator_blockade_engage",
+    "grabowski_operator_blockade_disarm",
     "grabowski_friction_record",
     "grabowski_friction_resolve",
     "grabowski_friction_summary",
@@ -138,6 +141,14 @@
     {
       "module": "grabowski_mcp",
       "source": "src/grabowski_mcp.py"
+    },
+    {
+      "module": "grabowski_blockades",
+      "source": "src/grabowski_blockades.py"
+    },
+    {
+      "module": "grabowski_blockade_store",
+      "source": "src/grabowski_blockade_store.py"
     },
     {
       "module": "grabowski_grips",
@@ -214,6 +225,10 @@
     {
       "module": "grabowski_recovery",
       "source": "src/grabowski_recovery.py"
+    },
+    {
+      "module": "grabowski_blockade_runtime",
+      "source": "src/grabowski_blockade_runtime.py"
     },
     {
       "module": "grabowski_friction",

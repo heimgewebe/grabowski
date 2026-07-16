@@ -734,7 +734,6 @@ def grabowski_task_start(
     Direct local write-capable agent CLIs receive an implicit repository lease
     unless the caller supplies an explicit path or repository scope.
     """
-    operator._require_operator_mutation("durable_job")
     target = fleet.fleet_host(host)
     command = _validate_command(argv)
     recovery_gate = _require_recovery_gate(command)
@@ -764,6 +763,15 @@ def grabowski_task_start(
     )
     task_id = uuid.uuid4().hex[:24]
     lease_owner = _lease_owner(task_id)
+    operator._require_operator_mutation(
+        "durable_job",
+        path=working_directory,
+        repo=working_directory,
+        task_id=task_id,
+        owner_id=lease_owner,
+        host=host,
+        opaque_command=True,
+    )
     attempt = 1
     unit = _task_unit(task_id, attempt)
     now = _now()
@@ -912,8 +920,15 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
 @mcp.tool(name="grabowski_task_cancel", annotations=MUTATING)
 def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     """Stop one task process group and retain its persistent task record."""
-    operator._require_operator_mutation("durable_job")
     record = _row(task_id)
+    operator._require_operator_mutation(
+        "durable_job",
+        path=record["cwd"],
+        repo=record["cwd"],
+        task_id=task_id,
+        owner_id=record.get("lease_owner_id"),
+        host=record["host"],
+    )
     result = _dispatch(
         record["host"],
         ["systemctl", "--user", "stop", record["unit"]],
@@ -938,8 +953,16 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
 @mcp.tool(name="grabowski_task_resume", annotations=MUTATING)
 def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     """Recreate a missing or stopped task unit from its persistent record."""
-    operator._require_operator_mutation("durable_job")
     record = _row(task_id)
+    operator._require_operator_mutation(
+        "durable_job",
+        path=record["cwd"],
+        repo=record["cwd"],
+        task_id=task_id,
+        owner_id=record.get("lease_owner_id"),
+        host=record["host"],
+        opaque_command=True,
+    )
     if record["resume_policy"] in {"never", "manual"}:
         raise PermissionError("Task resume policy does not permit automatic retry")
     command = json.loads(record["argv_json"])

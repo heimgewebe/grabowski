@@ -701,7 +701,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             for item in status["capability_requirements"]["missing_enabled_requirements"]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 125)
+        self.assertEqual(summary["registered_tool_requirements"], 128)
         self.assertEqual(missing["grabowski_remove_path"], ["file_delete"])
         self.assertEqual(missing["grabowski_restore_removed_path"], ["file_delete"])
         self.assertEqual(missing["rlens_bundle_discover"], ["bundle_registry"])
@@ -914,6 +914,113 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertEqual(record["capability"], "file_destroy")
                 self.assertFalse(record["rollback"]["available"])
                 self.assertTrue(grabowski_mcp.grabowski_verify_audit()["valid"])
+
+    def test_canonical_marker_is_typed_only_even_for_trusted_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capabilities = [
+                "file_read",
+                "file_write",
+                "file_delete",
+                "file_destroy",
+                "audit_verify",
+                "rollback_text",
+                "bundle_registry",
+            ]
+            work, _secret, _browser, _export, state, *patches = self._patched_runtime(
+                root,
+                capabilities=capabilities,
+            )
+            state.chmod(0o700)
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patch.object(
+                    grabowski_mcp,
+                    "_roots",
+                    side_effect=lambda kind, ignore_missing=False: [work, state],
+                ),
+                patch.object(grabowski_mcp, "_excluded_roots", return_value=[]),
+                patch.object(grabowski_mcp, "_path_is_sensitive", return_value=False),
+                patch.object(grabowski_mcp, "_trusted_owner_enabled", return_value=True),
+            ):
+                marker_path = grabowski_mcp.KILL_SWITCH_PATH
+                with self.assertRaisesRegex(PermissionError, "typed lifecycle tools"):
+                    grabowski_mcp.grabowski_create_text(str(marker_path), "stop\n")
+                self.assertFalse(marker_path.exists())
+
+                marker_path.write_text("legacy stop\n", encoding="utf-8")
+                marker_path.chmod(0o600)
+                before = marker_path.read_bytes()
+                before_sha = _sha256(marker_path)
+                with self.assertRaisesRegex(PermissionError, "typed lifecycle tools"):
+                    grabowski_mcp.grabowski_replace_text(
+                        str(marker_path), "changed\n", before_sha
+                    )
+                with self.assertRaisesRegex(PermissionError, "typed lifecycle tools"):
+                    grabowski_mcp.grabowski_remove_path(
+                        str(marker_path), "file", before_sha
+                    )
+                with self.assertRaisesRegex(PermissionError, "typed lifecycle tools"):
+                    grabowski_mcp.grabowski_destroy_path(
+                        str(marker_path),
+                        "file",
+                        "permanently-delete",
+                        before_sha,
+                    )
+                self.assertEqual(marker_path.read_bytes(), before)
+
+    def test_path_blockade_applies_to_generic_file_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, _secret, _browser, _export, _state, *patches = (
+                self._patched_runtime(root)
+            )
+            blocked = work / "blocked"
+            blocked.mkdir()
+            record = grabowski_mcp.blockade_policy.BlockadeRecord(
+                blockade_id="path-freeze-1",
+                posture="mutation_freeze",
+                scope=grabowski_mcp.blockade_policy.Scope("path", str(blocked)),
+                reason="Test path freeze.",
+                trigger_class="manual_path_freeze",
+                engaged_at=grabowski_mcp.datetime.now(grabowski_mcp.timezone.utc),
+                evidence_refs=("test:path-freeze",),
+                provenance=grabowski_mcp.blockade_policy.Provenance(
+                    tool="test",
+                    request_id="request-1",
+                    session_id="session-1",
+                    task_id="task-1",
+                    owner_id="owner-1",
+                ),
+            )
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patch.object(
+                    grabowski_mcp,
+                    "_operator_blockade_records",
+                    return_value=((record,), {"marker_source": "test"}),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    PermissionError, "mutation_blocked_by_mutation_freeze"
+                ):
+                    grabowski_mcp.grabowski_create_text(
+                        str(blocked / "denied.txt"), "denied\n"
+                    )
+                allowed = work / "allowed.txt"
+                result = grabowski_mcp.grabowski_create_text(
+                    str(allowed), "allowed\n"
+                )
+                self.assertTrue(allowed.is_file())
+                self.assertEqual(result["after_sha256"], _sha256(allowed))
 
     def test_kill_switch_blocks_filesystem_removal_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

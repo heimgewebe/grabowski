@@ -110,6 +110,9 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_task_reconcile_resume` | task | no | high | Resume bounded retry-safe tasks after reconcile verification. |
 | `grabowski_recovery_status` | recovery | yes | low | Evaluate the fail-closed recovery gate for power-worker activation. |
 | `grabowski_recovery_server_probe` | recovery | no | high | Produce fresh server recovery evidence. |
+| `grabowski_operator_blockade_status` | recovery | yes | low | Evaluate scoped typed, legacy and environment blockades for one action context. |
+| `grabowski_operator_blockade_engage` | recovery | no | high | Create one canonical typed operator blockade through the dedicated create-only lifecycle. |
+| `grabowski_operator_blockade_disarm` | recovery | no | high | Quarantine one exact typed blockade after live audit, deployment, recovery and broker evidence passes. |
 | `grabowski_friction_record` | operations-observability | no | medium | Record one bounded operator-friction event for later analysis. |
 | `grabowski_friction_resolve` | operations-observability | no | medium | Append evidence-bound closeout decisions for friction events or classes without rewriting history. |
 | `grabowski_friction_summary` | operations-observability | yes | low | Summarize recent bounded operator-friction events. |
