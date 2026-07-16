@@ -50,11 +50,11 @@ Schedule self-deployment from an explicitly selected clean immutable source iden
 
 ### P2 — Connector snapshot handshake
 
-Add an honest client/server handshake for tool count, tool-name hash, agent-instruction hash, release identity, and refresh requirement. When client state is not observable, report that limitation rather than inferring freshness.
+Bind a bounded client declaration for tool count, sorted tool-name hash, agent-instruction hash, and release identity to server-owned values through the existing `grip_run` surface. Persist a private, expiring, self-hashed receipt. Report the verification model as `client-declared-server-compared-v1`; do not claim platform attestation or client instruction compliance.
 
 ### P2 — Source-bound operator overview
 
-Provide one compact read-only overview containing pointers and freshness metadata for Bureau, Grabowski runtime, GitHub/CI, RepoBrief, Systemkatalog, and Chronik. It must not become another status database.
+Expose `system_overview` in the existing standard and evidence status views. Project runtime integrity, connector snapshot state, task projections, bounded active leases, and operator-obligation attention from their authoritative stores. Component errors or truncation block `operator_ready`; the overview never becomes another status database or grants mutation authority.
 
 ## Acceptance criteria
 
@@ -63,3 +63,5 @@ Provide one compact read-only overview containing pointers and freshness metadat
 3. No projection mutates source records or grants execution authority.
 4. Focused and full repository validation pass on the exact branch head.
 5. Every nontrivial merge remains head/base/diff/CI/review/lease bound.
+6. Connector freshness is represented by an expiring receipt bound to the current release and exact tool-name hash, with explicit non-claims.
+7. The consolidated overview remains a read-only projection and fails closed when required component state is unavailable or truncated.

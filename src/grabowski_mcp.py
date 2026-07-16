@@ -29,6 +29,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 import grabowski_consumer_surface as consumer_surface
+import grabowski_client_snapshot
 import grabowski_blockades as blockade_policy
 import grabowski_blockade_store as blockade_store
 
@@ -3548,7 +3549,9 @@ def _deployment_metadata_impl() -> dict[str, Any]:
     }
 
 
-def _runtime_tool_contract_summary() -> dict[str, Any]:
+def _runtime_tool_contract_summary(
+    deployment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     expected: list[str] = []
     manifest_error: str | None = None
     try:
@@ -3586,19 +3589,56 @@ def _runtime_tool_contract_summary() -> dict[str, Any]:
 
     expected_set = set(expected)
     registered_set = set(registered)
+    expected_names_sha256 = names_sha256(expected)
+    registered_names_sha256 = names_sha256(registered)
+    runtime_matches = manifest_error is None and expected_set == registered_set
+    deployment = _deployment_metadata() if deployment is None else deployment
+    release_id = deployment.get("release_id")
+    repo_head = deployment.get("repo_head")
+    if (
+        runtime_matches
+        and isinstance(release_id, str)
+        and release_id
+        and isinstance(repo_head, str)
+        and re.fullmatch(r"[0-9a-f]{40}", repo_head) is not None
+    ):
+        client_snapshot = grabowski_client_snapshot.snapshot_status(
+            expected_tool_count=len(registered),
+            expected_names_sha256=registered_names_sha256,
+            expected_release_id=release_id,
+            expected_repo_head=repo_head,
+            expected_agent_instructions_sha256=AGENT_INSTRUCTIONS_SHA256,
+        )
+    else:
+        client_snapshot = {
+            "state": "server_contract_invalid",
+            "observable": False,
+            "fresh": False,
+            "matched": False,
+            "recommended_next_action": (
+                "repair the server tool or deployment contract before binding a client snapshot"
+            ),
+            "does_not_establish": [
+                "platform-enforced client snapshot identity",
+                "client instruction compliance",
+                "resistance to compromised same-uid code",
+            ],
+        }
     return {
         "expected_tool_count": len(expected),
         "registered_tool_count": len(registered),
         "name_hash_contract": "sha256-json-sorted-utf8-v1",
-        "expected_names_sha256": names_sha256(expected),
-        "registered_names_sha256": names_sha256(registered),
-        "runtime_matches_deployment_contract": (
-            manifest_error is None and expected_set == registered_set
-        ),
+        "expected_names_sha256": expected_names_sha256,
+        "registered_names_sha256": registered_names_sha256,
+        "runtime_matches_deployment_contract": runtime_matches,
         "missing_from_runtime": sorted(expected_set - registered_set)[:50],
         "unexpected_in_runtime": sorted(registered_set - expected_set)[:50],
         "manifest_error": manifest_error,
-        "client_snapshot_observable": False,
+        "client_snapshot": client_snapshot,
+        "client_snapshot_observable": bool(client_snapshot.get("observable")),
+        "client_snapshot_verification_model": client_snapshot.get(
+            "verification_model"
+        ),
         "refresh_required_when_client_count_or_hash_differs": True,
     }
 
@@ -3715,6 +3755,211 @@ def _project_status_fields(
     )
 
 
+def _operator_system_overview(
+    *,
+    runtime_healthy: bool,
+    client_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    tasks: dict[str, Any] = {
+        "available": False,
+        "projection_counts": {},
+        "unknown_state_count": None,
+    }
+    leases: dict[str, Any] = {"available": False, "active_count": None}
+    obligations: dict[str, Any] = {
+        "available": False,
+        "attention_count": None,
+        "integrity_error_count": None,
+    }
+    errors: list[dict[str, str]] = []
+    try:
+        import grabowski_tasks
+
+        task_payload = grabowski_tasks.grabowski_task_list(
+            limit=1,
+            view="minimal",
+        )
+        tasks = {
+            "available": True,
+            "state_counts": task_payload.get("state_counts", {}),
+            "projection_counts": task_payload.get("projection_counts", {}),
+            "projection_counts_overlap": task_payload.get(
+                "projection_counts_overlap"
+            ),
+            "unknown_state_count": task_payload.get("unknown_state_count"),
+            "snapshot_complete": task_payload.get("state_counts_complete"),
+        }
+    except Exception as exc:  # pragma: no cover - defensive status boundary
+        errors.append({"component": "tasks", "error": type(exc).__name__})
+    try:
+        import grabowski_resources
+
+        lease_limit = 200
+        lease_payload = grabowski_resources.grabowski_resource_list(
+            include_expired=False,
+            limit=lease_limit,
+        )
+        active_count = lease_payload.get("count")
+        leases = {
+            "available": True,
+            "active_count": active_count,
+            "bounded_limit": lease_limit,
+            "may_be_truncated": active_count == lease_limit,
+        }
+    except Exception as exc:  # pragma: no cover - defensive status boundary
+        errors.append({"component": "leases", "error": type(exc).__name__})
+    try:
+        import grabowski_operator_obligation
+
+        obligation_limit = 100
+        obligation_payload = grabowski_operator_obligation.list_obligations(
+            {"state": "attention", "limit": obligation_limit}
+        )
+        obligations = {
+            "available": True,
+            "attention_count": obligation_payload.get("record_count"),
+            "integrity_error_count": len(
+                obligation_payload.get("integrity_errors", [])
+            ),
+            "scan_truncated": obligation_payload.get("scan_truncated"),
+            "bounded_limit": obligation_limit,
+        }
+    except Exception as exc:  # pragma: no cover - defensive status boundary
+        errors.append({"component": "operator_obligations", "error": type(exc).__name__})
+
+    snapshot_observable = bool(client_snapshot.get("observable"))
+    unknown_state_count = tasks.get("unknown_state_count")
+    truth_model_ready = (
+        tasks.get("available") is True and unknown_state_count == 0
+    )
+    components_observable = (
+        not errors
+        and leases.get("available") is True
+        and not leases.get("may_be_truncated")
+        and obligations.get("available") is True
+        and not obligations.get("scan_truncated")
+    )
+    operator_ready = (
+        runtime_healthy
+        and snapshot_observable
+        and truth_model_ready
+        and components_observable
+    )
+    if not runtime_healthy:
+        next_action = "repair runtime integrity before operator mutation"
+    elif not snapshot_observable:
+        next_action = str(
+            client_snapshot.get(
+                "recommended_next_action",
+                "bind the current connector client snapshot",
+            )
+        )
+    elif not tasks.get("available"):
+        next_action = "restore task projection observability"
+    elif errors:
+        next_action = "restore observability for the unavailable overview components"
+    elif leases.get("may_be_truncated") or obligations.get("scan_truncated"):
+        next_action = "narrow or extend bounded component projections before relying on the overview"
+    elif unknown_state_count:
+        next_action = "resolve unknown task states before relying on projections"
+    elif obligations.get("integrity_error_count"):
+        next_action = "inspect operator obligation integrity errors"
+    elif obligations.get("attention_count"):
+        next_action = "resume or close the highest-priority operator obligation"
+    elif (tasks.get("projection_counts") or {}).get("attention", 0):
+        next_action = "inspect the highest-priority attention task"
+    else:
+        next_action = "none"
+    source_registry = {
+        "grabowski_runtime": {
+            "authority": "deployment manifest and audit log",
+            "observation_state": "observed",
+            "freshness": "current status call",
+        },
+        "task_store": {
+            "authority": "Grabowski task database",
+            "observation_state": (
+                "observed" if tasks.get("available") else "unavailable"
+            ),
+            "freshness": "single bounded read snapshot",
+        },
+        "resource_leases": {
+            "authority": "Grabowski resource lease database",
+            "observation_state": (
+                "observed" if leases.get("available") else "unavailable"
+            ),
+            "freshness": "current bounded query",
+        },
+        "operator_obligations": {
+            "authority": "operator obligation store",
+            "observation_state": (
+                "observed" if obligations.get("available") else "unavailable"
+            ),
+            "freshness": "current bounded scan",
+        },
+        "bureau": {
+            "authority": "Bureau",
+            "observation_state": "target_required",
+            "required_binding": ["bureau task or obligation id"],
+            "freshness": "not inferred by global status",
+        },
+        "github_ci": {
+            "authority": "GitHub pull request and checks",
+            "observation_state": "target_required",
+            "required_binding": ["repository", "pull request"],
+            "freshness": "must be read live for the selected target",
+        },
+        "repobrief": {
+            "authority": "rLens/RepoBrief bundle receipts",
+            "observation_state": "target_required",
+            "required_binding": ["repository", "bundle stem"],
+            "freshness": "must be verified against the selected source commit",
+        },
+        "systemkatalog": {
+            "authority": "Systemkatalog",
+            "observation_state": "target_required",
+            "required_binding": ["system identity"],
+            "freshness": "not inferred by global status",
+        },
+        "chronik": {
+            "authority": "Chronik operation receipts",
+            "observation_state": "target_required",
+            "required_binding": ["operation or receipt identity"],
+            "freshness": "receipt-bound per operation",
+        },
+    }
+    return {
+        "schema_version": 1,
+        "operator_ready": operator_ready,
+        "readiness": {
+            "runtime_ready": runtime_healthy,
+            "connector_snapshot_ready": snapshot_observable,
+            "truth_model_ready": truth_model_ready,
+            "components_observable": components_observable,
+        },
+        "runtime": {"healthy": runtime_healthy},
+        "connector": {
+            "state": client_snapshot.get("state"),
+            "observable": snapshot_observable,
+            "fresh": client_snapshot.get("fresh"),
+            "matched": client_snapshot.get("matched"),
+            "verification_model": client_snapshot.get("verification_model"),
+        },
+        "tasks": tasks,
+        "leases": leases,
+        "operator_obligations": obligations,
+        "source_registry": source_registry,
+        "component_errors": errors,
+        "recommended_next_action": next_action,
+        "does_not_establish": [
+            "platform-enforced client snapshot identity",
+            "task output correctness",
+            "that attention work is safe to retry unchanged",
+            "future mutation authority",
+        ],
+    }
+
+
 @mcp.tool(name="grabowski_status", annotations=READ_ANNOTATIONS)
 def grabowski_status(
     view: str = "minimal",
@@ -3725,7 +3970,7 @@ def grabowski_status(
     policy = _load_policy()
     active_profile = _active_profile(policy)
     deployment = _deployment_metadata()
-    tool_contract = _runtime_tool_contract_summary()
+    tool_contract = _runtime_tool_contract_summary(deployment)
     audit = _verify_audit_log(AUDIT_LOG)
     kill_switch = _kill_switch_state()
     integrity_fields = (
@@ -3753,10 +3998,16 @@ def grabowski_status(
         warnings.append({"code": "runtime_tool_contract_drift"})
     if not bool(deployment.get("agent_instructions_identity_valid")):
         warnings.append({"code": "agent_instructions_drift"})
+    client_snapshot = tool_contract.get("client_snapshot", {})
     if not bool(tool_contract.get("client_snapshot_observable")):
+        snapshot_state = str(client_snapshot.get("state", "unavailable"))
         warnings.append({
-            "code": "client_snapshot_unobservable",
-            "detail": "server runtime cannot prove the connector's frozen client tool view",
+            "code": f"client_snapshot_{snapshot_state}",
+            "verification_model": client_snapshot.get("verification_model"),
+            "detail": client_snapshot.get(
+                "recommended_next_action",
+                "bind the connector client snapshot to the current server contract",
+            ),
         })
     healthy = (
         deployment.get("completion_status") == "complete"
@@ -3765,6 +4016,29 @@ def grabowski_status(
         and not bool(kill_switch.get("engaged"))
         and bool(tool_contract.get("runtime_matches_deployment_contract"))
     )
+    system_overview: dict[str, Any] | None = None
+    if selected_view in {"standard", "evidence"}:
+        system_overview = _operator_system_overview(
+            runtime_healthy=healthy,
+            client_snapshot=client_snapshot,
+        )
+    if not healthy:
+        recommended_next_action = "repair runtime integrity before operator mutation"
+    elif not bool(client_snapshot.get("observable")):
+        recommended_next_action = str(
+            client_snapshot.get(
+                "recommended_next_action",
+                "bind the current connector client snapshot",
+            )
+        )
+    elif system_overview is not None:
+        recommended_next_action = str(
+            system_overview["recommended_next_action"]
+        )
+    elif warnings:
+        recommended_next_action = "inspect warnings before mutation"
+    else:
+        recommended_next_action = "none"
     base_payload: dict[str, Any] = {
         "schema_version": 2,
         "view": selected_view,
@@ -3782,10 +4056,18 @@ def grabowski_status(
         "tool_contract": {
             "expected_tool_count": tool_contract.get("expected_tool_count"),
             "registered_tool_count": tool_contract.get("registered_tool_count"),
+            "name_hash_contract": tool_contract.get("name_hash_contract"),
+            "expected_names_sha256": tool_contract.get("expected_names_sha256"),
+            "registered_names_sha256": tool_contract.get(
+                "registered_names_sha256"
+            ),
             "runtime_matches_deployment_contract": tool_contract.get(
                 "runtime_matches_deployment_contract"
             ),
-            "client_snapshot_observable": tool_contract.get("client_snapshot_observable"),
+            "client_snapshot_observable": tool_contract.get(
+                "client_snapshot_observable"
+            ),
+            "client_snapshot": client_snapshot,
             "refresh_required_when_client_count_or_hash_differs": tool_contract.get(
                 "refresh_required_when_client_count_or_hash_differs"
             ),
@@ -3798,9 +4080,7 @@ def grabowski_status(
             "client_compliance_observable": False,
         },
         "warnings": warnings,
-        "recommended_next_action": (
-            "inspect warnings before mutation" if warnings else "none"
-        ),
+        "recommended_next_action": recommended_next_action,
         "evidence_refs": {
             "release_id": deployment.get("release_id"),
             "repo_head": deployment.get("repo_head"),
@@ -3808,16 +4088,19 @@ def grabowski_status(
             "agent_instructions_sha256": AGENT_INSTRUCTIONS_SHA256,
         },
         "does_not_establish": [
-            "client_snapshot_freshness",
+            "platform-enforced client snapshot identity",
             "client_instruction_compliance",
+            "resistance to compromised same-uid code",
             "individual_tool_behavior_correctness",
             "future_action_authority",
         ],
     }
     if selected_view in {"standard", "evidence"}:
+        assert system_overview is not None
         operating_protocol = _operator_relay_protocol()
         workspace_model = operating_protocol.get("workspace_execution_model", {})
         base_payload.update({
+            "system_overview": system_overview,
             "capabilities": sorted(_effective_capabilities(policy)),
             "roots": {
                 "read": _profile_values(policy, "read_roots"),
@@ -6353,6 +6636,25 @@ def grip_run(
         )
     dispatch_parameters = dict(raw_parameters)
     dispatch_parameters.pop("session_escalation", None)
+    if name == "connector-snapshot-bind":
+        deployment = _deployment_metadata()
+        tool_contract = _runtime_tool_contract_summary(deployment)
+        dispatch_parameters["_server_tool_contract"] = {
+            "registered_tool_count": tool_contract.get("registered_tool_count"),
+            "registered_names_sha256": tool_contract.get(
+                "registered_names_sha256"
+            ),
+            "runtime_matches_deployment_contract": tool_contract.get(
+                "runtime_matches_deployment_contract"
+            ),
+        }
+        dispatch_parameters["_server_runtime"] = {
+            "release_id": deployment.get("release_id"),
+            "repo_head": deployment.get("repo_head"),
+        }
+        dispatch_parameters["_server_agent_instructions_sha256"] = (
+            AGENT_INSTRUCTIONS_SHA256
+        )
     return grabowski_grips.grip_run(
         name,
         dispatch_parameters,

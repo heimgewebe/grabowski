@@ -477,6 +477,70 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         allow_mutation=True,
                     )
 
+    def test_connector_snapshot_wrapper_injects_server_owned_binding(self) -> None:
+        client_parameters = {
+            "client_id": "chatgpt-api-tool",
+            "session_id": "session-1",
+            "observed_tool_count": 140,
+            "observed_names_sha256": "a" * 64,
+            "observed_release_id": "release-real",
+            "observed_agent_instructions_sha256": "b" * 64,
+            "_server_tool_contract": {"registered_tool_count": 1},
+            "_server_runtime": {"release_id": "spoofed"},
+            "_server_agent_instructions_sha256": "f" * 64,
+        }
+        deployment = {
+            "release_id": "release-real",
+            "repo_head": "c" * 40,
+        }
+        contract = {
+            "registered_tool_count": 140,
+            "registered_names_sha256": "a" * 64,
+            "runtime_matches_deployment_contract": True,
+        }
+        with patch.object(grabowski_mcp, "_require_capability"), patch.object(
+            grabowski_mcp, "_require_mutations_enabled"
+        ), patch.object(
+            grabowski_mcp,
+            "_session_grip_policy_decision",
+            return_value={"allowed": True},
+        ), patch.object(
+            grabowski_mcp,
+            "_deployment_metadata",
+            return_value=deployment,
+        ), patch.object(
+            grabowski_mcp,
+            "_runtime_tool_contract_summary",
+            return_value=contract,
+        ) as summary, patch.object(
+            grabowski_mcp.grabowski_grips,
+            "grip_run",
+            return_value={"ok": True},
+        ) as run:
+            result = grabowski_mcp.grip_run(
+                "connector-snapshot-bind",
+                client_parameters,
+                profile="operator",
+                allow_mutation=True,
+            )
+
+        self.assertEqual({"ok": True}, result)
+        summary.assert_called_once_with(deployment)
+        dispatched = run.call_args.args[1]
+        self.assertEqual(
+            {
+                "registered_tool_count": 140,
+                "registered_names_sha256": "a" * 64,
+                "runtime_matches_deployment_contract": True,
+            },
+            dispatched["_server_tool_contract"],
+        )
+        self.assertEqual(deployment, dispatched["_server_runtime"])
+        self.assertEqual(
+            grabowski_mcp.AGENT_INSTRUCTIONS_SHA256,
+            dispatched["_server_agent_instructions_sha256"],
+        )
+
     def test_high_risk_grip_requires_explicit_session_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
