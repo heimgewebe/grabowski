@@ -154,6 +154,11 @@ class FakeGh:
             "mergeStateStatus": "CLEAN",
         }
         self.view.setdefault("baseRefOid", "e" * 40)
+        self.view.setdefault("headRefName", "feat/captain")
+        self.view.setdefault("changedFiles", 1)
+        self.view.setdefault(
+            "files", [{"path": "src/changed.py", "changeType": "MODIFIED"}]
+        )
         self.diff_text = diff_text
         self.view_failure_after_merge = view_failure_after_merge
         self.post_merge_view = post_merge_view or {}
@@ -231,6 +236,10 @@ class FakeGh:
             if self.view_sequence:
                 self.view = dict(self.view_sequence.pop(0))
                 self.view.setdefault("baseRefOid", "e" * 40)
+                self.view.setdefault("changedFiles", 1)
+                self.view.setdefault(
+                    "files", [{"path": "src/changed.py", "changeType": "MODIFIED"}]
+                )
                 return {"returncode": 0, "stdout": json.dumps(self.view), "stderr": ""}
             if self.view_failure_after_merge and self.merged:
                 return {"returncode": 1, "stdout": "", "stderr": "transient PR view failure"}
@@ -4986,8 +4995,15 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertTrue(guard["contract_satisfied"])
         self.assertTrue(guard["dispatch_called"])
         self.assertEqual(CAPTAIN_HEAD, guard["bindings"]["head_sha"])
+        self.assertEqual("feat/captain", guard["bindings"]["head_branch"])
         self.assertEqual("e" * 40, guard["bindings"]["base_sha"])
+        self.assertEqual("main", guard["bindings"]["base_branch"])
         self.assertEqual(CAPTAIN_DIFF, guard["bindings"]["diff_sha256"])
+        self.assertEqual(["src/changed.py"], guard["bindings"]["changed_paths"])
+        self.assertEqual(
+            guard["bindings"]["changed_paths_sha256"],
+            guard["changed_paths_sha256"],
+        )
         self.assertEqual(6, len(guard["resource_keys"]))
         self.assertLessEqual(
             guard["observed_at_unix_ns"],
@@ -5017,7 +5033,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             if argv[:2] == ["pr", "diff"] and not inserted:
                 resources.acquire_resources(
                     "foreign-writer",
-                    [f"path:{local_repo / 'src' / 'late.py'}"],
+                    [f"path:{local_repo / 'src' / 'changed.py'}"],
                     purpose="late writer lease",
                     ttl_seconds=60,
                 )
@@ -5033,6 +5049,55 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("blocked_by_live_lease", execution["merge_lease_guard"]["status"])
         self.assertFalse(execution["merge_lease_guard"]["contract_satisfied"])
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_blocks_late_base_or_head_branch_lease(self) -> None:
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        for branch in ("main", "feat/captain"):
+            with self.subTest(branch=branch):
+                resources.RESOURCE_DB.unlink(missing_ok=True)
+                parameters = authorized_captain_run_parameters()
+                gh = FakeGh(view={
+                    "number": 96,
+                    "state": "OPEN",
+                    "baseRefName": "main",
+                    "baseRefOid": "e" * 40,
+                    "headRefName": "feat/captain",
+                    "headRefOid": CAPTAIN_HEAD,
+                    "isDraft": False,
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                })
+                inserted = False
+
+                def late_branch_runner(repo: Path, argv: list[str]) -> dict[str, object]:
+                    nonlocal inserted
+                    result = gh(repo, argv)
+                    if argv[:2] == ["pr", "diff"] and not inserted:
+                        resources.acquire_resources(
+                            "foreign-branch-writer",
+                            [f"repo:{local_repo}:branch:{branch}"],
+                            purpose="late branch writer",
+                            ttl_seconds=60,
+                        )
+                        inserted = True
+                    return result
+
+                result = grips.grip_run(
+                    "captain-run",
+                    parameters,
+                    profile="captain",
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=late_branch_runner,
+                )
+                execution = result["output"]["executions"][0]
+                self.assertEqual("blocked", result["receipt"]["status"])
+                self.assertEqual(
+                    "blocked_by_live_lease", execution["merge_lease_guard"]["status"]
+                )
+                self.assertEqual(
+                    [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
+                )
 
     def test_atomic_merge_guard_requires_hash_bound_lease_owner(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -5120,6 +5185,14 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
     def test_atomic_merge_guard_allows_exact_nonoverlap(self) -> None:
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        local_disjoint = f"path:{local_repo / 'docs' / 'foreign.md'}"
+        resources.acquire_resources(
+            "foreign-same-repo",
+            [local_disjoint],
+            purpose="same repository but disjoint file",
+            ttl_seconds=60,
+        )
         resources.acquire_resources(
             "foreign-other-repo",
             ["gate:github-merge:heimgewebe-other:main"],
@@ -5130,15 +5203,90 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "number": 96, "state": "OPEN", "baseRefName": "main",
             "baseRefOid": "e" * 40, "headRefOid": CAPTAIN_HEAD,
             "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "changedFiles": 1,
+            "files": [{"path": "src/changed.py", "changeType": "MODIFIED"}],
         })
         result = grips.grip_run(
             "captain-run", parameters, profile="captain", allow_mutation=True,
             command_runner=FakeGit(), github_runner=gh,
         )
         self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual(
+            "foreign-same-repo", resources.inspect_resource(local_disjoint)["owner_id"]
+        )
         self.assertEqual("foreign-other-repo", resources.inspect_resource(
             "gate:github-merge:heimgewebe-other:main"
         )["owner_id"])
+
+    def test_atomic_merge_guard_rejects_incomplete_or_rename_path_evidence(self) -> None:
+        cases = (
+            (
+                {
+                    "changedFiles": 2,
+                    "files": [{"path": "src/changed.py", "changeType": "MODIFIED"}],
+                },
+                "merge_guard_changed_file_list_incomplete",
+            ),
+            (
+                {
+                    "changedFiles": True,
+                    "files": [{"path": "src/changed.py", "changeType": "MODIFIED"}],
+                },
+                "merge_guard_changed_file_count_invalid",
+            ),
+            (
+                {
+                    "changedFiles": 129,
+                    "files": [
+                        {"path": f"src/file-{index}.py", "changeType": "MODIFIED"}
+                        for index in range(129)
+                    ],
+                },
+                "merge_guard_changed_path_count_exceeds_limit",
+            ),
+            (
+                {
+                    "changedFiles": 1,
+                    "files": [
+                        {
+                            "path": "src/" + ("x" * 8200),
+                            "changeType": "MODIFIED",
+                        }
+                    ],
+                },
+                "merge_guard_changed_paths_exceed_byte_limit",
+            ),
+            (
+                {
+                    "changedFiles": 1,
+                    "files": [{"path": "src/new.py", "changeType": "RENAMED"}],
+                },
+                "merge_guard_changed_path_requires_previous_name",
+            ),
+        )
+        for file_evidence, expected in cases:
+            with self.subTest(expected=expected):
+                parameters = authorized_captain_run_parameters()
+                view = {
+                    "number": 96, "state": "OPEN", "baseRefName": "main",
+                    "baseRefOid": "e" * 40, "headRefOid": CAPTAIN_HEAD,
+                    "isDraft": False, "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    **file_evidence,
+                }
+                gh = FakeGh(view=view)
+                result = grips.grip_run(
+                    "captain-run", parameters, profile="captain", allow_mutation=True,
+                    command_runner=FakeGit(), github_runner=gh,
+                )
+                execution = result["output"]["executions"][0]
+                self.assertEqual("blocked_before_guard", execution["merge_lease_guard"]["status"])
+                self.assertTrue(any(
+                    expected in item for item in execution["merge_lease_guard"]["errors"]
+                ))
+                self.assertEqual(
+                    [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
+                )
 
     def test_atomic_merge_guard_external_merge_does_not_manufacture_compliance(self) -> None:
         local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
@@ -5162,7 +5310,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             if argv[:2] == ["pr", "diff"] and not inserted:
                 resources.acquire_resources(
                     "foreign-writer",
-                    [f"path:{local_repo / 'late.py'}"],
+                    [f"path:{local_repo / 'src' / 'changed.py'}"],
                     purpose="late external lease", ttl_seconds=60,
                 )
                 inserted = True

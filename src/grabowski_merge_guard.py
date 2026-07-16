@@ -13,6 +13,8 @@ _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 _MERGE_GUARD_TTL_SECONDS = 300
+_MERGE_GUARD_MAX_CHANGED_PATHS = 128
+_MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 8 * 1024
 _MERGE_GUARD_REPLAY_PARAMETERS = frozenset({"merge_lease_snapshot", "merge_guard_receipt"})
 
 
@@ -66,7 +68,7 @@ def merge_guard_resource_keys(repo_path: Path, *, repo_slug: str, pr_number: int
     slug = _merge_guard_slug(repo_slug)
     return sorted(
         {
-            f"repo:{repo_path.resolve()}",
+            f"component:github-repository:{slug}",
             f"component:github-branch:{slug}:{base}",
             f"service:github-main:{slug}",
             f"service:github-pr:{slug}-{pr_number}",
@@ -149,7 +151,7 @@ class CaptainMergeGuardRunner:
             "--repo",
             repo_slug,
             "--json",
-            "number,state,headRefOid,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus",
+            "number,state,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus,changedFiles,files",
         ]
         try:
             view_raw = self.github_runner(self.repo_path, view_args)
@@ -183,6 +185,14 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_pr_not_open")
         if viewed.get("isDraft") is not False:
             errors.append("merge_guard_pr_draft_state_not_confirmed")
+        head_branch = viewed.get("headRefName")
+        if (
+            not isinstance(head_branch, str)
+            or not head_branch
+            or "\x00" in head_branch
+            or len(head_branch.encode("utf-8")) > 1024
+        ):
+            errors.append("merge_guard_head_branch_missing_or_invalid")
         if viewed.get("headRefOid") != expected_head:
             errors.append("merge_guard_head_drift")
         if viewed.get("baseRefName") != expected_base:
@@ -191,6 +201,50 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_mergeable_not_confirmed")
         if viewed.get("mergeStateStatus") != "CLEAN":
             errors.append("merge_guard_merge_state_not_clean")
+
+        changed_files = viewed.get("changedFiles")
+        raw_files = viewed.get("files")
+        changed_paths: list[str] = []
+        if type(changed_files) is not int or changed_files < 1:
+            errors.append("merge_guard_changed_file_count_invalid")
+        if not isinstance(raw_files, list):
+            errors.append("merge_guard_changed_file_list_missing")
+        else:
+            for index, item in enumerate(raw_files):
+                if not isinstance(item, dict):
+                    errors.append(f"merge_guard_changed_file_invalid:{index}")
+                    continue
+                path = item.get("path")
+                change_type = item.get("changeType")
+                if (
+                    not isinstance(path, str)
+                    or not path
+                    or path.startswith("/")
+                    or "\x00" in path
+                    or any(part in {"", ".", ".."} for part in path.split("/"))
+                ):
+                    errors.append(f"merge_guard_changed_path_invalid:{index}")
+                    continue
+                if change_type in {"RENAMED", "COPIED"}:
+                    errors.append(f"merge_guard_changed_path_requires_previous_name:{index}")
+                    continue
+                if change_type not in {"ADDED", "MODIFIED", "DELETED"}:
+                    errors.append(f"merge_guard_change_type_invalid:{index}")
+                    continue
+                changed_paths.append(path)
+            if type(changed_files) is int and changed_files != len(raw_files):
+                errors.append("merge_guard_changed_file_list_incomplete")
+            if len(raw_files) > _MERGE_GUARD_MAX_CHANGED_PATHS:
+                errors.append("merge_guard_changed_path_count_exceeds_limit")
+            if len(changed_paths) != len(set(changed_paths)):
+                errors.append("merge_guard_changed_paths_duplicate")
+        changed_paths = sorted(set(changed_paths))
+        if not changed_paths:
+            errors.append("merge_guard_changed_paths_empty")
+        elif len(_canonical_json(changed_paths).encode("utf-8")) > (
+            _MERGE_GUARD_MAX_CHANGED_PATH_BYTES
+        ):
+            errors.append("merge_guard_changed_paths_exceed_byte_limit")
 
         diff_args = ["pr", "diff", str(pr_number), "--repo", repo_slug]
         try:
@@ -221,9 +275,12 @@ class CaptainMergeGuardRunner:
             "pull_request": pr_number,
             "base_branch": expected_base,
             "base_sha": base_sha,
+            "head_branch": head_branch,
             "head_sha": expected_head,
             "diff_sha256": live_diff_sha256,
             "execution_intent_sha256": self.execution_intent_sha256,
+            "changed_paths": changed_paths,
+            "changed_paths_sha256": _sha256_json(changed_paths),
         }
         return bindings, errors
 
@@ -252,6 +309,10 @@ class CaptainMergeGuardRunner:
 
         target = self.action["target"]
         bindings["local_resource_repository"] = str(resource_repository)
+        absolute_changed_paths = [
+            str(Path(resource_repository, path))
+            for path in bindings["changed_paths"]
+        ]
         self.resource_keys = merge_guard_resource_keys(
             resource_repository,
             repo_slug=str(target["repo"]),
@@ -274,6 +335,7 @@ class CaptainMergeGuardRunner:
                 self.lease_owner_id,
                 self.resource_keys,
                 repository=str(resource_repository),
+                changed_paths=absolute_changed_paths,
                 purpose=(
                     f"Captain atomic merge guard for {bindings['repository']}#{bindings['pull_request']} "
                     f"head={bindings['head_sha']} diff={bindings['diff_sha256']}"
@@ -303,6 +365,8 @@ class CaptainMergeGuardRunner:
                 "lease_snapshot": lease_snapshot,
                 "lease_snapshot_sha256": _sha256_json(lease_snapshot),
                 "lease_owner_id": self.lease_owner_id,
+                "changed_paths": bindings["changed_paths"],
+                "changed_paths_sha256": bindings["changed_paths_sha256"],
                 "held_resource_keys": self.held_resource_keys,
                 "guard_acquired_at_unix": self.acquisition["observed_at_unix"],
                 "lease_snapshot_observed_at_unix_ns": self.acquisition[
@@ -370,5 +434,3 @@ class CaptainMergeGuardRunner:
         receipt_material = dict(self.receipt)
         self.receipt["receipt_sha256"] = _sha256_json(receipt_material)
         execution_result["merge_lease_guard"] = self.receipt
-
-

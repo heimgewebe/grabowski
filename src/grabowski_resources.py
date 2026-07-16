@@ -1130,6 +1130,177 @@ def _merge_guard_repository_from_row(row: sqlite3.Row) -> str | None:
     return os.path.normpath(str(normalized))
 
 
+def _absolute_paths_overlap(left: str, right: str) -> bool:
+    try:
+        common = os.path.commonpath([left, right])
+    except ValueError:
+        return False
+    return common == left or common == right
+
+
+_MERGE_GUARD_MAX_CHANGED_PATHS = 128
+_MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 8 * 1024
+
+
+def _normalize_merge_guard_changed_paths(
+    values: Iterable[str], *, repository: str
+) -> list[str]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError("merge guard changed_paths must be a list")
+    normalized: list[str] = []
+    for raw in values:
+        if not isinstance(raw, str) or not raw or "\x00" in raw:
+            raise ValueError("merge guard changed path is invalid")
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("merge guard changed paths must be absolute")
+        path = os.path.normpath(str(candidate))
+        try:
+            within = os.path.commonpath([path, repository]) == repository
+        except ValueError:
+            within = False
+        if not within or path == repository:
+            raise ValueError("merge guard changed path must be inside repository")
+        normalized.append(path)
+    result = sorted(set(normalized))
+    if not result:
+        raise ValueError("merge guard changed_paths may not be empty")
+    if len(result) > _MERGE_GUARD_MAX_CHANGED_PATHS:
+        raise ValueError("merge guard changed_paths exceeds entry limit")
+    if len(_canonical_json(result).encode("utf-8")) > (
+        _MERGE_GUARD_MAX_CHANGED_PATH_BYTES
+    ):
+        raise ValueError("merge guard changed_paths exceeds byte limit")
+    return result
+
+
+def _merge_guard_relative_paths(
+    values: Iterable[str], *, repository: str
+) -> list[str]:
+    absolute = _normalize_merge_guard_changed_paths(values, repository=repository)
+    relative: list[str] = []
+    for path in absolute:
+        value = os.path.relpath(path, repository)
+        if value in {"", "."} or value.startswith("../") or value == "..":
+            raise ValueError("merge guard changed path must remain inside repository")
+        relative.append(value)
+    result = sorted(set(relative))
+    if len(_canonical_json(result).encode("utf-8")) > (
+        _MERGE_GUARD_MAX_CHANGED_PATH_BYTES
+    ):
+        raise ValueError("merge guard changed_paths exceeds byte limit")
+    return result
+
+
+def _merge_guard_changed_paths_from_row(
+    row: sqlite3.Row, *, repository: str
+) -> list[str] | None:
+    metadata = _row_metadata(row)
+    guard = metadata.get("merge_guard")
+    if not isinstance(guard, dict):
+        return None
+    values = guard.get("local_changed_paths")
+    if not isinstance(values, list):
+        return None
+    absolute: list[str] = []
+    for raw in values:
+        if (
+            not isinstance(raw, str)
+            or not raw
+            or raw.startswith("/")
+            or "\x00" in raw
+            or any(part in {"", ".", ".."} for part in raw.split("/"))
+        ):
+            return None
+        absolute.append(os.path.normpath(os.path.join(repository, raw)))
+    try:
+        normalized = _normalize_merge_guard_changed_paths(
+            absolute, repository=repository
+        )
+    except ValueError:
+        return None
+    try:
+        if _merge_guard_relative_paths(normalized, repository=repository) != sorted(values):
+            return None
+    except ValueError:
+        return None
+    return normalized
+
+
+def _resource_path_value(resource_key: str) -> str | None:
+    if not resource_key.startswith("path:"):
+        return None
+    return resource_key.split(":", 1)[1]
+
+
+def _repository_resource_scope(resource_key: str) -> dict[str, str | None] | None:
+    if not resource_key.startswith("repo:"):
+        return None
+    value = resource_key.split(":", 1)[1]
+    for marker, scope_kind in ((":branch:", "branch"), (":operation:", "operation")):
+        repository, separator, scope_value = value.partition(marker)
+        if not separator:
+            continue
+        if not repository:
+            return None
+        return {
+            "repository": os.path.normpath(repository),
+            "scope_kind": scope_kind if scope_value else "invalid",
+            "scope_value": scope_value or None,
+        }
+    return {
+        "repository": os.path.normpath(value),
+        "scope_kind": "repository",
+        "scope_value": None,
+    }
+
+
+def _merge_guard_branch_names(metadata: dict[str, Any]) -> set[str] | None:
+    guard = metadata.get("merge_guard")
+    if not isinstance(guard, dict):
+        return None
+    names: set[str] = set()
+    for field in ("base_branch", "head_branch"):
+        value = guard.get(field)
+        if (
+            not isinstance(value, str)
+            or not value
+            or "\x00" in value
+            or len(value.encode("utf-8")) > 1024
+        ):
+            return None
+        names.add(value)
+    return names
+
+
+def _repository_resource_overlaps_merge_guard(
+    resource_key: str,
+    *,
+    repository: str,
+    guarded_branches: set[str] | None,
+) -> bool:
+    scope = _repository_resource_scope(resource_key)
+    if scope is None or scope["repository"] != repository:
+        return False
+    if scope["scope_kind"] == "branch" and guarded_branches is not None:
+        return scope["scope_value"] in guarded_branches
+    return True
+
+
+def _scope_path_values(scope: dict[str, Any] | None) -> list[str]:
+    if scope is None:
+        return []
+    return sorted(set(scope.get("paths", []) + scope.get("generated_artifacts", [])))
+
+
+def _paths_overlap_any(paths: Iterable[str], changed_paths: Iterable[str]) -> bool:
+    return any(
+        _absolute_paths_overlap(path, changed)
+        for path in paths
+        for changed in changed_paths
+    )
+
+
 def _check_active_merge_guard_conflicts(
     connection: sqlite3.Connection,
     *,
@@ -1138,13 +1309,15 @@ def _check_active_merge_guard_conflicts(
     now: int,
 ) -> None:
     requested_scope = _scope_manifest_from_metadata(metadata, required=False)
-    requested_repositories = {
-        key.split(":", 1)[1]
+    requested_repo_scopes = [
+        scope
         for key in keys
-        if key.startswith("repo:")
-    }
-    if requested_scope is not None:
-        requested_repositories.add(requested_scope["repository"])
+        if (scope := _repository_resource_scope(key)) is not None
+    ]
+    requested_paths = [
+        path for key in keys if (path := _resource_path_value(key)) is not None
+    ]
+    requested_paths.extend(_scope_path_values(requested_scope))
     rows = connection.execute(
         "SELECT * FROM leases WHERE resource_key LIKE 'gate:github-merge:%' "
         "AND expires_at_unix>? ORDER BY resource_key",
@@ -1152,14 +1325,65 @@ def _check_active_merge_guard_conflicts(
     ).fetchall()
     for row in rows:
         repository = _merge_guard_repository_from_row(row)
-        if repository is None:
+        row_metadata = _row_metadata(row)
+        changed_paths = (
+            None
+            if repository is None
+            else _merge_guard_changed_paths_from_row(row, repository=repository)
+        )
+        guarded_branches = _merge_guard_branch_names(row_metadata)
+        if repository is None or changed_paths is None:
             raise ResourceConflict(
                 row["resource_key"], row["owner_id"], row["expires_at_unix"]
             )
-        overlaps = repository in requested_repositories or any(
-            _path_is_within_repository(key, repository) for key in keys
+        repo_scope_same_repository = any(
+            scope["repository"] == repository for scope in requested_repo_scopes
         )
-        if overlaps:
+        repo_scope_overlap = any(
+            _repository_resource_overlaps_merge_guard(
+                key,
+                repository=repository,
+                guarded_branches=guarded_branches,
+            )
+            for key in keys
+            if key.startswith("repo:")
+        )
+        same_repository = (
+            repo_scope_same_repository
+            or (
+                requested_scope is not None
+                and requested_scope["repository"] == repository
+            )
+            or any(
+                _path_is_within_repository(f"path:{path}", repository)
+                for path in requested_paths
+            )
+        )
+        if not same_repository:
+            continue
+        path_overlap = _paths_overlap_any(requested_paths, changed_paths)
+        scope_mutating = (
+            requested_scope is not None
+            and bool(set(requested_scope.get("effects", [])) - {"read"})
+        )
+        scope_without_paths = (
+            requested_scope is not None
+            and requested_scope["repository"] == repository
+            and not _scope_path_values(requested_scope)
+            and scope_mutating
+        )
+        scope_unattested_mutation = (
+            requested_scope is not None
+            and requested_scope["repository"] == repository
+            and scope_mutating
+            and metadata.get("scope_manifest_complete") is not True
+        )
+        if (
+            repo_scope_overlap
+            or path_overlap
+            or scope_without_paths
+            or scope_unattested_mutation
+        ):
             raise ResourceConflict(
                 row["resource_key"], row["owner_id"], row["expires_at_unix"]
             )
@@ -1171,6 +1395,7 @@ def acquire_merge_guard_resources(
     resource_keys: Iterable[str],
     *,
     repository: str,
+    changed_paths: Iterable[str],
     purpose: str,
     ttl_seconds: int = 300,
     metadata: dict[str, Any] | None = None,
@@ -1186,13 +1411,31 @@ def acquire_merge_guard_resources(
     if not repository_path.is_absolute():
         raise ValueError("merge guard repository must be absolute")
     canonical_repository = os.path.normpath(str(repository_path))
-    repo_key = f"repo:{canonical_repository}"
-    if repo_key not in keys:
-        raise ValueError("merge guard resources must include the canonical repository key")
+    normalized_changed_paths = _normalize_merge_guard_changed_paths(
+        changed_paths, repository=canonical_repository
+    )
+    relative_changed_paths = _merge_guard_relative_paths(
+        normalized_changed_paths, repository=canonical_repository
+    )
+    repository_components = [
+        key for key in keys if key.startswith("component:github-repository:")
+    ]
+    if len(repository_components) != 1:
+        raise ValueError(
+            "merge guard resources must include exactly one GitHub repository component"
+        )
     gate_keys = [key for key in keys if key.startswith("gate:github-merge:")]
     if len(gate_keys) != 1:
         raise ValueError("merge guard resources must include exactly one GitHub merge gate")
     normalized_metadata: dict[str, Any] = {} if metadata is None else dict(metadata)
+    guard_metadata = normalized_metadata.get("merge_guard")
+    if not isinstance(guard_metadata, dict):
+        raise ValueError("merge guard metadata is required")
+    guard_metadata = dict(guard_metadata)
+    guard_metadata["local_resource_repository"] = canonical_repository
+    guard_metadata["local_changed_paths"] = relative_changed_paths
+    normalized_metadata["merge_guard"] = guard_metadata
+    guarded_branches = _merge_guard_branch_names(normalized_metadata)
     if "scope_manifest" in normalized_metadata:
         normalized_metadata["scope_manifest"] = nonconflict.normalize_scope_manifest(
             normalized_metadata["scope_manifest"]
@@ -1217,14 +1460,49 @@ def acquire_merge_guard_resources(
                 row_key = row["resource_key"]
                 row_metadata = _row_metadata(row)
                 row_scope = _scope_manifest_from_metadata(row_metadata, required=False)
+                row_path = _resource_path_value(row_key)
+                row_repo_scope = _repository_resource_scope(row_key)
+                repo_resource_relevant = (
+                    row_repo_scope is not None
+                    and row_repo_scope["repository"] == canonical_repository
+                    and (
+                        row_repo_scope["scope_kind"] != "branch"
+                        or guarded_branches is None
+                        or row_repo_scope["scope_value"] in guarded_branches
+                    )
+                )
+                same_scope_repository = (
+                    row_scope is not None
+                    and row_scope["repository"] == canonical_repository
+                )
+                scoped_paths = _scope_path_values(row_scope)
+                scope_is_mutating = (
+                    row_scope is not None
+                    and bool(set(row_scope.get("effects", [])) - {"read"})
+                )
+                scope_is_broad_mutation = (
+                    same_scope_repository
+                    and not scoped_paths
+                    and scope_is_mutating
+                )
+                scope_is_unattested_mutation = (
+                    same_scope_repository
+                    and scope_is_mutating
+                    and row_metadata.get("scope_manifest_complete") is not True
+                )
                 relevant = (
                     row_key in keys
-                    or row_key == repo_key
-                    or _path_is_within_repository(row_key, canonical_repository)
+                    or repo_resource_relevant
                     or (
-                        row_scope is not None
-                        and row_scope["repository"] == canonical_repository
+                        row_path is not None
+                        and _paths_overlap_any([row_path], normalized_changed_paths)
                     )
+                    or (
+                        same_scope_repository
+                        and _paths_overlap_any(scoped_paths, normalized_changed_paths)
+                    )
+                    or scope_is_broad_mutation
+                    or scope_is_unattested_mutation
                 )
                 if not relevant:
                     continue
@@ -1290,6 +1568,11 @@ def acquire_merge_guard_resources(
         "guard_owner_id": guard_owner,
         "lease_owner_id": lease_owner,
         "repository": canonical_repository,
+        "changed_paths": normalized_changed_paths,
+        "relative_changed_paths": relative_changed_paths,
+        "changed_paths_sha256": hashlib.sha256(
+            _canonical_json(relative_changed_paths).encode("utf-8")
+        ).hexdigest(),
         "observed_at_unix": now,
         "observed_at_unix_ns": observed_at_unix_ns,
         "expires_at_unix": expires,
