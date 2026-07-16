@@ -1704,5 +1704,49 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             )
 
 
+class FrictionRepairContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        loader = FrictionFailureRuntimeTests()
+        self.module = loader._load_module()
+        self.addCleanup(loader.doCleanups)
+
+    def test_all_proposal_patterns_have_exact_repair_contracts(self) -> None:
+        self.assertEqual(
+            set(self.module.FRICTION_PROPOSAL_PATTERNS),
+            set(self.module.FRICTION_REPAIR_CONTRACTS),
+        )
+
+    def test_missing_repair_contract_fails_loudly(self) -> None:
+        group = {
+            "pattern": "future_pattern",
+            "actionable_repeated": True,
+            "count": 2,
+            "unresolved": 2,
+            "by_failure_class": {},
+            "by_kind": {},
+            "by_surface": {},
+            "unresolved_evidence_event_ids": [],
+            "unresolved_evidence_event_ids_truncated": False,
+            "unresolved_missing_event_id_count": 0,
+        }
+        rule = {
+            "terms": ("future",),
+            "recommendation_type": "next_grip",
+            "title": "Future",
+            "rationale": "Future contract",
+        }
+        with patch.dict(self.module.FRICTION_PROPOSAL_PATTERNS, {"future_pattern": rule}):
+            with self.assertRaisesRegex(RuntimeError, "lacks repair contract"):
+                self.module._recommendation_for_group(group)
+
+    def test_repair_contract_rejects_invalid_shapes(self) -> None:
+        with patch.dict(
+            self.module.FRICTION_REPAIR_CONTRACTS,
+            {"blocked_gates": {"preferred_route": "explicit_preflight"}},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid fields"):
+                self.module._repair_contract_for_pattern("blocked_gates")
+
+
 if __name__ == "__main__":
     unittest.main()

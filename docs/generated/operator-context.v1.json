@@ -2292,7 +2292,7 @@
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_convergence.py": "03ea75eb190ac08f29c4ec6c5ab1a14a631ce7c0cce4956ed6f437c492a6a635",
       "src/grabowski_fleet.py": "0daf060517bde7b17caf7dd1f684e29521fb7b7457d1bfd79b32cf28a15c3beb",
-      "src/grabowski_friction.py": "14ead1ffd03da6fe9469c4be076c528e2b38611c92a2424af417376c45e7cb21",
+      "src/grabowski_friction.py": "b0e9417cadf0e4e21c57b99c756d77feb16c08b51b057d7c1080a8623a71072c",
       "src/grabowski_grip_orchestration.py": "e996206cbc3a6e7ce97a1f340d1184a84c9a544de46a00253833c25b28577118",
       "src/grabowski_grips.py": "d2d5f0b13470a3333614e87fae3ddcbdc0beaf7942284147d48af26538acc772",
       "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
@@ -2317,7 +2317,7 @@
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "1c4a9517564c2b17c39a87a076e397f0bcb2f428467be782b1b48007b063a49a",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "1eb66e31e34c4eb7f02903f360d3e77e10424fd510b075c6a3224e1dcce5cb87",
+      "src/grabowski_tasks.py": "b1495b5deb3152b1e34dafb4872f7929dd5503c6d5684a75a1026414be429a3a",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9051739e6d1d9b900181ecde39809845cb04578f5bf6960df6e51955ab6419ef",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"
