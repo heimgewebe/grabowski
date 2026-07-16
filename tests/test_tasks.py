@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import io
 import json
 import sqlite3
@@ -198,6 +199,66 @@ class TaskTests(unittest.TestCase):
             unknown["recommended_next_action"],
             "inspect unknown task states before relying on projections",
         )
+
+    def test_database_connection_closes_after_success_and_failure(self) -> None:
+        with tasks._database_connection() as connection:
+            connection.execute("SELECT 1").fetchone()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
+        with self.assertRaisesRegex(RuntimeError, "connection failure"):
+            with tasks._database_connection() as failed_connection:
+                raise RuntimeError("connection failure")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            failed_connection.execute("SELECT 1")
+
+    def test_task_read_snapshot_closes_after_success_and_failure(self) -> None:
+        with tasks._task_read_snapshot() as connection:
+            self.assertTrue(connection.in_transaction)
+            connection.execute("SELECT 1").fetchone()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
+        with self.assertRaisesRegex(RuntimeError, "snapshot failure"):
+            with tasks._task_read_snapshot() as failed_connection:
+                self.assertTrue(failed_connection.in_transaction)
+                raise RuntimeError("snapshot failure")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            failed_connection.execute("SELECT 1")
+
+    def test_task_list_derives_total_from_single_grouped_count_query(self) -> None:
+        task = self._start()["task"]
+        statements: list[str] = []
+        original_snapshot = tasks._task_read_snapshot
+
+        @contextmanager
+        def traced_snapshot():
+            with original_snapshot() as connection:
+                connection.set_trace_callback(statements.append)
+                try:
+                    yield connection
+                finally:
+                    connection.set_trace_callback(None)
+
+        with patch.object(tasks, "_task_read_snapshot", traced_snapshot):
+            listed = tasks.grabowski_task_list(state="running")
+
+        normalized = [" ".join(statement.upper().split()) for statement in statements]
+        grouped_counts = [
+            statement
+            for statement in normalized
+            if statement.startswith("SELECT STATE, COUNT(*) AS COUNT FROM TASKS GROUP BY STATE")
+        ]
+        standalone_counts = [
+            statement
+            for statement in normalized
+            if statement.startswith("SELECT COUNT(*) FROM TASKS")
+        ]
+        self.assertEqual(len(grouped_counts), 1)
+        self.assertEqual(standalone_counts, [])
+        self.assertEqual(listed["total_matching"], 1)
+        self.assertEqual(listed["state_counts"]["running"], 1)
+        self.assertEqual(listed["tasks"][0]["task_id"], task["task_id"])
 
     def test_task_list_reads_rows_and_counts_from_one_snapshot(self) -> None:
         task = self._start()["task"]
@@ -1011,12 +1072,15 @@ class TaskTests(unittest.TestCase):
             ).fetchone()[0]
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(tasks)")}
             indexes = {row[1] for row in migrated.execute("PRAGMA index_list(tasks)")}
+            journal_mode = migrated.execute("PRAGMA journal_mode").fetchone()[0]
         self.assertEqual(version, "2")
         self.assertIn("resource_keys_json", columns)
         self.assertIn("lease_owner_id", columns)
         self.assertIn("chronik_outbox_enabled", columns)
         self.assertIn("chronik_outbox_state_root", columns)
         self.assertIn("tasks_state_created_task_idx", indexes)
+        self.assertIn("tasks_created_task_idx", indexes)
+        self.assertEqual(journal_mode, "wal")
 
     def test_database_rejects_symlink(self) -> None:
         target = self.root / "real.sqlite3"
