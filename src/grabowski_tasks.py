@@ -211,6 +211,10 @@ def _database() -> sqlite3.Connection:
         )
         """
     )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS tasks_state_created_task_idx "
+        "ON tasks(state, created_at_unix DESC, task_id DESC)"
+    )
     current = connection.execute(
         "SELECT value FROM metadata WHERE key='schema_version'"
     ).fetchone()

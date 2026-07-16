@@ -956,11 +956,13 @@ class TaskTests(unittest.TestCase):
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()[0]
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(tasks)")}
+            indexes = {row[1] for row in migrated.execute("PRAGMA index_list(tasks)")}
         self.assertEqual(version, "2")
         self.assertIn("resource_keys_json", columns)
         self.assertIn("lease_owner_id", columns)
         self.assertIn("chronik_outbox_enabled", columns)
         self.assertIn("chronik_outbox_state_root", columns)
+        self.assertIn("tasks_state_created_task_idx", indexes)
 
     def test_database_rejects_symlink(self) -> None:
         target = self.root / "real.sqlite3"
