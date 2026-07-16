@@ -41,6 +41,21 @@ SHELL_EXECUTABLES = {
     "/bin/sh", "/usr/bin/sh",
     "/usr/bin/env", "/bin/env",
 }
+ROOT_TASK_UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
+SYSTEMD_SHOW_PROPERTY = re.compile(r"[A-Za-z][A-Za-z0-9]*\Z")
+ROOT_TASK_OPERATIONS = {"start", "show", "journal", "stop"}
+# The broker must finish before the unprivileged client deadline. Read-only
+# operations therefore use narrower caps than start/stop even when the root
+# configuration permits a larger maximum.
+ROOT_TASK_OPERATION_TIMEOUT_CAPS = {
+    "start": 60,
+    "show": 15,
+    "journal": 30,
+    "stop": 60,
+}
+ROOT_TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS = 30
+ROOT_TASK_LOG_RATE_LIMIT_BURST = 1000
+ROOT_TASK_MAX_RUNTIME_SECONDS = 7 * 24 * 3600 - 300
 
 
 def canonical_sha256(value: Any) -> str:
@@ -883,6 +898,212 @@ def _validate_power_timeout(value: Any, *, configured_max: int) -> int:
     return value
 
 
+def _validate_root_task_unit(value: Any) -> str:
+    if not isinstance(value, str) or ROOT_TASK_UNIT.fullmatch(value) is None:
+        raise ValueError("root task unit is invalid")
+    return value
+
+
+def _validate_root_task_properties(value: Any) -> list[str]:
+    if not (
+        isinstance(value, list)
+        and 1 <= len(value) <= 32
+        and all(isinstance(item, str) and SYSTEMD_SHOW_PROPERTY.fullmatch(item) for item in value)
+    ):
+        raise ValueError("root task property list is invalid")
+    return value
+
+
+def _validate_root_task_lines(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 2000:
+        raise ValueError("root task journal line count is invalid")
+    return value
+
+
+def _validate_root_task_runtime(value: Any) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= ROOT_TASK_MAX_RUNTIME_SECONDS
+    ):
+        raise ValueError("root task runtime_seconds is invalid")
+    return value
+
+
+def _validate_root_task_weight(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 10_000:
+        raise ValueError(f"root task {label} is invalid")
+    return value
+
+
+def _validate_root_task_memory(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 16 * 1024 * 1024:
+        raise ValueError("root task memory_max_bytes is invalid")
+    return value
+
+
+def _validate_root_task_description(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError("root task description is invalid")
+    if len(value.encode("utf-8")) > 240:
+        raise ValueError("root task description exceeds size limit")
+    return value
+
+
+def _resolve_root_task_systemd_action(
+    candidate: dict[str, Any],
+    reference: dict[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "enabled", "mode", "target_pattern", "timeout_seconds",
+        "cwd_pattern", "max_argv", "allow_shell",
+        "allowed_argv_prefixes", "start_gate",
+    }
+    optional = {"policy_intent"}
+    candidate_keys = set(candidate)
+    if (
+        not required.issubset(candidate_keys)
+        or candidate_keys - required - optional
+        or candidate["enabled"] is not True
+    ):
+        raise PermissionError("privileged action is disabled or malformed")
+    if candidate["mode"] != "root-task-systemd":
+        raise PermissionError("privileged action is disabled or malformed")
+    pattern = candidate["target_pattern"]
+    if not isinstance(pattern, str) or len(pattern) > 500:
+        raise ValueError("root task target pattern is invalid")
+    if re.fullmatch(pattern, reference["target"]) is None:
+        raise PermissionError("privileged target does not match its contract")
+    timeout = candidate["timeout_seconds"]
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 3600:
+        raise ValueError("root task timeout is invalid")
+    max_argv = candidate["max_argv"]
+    if isinstance(max_argv, bool) or not isinstance(max_argv, int) or not 1 <= max_argv <= MAX_ARGV_ITEMS:
+        raise ValueError("root task max_argv is invalid")
+    allow_shell = candidate["allow_shell"]
+    if not isinstance(allow_shell, bool):
+        raise ValueError("root task allow_shell is invalid")
+    allowed_argv_prefixes = _validate_power_argv_prefixes(
+        candidate["allowed_argv_prefixes"],
+        max_argv=max_argv,
+        allow_shell=allow_shell,
+    )
+    cwd_pattern = candidate["cwd_pattern"]
+    if not isinstance(cwd_pattern, str):
+        raise ValueError("root task cwd_pattern is invalid")
+    policy_intent = _validate_power_policy_intent(candidate.get("policy_intent"))
+    try:
+        payload = json.loads(reference["target"])
+    except json.JSONDecodeError as exc:
+        raise ValueError("root task target payload JSON is invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("root task target payload is invalid")
+    operation = payload.get("operation")
+    if operation not in ROOT_TASK_OPERATIONS:
+        raise ValueError("root task operation is invalid")
+    operation_timeout = min(timeout, ROOT_TASK_OPERATION_TIMEOUT_CAPS[operation])
+    unit = _validate_root_task_unit(payload.get("unit"))
+    gate: dict[str, Any] | None = None
+    matched_argv_prefix: list[str] | None = None
+    if operation == "show":
+        if set(payload) != {"operation", "unit", "properties"}:
+            raise ValueError("root task show payload is invalid")
+        argv = ["/usr/bin/systemctl", "--system", "show", unit, "--no-pager"]
+        argv.extend(f"--property={item}" for item in _validate_root_task_properties(payload["properties"]))
+    elif operation == "journal":
+        if set(payload) != {"operation", "unit", "max_lines"}:
+            raise ValueError("root task journal payload is invalid")
+        argv = [
+            "/usr/bin/journalctl", "--system", "--unit", unit, "--no-pager",
+            "--output=cat", "--lines", str(_validate_root_task_lines(payload["max_lines"])),
+        ]
+    elif operation == "stop":
+        if set(payload) != {"operation", "unit"}:
+            raise ValueError("root task stop payload is invalid")
+        argv = ["/usr/bin/systemctl", "--system", "stop", unit]
+    else:
+        if set(payload) != {
+            "operation", "unit", "argv", "cwd", "runtime_seconds",
+            "cpu_weight", "io_weight", "memory_max_bytes", "description",
+        }:
+            raise ValueError("root task start payload is invalid")
+        command = _validate_power_argv(
+            payload["argv"],
+            max_argv=max_argv,
+            allow_shell=allow_shell,
+        )
+        # Prefix matching is an explicit command catalog, not an argument
+        # sandbox. Every newly catalogued executable must validate its own
+        # argument semantics or intentionally accept the remaining suffix.
+        for prefix in allowed_argv_prefixes:
+            if _power_argv_matches_prefix(command, prefix):
+                matched_argv_prefix = prefix
+                break
+        if matched_argv_prefix is None:
+            raise PermissionError("root task argv is not allowed by configured catalog")
+        cwd = _validate_power_cwd(payload["cwd"], pattern=cwd_pattern)
+        gate = _validate_power_gate(candidate["start_gate"])
+        runtime = _validate_root_task_runtime(payload["runtime_seconds"])
+        cpu_weight = _validate_root_task_weight(payload["cpu_weight"], "cpu_weight")
+        io_weight = _validate_root_task_weight(payload["io_weight"], "io_weight")
+        memory = _validate_root_task_memory(payload["memory_max_bytes"])
+        description = _validate_root_task_description(payload["description"])
+        argv = [
+            "/usr/bin/systemd-run",
+            "--system",
+            f"--description={description}",
+            "--unit",
+            unit,
+            "--slice=grabowski-root-tasks.slice",
+            "--property=Type=exec",
+            "--property=KillMode=control-group",
+            # The current catalog contains only the sleep-heim* handoff
+            # scripts, whose shutdown contract is bounded to ten seconds. A
+            # broader catalog must make stop grace an explicit validated field.
+            "--property=TimeoutStopSec=10s",
+            f"--property=LogRateLimitIntervalSec={ROOT_TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS}s",
+            f"--property=LogRateLimitBurst={ROOT_TASK_LOG_RATE_LIMIT_BURST}",
+            "--property=LimitCORE=0",
+            "--property=NoNewPrivileges=no",
+            "--property=ProtectSystem=off",
+            "--property=ProtectHome=no",
+            "--property=PrivateTmp=no",
+            "--property=MemoryDenyWriteExecute=no",
+            "--property=UMask=0077",
+            f"--property=RuntimeMaxSec={runtime}s",
+            f"--property=WorkingDirectory={cwd}",
+            f"--property=CPUWeight={cpu_weight}",
+            f"--property=IOWeight={io_weight}",
+        ]
+        if memory is not None:
+            argv.append(f"--property=MemoryMax={memory}")
+        argv.extend(["--", *command])
+    execution: dict[str, Any] = {
+        "mode": "root-task-systemd",
+        "internal_action": f"root-task-{operation}",
+        "argv": argv,
+        "cwd": "/",
+        "timeout_seconds": operation_timeout,
+        "configured_timeout_seconds": timeout,
+        "operation_timeout_cap_seconds": ROOT_TASK_OPERATION_TIMEOUT_CAPS[operation],
+        "unit": unit,
+        "operation": operation,
+        "argv_catalog_sha256": canonical_sha256(allowed_argv_prefixes),
+    }
+    if policy_intent is not None:
+        execution["policy_intent"] = policy_intent
+    if gate is not None:
+        execution["gate"] = gate
+        execution["matched_argv_prefix_sha256"] = canonical_sha256(matched_argv_prefix)
+    return execution
+
+
 def _resolve_power_argv_action(
     candidate: dict[str, Any],
     reference: dict[str, Any],
@@ -972,6 +1193,8 @@ def resolve_execution(config: dict[str, Any], reference: dict[str, Any]) -> dict
         return _resolve_power_argv_action(candidate, reference)
     if mode == "recovery-marker-publish":
         return _resolve_recovery_marker_publish_action(candidate, reference)
+    if mode == "root-task-systemd":
+        return _resolve_root_task_systemd_action(candidate, reference)
     raise PermissionError("privileged action mode is disabled or malformed")
 
 

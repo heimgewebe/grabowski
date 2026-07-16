@@ -60,6 +60,34 @@
         "require_root_owned_gate_files": true,
         "configured_target": "heimberry:rest-server/grabowski-recovery-probe"
       }
+    },
+    "operator_root_task_systemd_unit": {
+      "enabled": true,
+      "mode": "root-task-systemd",
+      "target_pattern": "\\{.{1,49152}\\}",
+      "cwd_pattern": "/[A-Za-z0-9._/@:+-]{0,999}",
+      "timeout_seconds": 60,
+      "max_argv": 16,
+      "allow_shell": false,
+      "policy_intent": "recovery-gated-root-task-catalog",
+      "allowed_argv_prefixes": [
+        [
+          "/usr/local/bin/sleep-heimserver"
+        ],
+        [
+          "/usr/local/bin/sleep-heim-pc"
+        ],
+        [
+          "/usr/local/bin/sleep-heimberry"
+        ]
+      ],
+      "start_gate": {
+        "kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+        "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
+        "max_recovery_age_seconds": 86400,
+        "require_root_owned_gate_files": true,
+        "configured_target": "heimberry:rest-server/grabowski-recovery-probe"
+      }
     }
   }
 }
