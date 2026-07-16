@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from types import ModuleType
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,56 @@ def load_module(name: str, path: Path) -> ModuleType:
 
 agent = load_module("test_juno_ipad_agent_module", AGENT_PATH)
 client_module = load_module("test_juno_job_client_module", CLIENT_PATH)
+
+
+class StateRootSelectionTests(unittest.TestCase):
+    def test_default_selection_falls_back_without_propagating_permission_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blocked = root / "blocked"
+            selected = root / "selected"
+            candidates = [
+                ("script_sibling", blocked, True),
+                ("application_support", selected, True),
+            ]
+            with (
+                patch.object(agent, "default_state_root_candidates", return_value=candidates),
+                patch.object(
+                    agent,
+                    "probe_writable_directory",
+                    side_effect=[PermissionError(1, "not permitted"), selected],
+                ),
+            ):
+                path, source, persistent, failures = agent.select_state_root(
+                    root / "agent.py",
+                    None,
+                )
+            self.assertEqual(path, selected)
+            self.assertEqual(source, "application_support")
+            self.assertTrue(persistent)
+            self.assertEqual(failures, ["script_sibling:PermissionError:1"])
+
+    def test_explicit_state_root_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            explicit = Path(directory) / "explicit"
+            with patch.object(
+                agent,
+                "probe_writable_directory",
+                side_effect=PermissionError(1, "not permitted"),
+            ):
+                with self.assertRaises(PermissionError):
+                    agent.select_state_root(Path(directory) / "agent.py", explicit)
+
+    def test_secret_is_persisted_in_selected_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "readonly" / "agent.py"
+            state_root = root / "writable"
+            state_root.mkdir()
+            secret, source, key_path = agent.load_secret(script, state_root)
+            self.assertIsNone(secret)
+            self.assertEqual(source, "unpaired")
+            self.assertEqual(key_path, state_root / "juno_ipad_agent.key")
 
 
 class NetworkPolicyTests(unittest.TestCase):
@@ -356,6 +407,8 @@ class HTTPIntegrationTests(unittest.TestCase):
                 client = client_module.AgentClient(base_url, secret, 3.0)
                 health = client.health()
                 self.assertTrue(health["arbitrary_python"])
+                self.assertEqual(health["state_storage_source"], "explicit")
+                self.assertTrue(health["state_persistent"])
                 submitted = client.submit(
                     "GRABOWSKI_RESULT = {'value': 7}",
                     timeout_seconds=5,

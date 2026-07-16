@@ -39,6 +39,18 @@ Tailscale-Pfad an den ungekoppelten Agenten übermittelt. Auf beiden Geräten wi
 er anschließend als private Datei gespeichert. Eine Schlüsseldatei muss nicht
 über Chat, Taildrop oder Zwischenablage transportiert werden.
 
+Juno kann ein über den Dateien- oder Dokumentanbieter geöffnetes Skript lesen,
+ohne in dessen Ordner neue Dateien anlegen zu dürfen. Der Agent prüft deshalb
+seine State-Pfade vor dem Start und verwendet in dieser Reihenfolge den
+Skriptordner, das aktuelle Arbeitsverzeichnis, den app-eigenen
+`Library/Application Support`-Bereich und zuletzt ein temporäres Verzeichnis.
+Die gewählte Quelle und ihre Persistenzeigenschaft erscheinen in der
+Startausgabe und im Health-Dokument. Der Pairing-Schlüssel wird im gewählten
+beschreibbaren State-Verzeichnis gespeichert, sofern keine lesbare alte
+Schlüsseldatei neben dem Skript existiert. Ein ausdrücklich gesetztes
+`--state-root` fällt dagegen nicht automatisch zurück, sondern scheitert bei
+fehlender Schreibberechtigung.
+
 Standardbindung:
 
 ```text
