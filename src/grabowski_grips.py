@@ -417,6 +417,9 @@ CAPTAIN_EXECUTION_INTENT_FIELDS = (
     "context",
     "issued_at",
 )
+CAPTAIN_EXECUTION_INTENT_ACTION_FIELDS = {
+    "pr-merge": ("expected_base_sha",),
+}
 CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS = (
     "actions_sha256",
     "status_projection_sha256",
@@ -496,6 +499,10 @@ def _captain_authority_contract(surface: str) -> dict[str, Any]:
                 "check": "execution-intent-bound",
                 "surfaces": ["captain-run"],
                 "required_fields": list(CAPTAIN_EXECUTION_INTENT_FIELDS),
+                "action_specific_required_fields": {
+                    action: list(fields)
+                    for action, fields in CAPTAIN_EXECUTION_INTENT_ACTION_FIELDS.items()
+                },
                 "evidence_digests": list(CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS),
                 "freshness": {
                     "max_age_seconds": CAPTAIN_EXECUTION_INTENT_MAX_AGE_SECONDS,
@@ -650,23 +657,31 @@ def _default_github_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
         completed = subprocess.run(
             command,
             cwd=repo,
-            text=True,
+            text=False,
             capture_output=True,
             check=False,
             timeout=30,
             env=env,
         )
     except subprocess.TimeoutExpired as exc:
+        stdout_bytes = exc.stdout if isinstance(exc.stdout, bytes) else b""
+        stderr_bytes = exc.stderr if isinstance(exc.stderr, bytes) else b""
         return {
             "returncode": 124,
-            "stdout": (exc.stdout or "").rstrip("\n") if isinstance(exc.stdout, str) else "",
+            "stdout": stdout_bytes.decode("utf-8", errors="replace").rstrip("\n"),
             "stderr": "gh command timed out after 30 seconds",
+            "stdout_bytes": stdout_bytes,
+            "stderr_bytes": stderr_bytes,
             "argv": command,
         }
+    stdout_bytes = completed.stdout
+    stderr_bytes = completed.stderr
     return {
         "returncode": completed.returncode,
-        "stdout": completed.stdout.rstrip("\n"),
-        "stderr": completed.stderr.rstrip("\n"),
+        "stdout": stdout_bytes.decode("utf-8", errors="replace").rstrip("\n"),
+        "stderr": stderr_bytes.decode("utf-8", errors="replace").rstrip("\n"),
+        "stdout_bytes": stdout_bytes,
+        "stderr_bytes": stderr_bytes,
         "argv": command,
     }
 
@@ -947,6 +962,7 @@ def _self_review_audit_errors(
     *,
     expected_head: str | None,
     expected_diff_sha256: str | None = None,
+    expected_base_sha: str | None = None,
     expected_repo: str | None = None,
     expected_pr: int | None = None,
 ) -> list[str]:
@@ -990,6 +1006,14 @@ def _self_review_audit_errors(
         errors.append("head_sha must be a 40 character hex SHA")
     elif expected_head is not None and head_sha != expected_head:
         errors.append("head_sha does not match expected_head")
+    base_sha = evidence.get("base_sha")
+    if expected_base_sha is not None:
+        if not _is_hex_sha(base_sha, lengths=(40,)):
+            errors.append("base_sha must be a 40 character hex SHA")
+        elif base_sha != expected_base_sha:
+            errors.append("base_sha does not match expected_base_sha")
+    elif base_sha is not None and not _is_hex_sha(base_sha, lengths=(40,)):
+        errors.append("base_sha must be a 40 character hex SHA when provided")
     diff_sha256 = evidence.get("diff_sha256")
     if not _is_hex_sha(diff_sha256, lengths=(64,)):
         errors.append("diff_sha256 must be a 64 character hex SHA")
@@ -2965,6 +2989,7 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
     if action_name == "pr-merge":
         schema["target_binding"] = {"repo": target.get("repo"), "pr": target.get("pr"), "base": target.get("base")}
         schema["head_binding"] = {"parameter": "expected_head", "required": True}
+        schema["base_sha_binding"] = {"parameter": "expected_base_sha", "required": True}
         schema["diff_binding"] = {"parameter": "diff_sha256", "required": True}
         schema["required_evidence"].extend([
             _captain_action_evidence_item(
@@ -2976,6 +3001,7 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
                     "pr",
                     "generated_at",
                     "head_sha",
+                    "base_sha",
                     "diff_sha256",
                     "review_tier",
                     "gate_verdict",
@@ -2994,8 +3020,8 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
                     "all_findings_triaged": True,
                     "tuning_signal": "observe",
                 },
-                binds=("expected_head", "diff_sha256", *common_bindings),
-                purpose="diff-bound self-review audit for the exact PR head, including risk-scaled review depth",
+                binds=("expected_head", "expected_base_sha", "diff_sha256", *common_bindings),
+                purpose="diff-bound self-review audit for the exact PR head and base commit, including risk-scaled review depth",
             ),
             _captain_action_evidence_item(
                 "ci_evidence",
@@ -3585,6 +3611,7 @@ def _captain_review_evidence_gate(parameters: dict[str, Any], actions: list[dict
             ["review_evidence_missing"],
         )
     expected_diff = parameters.get("diff_sha256")
+    expected_base_sha = parameters.get("expected_base_sha")
     pr_merge_targets = [
         action.get("target")
         for action in actions
@@ -3603,6 +3630,13 @@ def _captain_review_evidence_gate(parameters: dict[str, Any], actions: list[dict
             "one self-review audit can bind exactly one pr-merge action",
             ["pr_merge_review_target_count_invalid"],
         )
+    if not _is_hex_sha(expected_base_sha, lengths=(40,)):
+        return _captain_gate(
+            "review-evidence-present",
+            "blocked",
+            "expected_base_sha must be present as a 40 character hex SHA for PR merge review binding",
+            ["expected_base_sha_missing_or_invalid"],
+        )
     pr_target = pr_merge_targets[0]
     expected_repo = pr_target.get("repo")
     expected_pr = pr_target.get("pr")
@@ -3610,6 +3644,7 @@ def _captain_review_evidence_gate(parameters: dict[str, Any], actions: list[dict
         evidence,
         expected_head=expected_head if isinstance(expected_head, str) else None,
         expected_diff_sha256=expected_diff if isinstance(expected_diff, str) else None,
+        expected_base_sha=expected_base_sha if isinstance(expected_base_sha, str) else None,
         expected_repo=expected_repo if isinstance(expected_repo, str) else None,
         expected_pr=expected_pr if isinstance(expected_pr, int) and not isinstance(expected_pr, bool) else None,
     )
@@ -3955,6 +3990,7 @@ def _captain_execution_intent_review(
         "target_sha256": None,
         "expected_head": None,
         "expected_base": None,
+        "expected_base_sha": None,
         "evidence_sha256": {key: None for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS},
         "actor_sha256": None,
         "context_sha256": None,
@@ -3973,10 +4009,18 @@ def _captain_execution_intent_review(
         errors.append("execution_intent_malformed")
         info["errors"] = list(errors)
         return info, errors
-    for name in CAPTAIN_EXECUTION_INTENT_FIELDS:
+    action_name = (
+        str(actions[0].get("action"))
+        if len(actions) == 1 and isinstance(actions[0], dict)
+        else ""
+    )
+    action_fields = CAPTAIN_EXECUTION_INTENT_ACTION_FIELDS.get(action_name, ())
+    required_intent_fields = (*CAPTAIN_EXECUTION_INTENT_FIELDS, *action_fields)
+    allowed_intent_fields = frozenset(required_intent_fields)
+    for name in required_intent_fields:
         if name not in intent:
             errors.append(f"execution_intent_field_missing:{name}")
-    if any(key not in CAPTAIN_EXECUTION_INTENT_FIELDS for key in intent):
+    if any(key not in allowed_intent_fields for key in intent):
         errors.append("execution_intent_unknown_fields_present")
     schema_version = intent.get("schema_version")
     if isinstance(schema_version, bool) or schema_version != CAPTAIN_EXECUTION_INTENT_SCHEMA_VERSION:
@@ -4065,6 +4109,22 @@ def _captain_execution_intent_review(
             errors.append("execution_intent_base_drift")
         else:
             info["expected_base"] = declared_base
+    if action["action"] == "pr-merge" and "expected_base_sha" in intent:
+        declared_base_sha = intent.get("expected_base_sha")
+        base_sha_status = _captain_intent_canonical_hex_status(
+            declared_base_sha, length=40
+        )
+        expected_base_sha = _normalize_40_sha(parameters.get("expected_base_sha"))
+        if base_sha_status == "invalid":
+            errors.append("execution_intent_field_invalid:expected_base_sha")
+        elif base_sha_status == "not_canonical":
+            errors.append("execution_intent_field_not_canonical:expected_base_sha")
+        elif expected_base_sha is None:
+            errors.append("execution_intent_base_sha_unverifiable")
+        elif declared_base_sha != expected_base_sha:
+            errors.append("execution_intent_base_sha_drift")
+        else:
+            info["expected_base_sha"] = declared_base_sha
     if "evidence_sha256" in intent:
         declared_evidence = intent.get("evidence_sha256")
         if not isinstance(declared_evidence, dict) or not declared_evidence:
@@ -4118,7 +4178,7 @@ def _captain_pr_view(
         "--repo",
         repo_slug,
         "--json",
-        "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,isDraft,mergeable,mergeStateStatus",
+        "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus",
     ]
     try:
         view_result = github_runner(repo_path, view_args)
@@ -4140,9 +4200,15 @@ def _captain_pr_view(
     return viewed, info
 
 
-def _captain_pr_merge_preflight_errors(viewed: dict[str, Any], *, expected_head: str, expected_base: str) -> list[str]:
+def _captain_pr_merge_preflight_errors(
+    viewed: dict[str, Any],
+    *,
+    expected_head: str,
+    expected_base: str,
+    expected_base_sha: str,
+) -> list[str]:
     errors: list[str] = []
-    required = ("state", "isDraft", "headRefOid", "baseRefName", "mergeable", "mergeStateStatus")
+    required = ("state", "isDraft", "headRefOid", "baseRefName", "baseRefOid", "mergeable", "mergeStateStatus")
     for key in required:
         if key not in viewed:
             errors.append(f"pr_view_missing_{key}")
@@ -4159,6 +4225,9 @@ def _captain_pr_merge_preflight_errors(viewed: dict[str, Any], *, expected_head:
         errors.append("pr_head_does_not_match_expected_head_before_execution")
     if viewed.get("baseRefName") != expected_base:
         errors.append("pr_base_does_not_match_expected_base_before_execution")
+    observed_base_sha = _normalize_40_sha(viewed.get("baseRefOid"))
+    if observed_base_sha != expected_base_sha:
+        errors.append("pr_base_sha_does_not_match_expected_base_sha_before_execution")
     if viewed.get("mergeable") != "MERGEABLE":
         errors.append("pr_mergeable_not_confirmed_before_execution")
     if viewed.get("mergeStateStatus") != "CLEAN":
@@ -4189,6 +4258,7 @@ def _captain_pr_merge_preflight_view(
     pr_number: str,
     expected_head: str,
     expected_base: str,
+    expected_base_sha: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
     attempts: list[dict[str, Any]] = []
     last_viewed: dict[str, Any] | None = None
@@ -4208,7 +4278,12 @@ def _captain_pr_merge_preflight_view(
                 continue
             break
         last_viewed = viewed
-        last_errors = _captain_pr_merge_preflight_errors(viewed, expected_head=expected_head, expected_base=expected_base)
+        last_errors = _captain_pr_merge_preflight_errors(
+            viewed,
+            expected_head=expected_head,
+            expected_base=expected_base,
+            expected_base_sha=expected_base_sha,
+        )
         if not last_errors:
             summary = {
                 "attempt_count": len(attempts),
@@ -4394,6 +4469,9 @@ def _run_captain_pr_merge(
     expected_head = _normalize_40_sha(_string_parameter(parameters, "expected_head"))
     if expected_head is None:
         raise GripPreflightError("expected_head must be a 40 character hex SHA for pr-merge execution")
+    expected_base_sha = _normalize_40_sha(_string_parameter(parameters, "expected_base_sha"))
+    if expected_base_sha is None:
+        raise GripPreflightError("expected_base_sha must be a 40 character hex SHA for pr-merge execution")
     target = action["target"]
     repo_slug = str(target["repo"])
     pr_number = str(target["pr"])
@@ -4404,6 +4482,7 @@ def _run_captain_pr_merge(
         "pr": target["pr"],
         "expected_head": expected_head,
         "expected_base": expected_base,
+        "expected_base_sha": expected_base_sha,
         "execution_attempted": False,
         "execution_invoked": False,
         "command_returned": False,
@@ -4418,6 +4497,7 @@ def _run_captain_pr_merge(
         pr_number=pr_number,
         expected_head=expected_head,
         expected_base=expected_base,
+        expected_base_sha=expected_base_sha,
     )
     execution_result["pre_view"] = pre_view
     execution_result["preflight_view_summary"] = preflight_summary
