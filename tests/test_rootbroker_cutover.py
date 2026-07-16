@@ -272,6 +272,33 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 publisher=publisher,
             )
 
+    def test_current_recovery_dropin_binds_legacy_not_canonical_marker(self) -> None:
+        publisher = _publisher()
+        publisher["kill_switch_path"] = (
+            "/var/lib/grabowski/operator-blockade/operator-kill-switch"
+        )
+        publisher["legacy_kill_switch_path"] = (
+            "/home/alex/.local/state/grabowski/operator-kill-switch"
+        )
+
+        generated = cutover._expected_recovery_source_dropin(publisher)
+
+        self.assertIn(
+            b"BindReadOnlyPaths=-/home/alex/.local/state/grabowski/"
+            b"operator-kill-switch\n",
+            generated,
+        )
+        self.assertNotIn(b"/var/lib/grabowski/operator-blockade", generated)
+
+    def test_recovery_dropin_rejects_unsafe_explicit_legacy_path(self) -> None:
+        publisher = _publisher()
+        publisher["legacy_kill_switch_path"] = "/home/alex/unsafe marker"
+
+        with self.assertRaisesRegex(
+            cutover.CutoverError, "forbidden whitespace"
+        ):
+            cutover._expected_recovery_source_dropin(publisher)
+
     def test_publisher_is_loaded_from_bound_commit_not_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repository = Path(raw)

@@ -406,19 +406,30 @@ def _validate_source_artifacts(
 
 def _expected_recovery_source_dropin(publisher: dict[str, Any]) -> bytes:
     source_path = publisher.get("source_path")
-    kill_switch_path = publisher.get("kill_switch_path")
+    legacy_kill_switch_path = publisher.get("legacy_kill_switch_path")
+    if legacy_kill_switch_path is None:
+        # Commit-bound compatibility for pre-authority publisher fixtures, where
+        # kill_switch_path still named the operator-home marker. Current
+        # contracts always provide the explicit legacy path.
+        legacy_kill_switch_path = publisher.get("kill_switch_path")
     if not isinstance(source_path, str) or not source_path.startswith("/"):
         raise CutoverError("recovery publisher source path is invalid")
-    if not isinstance(kill_switch_path, str) or not kill_switch_path.startswith("/"):
-        raise CutoverError("recovery publisher kill-switch path is invalid")
-    if any(character in source_path + kill_switch_path for character in "\n\r "):
+    if (
+        not isinstance(legacy_kill_switch_path, str)
+        or not legacy_kill_switch_path.startswith("/")
+    ):
+        raise CutoverError("recovery publisher legacy kill-switch path is invalid")
+    if any(
+        character in source_path + legacy_kill_switch_path
+        for character in "\n\r "
+    ):
         raise CutoverError("recovery sandbox paths contain forbidden whitespace")
     return (
         "[Service]\n"
         "ProtectHome=tmpfs\n"
         "BindReadOnlyPaths=\n"
         f"BindReadOnlyPaths={source_path}\n"
-        f"BindReadOnlyPaths=-{kill_switch_path}\n"
+        f"BindReadOnlyPaths=-{legacy_kill_switch_path}\n"
     ).encode("utf-8")
 
 
