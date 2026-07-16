@@ -195,7 +195,7 @@ def _remote_run(host: str, argv: list[str], timeout_seconds: int = 60) -> dict[s
     )["result"]
     if result["returncode"] != 0:
         detail = result.get("stderr") or result.get("stdout") or "remote operation failed"
-        raise RuntimeError(operator._redact_text(detail.strip()))
+        raise RuntimeError(_error_summary(RuntimeError(detail.strip())))
     return result
 
 
@@ -318,6 +318,137 @@ def artifact_stat(host: str, path: str) -> dict[str, Any]:
     return {"transport": "ssh", **_remote_stat(host, path)}
 
 
+def _remote_state_evidence(state: dict[str, Any]) -> dict[str, Any]:
+    evidence: dict[str, Any] = {"exists": bool(state.get("exists"))}
+    if evidence["exists"]:
+        evidence["size"] = state.get("size")
+        evidence["sha256"] = state.get("sha256")
+    return evidence
+
+
+def _remote_states_equal(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    first_evidence = _remote_state_evidence(first)
+    second_evidence = _remote_state_evidence(second)
+    return first_evidence == second_evidence
+
+
+def _validate_remote_destination_precondition(
+    state: dict[str, Any],
+    *,
+    mode: str,
+    expected_destination_sha256: str,
+    destination: str,
+) -> None:
+    if mode == "create":
+        if state["exists"]:
+            raise FileExistsError(destination)
+        return
+    if not state["exists"]:
+        raise FileNotFoundError(destination)
+    if state.get("sha256") != expected_destination_sha256:
+        raise RuntimeError("Destination hash precondition failed")
+
+
+def _remote_state_matches_expected_artifact(
+    state: dict[str, Any],
+    *,
+    expected_sha256: str,
+    expected_size: int,
+) -> bool:
+    return (
+        state.get("exists") is True
+        and state.get("sha256") == expected_sha256
+        and state.get("size") == expected_size
+    )
+
+
+def _validated_remote_publish_receipt(
+    value: Any,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+    expected_mode: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError("Remote artifact publish returned an invalid receipt")
+    if (
+        value.get("sha256") != expected_sha256
+        or value.get("size") != expected_size
+        or value.get("mode") != expected_mode
+    ):
+        raise RuntimeError("Remote artifact publish receipt does not match the request")
+    return {
+        "sha256": expected_sha256,
+        "size": expected_size,
+        "mode": expected_mode,
+    }
+
+
+def _error_summary(error: BaseException) -> str:
+    value = str(error).strip()
+    try:
+        redactor = getattr(operator, "_redact_text")
+    except AttributeError:
+        redactor = None
+    if callable(redactor):
+        value = redactor(value)
+    return (value or type(error).__name__)[:1000]
+
+
+def _ambiguous_push_receipt(
+    *,
+    host: str,
+    source: Path,
+    destination: str,
+    source_sha256: str,
+    size: int,
+    mode: str,
+    scp_returncode: int,
+    pre_state: dict[str, Any],
+    publish_error: BaseException,
+    publish_response_valid: bool,
+    post_state: dict[str, Any] | None = None,
+    readback_error: BaseException | None = None,
+) -> dict[str, Any]:
+    ambiguity: dict[str, Any] = {
+        "reason": (
+            "post_state_readback_failed"
+            if readback_error is not None
+            else "post_state_did_not_match_precondition_or_expected_artifact"
+        ),
+        "publish_error": _error_summary(publish_error),
+        "publish_response_valid": publish_response_valid,
+        "pre_state": _remote_state_evidence(pre_state),
+        "expected_post_state": {
+            "exists": True,
+            "size": size,
+            "sha256": source_sha256,
+        },
+        "verification": {
+            "method": "grabowski_artifact_stat",
+            "host": host,
+            "path": destination,
+        },
+    }
+    if post_state is not None:
+        ambiguity["observed_post_state"] = _remote_state_evidence(post_state)
+    if readback_error is not None:
+        ambiguity["readback_error"] = _error_summary(readback_error)
+    return {
+        "success": False,
+        "direction": "push",
+        "source": {"host": "local", "path": str(source), "sha256": source_sha256},
+        "destination": {"host": host, "path": destination},
+        "size": size,
+        "expected_sha256": source_sha256,
+        "mode": mode,
+        "scp_returncode": scp_returncode,
+        "publish_response_valid": publish_response_valid,
+        "mutation_outcome": "ambiguous",
+        "ambiguous_mutation_outcome": ambiguity,
+    }
+
+
 def artifact_push(
     host: str,
     source_path: str,
@@ -349,31 +480,130 @@ def artifact_push(
         metadata={"host": host, "direction": "push"},
     )
     temporary = f"{destination}.grabowski-{uuid.uuid4().hex}.tmp"
+    temporary_uploaded = False
     try:
+        pre_state = _remote_stat(host, destination)
+        _validate_remote_destination_precondition(
+            pre_state,
+            mode=mode,
+            expected_destination_sha256=expected_destination,
+            destination=destination,
+        )
+        temporary_uploaded = True
         scp_result = _scp(host, str(source), temporary, upload=True)
         if scp_result["returncode"] != 0:
-            raise RuntimeError(operator._redact_text(scp_result.get("stderr", "scp failed")))
-        publish = _remote_run(
-            host,
-            [
-                "python3",
-                "-c",
-                _REMOTE_PUBLISH_SCRIPT,
-                temporary,
-                destination,
-                expected_source,
-                mode,
-                expected_destination,
-            ],
-            60,
-        )
-        result = json.loads(publish["stdout"])
+            raise RuntimeError(
+                _error_summary(RuntimeError(scp_result.get("stderr", "scp failed")))
+            )
+        publish_response_valid = False
+        publish_error: BaseException | None = None
+        try:
+            publish = _remote_run(
+                host,
+                [
+                    "python3",
+                    "-c",
+                    _REMOTE_PUBLISH_SCRIPT,
+                    temporary,
+                    destination,
+                    expected_source,
+                    mode,
+                    expected_destination,
+                ],
+                60,
+            )
+            try:
+                raw_receipt = json.loads(publish["stdout"])
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Remote artifact publish returned invalid JSON") from exc
+            _validated_remote_publish_receipt(
+                raw_receipt,
+                expected_sha256=expected_source,
+                expected_size=size,
+                expected_mode=mode,
+            )
+            publish_response_valid = True
+        except Exception as exc:
+            publish_error = exc
+
+        try:
+            observed_post_state = _remote_stat(host, destination)
+        except Exception as readback_error:
+            if temporary_uploaded:
+                _remote_cleanup(host, temporary)
+            return _ambiguous_push_receipt(
+                host=host,
+                source=source,
+                destination=destination,
+                source_sha256=actual_source,
+                size=size,
+                mode=mode,
+                scp_returncode=scp_result["returncode"],
+                pre_state=pre_state,
+                publish_error=(
+                    publish_error
+                    if publish_error is not None
+                    else RuntimeError(
+                        "Validated publish receipt could not be bound to a post-state readback"
+                    )
+                ),
+                publish_response_valid=publish_response_valid,
+                readback_error=readback_error,
+            )
+
+        if _remote_state_matches_expected_artifact(
+            observed_post_state,
+            expected_sha256=expected_source,
+            expected_size=size,
+        ):
+            result = {
+                "sha256": expected_source,
+                "size": size,
+                "mode": mode,
+            }
+            mutation_outcome = (
+                "confirmed_by_publish_receipt_and_post_state_readback"
+                if publish_response_valid
+                else "confirmed_by_post_state_readback_after_publish_error"
+            )
+            post_state_readback = _remote_state_evidence(observed_post_state)
+        elif publish_error is not None and _remote_states_equal(
+            pre_state, observed_post_state
+        ):
+            raise RuntimeError(
+                "Artifact publication failed without changing the destination: "
+                + _error_summary(publish_error)
+            ) from publish_error
+        else:
+            if temporary_uploaded:
+                _remote_cleanup(host, temporary)
+            return _ambiguous_push_receipt(
+                host=host,
+                source=source,
+                destination=destination,
+                source_sha256=actual_source,
+                size=size,
+                mode=mode,
+                scp_returncode=scp_result["returncode"],
+                pre_state=pre_state,
+                publish_error=(
+                    publish_error
+                    if publish_error is not None
+                    else RuntimeError(
+                        "Validated publish receipt contradicted the observed post-state"
+                    )
+                ),
+                publish_response_valid=publish_response_valid,
+                post_state=observed_post_state,
+            )
     except Exception:
-        _remote_cleanup(host, temporary)
+        if temporary_uploaded:
+            _remote_cleanup(host, temporary)
         raise
     finally:
         resources.release_resources(owner, [resource_key])
-    return {
+    receipt = {
+        "success": True,
         "direction": "push",
         "source": {"host": "local", "path": str(source), "sha256": actual_source},
         "destination": {"host": host, "path": destination},
@@ -381,7 +611,12 @@ def artifact_push(
         "sha256": result["sha256"],
         "mode": mode,
         "scp_returncode": scp_result["returncode"],
+        "publish_response_valid": publish_response_valid,
+        "mutation_outcome": mutation_outcome,
     }
+    if post_state_readback is not None:
+        receipt["post_state_readback"] = post_state_readback
+    return receipt
 
 
 def artifact_pull(
@@ -425,7 +660,9 @@ def artifact_pull(
     try:
         scp_result = _scp(host, source, str(temporary), upload=False)
         if scp_result["returncode"] != 0:
-            raise RuntimeError(operator._redact_text(scp_result.get("stderr", "scp failed")))
+            raise RuntimeError(
+                _error_summary(RuntimeError(scp_result.get("stderr", "scp failed")))
+            )
         downloaded_hash, downloaded_size = _hash_file(temporary)
         if downloaded_hash != expected_source or downloaded_size != remote["size"]:
             raise RuntimeError("Downloaded artifact failed source verification")

@@ -153,9 +153,13 @@ class ArtifactTests(unittest.TestCase):
         source = self.root / "source.bin"
         source.write_bytes(b"payload")
         expected = sha(b"payload")
+        old = sha(b"old")
         cleaned: list[str] = []
+        pre_state = {"exists": True, "size": 3, "sha256": old}
         with patch.object(artifacts, "_local_source", return_value=source), patch.object(
             artifacts.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            artifacts, "_remote_stat", side_effect=[pre_state, dict(pre_state)]
         ), patch.object(
             artifacts, "_scp", return_value={"returncode": 0, "stdout": "", "stderr": ""}
         ), patch.object(
@@ -163,10 +167,10 @@ class ArtifactTests(unittest.TestCase):
         ), patch.object(
             artifacts, "_remote_cleanup", side_effect=lambda host, path: cleaned.append(path)
         ):
-            with self.assertRaisesRegex(RuntimeError, "precondition"):
+            with self.assertRaisesRegex(RuntimeError, "without changing"):
                 artifacts.artifact_push(
                     "remote", str(source), "/remote/file", expected,
-                    create_only=False, expected_destination_sha256=sha(b"old"),
+                    create_only=False, expected_destination_sha256=old,
                 )
         self.assertEqual(len(cleaned), 1)
         self.assertTrue(cleaned[0].startswith("/remote/file.grabowski-"))
@@ -180,13 +184,210 @@ class ArtifactTests(unittest.TestCase):
         with patch.object(artifacts, "_local_source", return_value=source), patch.object(
             artifacts.fleet, "fleet_host", return_value=REMOTE_HOST
         ), patch.object(
+            artifacts, "_remote_stat", side_effect=[
+                {"exists": False},
+                {"exists": True, "size": source.stat().st_size, "sha256": expected},
+            ]
+        ), patch.object(
             artifacts, "_scp", return_value={"returncode": 0, "stdout": "", "stderr": ""}
         ), patch.object(artifacts, "_remote_run", return_value=publish):
             result = artifacts.artifact_push(
                 "remote", str(source), "/remote/file", expected, create_only=True
             )
         self.assertNotIn("secret-like-content", json.dumps(result))
+        self.assertTrue(result["success"])
         self.assertEqual(result["sha256"], expected)
+        self.assertEqual(
+            result["mutation_outcome"],
+            "confirmed_by_publish_receipt_and_post_state_readback",
+        )
+        self.assertEqual(result["post_state_readback"]["sha256"], expected)
+        self.assertTrue(result["publish_response_valid"])
+
+    def test_push_recovers_success_from_post_state_after_invalid_response(self) -> None:
+        source = self.root / "source.bin"
+        source.write_bytes(b"payload")
+        expected = sha(source.read_bytes())
+        cleaned: list[str] = []
+        with patch.object(artifacts, "_local_source", return_value=source), patch.object(
+            artifacts.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            artifacts, "_remote_stat", side_effect=[
+                {"exists": False},
+                {"exists": True, "size": source.stat().st_size, "sha256": expected},
+            ]
+        ), patch.object(
+            artifacts, "_scp", return_value={"returncode": 0, "stdout": "", "stderr": ""}
+        ), patch.object(
+            artifacts, "_remote_run", return_value={"returncode": 0, "stdout": "", "stderr": ""}
+        ), patch.object(
+            artifacts, "_remote_cleanup", side_effect=lambda host, path: cleaned.append(path)
+        ):
+            result = artifacts.artifact_push(
+                "remote", str(source), "/remote/file", expected, create_only=True
+            )
+        self.assertTrue(result["success"])
+        self.assertFalse(result["publish_response_valid"])
+        self.assertEqual(
+            result["mutation_outcome"],
+            "confirmed_by_post_state_readback_after_publish_error",
+        )
+        self.assertEqual(result["post_state_readback"]["sha256"], expected)
+        self.assertEqual(cleaned, [])
+        self.assertEqual(artifacts.resources.list_resources(), [])
+
+    def test_push_cleans_partial_temporary_after_scp_failure(self) -> None:
+        source = self.root / "source.bin"
+        source.write_bytes(b"payload")
+        expected = sha(source.read_bytes())
+        cleaned: list[str] = []
+        with patch.object(artifacts, "_local_source", return_value=source), patch.object(
+            artifacts.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            artifacts, "_remote_stat", return_value={"exists": False}
+        ), patch.object(
+            artifacts, "_scp", return_value={"returncode": 1, "stdout": "", "stderr": "copy failed"}
+        ), patch.object(
+            artifacts, "_remote_cleanup", side_effect=lambda host, path: cleaned.append(path)
+        ):
+            with self.assertRaisesRegex(RuntimeError, "copy failed"):
+                artifacts.artifact_push(
+                    "remote", str(source), "/remote/file", expected, create_only=True
+                )
+        self.assertEqual(len(cleaned), 1)
+        self.assertTrue(cleaned[0].startswith("/remote/file.grabowski-"))
+        self.assertEqual(artifacts.resources.list_resources(), [])
+
+    def test_push_marks_valid_receipt_with_contradictory_post_state_ambiguous(self) -> None:
+        source = self.root / "source.bin"
+        source.write_bytes(b"payload")
+        expected = sha(source.read_bytes())
+        other = sha(b"other")
+        publish = {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {"size": source.stat().st_size, "sha256": expected, "mode": "create"}
+            ),
+            "stderr": "",
+        }
+        with patch.object(artifacts, "_local_source", return_value=source), patch.object(
+            artifacts.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            artifacts, "_remote_stat", side_effect=[
+                {"exists": False},
+                {"exists": True, "size": 5, "sha256": other},
+            ]
+        ), patch.object(
+            artifacts, "_scp", return_value={"returncode": 0, "stdout": "", "stderr": ""}
+        ), patch.object(artifacts, "_remote_run", return_value=publish), patch.object(
+            artifacts, "_remote_cleanup"
+        ):
+            result = artifacts.artifact_push(
+                "remote", str(source), "/remote/file", expected, create_only=True
+            )
+        self.assertFalse(result["success"])
+        self.assertTrue(result["publish_response_valid"])
+        ambiguity = result["ambiguous_mutation_outcome"]
+        self.assertTrue(ambiguity["publish_response_valid"])
+        self.assertIn("contradicted", ambiguity["publish_error"])
+        self.assertEqual(ambiguity["observed_post_state"]["sha256"], other)
+        self.assertEqual(artifacts.resources.list_resources(), [])
+
+    def test_push_returns_ambiguous_receipt_when_post_state_readback_fails(self) -> None:
+        source = self.root / "source.bin"
+        source.write_bytes(b"payload")
+        expected = sha(source.read_bytes())
+        cleaned: list[str] = []
+        with patch.object(artifacts, "_local_source", return_value=source), patch.object(
+            artifacts.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            artifacts, "_remote_stat", side_effect=[
+                {"exists": False},
+                RuntimeError("readback offline"),
+            ]
+        ), patch.object(
+            artifacts, "_scp", return_value={"returncode": 0, "stdout": "", "stderr": ""}
+        ), patch.object(
+            artifacts, "_remote_run", side_effect=RuntimeError("transport response lost")
+        ), patch.object(
+            artifacts, "_remote_cleanup", side_effect=lambda host, path: cleaned.append(path)
+        ):
+            result = artifacts.artifact_push(
+                "remote", str(source), "/remote/file", expected, create_only=True
+            )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["mutation_outcome"], "ambiguous")
+        ambiguity = result["ambiguous_mutation_outcome"]
+        self.assertEqual(ambiguity["reason"], "post_state_readback_failed")
+        self.assertFalse(result["publish_response_valid"])
+        self.assertFalse(ambiguity["publish_response_valid"])
+        self.assertEqual(ambiguity["verification"]["method"], "grabowski_artifact_stat")
+        self.assertIn("readback offline", ambiguity["readback_error"])
+        self.assertEqual(len(cleaned), 1)
+        self.assertEqual(artifacts.resources.list_resources(), [])
+
+    def test_push_requires_readback_after_valid_publish_receipt(self) -> None:
+        source = self.root / "source.bin"
+        source.write_bytes(b"payload")
+        expected = sha(source.read_bytes())
+        publish = {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {"size": source.stat().st_size, "sha256": expected, "mode": "create"}
+            ),
+            "stderr": "",
+        }
+        with patch.object(artifacts, "_local_source", return_value=source), patch.object(
+            artifacts.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            artifacts, "_remote_stat", side_effect=[
+                {"exists": False},
+                RuntimeError("verification unavailable"),
+            ]
+        ), patch.object(
+            artifacts, "_scp", return_value={"returncode": 0, "stdout": "", "stderr": ""}
+        ), patch.object(artifacts, "_remote_run", return_value=publish), patch.object(
+            artifacts, "_remote_cleanup"
+        ):
+            result = artifacts.artifact_push(
+                "remote", str(source), "/remote/file", expected, create_only=True
+            )
+        self.assertFalse(result["success"])
+        self.assertTrue(result["publish_response_valid"])
+        ambiguity = result["ambiguous_mutation_outcome"]
+        self.assertTrue(ambiguity["publish_response_valid"])
+        self.assertEqual(ambiguity["reason"], "post_state_readback_failed")
+        self.assertIn("verification unavailable", ambiguity["readback_error"])
+        self.assertEqual(artifacts.resources.list_resources(), [])
+
+    def test_push_returns_ambiguous_receipt_for_unexpected_post_state(self) -> None:
+        source = self.root / "source.bin"
+        source.write_bytes(b"payload")
+        expected = sha(source.read_bytes())
+        other = sha(b"other")
+        with patch.object(artifacts, "_local_source", return_value=source), patch.object(
+            artifacts.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            artifacts, "_remote_stat", side_effect=[
+                {"exists": False},
+                {"exists": True, "size": 5, "sha256": other},
+            ]
+        ), patch.object(
+            artifacts, "_scp", return_value={"returncode": 0, "stdout": "", "stderr": ""}
+        ), patch.object(
+            artifacts, "_remote_run", side_effect=RuntimeError("publish response lost")
+        ), patch.object(artifacts, "_remote_cleanup"):
+            result = artifacts.artifact_push(
+                "remote", str(source), "/remote/file", expected, create_only=True
+            )
+        self.assertFalse(result["success"])
+        ambiguity = result["ambiguous_mutation_outcome"]
+        self.assertEqual(
+            ambiguity["reason"],
+            "post_state_did_not_match_precondition_or_expected_artifact",
+        )
+        self.assertEqual(ambiguity["observed_post_state"]["sha256"], other)
+        self.assertEqual(artifacts.resources.list_resources(), [])
 
 if __name__ == "__main__":
     unittest.main()
