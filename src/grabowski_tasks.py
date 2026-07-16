@@ -602,20 +602,26 @@ def _task_filter_states(state: str | None) -> tuple[str, ...] | None:
     return projection
 
 
-def _task_state_counts(connection: sqlite3.Connection) -> tuple[dict[str, int], dict[str, int]]:
+def _task_state_counts(
+    connection: sqlite3.Connection,
+) -> tuple[dict[str, int], dict[str, int], int]:
     rows = connection.execute(
         "SELECT state, COUNT(*) AS count FROM tasks GROUP BY state"
     ).fetchall()
     exact = {state: 0 for state in sorted(TASK_STATES)}
+    unknown_state_count = 0
     for row in rows:
         state = str(row["state"])
+        count = int(row["count"])
         if state in exact:
-            exact[state] = int(row["count"])
+            exact[state] = count
+        else:
+            unknown_state_count += count
     projections = {
         name: sum(exact[state] for state in states)
         for name, states in sorted(TASK_STATE_PROJECTIONS.items())
     }
-    return exact, projections
+    return exact, projections, unknown_state_count
 
 
 def _task_recommended_next_action(state: str) -> str:
@@ -1421,7 +1427,7 @@ def grabowski_task_list(
                     filter_states,
                 ).fetchone()[0]
             )
-        state_counts, projection_counts = _task_state_counts(connection)
+        state_counts, projection_counts, unknown_state_count = _task_state_counts(connection)
     has_more = len(rows) > limit
     page_rows = rows[:limit]
     tasks = [_public_for_view(dict(row), selected_view) for row in page_rows]
@@ -1442,7 +1448,13 @@ def grabowski_task_list(
         "signalled",
         "outcome_unknown",
     }
-    warnings = [
+    warnings: list[dict[str, Any]] = []
+    if unknown_state_count:
+        warnings.append({
+            "code": "unknown_task_states",
+            "count": unknown_state_count,
+        })
+    warnings.extend(
         {
             "code": "task_requires_attention",
             "task_id": task["task_id"],
@@ -1450,7 +1462,7 @@ def grabowski_task_list(
         }
         for task in tasks
         if task.get("state") in warning_states
-    ]
+    )
     payload: dict[str, Any] = {
         "schema_version": 2,
         "view": selected_view,
@@ -1462,7 +1474,10 @@ def grabowski_task_list(
         ),
         "state_filter_states": list(filter_states or ()),
         "state_counts": state_counts,
+        "state_counts_complete": unknown_state_count == 0,
+        "unknown_state_count": unknown_state_count,
         "projection_counts": projection_counts,
+        "projection_counts_overlap": True,
         "tasks": tasks,
         "pagination": {
             "limit": limit,
@@ -1473,7 +1488,9 @@ def grabowski_task_list(
         },
         "warnings": warnings,
         "recommended_next_action": (
-            "inspect attention tasks before retry" if warnings else "none"
+            "inspect unknown task states before relying on projections"
+            if unknown_state_count
+            else "inspect attention tasks before retry" if warnings else "none"
         ),
         "does_not_establish": [
             "task_output_correctness",

@@ -171,6 +171,9 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(attention["projection_counts"]["attention"], 1)
         self.assertEqual(attention["projection_counts"]["terminal"], 1)
         self.assertEqual(attention["projection_counts"]["active"], 0)
+        self.assertTrue(attention["projection_counts_overlap"])
+        self.assertTrue(attention["state_counts_complete"])
+        self.assertEqual(attention["unknown_state_count"], 0)
         self.assertEqual(tasks.grabowski_task_list(state="active")["count"], 0)
         self.assertEqual(
             tasks.grabowski_task_list(state="failed")["state_filter_kind"],
@@ -178,6 +181,21 @@ class TaskTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "state must be one of"):
             tasks.grabowski_task_list(state="stale")
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET state='legacy_unknown' WHERE task_id=?",
+                (task["task_id"],),
+            )
+            connection.commit()
+        unknown = tasks.grabowski_task_list()
+        self.assertFalse(unknown["state_counts_complete"])
+        self.assertEqual(unknown["unknown_state_count"], 1)
+        self.assertEqual(unknown["warnings"][0]["code"], "unknown_task_states")
+        self.assertEqual(
+            unknown["recommended_next_action"],
+            "inspect unknown task states before relying on projections",
+        )
 
     def test_start_uses_shared_unicode_argv_identity(self) -> None:
         argv = ["/bin/echo", "Grüße"]
