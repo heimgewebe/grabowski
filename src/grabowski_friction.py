@@ -1327,18 +1327,38 @@ def _proposal_group(pattern: str, events: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
-def _repair_contract_for_pattern(pattern: str) -> dict[str, Any] | None:
+def _repair_contract_for_pattern(pattern: str) -> dict[str, Any]:
     repair = FRICTION_REPAIR_CONTRACTS.get(pattern)
     if repair is None:
-        return None
+        raise RuntimeError(f"friction proposal pattern lacks repair contract: {pattern}")
+    required_keys = {
+        "preferred_route",
+        "required_evidence",
+        "preparation_steps",
+        "retry_policy",
+        "post_state_readback",
+    }
+    if set(repair) != required_keys:
+        raise RuntimeError(f"friction repair contract has invalid fields: {pattern}")
+    scalar_keys = ("preferred_route", "retry_policy", "post_state_readback")
+    if any(not isinstance(repair[key], str) or not repair[key] for key in scalar_keys):
+        raise RuntimeError(f"friction repair contract has invalid scalar fields: {pattern}")
+    list_keys = ("required_evidence", "preparation_steps")
+    if any(
+        not isinstance(repair[key], list)
+        or not repair[key]
+        or any(not isinstance(item, str) or not item for item in repair[key])
+        for key in list_keys
+    ):
+        raise RuntimeError(f"friction repair contract has invalid list fields: {pattern}")
     return {
         "schema_version": 1,
         "authority": "evidence_preparation_only",
-        "preferred_route": str(repair["preferred_route"]),
-        "required_evidence": [str(item) for item in repair["required_evidence"]],
-        "preparation_steps": [str(item) for item in repair["preparation_steps"]],
-        "retry_policy": str(repair["retry_policy"]),
-        "post_state_readback": str(repair["post_state_readback"]),
+        "preferred_route": repair["preferred_route"],
+        "required_evidence": list(repair["required_evidence"]),
+        "preparation_steps": list(repair["preparation_steps"]),
+        "retry_policy": repair["retry_policy"],
+        "post_state_readback": repair["post_state_readback"],
         "does_not_establish": list(FRICTION_REPAIR_NON_CLAIMS),
     }
 
@@ -1351,8 +1371,6 @@ def _recommendation_for_group(group: dict[str, Any]) -> dict[str, Any] | None:
     if not rule:
         return None
     repair_contract = _repair_contract_for_pattern(pattern)
-    if repair_contract is None:
-        return None
     return {
         "pattern": pattern,
         "recommendation_type": rule["recommendation_type"],

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -214,6 +216,10 @@ def _database() -> sqlite3.Connection:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS tasks_state_created_task_idx "
         "ON tasks(state, created_at_unix DESC, task_id DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS tasks_created_task_idx "
+        "ON tasks(created_at_unix DESC, task_id DESC)"
     )
     current = connection.execute(
         "SELECT value FROM metadata WHERE key='schema_version'"
@@ -550,7 +556,7 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
 
 def _row(task_id: str) -> dict[str, Any]:
     identifier = _validate_task_id(task_id)
-    with _database() as connection:
+    with _database_connection() as connection:
         row = connection.execute(
             "SELECT * FROM tasks WHERE task_id=?", (identifier,)
         ).fetchone()
@@ -588,6 +594,28 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
         "chronik_outbox_state_root": record.get("chronik_outbox_state_root"),
         "chronik_context": json.loads(record["chronik_context_json"]) if record.get("chronik_context_json") else None,
     }
+
+
+@contextmanager
+def _database_connection() -> Iterator[sqlite3.Connection]:
+    connection = _database()
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
+@contextmanager
+def _task_read_snapshot() -> Iterator[sqlite3.Connection]:
+    connection = _database()
+    try:
+        connection.execute("BEGIN DEFERRED")
+        yield connection
+    finally:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
 
 
 def _task_filter_states(state: str | None) -> tuple[str, ...] | None:
@@ -694,7 +722,7 @@ def _set_state(
         updates.append("attempt=?")
         values.append(attempt)
     values.append(_validate_task_id(task_id))
-    with _database() as connection:
+    with _database_connection() as connection:
         current = connection.execute(
             "SELECT * FROM tasks WHERE task_id=?", (values[-1],)
         ).fetchone()
@@ -860,7 +888,7 @@ def grabowski_task_start(
             },
         )
     try:
-        with _database() as connection:
+        with _database_connection() as connection:
             connection.execute(
             """
             INSERT INTO tasks(
@@ -1069,7 +1097,7 @@ def _reconcile_candidate_rows(task_id: str = "") -> list[dict[str, Any]]:
     if task_id:
         record = _row(task_id)
         return [record] if record["state"] in {"launching", "running"} else []
-    with _database() as connection:
+    with _database_connection() as connection:
         rows = connection.execute(
             "SELECT * FROM tasks WHERE state IN ('launching', 'running') "
             "ORDER BY created_at_unix, task_id"
@@ -1411,24 +1439,17 @@ def grabowski_task_list(
         where.append("(created_at_unix < ? OR (created_at_unix = ? AND task_id < ?))")
         parameters.extend([cursor_created_at, cursor_created_at, cursor_task_id])
     where_sql = f" WHERE {' AND '.join(where)}" if where else ""
-    with _database() as connection:
-        connection.execute("BEGIN")
+    with _task_read_snapshot() as connection:
         rows = connection.execute(
             f"SELECT * FROM tasks{where_sql} "
             "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
             (*parameters, limit + 1),
         ).fetchall()
-        if filter_states is None:
-            total_matching = int(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
-        else:
-            placeholders = ",".join("?" for _ in filter_states)
-            total_matching = int(
-                connection.execute(
-                    f"SELECT COUNT(*) FROM tasks WHERE state IN ({placeholders})",
-                    filter_states,
-                ).fetchone()[0]
-            )
         state_counts, projection_counts, unknown_state_count = _task_state_counts(connection)
+        if filter_states is None:
+            total_matching = sum(state_counts.values()) + unknown_state_count
+        else:
+            total_matching = sum(state_counts[item] for item in filter_states)
     has_more = len(rows) > limit
     page_rows = rows[:limit]
     tasks = [_public_for_view(dict(row), selected_view) for row in page_rows]
