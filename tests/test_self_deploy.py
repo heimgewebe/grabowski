@@ -1162,6 +1162,83 @@ class RuntimeDeploySchedulerTests(unittest.TestCase):
         shared.assert_called_once_with(head, 9, repo, None)
         self.assertEqual(result, receipt)
 
+    def test_schedule_binds_requested_source_lease_owner(self) -> None:
+        head = "a" * 40
+        repo = Path("/home/alex/repos/.grabowski-worktrees/deploy")
+        canonical = Path("/home/alex/repos/grabowski")
+        identity = _source_identity(
+            repo,
+            head,
+            kind="detached-worktree",
+            canonical=canonical,
+        )
+        material = {
+            key: value for key, value in identity.items() if key != "identity_sha256"
+        }
+        resource_key = f"path:{repo}"
+        material["lease_evidence"] = {
+            "resource_key": resource_key,
+            "lease": {
+                "resource_key": resource_key,
+                "owner_id": "task:deploy-owner",
+                "acquired_at_unix": 10,
+                "updated_at_unix": 11,
+                "expires_at_unix": 100,
+                "metadata_sha256": "b" * 64,
+            },
+        }
+        identity = {
+            **material,
+            "identity_sha256": SELF_DEPLOY._source_identity_sha256(material),
+        }
+        receipt = {
+            "scheduled": True,
+            "expected_head": head,
+            "source_identity": identity,
+            "source_identity_sha256": identity["identity_sha256"],
+        }
+        shared = Mock(return_value=receipt)
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            result = SCHEDULER.schedule(
+                head,
+                8,
+                str(repo),
+                "task:deploy-owner",
+            )
+        self.assertEqual(result, receipt)
+
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            with self.assertRaisesRegex(RuntimeError, "different source lease owner"):
+                SCHEDULER.schedule(
+                    head,
+                    8,
+                    str(repo),
+                    "task:other-owner",
+                )
+
+    def test_schedule_rejects_semantically_inconsistent_source_identity(self) -> None:
+        head = "a" * 40
+        repo = Path("/home/alex/repos/grabowski")
+        identity = _source_identity(repo, head)
+        material = {
+            key: value for key, value in identity.items() if key != "identity_sha256"
+        }
+        material["source_kind"] = "detached-worktree"
+        identity = {
+            **material,
+            "identity_sha256": SELF_DEPLOY._source_identity_sha256(material),
+        }
+        receipt = {
+            "scheduled": True,
+            "expected_head": head,
+            "source_identity": identity,
+            "source_identity_sha256": identity["identity_sha256"],
+        }
+        shared = Mock(return_value=receipt)
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            with self.assertRaisesRegex(RuntimeError, "inconsistent source kind"):
+                SCHEDULER.schedule(head, 8, str(repo), None)
+
     def test_schedule_rejects_unbound_shared_receipt(self) -> None:
         head = "b" * 40
         shared = Mock(return_value={"scheduled": True, "expected_head": "c" * 40})

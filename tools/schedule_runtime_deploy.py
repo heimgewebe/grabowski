@@ -82,6 +82,36 @@ def schedule(
         raise RuntimeError("runtime deploy scheduler returned an unbound receipt")
     if source_repository is not None and identity.get("repository") != source_repository:
         raise RuntimeError("runtime deploy scheduler returned a different source repository")
+    repository = identity.get("repository")
+    canonical_repository = identity.get("canonical_repository")
+    source_kind = identity.get("source_kind")
+    if not isinstance(repository, str) or not isinstance(canonical_repository, str):
+        raise RuntimeError("runtime deploy scheduler returned malformed source paths")
+    expected_source_kind = (
+        "canonical-main"
+        if repository == canonical_repository
+        else "detached-worktree"
+    )
+    if source_kind != expected_source_kind:
+        raise RuntimeError("runtime deploy scheduler returned an inconsistent source kind")
+    if source_repository is None and expected_source_kind != "canonical-main":
+        raise RuntimeError("runtime deploy scheduler returned a noncanonical default source")
+    lease_evidence = identity.get("lease_evidence")
+    if not isinstance(lease_evidence, dict):
+        raise RuntimeError("runtime deploy scheduler returned malformed lease evidence")
+    resource_key = f"path:{repository}"
+    if lease_evidence.get("resource_key") != resource_key:
+        raise RuntimeError("runtime deploy scheduler returned lease evidence for another source")
+    lease = lease_evidence.get("lease")
+    if source_lease_owner_id is None:
+        if lease is not None:
+            raise RuntimeError("runtime deploy scheduler returned an unexpected source lease")
+    elif (
+        not isinstance(lease, dict)
+        or lease.get("resource_key") != resource_key
+        or lease.get("owner_id") != source_lease_owner_id
+    ):
+        raise RuntimeError("runtime deploy scheduler returned a different source lease owner")
     return result
 
 
