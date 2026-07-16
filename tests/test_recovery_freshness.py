@@ -74,13 +74,20 @@ class RecoveryFreshnessContractTests(unittest.TestCase):
         config = json.loads((ROOT / "config/privileged-actions.example.json").read_text(encoding="utf-8"))
         publisher = config["actions"]["publish_recovery_marker"]
         power_gate = config["actions"]["operator_power_argv"]["gate"]
+        root_task = config["actions"]["operator_root_task_systemd_unit"]
+        root_task_gate = root_task["start_gate"]
 
         self.assertTrue(publisher["enabled"])
+        self.assertTrue(root_task["enabled"])
+        self.assertEqual(root_task["mode"], "root-task-systemd")
+        self.assertFalse(root_task["allow_shell"])
+        self.assertTrue(root_task["allowed_argv_prefixes"])
         self.assertEqual(publisher["mode"], "recovery-marker-publish")
         self.assertEqual(publisher["destination_path"], power_gate["recovery_marker_path"])
         self.assertEqual(publisher["max_recovery_age_seconds"], power_gate["max_recovery_age_seconds"])
         self.assertEqual(publisher["kill_switch_path"], power_gate["kill_switch_path"])
         self.assertEqual(publisher["configured_target"], power_gate["configured_target"])
+        self.assertEqual(root_task_gate, power_gate)
         self.assertTrue(publisher["require_root_owned_destination"])
         self.assertTrue(power_gate["require_root_owned_gate_files"])
 

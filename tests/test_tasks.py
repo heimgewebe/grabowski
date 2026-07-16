@@ -85,15 +85,22 @@ class TaskTests(unittest.TestCase):
         (self.root / ".git").write_text("gitdir: /tmp/test-worktree\n")
         self.database = self.root / "state" / "tasks.sqlite3"
         self.db_patch = patch.object(tasks, "TASK_DB", self.database)
+        self.outcomes_patch = patch.object(
+            tasks,
+            "TASK_OUTCOMES_DIR",
+            self.database.with_suffix(".outcomes"),
+        )
         self.resource_database = self.root / "state" / "resources.sqlite3"
         self.resource_patch = patch.object(
             tasks.resources, "RESOURCE_DB", self.resource_database
         )
         self.db_patch.start()
+        self.outcomes_patch.start()
         self.resource_patch.start()
 
     def tearDown(self) -> None:
         self.resource_patch.stop()
+        self.outcomes_patch.stop()
         self.db_patch.stop()
         self.temporary.cleanup()
 
@@ -138,6 +145,9 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(task["state"], "running")
         self.assertEqual(task["attempt"], 1)
         self.assertEqual(task["host"], "local")
+        self.assertEqual(task["execution_backend"], "systemd-user")
+        self.assertEqual(task["systemd_scope"], "user")
+        self.assertEqual(task["authoritative_unit"], task["unit"])
         self.assertEqual(task["argv"], ["/bin/echo", "ok"])
         self.assertFalse(task["chronik_outbox_enabled"])
         self.assertIsNone(task["chronik_outbox_state_root"])
@@ -428,21 +438,56 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(status["state"], "completed")
         self.assertEqual(status["last_observation"]["properties"]["Result"], "success")
 
-    def test_missing_unit_is_outcome_unknown_and_can_resume_manually(self) -> None:
+    def test_completed_observation_blocks_direct_resume_before_launch(self) -> None:
+        started = self._start()
+        task_id = started["task"]["task_id"]
+        completed = _launcher()
+        completed["stdout"] = (
+            "LoadState=not-found\n"
+            "ActiveState=inactive\n"
+            "SubState=dead\n"
+            "Result=success\n"
+            "ExecMainCode=0\n"
+            "ExecMainStatus=0\n"
+        )
+        with patch.object(tasks, "_observe", return_value={
+            "state": "completed",
+            "properties": {"Result": "success"},
+            "probe": completed,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 123,
+        }), patch.object(tasks, "_launch") as launch:
+            with self.assertRaisesRegex(RuntimeError, "already completed"):
+                tasks.grabowski_task_resume(task_id)
+        launch.assert_not_called()
+        stored = tasks._row(task_id)
+        self.assertEqual(stored["state"], "completed")
+
+    def test_terminal_record_blocks_direct_resume_before_observation(self) -> None:
+        started = self._start()
+        task_id = started["task"]["task_id"]
+        tasks._set_state(task_id, "failed", observation={"state": "failed"})
+        with patch.object(tasks, "_observe") as observe, patch.object(tasks, "_launch") as launch:
+            with self.assertRaisesRegex(RuntimeError, "Terminal task"):
+                tasks.grabowski_task_resume(task_id)
+        observe.assert_not_called()
+        launch.assert_not_called()
+
+    def test_missing_unit_outcome_unknown_blocks_manual_resume(self) -> None:
         started = self._start(host="remote")
         task_id = started["task"]["task_id"]
         missing = _launcher(returncode=1)
         missing["stderr"] = "unit not found"
-        with patch.object(tasks, "_dispatch", side_effect=[missing, _launcher()]), patch.object(
+        with patch.object(tasks, "_dispatch", return_value=missing), patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
         ):
-            resumed = tasks.grabowski_task_resume(task_id)
-        task = resumed["task"]
-        self.assertEqual(task["attempt"], 2)
-        self.assertEqual(task["state"], "running")
-        self.assertTrue(task["unit"].endswith("-a2.service"))
+            with self.assertRaisesRegex(RuntimeError, "outcome is unknown"):
+                tasks.grabowski_task_resume(task_id)
+        task = tasks.grabowski_task_list(view="evidence")["tasks"][0]
+        self.assertEqual(task["attempt"], 1)
+        self.assertEqual(task["state"], "outcome_unknown")
         self.assertEqual(task["last_observation"]["state"], "outcome_unknown")
 
     def test_reconcile_observer_falls_back_to_narrow_production_probe(self) -> None:
@@ -544,6 +589,278 @@ class TaskTests(unittest.TestCase):
                     "local", ["/usr/local/bin/sleep-heimserver"], cwd=str(self.root)
                 )
 
+    def test_root_task_runtime_preserves_lease_grace(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.recovery,
+            "recovery_status",
+            return_value={
+                "ready_for_user_power_worker": True,
+                "checked_at_unix": 199,
+            },
+        ), patch.object(
+            tasks.operator, "_job_runtime", side_effect=lambda value: value
+        ), patch.object(tasks.operator, "_require_operator_mutation") as mutation:
+            with self.assertRaisesRegex(ValueError, "300 seconds"):
+                tasks.grabowski_task_start(
+                    "local",
+                    ["/usr/local/bin/sleep-heimserver"],
+                    cwd=str(self.root),
+                    runtime_seconds=tasks.resources.MAX_TTL_SECONDS - 299,
+                )
+        mutation.assert_not_called()
+
+    def test_local_power_worker_task_starts_through_root_broker_backend(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.recovery,
+            "recovery_status",
+            return_value={
+                "ready_for_user_power_worker": True,
+                "checked_at_unix": 200,
+            },
+        ), patch.object(
+            tasks.privileged, "root_task_systemd_request", return_value=_launcher()
+        ) as broker, patch.object(tasks, "_dispatch") as dispatch, patch.object(
+            tasks.base, "_append_audit"
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/usr/local/bin/sleep-heimserver"],
+                cwd=str(self.root),
+                runtime_seconds=300,
+            )
+
+        task = result["task"]
+        self.assertEqual(task["state"], "running")
+        self.assertEqual(task["execution_backend"], "systemd-root-broker")
+        self.assertEqual(task["systemd_scope"], "system")
+        self.assertEqual(task["authoritative_unit"], task["unit"])
+        dispatch.assert_not_called()
+        broker.assert_called_once()
+        payload = broker.call_args.args[0]
+        self.assertEqual(payload["operation"], "start")
+        self.assertEqual(payload["unit"], task["authoritative_unit"])
+        self.assertEqual(payload["argv"], ["/usr/local/bin/sleep-heimserver"])
+        self.assertEqual(payload["runtime_seconds"], 300)
+        self.assertEqual(result["audit"]["execution_backend"], "systemd-root-broker")
+
+    def test_root_task_status_logs_and_cancel_route_by_stored_scope(self) -> None:
+        running = _launcher()
+        running["stdout"] = (
+            "LoadState=loaded\n"
+            "ActiveState=active\n"
+            "SubState=running\n"
+            "Result=success\n"
+            "ExecMainCode=0\n"
+            "ExecMainStatus=0\n"
+        )
+        logs = _launcher()
+        logs["stdout"] = "root log\n"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.recovery,
+            "recovery_status",
+            return_value={
+                "ready_for_user_power_worker": True,
+                "checked_at_unix": 201,
+            },
+        ), patch.object(
+            tasks.privileged,
+            "root_task_systemd_request",
+            side_effect=[_launcher(), running, logs, _launcher()],
+        ) as broker, patch.object(tasks, "_dispatch") as dispatch, patch.object(
+            tasks.base, "_append_audit"
+        ):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/usr/local/bin/sleep-heimserver"],
+                cwd=str(self.root),
+                runtime_seconds=300,
+            )
+            task_id = started["task"]["task_id"]
+            status = tasks.grabowski_task_status(task_id)
+            output = tasks.grabowski_task_logs(task_id, max_lines=50)
+            cancelled = tasks.grabowski_task_cancel(task_id)
+
+        self.assertEqual(status["state"], "running")
+        self.assertEqual(status["last_observation"]["observer"]["kind"], "root-systemd-broker-show-v1")
+        self.assertEqual(output["result"]["stdout"], "root log\n")
+        self.assertEqual(cancelled["task"]["state"], "cancelled")
+        self.assertEqual(
+            [call.args[0]["operation"] for call in broker.call_args_list],
+            ["start", "show", "journal", "stop"],
+        )
+        self.assertEqual(broker.call_args_list[2].args[0]["max_lines"], 50)
+        dispatch.assert_not_called()
+
+    def test_root_scope_observation_denial_does_not_fallback_to_user_scope(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.recovery,
+            "recovery_status",
+            return_value={
+                "ready_for_user_power_worker": True,
+                "checked_at_unix": 202,
+            },
+        ), patch.object(
+            tasks.privileged, "root_task_systemd_request", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/usr/local/bin/sleep-heimserver"],
+                cwd=str(self.root),
+                runtime_seconds=300,
+            )
+
+        with patch.object(
+            tasks.privileged,
+            "root_task_systemd_request",
+            side_effect=PermissionError("privileged broker is not ready"),
+        ) as broker, patch.object(tasks, "_dispatch") as dispatch:
+            result = tasks.reconcile_tasks_check(task_id=started["task"]["task_id"])
+
+        self.assertEqual(result["blocked"][0]["execution_backend"], "systemd-root-broker")
+        self.assertIn("observation denied", result["blocked"][0]["reason"])
+        broker.assert_called_once()
+        dispatch.assert_not_called()
+
+
+    def test_root_broker_pre_dispatch_failure_is_terminal_and_releases_lease(self) -> None:
+        resource_key = "service:root-task-pre-dispatch-failure"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.recovery,
+            "recovery_status",
+            return_value={
+                "ready_for_user_power_worker": True,
+                "checked_at_unix": 205,
+            },
+        ), patch.object(
+            tasks.privileged,
+            "root_task_systemd_request",
+            side_effect=PermissionError("privileged broker is not ready"),
+        ), patch.object(tasks.base, "_append_audit"):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/usr/local/bin/sleep-heimserver"],
+                cwd=str(self.root),
+                runtime_seconds=300,
+                resource_keys=[resource_key],
+            )
+
+        self.assertEqual(result["task"]["state"], "failed")
+        self.assertTrue(result["task"]["launcher"]["launch_not_dispatched"])
+        self.assertFalse(result["task"]["launcher"]["outcome_unknown"])
+        self.assertIsNone(tasks.resources.inspect_resource(resource_key))
+        receipt = tasks.TASK_OUTCOMES_DIR / f"{result['task']['task_id']}.json"
+        self.assertTrue(receipt.is_file())
+        self.assertEqual(json.loads(receipt.read_text())["state"], "failed")
+
+    def test_root_unknown_start_retains_lease_and_later_reattaches(self) -> None:
+        unknown = _launcher(returncode=1)
+        unknown["outcome_unknown"] = True
+        unknown["root_truth_observable"] = False
+        running = _launcher()
+        running["stdout"] = (
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
+        )
+        completed = _launcher()
+        completed["stdout"] = (
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
+        )
+        resource_key = "service:root-task-lifetime-test"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.recovery,
+            "recovery_status",
+            return_value={
+                "ready_for_user_power_worker": True,
+                "checked_at_unix": 203,
+            },
+        ), patch.object(
+            tasks.privileged,
+            "root_task_systemd_request",
+            side_effect=[unknown, running, completed, unknown],
+        ), patch.object(tasks.base, "_append_audit"):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/usr/local/bin/sleep-heimserver"],
+                cwd=str(self.root),
+                runtime_seconds=300,
+                resource_keys=[resource_key],
+            )
+            task_id = started["task"]["task_id"]
+            self.assertEqual(started["task"]["state"], "outcome_unknown")
+            lease = tasks.resources.inspect_resource(resource_key)
+            self.assertIsNotNone(lease)
+            self.assertGreaterEqual(
+                lease["expires_at_unix"],
+                tasks._now() + tasks.resources.MAX_TTL_SECONDS - 5,
+            )
+            self.assertEqual(
+                started["audit"]["resource_lease_maintenance"]["mode"],
+                "renewed",
+            )
+            self.assertFalse((tasks.TASK_OUTCOMES_DIR / f"{task_id}.json").exists())
+
+            reattached = tasks.grabowski_task_status(task_id)
+            self.assertEqual(reattached["state"], "running")
+            self.assertIsNotNone(tasks.resources.inspect_resource(resource_key))
+
+            terminal = tasks.grabowski_task_status(task_id)
+            self.assertEqual(terminal["state"], "completed")
+            self.assertIsNone(tasks.resources.inspect_resource(resource_key))
+            receipt = json.loads(
+                (tasks.TASK_OUTCOMES_DIR / f"{task_id}.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["state"], "completed")
+            self.assertEqual(receipt["systemd_scope"], "system")
+
+            terminal_readback = tasks.grabowski_task_status(task_id)
+            self.assertEqual(terminal_readback["state"], "completed")
+            self.assertIsNone(terminal_readback["lease_maintenance"])
+            self.assertIsNone(tasks.resources.inspect_resource(resource_key))
+
+    def test_unknown_root_task_reacquires_expired_free_lease(self) -> None:
+        unknown = _launcher(returncode=1)
+        unknown["outcome_unknown"] = True
+        unknown["root_truth_observable"] = False
+        running = _launcher()
+        running["stdout"] = (
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
+        )
+        resource_key = "service:root-task-expired-lease-test"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.recovery,
+            "recovery_status",
+            return_value={
+                "ready_for_user_power_worker": True,
+                "checked_at_unix": 204,
+            },
+        ), patch.object(
+            tasks.privileged,
+            "root_task_systemd_request",
+            side_effect=[unknown, running],
+        ), patch.object(tasks.base, "_append_audit"):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/usr/local/bin/sleep-heimserver"],
+                cwd=str(self.root),
+                runtime_seconds=300,
+                resource_keys=[resource_key],
+            )
+            with sqlite3.connect(self.resource_database) as connection:
+                connection.execute(
+                    "UPDATE leases SET expires_at_unix=0 WHERE resource_key=?",
+                    (resource_key,),
+                )
+                connection.commit()
+
+            status = tasks.grabowski_task_status(started["task"]["task_id"])
+
+        self.assertEqual(status["state"], "running")
+        self.assertEqual(status["lease_maintenance"]["mode"], "reacquired")
+        lease = tasks.resources.inspect_resource(resource_key)
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease["owner_id"], started["task"]["lease_owner_id"])
 
     def test_mutating_codex_task_implicitly_leases_workspace(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
@@ -793,7 +1110,7 @@ class TaskTests(unittest.TestCase):
                 for item in result["blocked"][1:]
             )
         )
-        self.assertIsNone(tasks.resources.inspect_resource("display:12"))
+        self.assertIsNotNone(tasks.resources.inspect_resource("display:12"))
 
     def test_reconcile_resume_blocks_unverified_policy(self) -> None:
         started = self._start()
@@ -830,7 +1147,7 @@ class TaskTests(unittest.TestCase):
         with patch.object(tasks, "_dispatch", return_value=missing):
             result = tasks.reconcile_tasks_check()
         self.assertEqual(result["scanned"], 1)
-        self.assertEqual(result["would_release"], [task["task_id"]])
+        self.assertEqual(result["would_release"], [])
         self.assertEqual(result["would_resume"], [])
         self.assertIn("outcome_unknown", result["blocked"][0]["reason"])
         listed = tasks.grabowski_task_list()
@@ -857,9 +1174,9 @@ class TaskTests(unittest.TestCase):
             result = tasks.reconcile_tasks_refresh()
         self.assertEqual(dispatch.call_count, 1)
         self.assertEqual(result["resumed"], [])
-        self.assertEqual(result["released"], [started["task"]["task_id"]])
+        self.assertEqual(result["released"], [])
         self.assertEqual(result["refreshed"][0]["state"], "outcome_unknown")
-        self.assertIsNone(tasks.resources.inspect_resource("service:refresh.service"))
+        self.assertIsNotNone(tasks.resources.inspect_resource("service:refresh.service"))
 
     def test_reconcile_resume_requires_reason(self) -> None:
         with self.assertRaisesRegex(ValueError, "reason is required"):
@@ -1066,6 +1383,12 @@ class TaskTests(unittest.TestCase):
         listed = tasks.grabowski_task_list()
         self.assertEqual(listed["count"], 1)
         self.assertEqual(listed["tasks"][0]["resource_keys"], [])
+        self.assertEqual(listed["tasks"][0]["execution_backend"], "systemd-user")
+        self.assertEqual(listed["tasks"][0]["systemd_scope"], "user")
+        self.assertEqual(
+            listed["tasks"][0]["authoritative_unit"],
+            f"grabowski-task-{'a' * 24}-a1.service",
+        )
         with sqlite3.connect(self.database) as migrated:
             version = migrated.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
@@ -1073,14 +1396,56 @@ class TaskTests(unittest.TestCase):
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(tasks)")}
             indexes = {row[1] for row in migrated.execute("PRAGMA index_list(tasks)")}
             journal_mode = migrated.execute("PRAGMA journal_mode").fetchone()[0]
-        self.assertEqual(version, "2")
+        self.assertEqual(version, "3")
         self.assertIn("resource_keys_json", columns)
         self.assertIn("lease_owner_id", columns)
+        self.assertIn("request_id", columns)
+        self.assertIn("origin_ref", columns)
+        self.assertIn("external_run_id", columns)
+        self.assertIn("execution_envelope_sha256", columns)
+        self.assertIn("acceptance_json", columns)
+        self.assertIn("request_sha256", columns)
         self.assertIn("chronik_outbox_enabled", columns)
         self.assertIn("chronik_outbox_state_root", columns)
+        self.assertIn("execution_backend", columns)
+        self.assertIn("systemd_scope", columns)
+        self.assertIn("authoritative_unit", columns)
         self.assertIn("tasks_state_created_task_idx", indexes)
         self.assertIn("tasks_created_task_idx", indexes)
         self.assertEqual(journal_mode, "wal")
+        with tasks._database() as reopened:
+            self.assertEqual(
+                reopened.total_changes,
+                0,
+                "schema-3 fast path must not repeat migration writes",
+            )
+
+    def test_schema_v3_missing_root_contract_column_fails_closed(self) -> None:
+        self.database.parent.mkdir(parents=True)
+        with sqlite3.connect(self.database) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO metadata(key, value) VALUES('schema_version', '3');
+                CREATE TABLE tasks (task_id TEXT PRIMARY KEY);
+                """
+            )
+        with self.assertRaisesRegex(RuntimeError, "schema 3 is incomplete"):
+            tasks.grabowski_task_list()
+
+    def test_schema_v3_missing_index_fails_closed_without_repair_write(self) -> None:
+        with tasks._database() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+                "3",
+            )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("DROP INDEX tasks_created_task_idx")
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "indexes are incomplete"):
+            tasks.grabowski_task_list()
 
     def test_database_rejects_symlink(self) -> None:
         target = self.root / "real.sqlite3"

@@ -415,6 +415,205 @@ class PrivilegedBrokerTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "target"):
                     privileged_broker.resolve_action(config, parsed)
 
+    def _root_task_reference(self, payload: dict[str, object], now: int = 1000) -> dict[str, object]:
+        value = self._reference(now=now)
+        value["action"] = "operator_root_task_systemd_unit"
+        value["target"] = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        value["justification"] = "Operate one Grabowski root-owned systemd task unit"
+        value.pop("reference_sha256")
+        value["reference_sha256"] = privileged_broker.canonical_sha256(value)
+        return value
+
+    def _root_task_config(self) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "actions": {
+                "operator_root_task_systemd_unit": {
+                    "enabled": True,
+                    "mode": "root-task-systemd",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 60,
+                    "max_argv": 16,
+                    "allow_shell": False,
+                    "allowed_argv_prefixes": [
+                        ["/usr/local/bin/sleep-heimserver"],
+                    ],
+                    "start_gate": self._power_gate(self.tmp.name),
+                    "policy_intent": "recovery-gated-root-task-catalog",
+                }
+            },
+        }
+
+    def test_root_task_start_resolves_to_root_owned_systemd_unit(self) -> None:
+        unit = "grabowski-task-0123456789abcdef01234567-a1.service"
+        reference = self._root_task_reference({
+            "operation": "start",
+            "unit": unit,
+            "argv": ["/usr/local/bin/sleep-heimserver"],
+            "cwd": "/",
+            "runtime_seconds": 300,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+            "description": "Grabowski task root",
+        })
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        execution = privileged_broker.resolve_execution(self._root_task_config(), parsed)
+
+        self.assertEqual(execution["mode"], "root-task-systemd")
+        self.assertEqual(execution["internal_action"], "root-task-start")
+        argv = execution["argv"]
+        self.assertEqual(argv[:2], ["/usr/bin/systemd-run", "--system"])
+        self.assertIn("--slice=grabowski-root-tasks.slice", argv)
+        self.assertIn("--property=LogRateLimitIntervalSec=30s", argv)
+        self.assertIn("--property=LogRateLimitBurst=1000", argv)
+        self.assertNotIn("--user", argv)
+        self.assertEqual(argv[-2:], ["--", "/usr/local/bin/sleep-heimserver"])
+
+    def test_root_task_start_rejects_runtime_without_lease_grace(self) -> None:
+        reference = self._root_task_reference({
+            "operation": "start",
+            "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+            "argv": ["/usr/local/bin/sleep-heimserver"],
+            "cwd": "/",
+            "runtime_seconds": privileged_broker.ROOT_TASK_MAX_RUNTIME_SECONDS + 1,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+            "description": "Grabowski task root",
+        })
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        with self.assertRaisesRegex(ValueError, "runtime_seconds"):
+            privileged_broker.resolve_execution(self._root_task_config(), parsed)
+
+    def test_root_task_start_rejects_control_character_description(self) -> None:
+        reference = self._root_task_reference({
+            "operation": "start",
+            "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+            "argv": ["/usr/local/bin/sleep-heimserver"],
+            "cwd": "/",
+            "runtime_seconds": 300,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+            "description": "Grabowski task\nforged",
+        })
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        with self.assertRaisesRegex(ValueError, "description"):
+            privileged_broker.resolve_execution(self._root_task_config(), parsed)
+
+    def test_root_task_start_rejects_command_outside_catalog(self) -> None:
+        reference = self._root_task_reference({
+            "operation": "start",
+            "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+            "argv": ["/usr/bin/id", "-u"],
+            "cwd": "/",
+            "runtime_seconds": 300,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+            "description": "Grabowski task root",
+        })
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        with self.assertRaisesRegex(PermissionError, "configured catalog"):
+            privileged_broker.resolve_execution(self._root_task_config(), parsed)
+
+    def test_root_task_start_requires_fresh_gate_but_show_remains_available(self) -> None:
+        config = self._root_task_config()
+        config["actions"]["operator_root_task_systemd_unit"]["start_gate"] = self._power_gate(
+            self.tmp.name,
+            generated_at_unix=1,
+        )
+        start = self._root_task_reference({
+            "operation": "start",
+            "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+            "argv": ["/usr/local/bin/sleep-heimserver"],
+            "cwd": "/",
+            "runtime_seconds": 300,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+            "description": "Grabowski task root",
+        })
+        parsed_start = privileged_broker.parse_reference(
+            json.dumps(start).encode("utf-8"), now=1000
+        )
+        with self.assertRaisesRegex(PermissionError, "stale"):
+            privileged_broker.resolve_execution(config, parsed_start)
+
+        show = self._root_task_reference({
+            "operation": "show",
+            "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+            "properties": ["LoadState", "ActiveState", "Result"],
+        })
+        parsed_show = privileged_broker.parse_reference(
+            json.dumps(show).encode("utf-8"), now=1000
+        )
+        execution = privileged_broker.resolve_execution(config, parsed_show)
+        self.assertEqual(execution["operation"], "show")
+        self.assertNotIn("gate", execution)
+
+    def test_root_task_show_resolves_to_system_scope_only(self) -> None:
+        unit = "grabowski-task-0123456789abcdef01234567-a1.service"
+        reference = self._root_task_reference({
+            "operation": "show",
+            "unit": unit,
+            "properties": ["LoadState", "ActiveState", "Result"],
+        })
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        argv, timeout = privileged_broker.resolve_action(self._root_task_config(), parsed)
+
+        self.assertEqual(timeout, 15)
+        self.assertEqual(
+            argv,
+            [
+                "/usr/bin/systemctl", "--system", "show", unit, "--no-pager",
+                "--property=LoadState", "--property=ActiveState", "--property=Result",
+            ],
+        )
+        self.assertNotIn("--user", argv)
+
+    def test_root_task_journal_uses_bounded_read_timeout(self) -> None:
+        unit = "grabowski-task-0123456789abcdef01234567-a1.service"
+        reference = self._root_task_reference({
+            "operation": "journal",
+            "unit": unit,
+            "max_lines": 200,
+        })
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        execution = privileged_broker.resolve_execution(
+            self._root_task_config(), parsed
+        )
+
+        self.assertEqual(execution["timeout_seconds"], 30)
+        self.assertEqual(execution["configured_timeout_seconds"], 60)
+        self.assertEqual(execution["operation_timeout_cap_seconds"], 30)
+        self.assertEqual(
+            execution["argv"],
+            [
+                "/usr/bin/journalctl", "--system", "--unit", unit,
+                "--no-pager", "--output=cat", "--lines", "200",
+            ],
+        )
+
     def _power_gate(
         self,
         directory: str | Path,
@@ -856,6 +1055,32 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             self.assertEqual(list(root.iterdir()), [])
             append_audit.assert_called_once()
             self.assertTrue(append_audit.call_args.args[0]["broker_client_timed_out"])
+
+    def test_root_task_garbage_broker_response_is_outcome_unknown(self) -> None:
+        invoked = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "broker_client_returncode": 0,
+            "broker_client_timed_out": False,
+            "broker_response": None,
+            "stdout": "not-json",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+        with patch.object(
+            privileged, "_invoke_privileged_reference", return_value=invoked
+        ):
+            result = privileged.root_task_systemd_request({
+                "operation": "show",
+                "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+                "properties": ["LoadState"],
+            })
+
+        self.assertTrue(result["outcome_unknown"])
+        self.assertFalse(result["root_truth_observable"])
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(result["stdout"], "not-json")
 
     def test_missing_operator_audit_backend_fails_explicitly(self) -> None:
         with patch.object(privileged.operator, "base", None):

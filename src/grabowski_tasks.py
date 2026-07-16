@@ -16,6 +16,7 @@ from typing import Any
 import grabowski_fleet as fleet
 import grabowski_mcp as base
 import grabowski_chronik as chronik
+import grabowski_privileged as privileged
 import grabowski_recovery as recovery
 import grabowski_resources as resources
 import grabowski_consumer_surface as consumer_surface
@@ -40,6 +41,8 @@ TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
 EXTERNAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+# Deliberately canonical: only names emitted by _task_unit are accepted.
+# Manual or future-format units must never be adopted as authoritative by accident.
 UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
 RESUME_POLICIES = {"never", "retry-safe", "verify-then-retry", "manual"}
 CHRONIK_OPERATION_TASK_CLASS = {
@@ -65,10 +68,13 @@ TASK_STATES = {
 TASK_STATE_PROJECTIONS: dict[str, tuple[str, ...]] = {
     "active": ("launching", "running", "interrupted"),
     "attention": ("interrupted", "outcome_unknown", "failed", "timed_out", "signalled"),
-    "terminal": ("completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"),
+    "terminal": ("completed", "failed", "cancelled", "timed_out", "signalled"),
 }
 MUTATING_AGENT_EXECUTABLES = frozenset({"agy", "claude", "cline", "codex"})
 READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
+TASK_EXECUTION_BACKENDS = {"systemd-user", "systemd-root-broker"}
+SYSTEMD_SCOPES = {"user", "system"}
+ACTIVE_TASK_STATES = {"running", "outcome_unknown"}
 
 
 def _now() -> int:
@@ -94,7 +100,11 @@ def _redact_reason(text: str) -> str:
 
 
 def _is_terminal_state(state: str) -> bool:
-    return state in {"completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}
+    return state in {"completed", "failed", "cancelled", "timed_out", "signalled"}
+
+
+def _state_releases_resources(state: str) -> bool:
+    return _is_terminal_state(state)
 
 
 def _write_outcome_receipt(record: dict[str, Any], state: str, observation: dict[str, Any] | None) -> None:
@@ -108,6 +118,9 @@ def _write_outcome_receipt(record: dict[str, Any], state: str, observation: dict
         "schema_version": 1,
         "task_id": record["task_id"],
         "unit": record["unit"],
+        "authoritative_unit": _authoritative_unit(record),
+        "execution_backend": _execution_backend(record),
+        "systemd_scope": _systemd_scope(record),
         "attempt": record["attempt"],
         "state": state,
         "argv_sha256": record["argv_sha256"],
@@ -171,100 +184,196 @@ def _database() -> sqlite3.Connection:
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tasks (
-            task_id TEXT PRIMARY KEY,
-            host TEXT NOT NULL,
-            unit TEXT NOT NULL,
-            attempt INTEGER NOT NULL,
-            state TEXT NOT NULL,
-            resume_policy TEXT NOT NULL,
-            argv_json TEXT NOT NULL,
-            argv_sha256 TEXT NOT NULL,
-            cwd TEXT NOT NULL,
-            runtime_seconds INTEGER NOT NULL,
-            cpu_weight INTEGER NOT NULL,
-            io_weight INTEGER NOT NULL,
-            memory_max_bytes INTEGER,
-            created_at_unix INTEGER NOT NULL,
-            updated_at_unix INTEGER NOT NULL,
-            launcher_json TEXT NOT NULL,
-            last_observation_json TEXT,
-            resource_keys_json TEXT NOT NULL DEFAULT '[]',
-            lease_owner_id TEXT,
-            request_id TEXT,
-            origin_ref TEXT,
-            external_run_id TEXT,
-            execution_envelope_sha256 TEXT,
-            acceptance_json TEXT NOT NULL DEFAULT '[]',
-            request_sha256 TEXT,
-            chronik_outbox_enabled INTEGER NOT NULL DEFAULT 0,
-            chronik_outbox_state_root TEXT,
-            chronik_context_json TEXT
-        )
-        """
-    )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS tasks_state_created_task_idx "
-        "ON tasks(state, created_at_unix DESC, task_id DESC)"
-    )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS tasks_created_task_idx "
-        "ON tasks(created_at_unix DESC, task_id DESC)"
-    )
-    current = connection.execute(
-        "SELECT value FROM metadata WHERE key='schema_version'"
-    ).fetchone()
-    if current is None:
-        connection.execute(
-            "INSERT INTO metadata(key, value) VALUES('schema_version', '2')"
-        )
-    elif current["value"] == "1":
-        columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(tasks)")
+
+    def table_exists(name: str) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone() is not None
+
+    def schema_version() -> str | None:
+        if not table_exists("metadata"):
+            return None
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'"
+        ).fetchone()
+        return str(row["value"]) if row is not None else None
+
+    def task_columns() -> set[str]:
+        if not table_exists("tasks"):
+            return set()
+        return {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(tasks)")
         }
-        if "resource_keys_json" not in columns:
-            connection.execute(
-                "ALTER TABLE tasks ADD COLUMN resource_keys_json "
-                "TEXT NOT NULL DEFAULT '[]'"
-            )
-        if "lease_owner_id" not in columns:
-            connection.execute(
-                "ALTER TABLE tasks ADD COLUMN lease_owner_id TEXT"
-            )
-        connection.execute(
-            "UPDATE metadata SET value='2' WHERE key='schema_version'"
-        )
-    elif current["value"] != "2":
+
+    def task_indexes() -> set[str]:
+        if not table_exists("tasks"):
+            return set()
+        return {
+            str(row["name"])
+            for row in connection.execute("PRAGMA index_list(tasks)")
+        }
+
+    required_columns = {
+        "task_id", "host", "unit", "attempt", "state", "resume_policy",
+        "argv_json", "argv_sha256", "cwd", "runtime_seconds",
+        "cpu_weight", "io_weight", "memory_max_bytes",
+        "created_at_unix", "updated_at_unix", "launcher_json",
+        "last_observation_json", "resource_keys_json", "lease_owner_id",
+        "request_id", "origin_ref", "external_run_id",
+        "execution_envelope_sha256", "acceptance_json", "request_sha256",
+        "execution_backend", "systemd_scope", "authoritative_unit",
+        "chronik_outbox_enabled", "chronik_outbox_state_root",
+        "chronik_context_json",
+    }
+    required_indexes = {
+        "tasks_state_created_task_idx",
+        "tasks_created_task_idx",
+    }
+
+    version = schema_version()
+    if version not in {None, "1", "2", "3"}:
         connection.close()
         raise RuntimeError("Unsupported task database schema")
-    columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
-    if "chronik_outbox_enabled" not in columns:
-        connection.execute(
-            "ALTER TABLE tasks ADD COLUMN chronik_outbox_enabled "
-            "INTEGER NOT NULL DEFAULT 0"
+
+    # Established schema-3 databases stay read-only here. Migration writes,
+    # backfills, index creation and the version flip are serialized together.
+    if version != "3":
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-read after acquiring the writer lock because another process
+            # may have completed the migration while this connection waited.
+            version = schema_version()
+            if version not in {None, "1", "2", "3"}:
+                raise RuntimeError("Unsupported task database schema")
+            if version is None:
+                if table_exists("metadata") or table_exists("tasks"):
+                    raise RuntimeError(
+                        "Task database schema metadata is missing from an existing database"
+                    )
+                connection.execute(
+                    """
+                    CREATE TABLE metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE tasks (
+                        task_id TEXT PRIMARY KEY,
+                        host TEXT NOT NULL,
+                        unit TEXT NOT NULL,
+                        attempt INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        resume_policy TEXT NOT NULL,
+                        argv_json TEXT NOT NULL,
+                        argv_sha256 TEXT NOT NULL,
+                        cwd TEXT NOT NULL,
+                        runtime_seconds INTEGER NOT NULL,
+                        cpu_weight INTEGER NOT NULL,
+                        io_weight INTEGER NOT NULL,
+                        memory_max_bytes INTEGER,
+                        created_at_unix INTEGER NOT NULL,
+                        updated_at_unix INTEGER NOT NULL,
+                        launcher_json TEXT NOT NULL,
+                        last_observation_json TEXT,
+                        resource_keys_json TEXT NOT NULL DEFAULT '[]',
+                        lease_owner_id TEXT,
+                        request_id TEXT,
+                        origin_ref TEXT,
+                        external_run_id TEXT,
+                        execution_envelope_sha256 TEXT,
+                        acceptance_json TEXT NOT NULL DEFAULT '[]',
+                        request_sha256 TEXT,
+                        execution_backend TEXT NOT NULL DEFAULT 'systemd-user',
+                        systemd_scope TEXT NOT NULL DEFAULT 'user',
+                        authoritative_unit TEXT,
+                        chronik_outbox_enabled INTEGER NOT NULL DEFAULT 0,
+                        chronik_outbox_state_root TEXT,
+                        chronik_context_json TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES('schema_version', '3')"
+                )
+            elif version in {"1", "2"}:
+                if not table_exists("metadata") or not table_exists("tasks"):
+                    raise RuntimeError("Legacy task database is structurally incomplete")
+                columns = task_columns()
+                additions = (
+                    ("resource_keys_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("lease_owner_id", "TEXT"),
+                    ("request_id", "TEXT"),
+                    ("origin_ref", "TEXT"),
+                    ("external_run_id", "TEXT"),
+                    ("execution_envelope_sha256", "TEXT"),
+                    ("acceptance_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("request_sha256", "TEXT"),
+                    ("chronik_outbox_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                    ("chronik_outbox_state_root", "TEXT"),
+                    ("chronik_context_json", "TEXT"),
+                    ("execution_backend", "TEXT NOT NULL DEFAULT 'systemd-user'"),
+                    ("systemd_scope", "TEXT NOT NULL DEFAULT 'user'"),
+                    ("authoritative_unit", "TEXT"),
+                )
+                for name, definition in additions:
+                    if name not in columns:
+                        connection.execute(
+                            f"ALTER TABLE tasks ADD COLUMN {name} {definition}"
+                        )
+                connection.execute(
+                    "UPDATE tasks SET execution_backend='systemd-user' "
+                    "WHERE execution_backend IS NULL OR execution_backend=''"
+                )
+                connection.execute(
+                    "UPDATE tasks SET systemd_scope='user' "
+                    "WHERE systemd_scope IS NULL OR systemd_scope=''"
+                )
+                connection.execute(
+                    "UPDATE tasks SET authoritative_unit=unit "
+                    "WHERE authoritative_unit IS NULL OR authoritative_unit=''"
+                )
+                connection.execute(
+                    "UPDATE metadata SET value='3' WHERE key='schema_version'"
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS tasks_state_created_task_idx "
+                "ON tasks(state, created_at_unix DESC, task_id DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS tasks_created_task_idx "
+                "ON tasks(created_at_unix DESC, task_id DESC)"
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.close()
+            raise
+
+    missing_columns = required_columns - task_columns()
+    if missing_columns:
+        connection.close()
+        raise RuntimeError(
+            "Task database schema 3 is incomplete: "
+            + ", ".join(sorted(missing_columns))
         )
-    if "chronik_outbox_state_root" not in columns:
-        connection.execute("ALTER TABLE tasks ADD COLUMN chronik_outbox_state_root TEXT")
-    if "chronik_context_json" not in columns:
-        connection.execute("ALTER TABLE tasks ADD COLUMN chronik_context_json TEXT")
-    connection.commit()
+    missing_indexes = required_indexes - task_indexes()
+    if missing_indexes:
+        connection.close()
+        raise RuntimeError(
+            "Task database schema 3 indexes are incomplete: "
+            + ", ".join(sorted(missing_indexes))
+        )
     try:
         os.chmod(TASK_DB, 0o600)
     except FileNotFoundError:
         connection.close()
         raise
     return connection
-
 
 def _command_requires_recovery(argv: list[str]) -> bool:
     names = [Path(item).name.lower() for item in argv if isinstance(item, str)]
@@ -306,6 +415,40 @@ def _validate_unit(unit: str) -> str:
     if UNIT.fullmatch(unit) is None:
         raise ValueError("Invalid task unit")
     return unit
+
+
+def _validate_execution_backend(value: str) -> str:
+    if value not in TASK_EXECUTION_BACKENDS:
+        raise ValueError("Invalid task execution backend")
+    return value
+
+
+def _validate_systemd_scope(value: str) -> str:
+    if value not in SYSTEMD_SCOPES:
+        raise ValueError("Invalid task systemd scope")
+    return value
+
+
+def _execution_backend(record: dict[str, Any]) -> str:
+    return _validate_execution_backend(record.get("execution_backend") or "systemd-user")
+
+
+def _systemd_scope(record: dict[str, Any]) -> str:
+    return _validate_systemd_scope(record.get("systemd_scope") or "user")
+
+
+def _authoritative_unit(record: dict[str, Any]) -> str:
+    return _validate_unit(record.get("authoritative_unit") or record["unit"])
+
+
+def _is_root_systemd_backend(record: dict[str, Any]) -> bool:
+    return _execution_backend(record) == "systemd-root-broker"
+
+
+def _execution_contract(target: dict[str, Any], command: list[str]) -> tuple[str, str]:
+    if target["transport"] == "local" and _command_requires_recovery(command):
+        return "systemd-root-broker", "system"
+    return "systemd-user", "user"
 
 
 def _task_unit(task_id: str, attempt: int) -> str:
@@ -499,6 +642,80 @@ def _release_record_resources(record: dict[str, Any]) -> dict[str, Any] | None:
     return resources.release_resources(owner, keys)
 
 
+def _task_lease_ttl(record: dict[str, Any], state: str) -> int:
+    if state == "outcome_unknown":
+        # Unknown root truth must remain protected long enough for operator
+        # recovery, but the lease is still bounded and therefore not permanent.
+        return resources.MAX_TTL_SECONDS
+    return min(
+        resources.MAX_TTL_SECONDS,
+        max(
+            resources.MIN_TTL_SECONDS,
+            int(record["runtime_seconds"]) + 300,
+        ),
+    )
+
+
+def _maintain_record_resources(
+    record: dict[str, Any],
+    state: str,
+) -> dict[str, Any] | None:
+    if state not in ACTIVE_TASK_STATES:
+        return None
+    keys = _record_resource_keys(record)
+    if not keys:
+        return None
+    owner = record.get("lease_owner_id") or _lease_owner(record["task_id"])
+    ttl = _task_lease_ttl(record, state)
+    try:
+        renewed = resources.renew_resources(owner, keys, ttl_seconds=ttl)
+        leases = renewed.get("leases", [])
+        return {
+            "maintained": True,
+            "mode": "renewed",
+            "expires_at_unix": (
+                min(int(item["expires_at_unix"]) for item in leases)
+                if leases
+                else None
+            ),
+        }
+    except (ValueError, RuntimeError):
+        # A lease may have expired between observations. Reacquire only when the
+        # resource is still free; a foreign owner remains a hard conflict.
+        try:
+            acquired = resources.acquire_resources(
+                owner,
+                keys,
+                purpose=f"persistent task {record['task_id']} lease recovery",
+                ttl_seconds=ttl,
+                metadata={
+                    "task_id": record["task_id"],
+                    "host": record["host"],
+                    "attempt": int(record["attempt"]),
+                    "recovered_after_expiry": True,
+                },
+            )
+        except Exception as exc:
+            return {
+                "maintained": False,
+                "mode": "failed",
+                "error": _redact_reason(f"{type(exc).__name__}: {exc}"),
+            }
+        return {
+            "maintained": True,
+            "mode": "reacquired",
+            "expires_at_unix": acquired.get("expires_at_unix"),
+        }
+    except Exception as exc:
+        # Ownership drift is evidence, not a reason to hide task status. Keep
+        # the task observable and surface the lease failure explicitly.
+        return {
+            "maintained": False,
+            "mode": "failed",
+            "error": _redact_reason(f"{type(exc).__name__}: {exc}"),
+        }
+
+
 def _validate_command(argv: list[str]) -> list[str]:
     command = operator._validate_argv(argv, cwd=operator.HOME)
     if operator._redact_argv(command) != command:
@@ -526,7 +743,7 @@ def _dispatch(host: str, argv: list[str], *, timeout_seconds: int = 60) -> dict[
 
 def _launch_argv(record: dict[str, Any]) -> list[str]:
     command = json.loads(record["argv_json"])
-    unit = _validate_unit(record["unit"])
+    unit = _authoritative_unit(record)
     argv = [
         "systemd-run",
         "--user",
@@ -554,6 +771,64 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
     return [*argv, "--", *command]
 
 
+def _root_task_start_payload(record: dict[str, Any]) -> dict[str, Any]:
+    unit = _authoritative_unit(record)
+    return {
+        "operation": "start",
+        "unit": unit,
+        "argv": json.loads(record["argv_json"]),
+        "cwd": record["cwd"],
+        "runtime_seconds": int(record["runtime_seconds"]),
+        "cpu_weight": int(record["cpu_weight"]),
+        "io_weight": int(record["io_weight"]),
+        "memory_max_bytes": record["memory_max_bytes"],
+        "description": operator._systemd_safe_description(
+            "task",
+            unit,
+            record["argv_sha256"],
+        ),
+    }
+
+
+def _root_task_payload(record: dict[str, Any], operation: str, **extra: Any) -> dict[str, Any]:
+    return {"operation": operation, "unit": _authoritative_unit(record), **extra}
+
+
+def _launch(record: dict[str, Any]) -> dict[str, Any]:
+    if _is_root_systemd_backend(record):
+        try:
+            return privileged.root_task_systemd_request(
+                _root_task_start_payload(record),
+                timeout_seconds=60,
+            )
+        except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+            # These failures occur before a structured broker response exists:
+            # broker readiness, local reference creation or client execution
+            # failed, so no accepted root dispatch is evidenced. Mark the
+            # attempt failed and release its resources instead of stranding a
+            # launching record. Once the client has contacted the broker, its
+            # timeout and malformed-response paths return outcome_unknown.
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": _redact_reason(f"{type(exc).__name__}: {exc}"),
+                "timed_out": False,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "root_truth_observable": False,
+                "outcome_unknown": False,
+                "launch_not_dispatched": True,
+                "privileged_broker": None,
+            }
+    return _dispatch(record["host"], _launch_argv(record), timeout_seconds=60)
+
+
+def _launch_state(result: dict[str, Any]) -> str:
+    if result.get("outcome_unknown"):
+        return "outcome_unknown"
+    return "running" if result["returncode"] == 0 else "failed"
+
+
 def _row(task_id: str) -> dict[str, Any]:
     identifier = _validate_task_id(task_id)
     with _database_connection() as connection:
@@ -570,6 +845,9 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
         "task_id": record["task_id"],
         "host": record["host"],
         "unit": record["unit"],
+        "authoritative_unit": _authoritative_unit(record),
+        "execution_backend": _execution_backend(record),
+        "systemd_scope": _systemd_scope(record),
         "attempt": record["attempt"],
         "state": record["state"],
         "resume_policy": record["resume_policy"],
@@ -674,6 +952,9 @@ def _public_for_view(record: dict[str, Any], view: str) -> dict[str, Any]:
         "task_id": full["task_id"],
         "host": full["host"],
         "unit": full["unit"],
+        "authoritative_unit": full["authoritative_unit"],
+        "execution_backend": full["execution_backend"],
+        "systemd_scope": full["systemd_scope"],
         "attempt": full["attempt"],
         "state": full["state"],
         "resume_policy": full["resume_policy"],
@@ -703,6 +984,7 @@ def _set_state(
     launcher: dict[str, Any] | None = None,
     observation: dict[str, Any] | None = None,
     unit: str | None = None,
+    authoritative_unit: str | None = None,
     attempt: int | None = None,
 ) -> dict[str, Any]:
     if state not in TASK_STATES:
@@ -718,6 +1000,9 @@ def _set_state(
     if unit is not None:
         updates.append("unit=?")
         values.append(_validate_unit(unit))
+    if authoritative_unit is not None:
+        updates.append("authoritative_unit=?")
+        values.append(_validate_unit(authoritative_unit))
     if attempt is not None:
         updates.append("attempt=?")
         values.append(attempt)
@@ -740,15 +1025,48 @@ def _set_state(
 
 
 def _observe(record: dict[str, Any]) -> dict[str, Any]:
+    if _is_root_systemd_backend(record):
+        result = privileged.root_task_systemd_request(
+            _root_task_payload(
+                record,
+                "show",
+                properties=list(fleet.TASK_UNIT_SHOW_PROPERTIES),
+            ),
+            timeout_seconds=30,
+            max_output_bytes=8192,
+        )
+        observer: dict[str, Any] = {
+            "kind": "root-systemd-broker-show-v1",
+            "execution_backend": _execution_backend(record),
+            "systemd_scope": _systemd_scope(record),
+        }
+        properties: dict[str, str] = {}
+        for line in result.get("stdout", "").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                properties[key] = value
+        state = "outcome_unknown" if result.get("outcome_unknown") else _classify_observation(result, properties)
+        return {
+            "state": state,
+            "properties": properties,
+            "probe": result,
+            "observer": observer,
+            "observed_at_unix": _now(),
+        }
+
     command = [
         "systemctl",
         "--user",
         "show",
-        record["unit"],
+        _authoritative_unit(record),
         "--no-pager",
     ]
     command.extend(f"--property={item}" for item in fleet.TASK_UNIT_SHOW_PROPERTIES)
-    observer: dict[str, Any] = {"kind": "fleet-dispatch-v1"}
+    observer: dict[str, Any] = {
+        "kind": "fleet-dispatch-v1",
+        "execution_backend": _execution_backend(record),
+        "systemd_scope": _systemd_scope(record),
+    }
     try:
         result = _dispatch(record["host"], command, timeout_seconds=30)
     except fleet.FleetCommandDenied:
@@ -757,7 +1075,7 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
         # for Grabowski-owned task units, so fall back to the narrow fleet helper.
         observed = fleet.run_fleet_task_unit_show(
             record["host"],
-            record["unit"],
+            _authoritative_unit(record),
             fleet.TASK_UNIT_SHOW_PROPERTIES,
             timeout_seconds=30,
             max_output_bytes=8192,
@@ -768,6 +1086,8 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
             "transport": observed["transport"],
             "roles": observed["roles"],
             "kind": observed["observer"],
+            "execution_backend": _execution_backend(record),
+            "systemd_scope": _systemd_scope(record),
             "fallback_from": "fleet-dispatch-permission-denied",
         }
     properties: dict[str, str] = {}
@@ -834,6 +1154,14 @@ def grabowski_task_start(
     )
     task_id = uuid.uuid4().hex[:24]
     lease_owner = _lease_owner(task_id)
+    execution_backend, systemd_scope = _execution_contract(target, command)
+    if (
+        execution_backend == "systemd-root-broker"
+        and runtime + 300 > resources.MAX_TTL_SECONDS
+    ):
+        raise ValueError(
+            "root task runtime must leave 300 seconds of lease and stop grace"
+        )
     operator._require_operator_mutation(
         "durable_job",
         path=working_directory,
@@ -850,6 +1178,9 @@ def grabowski_task_start(
         "task_id": task_id,
         "host": host,
         "unit": unit,
+        "authoritative_unit": unit,
+        "execution_backend": execution_backend,
+        "systemd_scope": systemd_scope,
         "attempt": attempt,
         "state": "launching",
         "resume_policy": policy,
@@ -897,6 +1228,7 @@ def grabowski_task_start(
                 cpu_weight, io_weight, memory_max_bytes,
                 created_at_unix, updated_at_unix, launcher_json,
                 last_observation_json, resource_keys_json, lease_owner_id,
+                execution_backend, systemd_scope, authoritative_unit,
                 chronik_outbox_enabled, chronik_outbox_state_root,
                 chronik_context_json
             ) VALUES(
@@ -905,6 +1237,7 @@ def grabowski_task_start(
                 :cpu_weight, :io_weight, :memory_max_bytes,
                 :created_at_unix, :updated_at_unix, :launcher_json,
                 :last_observation_json, :resource_keys_json, :lease_owner_id,
+                :execution_backend, :systemd_scope, :authoritative_unit,
                 :chronik_outbox_enabled, :chronik_outbox_state_root,
                 :chronik_context_json
             )
@@ -916,10 +1249,11 @@ def grabowski_task_start(
         if task_resources:
             resources.release_resources(lease_owner, task_resources)
         raise
-    launcher = _dispatch(host, _launch_argv(record), timeout_seconds=60)
-    state = "running" if launcher["returncode"] == 0 else "failed"
+    launcher = _launch(record)
+    state = _launch_state(launcher)
     stored = _set_state(task_id, state, launcher=launcher)
-    if launcher["returncode"] != 0:
+    lease_maintenance = _maintain_record_resources(stored, state)
+    if _state_releases_resources(state):
         _release_record_resources(stored)
     audit = {
         "timestamp_unix": _now(),
@@ -927,9 +1261,13 @@ def grabowski_task_start(
         "task_id": task_id,
         "host": host,
         "transport": target["transport"],
+        "execution_backend": execution_backend,
+        "systemd_scope": systemd_scope,
+        "authoritative_unit": unit,
         "argv_sha256": record["argv_sha256"],
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
+        "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
         "recovery_required": recovery_gate.get("required", False),
         "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),
         "resource_keys": task_resources,
@@ -938,6 +1276,7 @@ def grabowski_task_start(
         "resource_lease_expires_at_unix": (
             lease_result["expires_at_unix"] if lease_result else None
         ),
+        "resource_lease_maintenance": lease_maintenance,
     }
     base._append_audit(audit)
     return {"task": _public(stored), "audit": audit}
@@ -954,9 +1293,19 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
         observation["state"],
         observation=observation,
     )
-    if observation["state"] not in {"launching", "running"}:
+    lease_maintenance = _maintain_record_resources(stored, stored["state"])
+    if lease_maintenance is not None:
+        observation["lease_maintenance"] = lease_maintenance
+        stored = _set_state(
+            task_id,
+            observation["state"],
+            observation=observation,
+        )
+    if _state_releases_resources(observation["state"]):
         _release_record_resources(stored)
-    return _public(stored)
+    result = _public(stored)
+    result["lease_maintenance"] = lease_maintenance
+    return result
 
 
 @mcp.tool(name="grabowski_task_logs", annotations=READ_ONLY)
@@ -966,24 +1315,34 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
     if not isinstance(max_lines, int) or not 1 <= max_lines <= 2000:
         raise ValueError("max_lines must be between 1 and 2000")
     record = _row(task_id)
-    result = _dispatch(
-        record["host"],
-        [
-            "journalctl",
-            "--user",
-            "--unit",
-            record["unit"],
-            "--no-pager",
-            "--output=cat",
-            "--lines",
-            str(max_lines),
-        ],
-        timeout_seconds=30,
-    )
+    if _is_root_systemd_backend(record):
+        result = privileged.root_task_systemd_request(
+            _root_task_payload(record, "journal", max_lines=max_lines),
+            timeout_seconds=30,
+            max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+        )
+    else:
+        result = _dispatch(
+            record["host"],
+            [
+                "journalctl",
+                "--user",
+                "--unit",
+                _authoritative_unit(record),
+                "--no-pager",
+                "--output=cat",
+                "--lines",
+                str(max_lines),
+            ],
+            timeout_seconds=30,
+        )
     return {
         "task_id": task_id,
         "host": record["host"],
         "unit": record["unit"],
+        "authoritative_unit": _authoritative_unit(record),
+        "execution_backend": _execution_backend(record),
+        "systemd_scope": _systemd_scope(record),
         "result": result,
     }
 
@@ -1000,14 +1359,28 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
         owner_id=record.get("lease_owner_id"),
         host=record["host"],
     )
-    result = _dispatch(
-        record["host"],
-        ["systemctl", "--user", "stop", record["unit"]],
-        timeout_seconds=60,
-    )
-    state = "cancelled" if result["returncode"] == 0 else record["state"]
-    stored = _set_state(task_id, state, observation={"cancel": result})
-    if result["returncode"] == 0:
+    if _is_root_systemd_backend(record):
+        result = privileged.root_task_systemd_request(
+            _root_task_payload(record, "stop"),
+            timeout_seconds=60,
+        )
+    else:
+        result = _dispatch(
+            record["host"],
+            ["systemctl", "--user", "stop", _authoritative_unit(record)],
+            timeout_seconds=60,
+        )
+    if result.get("outcome_unknown"):
+        state = "outcome_unknown"
+    else:
+        state = "cancelled" if result["returncode"] == 0 else record["state"]
+    cancel_observation = {"cancel": result}
+    stored = _set_state(task_id, state, observation=cancel_observation)
+    lease_maintenance = _maintain_record_resources(stored, stored["state"])
+    if lease_maintenance is not None:
+        cancel_observation["lease_maintenance"] = lease_maintenance
+        stored = _set_state(task_id, state, observation=cancel_observation)
+    if _state_releases_resources(state):
         _release_record_resources(stored)
     audit = {
         "timestamp_unix": _now(),
@@ -1015,7 +1388,12 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
         "task_id": task_id,
         "host": record["host"],
         "unit": record["unit"],
+        "authoritative_unit": _authoritative_unit(record),
+        "execution_backend": _execution_backend(record),
+        "systemd_scope": _systemd_scope(record),
         "returncode": result["returncode"],
+        "outcome_unknown": bool(result.get("outcome_unknown")),
+        "resource_lease_maintenance": lease_maintenance,
     }
     base._append_audit(audit)
     return {"task": _public(stored), "result": result, "audit": audit}
@@ -1034,6 +1412,8 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
         host=record["host"],
         opaque_command=True,
     )
+    if _is_terminal_state(record["state"]):
+        raise RuntimeError("Terminal task cannot be resumed")
     if record["resume_policy"] in {"never", "manual"}:
         raise PermissionError("Task resume policy does not permit automatic retry")
     command = json.loads(record["argv_json"])
@@ -1041,9 +1421,24 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     observation = _observe(record)
     if observation["state"] == "running":
         raise RuntimeError("Task is still running")
+    if observation["state"] == "completed":
+        stored = _set_state(
+            task_id,
+            "completed",
+            observation=observation,
+        )
+        _release_record_resources(stored)
+        raise RuntimeError("Task already completed; refusing retry")
+    if observation["state"] == "outcome_unknown":
+        _set_state(
+            task_id,
+            "outcome_unknown",
+            observation=observation,
+        )
+        raise RuntimeError("Task outcome is unknown; verify the authoritative unit before retry")
     attempt = int(record["attempt"]) + 1
     unit = _task_unit(task_id, attempt)
-    candidate = {**record, "attempt": attempt, "unit": unit}
+    candidate = {**record, "attempt": attempt, "unit": unit, "authoritative_unit": unit}
     task_resources = _record_resource_keys(record)
     lease_owner = record.get("lease_owner_id") or _lease_owner(task_id)
     lease_result = None
@@ -1062,17 +1457,19 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
                 "attempt": attempt,
             },
         )
-    launcher = _dispatch(record["host"], _launch_argv(candidate), timeout_seconds=60)
-    state = "running" if launcher["returncode"] == 0 else "failed"
+    launcher = _launch(candidate)
+    state = _launch_state(launcher)
     stored = _set_state(
         task_id,
         state,
         launcher=launcher,
         observation=observation,
         unit=unit,
+        authoritative_unit=unit,
         attempt=attempt,
     )
-    if launcher["returncode"] != 0:
+    lease_maintenance = _maintain_record_resources(stored, state)
+    if _state_releases_resources(state):
         _release_record_resources(stored)
     audit = {
         "timestamp_unix": _now(),
@@ -1081,13 +1478,18 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
         "host": record["host"],
         "attempt": attempt,
         "unit": unit,
+        "authoritative_unit": unit,
+        "execution_backend": _execution_backend(record),
+        "systemd_scope": _systemd_scope(record),
         "launcher_returncode": launcher["returncode"],
+        "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
         "recovery_required": recovery_gate.get("required", False),
         "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),
         "resource_keys": task_resources,
         "resource_lease_expires_at_unix": (
             lease_result["expires_at_unix"] if lease_result else None
         ),
+        "resource_lease_maintenance": lease_maintenance,
     }
     base._append_audit(audit)
     return {"task": _public(stored), "audit": audit}
@@ -1096,10 +1498,14 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
 def _reconcile_candidate_rows(task_id: str = "") -> list[dict[str, Any]]:
     if task_id:
         record = _row(task_id)
-        return [record] if record["state"] in {"launching", "running"} else []
+        return (
+            [record]
+            if record["state"] in {"launching", "running", "outcome_unknown"}
+            else []
+        )
     with _database_connection() as connection:
         rows = connection.execute(
-            "SELECT * FROM tasks WHERE state IN ('launching', 'running') "
+            "SELECT * FROM tasks WHERE state IN ('launching', 'running', 'outcome_unknown') "
             "ORDER BY created_at_unix, task_id"
         ).fetchall()
     return [dict(row) for row in rows]
@@ -1134,6 +1540,9 @@ def _reconcile_observe_denial(record: dict[str, Any], exc: PermissionError) -> d
         "task_id": record["task_id"],
         "host": record["host"],
         "unit": record["unit"],
+        "authoritative_unit": _authoritative_unit(record),
+        "execution_backend": _execution_backend(record),
+        "systemd_scope": _systemd_scope(record),
         "current_state": record["state"],
         "resume_policy": record["resume_policy"],
         "reason": f"observation denied: {_redact_reason(str(exc))}",
@@ -1162,12 +1571,14 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
             "current_state": record["state"],
             "observed_state": observation["state"],
             "resume_policy": record["resume_policy"],
+            "execution_backend": _execution_backend(record),
+            "systemd_scope": _systemd_scope(record),
             "resource_keys": _record_resource_keys(record),
         }
         observations.append(item)
         if observation["state"] != record["state"]:
             would_refresh.append(item)
-        if observation["state"] not in {"launching", "running"}:
+        if _state_releases_resources(observation["state"]):
             would_release.append(record["task_id"])
         blocker = _reconcile_blocker(record, observation)
         if blocker is not None:
@@ -1207,10 +1618,22 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
             observation["state"],
             observation=observation,
         )
-        if observation["state"] not in {"launching", "running"}:
+        lease_maintenance = _maintain_record_resources(
+            stored, stored["state"]
+        )
+        if lease_maintenance is not None:
+            observation["lease_maintenance"] = lease_maintenance
+            stored = _set_state(
+                record["task_id"],
+                observation["state"],
+                observation=observation,
+            )
+        if _state_releases_resources(observation["state"]):
             _release_record_resources(stored)
             released.append(stored["task_id"])
-        refreshed.append(_public(stored))
+        public = _public(stored)
+        public["lease_maintenance"] = lease_maintenance
+        refreshed.append(public)
     return {
         "mode": "refresh",
         "task_id": task_id,
@@ -1253,10 +1676,22 @@ def reconcile_tasks_resume(
             observation["state"],
             observation=observation,
         )
-        if observation["state"] not in {"launching", "running"}:
+        lease_maintenance = _maintain_record_resources(
+            stored, stored["state"]
+        )
+        if lease_maintenance is not None:
+            observation["lease_maintenance"] = lease_maintenance
+            stored = _set_state(
+                record["task_id"],
+                observation["state"],
+                observation=observation,
+            )
+        if _state_releases_resources(observation["state"]):
             _release_record_resources(stored)
             released.append(stored["task_id"])
-        refreshed.append(_public(stored))
+        public = _public(stored)
+        public["lease_maintenance"] = lease_maintenance
+        refreshed.append(public)
         if observation["state"] == "running":
             continue
         blocker = _reconcile_blocker(stored, observation)
