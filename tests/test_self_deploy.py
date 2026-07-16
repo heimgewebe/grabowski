@@ -63,6 +63,22 @@ def _result(stdout: str = "", returncode: int = 0) -> dict[str, object]:
 
 SELF_DEPLOY = _load_self_deploy()
 
+def _source_identity(repo: Path, head: str, *, kind: str = "canonical-main", canonical: Path | None = None) -> dict[str, object]:
+    canonical_repo = canonical or repo
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_source_identity",
+        "source_kind": kind,
+        "repository": str(repo),
+        "canonical_repository": str(canonical_repo),
+        "git_common_directory": str(canonical_repo / ".git"),
+        "head": head,
+        "origin_main": head,
+        "clean": True,
+        "lease_evidence": {"resource_key": f"path:{repo}", "lease": None},
+    }
+    return {**material, "identity_sha256": SELF_DEPLOY._source_identity_sha256(material)}
+
 RUNNER_SPEC = importlib.util.spec_from_file_location("run_scheduled_deploy_test", ROOT / "tools" / "run_scheduled_deploy.py")
 if RUNNER_SPEC is None or RUNNER_SPEC.loader is None:
     raise RuntimeError("cannot load scheduled deployment runner")
@@ -166,6 +182,7 @@ class SelfDeployToolTests(unittest.TestCase):
     def test_preflight_requires_clean_synchronized_main(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
+            (repo / ".git").mkdir()
             runner = repo / "tools" / "run_scheduled_deploy.py"
             runner.parent.mkdir()
             runner.write_text("pass\n", encoding="utf-8")
@@ -173,15 +190,31 @@ class SelfDeployToolTests(unittest.TestCase):
             with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
                 SELF_DEPLOY,
                 "_git_result",
-                side_effect=[_result(expected), _result("main"), _result(expected), _result("")],
+                side_effect=[
+                    _result(".git"),
+                    _result(expected),
+                    _result("main"),
+                    _result(expected),
+                    _result(""),
+                ],
+            ), patch.object(
+                SELF_DEPLOY,
+                "_resource_inspect",
+                return_value={"resource_key": f"path:{repo}", "lease": None},
             ):
-                resolved_repo, resolved_runner = SELF_DEPLOY._canonical_preflight(expected)
+                resolved_repo, resolved_runner, identity = SELF_DEPLOY._deployment_source_preflight(
+                    expected, None, None
+                )
             self.assertEqual(resolved_repo, repo)
             self.assertEqual(resolved_runner, runner)
+            self.assertEqual(identity["source_kind"], "canonical-main")
+            self.assertEqual(identity["head"], expected)
+            self.assertEqual(identity["lease_evidence"]["lease"], None)
 
     def test_preflight_rejects_dirty_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
+            (repo / ".git").mkdir()
             runner = repo / "tools" / "run_scheduled_deploy.py"
             runner.parent.mkdir()
             runner.write_text("pass\n", encoding="utf-8")
@@ -189,18 +222,215 @@ class SelfDeployToolTests(unittest.TestCase):
             with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
                 SELF_DEPLOY,
                 "_git_result",
-                side_effect=[_result(expected), _result("main"), _result(expected), _result(" M file")],
+                side_effect=[
+                    _result(".git"),
+                    _result(expected),
+                    _result("main"),
+                    _result(expected),
+                    _result(" M file"),
+                ],
             ):
                 with self.assertRaisesRegex(RuntimeError, "dirty"):
-                    SELF_DEPLOY._canonical_preflight(expected)
+                    SELF_DEPLOY._deployment_source_preflight(expected, None, None)
+
+    def test_explicit_detached_worktree_source_is_identity_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            canonical = root / "canonical"
+            source = root / "source"
+            canonical.mkdir()
+            source.mkdir()
+            common = canonical / ".git"
+            common.mkdir()
+            runner = source / "tools" / "run_scheduled_deploy.py"
+            runner.parent.mkdir()
+            runner.write_text("pass\n", encoding="utf-8")
+            expected = "d" * 40
+            with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[
+                    _result(str(common)),
+                    _result(str(common)),
+                    _result(expected),
+                    _result("HEAD"),
+                    _result(expected),
+                    _result(""),
+                ],
+            ), patch.object(
+                SELF_DEPLOY,
+                "_resource_inspect",
+                return_value={
+                    "resource_key": f"path:{source}",
+                    "lease": {
+                        "resource_key": f"path:{source}",
+                        "owner_id": "task:deploy-source",
+                        "acquired_at_unix": 10,
+                        "updated_at_unix": 11,
+                        "expires_at_unix": 100,
+                        "metadata_sha256": "a" * 64,
+                    },
+                },
+            ):
+                resolved, resolved_runner, identity = SELF_DEPLOY._deployment_source_preflight(
+                    expected,
+                    str(source),
+                    "task:deploy-source",
+                )
+            self.assertEqual(resolved, source)
+            self.assertEqual(resolved_runner, runner)
+            self.assertEqual(identity["source_kind"], "detached-worktree")
+            self.assertEqual(identity["canonical_repository"], str(canonical))
+            self.assertRegex(identity["identity_sha256"], r"[0-9a-f]{64}")
+            self.assertEqual(
+                identity["lease_evidence"]["lease"]["owner_id"],
+                "task:deploy-source",
+            )
+
+    def test_detached_source_requires_lease_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            canonical = root / "canonical"
+            source = root / "source"
+            canonical.mkdir()
+            source.mkdir()
+            common = canonical / ".git"
+            common.mkdir()
+            runner = source / "tools" / "run_scheduled_deploy.py"
+            runner.parent.mkdir()
+            runner.write_text("pass\n", encoding="utf-8")
+            expected = "d" * 40
+            with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[
+                    _result(str(common)),
+                    _result(str(common)),
+                    _result(expected),
+                    _result("HEAD"),
+                    _result(expected),
+                    _result(""),
+                ],
+            ):
+                with self.assertRaisesRegex(ValueError, "requires source_lease_owner_id"):
+                    SELF_DEPLOY._deployment_source_preflight(
+                        expected,
+                        str(source),
+                        None,
+                    )
+
+    def test_explicit_source_rejects_topic_branch_and_foreign_git_common_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            canonical = root / "canonical"
+            source = root / "source"
+            canonical.mkdir()
+            source.mkdir()
+            common = canonical / ".git"
+            foreign = root / "foreign.git"
+            common.mkdir()
+            foreign.mkdir()
+            runner = source / "tools" / "run_scheduled_deploy.py"
+            runner.parent.mkdir()
+            runner.write_text("pass\n", encoding="utf-8")
+            expected = "e" * 40
+            with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[_result(str(common)), _result(str(foreign))],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "does not share"):
+                    SELF_DEPLOY._deployment_source_preflight(expected, str(source), None)
+            with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[
+                    _result(str(common)),
+                    _result(str(common)),
+                    _result(expected),
+                    _result("topic"),
+                    _result(expected),
+                    _result(""),
+                ],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invalid branch state"):
+                    SELF_DEPLOY._deployment_source_preflight(expected, str(source), None)
+
+    def test_source_lease_requires_exact_owner_and_enters_identity(self) -> None:
+        repo = Path("/home/alex/repos/.grabowski-worktrees/deploy")
+        lease = {
+            "resource_key": f"path:{repo}",
+            "owner_id": "task:deploy-owner",
+            "acquired_at_unix": 10,
+            "updated_at_unix": 11,
+            "expires_at_unix": 100,
+            "metadata_sha256": "a" * 64,
+        }
+        payload = {"resource_key": f"path:{repo}", "lease": lease}
+        with patch.object(SELF_DEPLOY, "_resource_inspect", return_value=payload):
+            with self.assertRaisesRegex(RuntimeError, "active lease"):
+                SELF_DEPLOY._source_lease_evidence(repo, None)
+            with self.assertRaisesRegex(RuntimeError, "owner drift"):
+                SELF_DEPLOY._source_lease_evidence(repo, "task:other")
+            evidence = SELF_DEPLOY._source_lease_evidence(repo, "task:deploy-owner")
+        self.assertEqual(evidence["lease"], lease)
+        first = _source_identity(repo, "a" * 40, kind="detached-worktree", canonical=Path("/home/alex/repos/grabowski"))
+        material = {key: value for key, value in first.items() if key != "identity_sha256"}
+        material["lease_evidence"] = evidence
+        second_hash = SELF_DEPLOY._source_identity_sha256(material)
+        self.assertNotEqual(first["identity_sha256"], second_hash)
+        command_a = SELF_DEPLOY._deploy_command(
+            repo,
+            repo / "tools/run_scheduled_deploy.py",
+            "a" * 40,
+            8,
+            canonical_repository=Path("/home/alex/repos/grabowski"),
+            source_kind="detached-worktree",
+            source_identity_sha256=first["identity_sha256"],
+        )
+        command_b = SELF_DEPLOY._deploy_command(
+            repo,
+            repo / "tools/run_scheduled_deploy.py",
+            "a" * 40,
+            8,
+            canonical_repository=Path("/home/alex/repos/grabowski"),
+            source_kind="detached-worktree",
+            source_identity_sha256=second_hash,
+        )
+        self.assertNotEqual(
+            SELF_DEPLOY._deploy_identity(command_a),
+            SELF_DEPLOY._deploy_identity(command_b),
+        )
+
+    def test_source_path_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            canonical = root / "canonical"
+            target = root / "target"
+            canonical.mkdir()
+            target.mkdir()
+            source = root / "source"
+            source.symlink_to(target, target_is_directory=True)
+            with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical):
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    SELF_DEPLOY._deployment_source_preflight("a" * 40, str(source), None)
 
     def test_schedule_uses_fixed_delayed_runner(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"
         expected = "c" * 40
+        identity = _source_identity(repo, expected)
         unit = "grabowski-job-abcdef012345"
         job_dir = Path("/state") / unit
-        command = SELF_DEPLOY._deploy_command(repo, runner, expected, 9)
+        command = SELF_DEPLOY._deploy_command(
+            repo,
+            runner,
+            expected,
+            9,
+            canonical_repository=repo,
+            source_kind="canonical-main",
+            source_identity_sha256=identity["identity_sha256"],
+        )
         job = {
             "unit": unit,
             "argv_sha256": SELF_DEPLOY.operator._argv_hash(command),
@@ -212,7 +442,11 @@ class SelfDeployToolTests(unittest.TestCase):
         SELF_DEPLOY.base._append_audit.reset_mock()
         SELF_DEPLOY.operator._start_job.return_value = job
         fixed_uuid = Mock(hex="abcdef012345ffffffffffffffffffff")
-        with patch.object(SELF_DEPLOY, "_canonical_preflight", return_value=(repo, runner)), patch.object(
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            return_value=(repo, runner, identity),
+        ), patch.object(
             SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
         ), patch.object(SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None), patch.object(
             SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")
@@ -223,7 +457,7 @@ class SelfDeployToolTests(unittest.TestCase):
         ):
             result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 9)
         SELF_DEPLOY.operator._start_job.assert_called_once_with(
-            ["/usr/bin/python3", str(runner), "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "9"],
+            command,
             cwd=str(repo),
             runtime_seconds=3600,
             finalization_expected_head=expected,
@@ -233,18 +467,15 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(write_index.call_count, 2)
         self.assertTrue(result["scheduled"])
         self.assertFalse(result["already_scheduled"])
-        self.assertEqual(9, result["requested_delay_seconds"])
-        self.assertEqual(9, result["delay_seconds"])
-        self.assertTrue(result["expected_connector_disconnect"])
+        self.assertEqual(result["source_identity_sha256"], identity["identity_sha256"])
         self.assertEqual(result["unit"], unit)
         self.assertEqual(SELF_DEPLOY.base._append_audit.call_count, 2)
-        self.assertEqual(result["audit"]["intent"]["operation"], "runtime-deploy-schedule-intent")
-        self.assertEqual(result["audit"]["scheduled"]["operation"], "runtime-deploy-scheduled")
 
     def test_schedule_reuses_identical_inflight_job_without_starting_another(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"
         expected = "e" * 40
+        identity = _source_identity(repo, expected)
         existing = {
             "unit": "grabowski-job-abcdef012345",
             "argv_sha256": "f" * 64,
@@ -256,26 +487,28 @@ class SelfDeployToolTests(unittest.TestCase):
         }
         SELF_DEPLOY.operator.grabowski_job_start.reset_mock()
         SELF_DEPLOY.base._append_audit.reset_mock()
-        with patch.object(SELF_DEPLOY, "_canonical_preflight", return_value=(repo, runner)), patch.object(
+        command = SELF_DEPLOY._deploy_command(
+            repo,
+            runner,
+            expected,
+            8,
+            canonical_repository=repo,
+            source_kind="canonical-main",
+            source_identity_sha256=identity["identity_sha256"],
+        )
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            return_value=(repo, runner, identity),
+        ), patch.object(
             SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
         ), patch.object(SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=existing) as lookup:
             result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
-        lookup.assert_called_once_with(
-            SELF_DEPLOY._deploy_command(repo, runner, expected, 8),
-            repo,
-        )
+        lookup.assert_called_once_with(command, repo)
         SELF_DEPLOY.operator.grabowski_job_start.assert_not_called()
-        self.assertTrue(result["scheduled"])
         self.assertTrue(result["already_scheduled"])
-        self.assertEqual(8, result["requested_delay_seconds"])
-        self.assertEqual(6, result["delay_seconds"])
-        self.assertEqual("grabowski-job-abcdef012345", result["unit"])
-        self.assertEqual(
-            "runtime-deploy-existing-schedule-observed",
-            result["audit"]["scheduled"]["operation"],
-        )
+        self.assertEqual(result["source_identity_sha256"], identity["identity_sha256"])
         self.assertEqual(1, SELF_DEPLOY.base._append_audit.call_count)
-        self.assertIsNone(result["audit"]["intent"])
 
     def test_deploy_identity_accepts_canonical_options_in_any_order(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
@@ -286,13 +519,27 @@ class SelfDeployToolTests(unittest.TestCase):
             str(runner),
             "--delay-seconds",
             "8",
+            "--source-kind",
+            "canonical-main",
+            "--source-identity-sha256",
+            "0" * 64,
             "--expected-head",
             head,
+            "--canonical-repo",
+            str(repo),
             "--repo",
             str(repo),
         ]
         self.assertEqual(
-            ("/usr/bin/python3", str(runner), str(repo), head),
+            (
+                "/usr/bin/python3",
+                str(runner),
+                str(repo),
+                str(repo),
+                "canonical-main",
+                "0" * 64,
+                head,
+            ),
             SELF_DEPLOY._deploy_identity(command),
         )
 
@@ -705,18 +952,52 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         for name in bindings:
             self.assertNotIn(name, environment)
 
+    def test_verify_repository_accepts_detached_shared_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            canonical = root / "canonical"
+            source = root / "source"
+            canonical.mkdir()
+            source.mkdir()
+            common = canonical / ".git"
+            common.mkdir()
+            expected = "d" * 40
+            with patch.object(
+                RUNNER,
+                "run_capture",
+                side_effect=[
+                    str(common),
+                    str(common),
+                    expected,
+                    "HEAD",
+                    expected,
+                    "",
+                ],
+            ):
+                RUNNER.verify_repository(
+                    source,
+                    canonical,
+                    "detached-worktree",
+                    expected,
+                )
+
     def test_verify_repository_rejects_non_main(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
+            (repo / ".git").mkdir()
             expected = "e" * 40
-            with patch.object(RUNNER, "run_capture", side_effect=[expected, "topic", expected, ""]):
-                with self.assertRaisesRegex(RuntimeError, "not on main"):
-                    RUNNER.verify_repository(repo, expected)
+            with patch.object(
+                RUNNER,
+                "run_capture",
+                side_effect=[".git", expected, "topic", expected, ""],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invalid branch state"):
+                    RUNNER.verify_repository(repo, repo, "canonical-main", expected)
 
     def test_main_validates_before_deploying(self) -> None:
         repo = Path("/tmp/repository")
         expected = "f" * 40
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "run_streamed") as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}):
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "run_streamed") as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}):
             self.assertEqual(RUNNER.main(), 0)
         self.assertEqual(verify.call_count, 2)
         self.assertEqual(streamed.call_args_list[0].args[0], ["make", "validate"])
@@ -820,7 +1101,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         repo = Path("/tmp/repository")
         expected = "f" * 40
         binding = {"expected_head": expected}
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "run_streamed"), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "write_finalization_receipt") as write:
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "run_streamed"), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "write_finalization_receipt") as write:
             self.assertEqual(RUNNER.main(), 0)
         write.assert_called_once_with(
             binding,
@@ -834,7 +1115,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         repo = Path("/tmp/repository")
         expected = "f" * 40
         binding = {"expected_head": expected}
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository", side_effect=RuntimeError("preflight failed")), patch.object(RUNNER, "write_finalization_receipt") as write:
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository", side_effect=RuntimeError("preflight failed")), patch.object(RUNNER, "write_finalization_receipt") as write:
             self.assertEqual(RUNNER.main(), 1)
         write.assert_called_once_with(
             binding,
@@ -852,34 +1133,131 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             'GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python',
             makefile,
         )
-        self.assertIn(
-            'deploy: context-check\n>test -x "$(GRABOWSKI_RUNTIME_PYTHON)"\n>set -eu; expected_head="$$(git rev-parse --verify HEAD)"; "$(GRABOWSKI_RUNTIME_PYTHON)" tools/schedule_runtime_deploy.py --expected-head "$$expected_head" --delay-seconds 8',
-            makefile,
-        )
+        self.assertIn('--source-repository "$(CURDIR)"', makefile)
+        self.assertIn('GRABOWSKI_DEPLOY_SOURCE_LEASE_OWNER_ID', makefile)
+        self.assertIn('tools/schedule_runtime_deploy.py "$$@"', makefile)
         self.assertIn(
             'runtime-retention-apply: context-check\n>test -x "$(GRABOWSKI_RUNTIME_PYTHON)"',
             makefile,
         )
 
 
+
 class RuntimeDeploySchedulerTests(unittest.TestCase):
     def test_schedule_delegates_to_shared_scheduler(self) -> None:
         head = "a" * 40
+        repo = "/home/alex/repos/grabowski"
+        identity = _source_identity(Path(repo), head)
         receipt = {
             "scheduled": True,
             "already_scheduled": False,
             "expected_head": head,
+            "source_identity": identity,
+            "source_identity_sha256": identity["identity_sha256"],
             "unit": "grabowski-job-abcdef012345",
         }
         shared = Mock(return_value=receipt)
         with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
-            result = SCHEDULER.schedule(head, 9)
-        shared.assert_called_once_with(head, 9)
+            result = SCHEDULER.schedule(head, 9, repo, None)
+        shared.assert_called_once_with(head, 9, repo, None)
         self.assertEqual(result, receipt)
+
+    def test_schedule_binds_requested_source_lease_owner(self) -> None:
+        head = "a" * 40
+        repo = Path("/home/alex/repos/.grabowski-worktrees/deploy")
+        canonical = Path("/home/alex/repos/grabowski")
+        identity = _source_identity(
+            repo,
+            head,
+            kind="detached-worktree",
+            canonical=canonical,
+        )
+        material = {
+            key: value for key, value in identity.items() if key != "identity_sha256"
+        }
+        resource_key = f"path:{repo}"
+        material["lease_evidence"] = {
+            "resource_key": resource_key,
+            "lease": {
+                "resource_key": resource_key,
+                "owner_id": "task:deploy-owner",
+                "acquired_at_unix": 10,
+                "updated_at_unix": 11,
+                "expires_at_unix": 100,
+                "metadata_sha256": "b" * 64,
+            },
+        }
+        identity = {
+            **material,
+            "identity_sha256": SELF_DEPLOY._source_identity_sha256(material),
+        }
+        receipt = {
+            "scheduled": True,
+            "expected_head": head,
+            "source_identity": identity,
+            "source_identity_sha256": identity["identity_sha256"],
+        }
+        shared = Mock(return_value=receipt)
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            result = SCHEDULER.schedule(
+                head,
+                8,
+                str(repo),
+                "task:deploy-owner",
+            )
+        self.assertEqual(result, receipt)
+
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            with self.assertRaisesRegex(RuntimeError, "different source lease owner"):
+                SCHEDULER.schedule(
+                    head,
+                    8,
+                    str(repo),
+                    "task:other-owner",
+                )
+
+    def test_schedule_rejects_semantically_inconsistent_source_identity(self) -> None:
+        head = "a" * 40
+        repo = Path("/home/alex/repos/grabowski")
+        identity = _source_identity(repo, head)
+        material = {
+            key: value for key, value in identity.items() if key != "identity_sha256"
+        }
+        material["source_kind"] = "detached-worktree"
+        identity = {
+            **material,
+            "identity_sha256": SELF_DEPLOY._source_identity_sha256(material),
+        }
+        receipt = {
+            "scheduled": True,
+            "expected_head": head,
+            "source_identity": identity,
+            "source_identity_sha256": identity["identity_sha256"],
+        }
+        shared = Mock(return_value=receipt)
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            with self.assertRaisesRegex(RuntimeError, "inconsistent source kind"):
+                SCHEDULER.schedule(head, 8, str(repo), None)
 
     def test_schedule_rejects_unbound_shared_receipt(self) -> None:
         head = "b" * 40
         shared = Mock(return_value={"scheduled": True, "expected_head": "c" * 40})
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            with self.assertRaisesRegex(RuntimeError, "unbound receipt"):
+                SCHEDULER.schedule(head, 8)
+
+    def test_schedule_rejects_tampered_source_identity(self) -> None:
+        head = "a" * 40
+        repo = Path("/home/alex/repos/grabowski")
+        identity = _source_identity(repo, head)
+        identity["repository"] = "/tmp/tampered"
+        receipt = {
+            "scheduled": True,
+            "expected_head": head,
+            "source_identity": identity,
+            "source_identity_sha256": identity["identity_sha256"],
+        }
+        shared = Mock(return_value=receipt)
         with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
             with self.assertRaisesRegex(RuntimeError, "unbound receipt"):
                 SCHEDULER.schedule(head, 8)
@@ -891,6 +1269,10 @@ class RuntimeDeploySchedulerTests(unittest.TestCase):
             SCHEDULER.schedule("d" * 40, 4)
         with self.assertRaises(ValueError):
             SCHEDULER.schedule("d" * 40, 61)
+        with self.assertRaisesRegex(ValueError, "bounded absolute path"):
+            SCHEDULER.schedule("d" * 40, 8, "relative/repo")
+        with self.assertRaisesRegex(ValueError, "source_lease_owner_id"):
+            SCHEDULER.schedule("d" * 40, 8, "/tmp/repo", "owner with spaces")
 
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -39,6 +40,9 @@ ExpectedHead = Annotated[
     ),
 ]
 DelaySeconds = Annotated[int, Field(ge=5, le=60)]
+SourceRepository = Annotated[str, Field(min_length=1, max_length=4096)]
+SourceLeaseOwner = Annotated[str, Field(min_length=1, max_length=128, pattern=r"[A-Za-z0-9._:@-]{1,128}")]
+SOURCE_KINDS = frozenset({"canonical-main", "detached-worktree"})
 CANONICAL_REPOSITORY = Path.home() / "repos/grabowski"
 RUNNER_RELATIVE_PATH = Path("tools/run_scheduled_deploy.py")
 DEPLOY_SCHEDULE_LOCK = Path.home() / ".local/state/grabowski/runtime-deploy-schedule.lock"
@@ -71,12 +75,28 @@ def _required_stdout(result: dict[str, Any], label: str) -> str:
     return result["stdout"].strip()
 
 
-def _deploy_command(repository: Path, runner: Path, expected_head: str, delay_seconds: int) -> list[str]:
+def _deploy_command(
+    repository: Path,
+    runner: Path,
+    expected_head: str,
+    delay_seconds: int,
+    *,
+    canonical_repository: Path | None = None,
+    source_kind: str = "canonical-main",
+    source_identity_sha256: str = "0" * 64,
+) -> list[str]:
+    canonical = canonical_repository or CANONICAL_REPOSITORY
     return [
         "/usr/bin/python3",
         str(runner),
         "--repo",
         str(repository),
+        "--canonical-repo",
+        str(canonical),
+        "--source-kind",
+        source_kind,
+        "--source-identity-sha256",
+        source_identity_sha256,
         "--expected-head",
         expected_head,
         "--delay-seconds",
@@ -91,20 +111,35 @@ def _deploy_command_sha256(command: list[str]) -> str:
 def _deploy_command_fields(command: Any) -> dict[str, str] | None:
     if (
         not isinstance(command, list)
-        or len(command) != 8
+        or len(command) != 14
         or not all(isinstance(item, str) for item in command)
         or command[0] != "/usr/bin/python3"
     ):
         return None
     values: dict[str, str] = {}
-    allowed = {"--repo", "--expected-head", "--delay-seconds"}
+    allowed = {
+        "--repo",
+        "--canonical-repo",
+        "--source-kind",
+        "--source-identity-sha256",
+        "--expected-head",
+        "--delay-seconds",
+    }
     for index in range(2, len(command), 2):
         option = command[index]
         if option not in allowed or option in values:
             return None
         values[option] = command[index + 1]
-    if set(values) != allowed or not OBJECT_ID_RE.fullmatch(values["--expected-head"]):
+    if (
+        set(values) != allowed
+        or not OBJECT_ID_RE.fullmatch(values["--expected-head"])
+        or values["--source-kind"] not in SOURCE_KINDS
+        or re.fullmatch(r"[0-9a-f]{64}", values["--source-identity-sha256"]) is None
+    ):
         return None
+    for name in ("--repo", "--canonical-repo"):
+        if not Path(values[name]).is_absolute():
+            return None
     try:
         delay_seconds = int(values["--delay-seconds"])
     except ValueError:
@@ -115,6 +150,9 @@ def _deploy_command_fields(command: Any) -> dict[str, str] | None:
         "python": command[0],
         "runner": command[1],
         "repository": values["--repo"],
+        "canonical_repository": values["--canonical-repo"],
+        "source_kind": values["--source-kind"],
+        "source_identity_sha256": values["--source-identity-sha256"],
         "expected_head": values["--expected-head"],
         "delay_seconds": str(delay_seconds),
     }
@@ -128,6 +166,9 @@ def _deploy_identity(command: Any) -> tuple[str, ...] | None:
         fields["python"],
         fields["runner"],
         fields["repository"],
+        fields["canonical_repository"],
+        fields["source_kind"],
+        fields["source_identity_sha256"],
         fields["expected_head"],
     )
 
@@ -480,6 +521,7 @@ def _schedule_result(
     intent: dict[str, Any] | None,
     scheduled: dict[str, Any],
     already_scheduled: bool,
+    source_identity: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "scheduled": True,
@@ -487,6 +529,8 @@ def _schedule_result(
         "expected_head": expected_head,
         "requested_delay_seconds": requested_delay_seconds,
         "delay_seconds": effective_delay_seconds,
+        "source_identity": source_identity,
+        "source_identity_sha256": source_identity["identity_sha256"],
         "unit": job["unit"],
         "argv_sha256": job["argv_sha256"],
         "metadata_path": job["metadata_path"],
@@ -502,23 +546,127 @@ def _schedule_result(
     }
 
 
-def _canonical_preflight(expected_head: str) -> tuple[Path, Path]:
+def _validated_repository_path(raw: Path, *, label: str) -> Path:
+    if not raw.is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
+    if raw.is_symlink() or not raw.is_dir():
+        raise RuntimeError(f"{label} is unavailable: {raw}")
+    resolved = raw.resolve(strict=True)
+    if resolved != raw:
+        raise RuntimeError(f"{label} must not traverse a symlink or relative segment")
+    return resolved
+
+
+def _git_common_directory(repository: Path) -> Path:
+    raw = _required_stdout(
+        _git_result(repository, "rev-parse", "--git-common-dir"),
+        "git common directory lookup",
+    )
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = repository / candidate
+    if candidate.is_symlink():
+        raise RuntimeError("git common directory may not be a symlink")
+    resolved = candidate.resolve(strict=True)
+    if resolved != candidate or not resolved.is_dir():
+        raise RuntimeError("git common directory must be an exact real directory")
+    return resolved
+
+
+def _resource_inspect(resource_key: str) -> dict[str, Any]:
+    import grabowski_resources
+
+    return grabowski_resources.grabowski_resource_inspect(resource_key)
+
+
+def _source_lease_evidence(
+    repository: Path,
+    expected_owner: str | None,
+) -> dict[str, Any]:
+    resource_key = f"path:{repository}"
+    payload = _resource_inspect(resource_key)
+    if not isinstance(payload, dict) or payload.get("resource_key") != resource_key:
+        raise RuntimeError("source repository lease readback is malformed")
+    lease = payload.get("lease")
+    if lease is None:
+        if expected_owner is not None:
+            raise RuntimeError("expected source repository lease is absent")
+        return {"resource_key": resource_key, "lease": None}
+    if not isinstance(lease, dict):
+        raise RuntimeError("source repository lease readback is malformed")
+    owner = lease.get("owner_id")
+    if expected_owner is None:
+        raise RuntimeError(f"source repository has an active lease: {owner}")
+    if owner != expected_owner:
+        raise RuntimeError(
+            f"source repository lease owner drift: expected {expected_owner}, found {owner}"
+        )
+    required = (
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    )
+    snapshot = {name: lease.get(name) for name in required}
+    if snapshot["resource_key"] != resource_key or any(
+        snapshot[name] is None for name in required
+    ):
+        raise RuntimeError("source repository lease snapshot is incomplete")
+    return {"resource_key": resource_key, "lease": snapshot}
+
+
+def _source_identity_sha256(identity: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _deployment_source_preflight(
+    expected_head: str,
+    source_repository: str | None,
+    source_lease_owner_id: str | None,
+) -> tuple[Path, Path, dict[str, Any]]:
     if not OBJECT_ID_RE.fullmatch(expected_head):
         raise ValueError("expected_head must be a lowercase Git object ID")
+    if source_lease_owner_id is not None and re.fullmatch(
+        r"[A-Za-z0-9._:@-]{1,128}", source_lease_owner_id
+    ) is None:
+        raise ValueError("source_lease_owner_id is invalid")
 
-    raw_repository = CANONICAL_REPOSITORY
-    if raw_repository.is_symlink() or not raw_repository.is_dir():
-        raise RuntimeError(f"canonical repository is unavailable: {raw_repository}")
-    repository = raw_repository.resolve(strict=True)
-    if repository != raw_repository:
-        raise RuntimeError("canonical repository path must not traverse a symlink")
+    canonical = _validated_repository_path(
+        CANONICAL_REPOSITORY,
+        label="canonical repository",
+    )
+    if source_repository is None:
+        repository = canonical
+    else:
+        repository = _validated_repository_path(
+            Path(source_repository).expanduser(),
+            label="source repository",
+        )
+
+    canonical_common = _git_common_directory(canonical)
+    source_common = (
+        canonical_common
+        if repository == canonical
+        else _git_common_directory(repository)
+    )
+    if source_common != canonical_common:
+        raise RuntimeError("source repository does not share the canonical Git common directory")
 
     head = _required_stdout(
         _git_result(repository, "rev-parse", "--verify", "HEAD"),
         "HEAD lookup",
     )
     branch = _required_stdout(
-        _git_result(repository, "symbolic-ref", "--short", "HEAD"),
+        _git_result(repository, "rev-parse", "--abbrev-ref", "HEAD"),
         "branch lookup",
     )
     origin_main = _required_stdout(
@@ -540,20 +688,53 @@ def _canonical_preflight(expected_head: str) -> tuple[Path, Path]:
         "working-tree status",
     )
 
+    source_kind = "canonical-main" if repository == canonical else "detached-worktree"
+    expected_branch = "main" if source_kind == "canonical-main" else "HEAD"
     if head != expected_head:
         raise RuntimeError(f"HEAD drift: expected {expected_head}, found {head}")
-    if branch != "main":
-        raise RuntimeError(f"canonical checkout is not on main: {branch}")
+    if branch != expected_branch:
+        raise RuntimeError(
+            f"{source_kind} source has invalid branch state: expected {expected_branch}, found {branch}"
+        )
     if origin_main != expected_head:
         raise RuntimeError(
             f"origin/main drift: expected {expected_head}, found {origin_main}"
         )
     if status:
-        raise RuntimeError("canonical checkout is dirty")
+        raise RuntimeError("source repository is dirty")
 
     runner = repository / RUNNER_RELATIVE_PATH
     if runner.is_symlink() or not runner.is_file():
         raise RuntimeError(f"scheduled deployment runner is unavailable: {runner}")
+    if source_kind == "detached-worktree" and source_lease_owner_id is None:
+        raise ValueError(
+            "detached deployment source requires source_lease_owner_id"
+        )
+    lease_evidence = _source_lease_evidence(repository, source_lease_owner_id)
+    identity = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_source_identity",
+        "source_kind": source_kind,
+        "repository": str(repository),
+        "canonical_repository": str(canonical),
+        "git_common_directory": str(source_common),
+        "head": head,
+        "origin_main": origin_main,
+        "clean": True,
+        "lease_evidence": lease_evidence,
+    }
+    return repository, runner, {
+        **identity,
+        "identity_sha256": _source_identity_sha256(identity),
+    }
+
+
+def _canonical_preflight(expected_head: str) -> tuple[Path, Path]:
+    repository, runner, _identity = _deployment_source_preflight(
+        expected_head,
+        None,
+        None,
+    )
     return repository, runner
 
 
@@ -561,14 +742,28 @@ def _canonical_preflight(expected_head: str) -> tuple[Path, Path]:
 def grabowski_runtime_deploy_schedule(
     expected_head: ExpectedHead,
     delay_seconds: DelaySeconds = 8,
+    source_repository: SourceRepository | None = None,
+    source_lease_owner_id: SourceLeaseOwner | None = None,
 ) -> dict[str, Any]:
-    """Schedule one validated self-deployment, reusing an identical in-flight job."""
+    """Schedule one source-identity-bound self-deployment, reusing an identical in-flight job."""
     operator._require_operator_mutation("durable_job")
     operator._require_operator_capability("git_cli")
-    repository, runner = _canonical_preflight(expected_head)
-    command = _deploy_command(repository, runner, expected_head, delay_seconds)
-
     with _deploy_schedule_lock():
+        repository, runner, source_identity = _deployment_source_preflight(
+            expected_head,
+            source_repository,
+            source_lease_owner_id,
+        )
+        canonical_repository = Path(source_identity["canonical_repository"])
+        command = _deploy_command(
+            repository,
+            runner,
+            expected_head,
+            delay_seconds,
+            canonical_repository=canonical_repository,
+            source_kind=source_identity["source_kind"],
+            source_identity_sha256=source_identity["identity_sha256"],
+        )
         existing = _matching_inflight_deploy_job(command, repository)
         if existing is not None:
             observed = {
@@ -580,6 +775,7 @@ def grabowski_runtime_deploy_schedule(
                 "unit": existing["unit"],
                 "argv_sha256": existing["argv_sha256"],
                 "final_status": existing["final_status"],
+                "source_identity_sha256": source_identity["identity_sha256"],
             }
             base._append_audit(observed)
             return _schedule_result(
@@ -590,6 +786,7 @@ def grabowski_runtime_deploy_schedule(
                 intent=None,
                 scheduled=observed,
                 already_scheduled=True,
+                source_identity=source_identity,
             )
 
         intent = {
@@ -597,6 +794,8 @@ def grabowski_runtime_deploy_schedule(
             "operation": "runtime-deploy-schedule-intent",
             "expected_head": expected_head,
             "delay_seconds": delay_seconds,
+            "source_identity": source_identity,
+            "source_identity_sha256": source_identity["identity_sha256"],
         }
         base._append_audit(intent)
         jobs_root = operator._jobs_root()
@@ -627,6 +826,7 @@ def grabowski_runtime_deploy_schedule(
             "delay_seconds": delay_seconds,
             "unit": job["unit"],
             "argv_sha256": job["argv_sha256"],
+            "source_identity_sha256": source_identity["identity_sha256"],
         }
         base._append_audit(scheduled)
         return _schedule_result(
@@ -637,4 +837,5 @@ def grabowski_runtime_deploy_schedule(
             intent=intent,
             scheduled=scheduled,
             already_scheduled=False,
+            source_identity=source_identity,
         )
