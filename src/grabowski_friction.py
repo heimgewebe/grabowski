@@ -306,6 +306,107 @@ FRICTION_PROPOSAL_PATTERNS: dict[str, dict[str, Any]] = {
         ),
     },
 }
+FRICTION_REPAIR_CONTRACTS: dict[str, dict[str, Any]] = {
+    "connector_transport": {
+        "preferred_route": "split_read",
+        "required_evidence": [
+            "bounded operator and tunnel service status",
+            "bounded transport journal window",
+            "adjacent successful or failed typed calls",
+        ],
+        "preparation_steps": [
+            "run connector transport diagnostics",
+            "split the original read into smaller typed calls",
+            "classify any possible mutation outcome before retry",
+        ],
+        "retry_policy": "retry read-only work at most once after narrowing; never retry a possible mutation unchanged",
+        "post_state_readback": "required whenever the failed call may have mutated state",
+    },
+    "command_chains": {
+        "preferred_route": "grip",
+        "required_evidence": [
+            "exact command intents and order",
+            "bounded target and resource scope",
+            "post-state readback for every mutating step",
+        ],
+        "preparation_steps": [
+            "split independent reads",
+            "extract repeated mutation into a typed grip",
+            "bind each mutation to one receipt",
+        ],
+        "retry_policy": "do not repeat the same broad command chain; retry only the failed bounded step after readback",
+        "post_state_readback": "required after each mutating step",
+    },
+    "blocked_gates": {
+        "preferred_route": "explicit_preflight",
+        "required_evidence": [
+            "gate owner and immutable policy boundary",
+            "exact target, scope and expected identity",
+            "live leases, dirty state and running work",
+            "missing receipt or acceptance evidence",
+            "defined post-state readback method",
+        ],
+        "preparation_steps": [
+            "run the narrow read-only preflight",
+            "collect only the missing evidence",
+            "choose a narrower typed route when available",
+            "re-read the gate immediately before effect",
+        ],
+        "retry_policy": "no unchanged retry; retry only after a named evidence or target-state change",
+        "post_state_readback": "mandatory and bound to the same target identity",
+    },
+    "stale_snapshots": {
+        "preferred_route": "typed_tool",
+        "required_evidence": [
+            "runtime release identity",
+            "server tool-contract identity",
+            "observable client or connector snapshot identity",
+        ],
+        "preparation_steps": [
+            "refresh observable contracts",
+            "compare tool count and identity hashes",
+            "block when client snapshot freshness is unobservable",
+        ],
+        "retry_policy": "retry only after a proven snapshot or release change",
+        "post_state_readback": "re-read runtime and contract drift after refresh",
+    },
+    "review_loops": {
+        "preferred_route": "explicit_preflight",
+        "required_evidence": [
+            "current base and head commit",
+            "full diff hash",
+            "current CI and review receipts",
+        ],
+        "preparation_steps": [
+            "invalidate evidence after every head change",
+            "collect the smallest missing review artifact",
+            "re-run readiness against current base and head",
+        ],
+        "retry_policy": "do not reuse stale review evidence after a push or base change",
+        "post_state_readback": "re-read head, base, diff and checks before merge",
+    },
+    "missing_receipt_fields": {
+        "preferred_route": "explicit_preflight",
+        "required_evidence": [
+            "emitter identity and receipt schema version",
+            "missing field semantics and consumer requirement",
+            "success and failure path examples",
+        ],
+        "preparation_steps": [
+            "bind the schema change to the emitting component",
+            "add positive and negative contract tests",
+            "verify old receipts fail or migrate explicitly",
+        ],
+        "retry_policy": "do not infer missing fields from surrounding state",
+        "post_state_readback": "validate the emitted receipt against the exact schema",
+    },
+}
+FRICTION_REPAIR_NON_CLAIMS = (
+    "execution_authority",
+    "policy_bypass",
+    "safe_mutation_retry",
+    "root_cause",
+)
 EXPECTED_RED_PHASE_TERMS = frozenset({
     "expected red-phase",
     "expected red phase",
@@ -1233,11 +1334,20 @@ def _recommendation_for_group(group: dict[str, Any]) -> dict[str, Any] | None:
     rule = FRICTION_PROPOSAL_PATTERNS.get(pattern)
     if not rule:
         return None
+    repair = FRICTION_REPAIR_CONTRACTS.get(pattern)
+    if repair is None:
+        return None
     return {
         "pattern": pattern,
         "recommendation_type": rule["recommendation_type"],
         "title": rule["title"],
         "rationale": rule["rationale"],
+        "repair_contract": {
+            "schema_version": 1,
+            "authority": "evidence_preparation_only",
+            **repair,
+            "does_not_establish": list(FRICTION_REPAIR_NON_CLAIMS),
+        },
         "count": group["count"],
         "unresolved": group["unresolved"],
         "evidence_threshold": PATTERN_EVIDENCE_THRESHOLD,
@@ -1961,6 +2071,7 @@ def friction_summary(
                         "recommendation_type",
                         "unresolved",
                         "evidence_event_ids",
+                        "repair_contract",
                     )
                 }
                 for item in proposals.get("recommendations", [])[:5]

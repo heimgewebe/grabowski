@@ -146,6 +146,38 @@ class TaskTests(unittest.TestCase):
         listed = tasks.grabowski_task_list()
         self.assertEqual(listed["count"], 1)
         self.assertEqual(listed["tasks"][0]["task_id"], task["task_id"])
+        self.assertEqual(listed["state_filter_kind"], "all")
+        self.assertEqual(listed["projection_counts"]["active"], 1)
+
+    def test_task_list_supports_compact_state_projections(self) -> None:
+        task = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET state='failed' WHERE task_id=?",
+                (task["task_id"],),
+            )
+            connection.commit()
+
+        attention = tasks.grabowski_task_list(state="attention")
+
+        self.assertEqual(attention["state_filter_kind"], "projection")
+        self.assertEqual(
+            attention["state_filter_states"],
+            ["interrupted", "outcome_unknown", "failed", "timed_out", "signalled"],
+        )
+        self.assertEqual(attention["total_matching"], 1)
+        self.assertEqual(attention["tasks"][0]["state"], "failed")
+        self.assertEqual(attention["state_counts"]["failed"], 1)
+        self.assertEqual(attention["projection_counts"]["attention"], 1)
+        self.assertEqual(attention["projection_counts"]["terminal"], 1)
+        self.assertEqual(attention["projection_counts"]["active"], 0)
+        self.assertEqual(tasks.grabowski_task_list(state="active")["count"], 0)
+        self.assertEqual(
+            tasks.grabowski_task_list(state="failed")["state_filter_kind"],
+            "exact",
+        )
+        with self.assertRaisesRegex(ValueError, "state must be one of"):
+            tasks.grabowski_task_list(state="stale")
 
     def test_start_uses_shared_unicode_argv_identity(self) -> None:
         argv = ["/bin/echo", "Grüße"]
