@@ -156,6 +156,10 @@
       "source": "src/grabowski_mcp.py"
     },
     {
+      "module": "grabowski_client_snapshot",
+      "source": "src/grabowski_client_snapshot.py"
+    },
+    {
       "module": "grabowski_blockades",
       "source": "src/grabowski_blockades.py"
     },

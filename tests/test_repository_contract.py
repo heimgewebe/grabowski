@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class RepositoryContractTests(unittest.TestCase):
     def test_live_server_snapshot_exists(self) -> None:
         self.assertTrue((ROOT / "src" / "grabowski_mcp.py").is_file())
+        self.assertTrue((ROOT / "src" / "grabowski_client_snapshot.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_operator.py").is_file())
         self.assertTrue(
             (ROOT / "src" / "grabowski_runtime_extensions.py").is_file()
@@ -57,10 +58,12 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_status_exposes_live_tool_contract_fingerprint(self) -> None:
         source = (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
-        self.assertIn("tool_contract = _runtime_tool_contract_summary()", source)
+        self.assertIn("tool_contract = _runtime_tool_contract_summary(deployment)", source)
         self.assertIn('"tool_contract": {', source)
         self.assertIn('"registered_names_sha256"', source)
-        self.assertIn('"client_snapshot_observable": False', source)
+        self.assertIn('"client_snapshot": client_snapshot', source)
+        self.assertIn('"client_snapshot_observable": bool(', source)
+        self.assertIn('"system_overview": system_overview', source)
 
     def test_status_surfaces_operator_relay_protocol(self) -> None:
         source = (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
