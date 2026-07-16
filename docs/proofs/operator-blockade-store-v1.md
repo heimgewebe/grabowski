@@ -129,6 +129,22 @@ recovery failure behind the original exception.
 - strict numeric and transaction identifiers;
 - isolated temporary state with production-path before/after comparison.
 
+
+## Runtime authority boundary
+
+The integrated runtime reserves the canonical marker from generic create,
+replace, remove and destroy tools. Explicit direct-command targets are rejected
+as defense in depth, and active strong path or repository blockades close opaque
+command channels because their side effects cannot be proven from argv.
+
+This is an operator policy boundary, not Unix process isolation. A different
+process running arbitrary code as the same UID, an already existing unsandboxed
+tmux pane, or another out-of-band execution route can still address user-owned
+filesystem state. Kernel-enforced exclusivity therefore requires a separate
+OS identity or privileged broker to own the marker and expose only typed
+engage/disarm transactions. Until that boundary exists, the runtime must not
+claim complete detection or prevention of arbitrary indirect execution.
+
 ## Explicit boundary
 
 This module does not establish:

@@ -1365,7 +1365,7 @@
     },
     "grabowski_operator_blockade_engage": {
       "justification_kind": "distinct_authority_boundary",
-      "rationale": "The canonical blockade marker must be creatable only through one create-only, schema-valid, audit-bound authority that generic file and command surfaces cannot inherit.",
+      "rationale": "The typed operator surface exposes one create-only, schema-valid, audit-bound authority for canonical blockade engagement; generic filesystem tools and explicitly targeted direct-command arguments are denied.",
       "evidence_refs": [
         "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
         "docs/proofs/operator-blockade-store-v1.md",
@@ -1374,7 +1374,7 @@
       "operation_alternative_considered": "A typed operation was rejected because generic operation execution would inherit broader terminal or file authority and could not enforce the exact marker transaction contract.",
       "exception_detail": {
         "claim": "The tool exclusively owns canonical typed blockade engagement.",
-        "evidence": "Generic file and command paths reject the marker; create-only store and exact rollback tests bind the authority."
+        "evidence": "Generic filesystem tools and explicit direct-command targets reject the marker; active strong scoped blockades also close opaque command channels. Same-UID out-of-band execution is not claimed as a kernel boundary."
       },
       "tool_contract": {
         "tool": "grabowski_operator_blockade_engage",

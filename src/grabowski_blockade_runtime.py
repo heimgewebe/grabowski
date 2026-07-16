@@ -164,6 +164,8 @@ def grabowski_operator_blockade_status(
             "future_action_authority",
             "fresh_preflight_completion",
             "recovery_disarm_authority",
+            "kernel_isolation_from_same_uid_out_of_band_execution",
+            "complete_prevention_of_arbitrary_indirect_marker_mutation",
         ],
     }
 

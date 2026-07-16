@@ -1180,7 +1180,7 @@ class OperatorContractTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             operator._validate_argv(["echo", "unguarded"])
 
-    def test_direct_commands_cannot_target_canonical_blockade_marker(self) -> None:
+    def test_explicit_direct_command_arguments_cannot_target_canonical_blockade_marker(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
