@@ -66,6 +66,9 @@
     "grabowski_power_run",
     "grabowski_fleet_list",
     "grabowski_fleet_run",
+    "grabowski_juno_status",
+    "grabowski_juno_pair",
+    "grabowski_juno_run",
     "grabowski_operation_list",
     "grabowski_operation_plan",
     "grabowski_operation_run",
@@ -309,6 +312,10 @@
     {
       "module": "grabowski_job_finalizer",
       "source": "src/grabowski_job_finalizer.py"
+    },
+    {
+      "module": "grabowski_juno",
+      "source": "src/grabowski_juno.py"
     }
   ]
 }

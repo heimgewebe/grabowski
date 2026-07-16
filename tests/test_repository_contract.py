@@ -128,7 +128,14 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 128)
+        self.assertEqual(len(tools), 131)
+        self.assertTrue(
+            {
+                "grabowski_juno_status",
+                "grabowski_juno_pair",
+                "grabowski_juno_run",
+            }.issubset(tools)
+        )
         legacy_tools = {
             "grabowski_status",
             "grabowski_context",

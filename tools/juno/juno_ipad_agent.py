@@ -21,6 +21,7 @@ import os
 import platform
 import queue
 import re
+import secrets
 import signal
 import sys
 import threading
@@ -39,6 +40,9 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_PAIRING_PEER = "100.68.88.111"
 PAIRING_SECRET_BYTES = 32
+PAIRING_CONSENT_TTL_SECONDS = 600
+PAIRING_CONSENT_MAX_ATTEMPTS = 5
+PAIRING_CONSENT_RE = re.compile(r"^[0-9]{6}$")
 MAX_BODY_BYTES = 512 * 1024
 MAX_CODE_BYTES = 384 * 1024
 MAX_OUTPUT_CHARS = 256 * 1024
@@ -140,14 +144,20 @@ def probe_writable_directory(path: Path) -> Path:
     return path.resolve()
 
 
+def directory_is_persistent(path: Path) -> bool:
+    lowered = {part.lower() for part in path.parts}
+    return "caches" not in lowered and "tmp" not in lowered
+
+
 def default_state_root_candidates(script_path: Path) -> list[tuple[str, Path, bool]]:
+    script_sibling = script_path.with_name("grabowski_workspace")
     candidates = [
-        ("script_sibling", script_path.with_name("grabowski_workspace"), True),
+        (
+            "script_sibling",
+            script_sibling,
+            directory_is_persistent(script_sibling),
+        ),
     ]
-    with contextlib.suppress(OSError):
-        candidates.append(
-            ("working_directory", Path.cwd() / "grabowski_workspace", True)
-        )
     with contextlib.suppress(OSError):
         candidates.append(
             (
@@ -158,6 +168,11 @@ def default_state_root_candidates(script_path: Path) -> list[tuple[str, Path, bo
                 / "GrabowskiJunoAgent",
                 True,
             )
+        )
+    with contextlib.suppress(OSError):
+        working = Path.cwd() / "grabowski_workspace"
+        candidates.append(
+            ("working_directory", working, directory_is_persistent(working))
         )
     candidates.append(
         (
@@ -693,6 +708,8 @@ class AgentHTTPServer(ThreadingHTTPServer):
         key_path: Path,
         pairing_peer: str,
         started_at: str,
+        pairing_consent_code: str | None,
+        pairing_consent_expires_at_unix: int | None,
     ) -> None:
         super().__init__(server_address, handler_class)
         self.authenticator = authenticator
@@ -701,6 +718,9 @@ class AgentHTTPServer(ThreadingHTTPServer):
         self.key_path = key_path
         self.pairing_peer = pairing_peer
         self.started_at = started_at
+        self.pairing_consent_code = pairing_consent_code
+        self.pairing_consent_expires_at_unix = pairing_consent_expires_at_unix
+        self.pairing_consent_attempts = 0
         self.auth_lock = threading.Lock()
 
     def is_paired(self) -> bool:
@@ -711,7 +731,13 @@ class AgentHTTPServer(ThreadingHTTPServer):
         with self.auth_lock:
             return self.authenticator
 
-    def pair(self, secret: bytes) -> str:
+    def pair(
+        self,
+        secret: bytes,
+        consent_code: str,
+        *,
+        now: int | None = None,
+    ) -> str:
         if len(secret) != PAIRING_SECRET_BYTES:
             raise ValueError("pairing_secret_must_be_32_bytes")
         with self.auth_lock:
@@ -719,9 +745,28 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 if self.authenticator.matches_secret(secret):
                     return "already_paired_same_secret"
                 raise FileExistsError("agent_already_paired")
+            current = int(time.time()) if now is None else int(now)
+            if not PAIRING_CONSENT_RE.fullmatch(consent_code):
+                raise ValueError("pairing_consent_code_invalid")
+            if (
+                self.pairing_consent_code is None
+                or self.pairing_consent_expires_at_unix is None
+                or current > self.pairing_consent_expires_at_unix
+            ):
+                raise PermissionError("pairing_consent_expired")
+            if not hmac.compare_digest(consent_code, self.pairing_consent_code):
+                self.pairing_consent_attempts += 1
+                if self.pairing_consent_attempts >= PAIRING_CONSENT_MAX_ATTEMPTS:
+                    self.pairing_consent_code = None
+                    self.pairing_consent_expires_at_unix = None
+                    raise PermissionError("pairing_consent_locked")
+                raise PermissionError("pairing_consent_mismatch")
             atomic_create_bytes(self.key_path, secret)
             self.authenticator = RequestAuthenticator(secret)
             self.secret_source = self.key_path.name
+            self.pairing_consent_code = None
+            self.pairing_consent_expires_at_unix = None
+            self.pairing_consent_attempts = 0
             return "paired"
 
 
@@ -826,6 +871,22 @@ class AgentHandler(BaseHTTPRequestHandler):
                     "secret_source": self.agent_server.secret_source,
                     "paired": self.agent_server.is_paired(),
                     "pairing_peer": self.agent_server.pairing_peer,
+                    "pairing_consent_required": (
+                        not self.agent_server.is_paired()
+                        and self.agent_server.pairing_consent_code is not None
+                    ),
+                    "pairing_consent_expires_at_unix": (
+                        self.agent_server.pairing_consent_expires_at_unix
+                    ),
+                    "pairing_consent_attempts_remaining": (
+                        max(
+                            0,
+                            PAIRING_CONSENT_MAX_ATTEMPTS
+                            - self.agent_server.pairing_consent_attempts,
+                        )
+                        if not self.agent_server.is_paired()
+                        else None
+                    ),
                     "timeout_contract": "cooperative_python_only",
                     "network_policy": "tailscale_or_loopback_source",
                 },
@@ -907,17 +968,26 @@ class AgentHandler(BaseHTTPRequestHandler):
                 encoded_secret = document.get("secret_b64")
                 if not isinstance(encoded_secret, str):
                     raise ValueError("secret_b64_must_be_string")
+                consent_code = document.get("consent_code")
+                if not isinstance(consent_code, str):
+                    raise ValueError("consent_code_must_be_string")
                 padding = "=" * (-len(encoded_secret) % 4)
                 secret = base64.b64decode(
                     encoded_secret + padding,
                     altchars=b"-_",
                     validate=True,
                 )
-                outcome = self.agent_server.pair(secret)
+                outcome = self.agent_server.pair(secret, consent_code)
             except UnicodeDecodeError:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"schema_version": SCHEMA_VERSION, "error": "body_not_utf8"},
+                )
+                return
+            except PermissionError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"schema_version": SCHEMA_VERSION, "error": str(exc)},
                 )
                 return
             except FileExistsError:
@@ -1043,6 +1113,14 @@ def main(argv: list[str] | None = None) -> int:
         storage_persistent=state_persistent,
     )
     started_at = utc_now()
+    pairing_consent_code = (
+        f"{secrets.randbelow(1_000_000):06d}" if secret is None else None
+    )
+    pairing_consent_expires_at_unix = (
+        int(time.time()) + PAIRING_CONSENT_TTL_SECONDS
+        if pairing_consent_code is not None
+        else None
+    )
     server = AgentHTTPServer(
         (args.host, args.port),
         AgentHandler,
@@ -1052,6 +1130,8 @@ def main(argv: list[str] | None = None) -> int:
         key_path=key_path,
         pairing_peer=pairing_peer,
         started_at=started_at,
+        pairing_consent_code=pairing_consent_code,
+        pairing_consent_expires_at_unix=pairing_consent_expires_at_unix,
     )
 
     def request_stop(signum: int, _frame: Any) -> None:
@@ -1078,6 +1158,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Schlüsselquelle: {secret_source}")
     if secret is None:
         print(f"Kopplung: wartet einmalig auf {pairing_peer}")
+        print(
+            f"Lokaler Kopplungscode: {pairing_consent_code} "
+            f"({PAIRING_CONSENT_TTL_SECONDS // 60} Minuten gültig)"
+        )
     else:
         print("Kopplung: aktiv")
     print("Rechte: beliebiges Python mit den Rechten des Juno-Prozesses")

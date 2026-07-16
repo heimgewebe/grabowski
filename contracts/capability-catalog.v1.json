@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "9358d922928c7478e47df46901da8a585e716199fa86fb869efa8b23b968721e",
+  "capability_source_sha256": "2af841f219be0bd69d2b86312e88e1e011ba33ac8912a7636629d0385e1bb899",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "6f2d8065c782f9676aa71d5a68f189bb05f9a226cfc62b5b9ea6409f72cb99bb",
+  "contract_sha256": "f450350a5eccaa674f0872715e01fa44648b32ccbc647aa3e2cfb3e6a41787cb",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -818,6 +818,47 @@
       "reversibility": "command-dependent",
       "risk_class": "variable",
       "tool": "grabowski_fleet_run"
+    },
+    {
+      "category": "device-worker",
+      "description": "Read the Juno iPad agent health or one authenticated job receipt.",
+      "effects": [],
+      "id": "grabowski_juno_status",
+      "purpose": "Read bounded health and job evidence from the paired Juno device worker.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_juno_status"
+    },
+    {
+      "category": "device-worker",
+      "description": "Pair the locally consented Juno iPad agent without exposing its secret.",
+      "effects": [
+        "device-key-create",
+        "local-secret-create-or-replace",
+        "receipt-create"
+      ],
+      "id": "grabowski_juno_pair",
+      "purpose": "Pair one exact Juno session after local consent and explicit escalation.",
+      "read_only": false,
+      "reversibility": "remove-both-pairing-files-and-restart",
+      "risk_class": "high",
+      "tool": "grabowski_juno_pair"
+    },
+    {
+      "category": "device-worker",
+      "description": "Run one locally consented, hash-bound Python job inside the Juno process.",
+      "effects": [
+        "device-job-execute",
+        "device-state-change",
+        "receipt-create"
+      ],
+      "id": "grabowski_juno_run",
+      "purpose": "Run one bounded digest-bound job on the paired Juno device worker.",
+      "read_only": false,
+      "reversibility": "job-dependent-with-local-stop-switch",
+      "risk_class": "high",
+      "tool": "grabowski_juno_run"
     },
     {
       "category": "operation",

@@ -1414,6 +1414,80 @@
         ],
         "reversibility": "hash-bound-restore-on-failure"
       }
+    },
+    "grabowski_juno_status": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Provide bounded observation of the private Juno device worker without generic command access.",
+      "evidence_refs": [
+        "docs:juno-ipad-agent.md",
+        "tests:test_juno_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because the private device protocol, local consent, exact instance binding and receipts require one cohesive typed boundary.",
+      "exception_detail": {
+        "claim": "grabowski_juno_status owns only its declared Juno device authority.",
+        "evidence": "Bounded protocol handling, exact identity checks, private key handling, receipts and integration tests."
+      },
+      "tool_contract": {
+        "tool": "grabowski_juno_status",
+        "category": "device-worker",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "grabowski_juno_pair": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Pair one exact device session only after short-lived local consent and session escalation.",
+      "evidence_refs": [
+        "docs:juno-ipad-agent.md",
+        "tests:test_juno_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because the private device protocol, local consent, exact instance binding and receipts require one cohesive typed boundary.",
+      "exception_detail": {
+        "claim": "grabowski_juno_pair owns only its declared Juno device authority.",
+        "evidence": "Bounded protocol handling, exact identity checks, private key handling, receipts and integration tests."
+      },
+      "tool_contract": {
+        "tool": "grabowski_juno_pair",
+        "category": "device-worker",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "device-key-create",
+          "local-secret-create-or-replace",
+          "receipt-create"
+        ],
+        "reversibility": "remove-both-pairing-files-and-restart"
+      }
+    },
+    "grabowski_juno_run": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Run one bounded, digest-bound device job through the paired Juno worker.",
+      "evidence_refs": [
+        "docs:juno-ipad-agent.md",
+        "tests:test_juno_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because the private device protocol, local consent, exact instance binding and receipts require one cohesive typed boundary.",
+      "exception_detail": {
+        "claim": "grabowski_juno_run owns only its declared Juno device authority.",
+        "evidence": "Bounded protocol handling, exact identity checks, private key handling, receipts and integration tests."
+      },
+      "tool_contract": {
+        "tool": "grabowski_juno_run",
+        "category": "device-worker",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "device-job-execute",
+          "device-state-change",
+          "receipt-create"
+        ],
+        "reversibility": "job-dependent-with-local-stop-switch"
+      }
     }
   },
   "retired_tools": {},

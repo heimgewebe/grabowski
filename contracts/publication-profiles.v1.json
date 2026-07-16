@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "6f2d8065c782f9676aa71d5a68f189bb05f9a226cfc62b5b9ea6409f72cb99bb"
+    "sha256": "f450350a5eccaa674f0872715e01fa44648b32ccbc647aa3e2cfb3e6a41787cb"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "fc4ac1ed8bc61dbafefc40ae7b88d810bc81a5b8dd2c99e00d310651dcb2829f"
+    "sha256": "94563b9bcc6a8bc81c6a9f51646f53d6343433b41f41fe1d7a3d7d329f841626"
   },
   "counts": {
     "core": 21,
-    "full": 128,
-    "operator": 113
+    "full": 131,
+    "operator": 116
   },
   "profiles": {
     "core": [
@@ -103,6 +103,9 @@
       "grabowski_power_run",
       "grabowski_fleet_list",
       "grabowski_fleet_run",
+      "grabowski_juno_status",
+      "grabowski_juno_pair",
+      "grabowski_juno_run",
       "grabowski_operation_list",
       "grabowski_operation_plan",
       "grabowski_operation_run",
@@ -220,6 +223,9 @@
       "grabowski_privileged_action_reference",
       "grabowski_power_run",
       "grabowski_fleet_run",
+      "grabowski_juno_status",
+      "grabowski_juno_pair",
+      "grabowski_juno_run",
       "grabowski_operation_list",
       "grabowski_operation_plan",
       "grabowski_operation_run",
