@@ -252,10 +252,42 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
                     parameters["execution_intent"]["context"].get("lease_owner_id", "")
                 ),
             )
-            execution_result = core._run_captain_pr_merge(
-                repo_path, action, parameters, guarded_runner
-            )
-            guarded_runner.finalize(execution_result)
+            execution_result: dict[str, Any] = {
+                "action": "pr-merge",
+                "repo": action["target"].get("repo"),
+                "pr": action["target"].get("pr"),
+                "execution_invoked": False,
+                "execution_attempted": False,
+                "command_returned": False,
+                "remote_mutation_observed": False,
+                "preflight_passed": False,
+                "verification_passed": False,
+            }
+            try:
+                if guarded_runner.static_errors:
+                    execution_result.update(
+                        {
+                            "preflight_errors": list(guarded_runner.static_errors),
+                            "verification_error": "merge lease guard static binding validation failed",
+                        }
+                    )
+                else:
+                    execution_result = core._run_captain_pr_merge(
+                        repo_path, action, parameters, guarded_runner
+                    )
+            except Exception as exc:  # defensive cleanup boundary
+                execution_result.update(
+                    {
+                        "execution_invoked": guarded_runner.dispatch_called,
+                        "execution_attempted": guarded_runner.dispatch_called,
+                        "command_returned": False,
+                        "verification_passed": False,
+                        "verification_error": "captain pr merge executor raised before receipt completion",
+                        "executor_exception": f"{type(exc).__name__}: {core._bounded_command_output(str(exc), limit=512)}",
+                    }
+                )
+            finally:
+                guarded_runner.finalize(execution_result)
         elif action["action"] == "runtime-deploy":
             execution_result = core._run_captain_runtime_deploy(action, parameters)
         else:
@@ -264,6 +296,8 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         invoked = execution_result.get("execution_invoked") is True
         command_returned = execution_result.get("command_returned") is True
         verified = execution_result.get("verification_passed") is True
+        cleanup_passed = execution_result.get("merge_guard_cleanup_passed") is not False
+        operationally_complete = verified and cleanup_passed
         asynchronously_scheduled = (
             verified
             and execution_result.get("deployment_scheduled") is True
@@ -284,15 +318,19 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
                 action,
                 gate_decision=(
                     successful_decision
+                    if operationally_complete
+                    else "executed_with_guard_cleanup_failure"
                     if verified
                     else "verification_failed_after_execution"
                     if invoked
                     else "blocked"
                 ),
                 projection_info=projection_info,
-                status="passed" if verified else "failed" if invoked else "blocked",
+                status="passed" if operationally_complete else "failed" if invoked else "blocked",
                 decision=(
                     successful_decision
+                    if operationally_complete
+                    else "executed_with_guard_cleanup_failure"
                     if verified
                     else "verification_failed_after_execution"
                     if invoked
@@ -313,12 +351,21 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         for result in executions
         if result.get("execution_invoked") is True and result.get("verification_passed") is not True
     ]
+    cleanup_failures = [
+        result
+        for result in executions
+        if result.get("verification_passed") is True
+        and result.get("merge_guard_cleanup_passed") is False
+    ]
     if pre_execution_failures:
         receipt_status = "blocked"
         decision = "blocked"
     elif verification_failures:
         receipt_status = "failed"
         decision = "verification_failed_after_execution"
+    elif cleanup_failures:
+        receipt_status = "failed"
+        decision = "executed_with_guard_cleanup_failure"
     else:
         receipt_status = "passed"
         decision = (
@@ -334,6 +381,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
     command_returned_count = sum(1 for result in executions if result.get("command_returned") is True)
     attempted_count = sum(1 for result in executions if result.get("execution_attempted") is True)
     verified_count = sum(1 for result in executions if result.get("verification_passed") is True)
+    cleanup_failed_count = len(cleanup_failures)
     for gate in gates:
         core._check(receipt, f"captain-gate-{gate['id']}", "pass", str(gate["reason"]))
     core._check(receipt, "captain-gates-pass", "pass", action_names)
@@ -344,7 +392,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         f"intent_sha256={intent_info['intent_sha256']} issued_at={intent_info['issued_at']}",
     )
     core._check(receipt, "trusted-owner-autonomy", "pass" if core._captain_trusted_owner_autonomy_ready(parameters, actions) else "warn", str(parameters.get("autonomy_policy") or "manual evidence mode"))
-    core._check(receipt, "receipt-bound-execution", "pass", f"execution_records={len(executions)} invoked={invoked_count} command_returned={command_returned_count} attempted={attempted_count} verified={verified_count}")
+    core._check(receipt, "receipt-bound-execution", "pass", f"execution_records={len(executions)} invoked={invoked_count} command_returned={command_returned_count} attempted={attempted_count} verified={verified_count} cleanup_failed={cleanup_failed_count}")
     preflight_reasons = [
         reason
         for result in pre_execution_failures
@@ -354,6 +402,11 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         str(result.get("verification_error") or "post-execution verification failed")
         for result in verification_failures
     ]
+    cleanup_reasons = [
+        str(result.get("merge_guard_cleanup_error") or "merge guard cleanup failed")
+        for result in cleanup_failures
+    ]
+    post_execution_reasons.extend(cleanup_reasons)
     if pre_execution_failures:
         core._check(receipt, "execution-preflight", "fail", "; ".join(preflight_reasons))
         core._check(receipt, "execution-attempted", "skip", "execution not attempted")
@@ -362,7 +415,15 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
         core._check(receipt, "execution-preflight", "pass", "execution preflight passed")
         core._check(receipt, "execution-attempted", "pass", f"invoked={invoked_count} command_returned={command_returned_count} attempted={attempted_count}")
         if verification_failures:
-            core._check(receipt, "post-execution-verification", "fail", "; ".join(post_execution_reasons))
+            core._check(
+                receipt,
+                "post-execution-verification",
+                "fail",
+                "; ".join(
+                    str(result.get("verification_error") or "post-execution verification failed")
+                    for result in verification_failures
+                ),
+            )
         else:
             core._check(
                 receipt,
@@ -370,6 +431,12 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
                 "pass",
                 "all execution receipts verified within their declared verification scope",
             )
+        core._check(
+            receipt,
+            "merge-guard-cleanup",
+            "fail" if cleanup_failures else "pass",
+            "; ".join(cleanup_reasons) if cleanup_reasons else "all required merge guard leases released",
+        )
     return {
         "schema_version": 1,
         "profile": "captain",
@@ -391,11 +458,12 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
             "command_returned_count": command_returned_count,
             "attempted_count": attempted_count,
             "verified_count": verified_count,
+            "cleanup_failed_count": cleanup_failed_count,
         },
         "executions": executions,
         "non_claims": [
             "does not execute actions outside the explicit executable_action_allowlist",
-            "does not bypass expected_head, review, diff, CI, status-projection or execution-intent gates",
+            "does not bypass expected_head, expected_base_sha, review, diff, CI, status-projection or execution-intent gates",
             "does not establish semantic correctness beyond the observed execution receipt",
             "does not echo raw execution_intent, actor or context values; receipts carry only normalized fields and digests",
         ],
