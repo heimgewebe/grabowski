@@ -101,14 +101,18 @@ Mutation, weil sie einen Juno-Job und lokale Receipts erzeugen.
 - `ipad_directory_list`: nur unmittelbare Einträge, keine Rekursion; Ausgabe
   und tatsächlich durchlaufene Provider-Einträge sind getrennt hart begrenzt.
   Eine am Scan-Limit abgeschnittene Teilansicht wird ausdrücklich markiert.
-- `ipad_file_read`: eine reguläre Datei bis zur serverseitigen Größenobergrenze,
-  mit SHA-256.
+- `ipad_file_read`: eine reguläre Datei bis **176 KiB**, mit SHA-256. Diese
+  Grenze lässt nach Base64-Kodierung und Ergebnis-Metadaten Reserve unter dem
+  256-KiB-Ergebnisvertrag des Juno-Agenten.
 - `ipad_file_create`: nur create-only; Vorzustand muss `absent` sein; Payload
-  wird vor und nach der Übertragung gehasht.
-- `ipad_file_replace`: gleichverzeichnisgebundener Ersatz nur bei passendem
+  wird vor und nach der Übertragung gehasht und ist auf **176 KiB** begrenzt.
+- `ipad_file_replace`: gleichverzeichnisgebundener Ersatz bis **176 KiB** nur bei passendem
   SHA-256 des vorhandenen Inhalts und passendem Payload-SHA-256; der Vorinhalt
-  wird unmittelbar vor dem Umschalten erneut geprüft. Dokumentanbieter können
-  abweichende Atomaritäts- und Dauerhaftigkeitsgarantien haben.
+  wird unmittelbar vor dem Umschalten erneut geprüft. Der Grant-Wurzelpfad und
+  alle Elternverzeichnisse bleiben während Stat, List, Read, Create und Replace
+  über Dateideskriptoren festgehalten; ein nachträglicher Symlink-Tausch ändert
+  daher nicht das Operationsziel. Dokumentanbieter können dennoch abweichende
+  Atomaritäts- und Dauerhaftigkeitsgarantien haben.
 
 Nicht freigeschaltet:
 

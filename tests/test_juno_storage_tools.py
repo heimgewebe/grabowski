@@ -298,6 +298,97 @@ class JunoStorageDeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(outside.read_bytes(), b"outside")
         self.assertEqual(linked.read_bytes(), b"outside")
 
+    def test_descriptor_pinned_parent_does_not_follow_later_symlink_swap(self) -> None:
+        original_parent = self.external / "nested"
+        original_parent.mkdir()
+        (original_parent / "inside.txt").write_bytes(b"inside")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "inside.txt").write_bytes(b"outside")
+
+        request = {
+            "schema_version": 1,
+            "operation": "grant_status",
+            "grant_id": GRANT_ID,
+        }
+        external = self.external
+
+        class FakeNSURLClass:
+            @staticmethod
+            def URLByResolvingBookmarkData_options_relativeToURL_bookmarkDataIsStale_error_(
+                *_args: object,
+            ) -> FakeURL:
+                return FakeURL(external)
+
+        objc = ModuleType("juno.objc")
+        objc.ObjCClass = lambda _name: FakeNSURLClass
+        objc.ns = lambda value: value
+        objc.nsdata_to_bytes = lambda value: bytes(value)
+        objc.py_from_ns = lambda value: value
+        juno = ModuleType("juno")
+        juno.objc = objc
+        namespace: dict[str, object] = {}
+        code, _digest = storage._storage_code(request)
+        with (
+            patch.dict(sys.modules, {"juno": juno, "juno.objc": objc}),
+            patch.dict(os.environ, {"HOME": str(self.home)}),
+        ):
+            exec(compile(code, "<juno-storage-job>", "exec"), namespace)
+
+        open_parent = namespace["_open_parent_directory"]
+        read_at = namespace["_read_file_at"]
+        create_at = namespace["_create_file_at"]
+        descriptor, name = open_parent(self.external, "nested/inside.txt")
+        try:
+            pinned_parent = self.external / "nested-pinned"
+            original_parent.rename(pinned_parent)
+            (self.external / "nested").symlink_to(outside, target_is_directory=True)
+
+            payload, _metadata = read_at(descriptor, name, 1024)
+            self.assertEqual(payload, b"inside")
+            create_at(descriptor, "created.txt", b"pinned")
+        finally:
+            os.close(descriptor)
+
+        self.assertEqual((pinned_parent / "created.txt").read_bytes(), b"pinned")
+        self.assertFalse((outside / "created.txt").exists())
+        self.assertEqual((outside / "inside.txt").read_bytes(), b"outside")
+
+    def test_missing_no_follow_flag_fails_closed(self) -> None:
+        request = {
+            "schema_version": 1,
+            "operation": "grant_status",
+            "grant_id": GRANT_ID,
+        }
+        external = self.external
+
+        class FakeNSURLClass:
+            @staticmethod
+            def URLByResolvingBookmarkData_options_relativeToURL_bookmarkDataIsStale_error_(
+                *_args: object,
+            ) -> FakeURL:
+                return FakeURL(external)
+
+        objc = ModuleType("juno.objc")
+        objc.ObjCClass = lambda _name: FakeNSURLClass
+        objc.ns = lambda value: value
+        objc.nsdata_to_bytes = lambda value: bytes(value)
+        objc.py_from_ns = lambda value: value
+        juno = ModuleType("juno")
+        juno.objc = objc
+        namespace: dict[str, object] = {}
+        code, _digest = storage._storage_code(request)
+        with (
+            patch.dict(sys.modules, {"juno": juno, "juno.objc": objc}),
+            patch.dict(os.environ, {"HOME": str(self.home)}),
+        ):
+            exec(compile(code, "<juno-storage-job>", "exec"), namespace)
+
+        directory_flags = namespace["_directory_open_flags"]
+        with patch.object(os, "O_NOFOLLOW", 0):
+            with self.assertRaisesRegex(RuntimeError, "O_NOFOLLOW"):
+                directory_flags()
+
     def test_capability_manifest_is_uniform_private_and_restart_bound(self) -> None:
         required = {
             "logical_name",
@@ -353,6 +444,100 @@ class JunoStorageHostValidationTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     storage._normalize_relative_path(value, allow_root=False)
+
+    def test_transport_bounds_fit_generated_code_and_result_envelopes(self) -> None:
+        payload = b"x" * storage.MAX_WRITE_BYTES
+        request = {
+            "schema_version": 1,
+            "operation": "file_replace",
+            "agent_instance_started_at": "2" * storage.MAX_EXPECTED_STARTED_AT_BYTES,
+            "grant_id": GRANT_ID,
+            "expected_grant_evidence_hash": EVIDENCE_HASH,
+            "expected_provider": "p" * storage.MAX_PROVIDER_BYTES,
+            "relative_path": "x" * storage.MAX_RELATIVE_PATH_BYTES,
+            "expected_sha256": "c" * 64,
+            "payload_b64": base64.b64encode(payload).decode("ascii"),
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "max_write_bytes": storage.MAX_WRITE_BYTES,
+        }
+        code, _digest = storage._storage_code(request)
+        self.assertLessEqual(len(code.encode("utf-8")), storage.bridge.MAX_CODE_BYTES)
+
+        too_large = b"x" * (storage.MAX_WRITE_BYTES + 1)
+        with patch.object(storage.bridge, "grabowski_juno_run") as run:
+            with self.assertRaisesRegex(ValueError, "write bound"):
+                storage.ipad_file_create(
+                    grant_id=GRANT_ID,
+                    expected_grant_evidence_hash=EVIDENCE_HASH,
+                    expected_provider=PROVIDER,
+                    relative_path="oversized.bin",
+                    payload_b64=base64.b64encode(too_large).decode("ascii"),
+                    payload_sha256=hashlib.sha256(too_large).hexdigest(),
+                    expected_started_at="agent-start",
+                    session_escalation={"target": {"device": "ipad"}},
+                )
+        run.assert_not_called()
+
+        transport_oversized = b"x" * (256 * 1024)
+        oversized_request = {
+            **request,
+            "payload_b64": base64.b64encode(transport_oversized).decode("ascii"),
+            "payload_sha256": hashlib.sha256(transport_oversized).hexdigest(),
+            "max_write_bytes": len(transport_oversized),
+        }
+        with self.assertRaisesRegex(ValueError, "code transport bound"):
+            storage._storage_code(oversized_request)
+
+        read_payload = b"x" * storage.MAX_READ_BYTES
+        result = {
+            "schema_version": 1,
+            "kind": "ipad_file_read",
+            "verification_time": "2" * 64,
+            "grant_id": GRANT_ID,
+            "provider": "p" * storage.MAX_PROVIDER_BYTES,
+            "grant_evidence_hash": EVIDENCE_HASH,
+            "relative_path": "x" * storage.MAX_RELATIVE_PATH_BYTES,
+            "payload_b64": base64.b64encode(read_payload).decode("ascii"),
+            "size": len(read_payload),
+            "sha256": hashlib.sha256(read_payload).hexdigest(),
+            "mode": 0o600,
+            "mtime_ns": 1,
+            "bookmark_stale": None,
+            "bookmark_stale_observed": False,
+        }
+        encoded = storage._canonical_json_bytes(result)
+        self.assertLessEqual(len(encoded), storage.MAX_DEVICE_RESULT_BYTES)
+        storage._validate_device_result(
+            {
+                "operation": "file_read",
+                "grant_id": GRANT_ID,
+                "expected_grant_evidence_hash": EVIDENCE_HASH,
+                "expected_provider": result["provider"],
+                "relative_path": result["relative_path"],
+                "max_bytes": storage.MAX_READ_BYTES,
+            },
+            result,
+        )
+
+        oversized_result = dict(result)
+        oversized_result["padding"] = "x" * storage.MAX_DEVICE_RESULT_BYTES
+        with self.assertRaisesRegex(RuntimeError, "result transport bound"):
+            storage._validate_device_result(
+                {
+                    "operation": "file_read",
+                    "grant_id": GRANT_ID,
+                    "expected_grant_evidence_hash": EVIDENCE_HASH,
+                    "expected_provider": result["provider"],
+                    "relative_path": result["relative_path"],
+                    "max_bytes": storage.MAX_READ_BYTES,
+                },
+                oversized_result,
+            )
+
+        with self.assertRaisesRegex(ValueError, "bounded non-empty"):
+            storage._validate_expected_started_at(
+                "x" * (storage.MAX_EXPECTED_STARTED_AT_BYTES + 1)
+            )
 
     def test_payload_hash_is_checked_before_device_submission(self) -> None:
         with patch.object(storage.bridge, "grabowski_juno_run") as run:
@@ -494,6 +679,10 @@ class JunoStorageGrantScriptTests(unittest.TestCase):
         ):
             spec.loader.exec_module(module)
         return module
+
+    def test_picker_uses_open_in_place_mode(self) -> None:
+        module = self.load_script()
+        self.assertEqual(module.PICKER_MODE_OPEN, 1)
 
     def test_atomic_create_is_private_single_link_and_create_only(self) -> None:
         module = self.load_script()
