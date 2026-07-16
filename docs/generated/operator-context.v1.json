@@ -2102,7 +2102,7 @@
       "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_mcp.py": "36a279af21caecc1777050460aaa45becfc300a8255b2762705e96f017204c54",
-      "src/grabowski_merge_guard.py": "8e97600f29cbccf7e59a9d418525541c067c11dab4fbc7501ee9bc5069e9c5ba",
+      "src/grabowski_merge_guard.py": "aebee17a3ed087f1f1b8c2071237739526faf08fda5cd89274161a464adb7c53",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
       "src/grabowski_operator.py": "674c070df71d3538e6dd8edc6e373a57563650015a6d8bedae91133e4b486666",

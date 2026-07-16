@@ -36,7 +36,12 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.server.fastmcp"] = fake_fastmcp
     sys.modules["mcp.types"] = fake_types
 
+import grabowski_merge_guard as merge_guard
 import grabowski_resources as resources
+
+REPOSITORY_ID = merge_guard._merge_guard_identifier("repository", "heimgewebe/grabowski")
+MAIN_BRANCH_ID = merge_guard._merge_guard_identifier("branch", "main")
+WORK_BRANCH_ID = merge_guard._merge_guard_identifier("branch", "feat/work")
 
 class ResourceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -105,7 +110,7 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(resources.inspect_resource("port:9222")["owner_id"], "owner-a")
 
     def test_github_merge_gate_is_nonrenewable_even_for_same_owner(self) -> None:
-        key = "gate:github-merge:heimgewebe-grabowski:main"
+        key = f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}"
         first = resources.acquire_resources(
             "owner-a", [key], purpose="first merge dispatch", ttl_seconds=60
         )
@@ -121,7 +126,7 @@ class ResourceTests(unittest.TestCase):
         repository.mkdir()
         changed_path = repository / "src" / "owned.py"
         existing_path = f"path:{changed_path}"
-        existing_main = "service:github-main:heimgewebe-grabowski"
+        existing_main = f"service:github-main:{REPOSITORY_ID}"
         resources.acquire_resources(
             "task-owner",
             [existing_path, existing_main],
@@ -129,12 +134,12 @@ class ResourceTests(unittest.TestCase):
             ttl_seconds=120,
         )
         keys = [
-            "component:github-repository:heimgewebe-grabowski",
-            "component:github-branch:heimgewebe-grabowski:main",
-            "service:github-main:heimgewebe-grabowski",
-            "service:github-pr:heimgewebe-grabowski-57",
-            "gate:github-merge:heimgewebe-grabowski:main",
-            "deployment:github:heimgewebe-grabowski:main",
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
         ]
         result = resources.acquire_merge_guard_resources(
             "captain-merge:guard-1",
@@ -178,12 +183,12 @@ class ResourceTests(unittest.TestCase):
             "task-owner", [repo_key], purpose="active task repo", ttl_seconds=120
         )
         keys = [
-            "component:github-repository:heimgewebe-grabowski",
-            "component:github-branch:heimgewebe-grabowski:main",
-            "service:github-main:heimgewebe-grabowski",
-            "service:github-pr:heimgewebe-grabowski-57",
-            "gate:github-merge:heimgewebe-grabowski:main",
-            "deployment:github:heimgewebe-grabowski:main",
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
         ]
         result = resources.acquire_merge_guard_resources(
             "captain-merge:guard-2",
@@ -235,12 +240,12 @@ class ResourceTests(unittest.TestCase):
             "foreign-owner", [foreign_path], purpose="disjoint task", ttl_seconds=120
         )
         keys = [
-            "component:github-repository:heimgewebe-grabowski",
-            "component:github-branch:heimgewebe-grabowski:main",
-            "service:github-main:heimgewebe-grabowski",
-            "service:github-pr:heimgewebe-grabowski-57",
-            "gate:github-merge:heimgewebe-grabowski:main",
-            "deployment:github:heimgewebe-grabowski:main",
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
         ]
         result = resources.acquire_merge_guard_resources(
             "captain-merge:guard-3",
@@ -286,12 +291,12 @@ class ResourceTests(unittest.TestCase):
         changed_path = repository / "src" / "target.py"
         disjoint_path = repository / "docs" / "other.md"
         keys = [
-            "component:github-repository:heimgewebe-grabowski",
-            "component:github-branch:heimgewebe-grabowski:main",
-            "service:github-main:heimgewebe-grabowski",
-            "service:github-pr:heimgewebe-grabowski-57",
-            "gate:github-merge:heimgewebe-grabowski:main",
-            "deployment:github:heimgewebe-grabowski:main",
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
         ]
         guard = resources.acquire_merge_guard_resources(
             "captain-merge:scope-guard",
@@ -353,12 +358,12 @@ class ResourceTests(unittest.TestCase):
             metadata={"scope_manifest": scope},
         )
         keys = [
-            "component:github-repository:heimgewebe-grabowski",
-            "component:github-branch:heimgewebe-grabowski:main",
-            "service:github-main:heimgewebe-grabowski",
-            "service:github-pr:heimgewebe-grabowski-57",
-            "gate:github-merge:heimgewebe-grabowski:main",
-            "deployment:github:heimgewebe-grabowski:main",
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
         ]
         with self.assertRaises(resources.ResourceConflict):
             resources.acquire_merge_guard_resources(
@@ -383,12 +388,12 @@ class ResourceTests(unittest.TestCase):
         repository.mkdir()
         changed_path = repository / "src" / "target.py"
         keys = [
-            "component:github-repository:heimgewebe-grabowski",
-            "component:github-branch:heimgewebe-grabowski:main",
-            "service:github-main:heimgewebe-grabowski",
-            "service:github-pr:heimgewebe-grabowski-57",
-            "gate:github-merge:heimgewebe-grabowski:main",
-            "deployment:github:heimgewebe-grabowski:main",
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
         ]
         resources.acquire_resources(
             "foreign-owner",
@@ -445,12 +450,12 @@ class ResourceTests(unittest.TestCase):
         repository.mkdir()
         changed_path = repository / "src" / "target.py"
         keys = [
-            "component:github-repository:heimgewebe-grabowski",
-            "component:github-branch:heimgewebe-grabowski:main",
-            "service:github-main:heimgewebe-grabowski",
-            "service:github-pr:heimgewebe-grabowski-57",
-            "gate:github-merge:heimgewebe-grabowski:main",
-            "deployment:github:heimgewebe-grabowski:main",
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
         ]
         metadata = {
             "merge_guard": {
@@ -512,12 +517,12 @@ class ResourceTests(unittest.TestCase):
         repository.mkdir()
         changed_path = repository / "src" / "target.py"
         keys = [
-            "component:github-repository:heimgewebe-grabowski",
-            "component:github-branch:heimgewebe-grabowski:main",
-            "service:github-main:heimgewebe-grabowski",
-            "service:github-pr:heimgewebe-grabowski-57",
-            "gate:github-merge:heimgewebe-grabowski:main",
-            "deployment:github:heimgewebe-grabowski:main",
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
         ]
         guard = resources.acquire_merge_guard_resources(
             "captain-merge:active-branch-guard",
@@ -565,13 +570,13 @@ class ResourceTests(unittest.TestCase):
         repository.mkdir()
         changed_path = repository / "src" / "target.py"
         keys = [
-            "component:github-repository:heimgewebe-grabowski",
-            "component:github-branch:heimgewebe-grabowski:main",
-            "component:github-branch:heimgewebe-grabowski:feat/work",
-            "service:github-main:heimgewebe-grabowski",
-            "service:github-pr:heimgewebe-grabowski-57",
-            "gate:github-merge:heimgewebe-grabowski:main",
-            "deployment:github:heimgewebe-grabowski:main",
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{WORK_BRANCH_ID}",
+            f"service:github-main:{REPOSITORY_ID}",
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
         ]
         resources.acquire_merge_guard_resources(
             "captain-merge:tamper-guard",
@@ -589,7 +594,7 @@ class ResourceTests(unittest.TestCase):
                 }
             },
         )
-        gate = "gate:github-merge:heimgewebe-grabowski:main"
+        gate = f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}"
         with resources._database() as connection:
             row = connection.execute(
                 "SELECT metadata_json FROM leases WHERE resource_key=?", (gate,)

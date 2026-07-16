@@ -5187,7 +5187,20 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_atomic_merge_guard_serializes_head_branch_component(self) -> None:
         local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
-        head_component = "component:github-branch:heimgewebe-grabowski:feat/captain"
+        resource_keys = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=96,
+            base="main",
+            head="feat/captain",
+        )
+        head_branch_id = merge_guard._merge_guard_identifier("branch", "feat/captain")
+        head_component = next(
+            key
+            for key in resource_keys
+            if key.startswith("component:github-branch:")
+            and key.endswith(f":{head_branch_id}")
+        )
         parameters = authorized_captain_run_parameters()
 
         resources.acquire_resources(
@@ -5271,6 +5284,43 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("passed", passed["receipt"]["status"])
         self.assertTrue(late_component_blocked)
         self.assertIn(head_component, execution["merge_lease_guard"]["resource_keys"])
+
+    def test_merge_guard_resource_ids_are_collision_free_and_slash_safe(self) -> None:
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        first = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="a-b/c",
+            pr_number=96,
+            base="release/2026",
+            head="feat/captain",
+        )
+        second = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="a/b-c",
+            pr_number=96,
+            base="release/2026",
+            head="feat/captain",
+        )
+        self.assertTrue(set(first).isdisjoint(second))
+        self.assertEqual(7, len(first))
+        self.assertEqual(first, resources.normalize_resource_keys(first))
+        release_branch_id = merge_guard._merge_guard_identifier(
+            "branch", "release/2026"
+        )
+        self.assertTrue(
+            any(
+                key.startswith("gate:github-merge:")
+                and key.endswith(f":{release_branch_id}")
+                for key in first
+            )
+        )
+        self.assertTrue(
+            any(
+                key.startswith("deployment:github:")
+                and key.endswith(f":{release_branch_id}")
+                for key in first
+            )
+        )
 
     def test_atomic_merge_guard_allows_exact_nonoverlap(self) -> None:
         local_repo = merge_guard.merge_guard_repository_root(Path.cwd())

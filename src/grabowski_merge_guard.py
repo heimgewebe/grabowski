@@ -26,8 +26,15 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _merge_guard_slug(repo_slug: str) -> str:
-    return repo_slug.replace("/", "-")
+def _merge_guard_identifier(namespace: str, value: str) -> str:
+    if not isinstance(namespace, str) or not namespace:
+        raise ValueError("merge guard identifier namespace is required")
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("merge guard identifier value is invalid")
+    digest = hashlib.sha256(
+        namespace.encode("utf-8") + b"\x00" + value.encode("utf-8")
+    ).hexdigest()
+    return f"{namespace}-{digest}"
 
 
 def merge_guard_repository_root(repo_path: Path) -> Path:
@@ -72,16 +79,18 @@ def merge_guard_resource_keys(
     base: str,
     head: str,
 ) -> list[str]:
-    slug = _merge_guard_slug(repo_slug)
+    repository_id = _merge_guard_identifier("repository", repo_slug)
+    base_branch_id = _merge_guard_identifier("branch", base)
+    head_branch_id = _merge_guard_identifier("branch", head)
     return sorted(
         {
-            f"component:github-repository:{slug}",
-            f"component:github-branch:{slug}:{base}",
-            f"component:github-branch:{slug}:{head}",
-            f"service:github-main:{slug}",
-            f"service:github-pr:{slug}-{pr_number}",
-            f"gate:github-merge:{slug}:{base}",
-            f"deployment:github:{slug}:{base}",
+            f"component:github-repository:{repository_id}",
+            f"component:github-branch:{repository_id}:{base_branch_id}",
+            f"component:github-branch:{repository_id}:{head_branch_id}",
+            f"service:github-main:{repository_id}",
+            f"service:github-pr:{repository_id}:{pr_number}",
+            f"gate:github-merge:{repository_id}:{base_branch_id}",
+            f"deployment:github:{repository_id}:{base_branch_id}",
         }
     )
 
