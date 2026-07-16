@@ -489,7 +489,7 @@
     },
     {
       "category": "deployment",
-      "description": "Schedule one validated self-deployment, reusing an identical in-flight job.",
+      "description": "Schedule one source-identity-bound self-deployment, reusing an identical in-flight job.",
       "effects": [
         "background-job-start",
         "runtime-deploy",

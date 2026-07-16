@@ -74,7 +74,7 @@ deploy-direct: deploy-apply
 
 deploy: context-check
 >test -x "$(GRABOWSKI_RUNTIME_PYTHON)"
->set -eu; expected_head="$$(git rev-parse --verify HEAD)"; "$(GRABOWSKI_RUNTIME_PYTHON)" tools/schedule_runtime_deploy.py --expected-head "$$expected_head" --delay-seconds 8
+>set -eu; expected_head="$$(git rev-parse --verify HEAD)"; set -- --expected-head "$$expected_head" --delay-seconds 8 --source-repository "$(CURDIR)"; if test -n "$${GRABOWSKI_DEPLOY_SOURCE_LEASE_OWNER_ID:-}"; then set -- "$$@" --source-lease-owner-id "$$GRABOWSKI_DEPLOY_SOURCE_LEASE_OWNER_ID"; fi; "$(GRABOWSKI_RUNTIME_PYTHON)" tools/schedule_runtime_deploy.py "$$@"
 
 runtime-retention-check: context-check
 >test -x "$(GRABOWSKI_RUNTIME_PYTHON)"

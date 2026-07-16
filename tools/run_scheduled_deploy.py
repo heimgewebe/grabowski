@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
+SOURCE_KINDS = frozenset({"canonical-main", "detached-worktree"})
 MAX_CAPTURE_BYTES = 65_536
 MAX_MANIFEST_BYTES = 2_000_000
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
@@ -258,27 +259,95 @@ def run_capture(argv: list[str], *, cwd: Path, timeout: int = 30) -> str:
     return stdout.strip()
 
 
-def verify_repository(repo: Path, expected_head: str) -> None:
-    if not OBJECT_ID_RE.fullmatch(expected_head):
-        raise ValueError("expected_head must be a lowercase Git object ID")
+def _validated_repository_path(repo: Path, *, label: str) -> Path:
+    if not repo.is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
     if repo.is_symlink() or not repo.is_dir():
-        raise RuntimeError(f"canonical repository is unavailable: {repo}")
+        raise RuntimeError(f"{label} is unavailable: {repo}")
     resolved = repo.resolve(strict=True)
     if resolved != repo:
-        raise RuntimeError("canonical repository path must not traverse a symlink")
-    git_prefix = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.file.allow=never", "-C", str(repo)]
-    head = run_capture([*git_prefix, "rev-parse", "--verify", "HEAD"], cwd=repo)
-    branch = run_capture([*git_prefix, "symbolic-ref", "--short", "HEAD"], cwd=repo)
-    origin_main = run_capture([*git_prefix, "rev-parse", "--verify", "refs/remotes/origin/main"], cwd=repo)
-    status = run_capture([*git_prefix, "status", "--porcelain=v1", "--untracked-files=normal"], cwd=repo)
+        raise RuntimeError(f"{label} must not traverse a symlink or relative segment")
+    return resolved
+
+
+def _git_prefix(repo: Path) -> list[str]:
+    return [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "protocol.file.allow=never",
+        "-C",
+        str(repo),
+    ]
+
+
+def _git_common_directory(repo: Path) -> Path:
+    raw = run_capture(
+        [*_git_prefix(repo), "rev-parse", "--git-common-dir"],
+        cwd=repo,
+    )
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = repo / candidate
+    if candidate.is_symlink():
+        raise RuntimeError("git common directory may not be a symlink")
+    resolved = candidate.resolve(strict=True)
+    if resolved != candidate or not resolved.is_dir():
+        raise RuntimeError("git common directory must be an exact real directory")
+    return resolved
+
+
+def verify_repository(
+    repo: Path,
+    canonical_repo: Path,
+    source_kind: str,
+    expected_head: str,
+) -> None:
+    if not OBJECT_ID_RE.fullmatch(expected_head):
+        raise ValueError("expected_head must be a lowercase Git object ID")
+    if source_kind not in SOURCE_KINDS:
+        raise ValueError("source_kind is invalid")
+    source = _validated_repository_path(repo, label="source repository")
+    canonical = _validated_repository_path(
+        canonical_repo,
+        label="canonical repository",
+    )
+    source_common = _git_common_directory(source)
+    canonical_common = (
+        source_common if source == canonical else _git_common_directory(canonical)
+    )
+    if source_common != canonical_common:
+        raise RuntimeError("source repository does not share the canonical Git common directory")
+    expected_kind = "canonical-main" if source == canonical else "detached-worktree"
+    if source_kind != expected_kind:
+        raise RuntimeError(
+            f"source kind drift: expected {expected_kind}, found {source_kind}"
+        )
+    git_prefix = _git_prefix(source)
+    head = run_capture([*git_prefix, "rev-parse", "--verify", "HEAD"], cwd=source)
+    branch = run_capture([*git_prefix, "rev-parse", "--abbrev-ref", "HEAD"], cwd=source)
+    origin_main = run_capture(
+        [*git_prefix, "rev-parse", "--verify", "refs/remotes/origin/main"],
+        cwd=source,
+    )
+    status = run_capture(
+        [*git_prefix, "status", "--porcelain=v1", "--untracked-files=normal"],
+        cwd=source,
+    )
     if head != expected_head:
         raise RuntimeError(f"HEAD drift: expected {expected_head}, found {head}")
-    if branch != "main":
-        raise RuntimeError(f"canonical checkout is not on main: {branch}")
+    expected_branch = "main" if source_kind == "canonical-main" else "HEAD"
+    if branch != expected_branch:
+        raise RuntimeError(
+            f"{source_kind} source has invalid branch state: expected {expected_branch}, found {branch}"
+        )
     if origin_main != expected_head:
         raise RuntimeError(f"origin/main drift: expected {expected_head}, found {origin_main}")
     if status:
-        raise RuntimeError("canonical checkout is dirty")
+        raise RuntimeError("source repository is dirty")
 
 
 def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str) -> None:
@@ -323,23 +392,51 @@ def verify_live_manifest(expected_head: str) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, required=True)
+    parser.add_argument("--canonical-repo", type=Path, required=True)
+    parser.add_argument("--source-kind", choices=sorted(SOURCE_KINDS), required=True)
+    parser.add_argument("--source-identity-sha256", required=True)
     parser.add_argument("--expected-head", required=True)
     parser.add_argument("--delay-seconds", type=int, required=True)
     args = parser.parse_args()
     repo = args.repo
     if not 5 <= args.delay_seconds <= 60:
         raise ValueError("delay_seconds must be between 5 and 60")
+    if re.fullmatch(r"[0-9a-f]{64}", args.source_identity_sha256) is None:
+        raise ValueError("source_identity_sha256 must be a lowercase SHA-256")
     binding: dict[str, Any] | None = None
     try:
         binding = load_finalization_binding()
         if binding is not None and binding["expected_head"] != args.expected_head:
             raise RuntimeError("job finalization expected_head does not match runner arguments")
-        emit("scheduled", repo=str(repo), expected_head=args.expected_head, delay_seconds=args.delay_seconds)
+        emit(
+            "scheduled",
+            repo=str(repo),
+            canonical_repo=str(args.canonical_repo),
+            source_kind=args.source_kind,
+            source_identity_sha256=args.source_identity_sha256,
+            expected_head=args.expected_head,
+            delay_seconds=args.delay_seconds,
+        )
         time.sleep(args.delay_seconds)
-        verify_repository(repo, args.expected_head)
-        emit("repository-preflight-complete", expected_head=args.expected_head)
+        verify_repository(
+            repo,
+            args.canonical_repo,
+            args.source_kind,
+            args.expected_head,
+        )
+        emit(
+            "repository-preflight-complete",
+            expected_head=args.expected_head,
+            source_kind=args.source_kind,
+            source_identity_sha256=args.source_identity_sha256,
+        )
         run_streamed(["make", "validate"], cwd=repo, timeout_seconds=1_200, phase="validate")
-        verify_repository(repo, args.expected_head)
+        verify_repository(
+            repo,
+            args.canonical_repo,
+            args.source_kind,
+            args.expected_head,
+        )
         run_streamed(["make", "deploy-apply"], cwd=repo, timeout_seconds=1_800, phase="deploy")
         live = verify_live_manifest(args.expected_head)
         emit("complete", **live)

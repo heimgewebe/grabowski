@@ -420,6 +420,71 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertIn("merge", result["immutable_boundaries"])
         self.assertIn("deployment", result["immutable_boundaries"])
 
+    def test_bound_outcome_is_idempotent_and_accepts_workspace_routes(self) -> None:
+        module = self._load_module()
+        binding_id = "b" * 64
+        kwargs = {
+            "binding_id": binding_id,
+            "recommendation_id": "a" * 64,
+            "operation_class": "long_running",
+            "risk_level": "critical",
+            "recommended_route": "workspace_with_contrast",
+            "actual_route": "full_workspace",
+            "first_pass_success": True,
+            "unchanged_retries": 0,
+            "ambiguous_mutation_outcomes": 0,
+            "tool_call_count": 4,
+            "elapsed_ms": 120000,
+            "evidence_ref": "artifact:agent-workspace:gaw-test:close:" + "c" * 64,
+        }
+        audit = Mock()
+        module.base._append_audit = audit
+        with patch.object(module.time, "time", return_value=1_783_773_600):
+            first = module.record_execution_outcome_once(**kwargs)
+            second = module.record_execution_outcome_once(**kwargs)
+        self.assertEqual(
+            [call.args[0]["operation"] for call in audit.call_args_list],
+            [
+                "execution-governor-outcome-record",
+                "execution-governor-outcome-readback",
+            ],
+        )
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(first["outcome_id"], second["outcome_id"])
+        lines = module.EXECUTION_OUTCOME_LOG.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertEqual(record["recommended_route"], "workspace_with_contrast")
+        self.assertEqual(record["actual_route"], "full_workspace")
+
+    def test_bound_outcome_rejects_same_binding_with_changed_evidence(self) -> None:
+        module = self._load_module()
+        kwargs = {
+            "binding_id": "b" * 64,
+            "recommendation_id": "a" * 64,
+            "operation_class": "long_running",
+            "risk_level": "high",
+            "recommended_route": "full_workspace",
+            "actual_route": "full_workspace",
+            "first_pass_success": True,
+            "unchanged_retries": 0,
+            "ambiguous_mutation_outcomes": 0,
+            "tool_call_count": 4,
+            "elapsed_ms": 120000,
+            "evidence_ref": "artifact:agent-workspace:gaw-test:close:" + "c" * 64,
+        }
+        with patch.object(module.time, "time", return_value=1_783_773_600):
+            module.record_execution_outcome_once(**kwargs)
+            with self.assertRaisesRegex(RuntimeError, "different evidence"):
+                module.record_execution_outcome_once(
+                    **{**kwargs, "first_pass_success": False}
+                )
+        self.assertEqual(
+            len(module.EXECUTION_OUTCOME_LOG.read_text(encoding="utf-8").splitlines()),
+            1,
+        )
+
     def test_shadow_outcomes_create_low_risk_candidate_without_applying_it(self) -> None:
         module = self._load_module()
         now = 1_783_773_600
