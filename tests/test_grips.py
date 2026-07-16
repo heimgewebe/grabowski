@@ -2775,6 +2775,7 @@ class ConnectorSnapshotGripTests(unittest.TestCase):
 
 
 CAPTAIN_HEAD = "b" * 40
+CAPTAIN_BASE_SHA = "e" * 40
 CAPTAIN_DIFF_TEXT = "captain-diff\n"
 CAPTAIN_DIFF = hashlib.sha256(CAPTAIN_DIFF_TEXT.encode("utf-8")).hexdigest()
 
@@ -2819,6 +2820,7 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
         "status_projection_source": "bureau status-projection",
         "status_projection_sha256": grips.sha256_json(projection),
         "expected_head": CAPTAIN_HEAD,
+        "expected_base_sha": CAPTAIN_BASE_SHA,
         "diff_sha256": CAPTAIN_DIFF,
         "execution_authority": {"granted_by": "alex", "reference": "captain decision record 2026-07-07"},
         "review_evidence": {
@@ -2828,6 +2830,7 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
             "pr": 96,
             "generated_at": "2026-07-10T12:00:00+00:00",
             "head_sha": CAPTAIN_HEAD,
+            "base_sha": CAPTAIN_BASE_SHA,
             "diff_sha256": CAPTAIN_DIFF,
             "review_tier": "high_critical",
             "minimum_review_iterations": 4,
@@ -2888,6 +2891,8 @@ def captain_execution_intent(parameters: dict[str, object], **overrides) -> dict
         },
         "issued_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
+    if action["action"] == "pr-merge":
+        intent["expected_base_sha"] = parameters.get("expected_base_sha")
     intent.update(overrides)
     return intent
 
@@ -3325,6 +3330,23 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(parameters)
 
         self.assertEqual("blocked", self.gate(result, "review-evidence-present")["status"])
+
+    def test_blocks_review_evidence_for_other_base_sha(self) -> None:
+        parameters = captain_parameters()
+        parameters["review_evidence"]["base_sha"] = "a" * 40
+        result = self.run_captain(parameters)
+
+        gate = self.gate(result, "review-evidence-present")
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn("base_sha does not match expected_base_sha", result["output"]["blocked_reasons"])
+
+    def test_expected_base_sha_is_required_for_captain_review_binding(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("expected_base_sha")
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", self.gate(result, "review-evidence-present")["status"])
+        self.assertIn("expected_base_sha_missing_or_invalid", result["output"]["blocked_reasons"])
 
     def test_blocks_review_evidence_for_other_repository(self) -> None:
         parameters = captain_parameters()
@@ -4568,6 +4590,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "command_returned_count": 0,
                 "attempted_count": 0,
                 "verified_count": 0,
+                "cleanup_failed_count": 0,
             },
             result["output"]["execution_counts"],
         )
@@ -4877,6 +4900,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(schema["action"], "pr-merge")
         self.assertEqual(schema["target_binding"], {"repo": "heimgewebe/grabowski", "pr": 96, "base": "main"})
         self.assertEqual(schema["head_binding"], {"parameter": "expected_head", "required": True})
+        self.assertEqual(schema["base_sha_binding"], {"parameter": "expected_base_sha", "required": True})
         self.assertEqual(schema["diff_binding"], {"parameter": "diff_sha256", "required": True})
         self.assertLessEqual({"status_projection", "review_evidence", "ci_evidence", "human_authorization"}, evidence_names)
         review_evidence = next(item for item in schema["required_evidence"] if item["name"] == "review_evidence")
@@ -5123,7 +5147,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "isDraft": False,
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
-        }, diff_text=CAPTAIN_DIFF_TEXT.rstrip("\n"))
+        }, diff_text=CAPTAIN_DIFF_TEXT)
         result = grips.grip_run(
             "captain-run", parameters, profile="captain", allow_mutation=True,
             command_runner=FakeGit(), github_runner=gh,
@@ -5258,7 +5282,38 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIn(
             "merge_guard_lease_owner_invalid", execution["merge_lease_guard"]["errors"]
         )
-        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        self.assertEqual([], gh.calls)
+
+    def test_atomic_merge_guard_hashes_raw_diff_bytes_without_newline_translation(self) -> None:
+        raw_diff = b"captain-diff\r\n"
+        parameters = authorized_captain_run_parameters()
+        parameters["diff_sha256"] = hashlib.sha256(raw_diff).hexdigest()
+        parameters["review_evidence"]["diff_sha256"] = parameters["diff_sha256"]
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(view={
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA, "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        })
+
+        def raw_runner(repo: Path, argv: list[str]) -> dict[str, object]:
+            result = gh(repo, argv)
+            if argv[:2] == ["pr", "diff"]:
+                result = dict(result)
+                result["stdout"] = raw_diff.decode("utf-8")
+                result["stdout_bytes"] = raw_diff
+            return result
+
+        runner = merge_guard.CaptainMergeGuardRunner(
+            repo_path=Path.cwd(), action=parameters["actions"][0],
+            parameters=parameters, github_runner=raw_runner,
+            execution_intent_sha256="f" * 64, lease_owner_id="captain-test-owner",
+        )
+        bindings, errors = runner._live_bindings()
+        self.assertEqual([], errors)
+        self.assertIsNotNone(bindings)
+        self.assertEqual(hashlib.sha256(raw_diff).hexdigest(), bindings["diff_sha256"])
+        self.assertEqual("raw-command-bytes", runner.receipt["live_diff"]["canonicalization"])
 
     def test_atomic_merge_guard_rejects_cached_snapshot_and_live_diff_drift(self) -> None:
         for parameters, gh, expected in (
@@ -5315,6 +5370,81 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIsNotNone(bindings)
         self.assertIn("merge_guard_live_diff_empty", errors)
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_releases_after_unexpected_executor_exception(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(view={
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA, "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        })
+
+        def exploding_executor(repo, action, supplied_parameters, guarded_runner):
+            guarded_runner(repo, ["pr", "merge", "96"])
+            raise RuntimeError("executor exploded after guarded dispatch")
+
+        with patch.object(
+            grips,
+            "_run_captain_pr_merge",
+            side_effect=exploding_executor,
+        ):
+            result = grips.grip_run(
+                "captain-run", parameters, profile="captain", allow_mutation=True,
+                command_runner=FakeGit(), github_runner=gh,
+            )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertTrue(execution["merge_guard_cleanup_passed"])
+        self.assertEqual("completed", execution["merge_lease_guard"]["status"])
+        with resources._database() as connection:
+            self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM leases").fetchone()[0])
+
+    def test_atomic_merge_guard_preserves_merge_verification_when_release_fails(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(view={
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA, "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        })
+        with patch.object(resources, "release_resources", side_effect=RuntimeError("release unavailable")):
+            result = grips.grip_run(
+                "captain-run", parameters, profile="captain", allow_mutation=True,
+                command_runner=FakeGit(), github_runner=gh,
+            )
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
+        self.assertFalse(execution["merge_guard_cleanup_passed"])
+        self.assertEqual("guard_release_failed", execution["merge_lease_guard"]["status"])
+        self.assertEqual("executed_with_guard_cleanup_failure", result["output"]["decision"])
+        self.assertEqual("failed", result["receipt"]["status"])
+
+    def test_atomic_merge_guard_blocks_base_sha_drift_after_acquisition_and_releases(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        good = {
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA, "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD, "isDraft": False,
+            "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        }
+        drifted = dict(good, baseRefOid="a" * 40)
+        gh = FakeGh(view_sequence=[good, good, drifted])
+        result = grips.grip_run(
+            "captain-run", parameters, profile="captain", allow_mutation=True,
+            command_runner=FakeGit(), github_runner=gh,
+        )
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertTrue(execution["merge_guard_cleanup_passed"])
+        self.assertTrue(
+            any(
+                "merge_guard_dispatch_revalidation_drift:baseRefOid" in item
+                for item in execution["merge_lease_guard"]["errors"]
+            )
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        with resources._database() as connection:
+            self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM leases").fetchone()[0])
 
     def test_atomic_merge_guard_blocks_legacy_repo_lease_and_same_owner_concurrent_gate(self) -> None:
         for mode in ("legacy-repo", "same-owner-gate"):
@@ -5557,6 +5687,16 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             ),
             (
                 {
+                    "changedFiles": 101,
+                    "files": [
+                        {"path": f"src/file-{index}.py", "changeType": "MODIFIED"}
+                        for index in range(100)
+                    ],
+                },
+                "merge_guard_changed_file_count_exceeds_supported_limit",
+            ),
+            (
+                {
                     "changedFiles": 129,
                     "files": [
                         {"path": f"src/file-{index}.py", "changeType": "MODIFIED"}
@@ -5760,6 +5900,14 @@ class CaptainExecutionIntentTests(unittest.TestCase):
             ("execution_intent_context_invalid", lambda intent: dict(intent, context={})),
             ("execution_intent_field_invalid:action", lambda intent: dict(intent, action="  ")),
             ("execution_intent_field_invalid:expected_base", lambda intent: dict(intent, expected_base=None)),
+            (
+                "execution_intent_field_missing:expected_base_sha",
+                lambda intent: {k: v for k, v in intent.items() if k != "expected_base_sha"},
+            ),
+            (
+                "execution_intent_field_invalid:expected_base_sha",
+                lambda intent: dict(intent, expected_base_sha="e" * 39),
+            ),
             ("execution_intent_field_invalid:expected_head", lambda intent: dict(intent, expected_head="b" * 39)),
             ("execution_intent_issued_at_invalid", lambda intent: dict(intent, issued_at="soon")),
             (
@@ -5782,6 +5930,12 @@ class CaptainExecutionIntentTests(unittest.TestCase):
             (
                 "execution_intent_field_not_canonical:expected_head",
                 lambda intent: dict(intent, expected_head=str(intent["expected_head"]).upper()),
+            ),
+            (
+                "execution_intent_field_not_canonical:expected_base_sha",
+                lambda intent: dict(
+                    intent, expected_base_sha=str(intent["expected_base_sha"]).upper()
+                ),
             ),
             (
                 "execution_intent_field_not_canonical:target_sha256",
@@ -5813,6 +5967,10 @@ class CaptainExecutionIntentTests(unittest.TestCase):
             ("execution_intent_action_drift", lambda intent: dict(intent, action="runtime-deploy")),
             ("execution_intent_target_drift", lambda intent: dict(intent, target_sha256="f" * 64)),
             ("execution_intent_head_drift", lambda intent: dict(intent, expected_head="a" * 40)),
+            (
+                "execution_intent_base_sha_drift",
+                lambda intent: dict(intent, expected_base_sha="a" * 40),
+            ),
             ("execution_intent_base_drift", lambda intent: dict(intent, expected_base="develop")),
         )
         for expected_reason, mutate in cases:
@@ -5920,6 +6078,7 @@ class CaptainExecutionIntentTests(unittest.TestCase):
         self.assertEqual("pr-merge", info["action"])
         self.assertEqual(CAPTAIN_HEAD, info["expected_head"])
         self.assertEqual("main", info["expected_base"])
+        self.assertEqual(CAPTAIN_BASE_SHA, info["expected_base_sha"])
         self.assertEqual(intent["target_sha256"], info["target_sha256"])
         self.assertEqual(intent["evidence_sha256"], info["evidence_sha256"])
         self.assertEqual(grips.sha256_json(intent["actor"]), info["actor_sha256"])
