@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import importlib.util
 import json
@@ -272,6 +273,250 @@ class JunoStorageDeviceRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "evidence hash mismatch"):
             self.run_device({**self.base_request("grant_status", "")})
 
+    def test_create_write_failure_preserves_partial_file_safely(self) -> None:
+        request = {
+            **self.base_request("file_create", "partial.txt"),
+            "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+            "payload_sha256": hashlib.sha256(b"payload").hexdigest(),
+            "max_write_bytes": 1024,
+        }
+        with (
+            patch.object(
+                os,
+                "write",
+                side_effect=OSError(errno.ENOSPC, "simulated full provider"),
+            ),
+            patch.object(
+                os,
+                "unlink",
+                side_effect=AssertionError("failure cleanup must not unlink by name"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "atomic identity-conditional unlink.*residue preserved",
+            ):
+                self.run_device(request)
+        partial = self.external / "partial.txt"
+        self.assertTrue(partial.exists())
+        partial.unlink()
+
+    def test_create_close_failure_is_reported_and_preserves_file(self) -> None:
+        request = {
+            **self.base_request("file_create", "close-failure.txt"),
+            "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+            "payload_sha256": hashlib.sha256(b"payload").hexdigest(),
+            "max_write_bytes": 1024,
+        }
+        target = self.external / "close-failure.txt"
+        real_close = os.close
+        failed = False
+
+        def failing_close(descriptor: int) -> None:
+            nonlocal failed
+            metadata = os.fstat(descriptor)
+            should_fail = (
+                not failed
+                and target.exists()
+                and metadata.st_dev == target.stat().st_dev
+                and metadata.st_ino == target.stat().st_ino
+            )
+            real_close(descriptor)
+            if should_fail:
+                failed = True
+                raise OSError(errno.EIO, "simulated delayed close failure")
+
+        with patch.object(os, "close", side_effect=failing_close):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "atomic identity-conditional unlink.*residue preserved",
+            ):
+                self.run_device(request)
+        self.assertTrue(failed)
+        self.assertEqual(target.read_bytes(), b"payload")
+        target.unlink()
+
+    def test_create_readback_failure_preserves_created_file(self) -> None:
+        request = {
+            **self.base_request("file_create", "readback.txt"),
+            "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+            "payload_sha256": hashlib.sha256(b"payload").hexdigest(),
+            "max_write_bytes": 1024,
+        }
+        real_read = os.read
+
+        def failing_read(descriptor: int, size: int) -> bytes:
+            if not (self.external / "readback.txt").exists():
+                return real_read(descriptor, size)
+            raise OSError(errno.EIO, "simulated provider readback failure")
+
+        with patch.object(os, "read", side_effect=failing_read):
+            with self.assertRaisesRegex(RuntimeError, "residue preserved"):
+                self.run_device(request)
+        target = self.external / "readback.txt"
+        self.assertEqual(target.read_bytes(), b"payload")
+        target.unlink()
+
+    def test_create_readback_failure_does_not_touch_a_replacement(self) -> None:
+        request = {
+            **self.base_request("file_create", "readback.txt"),
+            "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+            "payload_sha256": hashlib.sha256(b"payload").hexdigest(),
+            "max_write_bytes": 1024,
+        }
+        replaced = False
+        real_read = os.read
+
+        def failing_read(descriptor: int, size: int) -> bytes:
+            nonlocal replaced
+            target = self.external / "readback.txt"
+            if not target.exists():
+                return real_read(descriptor, size)
+            if not replaced:
+                displaced = self.external / "readback-displaced.txt"
+                target.rename(displaced)
+                target.write_bytes(b"replacement")
+                replaced = True
+            raise OSError(errno.EIO, "simulated provider readback failure")
+
+        with patch.object(os, "read", side_effect=failing_read):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "cleanup target changed.*cleanup was skipped",
+            ):
+                self.run_device(request)
+        self.assertTrue(replaced)
+        self.assertEqual((self.external / "readback.txt").read_bytes(), b"replacement")
+        (self.external / "readback.txt").unlink()
+        (self.external / "readback-displaced.txt").unlink()
+
+    def test_create_write_failure_does_not_touch_a_replacement(self) -> None:
+        request = {
+            **self.base_request("file_create", "partial.txt"),
+            "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+            "payload_sha256": hashlib.sha256(b"payload").hexdigest(),
+            "max_write_bytes": 1024,
+        }
+        replaced = False
+
+        def failing_write(descriptor: int, payload: bytes) -> int:
+            nonlocal replaced
+            if not replaced:
+                partial = self.external / "partial.txt"
+                displaced = self.external / "partial-displaced.txt"
+                partial.rename(displaced)
+                partial.write_bytes(b"replacement")
+                replaced = True
+            raise OSError(errno.ENOSPC, "simulated full provider")
+
+        with patch.object(os, "write", side_effect=failing_write):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "cleanup target changed.*cleanup was skipped",
+            ):
+                self.run_device(request)
+        self.assertTrue(replaced)
+        self.assertEqual((self.external / "partial.txt").read_bytes(), b"replacement")
+        (self.external / "partial.txt").unlink()
+        (self.external / "partial-displaced.txt").unlink()
+
+    def test_directory_list_on_file_has_stable_validation_error(self) -> None:
+        (self.external / "plain.txt").write_text("plain", encoding="utf-8")
+        request = {
+            **self.base_request("directory_list", "plain.txt"),
+            "limit": 10,
+            "max_scan_entries": 10,
+        }
+        with self.assertRaisesRegex(ValueError, "target is not a directory"):
+            self.run_device(request)
+
+    def test_replace_write_failure_preserves_temporary_safely(self) -> None:
+        target = self.external / "target.txt"
+        target.write_bytes(b"before")
+        payload = b"after"
+        request = {
+            **self.base_request("file_replace", "target.txt"),
+            "expected_sha256": hashlib.sha256(b"before").hexdigest(),
+            "payload_b64": base64.b64encode(payload).decode("ascii"),
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "max_write_bytes": 1024,
+        }
+        with (
+            patch.object(
+                os,
+                "write",
+                side_effect=OSError(errno.ENOSPC, "simulated full provider"),
+            ),
+            patch.object(
+                os,
+                "unlink",
+                side_effect=AssertionError("failure cleanup must not unlink by name"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "residue preserved"):
+                self.run_device(request)
+        self.assertEqual(target.read_bytes(), b"before")
+        leftovers = list(self.external.glob(".grabowski-replace-*.tmp"))
+        self.assertEqual(len(leftovers), 1)
+        leftovers[0].unlink()
+
+    def test_replace_failure_does_not_touch_a_swapped_temporary(self) -> None:
+        target = self.external / "target.txt"
+        target.write_bytes(b"before")
+        payload = b"after"
+        request = {
+            **self.base_request("file_replace", "target.txt"),
+            "expected_sha256": hashlib.sha256(b"before").hexdigest(),
+            "payload_b64": base64.b64encode(payload).decode("ascii"),
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "max_write_bytes": 1024,
+        }
+        swapped_paths: list[Path] = []
+
+        def failing_replace(
+            source_name: str,
+            destination_name: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+        ) -> None:
+            temporary = self.external / source_name
+            displaced = self.external / f"{source_name}.displaced"
+            temporary.rename(displaced)
+            temporary.write_bytes(b"replacement temporary")
+            swapped_paths.extend([temporary, displaced])
+            raise OSError(errno.EIO, "simulated provider replace failure")
+
+        with patch.object(os, "replace", side_effect=failing_replace):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "cleanup target changed.*cleanup was skipped",
+            ):
+                self.run_device(request)
+        self.assertEqual(target.read_bytes(), b"before")
+        self.assertEqual(swapped_paths[0].read_bytes(), b"replacement temporary")
+        for path in swapped_paths:
+            path.unlink()
+
+    def test_unsupported_descriptor_replace_preserves_temporary(self) -> None:
+        target = self.external / "target.txt"
+        target.write_bytes(b"before")
+        payload = b"after"
+        request = {
+            **self.base_request("file_replace", "target.txt"),
+            "expected_sha256": hashlib.sha256(b"before").hexdigest(),
+            "payload_b64": base64.b64encode(payload).decode("ascii"),
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "max_write_bytes": 1024,
+        }
+        with patch.object(os, "replace", side_effect=TypeError("no dir_fd")):
+            with self.assertRaisesRegex(RuntimeError, "residue preserved"):
+                self.run_device(request)
+        self.assertEqual(target.read_bytes(), b"before")
+        leftovers = list(self.external.glob(".grabowski-replace-*.tmp"))
+        self.assertEqual(len(leftovers), 1)
+        leftovers[0].unlink()
+
     def test_hardlinked_file_read_and_replace_are_rejected(self) -> None:
         outside = self.root / "outside.txt"
         outside.write_bytes(b"outside")
@@ -355,6 +600,56 @@ class JunoStorageDeviceRuntimeTests(unittest.TestCase):
         self.assertFalse((outside / "created.txt").exists())
         self.assertEqual((outside / "inside.txt").read_bytes(), b"outside")
 
+    def test_root_swap_between_stat_and_open_fails_closed(self) -> None:
+        request = {
+            "schema_version": 1,
+            "operation": "grant_status",
+            "grant_id": GRANT_ID,
+        }
+        external = self.external
+
+        class FakeNSURLClass:
+            @staticmethod
+            def URLByResolvingBookmarkData_options_relativeToURL_bookmarkDataIsStale_error_(
+                *_args: object,
+            ) -> FakeURL:
+                return FakeURL(external)
+
+        objc = ModuleType("juno.objc")
+        objc.ObjCClass = lambda _name: FakeNSURLClass
+        objc.ns = lambda value: value
+        objc.nsdata_to_bytes = lambda value: bytes(value)
+        objc.py_from_ns = lambda value: value
+        juno = ModuleType("juno")
+        juno.objc = objc
+        namespace: dict[str, object] = {}
+        code, _digest = storage._storage_code(request)
+        with (
+            patch.dict(sys.modules, {"juno": juno, "juno.objc": objc}),
+            patch.dict(os.environ, {"HOME": str(self.home)}),
+        ):
+            exec(compile(code, "<juno-storage-job>", "exec"), namespace)
+
+        open_root = namespace["_open_root_directory"]
+        displaced = self.root / "provider-original"
+        replacement = self.root / "provider-replacement"
+        replacement.mkdir()
+        real_open = os.open
+        swapped = False
+
+        def racing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            if not swapped and Path(path) == self.external:
+                self.external.rename(displaced)
+                replacement.rename(self.external)
+                swapped = True
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(os, "open", side_effect=racing_open):
+            with self.assertRaisesRegex(RuntimeError, "changed while it was opened"):
+                open_root(self.external)
+        self.assertTrue(swapped)
+
     def test_missing_no_follow_flag_fails_closed(self) -> None:
         request = {
             "schema_version": 1,
@@ -386,8 +681,18 @@ class JunoStorageDeviceRuntimeTests(unittest.TestCase):
             exec(compile(code, "<juno-storage-job>", "exec"), namespace)
 
         directory_flags = namespace["_directory_open_flags"]
-        with patch.object(os, "O_NOFOLLOW", 0):
-            with self.assertRaisesRegex(RuntimeError, "O_NOFOLLOW"):
+        open_regular_file_at = namespace["_open_regular_file_at"]
+        parent_descriptor = os.open(self.external, os.O_RDONLY)
+        try:
+            with patch.object(os, "O_NOFOLLOW", 0):
+                with self.assertRaisesRegex(RuntimeError, "O_NOFOLLOW"):
+                    directory_flags()
+                with self.assertRaisesRegex(RuntimeError, "O_NOFOLLOW"):
+                    open_regular_file_at(parent_descriptor, "missing.txt")
+        finally:
+            os.close(parent_descriptor)
+        with patch.object(os, "O_DIRECTORY", 0):
+            with self.assertRaisesRegex(RuntimeError, "O_DIRECTORY"):
                 directory_flags()
 
     def test_capability_manifest_is_uniform_private_and_restart_bound(self) -> None:
@@ -502,12 +807,16 @@ class JunoStorageHostValidationTests(unittest.TestCase):
             "size": len(read_payload),
             "sha256": hashlib.sha256(read_payload).hexdigest(),
             "mode": 0o600,
-            "mtime_ns": 1,
+            "mtime_ns": 9223372036854775807,
             "bookmark_stale": None,
             "bookmark_stale_observed": False,
         }
         encoded = storage._canonical_json_bytes(result)
         self.assertLessEqual(len(encoded), storage.MAX_DEVICE_RESULT_BYTES)
+        self.assertGreaterEqual(
+            storage.MAX_DEVICE_RESULT_BYTES - len(encoded),
+            storage.MIN_DEVICE_RESULT_HEADROOM_BYTES,
+        )
         storage._validate_device_result(
             {
                 "operation": "file_read",
