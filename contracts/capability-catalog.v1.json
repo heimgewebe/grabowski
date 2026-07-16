@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "2af841f219be0bd69d2b86312e88e1e011ba33ac8912a7636629d0385e1bb899",
+  "capability_source_sha256": "97aa1f67e5d937e35796c2d7db9e99bb074fa9dd8e51b0fc9104e605ea5dca62",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "f450350a5eccaa674f0872715e01fa44648b32ccbc647aa3e2cfb3e6a41787cb",
+  "contract_sha256": "66d76cac7479d37b932666dbc5b4bc82a9afaaefddb7648d802d2ec62d41058b",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -859,6 +859,136 @@
       "reversibility": "job-dependent-with-local-stop-switch",
       "risk_class": "high",
       "tool": "grabowski_juno_run"
+    },
+    {
+      "category": "device-storage",
+      "description": "Read a bounded manifest of Juno sandbox paths and locally granted folders.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_capability_manifest",
+      "purpose": "Return the bounded iPad/Juno storage capability manifest without exposing bookmark bytes.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_capability_manifest"
+    },
+    {
+      "category": "device-storage",
+      "description": "Resolve all private grant records and return current bounded storage access.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_storage_inventory",
+      "purpose": "Inventory current Juno sandbox paths and user-granted document-provider scopes.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_storage_inventory"
+    },
+    {
+      "category": "device-storage",
+      "description": "Read one or all private grant records without exposing bookmark bytes.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_storage_grant_status",
+      "purpose": "Observe exact grant identity, provider hint, path evidence and recorded limitations.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_storage_grant_status"
+    },
+    {
+      "category": "device-storage",
+      "description": "Resolve one exact grant and check current read/write access without writing.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_permission_probe",
+      "purpose": "Verify that one exact grant, evidence hash, provider and agent instance still resolve.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_permission_probe"
+    },
+    {
+      "category": "device-storage",
+      "description": "Read metadata for one exact path under one locally granted folder.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_file_stat",
+      "purpose": "Stat one exact granted iPad path without reading file contents.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_file_stat"
+    },
+    {
+      "category": "device-storage",
+      "description": "List bounded immediate metadata under one exact granted directory.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_directory_list",
+      "purpose": "List one granted directory without recursive traversal or content transfer.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_directory_list"
+    },
+    {
+      "category": "device-storage",
+      "description": "Read one bounded regular file from one exact locally granted path.",
+      "effects": [
+        "device-job-execute",
+        "device-file-content-return",
+        "receipt-create"
+      ],
+      "id": "ipad_file_read",
+      "purpose": "Read one exact granted iPad file with size and SHA-256 evidence.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "high",
+      "tool": "ipad_file_read"
+    },
+    {
+      "category": "device-storage",
+      "description": "Create one absent regular file and verify its exact payload hash.",
+      "effects": [
+        "device-job-execute",
+        "device-file-create",
+        "receipt-create"
+      ],
+      "id": "ipad_file_create",
+      "purpose": "Create one create-only file bound to agent instance, grant evidence, provider, path and payload hash.",
+      "read_only": false,
+      "reversibility": "manual-exact-file-removal-not-exposed",
+      "risk_class": "high",
+      "tool": "ipad_file_create"
+    },
+    {
+      "category": "device-storage",
+      "description": "Replace one regular file only when its exact preimage hash matches.",
+      "effects": [
+        "device-job-execute",
+        "device-file-replace",
+        "temporary-file-create",
+        "receipt-create"
+      ],
+      "id": "ipad_file_replace",
+      "purpose": "Perform one hash-bound same-directory replace with immediate preimage recheck and post-readback inside one exact locally granted scope.",
+      "read_only": false,
+      "reversibility": "preimage-dependent-not-automatically-retained",
+      "risk_class": "high",
+      "tool": "ipad_file_replace"
     },
     {
       "category": "operation",

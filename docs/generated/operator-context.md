@@ -98,6 +98,15 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_juno_status` | device-worker | yes | low | Read bounded health and job evidence from the paired Juno device worker. |
 | `grabowski_juno_pair` | device-worker | no | high | Pair one exact Juno session after local consent and explicit escalation. |
 | `grabowski_juno_run` | device-worker | no | high | Run one bounded digest-bound job on the paired Juno device worker. |
+| `ipad_capability_manifest` | device-storage | no | medium | Return the bounded iPad/Juno storage capability manifest without exposing bookmark bytes. |
+| `ipad_storage_inventory` | device-storage | no | medium | Inventory current Juno sandbox paths and user-granted document-provider scopes. |
+| `ipad_storage_grant_status` | device-storage | no | medium | Observe exact grant identity, provider hint, path evidence and recorded limitations. |
+| `ipad_permission_probe` | device-storage | no | medium | Verify that one exact grant, evidence hash, provider and agent instance still resolve. |
+| `ipad_file_stat` | device-storage | no | medium | Stat one exact granted iPad path without reading file contents. |
+| `ipad_directory_list` | device-storage | no | medium | List one granted directory without recursive traversal or content transfer. |
+| `ipad_file_read` | device-storage | no | high | Read one exact granted iPad file with size and SHA-256 evidence. |
+| `ipad_file_create` | device-storage | no | high | Create one create-only file bound to agent instance, grant evidence, provider, path and payload hash. |
+| `ipad_file_replace` | device-storage | no | high | Perform one hash-bound same-directory replace with immediate preimage recheck and post-readback inside one exact locally granted scope. |
 | `grabowski_operation_list` | operation | yes | low | List validated named multi-step operations. |
 | `grabowski_operation_plan` | operation | yes | low | Render a named operation and rollback path without executing it. |
 | `grabowski_operation_run` | operation | no | high | Run a named preflight/action/postflight operation with rollback after failure. |

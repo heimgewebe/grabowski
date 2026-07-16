@@ -23,6 +23,7 @@ Worker, Testknoten und Sensorzugang.
 
 - `tools/juno/juno_ipad_agent.py`: Agent für Juno auf dem iPad
 - `tools/juno/juno_job_client.py`: signierender Client auf dem heim-pc
+- `tools/juno/juno_storage_grant.py`: sichtbare lokale Ordnerauswahl und private iPadOS-Freigabereferenz
 - `juno_ipad_agent.key`: bei der einmaligen Kopplung lokal erzeugter gemeinsamer Schlüssel, niemals einchecken
 - `grabowski_workspace/`: lokaler Arbeits-, Job- und Auditbereich auf dem iPad
 
@@ -100,13 +101,20 @@ python3 tools/juno/juno_job_client.py shutdown
 ## Typisierte Grabowski-Werkzeuge
 
 Der produktive Operatorpfad verwendet keine generischen Terminal- oder
-`curl`-Aufrufe, sondern drei eigene Werkzeuge:
+`curl`-Aufrufe. Drei Werkzeuge steuern den Agenten selbst:
 
 - `grabowski_juno_status`: liest Health und optional einen signierten Jobbeleg,
 - `grabowski_juno_pair`: koppelt nur mit lokal sichtbarem Code, exakter
   `started_at`-Bindung und frischer Sitzungseskalation,
 - `grabowski_juno_run`: führt genau einen Auftrag mit passendem Code-SHA-256,
   exakter Agent-Instanz und lokalem Receipt aus.
+
+Neun zusätzliche Storage-Werkzeuge begrenzen den Dateizugriff auf lokal
+freigegebene Ordner: Capability-Manifest, Inventar, Grant-Status,
+Berechtigungsprobe, Stat, nicht-rekursive Auflistung, begrenztes Lesen,
+create-only Schreiben und hashgebundener Ersatz im selben Verzeichnis. Der
+vollständige
+Vertrag und die Neustartprüfung stehen in `docs/juno-ipad-storage.md`.
 
 Pairing und Aufträge bleiben Hochrisikoaktionen. Sie benötigen eine kurze, auf
 `ipad-10th-gen-wifi` beziehungsweise `100.111.206.65` gebundene
