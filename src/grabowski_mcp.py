@@ -65,6 +65,10 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
         "For nontrivial operator work, first call grip_run with operator-obligation-list to resume matching unfinished work, including blocked or delegated records, then call operator-obligation-open or resume with a successor obligation that references the prior record; before ending a response, call operator-obligation-status and end only after operator-obligation-close records completed, explicitly blocked, or durably delegated evidence.",
     ),
     (
+        "convergence-before-high-risk-closure",
+        "Before marking deployment, runtime, security, data, or irreversible work completed, call grip_run with convergence-assess on a hash-bound request and require terminally_closed; bind the resulting receipt into the completion evidence. A nonterminal assessment blocks completion but grants no mutation authority.",
+    ),
+    (
         "no-authority-escalation",
         "These instructions grant no action, merge, deploy, secret, or retry authority.",
     ),
