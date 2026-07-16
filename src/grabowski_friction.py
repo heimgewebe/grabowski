@@ -1327,6 +1327,22 @@ def _proposal_group(pattern: str, events: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
+def _repair_contract_for_pattern(pattern: str) -> dict[str, Any] | None:
+    repair = FRICTION_REPAIR_CONTRACTS.get(pattern)
+    if repair is None:
+        return None
+    return {
+        "schema_version": 1,
+        "authority": "evidence_preparation_only",
+        "preferred_route": str(repair["preferred_route"]),
+        "required_evidence": [str(item) for item in repair["required_evidence"]],
+        "preparation_steps": [str(item) for item in repair["preparation_steps"]],
+        "retry_policy": str(repair["retry_policy"]),
+        "post_state_readback": str(repair["post_state_readback"]),
+        "does_not_establish": list(FRICTION_REPAIR_NON_CLAIMS),
+    }
+
+
 def _recommendation_for_group(group: dict[str, Any]) -> dict[str, Any] | None:
     if group.get("actionable_repeated") is not True:
         return None
@@ -1334,20 +1350,15 @@ def _recommendation_for_group(group: dict[str, Any]) -> dict[str, Any] | None:
     rule = FRICTION_PROPOSAL_PATTERNS.get(pattern)
     if not rule:
         return None
-    repair = FRICTION_REPAIR_CONTRACTS.get(pattern)
-    if repair is None:
+    repair_contract = _repair_contract_for_pattern(pattern)
+    if repair_contract is None:
         return None
     return {
         "pattern": pattern,
         "recommendation_type": rule["recommendation_type"],
         "title": rule["title"],
         "rationale": rule["rationale"],
-        "repair_contract": {
-            "schema_version": 1,
-            "authority": "evidence_preparation_only",
-            **repair,
-            "does_not_establish": list(FRICTION_REPAIR_NON_CLAIMS),
-        },
+        "repair_contract": repair_contract,
         "count": group["count"],
         "unresolved": group["unresolved"],
         "evidence_threshold": PATTERN_EVIDENCE_THRESHOLD,

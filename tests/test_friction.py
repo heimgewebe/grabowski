@@ -1099,6 +1099,15 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             compact["blocked_gates"]["repair_contract"]["preferred_route"],
             "explicit_preflight",
         )
+        repair["required_evidence"].append("caller mutation")
+        repair["preparation_steps"].clear()
+        repeated = module.friction_summary(view="evidence", limit=10)["next_grip_proposals"]
+        repeated_repair = {
+            item["pattern"]: item
+            for item in repeated["recommendations"]
+        }["blocked_gates"]["repair_contract"]
+        self.assertNotIn("caller mutation", repeated_repair["required_evidence"])
+        self.assertTrue(repeated_repair["preparation_steps"])
         self.assertEqual(
             recommendations["missing_receipt_fields"]["recommendation_type"],
             "small_bureau_task",

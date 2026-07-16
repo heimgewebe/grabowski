@@ -1474,9 +1474,11 @@ def grabowski_task_list(
         ),
         "state_filter_states": list(filter_states or ()),
         "state_counts": state_counts,
+        "state_counts_scope": "all_tasks",
         "state_counts_complete": unknown_state_count == 0,
         "unknown_state_count": unknown_state_count,
         "projection_counts": projection_counts,
+        "projection_counts_scope": "all_tasks",
         "projection_counts_overlap": True,
         "tasks": tasks,
         "pagination": {
