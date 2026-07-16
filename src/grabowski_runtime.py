@@ -6,6 +6,7 @@ import grabowski_runtime_extensions
 import grabowski_read_surface
 import grabowski_self_deploy
 import grabowski_fleet
+import grabowski_juno
 import grabowski_artifacts
 import grabowski_agent_workspace
 import grabowski_agent_workspace_observer

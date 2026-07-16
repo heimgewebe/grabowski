@@ -129,7 +129,14 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 128)
+        self.assertEqual(len(tools), 131)
+        self.assertTrue(
+            {
+                "grabowski_juno_status",
+                "grabowski_juno_pair",
+                "grabowski_juno_run",
+            }.issubset(tools)
+        )
         legacy_tools = {
             "grabowski_status",
             "grabowski_context",
@@ -190,7 +197,8 @@ class RepositoryContractTests(unittest.TestCase):
         )
         self.assertEqual(supporting["grabowski_grip_orchestration"], "src/grabowski_grip_orchestration.py")
         self.assertEqual(supporting["grabowski_merge_guard"], "src/grabowski_merge_guard.py")
-        for module in ("grabowski_mcp", "grabowski_grips", "grabowski_grip_orchestration", "grabowski_merge_guard", "grabowski_operator_obligation", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_privileged_broker", "grabowski_tasks", "grabowski_recovery", "grabowski_friction", "grabowski_agent_bootstrap", "grabowski_recall", "grabowski_consumer_surface", "grabowski_private_io", "grabowski_job_origin", "grabowski_job_finalizer"):
+        for module in ("grabowski_mcp", "grabowski_grips", "grabowski_convergence", "grabowski_grip_orchestration", "grabowski_merge_guard", "grabowski_operator_obligation", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_privileged_broker", "grabowski_tasks", "grabowski_recovery", "grabowski_friction", "grabowski_agent_bootstrap", "grabowski_recall", "grabowski_consumer_surface", "grabowski_private_io", "grabowski_job_origin", "grabowski_job_finalizer"):
+
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
 
