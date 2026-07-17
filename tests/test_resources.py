@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import sqlite3
 import sys
 import tempfile
 import time
@@ -247,6 +248,111 @@ class ResourceTests(unittest.TestCase):
             )
 
         self.assertEqual(extra_repo, raised.exception.resource_key)
+
+    def test_task_terminalization_and_merge_adoption_are_serialized(self) -> None:
+        repository = self.root / "repo-task-authority-race"
+        repository.mkdir()
+        task_id = "c" * 24
+        task_owner = f"task:{task_id}"
+        task_key = f"service:github-main:{REPOSITORY_ID}"
+        resources.acquire_resources(
+            task_owner,
+            [task_key],
+            purpose="task merge authority",
+            ttl_seconds=120,
+            metadata={"task_id": task_id, "attempt": 1},
+        )
+        delegated = resources.task_lease_delegation_evidence(
+            task_owner, task_id, [task_key]
+        )
+        guard_keys = [
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            task_key,
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+        ]
+        guard_owner = "captain-merge:task-authority-race"
+        guard = resources.acquire_merge_guard_resources(
+            guard_owner,
+            task_owner,
+            guard_keys,
+            repository=str(repository),
+            changed_paths=[str(repository / "src" / "target.py")],
+            purpose="task authority race guard",
+            ttl_seconds=60,
+            metadata={
+                "merge_guard": {
+                    "head_sha": "a" * 40,
+                    "diff_sha256": "b" * 64,
+                    "base_branch": "main",
+                    "head_branch": "feat/work",
+                }
+            },
+            delegated_task=delegated,
+        )
+        self.assertEqual(
+            task_id, guard["task_authority_adoption"]["task_id"]
+        )
+        self.assertLessEqual(
+            guard["task_authority_adoption"]["expires_at_unix"],
+            delegated["minimum_expires_at_unix"],
+        )
+        projection = {
+            "task_id": task_id,
+            "state": "completed",
+            "updated_at_unix": int(time.time()),
+            "launcher_json": "{}",
+            "last_observation_json": "{}",
+            "unit": f"grabowski-task-{task_id}-a1.service",
+            "authoritative_unit": f"grabowski-task-{task_id}-a1.service",
+            "attempt": 1,
+        }
+        with self.assertRaises(resources.ResourceConflict):
+            resources.begin_task_terminalization(
+                task_id,
+                1,
+                task_owner,
+                "completed",
+                [task_key],
+                task_projection=projection,
+                observation_sha256="d" * 64,
+            )
+        resources.release_resources(
+            guard_owner, guard["held_resource_keys"]
+        )
+        resources.release_task_authority_adoption(guard_owner, task_id)
+
+        transition = resources.begin_task_terminalization(
+            task_id,
+            1,
+            task_owner,
+            "completed",
+            [task_key],
+            task_projection=projection,
+            observation_sha256="d" * 64,
+        )
+        self.assertEqual("leases_revoked", transition["phase"])
+        with self.assertRaisesRegex(ValueError, "terminalized"):
+            resources.acquire_merge_guard_resources(
+                "captain-merge:task-authority-race-late",
+                task_owner,
+                guard_keys,
+                repository=str(repository),
+                changed_paths=[str(repository / "src" / "target.py")],
+                purpose="late task authority race guard",
+                ttl_seconds=60,
+                metadata={
+                    "merge_guard": {
+                        "head_sha": "a" * 40,
+                        "diff_sha256": "b" * 64,
+                        "base_branch": "main",
+                        "head_branch": "feat/work",
+                    }
+                },
+                delegated_task=delegated,
+            )
 
     def test_merge_guard_preserves_owner_repo_lease_and_blocks_only_changed_paths(self) -> None:
         repository = self.root / "repo"
@@ -959,6 +1065,89 @@ class ResourceTests(unittest.TestCase):
         self.assertGreater(renewed["leases"][0]["expires_at_unix"], int(time.time()) + 60)
         with self.assertRaises(PermissionError):
             resources.renew_resources("owner-b", ["repo:/tmp/repo"])
+
+    def test_schema_v1_database_migrates_to_v2_without_losing_leases(self) -> None:
+        self.database.parent.mkdir(parents=True)
+        metadata_json, metadata_sha256 = resources._metadata({"task_id": "a" * 24})
+        now = int(time.time())
+        with sqlite3.connect(self.database) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO metadata(key, value) VALUES('schema_version', '1');
+                CREATE TABLE leases (
+                    resource_key TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    acquired_at_unix INTEGER NOT NULL,
+                    updated_at_unix INTEGER NOT NULL,
+                    expires_at_unix INTEGER NOT NULL,
+                    metadata_sha256 TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    reclaimed_from_owner TEXT
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO leases VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    "component:migration-preserved",
+                    "task:" + "a" * 24,
+                    "migration fixture",
+                    now,
+                    now,
+                    now + 120,
+                    metadata_sha256,
+                    metadata_json,
+                ),
+            )
+            connection.commit()
+
+        listed = resources.list_resources(owner_id="task:" + "a" * 24)
+
+        self.assertEqual(
+            ["component:migration-preserved"],
+            [item["resource_key"] for item in listed],
+        )
+        with sqlite3.connect(self.database) as migrated:
+            version = migrated.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0]
+            tables = {
+                row[0]
+                for row in migrated.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        self.assertEqual("2", version)
+        self.assertTrue(
+            {"leases", "task_terminalizations", "task_authority_adoptions"}.issubset(
+                tables
+            )
+        )
+
+    def test_schema_v2_missing_terminalization_table_fails_closed(self) -> None:
+        self.database.parent.mkdir(parents=True)
+        with sqlite3.connect(self.database) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO metadata(key, value) VALUES('schema_version', '2');
+                CREATE TABLE leases (
+                    resource_key TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    acquired_at_unix INTEGER NOT NULL,
+                    updated_at_unix INTEGER NOT NULL,
+                    expires_at_unix INTEGER NOT NULL,
+                    metadata_sha256 TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    reclaimed_from_owner TEXT
+                );
+                """
+            )
+        with self.assertRaisesRegex(RuntimeError, "schema 2 is incomplete"):
+            resources.list_resources()
 
     def test_database_rejects_symlink(self) -> None:
         target = self.root / "real.sqlite3"

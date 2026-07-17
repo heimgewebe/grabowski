@@ -910,6 +910,11 @@ class CaptainMergeGuardRunner:
                 ],
                 "guard_expires_at_unix": self.acquisition["expires_at_unix"],
                 "delegated_task_id": self.acquisition.get("delegated_task_id"),
+                "task_authority_adoption_sha256": (
+                    self.acquisition.get("task_authority_adoption", {}).get("binding_sha256")
+                    if isinstance(self.acquisition.get("task_authority_adoption"), dict)
+                    else None
+                ),
                 "delegated_task_resource_keys_sha256": (
                     _sha256_json(self.acquisition.get("delegated_task_resource_keys", []))
                     if self.acquisition.get("delegated_task_id") is not None
@@ -944,27 +949,55 @@ class CaptainMergeGuardRunner:
         self.receipt["merge_command_returncode"] = execution_result.get("merge_returncode")
         self.receipt["post_merge_verification_passed"] = execution_result.get("verification_passed") is True
         if self.acquisition is not None and self.owner_id is not None:
+            cleanup_failures: list[str] = []
+            release_failed = False
+            released: dict[str, Any] | None = None
             try:
                 released = resources.release_resources(
                     self.owner_id, self.held_resource_keys, force=False
                 )
                 self.receipt["release"] = released
-                released_keys = sorted(item["resource_key"] for item in released.get("released", []))
+                released_keys = sorted(
+                    item["resource_key"] for item in released.get("released", [])
+                )
                 if released_keys != self.held_resource_keys:
-                    cleanup_passed = False
-                    cleanup_error = "merge lease guard release incomplete"
-                    self.receipt["status"] = "guard_release_incomplete"
-                    self.receipt["contract_satisfied"] = False
-                elif self.receipt["status"] == "guard_acquired":
-                    self.receipt["status"] = "completed"
-                else:
-                    self.receipt["status"] = self.receipt["status"] + "_released"
+                    cleanup_failures.append("merge lease guard release incomplete")
             except Exception as exc:
-                cleanup_passed = False
-                cleanup_error = "merge lease guard release failed"
-                self.receipt["status"] = "guard_release_failed"
-                self.receipt["contract_satisfied"] = False
+                release_failed = True
+                cleanup_failures.append("merge lease guard release failed")
                 self.receipt["release_error"] = f"{type(exc).__name__}:{exc}"
+
+            delegated_task_id = self.acquisition.get("delegated_task_id")
+            if delegated_task_id is not None:
+                try:
+                    adoption_release = resources.release_task_authority_adoption(
+                        self.owner_id, delegated_task_id
+                    )
+                    self.receipt["task_authority_adoption_release"] = adoption_release
+                    if adoption_release.get("released") is not True:
+                        cleanup_failures.append(
+                            "merge task authority adoption release incomplete"
+                        )
+                except Exception as exc:
+                    release_failed = True
+                    cleanup_failures.append(
+                        "merge task authority adoption release failed"
+                    )
+                    self.receipt["task_authority_adoption_release_error"] = (
+                        f"{type(exc).__name__}:{exc}"
+                    )
+
+            if cleanup_failures:
+                cleanup_passed = False
+                cleanup_error = "; ".join(cleanup_failures)
+                self.receipt["status"] = (
+                    "guard_release_failed" if release_failed else "guard_release_incomplete"
+                )
+                self.receipt["contract_satisfied"] = False
+            elif self.receipt["status"] == "guard_acquired":
+                self.receipt["status"] = "completed"
+            else:
+                self.receipt["status"] = self.receipt["status"] + "_released"
         if (
             not self.dispatch_called
             and self.receipt["status"] != "not_reached"

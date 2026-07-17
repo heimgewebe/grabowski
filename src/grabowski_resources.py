@@ -60,6 +60,11 @@ LEASE_SNAPSHOT_KEYS = frozenset({
     "metadata_sha256",
 })
 TASK_RELEASABLE_STATES = frozenset({"completed"})
+TASK_TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "timed_out", "signalled"})
+TASK_TERMINALIZATION_PHASES = frozenset({"leases_revoked", "projected"})
+TASK_TERMINALIZATION_SCHEMA_VERSION = 1
+TASK_TERMINALIZATION_KIND = "grabowski_task_terminalization"
+TASK_AUTHORITY_ADOPTION_KIND = "grabowski_task_authority_adoption"
 NONRENEWABLE_CRITICAL_RESOURCE_PREFIXES = ("gate:github-merge:",)
 RECONCILIATION_NON_CLAIMS = [
     "permission_to_release_changed_lease",
@@ -140,15 +145,84 @@ def _database() -> sqlite3.Connection:
     current = connection.execute(
         "SELECT value FROM metadata WHERE key='schema_version'"
     ).fetchone()
-    if current is None:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "INSERT INTO metadata(key, value) VALUES('schema_version', '1')"
-        )
-        connection.commit()
-    elif current["value"] != "1":
+    version = None if current is None else str(current["value"])
+    if version not in {None, "1", "2"}:
         connection.close()
         raise RuntimeError("Unsupported resource database schema")
+    if version != "2":
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()
+            version = None if current is None else str(current["value"])
+            if version not in {None, "1", "2"}:
+                raise RuntimeError("Unsupported resource database schema")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_terminalizations (
+                    task_id TEXT PRIMARY KEY,
+                    attempt INTEGER NOT NULL,
+                    lease_owner_id TEXT NOT NULL,
+                    terminal_state TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    task_projection_json TEXT NOT NULL,
+                    task_projection_sha256 TEXT NOT NULL,
+                    requested_resource_keys_json TEXT NOT NULL,
+                    requested_resource_keys_sha256 TEXT NOT NULL,
+                    prior_leases_json TEXT NOT NULL,
+                    prior_leases_sha256 TEXT NOT NULL,
+                    revoked_resource_keys_json TEXT NOT NULL,
+                    missing_resource_keys_json TEXT NOT NULL,
+                    observation_sha256 TEXT NOT NULL,
+                    prepared_at_unix INTEGER NOT NULL,
+                    leases_revoked_at_unix INTEGER NOT NULL,
+                    projected_at_unix INTEGER,
+                    lifecycle_receipt_sha256 TEXT,
+                    recovery_status TEXT NOT NULL,
+                    transition_sha256 TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_authority_adoptions (
+                    task_id TEXT PRIMARY KEY,
+                    guard_owner_id TEXT NOT NULL,
+                    lease_owner_id TEXT NOT NULL,
+                    acquired_at_unix INTEGER NOT NULL,
+                    expires_at_unix INTEGER NOT NULL,
+                    binding_sha256 TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS task_authority_adoptions_expiry_idx "
+                "ON task_authority_adoptions(expires_at_unix)"
+            )
+            if version is None:
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES('schema_version', '2')"
+                )
+            elif version == "1":
+                connection.execute(
+                    "UPDATE metadata SET value='2' WHERE key='schema_version'"
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.close()
+            raise
+    required_tables = {"leases", "task_terminalizations", "task_authority_adoptions"}
+    present_tables = {
+        str(row["name"])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if not required_tables.issubset(present_tables):
+        connection.close()
+        raise RuntimeError("Resource database schema 2 is incomplete")
     try:
         os.chmod(RESOURCE_DB, 0o600)
     except FileNotFoundError:
@@ -1439,6 +1513,346 @@ def _check_active_merge_guard_conflicts(
             )
 
 
+
+def _task_identifier(value: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{24}", value) is None:
+        raise ValueError("task_id must be 24 lowercase hex characters")
+    return value
+
+
+def _task_lease_owner(task_id: str, owner_id: str) -> str:
+    identifier = _task_identifier(task_id)
+    owner = _owner(owner_id)
+    if owner != f"task:{identifier}":
+        raise ValueError("task lease owner does not match task_id")
+    return owner
+
+
+def _optional_resource_keys(values: Iterable[str]) -> list[str]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError("resource_keys must be a list")
+    raw = list(values)
+    if not raw:
+        return []
+    return normalize_resource_keys(raw)
+
+
+def _task_terminalization_public(
+    row: sqlite3.Row | dict[str, Any], *, include_projection: bool = False
+) -> dict[str, Any]:
+    record = dict(row)
+    result: dict[str, Any] = {
+        "schema_version": TASK_TERMINALIZATION_SCHEMA_VERSION,
+        "kind": TASK_TERMINALIZATION_KIND,
+        "task_id": record["task_id"],
+        "attempt": int(record["attempt"]),
+        "lease_owner_id": record["lease_owner_id"],
+        "terminal_state": record["terminal_state"],
+        "phase": record["phase"],
+        "task_projection_sha256": record["task_projection_sha256"],
+        "requested_resource_keys": json.loads(record["requested_resource_keys_json"]),
+        "requested_resource_keys_sha256": record["requested_resource_keys_sha256"],
+        "prior_leases": json.loads(record["prior_leases_json"]),
+        "prior_leases_sha256": record["prior_leases_sha256"],
+        "revoked_resource_keys": json.loads(record["revoked_resource_keys_json"]),
+        "missing_resource_keys": json.loads(record["missing_resource_keys_json"]),
+        "observation_sha256": record["observation_sha256"],
+        "prepared_at_unix": int(record["prepared_at_unix"]),
+        "leases_revoked_at_unix": int(record["leases_revoked_at_unix"]),
+        "projected_at_unix": (
+            None if record["projected_at_unix"] is None else int(record["projected_at_unix"])
+        ),
+        "lifecycle_receipt_sha256": record["lifecycle_receipt_sha256"],
+        "recovery_status": record["recovery_status"],
+        "transition_sha256": record["transition_sha256"],
+    }
+    if include_projection:
+        result["task_projection"] = json.loads(record["task_projection_json"])
+    return result
+
+
+def task_terminalization_record(
+    task_id: str, *, include_projection: bool = False
+) -> dict[str, Any] | None:
+    identifier = _task_identifier(task_id)
+    with _database() as connection:
+        row = connection.execute(
+            "SELECT * FROM task_terminalizations WHERE task_id=?",
+            (identifier,),
+        ).fetchone()
+    return None if row is None else _task_terminalization_public(
+        row, include_projection=include_projection
+    )
+
+
+def pending_task_terminalizations() -> list[dict[str, Any]]:
+    with _database() as connection:
+        rows = connection.execute(
+            "SELECT * FROM task_terminalizations WHERE phase!='projected' "
+            "ORDER BY prepared_at_unix, task_id"
+        ).fetchall()
+    return [
+        _task_terminalization_public(row, include_projection=True) for row in rows
+    ]
+
+
+def begin_task_terminalization(
+    task_id: str,
+    attempt: int,
+    lease_owner_id: str,
+    terminal_state: str,
+    resource_keys: Iterable[str],
+    *,
+    task_projection: dict[str, Any],
+    observation_sha256: str,
+    recovery_status: str = "not_recovered",
+) -> dict[str, Any]:
+    identifier = _task_identifier(task_id)
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise ValueError("task attempt must be a positive integer")
+    owner = _task_lease_owner(identifier, lease_owner_id)
+    if terminal_state not in TASK_TERMINAL_STATES:
+        raise ValueError("terminal_state is not terminal")
+    requested_keys = _optional_resource_keys(resource_keys)
+    if not isinstance(task_projection, dict):
+        raise ValueError("task_projection must be an object")
+    projection_json = _canonical_json(task_projection)
+    if len(projection_json.encode("utf-8")) > 512 * 1024:
+        raise ValueError("task_projection is too large")
+    projection_sha256 = hashlib.sha256(projection_json.encode("utf-8")).hexdigest()
+    if not isinstance(observation_sha256, str) or SHA256_RE.fullmatch(observation_sha256) is None:
+        raise ValueError("observation_sha256 is invalid")
+    if recovery_status not in {"not_recovered", "recovered_legacy_row_first", "recovered_after_revocation"}:
+        raise ValueError("recovery_status is invalid")
+    requested_json = _canonical_json(requested_keys)
+    requested_sha256 = hashlib.sha256(requested_json.encode("utf-8")).hexdigest()
+    now = _now()
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "DELETE FROM task_authority_adoptions WHERE expires_at_unix<=?",
+                (now,),
+            )
+            adoption = connection.execute(
+                "SELECT * FROM task_authority_adoptions WHERE task_id=?",
+                (identifier,),
+            ).fetchone()
+            if adoption is not None:
+                raise ResourceConflict(
+                    f"gate:task-authority:{identifier}",
+                    adoption["guard_owner_id"],
+                    int(adoption["expires_at_unix"]),
+                )
+            existing = connection.execute(
+                "SELECT * FROM task_terminalizations WHERE task_id=?",
+                (identifier,),
+            ).fetchone()
+            if existing is not None:
+                immutable = {
+                    "attempt": attempt,
+                    "lease_owner_id": owner,
+                    "terminal_state": terminal_state,
+                    "task_projection_sha256": projection_sha256,
+                    "requested_resource_keys_sha256": requested_sha256,
+                    "observation_sha256": observation_sha256,
+                }
+                for field, expected in immutable.items():
+                    if existing[field] != expected:
+                        raise ValueError(
+                            f"task terminalization replay drift: {field}"
+                        )
+                connection.commit()
+                return _task_terminalization_public(
+                    existing, include_projection=True
+                )
+            lease_rows = connection.execute(
+                "SELECT * FROM leases WHERE owner_id=? ORDER BY resource_key",
+                (owner,),
+            ).fetchall()
+            prior_leases: list[dict[str, Any]] = []
+            revoked_keys: list[str] = []
+            for row in lease_rows:
+                snapshot = _public(row)
+                metadata_integrity_valid = False
+                task_binding_valid = False
+                try:
+                    metadata = _row_metadata(row)
+                    _, observed_metadata_sha256 = _metadata(metadata)
+                    metadata_integrity_valid = (
+                        row["metadata_sha256"] == observed_metadata_sha256
+                    )
+                    task_binding_valid = metadata.get("task_id") == identifier
+                except Exception:
+                    metadata_integrity_valid = False
+                    task_binding_valid = False
+                prior_leases.append(
+                    {
+                        **snapshot,
+                        "metadata_integrity_valid": metadata_integrity_valid,
+                        "task_binding_valid": task_binding_valid,
+                    }
+                )
+                revoked_keys.append(str(row["resource_key"]))
+            revoked_keys = sorted(revoked_keys)
+            missing_keys = sorted(set(requested_keys) - set(revoked_keys))
+            prior_json = _canonical_json(prior_leases)
+            prior_sha256 = hashlib.sha256(prior_json.encode("utf-8")).hexdigest()
+            if revoked_keys:
+                connection.execute(
+                    "DELETE FROM leases WHERE owner_id=?",
+                    (owner,),
+                )
+            transition_material = {
+                "schema_version": TASK_TERMINALIZATION_SCHEMA_VERSION,
+                "kind": TASK_TERMINALIZATION_KIND,
+                "task_id": identifier,
+                "attempt": attempt,
+                "lease_owner_id": owner,
+                "terminal_state": terminal_state,
+                "task_projection_sha256": projection_sha256,
+                "requested_resource_keys_sha256": requested_sha256,
+                "prior_leases_sha256": prior_sha256,
+                "revoked_resource_keys": revoked_keys,
+                "missing_resource_keys": missing_keys,
+                "observation_sha256": observation_sha256,
+                "prepared_at_unix": now,
+                "leases_revoked_at_unix": now,
+                "recovery_status": recovery_status,
+            }
+            transition_sha256 = hashlib.sha256(
+                _canonical_json(transition_material).encode("utf-8")
+            ).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO task_terminalizations(
+                    task_id, attempt, lease_owner_id, terminal_state, phase,
+                    task_projection_json, task_projection_sha256,
+                    requested_resource_keys_json, requested_resource_keys_sha256,
+                    prior_leases_json, prior_leases_sha256,
+                    revoked_resource_keys_json, missing_resource_keys_json,
+                    observation_sha256, prepared_at_unix, leases_revoked_at_unix,
+                    projected_at_unix, lifecycle_receipt_sha256,
+                    recovery_status, transition_sha256
+                ) VALUES(?, ?, ?, ?, 'leases_revoked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                """,
+                (
+                    identifier,
+                    attempt,
+                    owner,
+                    terminal_state,
+                    projection_json,
+                    projection_sha256,
+                    requested_json,
+                    requested_sha256,
+                    prior_json,
+                    prior_sha256,
+                    _canonical_json(revoked_keys),
+                    _canonical_json(missing_keys),
+                    observation_sha256,
+                    now,
+                    now,
+                    recovery_status,
+                    transition_sha256,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM task_terminalizations WHERE task_id=?",
+                (identifier,),
+            ).fetchone()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    if row is None:
+        raise RuntimeError("task terminalization was not persisted")
+    return _task_terminalization_public(row, include_projection=True)
+
+
+def complete_task_terminalization(
+    task_id: str,
+    transition_sha256: str,
+    lifecycle_receipt_sha256: str,
+    *,
+    recovered: bool = False,
+) -> dict[str, Any]:
+    identifier = _task_identifier(task_id)
+    if not isinstance(transition_sha256, str) or SHA256_RE.fullmatch(transition_sha256) is None:
+        raise ValueError("transition_sha256 is invalid")
+    if not isinstance(lifecycle_receipt_sha256, str) or SHA256_RE.fullmatch(lifecycle_receipt_sha256) is None:
+        raise ValueError("lifecycle_receipt_sha256 is invalid")
+    now = _now()
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT * FROM task_terminalizations WHERE task_id=?",
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("task terminalization is missing")
+            if row["transition_sha256"] != transition_sha256:
+                raise ValueError("task terminalization transition digest drift")
+            existing_receipt = row["lifecycle_receipt_sha256"]
+            if existing_receipt not in {None, lifecycle_receipt_sha256}:
+                raise ValueError("task terminalization receipt digest drift")
+            recovery_status = str(row["recovery_status"])
+            if recovered and recovery_status == "not_recovered":
+                recovery_status = "recovered_after_revocation"
+            connection.execute(
+                "UPDATE task_terminalizations SET phase='projected', "
+                "projected_at_unix=COALESCE(projected_at_unix, ?), "
+                "lifecycle_receipt_sha256=?, recovery_status=? WHERE task_id=?",
+                (now, lifecycle_receipt_sha256, recovery_status, identifier),
+            )
+            updated = connection.execute(
+                "SELECT * FROM task_terminalizations WHERE task_id=?",
+                (identifier,),
+            ).fetchone()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    if updated is None:
+        raise RuntimeError("task terminalization completion disappeared")
+    return _task_terminalization_public(updated, include_projection=True)
+
+
+def release_task_authority_adoption(
+    guard_owner_id: str, task_id: str
+) -> dict[str, Any]:
+    guard_owner = _owner(guard_owner_id)
+    identifier = _task_identifier(task_id)
+    released: dict[str, Any] | None = None
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT * FROM task_authority_adoptions WHERE task_id=?",
+                (identifier,),
+            ).fetchone()
+            if row is not None:
+                if row["guard_owner_id"] != guard_owner:
+                    raise PermissionError("task authority adoption belongs to another guard")
+                released = dict(row)
+                connection.execute(
+                    "DELETE FROM task_authority_adoptions WHERE task_id=?",
+                    (identifier,),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return {
+        "schema_version": 1,
+        "kind": TASK_AUTHORITY_ADOPTION_KIND,
+        "task_id": identifier,
+        "guard_owner_id": guard_owner,
+        "released": released is not None,
+        "binding_sha256": None if released is None else released["binding_sha256"],
+    }
+
+
 def task_lease_delegation_evidence(
     owner_id: str,
     task_id: str,
@@ -1457,10 +1871,23 @@ def task_lease_delegation_evidence(
     bindings: list[dict[str, str]] = []
     minimum_expiry: int | None = None
     with _database() as connection:
-        rows = connection.execute(
-            f"SELECT * FROM leases WHERE resource_key IN ({','.join('?' for _ in keys)}) ORDER BY resource_key",
-            keys,
+        terminalization = connection.execute(
+            "SELECT transition_sha256 FROM task_terminalizations WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if terminalization is not None:
+            raise ValueError("task authority has been terminalized")
+        owner_rows = connection.execute(
+            "SELECT * FROM leases WHERE owner_id=? ORDER BY resource_key",
+            (owner,),
         ).fetchall()
+        owner_keys = [str(row["resource_key"]) for row in owner_rows]
+        missing_owner_keys = sorted(set(keys) - set(owner_keys))
+        if missing_owner_keys:
+            raise ValueError(f"task lease is not live: {missing_owner_keys[0]}")
+        if owner_keys != keys:
+            raise ValueError("task lease set does not match the complete current owner lease set")
+        rows = owner_rows
         by_key = {row["resource_key"]: row for row in rows}
         for key in keys:
             row = by_key.get(key)
@@ -1521,6 +1948,7 @@ def acquire_merge_guard_resources(
     delegated_task_id: str | None = None
     delegated_resource_keys: list[str] = []
     delegated_bindings_sha256: str | None = None
+    delegated_expires_at_unix: int | None = None
     if delegated_task is not None:
         required = {
             "task_id",
@@ -1553,6 +1981,17 @@ def acquire_merge_guard_resources(
             or SHA256_RE.fullmatch(delegated_bindings_sha256) is None
         ):
             raise ValueError("delegated task lease binding digest is invalid")
+        delegated_expiry = delegated_task.get(
+            "expires_at_unix",
+            delegated_task.get("minimum_expires_at_unix"),
+        )
+        if (
+            not isinstance(delegated_expiry, int)
+            or isinstance(delegated_expiry, bool)
+            or delegated_expiry < 1
+        ):
+            raise ValueError("delegated task lease expiry is invalid")
+        delegated_expires_at_unix = delegated_expiry
     repository_path = Path(repository).expanduser()
     if not repository_path.is_absolute():
         raise ValueError("merge guard repository must be absolute")
@@ -1597,14 +2036,77 @@ def acquire_merge_guard_resources(
     metadata_json, metadata_sha256 = _metadata(normalized_metadata)
     now = _now()
     expires = now + ttl
+    if delegated_expires_at_unix is not None and delegated_expires_at_unix <= now:
+        raise ValueError("delegated task lease authority is expired")
+    task_adoption_expires = (
+        expires
+        if delegated_expires_at_unix is None
+        else min(expires, delegated_expires_at_unix)
+    )
     observed: list[dict[str, Any]] = []
     acquired_rows: list[sqlite3.Row] = []
     held_keys: list[str] = []
+    task_adoption: dict[str, Any] | None = None
     observed_at_unix_ns = 0
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             observed_at_unix_ns = time.time_ns()
+            connection.execute(
+                "DELETE FROM task_authority_adoptions WHERE expires_at_unix<=?",
+                (now,),
+            )
+            if delegated_task_id is not None:
+                terminalization = connection.execute(
+                    "SELECT transition_sha256 FROM task_terminalizations WHERE task_id=?",
+                    (delegated_task_id,),
+                ).fetchone()
+                if terminalization is not None:
+                    raise ValueError("delegated task authority has been terminalized")
+                existing_adoption = connection.execute(
+                    "SELECT * FROM task_authority_adoptions WHERE task_id=?",
+                    (delegated_task_id,),
+                ).fetchone()
+                adoption_material = {
+                    "schema_version": 1,
+                    "kind": TASK_AUTHORITY_ADOPTION_KIND,
+                    "task_id": delegated_task_id,
+                    "guard_owner_id": guard_owner,
+                    "lease_owner_id": lease_owner,
+                    "resource_keys_sha256": hashlib.sha256(
+                        _canonical_json(delegated_resource_keys).encode("utf-8")
+                    ).hexdigest(),
+                    "lease_bindings_sha256": delegated_bindings_sha256,
+                    "acquired_at_unix": now,
+                    "expires_at_unix": task_adoption_expires,
+                }
+                adoption_sha256 = hashlib.sha256(
+                    _canonical_json(adoption_material).encode("utf-8")
+                ).hexdigest()
+                if existing_adoption is not None:
+                    if existing_adoption["guard_owner_id"] != guard_owner:
+                        raise ResourceConflict(
+                            f"gate:task-authority:{delegated_task_id}",
+                            existing_adoption["guard_owner_id"],
+                            int(existing_adoption["expires_at_unix"]),
+                        )
+                    if existing_adoption["binding_sha256"] != adoption_sha256:
+                        raise ValueError("task authority adoption replay drift")
+                else:
+                    connection.execute(
+                        "INSERT INTO task_authority_adoptions("
+                        "task_id, guard_owner_id, lease_owner_id, acquired_at_unix, "
+                        "expires_at_unix, binding_sha256) VALUES(?, ?, ?, ?, ?, ?)",
+                        (
+                            delegated_task_id,
+                            guard_owner,
+                            lease_owner,
+                            now,
+                            task_adoption_expires,
+                            adoption_sha256,
+                        ),
+                    )
+                task_adoption = {**adoption_material, "binding_sha256": adoption_sha256}
             rows = connection.execute(
                 "SELECT * FROM leases WHERE expires_at_unix>? ORDER BY resource_key",
                 (now,),
@@ -1790,6 +2292,7 @@ def acquire_merge_guard_resources(
         "resource_keys": keys,
         "delegated_task_id": delegated_task_id,
         "delegated_task_resource_keys": delegated_resource_keys,
+        "task_authority_adoption": task_adoption,
     }
 
 
@@ -1803,6 +2306,7 @@ def acquire_resources(
     nonconflict_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     owner = _owner(owner_id)
+    task_owner_match = re.fullmatch(r"task:([0-9a-f]{24})", owner)
     keys = normalize_resource_keys(resource_keys)
     lease_purpose = _purpose(purpose)
     ttl = _ttl(ttl_seconds)
@@ -1829,6 +2333,13 @@ def acquire_resources(
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            if task_owner_match is not None:
+                terminalization = connection.execute(
+                    "SELECT transition_sha256 FROM task_terminalizations WHERE task_id=?",
+                    (task_owner_match.group(1),),
+                ).fetchone()
+                if terminalization is not None:
+                    raise ValueError("terminalized task owner cannot acquire resources")
             _check_active_merge_guard_conflicts(
                 connection, keys=keys, metadata=sanitized_metadata, now=now
             )

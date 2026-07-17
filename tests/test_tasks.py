@@ -45,6 +45,7 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_command_identity as command_identity
+import grabowski_resources as resources
 import grabowski_tasks as tasks
 import grabowski_task_reconcile as task_reconcile_cli
 
@@ -161,6 +162,135 @@ class TaskTests(unittest.TestCase):
         tasks._set_state(task["task_id"], "completed")
         with self.assertRaisesRegex(ValueError, "state does not permit"):
             tasks.server_task_lease_delegation_evidence(owner)
+
+    def test_terminalization_atomically_revokes_owner_leases_and_binds_lifecycle_receipt(self) -> None:
+        result = self._start(
+            resource_keys=[
+                "component:test-terminalization-a",
+                "service:test-terminalization-b",
+            ]
+        )
+        task = result["task"]
+        task_id = task["task_id"]
+        owner = task["lease_owner_id"]
+        resources.acquire_resources(
+            owner,
+            ["component:test-terminalization-late"],
+            purpose="late owner-bound task lease",
+            ttl_seconds=120,
+            metadata={"task_id": task_id, "attempt": 1},
+        )
+        observation = {"state": "completed", "source": "unit-test"}
+
+        stored = tasks._set_state(
+            task_id,
+            "completed",
+            observation=observation,
+        )
+
+        self.assertEqual("completed", stored["state"])
+        transition = resources.task_terminalization_record(task_id)
+        self.assertIsNotNone(transition)
+        self.assertEqual("projected", transition["phase"])
+        self.assertEqual(
+            sorted(
+                [
+                    "component:test-terminalization-a",
+                    "component:test-terminalization-late",
+                    "service:test-terminalization-b",
+                ]
+            ),
+            transition["revoked_resource_keys"],
+        )
+        self.assertEqual([], resources.list_resources(owner_id=owner))
+        self.assertEqual(
+            transition["transition_sha256"], stored["terminalization_sha256"]
+        )
+        receipt_path = tasks.TASK_OUTCOMES_DIR / f"{task_id}.json"
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(2, payload["schema_version"])
+        self.assertEqual("grabowski_task_lifecycle_receipt", payload["kind"])
+        self.assertEqual(
+            transition["transition_sha256"],
+            payload["terminalization"]["transition_sha256"],
+        )
+        self.assertEqual(payload["receipt_sha256"], stored["lifecycle_receipt_sha256"])
+        self.assertEqual(payload["receipt_sha256"], transition["lifecycle_receipt_sha256"])
+        with self.assertRaisesRegex(ValueError, "terminalized task owner"):
+            resources.acquire_resources(
+                owner,
+                ["component:test-terminalization-revival"],
+                purpose="forbidden terminal task revival",
+                ttl_seconds=120,
+                metadata={"task_id": task_id, "attempt": 1},
+            )
+
+    def test_pending_resource_terminalization_recovers_task_projection_and_blocks_delegation(self) -> None:
+        result = self._start(
+            resource_keys=["component:test-terminalization-crash"]
+        )
+        task_id = result["task"]["task_id"]
+        record = tasks._row_raw(task_id)
+        observation = {"state": "failed", "source": "crash-fixture"}
+        projection = tasks._terminal_projection(
+            record,
+            "failed",
+            observation=observation,
+        )
+        transition = resources.begin_task_terminalization(
+            task_id,
+            int(record["attempt"]),
+            record["lease_owner_id"],
+            "failed",
+            tasks._record_resource_keys(record),
+            task_projection=projection,
+            observation_sha256=tasks._sha256_json(observation),
+        )
+        self.assertEqual("leases_revoked", transition["phase"])
+        self.assertEqual("running", tasks._row_raw(task_id)["state"])
+        self.assertEqual([], resources.list_resources(owner_id=record["lease_owner_id"]))
+
+        listed = tasks.grabowski_task_list(limit=100, view="evidence")
+        listed_task = next(item for item in listed["tasks"] if item["task_id"] == task_id)
+        self.assertEqual("failed", listed_task["state"])
+        with self.assertRaisesRegex(ValueError, "state does not permit"):
+            tasks.server_task_lease_delegation_evidence(record["lease_owner_id"])
+
+        recovered = tasks._row_raw(task_id)
+        self.assertEqual("failed", recovered["state"])
+        final = resources.task_terminalization_record(task_id)
+        self.assertEqual("projected", final["phase"])
+        self.assertEqual("recovered_after_revocation", final["recovery_status"])
+        self.assertEqual(final["transition_sha256"], recovered["terminalization_sha256"])
+
+    def test_legacy_row_first_terminal_state_is_recovered_before_delegation(self) -> None:
+        result = self._start(
+            resource_keys=["component:test-terminalization-legacy-row-first"]
+        )
+        task_id = result["task"]["task_id"]
+        owner = result["task"]["lease_owner_id"]
+        observation = {"state": "completed", "source": "legacy-row-first"}
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed', last_observation_json=? "
+                "WHERE task_id=?",
+                (tasks._canonical_json(observation), task_id),
+            )
+            connection.commit()
+        self.assertIsNotNone(
+            resources.inspect_resource("component:test-terminalization-legacy-row-first")
+        )
+
+        with self.assertRaisesRegex(ValueError, "state does not permit"):
+            tasks.server_task_lease_delegation_evidence(owner)
+
+        recovered = tasks._row_raw(task_id)
+        transition = resources.task_terminalization_record(task_id)
+        self.assertEqual("completed", recovered["state"])
+        self.assertEqual([], resources.list_resources(owner_id=owner))
+        self.assertEqual("projected", transition["phase"])
+        self.assertEqual("recovered_legacy_row_first", transition["recovery_status"])
+        self.assertEqual(transition["transition_sha256"], recovered["terminalization_sha256"])
 
     def test_server_task_lease_delegation_rejects_missing_live_lease(self) -> None:
         result = self._start(resource_keys=["component:test-task-delegation-missing"])
@@ -1430,7 +1560,7 @@ class TaskTests(unittest.TestCase):
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(tasks)")}
             indexes = {row[1] for row in migrated.execute("PRAGMA index_list(tasks)")}
             journal_mode = migrated.execute("PRAGMA journal_mode").fetchone()[0]
-        self.assertEqual(version, "3")
+        self.assertEqual(version, "4")
         self.assertIn("resource_keys_json", columns)
         self.assertIn("lease_owner_id", columns)
         self.assertIn("request_id", columns)
@@ -1451,7 +1581,7 @@ class TaskTests(unittest.TestCase):
             self.assertEqual(
                 reopened.total_changes,
                 0,
-                "schema-3 fast path must not repeat migration writes",
+                "schema-4 fast path must not repeat migration writes",
             )
 
     def test_schema_v3_missing_root_contract_column_fails_closed(self) -> None:
@@ -1467,13 +1597,13 @@ class TaskTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "schema 3 is incomplete"):
             tasks.grabowski_task_list()
 
-    def test_schema_v3_missing_index_fails_closed_without_repair_write(self) -> None:
+    def test_schema_v4_missing_index_fails_closed_without_repair_write(self) -> None:
         with tasks._database() as connection:
             self.assertEqual(
                 connection.execute(
                     "SELECT value FROM metadata WHERE key='schema_version'"
                 ).fetchone()[0],
-                "3",
+                "4",
             )
         with sqlite3.connect(self.database) as connection:
             connection.execute("DROP INDEX tasks_created_task_idx")
