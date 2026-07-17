@@ -4,6 +4,8 @@ import hashlib
 import io
 import importlib.util
 import json
+import os
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -109,6 +111,196 @@ def _fixture_kwargs(root: Path, environment: dict) -> dict:
         "baseline_fixture": baseline,
         "treatment_fixture": treatment,
     }
+
+
+class ClaudeExecutableIdentityTests(unittest.TestCase):
+    def _identity(self, executable: Path) -> dict:
+        with mock.patch.object(
+            support.preflight._core.shutil,
+            "which",
+            return_value=str(executable),
+        ):
+            return support.preflight._core._claude_identity("claude")
+
+    def test_hashes_regular_executable_in_bounded_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "claude"
+            payload = b"provider-free fixture\n" * 100_000
+            executable.write_bytes(payload)
+            executable.chmod(0o755)
+            real_read = os.read
+            read_sizes: list[int] = []
+
+            def recording_read(descriptor: int, size: int) -> bytes:
+                read_sizes.append(size)
+                return real_read(descriptor, size)
+
+            with mock.patch.object(
+                support.preflight._core.os,
+                "read",
+                side_effect=recording_read,
+            ):
+                identity = self._identity(executable)
+            self.assertEqual(identity["resolved_path"], str(executable.resolve()))
+            self.assertEqual(identity["bytes"], len(payload))
+            self.assertEqual(identity["sha256"], hashlib.sha256(payload).hexdigest())
+            self.assertGreater(len(read_sizes), 1)
+            self.assertTrue(
+                all(
+                    size == support.preflight._core.EXECUTABLE_HASH_CHUNK_BYTES
+                    for size in read_sizes
+                )
+            )
+
+    def test_resolves_symlink_to_exact_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "claude-version"
+            link = root / "claude"
+            payload = b"provider-free fixture"
+            target.write_bytes(payload)
+            target.chmod(0o755)
+            link.symlink_to(target)
+            identity = self._identity(link)
+            self.assertEqual(identity["resolved_path"], str(target.resolve()))
+            self.assertEqual(identity["bytes"], len(payload))
+
+    def test_rejects_non_executable_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "claude"
+            executable.write_bytes(b"not executable")
+            executable.chmod(0o644)
+            with self.assertRaisesRegex(
+                support.preflight._core.PreflightError,
+                "is not executable",
+            ):
+                self._identity(executable)
+
+    def test_rejects_empty_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "claude"
+            executable.touch()
+            executable.chmod(0o755)
+            with self.assertRaisesRegex(
+                support.preflight._core.PreflightError,
+                "executable is empty",
+            ):
+                self._identity(executable)
+
+    def test_rejects_oversized_executable_without_reading_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "claude"
+            with executable.open("wb") as handle:
+                handle.truncate(
+                    support.preflight._core.runner.MAX_PROVIDER_EXECUTABLE_BYTES + 1
+                )
+            executable.chmod(0o755)
+            with mock.patch.object(
+                support.preflight._core.os,
+                "read",
+                side_effect=AssertionError("oversized executable must not be read"),
+            ):
+                with self.assertRaisesRegex(
+                    support.preflight._core.PreflightError,
+                    "exceeds maximum size",
+                ):
+                    self._identity(executable)
+
+    def test_rejects_non_regular_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "claude"
+            executable.mkdir()
+            with self.assertRaisesRegex(
+                support.preflight._core.PreflightError,
+                "must be a regular file",
+            ):
+                self._identity(executable)
+
+    def test_detects_same_path_mutation_during_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "claude"
+            payload = b"a" * (
+                support.preflight._core.EXECUTABLE_HASH_CHUNK_BYTES * 2
+            )
+            executable.write_bytes(payload)
+            executable.chmod(0o755)
+            real_read = os.read
+            mutated = False
+
+            def mutating_read(descriptor: int, size: int) -> bytes:
+                nonlocal mutated
+                chunk = real_read(descriptor, size)
+                if chunk and not mutated:
+                    mutated = True
+                    executable.write_bytes(b"b" * len(payload))
+                    executable.chmod(0o755)
+                return chunk
+
+            with mock.patch.object(
+                support.preflight._core.os,
+                "read",
+                side_effect=mutating_read,
+            ):
+                with self.assertRaisesRegex(
+                    support.preflight._core.PreflightError,
+                    "changed during hashing",
+                ):
+                    self._identity(executable)
+
+    def test_detects_path_replacement_during_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "claude"
+            replacement = root / "replacement"
+            payload = b"a" * (
+                support.preflight._core.EXECUTABLE_HASH_CHUNK_BYTES * 2
+            )
+            executable.write_bytes(payload)
+            executable.chmod(0o755)
+            replacement.write_bytes(b"b" * len(payload))
+            replacement.chmod(0o755)
+            real_read = os.read
+            replaced = False
+
+            def replacing_read(descriptor: int, size: int) -> bytes:
+                nonlocal replaced
+                chunk = real_read(descriptor, size)
+                if chunk and not replaced:
+                    replaced = True
+                    replacement.replace(executable)
+                return chunk
+
+            with mock.patch.object(
+                support.preflight._core.os,
+                "read",
+                side_effect=replacing_read,
+            ):
+                with self.assertRaisesRegex(
+                    support.preflight._core.PreflightError,
+                    "changed during hashing",
+                ):
+                    self._identity(executable)
+
+    @unittest.skipUnless(
+        os.environ.get("GRABOWSKI_TEST_INSTALLED_CLAUDE") == "1",
+        "opt-in provider-free installed Claude identity check",
+    )
+    def test_installed_claude_matches_independent_streamed_sha256(self) -> None:
+        executable = shutil.which("claude")
+        if executable is None:
+            self.skipTest("Claude executable is not installed")
+        identity = support.preflight._core._claude_identity("claude")
+        digest = hashlib.sha256()
+        total = 0
+        with Path(identity["resolved_path"]).open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                digest.update(chunk)
+        self.assertEqual(identity["bytes"], total)
+        self.assertEqual(identity["sha256"], digest.hexdigest())
 
 
 class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):

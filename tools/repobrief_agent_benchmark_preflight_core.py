@@ -41,7 +41,7 @@ MAX_REQUEST_FILES = 128
 MAX_MCP_LINE_BYTES = 4 * 1024 * 1024
 MAX_VALIDATOR_OUTPUT_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
-MAX_EXECUTABLE_BYTES = 64 * 1024 * 1024
+EXECUTABLE_HASH_CHUNK_BYTES = 1024 * 1024
 MAX_LEDGER_ARTIFACT_BYTES = 16 * 1024 * 1024
 LEDGER_KIND = "repobrief.agent_benchmark_preflight_dispatch_ledger"
 LEDGER_EVENT_KIND = "repobrief.agent_benchmark_preflight_dispatch_event"
@@ -1104,23 +1104,82 @@ def _receipt_path(evidence_root: Path, request: Mapping[str, Any]) -> Path:
     return evidence_root.resolve() / "receipts" / filename
 
 
+def _executable_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _validate_executable_metadata(metadata: os.stat_result) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PreflightError("Claude executable must be a regular file")
+    if metadata.st_size <= 0:
+        raise PreflightError("Claude executable is empty")
+    if metadata.st_size > runner.MAX_PROVIDER_EXECUTABLE_BYTES:
+        raise PreflightError("Claude executable exceeds maximum size")
+    if metadata.st_mode & 0o111 == 0:
+        raise PreflightError("Claude executable is not executable")
+
+
 def _claude_identity(claude: str) -> dict[str, Any]:
     executable = shutil.which(claude)
     if executable is None:
         raise PreflightError("Claude executable cannot be resolved")
-    resolved = Path(executable).expanduser().resolve()
     try:
-        with resolved.open("rb") as handle:
-            data = handle.read(MAX_EXECUTABLE_BYTES + 1)
+        resolved = Path(executable).expanduser().resolve(strict=True)
+        path_metadata = resolved.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise PreflightError("Claude executable cannot be resolved safely") from exc
+    if stat.S_ISLNK(path_metadata.st_mode):
+        raise PreflightError("Claude executable resolved to a symbolic link")
+    _validate_executable_metadata(path_metadata)
+    expected_identity = _executable_file_identity(path_metadata)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(resolved, flags)
     except OSError as exc:
-        raise PreflightError("Claude executable cannot be read") from exc
-    if not data or len(data) > MAX_EXECUTABLE_BYTES:
-        raise PreflightError("Claude executable is empty or oversized")
+        raise PreflightError("Claude executable cannot be opened safely") from exc
+    digest = hashlib.sha256()
+    total_bytes = 0
+    try:
+        try:
+            opened_metadata = os.fstat(descriptor)
+            _validate_executable_metadata(opened_metadata)
+            if _executable_file_identity(opened_metadata) != expected_identity:
+                raise PreflightError("Claude executable changed before hashing")
+            while True:
+                chunk = os.read(descriptor, EXECUTABLE_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > runner.MAX_PROVIDER_EXECUTABLE_BYTES:
+                    raise PreflightError("Claude executable exceeds maximum size")
+                digest.update(chunk)
+            final_descriptor_metadata = os.fstat(descriptor)
+        except OSError as exc:
+            raise PreflightError("Claude executable cannot be read safely") from exc
+    finally:
+        os.close(descriptor)
+    try:
+        final_path_metadata = resolved.lstat()
+    except OSError as exc:
+        raise PreflightError("Claude executable disappeared during hashing") from exc
+    if (
+        _executable_file_identity(final_descriptor_metadata) != expected_identity
+        or _executable_file_identity(final_path_metadata) != expected_identity
+        or total_bytes != path_metadata.st_size
+    ):
+        raise PreflightError("Claude executable changed during hashing")
     return {
         "command": claude,
         "resolved_path": str(resolved),
-        "bytes": len(data),
-        "sha256": _sha256_bytes(data),
+        "bytes": total_bytes,
+        "sha256": digest.hexdigest(),
         "version": None,
         "version_probed": False,
     }
