@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import runpy
 import sys
 import tempfile
 import unittest
@@ -160,6 +163,25 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(result.status, "warning")
             self.assertEqual(result.data, {"roots": []})
             self.assertIn("catalog invalid", result.errors[0])
+
+
+class RunnerTests(unittest.TestCase):
+    def test_warning_run_finishes_without_system_exit(self) -> None:
+        runner = JUNO_ROOT / "run_juno_operator.py"
+        warning_snapshot = mock.Mock(overall_status="warning")
+        dashboard = Path("/tmp/juno-operator-dashboard.html")
+        output = io.StringIO()
+        with (
+            mock.patch(
+                "juno_operator.app.refresh",
+                return_value=(warning_snapshot, dashboard),
+            ),
+            mock.patch.object(sys, "argv", [str(runner)]),
+            contextlib.redirect_stdout(output),
+        ):
+            runpy.run_path(str(runner), run_name="__main__")
+        self.assertIn("Juno Operator: warning", output.getvalue())
+        self.assertIn(str(dashboard), output.getvalue())
 
 
 class AppTests(unittest.TestCase):
