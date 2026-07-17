@@ -76,6 +76,38 @@ RECONCILIATION_NON_CLAIMS = [
     "migration_authority",
     "policy_bypass_authority",
 ]
+RESOURCE_SCHEMA_V2_ADDITIVE_TABLES = {
+    "task_authority_adoptions": (
+        ("task_id", "TEXT", 0, 1),
+        ("guard_owner_id", "TEXT", 1, 0),
+        ("lease_owner_id", "TEXT", 1, 0),
+        ("acquired_at_unix", "INTEGER", 1, 0),
+        ("expires_at_unix", "INTEGER", 1, 0),
+        ("binding_sha256", "TEXT", 1, 0),
+    ),
+    "task_terminalizations": (
+        ("task_id", "TEXT", 0, 1),
+        ("attempt", "INTEGER", 1, 0),
+        ("lease_owner_id", "TEXT", 1, 0),
+        ("terminal_state", "TEXT", 1, 0),
+        ("phase", "TEXT", 1, 0),
+        ("task_projection_json", "TEXT", 1, 0),
+        ("task_projection_sha256", "TEXT", 1, 0),
+        ("requested_resource_keys_json", "TEXT", 1, 0),
+        ("requested_resource_keys_sha256", "TEXT", 1, 0),
+        ("prior_leases_json", "TEXT", 1, 0),
+        ("prior_leases_sha256", "TEXT", 1, 0),
+        ("revoked_resource_keys_json", "TEXT", 1, 0),
+        ("missing_resource_keys_json", "TEXT", 1, 0),
+        ("observation_sha256", "TEXT", 1, 0),
+        ("prepared_at_unix", "INTEGER", 1, 0),
+        ("leases_revoked_at_unix", "INTEGER", 1, 0),
+        ("projected_at_unix", "INTEGER", 0, 0),
+        ("lifecycle_receipt_sha256", "TEXT", 0, 0),
+        ("recovery_status", "TEXT", 1, 0),
+        ("transition_sha256", "TEXT", 1, 0),
+    ),
+}
 
 
 class ResourceConflict(RuntimeError):
@@ -105,6 +137,25 @@ def _metadata(metadata: dict[str, Any] | None) -> tuple[str, str]:
     if len(encoded.encode("utf-8")) > 16 * 1024:
         raise ValueError("metadata is too large")
     return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _validate_additive_schema_v2(connection: sqlite3.Connection) -> None:
+    for table_name, expected_columns in RESOURCE_SCHEMA_V2_ADDITIVE_TABLES.items():
+        rows = connection.execute(
+            f'PRAGMA table_info("{table_name}")'
+        ).fetchall()
+        actual_columns = tuple(
+            (
+                str(row["name"]),
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                int(row["pk"]),
+            )
+            for row in rows
+        )
+        if actual_columns != expected_columns:
+            connection.close()
+            raise RuntimeError("Unsupported resource database schema")
 
 
 def _database() -> sqlite3.Connection:
@@ -213,16 +264,7 @@ def _database() -> sqlite3.Connection:
             connection.rollback()
             connection.close()
             raise
-    required_tables = {"leases", "task_terminalizations", "task_authority_adoptions"}
-    present_tables = {
-        str(row["name"])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )
-    }
-    if not required_tables.issubset(present_tables):
-        connection.close()
-        raise RuntimeError("Resource database schema 2 is incomplete")
+    _validate_additive_schema_v2(connection)
     try:
         os.chmod(RESOURCE_DB, 0o600)
     except FileNotFoundError:

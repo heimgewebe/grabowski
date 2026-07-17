@@ -1,0 +1,306 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import types
+import unittest
+from unittest.mock import patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+
+class _FakeFastMCP:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def tool(self, *args, **kwargs):
+        return lambda function: function
+
+
+class _FakeToolAnnotations:
+    def __init__(self, **kwargs):
+        self.values = kwargs
+
+
+if "mcp" not in sys.modules:
+    fake_mcp = types.ModuleType("mcp")
+    fake_server = types.ModuleType("mcp.server")
+    fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+    fake_types = types.ModuleType("mcp.types")
+    fake_fastmcp.FastMCP = _FakeFastMCP
+    fake_types.ToolAnnotations = _FakeToolAnnotations
+    sys.modules["mcp"] = fake_mcp
+    sys.modules["mcp.server"] = fake_server
+    sys.modules["mcp.server.fastmcp"] = fake_fastmcp
+    sys.modules["mcp.types"] = fake_types
+
+
+import grabowski_task_attention as attention
+import grabowski_tasks as tasks
+
+
+LOCAL_HOST = {
+    "transport": "local",
+    "target": "local",
+    "enabled": True,
+    "roles": ["test"],
+    "command_allowlist": ["*"],
+    "connect_timeout_seconds": 10,
+}
+
+
+def _launcher(returncode: int = 0) -> dict[str, object]:
+    return {
+        "returncode": returncode,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+    }
+
+
+class TaskAttentionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        (self.root / ".git").write_text("gitdir: /tmp/test-worktree\n", encoding="utf-8")
+        self.database = self.root / "state" / "tasks.sqlite3"
+        self.outcomes = self.database.with_suffix(".outcomes")
+        self.decisions = self.database.with_suffix(".attention-decisions")
+        self.resource_database = self.root / "state" / "resources.sqlite3"
+        self.patches = [
+            patch.object(tasks, "TASK_DB", self.database),
+            patch.object(tasks, "TASK_OUTCOMES_DIR", self.outcomes),
+            patch.object(tasks.resources, "RESOURCE_DB", self.resource_database),
+            patch.dict(os.environ, {"GRABOWSKI_TASK_ATTENTION_ROOT": str(self.decisions)}),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self) -> None:
+        for item in reversed(self.patches):
+            item.stop()
+        self.temporary.cleanup()
+
+    def _start(self) -> dict[str, object]:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+        ):
+            return tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "ok"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="verify-then-retry",
+            )
+
+    def _failed_task(self) -> dict[str, object]:
+        started = self._start()
+        task_id = started["task"]["task_id"]
+        tasks._set_state(task_id, "failed", observation={"state": "failed"})
+        return tasks._row(task_id)
+
+    def _parameters(self, record: dict[str, object], **overrides: object) -> dict[str, object]:
+        outcome = json.loads(
+            (self.outcomes / f"{record['task_id']}.json").read_text(encoding="utf-8")
+        )
+        value: dict[str, object] = {
+            "task_id": record["task_id"],
+            "decision": "closed",
+            "expected_attempt": record["attempt"],
+            "expected_unit": record["unit"],
+            "expected_authoritative_unit": record["authoritative_unit"],
+            "expected_argv_sha256": record["argv_sha256"],
+            "expected_execution_envelope_sha256": record["execution_envelope_sha256"],
+            "outcome_receipt_sha256": outcome["receipt_sha256"],
+            "authority": "operator:alex",
+            "evidence_ref": "bureau:event:597",
+        }
+        value.update(overrides)
+        return value
+
+    def test_decision_is_private_create_only_and_idempotent(self) -> None:
+        record = self._failed_task()
+        parameters = self._parameters(record)
+
+        first = attention.record_decision(parameters)
+        second = attention.record_decision(parameters)
+
+        self.assertTrue(first["created"])
+        self.assertFalse(first["replayed"])
+        self.assertFalse(second["created"])
+        self.assertTrue(second["replayed"])
+        self.assertEqual(first["receipt_sha256"], second["receipt_sha256"])
+        decision_path = self.decisions / f"{record['task_id']}.a1.json"
+        self.assertEqual(0o600, decision_path.stat().st_mode & 0o777)
+        self.assertEqual(0o700, self.decisions.stat().st_mode & 0o777)
+        stored = tasks._row(str(record["task_id"]))
+        self.assertEqual("failed", stored["state"])
+        self.assertEqual(1, stored["attempt"])
+
+    def test_different_material_conflicts_without_replacement(self) -> None:
+        record = self._failed_task()
+        first = attention.record_decision(self._parameters(record))
+        with self.assertRaises(attention.TaskAttentionConflictError):
+            attention.record_decision(
+                self._parameters(record, evidence_ref="bureau:event:598")
+            )
+        decision_path = self.decisions / f"{record['task_id']}.a1.json"
+        payload = json.loads(decision_path.read_text(encoding="utf-8"))
+        self.assertEqual(first["receipt_sha256"], payload["receipt_sha256"])
+
+    def test_expected_task_binding_drift_blocks_before_publication(self) -> None:
+        record = self._failed_task()
+        with self.assertRaises(attention.TaskAttentionConflictError):
+            attention.record_decision(self._parameters(record, expected_attempt=2))
+        self.assertEqual([], list(self.decisions.glob("*.json")))
+
+    def test_missing_or_wrong_outcome_receipt_blocks_decision(self) -> None:
+        record = self._failed_task()
+        outcome_path = self.outcomes / f"{record['task_id']}.json"
+        outcome_path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            attention.record_decision(self._parameters_from_missing(record))
+
+    def _parameters_from_missing(self, record: dict[str, object]) -> dict[str, object]:
+        return {
+            "task_id": record["task_id"],
+            "decision": "closed",
+            "expected_attempt": record["attempt"],
+            "expected_unit": record["unit"],
+            "expected_authoritative_unit": record["authoritative_unit"],
+            "expected_argv_sha256": record["argv_sha256"],
+            "expected_execution_envelope_sha256": record["execution_envelope_sha256"],
+            "outcome_receipt_sha256": "a" * 64,
+            "authority": "operator:alex",
+            "evidence_ref": "bureau:event:597",
+        }
+
+    def test_manipulated_outcome_self_hash_is_rejected(self) -> None:
+        record = self._failed_task()
+        parameters = self._parameters(record)
+        outcome_path = self.outcomes / f"{record['task_id']}.json"
+        payload = json.loads(outcome_path.read_text(encoding="utf-8"))
+        payload["state"] = "timed_out"
+        outcome_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(outcome_path, 0o600)
+        with self.assertRaises(attention.TaskAttentionIntegrityError):
+            attention.record_decision(parameters)
+
+    def test_lifecycle_transition_tampering_is_rejected_after_outer_rehash(self) -> None:
+        record = self._failed_task()
+        outcome_path = self.outcomes / f"{record['task_id']}.json"
+        payload = json.loads(outcome_path.read_text(encoding="utf-8"))
+        self.assertEqual(2, payload["schema_version"])
+        payload["terminalization"]["recovery_status"] = "recovered_after_revocation"
+        payload["receipt_sha256"] = attention._sha256_json(
+            {key: value for key, value in payload.items() if key != "receipt_sha256"}
+        )
+        tampered_record = dict(record)
+        tampered_record["lifecycle_receipt_sha256"] = payload["receipt_sha256"]
+        with self.assertRaisesRegex(
+            attention.TaskAttentionIntegrityError,
+            "transition hash",
+        ):
+            attention._validate_outcome_receipt(
+                payload,
+                record=tampered_record,
+                binding=attention._task_binding(tampered_record),
+                expected_receipt_sha256=payload["receipt_sha256"],
+            )
+
+    def test_unsafe_outcome_mode_owner_symlink_and_oversize_fail_closed(self) -> None:
+        scenarios = ("mode", "owner", "symlink", "oversize")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                self.tearDown()
+                self.setUp()
+                record = self._failed_task()
+                parameters = self._parameters(record)
+                outcome_path = self.outcomes / f"{record['task_id']}.json"
+                if scenario == "mode":
+                    os.chmod(outcome_path, 0o644)
+                    context = self.assertRaises(attention.TaskAttentionIntegrityError)
+                    with context:
+                        attention.record_decision(parameters)
+                elif scenario == "owner":
+                    with patch.object(attention.os, "getuid", return_value=os.getuid() + 1):
+                        with self.assertRaises(attention.TaskAttentionIntegrityError):
+                            attention.record_decision(parameters)
+                elif scenario == "symlink":
+                    target = self.root / "outcome-target.json"
+                    target.write_bytes(outcome_path.read_bytes())
+                    outcome_path.unlink()
+                    outcome_path.symlink_to(target)
+                    with self.assertRaises(OSError):
+                        attention.record_decision(parameters)
+                else:
+                    outcome_path.write_bytes(b"{" + b" " * attention.MAX_RECORD_BYTES + b"}")
+                    os.chmod(outcome_path, 0o600)
+                    with self.assertRaises(attention.TaskAttentionIntegrityError):
+                        attention.record_decision(parameters)
+
+    def test_reconciliation_uses_no_observation_probe_and_classifies_decisions(self) -> None:
+        failed = self._failed_task()
+        attention.record_decision(self._parameters(failed))
+        unknown = self._start()["task"]
+        tasks._set_state(str(unknown["task_id"]), "outcome_unknown", observation={"state": "outcome_unknown"})
+
+        with patch.object(tasks, "_observe", side_effect=AssertionError("probe called")), patch.object(
+            tasks, "_dispatch", side_effect=AssertionError("dispatch called")
+        ):
+            result = attention.reconcile_attention({"limit": 20})
+
+        by_id = {item["task_id"]: item for item in result["records"]}
+        self.assertEqual("decision_closed", by_id[failed["task_id"]]["classification"])
+        self.assertEqual("outcome_unknown", by_id[unknown["task_id"]]["classification"])
+        self.assertEqual(1, result["classification_counts"]["decision_closed"])
+        self.assertEqual(1, result["classification_counts"]["outcome_unknown"])
+
+    def test_missing_terminal_outcome_and_invalid_decision_are_visible(self) -> None:
+        record = self._failed_task()
+        (self.outcomes / f"{record['task_id']}.json").unlink()
+        result = attention.reconcile_attention({"limit": 20})
+        item = next(entry for entry in result["records"] if entry["task_id"] == record["task_id"])
+        self.assertEqual("invalid_evidence", item["classification"])
+        self.assertEqual("FileNotFoundError", item["evidence_error"])
+
+    def test_outcome_unknown_with_decision_artifact_is_invalid_not_closed(self) -> None:
+        started = self._start()["task"]
+        task_id = str(started["task_id"])
+        tasks._set_state(task_id, "outcome_unknown", observation={"state": "outcome_unknown"})
+        self.decisions.mkdir(mode=0o700, parents=True)
+        artifact = self.decisions / f"{task_id}.a1.json"
+        artifact.write_text("{}", encoding="utf-8")
+        os.chmod(artifact, 0o600)
+
+        result = attention.reconcile_attention({"limit": 20})
+        item = next(entry for entry in result["records"] if entry["task_id"] == task_id)
+        self.assertEqual("invalid_evidence", item["classification"])
+        self.assertEqual("decision_without_eligible_outcome", item["evidence_error"])
+
+    def test_reconciliation_is_bounded_and_cursor_stable(self) -> None:
+        first = self._failed_task()
+        second = self._failed_task()
+        page = attention.reconcile_attention({"limit": 1})
+        self.assertEqual(1, page["pagination"]["returned"])
+        self.assertTrue(page["pagination"]["has_more"])
+        next_page = attention.reconcile_attention(
+            {"limit": 1, "cursor": page["pagination"]["next_cursor"]}
+        )
+        ids = {page["records"][0]["task_id"], next_page["records"][0]["task_id"]}
+        self.assertEqual({first["task_id"], second["task_id"]}, ids)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -74,6 +74,11 @@ MUTATING_AGENT_EXECUTABLES = frozenset({"agy", "claude", "cline", "codex"})
 READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
 TASK_EXECUTION_BACKENDS = {"systemd-user", "systemd-root-broker"}
 SYSTEMD_SCOPES = {"user", "system"}
+TASK_SCHEMA_V4_ADDITIVE_COLUMNS = {
+    "terminalization_sha256": ("TEXT", 0, 0),
+    "terminalized_at_unix": ("INTEGER", 0, 0),
+    "lifecycle_receipt_sha256": ("TEXT", 0, 0),
+}
 ACTIVE_TASK_STATES = {"running", "outcome_unknown"}
 TASK_LEASE_DELEGATION_STATES = frozenset({"running"})
 
@@ -139,7 +144,6 @@ def _write_outcome_receipt(
         }
     payload = {
         "schema_version": 2 if terminalization is not None else 1,
-        "kind": "grabowski_task_lifecycle_receipt" if terminalization is not None else "grabowski_task_outcome_receipt",
         "task_id": record["task_id"],
         "unit": record["unit"],
         "authoritative_unit": _authoritative_unit(record),
@@ -153,8 +157,10 @@ def _write_outcome_receipt(
         "observed_at_unix": _now(),
         "observation_sha256": _sha256_json(observation or {}),
         "observation": observation or {},
-        "terminalization": terminalization_payload,
     }
+    if terminalization is not None:
+        payload["kind"] = "grabowski_task_lifecycle_receipt"
+        payload["terminalization"] = terminalization_payload
     payload["receipt_sha256"] = _sha256_json(
         {k: v for k, v in payload.items() if k != "receipt_sha256"}
     )
@@ -465,6 +471,21 @@ def _database() -> sqlite3.Connection:
             "Task database schema 4 indexes are incomplete: "
             + ", ".join(sorted(missing_indexes))
         )
+    effective_version = schema_version()
+    if effective_version == "4":
+        columns = {
+            str(row["name"]): (
+                str(row["type"]).upper(), int(row["notnull"]), int(row["pk"])
+            )
+            for row in connection.execute("PRAGMA table_info(tasks)")
+        }
+        expected_names = required_columns | set(TASK_SCHEMA_V4_ADDITIVE_COLUMNS)
+        if set(columns) != expected_names or any(
+            columns.get(name) != expected
+            for name, expected in TASK_SCHEMA_V4_ADDITIVE_COLUMNS.items()
+        ):
+            connection.close()
+            raise RuntimeError("Task database schema 4 is incomplete or unsupported")
     try:
         os.chmod(TASK_DB, 0o600)
     except FileNotFoundError:

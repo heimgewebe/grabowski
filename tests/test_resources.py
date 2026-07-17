@@ -78,6 +78,127 @@ class ResourceTests(unittest.TestCase):
             "shared_gates": [],
         }
 
+    def _promote_to_additive_schema_v2(self, *, incomplete: bool = False) -> None:
+        self.database.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.database) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO metadata(key, value) VALUES('schema_version', '1');
+                CREATE TABLE leases (
+                    resource_key TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    acquired_at_unix INTEGER NOT NULL,
+                    updated_at_unix INTEGER NOT NULL,
+                    expires_at_unix INTEGER NOT NULL,
+                    metadata_sha256 TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    reclaimed_from_owner TEXT
+                );
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE task_authority_adoptions (
+                    task_id TEXT PRIMARY KEY,
+                    guard_owner_id TEXT NOT NULL,
+                    lease_owner_id TEXT NOT NULL,
+                    acquired_at_unix INTEGER NOT NULL,
+                    expires_at_unix INTEGER NOT NULL,
+                    binding_sha256 TEXT NOT NULL
+                )
+                """
+            )
+            if not incomplete:
+                connection.execute(
+                    """
+                    CREATE TABLE task_terminalizations (
+                        task_id TEXT PRIMARY KEY,
+                        attempt INTEGER NOT NULL,
+                        lease_owner_id TEXT NOT NULL,
+                        terminal_state TEXT NOT NULL,
+                        phase TEXT NOT NULL,
+                        task_projection_json TEXT NOT NULL,
+                        task_projection_sha256 TEXT NOT NULL,
+                        requested_resource_keys_json TEXT NOT NULL,
+                        requested_resource_keys_sha256 TEXT NOT NULL,
+                        prior_leases_json TEXT NOT NULL,
+                        prior_leases_sha256 TEXT NOT NULL,
+                        revoked_resource_keys_json TEXT NOT NULL,
+                        missing_resource_keys_json TEXT NOT NULL,
+                        observation_sha256 TEXT NOT NULL,
+                        prepared_at_unix INTEGER NOT NULL,
+                        leases_revoked_at_unix INTEGER NOT NULL,
+                        projected_at_unix INTEGER,
+                        lifecycle_receipt_sha256 TEXT,
+                        recovery_status TEXT NOT NULL,
+                        transition_sha256 TEXT NOT NULL
+                    )
+                    """
+                )
+            connection.execute(
+                "UPDATE metadata SET value='2' WHERE key='schema_version'"
+            )
+            connection.execute(
+                """
+                INSERT INTO task_authority_adoptions(
+                    task_id, guard_owner_id, lease_owner_id,
+                    acquired_at_unix, expires_at_unix, binding_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("task-v2", "guard-v2", "lease-v2", 1, 2, "a" * 64),
+            )
+            connection.commit()
+
+    def test_additive_schema_v2_preserves_task_lifetime_state(self) -> None:
+        self._promote_to_additive_schema_v2()
+
+        resources.acquire_resources(
+            "owner-v2", ["port:9222"], purpose="schema v2 compatibility", ttl_seconds=60
+        )
+
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                "2",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                ("task-v2", "guard-v2", "lease-v2", 1, 2, "a" * 64),
+                connection.execute(
+                    """
+                    SELECT task_id, guard_owner_id, lease_owner_id,
+                           acquired_at_unix, expires_at_unix, binding_sha256
+                    FROM task_authority_adoptions
+                    """
+                ).fetchone(),
+            )
+            self.assertEqual(
+                1,
+                connection.execute(
+                    "SELECT COUNT(*) FROM leases WHERE owner_id='owner-v2'"
+                ).fetchone()[0],
+            )
+
+    def test_incomplete_additive_schema_v2_fails_closed(self) -> None:
+        self._promote_to_additive_schema_v2(incomplete=True)
+
+        with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
+            resources.count_resources()
+
+    def test_unknown_resource_schema_still_fails_closed(self) -> None:
+        resources.count_resources()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE metadata SET value='3' WHERE key='schema_version'"
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
+            resources.count_resources()
+
     def test_normalizes_typed_resource_keys(self) -> None:
         self.assertEqual(resources.normalize_resource_key("port:09222"), "port:9222")
         self.assertEqual(resources.normalize_resource_key("display::17"), "display:17")
@@ -1146,7 +1267,7 @@ class ResourceTests(unittest.TestCase):
                 );
                 """
             )
-        with self.assertRaisesRegex(RuntimeError, "schema 2 is incomplete"):
+        with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
             resources.list_resources()
 
     def test_database_rejects_symlink(self) -> None:

@@ -158,6 +158,45 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=("registered-adapter", "expected-head-bound", "deploy-preflight-readonly"),
         runner="runtime_deploy_check",
     ),
+    "task-attention-decision": GripSpec(
+        name="task-attention-decision",
+        version="1.0",
+        summary="Record one create-only, outcome-bound attention decision for the current task attempt.",
+        effect=MUTATING,
+        required_parameters=(
+            "task_id",
+            "decision",
+            "expected_attempt",
+            "expected_unit",
+            "expected_authoritative_unit",
+            "expected_argv_sha256",
+            "expected_execution_envelope_sha256",
+            "outcome_receipt_sha256",
+            "authority",
+            "evidence_ref",
+        ),
+        acceptance_ids=(
+            "current-task-outcome-bound",
+            "create-only-decision",
+            "idempotent-replay",
+            "task-store-unchanged",
+        ),
+        runner="task_attention_decision",
+    ),
+    "task-attention-reconciliation": GripSpec(
+        name="task-attention-reconciliation",
+        version="1.0",
+        summary="Classify a bounded attention-task snapshot from outcome and create-only decision evidence.",
+        effect=READ_ONLY,
+        required_parameters=(),
+        acceptance_ids=(
+            "bounded-task-snapshot",
+            "decision-evidence-validated",
+            "conservative-classification",
+            "no-probes-or-mutation",
+        ),
+        runner="task_attention_reconciliation",
+    ),
     "connector-snapshot-bind": GripSpec(
         name="connector-snapshot-bind",
         version="1.0",
@@ -330,6 +369,8 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "situation",
         "scout",
         "runtime-deploy-check",
+        "task-attention-decision",
+        "task-attention-reconciliation",
         "connector-snapshot-bind",
         "convergence-assess",
         "gate-evidence-preflight",
@@ -356,6 +397,8 @@ GRIP_SURFACE_TARGETS = {
     "situation": "repository and PR situation snapshot",
     "scout": "change-only repository, PR and runtime drift signal",
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
+    "task-attention-decision": "one create-only current-attempt attention decision",
+    "task-attention-reconciliation": "bounded attention-task evidence classification",
     "connector-snapshot-bind": "one connector client snapshot receipt",
     "convergence-assess": "one hash-bound convergence closure assessment",
     "gate-evidence-preflight": "one fail-closed gate evidence preparation",
@@ -1933,6 +1976,26 @@ def _runtime_deploy_adapter(parameters: dict[str, Any]) -> str:
     return adapter
 
 
+def _runtime_deploy_source_parameters(
+    parameters: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    source_repository = parameters.get("source_repository")
+    source_owner = parameters.get("source_lease_owner_id")
+    if (source_repository is None) != (source_owner is None):
+        raise GripPreflightError(
+            "source_repository and source_lease_owner_id must be provided together"
+        )
+    if source_repository is None:
+        return None, None
+    repository = _string_parameter(parameters, "source_repository")
+    owner = _string_parameter(parameters, "source_lease_owner_id")
+    if not Path(repository).expanduser().is_absolute():
+        raise GripPreflightError("source_repository must be an absolute path")
+    if re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", owner) is None:
+        raise GripPreflightError("source_lease_owner_id is invalid")
+    return repository, owner
+
+
 def _runtime_deploy_delay_seconds(parameters: dict[str, Any]) -> int:
     value = parameters.get("delay_seconds", RUNTIME_DEPLOY_DEFAULT_DELAY_SECONDS)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -1944,10 +2007,18 @@ def _runtime_deploy_delay_seconds(parameters: dict[str, Any]) -> int:
     return value
 
 
-def _runtime_deploy_self_preflight(expected_head: str) -> dict[str, Any]:
+def _runtime_deploy_self_preflight(
+    expected_head: str,
+    source_repository: str | None = None,
+    source_lease_owner_id: str | None = None,
+) -> dict[str, Any]:
     import grabowski_self_deploy
 
-    repository, runner = grabowski_self_deploy._canonical_preflight(expected_head)
+    repository, runner, source_identity = grabowski_self_deploy._deployment_source_preflight(
+        expected_head,
+        source_repository,
+        source_lease_owner_id,
+    )
     return {
         "adapter": RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF,
         "repository": str(repository),
@@ -1955,6 +2026,12 @@ def _runtime_deploy_self_preflight(expected_head: str) -> dict[str, Any]:
         "job_root": str(grabowski_self_deploy.DEPLOY_JOB_ROOT),
         "job_prefix": grabowski_self_deploy.DEPLOY_JOB_PREFIX,
         "expected_head": expected_head,
+        "source_kind": source_identity["source_kind"],
+        "source_identity_sha256": source_identity["identity_sha256"],
+        "source_lease_resource_key": source_identity["lease_evidence"].get("resource_key"),
+        "source_lease_metadata_sha256": (
+            source_identity["lease_evidence"].get("lease") or {}
+        ).get("metadata_sha256"),
         "target": {
             "service": RUNTIME_DEPLOY_GRABOWSKI_SERVICE,
             "runtime_target": RUNTIME_DEPLOY_GRABOWSKI_TARGET,
@@ -1963,10 +2040,20 @@ def _runtime_deploy_self_preflight(expected_head: str) -> dict[str, Any]:
     }
 
 
-def _runtime_deploy_self_schedule(expected_head: str, delay_seconds: int) -> dict[str, Any]:
+def _runtime_deploy_self_schedule(
+    expected_head: str,
+    delay_seconds: int,
+    source_repository: str | None = None,
+    source_lease_owner_id: str | None = None,
+) -> dict[str, Any]:
     import grabowski_self_deploy
 
-    return grabowski_self_deploy.grabowski_runtime_deploy_schedule(expected_head, delay_seconds)
+    return grabowski_self_deploy.grabowski_runtime_deploy_schedule(
+        expected_head,
+        delay_seconds,
+        source_repository,
+        source_lease_owner_id,
+    )
 
 
 def _runtime_deploy_self_expected_argv_sha256(
@@ -1976,11 +2063,16 @@ def _runtime_deploy_self_expected_argv_sha256(
 ) -> str:
     import grabowski_self_deploy
 
+    source_kind = str(preflight["source_kind"])
+    source_identity_sha256 = str(preflight["source_identity_sha256"])
     command = grabowski_self_deploy._deploy_command(
         Path(str(preflight["repository"])),
         Path(str(preflight["runner"])),
         expected_head,
         delay_seconds,
+        canonical_repository=grabowski_self_deploy.CANONICAL_REPOSITORY,
+        source_kind=source_kind,
+        source_identity_sha256=source_identity_sha256,
     )
     return grabowski_self_deploy._deploy_command_sha256(command)
 
@@ -2367,11 +2459,20 @@ def _run_runtime_deploy_check(
     del spec, runner
     adapter = _runtime_deploy_adapter(parameters)
     expected_head = _runtime_deploy_expected_head(parameters)
+    source_repository, source_lease_owner_id = _runtime_deploy_source_parameters(parameters)
     _check(receipt, "registered-adapter", "pass", adapter)
     _check(receipt, "expected-head-bound", "pass", expected_head)
     try:
         if adapter == RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF:
-            preflight = _runtime_deploy_self_preflight(expected_head)
+            preflight = (
+                _runtime_deploy_self_preflight(expected_head)
+                if source_repository is None
+                else _runtime_deploy_self_preflight(
+                    expected_head,
+                    source_repository,
+                    source_lease_owner_id,
+                )
+            )
         else:  # pragma: no cover - guarded by the adapter registry
             raise GripPreflightError(f"no runtime deploy preflight implementation for adapter: {adapter}")
     except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
@@ -2379,6 +2480,8 @@ def _run_runtime_deploy_check(
         return {
             "adapter": adapter,
             "expected_head": expected_head,
+            "source_repository": source_repository,
+            "source_lease_owner_id": source_lease_owner_id,
             "ready": False,
             "receipt_status": "blocked",
             "blocking_reasons": [str(exc)],
@@ -3020,6 +3123,15 @@ def _validate_mechanic_target_matches_parameters(
             raise GripPreflightError(f"actions[{index}].target.adapter must match parameters.adapter")
         if target.get("expected_head") != expected_head:
             raise GripPreflightError(f"actions[{index}].target.expected_head must match parameters.expected_head")
+        source_repository, source_lease_owner_id = _runtime_deploy_source_parameters(parameters)
+        if target.get("source_repository") != source_repository:
+            raise GripPreflightError(
+                f"actions[{index}].target.source_repository must match parameters.source_repository"
+            )
+        if target.get("source_lease_owner_id") != source_lease_owner_id:
+            raise GripPreflightError(
+                f"actions[{index}].target.source_lease_owner_id must match parameters.source_lease_owner_id"
+            )
 
         def one_concrete_alias(keys: tuple[str, ...], label: str) -> tuple[str, str]:
             selected: list[tuple[str, str]] = []
@@ -3304,6 +3416,24 @@ def _validate_captain_target(action_name: str, target: dict[str, Any], *, index:
             origin_value=runtime_origin,
             runtime_value=runtime_target,
         )
+        source_repository = _captain_optional_string(
+            target, "source_repository", index=index, action_name="runtime-deploy"
+        )
+        source_owner = _captain_optional_string(
+            target, "source_lease_owner_id", index=index, action_name="runtime-deploy"
+        )
+        if (source_repository is None) != (source_owner is None):
+            raise GripPreflightError(
+                f"actions[{index}].target source_repository and source_lease_owner_id must be provided together"
+            )
+        if source_repository is not None and not Path(source_repository).expanduser().is_absolute():
+            raise GripPreflightError(
+                f"actions[{index}].target.source_repository must be an absolute path"
+            )
+        if source_owner is not None and re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", source_owner) is None:
+            raise GripPreflightError(
+                f"actions[{index}].target.source_lease_owner_id is invalid"
+            )
         if binding_errors:
             raise GripPreflightError(
                 f"actions[{index}].target is not bound to the registered {adapter} adapter: "
@@ -3456,7 +3586,15 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
             if isinstance(target.get("environment"), str) and target.get("environment", "").strip()
             else "runtime_target"
         )
-        schema["target_binding"] = {origin_key: target.get(origin_key), runtime_key: target.get(runtime_key)}
+        schema["target_binding"] = {
+            origin_key: target.get(origin_key),
+            runtime_key: target.get(runtime_key),
+        }
+        if target.get("source_repository") is not None:
+            schema["target_binding"].update({
+                "source_repository": target.get("source_repository"),
+                "source_lease_owner_id": target.get("source_lease_owner_id"),
+            })
         schema["required_evidence"].extend([
             _captain_action_evidence_item(
                 "deployment_boundary",
@@ -4985,7 +5123,10 @@ def _run_captain_pr_merge(
     return execution_result
 
 
-def _captain_runtime_deploy_target_errors(action: dict[str, Any]) -> list[str]:
+def _captain_runtime_deploy_target_errors(
+    action: dict[str, Any],
+    parameters: dict[str, Any],
+) -> list[str]:
     target = action["target"]
     origin_key = "repo" if isinstance(target.get("repo"), str) and target.get("repo") else "service"
     runtime_key = (
@@ -4993,12 +5134,22 @@ def _captain_runtime_deploy_target_errors(action: dict[str, Any]) -> list[str]:
         if isinstance(target.get("environment"), str) and target.get("environment")
         else "runtime_target"
     )
-    return _captain_runtime_deploy_binding_errors(
+    errors = _captain_runtime_deploy_binding_errors(
         adapter=target.get("adapter"),
         origin_key=origin_key,
         origin_value=target.get(origin_key),
         runtime_value=target.get(runtime_key),
     )
+    try:
+        source_repository, source_owner = _runtime_deploy_source_parameters(parameters)
+    except GripPreflightError as exc:
+        errors.append(str(exc))
+        return errors
+    if target.get("source_repository") != source_repository:
+        errors.append("runtime_deploy_source_repository_target_mismatch")
+    if target.get("source_lease_owner_id") != source_owner:
+        errors.append("runtime_deploy_source_lease_owner_target_mismatch")
+    return errors
 
 
 def _runtime_deploy_schedule_errors(
@@ -5009,6 +5160,7 @@ def _runtime_deploy_schedule_errors(
     expected_argv_sha256: str,
     expected_job_root: str,
     expected_job_prefix: str,
+    expected_source_identity_sha256: str,
 ) -> list[str]:
     if not isinstance(schedule, dict):
         return ["runtime_deploy_scheduler_returned_non_object"]
@@ -5038,6 +5190,11 @@ def _runtime_deploy_schedule_errors(
         errors.append("runtime_deploy_schedule_argv_hash_missing_or_invalid")
     elif argv_sha256 != expected_argv_sha256:
         errors.append("runtime_deploy_schedule_argv_hash_mismatch")
+    if schedule.get("source_identity_sha256") != expected_source_identity_sha256:
+        errors.append("runtime_deploy_schedule_source_identity_mismatch")
+    source_identity = schedule.get("source_identity")
+    if not isinstance(source_identity, dict) or source_identity.get("identity_sha256") != expected_source_identity_sha256:
+        errors.append("runtime_deploy_schedule_source_identity_missing_or_unbound")
     if schedule.get("expected_connector_disconnect") is not True:
         errors.append("runtime_deploy_disconnect_contract_missing")
     if schedule.get("status_tool") != "grabowski_job_status":
@@ -5089,13 +5246,22 @@ def _run_captain_runtime_deploy(
         "verification_scope": "schedule-registration",
         "deployment_completion_verified": False,
     }
-    target_errors = _captain_runtime_deploy_target_errors(action)
+    source_repository, source_lease_owner_id = _runtime_deploy_source_parameters(parameters)
+    target_errors = _captain_runtime_deploy_target_errors(action, parameters)
     if target_errors:
         execution_result["preflight_errors"] = target_errors
         execution_result["verification_error"] = "; ".join(target_errors)
         return execution_result
     try:
-        preflight = _runtime_deploy_self_preflight(expected_head)
+        preflight = (
+            _runtime_deploy_self_preflight(expected_head)
+            if source_repository is None
+            else _runtime_deploy_self_preflight(
+                expected_head,
+                source_repository,
+                source_lease_owner_id,
+            )
+        )
     except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
         execution_result["preflight_errors"] = [str(exc)]
         execution_result["verification_error"] = f"runtime deploy preflight failed; deployment not scheduled: {exc}"
@@ -5105,7 +5271,16 @@ def _run_captain_runtime_deploy(
     execution_result["execution_invoked"] = True
     execution_result["execution_attempted"] = True
     try:
-        schedule = _runtime_deploy_self_schedule(expected_head, delay_seconds)
+        schedule = (
+            _runtime_deploy_self_schedule(expected_head, delay_seconds)
+            if source_repository is None
+            else _runtime_deploy_self_schedule(
+                expected_head,
+                delay_seconds,
+                source_repository,
+                source_lease_owner_id,
+            )
+        )
         execution_result["command_returned"] = True
     except Exception as exc:  # pragma: no cover - defensive receipt boundary
         execution_result["runner_exception"] = (
@@ -5131,6 +5306,7 @@ def _run_captain_runtime_deploy(
         expected_argv_sha256=expected_schedule_hash,
         expected_job_root=str(preflight["job_root"]),
         expected_job_prefix=str(preflight["job_prefix"]),
+        expected_source_identity_sha256=str(preflight["source_identity_sha256"]),
     )
     if schedule_errors:
         execution_result["post_verify_errors"] = schedule_errors
@@ -5149,6 +5325,7 @@ def _run_captain_runtime_deploy(
         "logs_tool": schedule["logs_tool"],
         "unit": schedule["unit"],
         "expected_head": expected_head,
+        "source_identity_sha256": schedule["source_identity_sha256"],
     }
     execution_result["non_claims"] = [
         "schedule verification does not claim that the delayed deployment has completed",
@@ -5156,6 +5333,83 @@ def _run_captain_runtime_deploy(
         "runtime identity must be checked after the connector reconnects",
     ]
     return execution_result
+
+
+def _run_task_attention_decision(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_task_attention
+
+    try:
+        output = grabowski_task_attention.record_decision(parameters)
+    except grabowski_task_attention.TaskAttentionInputError as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except grabowski_task_attention.TaskAttentionConflictError as exc:
+        _check(receipt, "current-task-outcome-bound", "fail", str(exc))
+        return {
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["attention_decision_conflict"],
+            "error": str(exc),
+        }
+    except (
+        grabowski_task_attention.TaskAttentionIntegrityError,
+        grabowski_task_attention.TaskAttentionError,
+        OSError,
+    ) as exc:
+        _check(receipt, "current-task-outcome-bound", "fail", type(exc).__name__)
+        raise GripActionError("task attention decision evidence is invalid or unavailable") from exc
+    _check(receipt, "current-task-outcome-bound", "pass", output["outcome_receipt_sha256"])
+    _check(receipt, "create-only-decision", "pass", output["file_sha256"])
+    _check(
+        receipt,
+        "idempotent-replay",
+        "pass",
+        "replayed" if output["replayed"] else "created",
+    )
+    _check(receipt, "task-store-unchanged", "pass", output["task_binding"]["argv_sha256"])
+    return {**output, "receipt_status": "passed"}
+
+
+def _run_task_attention_reconciliation(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_task_attention
+
+    try:
+        output = grabowski_task_attention.reconcile_attention(parameters)
+    except grabowski_task_attention.TaskAttentionInputError as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except (grabowski_task_attention.TaskAttentionError, OSError) as exc:
+        raise GripActionError("task attention reconciliation failed closed") from exc
+    _check(
+        receipt,
+        "bounded-task-snapshot",
+        "pass",
+        f"returned={output['pagination']['returned']};total={output['total_attention']}",
+    )
+    _check(
+        receipt,
+        "decision-evidence-validated",
+        "pass",
+        sha256_json(output["records"]),
+    )
+    _check(
+        receipt,
+        "conservative-classification",
+        "pass",
+        sha256_json(output["classification_counts"]),
+    )
+    _check(receipt, "no-probes-or-mutation", "pass", "read_only_task_snapshot_and_receipts")
+    return {**output, "receipt_status": "passed"}
 
 
 def _run_operator_obligation_open(
@@ -5500,6 +5754,8 @@ _RUNNERS = {
     "situation": _run_situation,
     "scout": _run_scout,
     "runtime_deploy_check": _run_runtime_deploy_check,
+    "task_attention_decision": _run_task_attention_decision,
+    "task_attention_reconciliation": _run_task_attention_reconciliation,
     "connector_snapshot_bind": _run_connector_snapshot_bind,
     "convergence_assess": _run_convergence_assess,
     "gate_evidence_preflight": _run_gate_evidence_preflight,
