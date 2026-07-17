@@ -21,6 +21,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+class _FakeContext:
+    pass
+
+
 class _FakeFastMCP:
     def __init__(self, *args, **kwargs):
         pass
@@ -39,6 +43,7 @@ def _load_grabowski_mcp():
     fake_server = types.ModuleType("mcp.server")
     fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
     fake_types = types.ModuleType("mcp.types")
+    fake_fastmcp.Context = _FakeContext
     fake_fastmcp.FastMCP = _FakeFastMCP
     fake_types.ToolAnnotations = _FakeToolAnnotations
     module_name = "grabowski_mcp_operator_v2_test"
@@ -573,13 +578,45 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 )
                 self.assertTrue(valid["allowed"])
 
+                class Session:
+                    pass
+
+                class RequestContext:
+                    session = Session()
+
                 with patch.object(grabowski_mcp.grabowski_grips, "grip_run", return_value={"ok": True}) as run:
-                    result = grabowski_mcp.grip_run("captain-run", valid_parameters)
+                    result = grabowski_mcp.grip_run(
+                        "captain-run", valid_parameters, ctx=RequestContext()
+                    )
 
                 self.assertEqual(result, {"ok": True})
                 dispatched = run.call_args.args[1]
                 self.assertNotIn("session_escalation", dispatched)
+                identity = dispatched.pop("_server_runtime_actor_identity")
                 self.assertEqual(dispatched, {"actions": []})
+                verified = grabowski_mcp.grabowski_merge_guard.verify_server_runtime_actor_identity(
+                    identity
+                )
+                self.assertTrue(verified["owner_id"].startswith("runtime-actor:"))
+
+                spoofed = dict(valid_parameters)
+                spoofed["_server_runtime_actor_identity"] = identity
+                with patch.object(grabowski_mcp.grabowski_grips, "grip_run") as blocked_run:
+                    blocked = grabowski_mcp.grip_run(
+                        "captain-run", spoofed, ctx=RequestContext()
+                    )
+                self.assertEqual("blocked", blocked["receipt"]["status"])
+                self.assertIn("reserved server runtime actor", blocked["output"]["error"])
+                blocked_run.assert_not_called()
+
+                unavailable = grabowski_mcp.grip_run(
+                    "captain-run", valid_parameters, ctx=None
+                )
+                self.assertEqual("blocked", unavailable["receipt"]["status"])
+                self.assertIn(
+                    "server runtime actor identity is unavailable",
+                    unavailable["output"]["error"],
+                )
 
     def test_session_forbidden_hosts_block_operator_argv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

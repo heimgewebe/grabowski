@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from pathlib import Path
 import re
+import secrets
 import subprocess
+import threading
 import time
 from typing import Any
+import weakref
 
 
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -16,6 +20,23 @@ _MERGE_GUARD_TTL_SECONDS = 300
 _MERGE_GUARD_MAX_CHANGED_PATHS = 100
 _MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 8 * 1024
 _MERGE_GUARD_REPLAY_PARAMETERS = frozenset({"merge_lease_snapshot", "merge_guard_receipt"})
+_SERVER_ACTOR_SCHEMA_VERSION = 1
+_SERVER_ACTOR_KIND = "grabowski_server_runtime_actor_identity"
+_SERVER_ACTOR_TTL_SECONDS = 300
+_SERVER_ACTOR_SECRET = secrets.token_bytes(32)
+_SERVER_ACTOR_LOCK = threading.Lock()
+_SERVER_ACTOR_SESSIONS: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+_SERVER_ACTOR_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "owner_id",
+        "profile",
+        "issued_at_unix",
+        "expires_at_unix",
+        "proof_sha256",
+    }
+)
 
 
 def _canonical_json(value: Any) -> str:
@@ -24,6 +45,97 @@ def _canonical_json(value: Any) -> str:
 
 def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def issue_server_runtime_actor_identity(
+    session: Any,
+    *,
+    profile: str,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Issue one short-lived, server-authenticated owner identity for an MCP session."""
+    if session is None:
+        raise ValueError("server runtime actor session is required")
+    if _OWNER_RE.fullmatch(profile) is None:
+        raise ValueError("server runtime actor profile is invalid")
+    with _SERVER_ACTOR_LOCK:
+        try:
+            session_nonce = _SERVER_ACTOR_SESSIONS.get(session)
+        except TypeError as exc:
+            raise ValueError("server runtime actor session must support weak references") from exc
+        if session_nonce is None:
+            session_nonce = secrets.token_hex(32)
+            try:
+                _SERVER_ACTOR_SESSIONS[session] = session_nonce
+            except TypeError as exc:
+                raise ValueError("server runtime actor session must support weak references") from exc
+    owner_digest = hmac.new(
+        _SERVER_ACTOR_SECRET,
+        b"owner\x00" + session_nonce.encode("ascii") + b"\x00" + profile.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    issued_at = int(time.time()) if now_unix is None else int(now_unix)
+    payload: dict[str, Any] = {
+        "schema_version": _SERVER_ACTOR_SCHEMA_VERSION,
+        "kind": _SERVER_ACTOR_KIND,
+        "owner_id": f"runtime-actor:{owner_digest}",
+        "profile": profile,
+        "issued_at_unix": issued_at,
+        "expires_at_unix": issued_at + _SERVER_ACTOR_TTL_SECONDS,
+    }
+    payload["proof_sha256"] = hmac.new(
+        _SERVER_ACTOR_SECRET,
+        _canonical_json(payload).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return payload
+
+
+def verify_server_runtime_actor_identity(
+    value: Any,
+    *,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Verify a server-issued runtime actor proof and return bounded receipt evidence."""
+    if not isinstance(value, dict) or set(value) != _SERVER_ACTOR_KEYS:
+        raise ValueError("server runtime actor identity shape is invalid")
+    if value.get("schema_version") != _SERVER_ACTOR_SCHEMA_VERSION:
+        raise ValueError("server runtime actor identity schema is invalid")
+    if value.get("kind") != _SERVER_ACTOR_KIND:
+        raise ValueError("server runtime actor identity kind is invalid")
+    owner_id = value.get("owner_id")
+    profile = value.get("profile")
+    if not isinstance(owner_id, str) or _OWNER_RE.fullmatch(owner_id) is None:
+        raise ValueError("server runtime actor owner is invalid")
+    if not isinstance(profile, str) or _OWNER_RE.fullmatch(profile) is None:
+        raise ValueError("server runtime actor profile is invalid")
+    issued_at = value.get("issued_at_unix")
+    expires_at = value.get("expires_at_unix")
+    if not isinstance(issued_at, int) or isinstance(issued_at, bool):
+        raise ValueError("server runtime actor issue time is invalid")
+    if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+        raise ValueError("server runtime actor expiry is invalid")
+    if expires_at - issued_at != _SERVER_ACTOR_TTL_SECONDS:
+        raise ValueError("server runtime actor lifetime is invalid")
+    current = int(time.time()) if now_unix is None else int(now_unix)
+    if issued_at > current + 5 or expires_at < current:
+        raise ValueError("server runtime actor identity is not current")
+    unsigned = {key: value[key] for key in value if key != "proof_sha256"}
+    expected_proof = hmac.new(
+        _SERVER_ACTOR_SECRET,
+        _canonical_json(unsigned).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    proof = value.get("proof_sha256")
+    if not isinstance(proof, str) or not hmac.compare_digest(proof, expected_proof):
+        raise ValueError("server runtime actor proof is invalid")
+    return {
+        "owner_id": owner_id,
+        "profile": profile,
+        "identity_sha256": _sha256_json(value),
+        "issued_at_unix": issued_at,
+        "expires_at_unix": expires_at,
+    }
 
 
 def _merge_guard_identifier(namespace: str, value: str) -> str:
@@ -139,6 +251,7 @@ class CaptainMergeGuardRunner:
         github_runner: Any,
         execution_intent_sha256: str,
         lease_owner_id: str,
+        server_actor_identity: dict[str, Any] | None = None,
     ) -> None:
         self.repo_path = repo_path.resolve()
         self.action = action
@@ -146,11 +259,33 @@ class CaptainMergeGuardRunner:
         self.github_runner = github_runner
         self.execution_intent_sha256 = execution_intent_sha256
         self.lease_owner_id = lease_owner_id
+        self.lease_owner_source = "execution-intent-context"
+        self.server_actor_identity: dict[str, Any] | None = None
+        self.server_actor_identity_error = False
+        if server_actor_identity is not None:
+            try:
+                verified_actor = verify_server_runtime_actor_identity(server_actor_identity)
+            except ValueError:
+                self.lease_owner_id = ""
+                self.server_actor_identity_error = True
+            else:
+                self.server_actor_identity = verified_actor
+                self.lease_owner_id = str(verified_actor["owner_id"])
+                self.lease_owner_source = "server-runtime-session-v1"
         self.owner_id: str | None = None
         self.resource_keys: list[str] = []
         self.held_resource_keys: list[str] = []
         self.acquisition: dict[str, Any] | None = None
         self.dispatch_called = False
+        does_not_establish = [
+            "merge_authority",
+            "review_completeness",
+            "ci_freshness",
+            "authorization",
+            "absence_of_noncooperating_external_github_actors",
+        ]
+        if self.server_actor_identity is None:
+            does_not_establish.append("server_authenticated_lease_owner_identity")
         self.receipt: dict[str, Any] = {
             "schema_version": 1,
             "kind": "grabowski_captain_merge_lease_guard",
@@ -158,14 +293,16 @@ class CaptainMergeGuardRunner:
             "contract_satisfied": False,
             "dispatch_called": False,
             "resource_keys": [],
-            "does_not_establish": [
-                "merge_authority",
-                "review_completeness",
-                "ci_freshness",
-                "authorization",
-                "server_authenticated_lease_owner_identity",
-                "absence_of_noncooperating_external_github_actors",
-            ],
+            "lease_owner_binding": {
+                "source": self.lease_owner_source,
+                "server_authenticated": self.server_actor_identity is not None,
+                "identity_sha256": (
+                    self.server_actor_identity.get("identity_sha256")
+                    if self.server_actor_identity is not None
+                    else None
+                ),
+            },
+            "does_not_establish": does_not_establish,
         }
         self.static_errors = self._static_binding_errors()
         if self.static_errors:
@@ -177,6 +314,8 @@ class CaptainMergeGuardRunner:
         expected_base_sha = str(self.parameters.get("expected_base_sha", ""))
         expected_diff = str(self.parameters.get("diff_sha256", ""))
         errors: list[str] = []
+        if self.server_actor_identity_error:
+            errors.append("merge_guard_server_actor_identity_invalid")
         if _OWNER_RE.fullmatch(self.lease_owner_id) is None:
             errors.append("merge_guard_lease_owner_invalid")
         if _SHA40_RE.fullmatch(expected_head) is None:
@@ -497,6 +636,7 @@ class CaptainMergeGuardRunner:
                 "lease_snapshot": lease_snapshot,
                 "lease_snapshot_sha256": _sha256_json(lease_snapshot),
                 "lease_owner_id": self.lease_owner_id,
+                "lease_owner_source": self.lease_owner_source,
                 "changed_paths": bindings["changed_paths"],
                 "changed_paths_sha256": bindings["changed_paths_sha256"],
                 "held_resource_keys": self.held_resource_keys,
