@@ -1888,6 +1888,28 @@ def inspect_resource(resource_key: str) -> dict[str, Any] | None:
     return None if row is None else _public(row)
 
 
+def count_resources(
+    *,
+    owner_id: str | None = None,
+    include_expired: bool = False,
+) -> int:
+    parameters: list[Any] = []
+    clauses: list[str] = []
+    if owner_id is not None:
+        clauses.append("owner_id=?")
+        parameters.append(_owner(owner_id))
+    if not include_expired:
+        clauses.append("expires_at_unix>?")
+        parameters.append(_now())
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with _database() as connection:
+        row = connection.execute(
+            f"SELECT COUNT(*) AS count FROM leases{where}",
+            parameters,
+        ).fetchone()
+    return int(row["count"])
+
+
 def list_resources(
     *,
     owner_id: str | None = None,

@@ -376,16 +376,14 @@ class ConsumerSurfaceTests(unittest.TestCase):
             }
         )
         fake_resources = SimpleNamespace(
-            grabowski_resource_list=lambda **_kwargs: {
-                "count": 3,
-                "leases": [{}, {}, {}],
-            }
+            count_resources=lambda **_kwargs: 3
         )
         fake_obligations = SimpleNamespace(
-            list_obligations=lambda _parameters: {
+            list_obligations=lambda parameters: {
                 "record_count": 1,
                 "integrity_errors": [],
                 "scan_truncated": False,
+                "summary_only": parameters.get("summary_only"),
             }
         )
         with mock.patch.dict(
