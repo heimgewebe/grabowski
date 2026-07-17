@@ -113,15 +113,64 @@ def _state_releases_resources(state: str) -> bool:
     return _is_terminal_state(state)
 
 
-def _write_outcome_receipt(record: dict[str, Any], state: str, observation: dict[str, Any] | None) -> None:
+def _read_existing_outcome_receipt(
+    path: Path,
+    *,
+    transition_sha256: str | None,
+    allow_legacy: bool,
+) -> str | None:
+    existing = json.loads(path.read_text(encoding="utf-8"))
+    existing_digest = existing.get("receipt_sha256")
+    if not isinstance(existing_digest, str) or existing_digest != _sha256_json(
+        {key: value for key, value in existing.items() if key != "receipt_sha256"}
+    ):
+        raise RuntimeError("Stored task lifecycle receipt integrity is invalid")
+    if transition_sha256 is None:
+        return existing_digest
+    existing_terminalization = existing.get("terminalization")
+    if (
+        isinstance(existing_terminalization, dict)
+        and existing_terminalization.get("transition_sha256") == transition_sha256
+    ):
+        return existing_digest
+    if allow_legacy and existing.get("schema_version") == 1:
+        return None
+    raise RuntimeError("Stored task lifecycle receipt belongs to another transition")
+
+
+def _write_outcome_receipt(
+    record: dict[str, Any],
+    state: str,
+    observation: dict[str, Any] | None,
+    *,
+    terminalization: dict[str, Any] | None = None,
+) -> str | None:
     if not _is_terminal_state(state):
-        return
+        return None
     TASK_OUTCOMES_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = TASK_OUTCOMES_DIR / f"{record['task_id']}.json"
-    if path.exists():
-        return
+    primary_path = TASK_OUTCOMES_DIR / f"{record['task_id']}.json"
+    terminalization_payload: dict[str, Any] | None = None
+    transition_sha256: str | None = None
+    if terminalization is not None:
+        transition_sha256 = terminalization["transition_sha256"]
+        terminalization_payload = {
+            "kind": terminalization["kind"],
+            "transition_sha256": transition_sha256,
+            "task_projection_sha256": terminalization["task_projection_sha256"],
+            "requested_resource_keys": terminalization["requested_resource_keys"],
+            "requested_resource_keys_sha256": terminalization[
+                "requested_resource_keys_sha256"
+            ],
+            "prior_leases": terminalization["prior_leases"],
+            "prior_leases_sha256": terminalization["prior_leases_sha256"],
+            "revoked_resource_keys": terminalization["revoked_resource_keys"],
+            "missing_resource_keys": terminalization["missing_resource_keys"],
+            "prepared_at_unix": terminalization["prepared_at_unix"],
+            "leases_revoked_at_unix": terminalization["leases_revoked_at_unix"],
+            "recovery_status": terminalization["recovery_status"],
+        }
     payload = {
-        "schema_version": 1,
+        "schema_version": 2 if terminalization is not None else 1,
         "task_id": record["task_id"],
         "unit": record["unit"],
         "authoritative_unit": _authoritative_unit(record),
@@ -136,8 +185,32 @@ def _write_outcome_receipt(record: dict[str, Any], state: str, observation: dict
         "observation_sha256": _sha256_json(observation or {}),
         "observation": observation or {},
     }
-    payload["receipt_sha256"] = _sha256_json({k: v for k, v in payload.items() if k != "receipt_sha256"})
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{record['task_id']}.", suffix=".tmp", dir=TASK_OUTCOMES_DIR)
+    if terminalization is not None:
+        payload["kind"] = "grabowski_task_lifecycle_receipt"
+        payload["terminalization"] = terminalization_payload
+    payload["receipt_sha256"] = _sha256_json(
+        {key: value for key, value in payload.items() if key != "receipt_sha256"}
+    )
+
+    candidates = [(primary_path, terminalization is not None)]
+    if terminalization is not None:
+        candidates.append(
+            (TASK_OUTCOMES_DIR / f"{record['task_id']}.lifecycle.json", False)
+        )
+    for path, allow_legacy in candidates:
+        if not path.exists():
+            continue
+        existing_digest = _read_existing_outcome_receipt(
+            path,
+            transition_sha256=transition_sha256,
+            allow_legacy=allow_legacy,
+        )
+        if existing_digest is not None:
+            return existing_digest
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{record['task_id']}.", suffix=".tmp", dir=TASK_OUTCOMES_DIR
+    )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
@@ -145,15 +218,30 @@ def _write_outcome_receipt(record: dict[str, Any], state: str, observation: dict
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_name, 0o600)
-        os.link(tmp_name, path)
-    except FileExistsError:
-        pass
+        for path, allow_legacy in candidates:
+            try:
+                os.link(tmp_name, path)
+            except FileExistsError:
+                existing_digest = _read_existing_outcome_receipt(
+                    path,
+                    transition_sha256=transition_sha256,
+                    allow_legacy=allow_legacy,
+                )
+                if existing_digest is not None:
+                    return existing_digest
+                continue
+            directory_fd = os.open(TASK_OUTCOMES_DIR, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return str(payload["receipt_sha256"])
     finally:
         try:
             os.unlink(tmp_name)
         except FileNotFoundError:
             pass
-
+    raise RuntimeError("Task lifecycle receipt could not be persisted")
 
 def _classify_observation(result: dict[str, Any], properties: dict[str, str]) -> str:
     active = properties.get("ActiveState")
@@ -232,10 +320,17 @@ def _database() -> sqlite3.Connection:
         "execution_backend", "systemd_scope", "authoritative_unit",
         "chronik_outbox_enabled", "chronik_outbox_state_root",
         "chronik_context_json",
+        "terminalization_sha256", "terminalized_at_unix",
+        "lifecycle_receipt_sha256",
     }
     required_indexes = {
         "tasks_state_created_task_idx",
         "tasks_created_task_idx",
+    }
+    schema3_required_columns = required_columns - {
+        "terminalization_sha256",
+        "terminalized_at_unix",
+        "lifecycle_receipt_sha256",
     }
 
     version = schema_version()
@@ -243,9 +338,9 @@ def _database() -> sqlite3.Connection:
         connection.close()
         raise RuntimeError("Unsupported task database schema")
 
-    # Established schema-3 databases stay read-only here. Migration writes,
-    # backfills, index creation and the version flip are serialized together.
-    if version not in {"3", "4"}:
+    # Established schema-4 databases stay read-only here. Legacy migrations,
+    # backfills, index validation and the version flip are serialized together.
+    if version != "4":
         connection.execute("BEGIN IMMEDIATE")
         try:
             # Re-read after acquiring the writer lock because another process
@@ -299,17 +394,33 @@ def _database() -> sqlite3.Connection:
                         authoritative_unit TEXT,
                         chronik_outbox_enabled INTEGER NOT NULL DEFAULT 0,
                         chronik_outbox_state_root TEXT,
-                        chronik_context_json TEXT
+                        chronik_context_json TEXT,
+                        terminalization_sha256 TEXT,
+                        terminalized_at_unix INTEGER,
+                        lifecycle_receipt_sha256 TEXT
                     )
                     """
                 )
                 connection.execute(
-                    "INSERT INTO metadata(key, value) VALUES('schema_version', '3')"
+                    "INSERT INTO metadata(key, value) VALUES('schema_version', '4')"
                 )
-            elif version in {"1", "2"}:
+            elif version in {"1", "2", "3"}:
                 if not table_exists("metadata") or not table_exists("tasks"):
                     raise RuntimeError("Legacy task database is structurally incomplete")
                 columns = task_columns()
+                if version == "3":
+                    missing_schema3_columns = schema3_required_columns - columns
+                    if missing_schema3_columns:
+                        raise RuntimeError(
+                            "Task database schema 3 is incomplete: "
+                            + ", ".join(sorted(missing_schema3_columns))
+                        )
+                    missing_schema3_indexes = required_indexes - task_indexes()
+                    if missing_schema3_indexes:
+                        raise RuntimeError(
+                            "Task database schema 3 indexes are incomplete: "
+                            + ", ".join(sorted(missing_schema3_indexes))
+                        )
                 additions = (
                     ("resource_keys_json", "TEXT NOT NULL DEFAULT '[]'"),
                     ("lease_owner_id", "TEXT"),
@@ -325,6 +436,9 @@ def _database() -> sqlite3.Connection:
                     ("execution_backend", "TEXT NOT NULL DEFAULT 'systemd-user'"),
                     ("systemd_scope", "TEXT NOT NULL DEFAULT 'user'"),
                     ("authoritative_unit", "TEXT"),
+                    ("terminalization_sha256", "TEXT"),
+                    ("terminalized_at_unix", "INTEGER"),
+                    ("lifecycle_receipt_sha256", "TEXT"),
                 )
                 for name, definition in additions:
                     if name not in columns:
@@ -350,7 +464,7 @@ def _database() -> sqlite3.Connection:
                     "WHERE authoritative_unit IS NULL OR authoritative_unit=''"
                 )
                 connection.execute(
-                    "UPDATE metadata SET value='3' WHERE key='schema_version'"
+                    "UPDATE metadata SET value='4' WHERE key='schema_version'"
                 )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS tasks_state_created_task_idx "
@@ -370,14 +484,14 @@ def _database() -> sqlite3.Connection:
     if missing_columns:
         connection.close()
         raise RuntimeError(
-            "Task database schema 3 is incomplete: "
+            "Task database schema 4 is incomplete: "
             + ", ".join(sorted(missing_columns))
         )
     missing_indexes = required_indexes - task_indexes()
     if missing_indexes:
         connection.close()
         raise RuntimeError(
-            "Task database schema indexes are incomplete: "
+            "Task database schema 4 indexes are incomplete: "
             + ", ".join(sorted(missing_indexes))
         )
     effective_version = schema_version()
@@ -661,14 +775,6 @@ def _record_resource_keys(record: dict[str, Any]) -> list[str]:
     return [resources.normalize_resource_key(value) for value in values]
 
 
-def _release_record_resources(record: dict[str, Any]) -> dict[str, Any] | None:
-    keys = _record_resource_keys(record)
-    if not keys:
-        return None
-    owner = record.get("lease_owner_id") or _lease_owner(record["task_id"])
-    return resources.release_resources(owner, keys)
-
-
 def _task_lease_ttl(record: dict[str, Any], state: str) -> int:
     if state == "outcome_unknown":
         # Unknown root truth must remain protected long enough for operator
@@ -862,7 +968,7 @@ def _launch_state(result: dict[str, Any]) -> str:
     return "running" if result["returncode"] == 0 else "failed"
 
 
-def _row(task_id: str) -> dict[str, Any]:
+def _row_raw(task_id: str) -> dict[str, Any]:
     identifier = _validate_task_id(task_id)
     with _database_connection() as connection:
         row = connection.execute(
@@ -872,6 +978,190 @@ def _row(task_id: str) -> dict[str, Any]:
         raise ValueError(f"Unknown task: {identifier}")
     return dict(row)
 
+
+def _terminal_projection(
+    record: dict[str, Any],
+    state: str,
+    *,
+    launcher: dict[str, Any] | None = None,
+    observation: dict[str, Any] | None = None,
+    unit: str | None = None,
+    authoritative_unit: str | None = None,
+    attempt: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "task_id": record["task_id"],
+        "state": state,
+        "updated_at_unix": _now(),
+        "launcher_json": (
+            record["launcher_json"]
+            if launcher is None
+            else _canonical_json(launcher)
+        ),
+        "last_observation_json": (
+            record.get("last_observation_json")
+            if observation is None
+            else _canonical_json(observation)
+        ),
+        "unit": record["unit"] if unit is None else _validate_unit(unit),
+        "authoritative_unit": (
+            _authoritative_unit(record)
+            if authoritative_unit is None
+            else _validate_unit(authoritative_unit)
+        ),
+        "attempt": int(record["attempt"] if attempt is None else attempt),
+    }
+
+
+def _apply_terminalization_projection(
+    terminalization: dict[str, Any], *, recovered: bool = False
+) -> dict[str, Any]:
+    projection = terminalization.get("task_projection")
+    required = {
+        "task_id", "state", "updated_at_unix", "launcher_json",
+        "last_observation_json", "unit", "authoritative_unit", "attempt",
+    }
+    if not isinstance(projection, dict) or set(projection) != required:
+        raise RuntimeError("Task terminalization projection is invalid")
+    task_id = _validate_task_id(projection["task_id"])
+    if task_id != terminalization.get("task_id"):
+        raise RuntimeError("Task terminalization projection identity drift")
+    state = projection["state"]
+    if not _is_terminal_state(state) or state != terminalization.get("terminal_state"):
+        raise RuntimeError("Task terminalization projection state drift")
+    transition_sha256 = terminalization.get("transition_sha256")
+    if not isinstance(transition_sha256, str) or SHA256.fullmatch(transition_sha256) is None:
+        raise RuntimeError("Task terminalization digest is invalid")
+    with _database_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if current is None:
+            connection.rollback()
+            raise ValueError(f"Unknown task: {task_id}")
+        current_record = dict(current)
+        existing_digest = current_record.get("terminalization_sha256")
+        if existing_digest not in {None, transition_sha256}:
+            connection.rollback()
+            raise RuntimeError("Task row is bound to another terminalization")
+        if _is_terminal_state(current_record["state"]) and current_record["state"] != state:
+            connection.rollback()
+            raise RuntimeError("Task row terminal state conflicts with terminalization")
+        connection.execute(
+            """
+            UPDATE tasks SET
+                state=?, updated_at_unix=?, launcher_json=?,
+                last_observation_json=?, unit=?, authoritative_unit=?, attempt=?,
+                terminalization_sha256=?, terminalized_at_unix=?
+            WHERE task_id=?
+            """,
+            (
+                state,
+                int(projection["updated_at_unix"]),
+                str(projection["launcher_json"]),
+                projection["last_observation_json"],
+                _validate_unit(str(projection["unit"])),
+                _validate_unit(str(projection["authoritative_unit"])),
+                int(projection["attempt"]),
+                transition_sha256,
+                int(terminalization["leases_revoked_at_unix"]),
+                task_id,
+            ),
+        )
+        connection.commit()
+    updated = _row_raw(task_id)
+    observation = (
+        json.loads(updated["last_observation_json"])
+        if updated.get("last_observation_json")
+        else None
+    )
+    receipt_sha256 = _write_outcome_receipt(
+        updated,
+        state,
+        observation,
+        terminalization=terminalization,
+    )
+    if receipt_sha256 is None:
+        raise RuntimeError("Task lifecycle receipt was not emitted")
+    with _database_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT terminalization_sha256, lifecycle_receipt_sha256 "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["terminalization_sha256"] != transition_sha256:
+            connection.rollback()
+            raise RuntimeError("Task terminalization projection changed before receipt binding")
+        if row["lifecycle_receipt_sha256"] not in {None, receipt_sha256}:
+            connection.rollback()
+            raise RuntimeError("Task lifecycle receipt digest drift")
+        connection.execute(
+            "UPDATE tasks SET lifecycle_receipt_sha256=? WHERE task_id=?",
+            (receipt_sha256, task_id),
+        )
+        connection.commit()
+    resources.complete_task_terminalization(
+        task_id,
+        transition_sha256,
+        receipt_sha256,
+        recovered=recovered,
+    )
+    updated = _row_raw(task_id)
+    chronik.record_task_state_safely(updated, state)
+    return updated
+
+
+def _recover_task_terminalization(task_id: str) -> dict[str, Any] | None:
+    identifier = _validate_task_id(task_id)
+    transition = resources.task_terminalization_record(
+        identifier, include_projection=True
+    )
+    if transition is not None:
+        record = _row_raw(identifier)
+        if (
+            transition["phase"] != "projected"
+            or record.get("terminalization_sha256") != transition["transition_sha256"]
+            or record.get("lifecycle_receipt_sha256")
+            != transition.get("lifecycle_receipt_sha256")
+        ):
+            return _apply_terminalization_projection(transition, recovered=True)
+        return record
+    record = _row_raw(identifier)
+    if not _is_terminal_state(str(record["state"])):
+        return None
+    projection = _terminal_projection(record, str(record["state"]))
+    observation = (
+        json.loads(record["last_observation_json"])
+        if record.get("last_observation_json")
+        else {}
+    )
+    transition = resources.begin_task_terminalization(
+        identifier,
+        int(record["attempt"]),
+        record.get("lease_owner_id") or _lease_owner(identifier),
+        str(record["state"]),
+        _record_resource_keys(record),
+        task_projection=projection,
+        observation_sha256=_sha256_json(observation),
+        recovery_status="recovered_legacy_row_first",
+    )
+    return _apply_terminalization_projection(transition, recovered=True)
+
+
+def _recover_pending_task_terminalizations() -> list[str]:
+    recovered: list[str] = []
+    for terminalization in resources.pending_task_terminalizations():
+        updated = _apply_terminalization_projection(terminalization, recovered=True)
+        recovered.append(str(updated["task_id"]))
+    return recovered
+
+
+def _row(task_id: str) -> dict[str, Any]:
+    identifier = _validate_task_id(task_id)
+    recovered = _recover_task_terminalization(identifier)
+    return recovered if recovered is not None else _row_raw(identifier)
 
 def _public(record: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -904,6 +1194,9 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
         "chronik_outbox_enabled": bool(record.get("chronik_outbox_enabled")),
         "chronik_outbox_state_root": record.get("chronik_outbox_state_root"),
         "chronik_context": json.loads(record["chronik_context_json"]) if record.get("chronik_context_json") else None,
+        "terminalization_sha256": record.get("terminalization_sha256"),
+        "terminalized_at_unix": record.get("terminalized_at_unix"),
+        "lifecycle_receipt_sha256": record.get("lifecycle_receipt_sha256"),
     }
 
 
@@ -1022,6 +1315,46 @@ def _set_state(
 ) -> dict[str, Any]:
     if state not in TASK_STATES:
         raise ValueError("Invalid task state")
+    identifier = _validate_task_id(task_id)
+    current = _row_raw(identifier)
+    existing_terminalization = resources.task_terminalization_record(
+        identifier, include_projection=True
+    )
+    if existing_terminalization is not None:
+        return _apply_terminalization_projection(
+            existing_terminalization,
+            recovered=existing_terminalization["phase"] != "projected",
+        )
+    if _is_terminal_state(current["state"]):
+        recovered = _recover_task_terminalization(identifier)
+        return recovered if recovered is not None else _row_raw(identifier)
+    if _is_terminal_state(state):
+        projection = _terminal_projection(
+            current,
+            state,
+            launcher=launcher,
+            observation=observation,
+            unit=unit,
+            authoritative_unit=authoritative_unit,
+            attempt=attempt,
+        )
+        observation_material = observation
+        if observation_material is None:
+            observation_material = (
+                json.loads(current["last_observation_json"])
+                if current.get("last_observation_json")
+                else {}
+            )
+        terminalization = resources.begin_task_terminalization(
+            identifier,
+            int(projection["attempt"]),
+            current.get("lease_owner_id") or _lease_owner(identifier),
+            state,
+            _record_resource_keys(current),
+            task_projection=projection,
+            observation_sha256=_sha256_json(observation_material),
+        )
+        return _apply_terminalization_projection(terminalization)
     updates = ["state=?", "updated_at_unix=?"]
     values: list[Any] = [state, _now()]
     if launcher is not None:
@@ -1039,23 +1372,30 @@ def _set_state(
     if attempt is not None:
         updates.append("attempt=?")
         values.append(attempt)
-    values.append(_validate_task_id(task_id))
+    values.append(identifier)
     with _database_connection() as connection:
-        current = connection.execute(
-            "SELECT * FROM tasks WHERE task_id=?", (values[-1],)
+        connection.execute("BEGIN IMMEDIATE")
+        current_row = connection.execute(
+            "SELECT state, terminalization_sha256 FROM tasks WHERE task_id=?",
+            (identifier,),
         ).fetchone()
-        if current is not None and _is_terminal_state(current["state"]):
-            return dict(current)
+        if current_row is None:
+            connection.rollback()
+            raise ValueError(f"Unknown task: {identifier}")
+        if current_row["terminalization_sha256"] is not None or _is_terminal_state(
+            current_row["state"]
+        ):
+            connection.rollback()
+            recovered = _recover_task_terminalization(identifier)
+            return recovered if recovered is not None else _row_raw(identifier)
         connection.execute(
             f"UPDATE tasks SET {', '.join(updates)} WHERE task_id=?",
             values,
         )
         connection.commit()
-    updated = _row(task_id)
-    _write_outcome_receipt(updated, state, observation)
+    updated = _row_raw(identifier)
     chronik.record_task_state_safely(updated, state)
     return updated
-
 
 def _observe(record: dict[str, Any]) -> dict[str, Any]:
     if _is_root_systemd_backend(record):
@@ -1329,8 +1669,6 @@ def grabowski_task_start(
     state = _launch_state(launcher)
     stored = _set_state(task_id, state, launcher=launcher)
     lease_maintenance = _maintain_record_resources(stored, state)
-    if _state_releases_resources(state):
-        _release_record_resources(stored)
     audit = {
         "timestamp_unix": _now(),
         "operation": "task-start",
@@ -1373,8 +1711,6 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
         observation["state"],
         observation=observation,
     )
-    if _state_releases_resources(observation["state"]):
-        _release_record_resources(stored)
     result = _public(stored)
     result["lease_maintenance"] = lease_maintenance
     return result
@@ -1452,8 +1788,6 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     if lease_maintenance is not None:
         cancel_observation["lease_maintenance"] = lease_maintenance
     stored = _set_state(task_id, state, observation=cancel_observation)
-    if _state_releases_resources(state):
-        _release_record_resources(stored)
     audit = {
         "timestamp_unix": _now(),
         "operation": "task-cancel",
@@ -1499,7 +1833,6 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
             "completed",
             observation=observation,
         )
-        _release_record_resources(stored)
         raise RuntimeError("Task already completed; refusing retry")
     if observation["state"] == "outcome_unknown":
         _set_state(
@@ -1541,8 +1874,6 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
         attempt=attempt,
     )
     lease_maintenance = _maintain_record_resources(stored, state)
-    if _state_releases_resources(state):
-        _release_record_resources(stored)
     audit = {
         "timestamp_unix": _now(),
         "operation": "task-resume",
@@ -1575,6 +1906,7 @@ def _reconcile_candidate_rows(task_id: str = "") -> list[dict[str, Any]]:
             if record["state"] in {"launching", "running", "outcome_unknown"}
             else []
         )
+    _recover_pending_task_terminalizations()
     with _database_connection() as connection:
         rows = connection.execute(
             "SELECT * FROM tasks WHERE state IN ('launching', 'running', 'outcome_unknown') "
@@ -1695,7 +2027,6 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
             observation=observation,
         )
         if _state_releases_resources(observation["state"]):
-            _release_record_resources(stored)
             released.append(stored["task_id"])
         public = _public(stored)
         public["lease_maintenance"] = lease_maintenance
@@ -1747,7 +2078,6 @@ def reconcile_tasks_resume(
             observation=observation,
         )
         if _state_releases_resources(observation["state"]):
-            _release_record_resources(stored)
             released.append(stored["task_id"])
         public = _public(stored)
         public["lease_maintenance"] = lease_maintenance
@@ -1906,6 +2236,7 @@ def grabowski_task_list(
     """List persistent tasks with keyset pagination and compact default records."""
     operator._require_operator_capability("durable_job")
     selected_view = consumer_surface.normalize_view(view)
+    _recover_pending_task_terminalizations()
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
     filter_states = _task_filter_states(state)

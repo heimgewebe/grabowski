@@ -275,17 +275,21 @@ def _validate_expected_binding(
         raise TaskAttentionConflictError("current task binding does not match the expected decision target")
 
 
-def _outcome_path(task_id: str) -> Path:
-    return tasks.TASK_OUTCOMES_DIR / f"{task_id}.json"
+def _outcome_paths(task_id: str) -> tuple[Path, Path]:
+    return (
+        tasks.TASK_OUTCOMES_DIR / f"{task_id}.json",
+        tasks.TASK_OUTCOMES_DIR / f"{task_id}.lifecycle.json",
+    )
 
 
 def _validate_outcome_receipt(
     value: dict[str, Any],
     *,
+    record: dict[str, Any],
     binding: dict[str, Any],
     expected_receipt_sha256: str | None,
 ) -> str:
-    required = {
+    base_required = {
         "schema_version",
         "task_id",
         "unit",
@@ -302,9 +306,16 @@ def _validate_outcome_receipt(
         "observation",
         "receipt_sha256",
     }
-    if set(value) != required:
-        raise TaskAttentionIntegrityError("task outcome receipt fields are invalid")
-    if value["schema_version"] != 1:
+    schema_version = value.get("schema_version")
+    if schema_version == 1:
+        if set(value) != base_required:
+            raise TaskAttentionIntegrityError("task outcome receipt fields are invalid")
+    elif schema_version == 2:
+        if set(value) != base_required | {"kind", "terminalization"}:
+            raise TaskAttentionIntegrityError("task lifecycle receipt fields are invalid")
+        if value.get("kind") != "grabowski_task_lifecycle_receipt":
+            raise TaskAttentionIntegrityError("task lifecycle receipt kind is invalid")
+    else:
         raise TaskAttentionIntegrityError("task outcome receipt schema is unsupported")
     receipt_sha256 = value["receipt_sha256"]
     if not isinstance(receipt_sha256, str) or SHA256_RE.fullmatch(receipt_sha256) is None:
@@ -337,12 +348,134 @@ def _validate_outcome_receipt(
     if isinstance(observed_at, bool) or not isinstance(observed_at, int) or observed_at < 0:
         raise TaskAttentionIntegrityError("task outcome timestamp is invalid")
     resource_keys = value["resource_keys"]
-    if not isinstance(resource_keys, list) or not all(
-        isinstance(item, str) and item for item in resource_keys
+    if (
+        not isinstance(resource_keys, list)
+        or resource_keys != sorted(set(resource_keys))
+        or not all(isinstance(item, str) and item for item in resource_keys)
     ):
         raise TaskAttentionIntegrityError("task outcome resource binding is invalid")
-    return receipt_sha256
 
+    if schema_version == 2:
+        terminalization = value["terminalization"]
+        terminalization_required = {
+            "kind",
+            "transition_sha256",
+            "task_projection_sha256",
+            "requested_resource_keys",
+            "requested_resource_keys_sha256",
+            "prior_leases",
+            "prior_leases_sha256",
+            "revoked_resource_keys",
+            "missing_resource_keys",
+            "prepared_at_unix",
+            "leases_revoked_at_unix",
+            "recovery_status",
+        }
+        if not isinstance(terminalization, dict) or set(terminalization) != terminalization_required:
+            raise TaskAttentionIntegrityError("task lifecycle terminalization fields are invalid")
+        if terminalization["kind"] != "grabowski_task_terminalization":
+            raise TaskAttentionIntegrityError("task lifecycle terminalization kind is invalid")
+        for field in (
+            "transition_sha256",
+            "task_projection_sha256",
+            "requested_resource_keys_sha256",
+            "prior_leases_sha256",
+        ):
+            field_value = terminalization[field]
+            if not isinstance(field_value, str) or SHA256_RE.fullmatch(field_value) is None:
+                raise TaskAttentionIntegrityError(
+                    f"task lifecycle terminalization {field} is invalid"
+                )
+        requested_keys = terminalization["requested_resource_keys"]
+        revoked_keys = terminalization["revoked_resource_keys"]
+        missing_keys = terminalization["missing_resource_keys"]
+        for label, keys in (
+            ("requested", requested_keys),
+            ("revoked", revoked_keys),
+            ("missing", missing_keys),
+        ):
+            if (
+                not isinstance(keys, list)
+                or keys != sorted(set(keys))
+                or not all(isinstance(item, str) and item for item in keys)
+            ):
+                raise TaskAttentionIntegrityError(
+                    f"task lifecycle terminalization {label} resources are invalid"
+                )
+        if requested_keys != resource_keys:
+            raise TaskAttentionIntegrityError(
+                "task lifecycle requested resources do not match outcome resources"
+            )
+        if terminalization["requested_resource_keys_sha256"] != _sha256_json(requested_keys):
+            raise TaskAttentionIntegrityError("task lifecycle requested resource hash is invalid")
+        if missing_keys != sorted(set(requested_keys) - set(revoked_keys)):
+            raise TaskAttentionIntegrityError("task lifecycle missing resource set is invalid")
+        prior_leases = terminalization["prior_leases"]
+        if not isinstance(prior_leases, list) or not all(
+            isinstance(item, dict) and isinstance(item.get("resource_key"), str)
+            for item in prior_leases
+        ):
+            raise TaskAttentionIntegrityError("task lifecycle prior lease evidence is invalid")
+        if terminalization["prior_leases_sha256"] != _sha256_json(prior_leases):
+            raise TaskAttentionIntegrityError("task lifecycle prior lease hash is invalid")
+        if sorted(item["resource_key"] for item in prior_leases) != revoked_keys:
+            raise TaskAttentionIntegrityError("task lifecycle revoked lease evidence is invalid")
+        prepared_at = terminalization["prepared_at_unix"]
+        revoked_at = terminalization["leases_revoked_at_unix"]
+        if (
+            isinstance(prepared_at, bool)
+            or not isinstance(prepared_at, int)
+            or prepared_at < 0
+            or isinstance(revoked_at, bool)
+            or not isinstance(revoked_at, int)
+            or revoked_at < prepared_at
+        ):
+            raise TaskAttentionIntegrityError("task lifecycle terminalization timestamps are invalid")
+        recovery_status = terminalization["recovery_status"]
+        if recovery_status not in {
+            "not_recovered",
+            "recovered_legacy_row_first",
+            "recovered_after_revocation",
+        }:
+            raise TaskAttentionIntegrityError("task lifecycle recovery status is invalid")
+        task_projection = {
+            "task_id": record["task_id"],
+            "state": record["state"],
+            "updated_at_unix": record["updated_at_unix"],
+            "launcher_json": record["launcher_json"],
+            "last_observation_json": record.get("last_observation_json"),
+            "unit": record["unit"],
+            "authoritative_unit": tasks._authoritative_unit(record),
+            "attempt": int(record["attempt"]),
+        }
+        if terminalization["task_projection_sha256"] != _sha256_json(task_projection):
+            raise TaskAttentionIntegrityError("task lifecycle task projection hash is invalid")
+        transition_material = {
+            "schema_version": 1,
+            "kind": terminalization["kind"],
+            "task_id": binding["task_id"],
+            "attempt": binding["attempt"],
+            "lease_owner_id": f"task:{binding['task_id']}",
+            "terminal_state": value["state"],
+            "task_projection_sha256": terminalization["task_projection_sha256"],
+            "requested_resource_keys_sha256": terminalization[
+                "requested_resource_keys_sha256"
+            ],
+            "prior_leases_sha256": terminalization["prior_leases_sha256"],
+            "revoked_resource_keys": revoked_keys,
+            "missing_resource_keys": missing_keys,
+            "observation_sha256": value["observation_sha256"],
+            "prepared_at_unix": prepared_at,
+            "leases_revoked_at_unix": revoked_at,
+            "recovery_status": recovery_status,
+        }
+        if terminalization["transition_sha256"] != _sha256_json(transition_material):
+            raise TaskAttentionIntegrityError("task lifecycle transition hash is invalid")
+        if record.get("terminalization_sha256") != terminalization["transition_sha256"]:
+            raise TaskAttentionIntegrityError("task lifecycle task-row transition binding is invalid")
+        if record.get("lifecycle_receipt_sha256") != receipt_sha256:
+            raise TaskAttentionIntegrityError("task lifecycle task-row receipt binding is invalid")
+    return receipt_sha256
 
 def _read_valid_outcome(
     record: dict[str, Any],
@@ -350,17 +483,55 @@ def _read_valid_outcome(
     expected_receipt_sha256: str | None,
 ) -> tuple[dict[str, Any], str, str]:
     binding = _task_binding(record)
+    authoritative_receipt_sha256 = record.get("lifecycle_receipt_sha256")
+    if authoritative_receipt_sha256 is not None:
+        if (
+            not isinstance(authoritative_receipt_sha256, str)
+            or SHA256_RE.fullmatch(authoritative_receipt_sha256) is None
+        ):
+            raise TaskAttentionIntegrityError(
+                "task lifecycle task-row receipt binding is invalid"
+            )
+        if (
+            expected_receipt_sha256 is not None
+            and expected_receipt_sha256 != authoritative_receipt_sha256
+        ):
+            raise TaskAttentionConflictError(
+                "task outcome receipt does not match authoritative task-row hash"
+            )
+        expected_receipt_sha256 = authoritative_receipt_sha256
+
     _ensure_private_directory(tasks.TASK_OUTCOMES_DIR, create=False)
-    value, file_sha256 = _read_private_json(
-        _outcome_path(binding["task_id"]),
-        label="task outcome receipt",
-    )
-    receipt_sha256 = _validate_outcome_receipt(
-        value,
-        binding=binding,
-        expected_receipt_sha256=expected_receipt_sha256,
-    )
-    return value, receipt_sha256, file_sha256
+    first_missing: FileNotFoundError | None = None
+    first_conflict: TaskAttentionConflictError | None = None
+    for path in _outcome_paths(binding["task_id"]):
+        try:
+            value, file_sha256 = _read_private_json(
+                path,
+                label="task outcome receipt",
+            )
+        except FileNotFoundError as exc:
+            if first_missing is None:
+                first_missing = exc
+            continue
+        try:
+            receipt_sha256 = _validate_outcome_receipt(
+                value,
+                record=record,
+                binding=binding,
+                expected_receipt_sha256=expected_receipt_sha256,
+            )
+        except TaskAttentionConflictError as exc:
+            if first_conflict is None:
+                first_conflict = exc
+            continue
+        return value, receipt_sha256, file_sha256
+
+    if first_conflict is not None:
+        raise first_conflict
+    if first_missing is not None:
+        raise first_missing
+    raise FileNotFoundError(f"No task outcome receipt for {binding['task_id']}")
 
 
 def _decision_path(binding: dict[str, Any]) -> Path:
