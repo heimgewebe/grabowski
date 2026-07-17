@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Juno Operator beendet interaktive Warnläufe ohne rote `SystemExit`-Ausnahme; echte Laufzeitfehler bleiben weiterhin sichtbar.
-
+- Extended the commit-bound Rootbroker cutover to install the reviewed root-task systemd action as an exact, recovery-gated catalog contract; absent actions are added, exact preexisting actions remain idempotent, drifted actions, broadened patterns or command prefixes, and incoherent publisher/lifecycle gates fail closed before backup or mutation.
 - Added Juno Operator, a standard-library-only read-only iPad dashboard with bounded storage/network collectors, local cache, self-contained HTML, notebook entry point, and hash-bound incident packages.
 - Added read-only gate-evidence preparation and semantic convergence-state classification grips so repeated fail-closed friction can collect named evidence without policy bypasses, while historical defects, expected red phases, blocks, supersessions, resolutions and contradictions remain explicitly distinguishable.
 - Moved the canonical typed operator blockade into a root-owned authority domain with a peer-cgroup-bound internal broker lifecycle, two-phase fail-closed legacy migration, root audit intent-before-mutation, recovery-gated engage rollback, disarm restore, unknown-outcome readback and dual canonical/legacy fail-closed observation.
