@@ -703,6 +703,8 @@ class GripFoundationTests(unittest.TestCase):
                 "pr-create-or-update",
                 "repo-orient",
                 "runtime-deploy-check",
+                "task-attention-decision",
+                "task-attention-reconciliation",
                 "scout",
                 "situation",
                 "worktree-ensure",
@@ -3668,6 +3670,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
             "job_prefix": "grabowski-job-",
             "expected_head": CAPTAIN_HEAD,
+            "source_kind": "canonical-main",
+            "source_identity_sha256": "e" * 64,
             "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
             "ready": True,
         }
@@ -3692,6 +3696,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "delay_seconds": 8,
             "unit": unit,
             "argv_sha256": expected_argv_sha256,
+            "source_identity_sha256": "e" * 64,
+            "source_identity": {"identity_sha256": "e" * 64},
             "metadata_path": str(job_dir / "metadata.json"),
             "stdout_path": str(job_dir / "stdout.log"),
             "stderr_path": str(job_dir / "stderr.log"),
@@ -3762,6 +3768,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
             "job_prefix": "grabowski-job-",
             "expected_head": CAPTAIN_HEAD,
+            "source_kind": "canonical-main",
+            "source_identity_sha256": "e" * 64,
             "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
             "ready": True,
         }
@@ -3773,6 +3781,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "delay_seconds": 8,
             "unit": "grabowski-job-abcdef012345",
             "argv_sha256": "d" * 64,
+            "source_identity_sha256": "e" * 64,
+            "source_identity": {"identity_sha256": "e" * 64},
             "metadata_path": "/wrong/metadata.json",
             "stdout_path": "/wrong/stdout.log",
             "stderr_path": "/wrong/stderr.log",
@@ -3830,6 +3840,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
             "job_prefix": "grabowski-job-",
             "expected_head": CAPTAIN_HEAD,
+            "source_kind": "canonical-main",
+            "source_identity_sha256": "e" * 64,
             "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
             "ready": True,
         }
@@ -3877,6 +3889,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "delay_seconds": 8,
             "unit": unit,
             "argv_sha256": expected_argv_sha256,
+            "source_identity_sha256": "e" * 64,
+            "source_identity": {"identity_sha256": "e" * 64},
             "metadata_path": str(job_dir / "metadata.json"),
             "stdout_path": str(job_dir / "stdout.log"),
             "stderr_path": str(job_dir / "stderr.log"),
@@ -3893,6 +3907,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 expected_argv_sha256=expected_argv_sha256,
                 expected_job_root=str(job_root),
                 expected_job_prefix=job_prefix,
+                expected_source_identity_sha256="e" * 64,
             ),
         )
         drifted = dict(
@@ -3910,6 +3925,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             expected_argv_sha256=expected_argv_sha256,
             expected_job_root=str(job_root),
             expected_job_prefix=job_prefix,
+            expected_source_identity_sha256="e" * 64,
         )
         self.assertIn("runtime_deploy_schedule_requested_delay_mismatch", errors)
         self.assertIn("runtime_deploy_schedule_unit_missing_or_unbound", errors)
@@ -3923,6 +3939,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             expected_argv_sha256=expected_argv_sha256,
             expected_job_root=str(job_root),
             expected_job_prefix=job_prefix,
+            expected_source_identity_sha256="e" * 64,
         )
         self.assertIn("runtime_deploy_schedule_argv_hash_mismatch", hash_errors)
 

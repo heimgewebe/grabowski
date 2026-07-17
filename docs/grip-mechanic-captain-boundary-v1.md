@@ -1,7 +1,7 @@
 # Grip Mechanic/Captain Boundary v1
 
 Status: implementation slice
-Date: 2026-07-07 (updated 2026-07-14: atomic merge lease guard)
+Date: 2026-07-07 (updated 2026-07-17: source-bound deploy surface and task-attention decisions)
 
 ## Boundary
 
@@ -9,13 +9,13 @@ Date: 2026-07-07 (updated 2026-07-14: atomic merge lease guard)
 
 `captain-preflight` is a Captain-only seam. It recognizes high-impact action envelopes, validates target, scope, recovery or irreversibility, and target-change records. It remains read-only: it evaluates the Captain authority gates listed below and never executes anything.
 
-`captain-run` is the execution seam for action-specific Captain operations. It executes exactly one action per invocation and currently supports `pr-merge` plus the registered `grabowski-self` adapter for `runtime-deploy`. Both paths require the same Captain gates, `allow_execution=true`, a fresh action-bound `execution_intent` (see "Captain execution intent" below), and evidence bound to the reviewed `expected_head`. The merge executor verifies GitHub state before and after mutation. The self-deploy executor verifies the canonical Grabowski checkout before scheduling an independent delayed deployment job and verifies the scheduling receipt; deployment completion remains a later, separately observed state. In trusted-owner mode, a reversible `runtime-deploy` may execute without a per-action human authorization record when every Captain evidence gate passes, the exact trusted-owner autonomy policy is present, and the action remains bound to the registered local adapter and target. This is intentional operator authority, not an implicit exemption. Other high-impact actions remain explicitly blocked until they receive dedicated executors.
+`captain-run` is the execution seam for action-specific Captain operations. It executes exactly one action per invocation and currently supports `pr-merge` plus the registered `grabowski-self` adapter for `runtime-deploy`. Both paths require the same Captain gates, `allow_execution=true`, a fresh action-bound `execution_intent` (see "Captain execution intent" below), and evidence bound to the reviewed `expected_head`. The merge executor verifies GitHub state before and after mutation. The self-deploy executor verifies either the canonical Grabowski checkout or an explicitly selected, owner-leased detached worktree sharing the canonical Git common directory before scheduling an independent delayed deployment job. It binds the exact source identity through preflight, command hash, scheduling receipt and post-schedule verification; deployment completion remains a later, separately observed state. In trusted-owner mode, a reversible `runtime-deploy` may execute without a per-action human authorization record when every Captain evidence gate passes, the exact trusted-owner autonomy policy is present, and the action remains bound to the registered local adapter and target. This is intentional operator authority, not an implicit exemption. Other high-impact actions remain explicitly blocked until they receive dedicated executors.
 
 ## Captain authority gates
 
 `captain-preflight` and `captain-run` evaluate a structured gate list per request: `high-impact-marked`, `target-bound`, `scope-bound`, `target-change-record`, `recovery-or-irreversibility`, `status-projection-fresh`, `execution-authority-present`, `review-evidence-present`, `diff-bound`, `ci-green`, `autonomy-policy`, `human-authorization-present`. Every gate reports `id`, `status` (`pass`/`blocked`), `reason` and optional `details`. Missing safety evidence blocks; the evaluation is fail-closed.
 
-Target binding is action-specific: `pr-merge` requires exactly one syntactically bounded `owner/repo` slug, a positive integer `pr`, and a concrete non-wildcard `base`; `runtime-deploy` requires exactly one concrete `repo` or `service`, exactly one concrete `environment` or `runtime_target`, and one registered `adapter`; the first executable adapter is `grabowski-self`, bound to `grabowski-mcp`/`heimgewebe/grabowski` on `heim-pc`; `service-restart` requires one concrete non-wildcard `host` and one concrete non-wildcard `unit`; `fleet-mutation` requires a concrete `fleet_target` and an explicit non-generic `operation`; `cleanup-apply` requires one concrete `cleanup_target` plus a bounded `repo` or concrete `checkout_path`, and any provided optional target field must be typed and concrete. Target changes require an explicit non-empty `target_change` record when present or required; silent target switches and empty target-change records are rejected.
+Target binding is action-specific: `pr-merge` requires exactly one syntactically bounded `owner/repo` slug, a positive integer `pr`, and a concrete non-wildcard `base`; `runtime-deploy` requires exactly one concrete `repo` or `service`, exactly one concrete `environment` or `runtime_target`, and one registered `adapter`; the first executable adapter is `grabowski-self`, bound to `grabowski-mcp`/`heimgewebe/grabowski` on `heim-pc`. Optional `source_repository` and `source_lease_owner_id` must be supplied together, must match between parameters and the action target, and identify one absolute, clean, exact-head detached worktree with the expected owner lease; `service-restart` requires one concrete non-wildcard `host` and one concrete non-wildcard `unit`; `fleet-mutation` requires a concrete `fleet_target` and an explicit non-generic `operation`; `cleanup-apply` requires one concrete `cleanup_target` plus a bounded `repo` or concrete `checkout_path`, and any provided optional target field must be typed and concrete. Target changes require an explicit non-empty `target_change` record when present or required; silent target switches and empty target-change records are rejected.
 
 Status projection is mandatory evidence: `status_projection` must be a non-empty object with `status_projection_fresh=true`, an allowlisted `status_projection_source` label that matches the hash-bound `status_projection.source`, a supported `schema_version`, required minimal typed status fields including `healthy=true`, a timezone-aware ISO-8601 string or numeric Unix-timestamp `generated_at` inside the configured max-age window with bounded clock-skew tolerance, replay-reference metadata such as `receipt_ref`, `run_id` or `nonce`, and a `status_projection_sha256` that matches the deterministic JSON hash of the projection object. A missing, stale, non-allowlisted, unhashed, replay-reference-less, unhealthy or drifted projection blocks. Caller-declared freshness is not enough by itself. Replay-reference metadata is presence-checked but not uniqueness-verified; when multiple replay-reference fields are present, `receipt_ref` is preferred over `run_id`, and `run_id` is preferred over `nonce`. `source_trusted` is retained for compatibility; new callers should use `source_allowlisted`. Captain evidence must be bound to an explicit `expected_head`; review and CI evidence must match that head. The projection is evidence about observed state, never runtime truth.
 
@@ -55,10 +55,16 @@ Receipts never echo the raw intent, actor or context. The top-level `execution_i
 - `situation`
 - `scout`
 - `runtime-deploy-check`
+- `task-attention-decision`
+- `task-attention-reconciliation`
 - `pr-check-readiness`
 - `post-merge-sync`
 - `branch-publish`
 - `pr-create-or-update`
+
+## Task attention decisions
+
+The normal mutating grip `task-attention-decision` records one create-only operator decision only for the current task attempt and only when a valid terminal attention outcome receipt binds task, attempt, task unit, authoritative unit, argv hash and execution-envelope hash. `task-attention-reconciliation` is read-only and classifies one bounded task snapshot without systemd/Fleet probes, retries or task mutation. It never infers closed, deferred or superseded state from a unit state, resume policy or timestamp. See `docs/task-attention-decisions-v1.md`.
 
 ## Action evidence schemas
 
