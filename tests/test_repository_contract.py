@@ -1,4 +1,5 @@
 from pathlib import Path
+import ast
 import json
 import unittest
 
@@ -200,10 +201,44 @@ class RepositoryContractTests(unittest.TestCase):
         )
         self.assertEqual(supporting["grabowski_grip_orchestration"], "src/grabowski_grip_orchestration.py")
         self.assertEqual(supporting["grabowski_merge_guard"], "src/grabowski_merge_guard.py")
-        for module in ("grabowski_mcp", "grabowski_grips", "grabowski_convergence", "grabowski_grip_orchestration", "grabowski_merge_guard", "grabowski_operator_obligation", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_privileged_broker", "grabowski_tasks", "grabowski_recovery", "grabowski_friction", "grabowski_agent_bootstrap", "grabowski_recall", "grabowski_consumer_surface", "grabowski_private_io", "grabowski_job_origin", "grabowski_job_finalizer"):
+        self.assertEqual(
+            supporting["grabowski_task_attention"],
+            "src/grabowski_task_attention.py",
+        )
+        for module in ("grabowski_mcp", "grabowski_grips", "grabowski_convergence", "grabowski_grip_orchestration", "grabowski_merge_guard", "grabowski_operator_obligation", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_privileged_broker", "grabowski_tasks", "grabowski_task_attention", "grabowski_recovery", "grabowski_friction", "grabowski_agent_bootstrap", "grabowski_recall", "grabowski_consumer_surface", "grabowski_private_io", "grabowski_job_origin", "grabowski_job_finalizer"):
 
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
+
+    def test_grip_runtime_imports_are_in_the_deployment_source_set(self) -> None:
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        deployed_modules = {
+            contract["module"],
+            *(item["module"] for item in contract["supporting_sources"]),
+        }
+        tree = ast.parse(
+            (ROOT / "src" / "grabowski_grips.py").read_text(encoding="utf-8")
+        )
+        grip_imports: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                candidates = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                candidates = [node.module or ""]
+            else:
+                continue
+            grip_imports.update(
+                candidate.split(".", 1)[0]
+                for candidate in candidates
+                if candidate.startswith("grabowski_")
+            )
+        self.assertEqual(grip_imports - deployed_modules, set())
+
+    def test_task_attention_is_packaged_as_a_python_module(self) -> None:
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('"grabowski_task_attention"', pyproject)
 
     def test_runtime_lock_contract_exists(self) -> None:
         runtime_input = ROOT / "requirements" / "runtime.in"

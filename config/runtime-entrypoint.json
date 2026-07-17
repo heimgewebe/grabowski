@@ -248,6 +248,10 @@
       "source": "src/grabowski_tasks.py"
     },
     {
+      "module": "grabowski_task_attention",
+      "source": "src/grabowski_task_attention.py"
+    },
+    {
       "module": "grabowski_chronik",
       "source": "src/grabowski_chronik.py"
     },
