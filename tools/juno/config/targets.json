@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "targets": [
+    {
+      "id": "juno-agent",
+      "label": "Juno-Agent lokal",
+      "kind": "http",
+      "url": "http://127.0.0.1:8765/health",
+      "timeout_seconds": 3
+    },
+    {
+      "id": "heim-pc-ssh",
+      "label": "heim-pc SSH über Tailscale",
+      "kind": "tcp",
+      "host": "100.68.88.111",
+      "port": 22,
+      "timeout_seconds": 3
+    },
+    {
+      "id": "heim-pc-https",
+      "label": "heim-pc HTTPS über Tailscale",
+      "kind": "tcp",
+      "host": "100.68.88.111",
+      "port": 443,
+      "timeout_seconds": 3
+    }
+  ]
+}
