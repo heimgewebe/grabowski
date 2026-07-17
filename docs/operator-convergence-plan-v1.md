@@ -21,11 +21,17 @@ Bind merge dispatch to a fresh atomic snapshot of repository identity, pull-requ
 
 Expose named task projections through the existing `grabowski_task_list` surface:
 
-- `active`: launching, running, or interrupted tasks;
+- `active`: launching or running tasks whose execution may still be live;
 - `attention`: interrupted, outcome-unknown, failed, timed-out, or signalled tasks;
-- `terminal`: completed, failed, cancelled, timed-out, signalled, or outcome-unknown tasks.
+- `terminal`: completed, failed, cancelled, timed-out, or signalled tasks.
+
+`interrupted` and `outcome_unknown` are retained recovery states, not current execution truth. They remain visible through `attention` and keep fail-closed recovery semantics, but they do not inflate the active-work count.
 
 Every response also returns exact state counts and projection counts from one SQLite read snapshot. Projections intentionally overlap and must not be summed. Unknown legacy states are counted explicitly and make the exact-state projection incomplete instead of disappearing silently. Historical rows remain in the task database.
+
+### P1 — Workspace liveness projection
+
+Derive operational workspace liveness from tasks that may still execute (`launching` or `running`), live resource leases, unresolved task-start intents, and observation errors. Retained recovery states such as `interrupted` or `outcome_unknown` remain explicit reconciliation blockers without claiming that execution is still live. tmux remains a non-authoritative process UI: a surviving idle session is reported, but it does not by itself block stale-workspace reconciliation or make historical work active again. Worktree cleanup remains separately protected by checkout coordination and dirty-state checks.
 
 ### P1 — Gate evidence preparation
 
@@ -65,3 +71,4 @@ Expose `system_overview` in the existing standard and evidence status views. Pro
 5. Every nontrivial merge remains head/base/diff/CI/review/lease bound.
 6. Connector freshness is represented by an expiring receipt bound to the current release and exact tool-name hash, with explicit non-claims.
 7. The consolidated overview remains a read-only projection and fails closed when required component state is unavailable or truncated.
+8. An idle tmux session alone never establishes operational workspace liveness; it remains an explicit cleanup blocker until a mutating closeout removes it. Task, lease, start-intent, and checkout safety remain authoritative.

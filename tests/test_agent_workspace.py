@@ -5133,6 +5133,105 @@ class AgentWorkspaceTests(unittest.TestCase):
         archive.assert_not_called()
         checkout_cleanup.assert_not_called()
 
+    def test_idle_tmux_session_does_not_establish_workspace_liveness(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        workspace._write_manifest(manifest)
+
+        def task_public(task_id: str | None) -> dict:
+            if task_id is None:
+                return {"task_id": None, "state": "not_started", "terminal": False}
+            return {"task_id": task_id, "state": "completed", "terminal": True}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace, "_task_public", side_effect=task_public),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            report = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )
+            plan = report["plans"][0]
+
+        self.assertEqual(report["summary"]["operationally_live_count"], 0)
+        self.assertEqual(
+            report["summary"]["session_only_non_authoritative_count"], 1
+        )
+        self.assertTrue(plan["liveness"]["session_live"])
+        self.assertFalse(plan["liveness"]["operationally_live"])
+        self.assertTrue(plan["liveness"]["session_only_non_authoritative"])
+        self.assertFalse(plan["stale_reconciliation"]["eligible"])
+        blocker_codes = {
+            item["code"] for item in plan["stale_reconciliation"]["blockers"]
+        }
+        self.assertIn("workspace_idle_tmux_cleanup_required", blocker_codes)
+        self.assertNotIn("workspace_tmux_session_live", blocker_codes)
+
+    def test_interrupted_task_requires_reconciliation_without_claiming_liveness(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        workspace._write_manifest(manifest)
+
+        def task_public(task_id: str | None) -> dict:
+            if task_id is None:
+                return {"task_id": None, "state": "not_started", "terminal": False}
+            return {"task_id": task_id, "state": "interrupted", "terminal": False}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace, "_task_public", side_effect=task_public),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+
+        liveness = plan["liveness"]
+        self.assertEqual(liveness["nonterminal_roles"], ["writer"])
+        self.assertEqual(liveness["execution_live_roles"], [])
+        self.assertEqual(liveness["recovery_attention_roles"], ["writer"])
+        self.assertFalse(liveness["operationally_live"])
+        self.assertTrue(liveness["session_only_non_authoritative"])
+        self.assertFalse(plan["stale_reconciliation"]["eligible"])
+        blocker_codes = {
+            item["code"] for item in plan["stale_reconciliation"]["blockers"]
+        }
+        self.assertIn("workspace_tasks_require_reconciliation", blocker_codes)
+        self.assertNotIn("workspace_tasks_nonterminal", blocker_codes)
+        self.assertNotIn("workspace_tmux_session_live", blocker_codes)
+
+    def test_live_tmux_session_remains_blocking_with_nonterminal_task(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        workspace._write_manifest(manifest)
+
+        def task_public(task_id: str | None) -> dict:
+            if task_id is None:
+                return {"task_id": None, "state": "not_started", "terminal": False}
+            return {"task_id": task_id, "state": "running", "terminal": False}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace, "_task_public", side_effect=task_public),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+
+        self.assertTrue(plan["liveness"]["operationally_live"])
+        self.assertFalse(plan["liveness"]["session_only_non_authoritative"])
+        self.assertFalse(plan["stale_reconciliation"]["eligible"])
+        blocker_codes = {item["code"] for item in plan["stale_reconciliation"]["blockers"]}
+        self.assertIn("workspace_tasks_nonterminal", blocker_codes)
+        self.assertIn("workspace_tmux_session_live", blocker_codes)
+
     def test_versioned_missing_workspace_uses_stale_not_legacy_outcome(self) -> None:
         manifest = self.manifest(with_writer=False)
         manifest["created_at"] = "2026-01-01T00:00:00+00:00"

@@ -402,6 +402,22 @@ class TaskTests(unittest.TestCase):
         self.assertTrue(attention["state_counts_complete"])
         self.assertEqual(attention["unknown_state_count"], 0)
         self.assertEqual(tasks.grabowski_task_list(state="active")["count"], 0)
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET state='interrupted' WHERE task_id=?",
+                (task["task_id"],),
+            )
+            connection.commit()
+        interrupted = tasks.grabowski_task_list(state="attention")
+        self.assertEqual(interrupted["count"], 1)
+        self.assertEqual(interrupted["tasks"][0]["state"], "interrupted")
+        self.assertEqual(interrupted["projection_counts"]["active"], 0)
+        self.assertEqual(interrupted["projection_counts"]["attention"], 1)
+        self.assertEqual(interrupted["projection_counts"]["terminal"], 0)
+        self.assertEqual(tasks.grabowski_task_list(state="active")["count"], 0)
+        self.assertIn("reconcile_check", interrupted["tasks"][0]["recommended_next_action"])
+
         self.assertEqual(
             tasks.grabowski_task_list(state="failed")["state_filter_kind"],
             "exact",
