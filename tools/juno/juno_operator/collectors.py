@@ -109,10 +109,27 @@ def _bounded_entries(path: Path) -> tuple[list[dict[str, Any]], bool]:
     return entries, truncated
 
 
-def collect_storage(project_root: Path) -> CollectorResult:
+def collect_storage(
+    project_root: Path,
+    *,
+    local_config_path: Path | None = None,
+) -> CollectorResult:
     roots: list[dict[str, Any]] = []
     warnings: list[str] = []
-    for label, path in discover_storage_roots(project_root):
+    try:
+        discovered_roots = discover_storage_roots(
+            project_root,
+            local_config_path=local_config_path,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return CollectorResult(
+            "storage",
+            "warning",
+            utc_now(),
+            {"roots": []},
+            errors=(f"local storage root catalog invalid: {exc}",),
+        )
+    for label, path in discovered_roots:
         record: dict[str, Any] = {
             "label": label,
             "path": str(path),

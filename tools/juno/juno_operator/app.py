@@ -56,7 +56,10 @@ def refresh(project_root: Path | str = ".") -> tuple[Snapshot, Path]:
         generated_at=utc_now(),
         results=(
             collect_runtime(paths["root"]),
-            collect_storage(paths["root"]),
+            collect_storage(
+                paths["root"],
+                local_config_path=paths["local_storage_roots"],
+            ),
             collect_targets(paths["config"]),
         ),
     )
