@@ -1454,6 +1454,72 @@ class TaskTests(unittest.TestCase):
                 "schema-3 fast path must not repeat migration writes",
             )
 
+    def _promote_to_additive_schema_v4(self, *, incomplete: bool = False) -> str:
+        with tasks._database() as connection:
+            task_id = "d" * 24
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    task_id, host, unit, attempt, state, resume_policy,
+                    argv_json, argv_sha256, cwd, runtime_seconds,
+                    cpu_weight, io_weight, memory_max_bytes,
+                    created_at_unix, updated_at_unix, launcher_json,
+                    last_observation_json, resource_keys_json,
+                    execution_backend, systemd_scope, authoritative_unit
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task_id, "local", f"grabowski-task-{task_id}-a1.service", 1,
+                 "completed", "manual", '["/bin/true"]', "b" * 64,
+                 str(self.root), 60, 100, 100, None, 1, 1, '{}', None, '[]',
+                 "systemd-user", "user", f"grabowski-task-{task_id}-a1.service"),
+            )
+            connection.commit()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("ALTER TABLE tasks ADD COLUMN terminalization_sha256 TEXT")
+            connection.execute("ALTER TABLE tasks ADD COLUMN terminalized_at_unix INTEGER")
+            if not incomplete:
+                connection.execute("ALTER TABLE tasks ADD COLUMN lifecycle_receipt_sha256 TEXT")
+            connection.execute("UPDATE metadata SET value='4' WHERE key='schema_version'")
+            connection.execute(
+                "UPDATE tasks SET terminalization_sha256=?, terminalized_at_unix=? WHERE task_id=?",
+                ("c" * 64, 42, task_id),
+            )
+            if not incomplete:
+                connection.execute(
+                    "UPDATE tasks SET lifecycle_receipt_sha256=? WHERE task_id=?",
+                    ("e" * 64, task_id),
+                )
+            connection.commit()
+        return task_id
+
+    def test_additive_schema_v4_preserves_terminalization_state(self) -> None:
+        task_id = self._promote_to_additive_schema_v4()
+        listed = tasks.grabowski_task_list(limit=10)
+        self.assertTrue(any(item["task_id"] == task_id for item in listed["tasks"]))
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual("4", connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0])
+            self.assertEqual(
+                ("c" * 64, 42, "e" * 64),
+                connection.execute(
+                    "SELECT terminalization_sha256, terminalized_at_unix, lifecycle_receipt_sha256 FROM tasks WHERE task_id=?",
+                    (task_id,),
+                ).fetchone(),
+            )
+
+    def test_incomplete_additive_schema_v4_fails_closed(self) -> None:
+        self._promote_to_additive_schema_v4(incomplete=True)
+        with self.assertRaisesRegex(RuntimeError, "schema 4 is incomplete or unsupported"):
+            tasks.grabowski_task_list()
+
+    def test_unknown_task_schema_still_fails_closed(self) -> None:
+        with tasks._database() as connection:
+            connection.execute("UPDATE metadata SET value='5' WHERE key='schema_version'")
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "Unsupported task database schema"):
+            tasks.grabowski_task_list()
+
     def test_schema_v3_missing_root_contract_column_fails_closed(self) -> None:
         self.database.parent.mkdir(parents=True)
         with sqlite3.connect(self.database) as connection:

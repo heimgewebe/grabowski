@@ -74,6 +74,11 @@ MUTATING_AGENT_EXECUTABLES = frozenset({"agy", "claude", "cline", "codex"})
 READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
 TASK_EXECUTION_BACKENDS = {"systemd-user", "systemd-root-broker"}
 SYSTEMD_SCOPES = {"user", "system"}
+TASK_SCHEMA_V4_ADDITIVE_COLUMNS = {
+    "terminalization_sha256": ("TEXT", 0, 0),
+    "terminalized_at_unix": ("INTEGER", 0, 0),
+    "lifecycle_receipt_sha256": ("TEXT", 0, 0),
+}
 ACTIVE_TASK_STATES = {"running", "outcome_unknown"}
 TASK_LEASE_DELEGATION_STATES = frozenset({"running"})
 
@@ -234,19 +239,19 @@ def _database() -> sqlite3.Connection:
     }
 
     version = schema_version()
-    if version not in {None, "1", "2", "3"}:
+    if version not in {None, "1", "2", "3", "4"}:
         connection.close()
         raise RuntimeError("Unsupported task database schema")
 
     # Established schema-3 databases stay read-only here. Migration writes,
     # backfills, index creation and the version flip are serialized together.
-    if version != "3":
+    if version not in {"3", "4"}:
         connection.execute("BEGIN IMMEDIATE")
         try:
             # Re-read after acquiring the writer lock because another process
             # may have completed the migration while this connection waited.
             version = schema_version()
-            if version not in {None, "1", "2", "3"}:
+            if version not in {None, "1", "2", "3", "4"}:
                 raise RuntimeError("Unsupported task database schema")
             if version is None:
                 if table_exists("metadata") or table_exists("tasks"):
@@ -372,9 +377,24 @@ def _database() -> sqlite3.Connection:
     if missing_indexes:
         connection.close()
         raise RuntimeError(
-            "Task database schema 3 indexes are incomplete: "
+            "Task database schema indexes are incomplete: "
             + ", ".join(sorted(missing_indexes))
         )
+    effective_version = schema_version()
+    if effective_version == "4":
+        columns = {
+            str(row["name"]): (
+                str(row["type"]).upper(), int(row["notnull"]), int(row["pk"])
+            )
+            for row in connection.execute("PRAGMA table_info(tasks)")
+        }
+        expected_names = required_columns | set(TASK_SCHEMA_V4_ADDITIVE_COLUMNS)
+        if set(columns) != expected_names or any(
+            columns.get(name) != expected
+            for name, expected in TASK_SCHEMA_V4_ADDITIVE_COLUMNS.items()
+        ):
+            connection.close()
+            raise RuntimeError("Task database schema 4 is incomplete or unsupported")
     try:
         os.chmod(TASK_DB, 0o600)
     except FileNotFoundError:
