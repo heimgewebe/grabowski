@@ -7,6 +7,7 @@ import inspect
 import json
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -5328,6 +5329,200 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         tampered["owner_id"] = "runtime-actor:" + "0" * 64
         with self.assertRaisesRegex(ValueError, "proof"):
             merge_guard.verify_server_runtime_actor_identity(tampered, now_unix=100)
+
+    def test_server_task_lease_delegation_is_request_bound_and_short_lived(self) -> None:
+        class Session:
+            pass
+
+        task_id = "a" * 24
+        owner = f"task:{task_id}"
+        resource_keys = ["component:test-task-delegation"]
+        task_binding = {
+            "task_id": task_id,
+            "lease_owner_id": owner,
+            "state": "running",
+            "attempt": 1,
+            "updated_at_unix": 100,
+            "resource_keys_sha256": merge_guard._sha256_json(resource_keys),
+            "lease_bindings_sha256": "b" * 64,
+        }
+        evidence = {
+            "schema_version": 1,
+            "kind": "grabowski_live_task_lease_delegation_evidence",
+            **task_binding,
+            "task_record_sha256": merge_guard._sha256_json(task_binding),
+            "resource_keys": resource_keys,
+            "minimum_expires_at_unix": 150,
+            "observed_at_unix": 100,
+        }
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner", now_unix=100
+        )
+        delegation = merge_guard.issue_server_task_lease_delegation(
+            actor,
+            evidence,
+            captain_request_sha256_value="c" * 64,
+            now_unix=100,
+        )
+
+        verified = merge_guard.verify_server_task_lease_delegation(
+            delegation,
+            actor_identity=actor,
+            captain_request_sha256_value="c" * 64,
+            now_unix=100,
+        )
+        self.assertEqual(owner, verified["lease_owner_id"])
+        self.assertEqual(150, verified["expires_at_unix"])
+        with self.assertRaisesRegex(ValueError, "captain request mismatch"):
+            merge_guard.verify_server_task_lease_delegation(
+                delegation,
+                actor_identity=actor,
+                captain_request_sha256_value="d" * 64,
+                now_unix=100,
+            )
+        with self.assertRaisesRegex(ValueError, "not current"):
+            merge_guard.verify_server_task_lease_delegation(
+                delegation,
+                actor_identity=actor,
+                captain_request_sha256_value="c" * 64,
+                now_unix=151,
+            )
+
+    def test_atomic_merge_guard_accepts_live_server_delegated_task_lease(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=96,
+            base="main",
+            head="feat/captain",
+        )
+        task_key = next(
+            key for key in guard_keys if key.startswith("component:github-branch:")
+            and key.endswith(":" + merge_guard._merge_guard_identifier("branch", "feat/captain"))
+        )
+        task_id = "a" * 24
+        task_owner = f"task:{task_id}"
+        resources.acquire_resources(
+            task_owner,
+            [task_key],
+            purpose="live task branch lease",
+            ttl_seconds=600,
+            metadata={"task_id": task_id, "attempt": 1},
+        )
+        lease_evidence = resources.task_lease_delegation_evidence(
+            task_owner, task_id, [task_key]
+        )
+        task_binding = {
+            "task_id": task_id,
+            "lease_owner_id": task_owner,
+            "state": "running",
+            "attempt": 1,
+            "updated_at_unix": int(time.time()),
+            "resource_keys_sha256": lease_evidence["resource_keys_sha256"],
+            "lease_bindings_sha256": lease_evidence["lease_bindings_sha256"],
+        }
+        task_evidence = {
+            "schema_version": 1,
+            "kind": "grabowski_live_task_lease_delegation_evidence",
+            **task_binding,
+            "task_record_sha256": merge_guard._sha256_json(task_binding),
+            "resource_keys": lease_evidence["resource_keys"],
+            "minimum_expires_at_unix": lease_evidence["minimum_expires_at_unix"],
+            "observed_at_unix": lease_evidence["observed_at_unix"],
+        }
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = task_owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        delegation = merge_guard.issue_server_task_lease_delegation(
+            actor,
+            task_evidence,
+            captain_request_sha256_value=merge_guard.captain_request_sha256(parameters),
+        )
+        parameters["_server_task_lease_delegation"] = delegation
+        gh = FakeGh(view={
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA, "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD, "isDraft": False,
+            "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        })
+
+        result = grips.grip_run(
+            "captain-run", parameters, profile="captain", allow_mutation=True,
+            command_runner=FakeGit(), github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("server-runtime-task-delegation-v1", guard["lease_owner_source"])
+        self.assertEqual(task_id, guard["delegated_task_id"])
+        self.assertNotIn(delegation["proof_sha256"], json.dumps(guard, sort_keys=True))
+        remaining = resources.inspect_resource(task_key)
+        self.assertIsNotNone(remaining)
+        self.assertEqual(task_owner, remaining["owner_id"])
+
+    def test_atomic_merge_guard_rejects_delegation_after_task_lease_release(self) -> None:
+        class Session:
+            pass
+
+        task_id = "a" * 24
+        task_owner = f"task:{task_id}"
+        task_key = "component:delegated-task-release"
+        resources.acquire_resources(
+            task_owner, [task_key], purpose="task lease", ttl_seconds=600,
+            metadata={"task_id": task_id},
+        )
+        lease_evidence = resources.task_lease_delegation_evidence(
+            task_owner, task_id, [task_key]
+        )
+        task_binding = {
+            "task_id": task_id, "lease_owner_id": task_owner,
+            "state": "running", "attempt": 1,
+            "updated_at_unix": int(time.time()),
+            "resource_keys_sha256": lease_evidence["resource_keys_sha256"],
+            "lease_bindings_sha256": lease_evidence["lease_bindings_sha256"],
+        }
+        task_evidence = {
+            "schema_version": 1,
+            "kind": "grabowski_live_task_lease_delegation_evidence",
+            **task_binding, "task_record_sha256": merge_guard._sha256_json(task_binding),
+            "resource_keys": [task_key],
+            "minimum_expires_at_unix": lease_evidence["minimum_expires_at_unix"],
+            "observed_at_unix": lease_evidence["observed_at_unix"],
+        }
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = task_owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(Session(), profile="trusted-owner")
+        parameters["_server_runtime_actor_identity"] = actor
+        parameters["_server_task_lease_delegation"] = merge_guard.issue_server_task_lease_delegation(
+            actor, task_evidence,
+            captain_request_sha256_value=merge_guard.captain_request_sha256(parameters),
+        )
+        resources.release_resources(task_owner, [task_key])
+        result = grips.grip_run(
+            "captain-run", parameters, profile="captain", allow_mutation=True,
+            command_runner=FakeGit(), github_runner=FakeGh(view={
+                "number": 96, "state": "OPEN", "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA, "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD, "isDraft": False,
+                "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            }),
+        )
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("blocked_by_live_lease", guard["status"])
+        self.assertIn("delegated task lease is not live", guard["errors"][0])
 
     def test_atomic_merge_guard_prefers_server_actor_to_caller_lease_owner(self) -> None:
         class Session:

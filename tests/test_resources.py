@@ -193,6 +193,61 @@ class ResourceTests(unittest.TestCase):
             item["resource_key"] for item in resources.list_resources()
         ])
 
+    def test_delegated_merge_guard_rejects_same_owner_lease_added_after_signing(self) -> None:
+        repository = self.root / "repo-delegated-growth"
+        repository.mkdir()
+        task_id = "a" * 24
+        task_owner = f"task:{task_id}"
+        existing_main = f"service:github-main:{REPOSITORY_ID}"
+        resources.acquire_resources(
+            task_owner,
+            [existing_main],
+            purpose="signed task lease",
+            ttl_seconds=120,
+            metadata={"task_id": task_id},
+        )
+        delegated_task = resources.task_lease_delegation_evidence(
+            task_owner, task_id, [existing_main]
+        )
+        extra_repo = f"repo:{repository}"
+        resources.acquire_resources(
+            task_owner,
+            [extra_repo],
+            purpose="late task lease",
+            ttl_seconds=120,
+            metadata={"task_id": task_id},
+        )
+        keys = [
+            f"component:github-repository:{REPOSITORY_ID}",
+            f"component:github-branch:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            existing_main,
+            f"service:github-pr:{REPOSITORY_ID}:57",
+            f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+            f"deployment:github:{REPOSITORY_ID}:{MAIN_BRANCH_ID}",
+        ]
+
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_merge_guard_resources(
+                "captain-merge:delegated-growth",
+                task_owner,
+                keys,
+                repository=str(repository),
+                changed_paths=[str(repository / "src" / "target.py")],
+                purpose="atomic delegated merge guard",
+                ttl_seconds=60,
+                metadata={
+                    "merge_guard": {
+                        "head_sha": "a" * 40,
+                        "diff_sha256": "b" * 64,
+                        "base_branch": "main",
+                        "head_branch": "feat/work",
+                    }
+                },
+                delegated_task=delegated_task,
+            )
+
+        self.assertEqual(extra_repo, raised.exception.resource_key)
+
     def test_merge_guard_preserves_owner_repo_lease_and_blocks_only_changed_paths(self) -> None:
         repository = self.root / "repo"
         repository.mkdir()

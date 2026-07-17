@@ -1439,6 +1439,66 @@ def _check_active_merge_guard_conflicts(
             )
 
 
+def task_lease_delegation_evidence(
+    owner_id: str,
+    task_id: str,
+    resource_keys: Iterable[str],
+    *,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Return integrity-bound evidence for one task owner's complete live lease set."""
+    owner = _owner(owner_id)
+    if not isinstance(task_id, str) or re.fullmatch(r"[0-9a-f]{24}", task_id) is None:
+        raise ValueError("task_id is invalid")
+    if owner != f"task:{task_id}":
+        raise ValueError("task lease owner does not match task_id")
+    keys = normalize_resource_keys(resource_keys)
+    now = _now() if now_unix is None else int(now_unix)
+    bindings: list[dict[str, str]] = []
+    minimum_expiry: int | None = None
+    with _database() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM leases WHERE resource_key IN ({','.join('?' for _ in keys)}) ORDER BY resource_key",
+            keys,
+        ).fetchall()
+        by_key = {row["resource_key"]: row for row in rows}
+        for key in keys:
+            row = by_key.get(key)
+            if row is None or row["expires_at_unix"] <= now:
+                raise ValueError(f"task lease is not live: {key}")
+            if row["owner_id"] != owner:
+                raise ValueError(f"task lease owner mismatch: {key}")
+            metadata = _row_metadata(row)
+            _, observed_metadata_sha256 = _metadata(metadata)
+            if row["metadata_sha256"] != observed_metadata_sha256:
+                raise ValueError(f"task lease metadata integrity mismatch: {key}")
+            if metadata.get("task_id") != task_id:
+                raise ValueError(f"task lease metadata task mismatch: {key}")
+            bindings.append(
+                {
+                    "resource_key": key,
+                    "metadata_sha256": row["metadata_sha256"],
+                }
+            )
+            expiry = int(row["expires_at_unix"])
+            minimum_expiry = expiry if minimum_expiry is None else min(minimum_expiry, expiry)
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_live_task_lease_evidence",
+        "task_id": task_id,
+        "lease_owner_id": owner,
+        "resource_keys": keys,
+        "resource_keys_sha256": hashlib.sha256(
+            _canonical_json(keys).encode("utf-8")
+        ).hexdigest(),
+        "lease_bindings_sha256": hashlib.sha256(
+            _canonical_json(bindings).encode("utf-8")
+        ).hexdigest(),
+        "minimum_expires_at_unix": minimum_expiry,
+        "observed_at_unix": now,
+    }
+
+
 def acquire_merge_guard_resources(
     guard_owner_id: str,
     lease_owner_id: str,
@@ -1449,6 +1509,7 @@ def acquire_merge_guard_resources(
     purpose: str,
     ttl_seconds: int = 300,
     metadata: dict[str, Any] | None = None,
+    delegated_task: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     guard_owner = _owner(guard_owner_id)
     lease_owner = _owner(lease_owner_id)
@@ -1457,6 +1518,41 @@ def acquire_merge_guard_resources(
     keys = normalize_resource_keys(resource_keys)
     lease_purpose = _purpose(purpose)
     ttl = _ttl(ttl_seconds)
+    delegated_task_id: str | None = None
+    delegated_resource_keys: list[str] = []
+    delegated_bindings_sha256: str | None = None
+    if delegated_task is not None:
+        required = {
+            "task_id",
+            "lease_owner_id",
+            "resource_keys",
+            "resource_keys_sha256",
+            "lease_bindings_sha256",
+        }
+        if not isinstance(delegated_task, dict) or not required.issubset(delegated_task):
+            raise ValueError("delegated task binding is invalid")
+        delegated_task_id = delegated_task.get("task_id")
+        if (
+            not isinstance(delegated_task_id, str)
+            or re.fullmatch(r"[0-9a-f]{24}", delegated_task_id) is None
+        ):
+            raise ValueError("delegated task_id is invalid")
+        if delegated_task.get("lease_owner_id") != lease_owner:
+            raise ValueError("delegated task owner does not match lease owner")
+        delegated_resource_keys = normalize_resource_keys(
+            delegated_task.get("resource_keys")
+        )
+        expected_keys_sha256 = hashlib.sha256(
+            _canonical_json(delegated_resource_keys).encode("utf-8")
+        ).hexdigest()
+        if delegated_task.get("resource_keys_sha256") != expected_keys_sha256:
+            raise ValueError("delegated task resource key digest is invalid")
+        delegated_bindings_sha256 = delegated_task.get("lease_bindings_sha256")
+        if (
+            not isinstance(delegated_bindings_sha256, str)
+            or SHA256_RE.fullmatch(delegated_bindings_sha256) is None
+        ):
+            raise ValueError("delegated task lease binding digest is invalid")
     repository_path = Path(repository).expanduser()
     if not repository_path.is_absolute():
         raise ValueError("merge guard repository must be absolute")
@@ -1513,6 +1609,46 @@ def acquire_merge_guard_resources(
                 "SELECT * FROM leases WHERE expires_at_unix>? ORDER BY resource_key",
                 (now,),
             ).fetchall()
+            if delegated_task_id is not None:
+                delegated_rows = {
+                    row["resource_key"]: row
+                    for row in rows
+                    if row["resource_key"] in delegated_resource_keys
+                }
+                bindings: list[dict[str, str]] = []
+                for delegated_key in delegated_resource_keys:
+                    delegated_row = delegated_rows.get(delegated_key)
+                    if delegated_row is None:
+                        raise ValueError(
+                            f"delegated task lease is not live: {delegated_key}"
+                        )
+                    if delegated_row["owner_id"] != lease_owner:
+                        raise ResourceConflict(
+                            delegated_key,
+                            delegated_row["owner_id"],
+                            delegated_row["expires_at_unix"],
+                        )
+                    delegated_metadata = _row_metadata(delegated_row)
+                    _, observed_delegated_sha256 = _metadata(delegated_metadata)
+                    if delegated_row["metadata_sha256"] != observed_delegated_sha256:
+                        raise ValueError(
+                            f"delegated task lease metadata integrity mismatch: {delegated_key}"
+                        )
+                    if delegated_metadata.get("task_id") != delegated_task_id:
+                        raise ValueError(
+                            f"delegated task lease metadata task mismatch: {delegated_key}"
+                        )
+                    bindings.append(
+                        {
+                            "resource_key": delegated_key,
+                            "metadata_sha256": delegated_row["metadata_sha256"],
+                        }
+                    )
+                observed_bindings_sha256 = hashlib.sha256(
+                    _canonical_json(bindings).encode("utf-8")
+                ).hexdigest()
+                if observed_bindings_sha256 != delegated_bindings_sha256:
+                    raise ValueError("delegated task lease bindings changed")
             existing_owned_keys: set[str] = set()
             for row in rows:
                 row_key = row["resource_key"]
@@ -1576,6 +1712,13 @@ def acquire_merge_guard_resources(
                 same_lease_owner = row["owner_id"] == lease_owner
                 if same_lease_owner:
                     if row_key.startswith("gate:github-merge:"):
+                        raise ResourceConflict(
+                            row_key, row["owner_id"], row["expires_at_unix"]
+                        )
+                    if (
+                        delegated_task_id is not None
+                        and row_key not in delegated_resource_keys
+                    ):
                         raise ResourceConflict(
                             row_key, row["owner_id"], row["expires_at_unix"]
                         )
@@ -1645,6 +1788,8 @@ def acquire_merge_guard_resources(
         "acquired_leases": [_public(row) for row in acquired_rows],
         "held_resource_keys": held_keys,
         "resource_keys": keys,
+        "delegated_task_id": delegated_task_id,
+        "delegated_task_resource_keys": delegated_resource_keys,
     }
 
 

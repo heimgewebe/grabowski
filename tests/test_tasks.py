@@ -104,7 +104,12 @@ class TaskTests(unittest.TestCase):
         self.db_patch.stop()
         self.temporary.cleanup()
 
-    def _start(self, *, host: str = "local") -> dict[str, object]:
+    def _start(
+        self,
+        *,
+        host: str = "local",
+        resource_keys: list[str] | None = None,
+    ) -> dict[str, object]:
         selected = LOCAL_HOST if host == "local" else REMOTE_HOST
         with patch.object(tasks.fleet, "fleet_host", return_value=selected), patch.object(
             tasks, "_dispatch", return_value=_launcher()
@@ -120,6 +125,7 @@ class TaskTests(unittest.TestCase):
                 cpu_weight=50,
                 io_weight=25,
                 memory_max_bytes=64 * 1024 * 1024,
+                resource_keys=resource_keys,
             )
         launch = dispatch.call_args.args[1]
         descriptions = [item for item in launch if item.startswith("--description=")]
@@ -138,6 +144,32 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=UMask=0077", launch)
         self.assertEqual(launch[-3:], ["--", "/bin/echo", "ok"])
         return result
+
+    def test_server_task_lease_delegation_requires_running_task_and_live_leases(self) -> None:
+        result = self._start(resource_keys=["component:test-task-delegation"])
+        task = result["task"]
+        owner = task["lease_owner_id"]
+
+        evidence = tasks.server_task_lease_delegation_evidence(owner)
+
+        self.assertEqual(task["task_id"], evidence["task_id"])
+        self.assertEqual(owner, evidence["lease_owner_id"])
+        self.assertEqual("running", evidence["state"])
+        self.assertEqual(task["resource_keys"], evidence["resource_keys"])
+        self.assertRegex(evidence["task_record_sha256"], r"[0-9a-f]{64}\Z")
+
+        tasks._set_state(task["task_id"], "completed")
+        with self.assertRaisesRegex(ValueError, "state does not permit"):
+            tasks.server_task_lease_delegation_evidence(owner)
+
+    def test_server_task_lease_delegation_rejects_missing_live_lease(self) -> None:
+        result = self._start(resource_keys=["component:test-task-delegation-missing"])
+        task = result["task"]
+        owner = task["lease_owner_id"]
+        tasks.resources.release_resources(owner, task["resource_keys"])
+
+        with self.assertRaisesRegex(ValueError, "not live"):
+            tasks.server_task_lease_delegation_evidence(owner)
 
     def test_start_persists_auditable_record(self) -> None:
         result = self._start()

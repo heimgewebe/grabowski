@@ -75,6 +75,7 @@ READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
 TASK_EXECUTION_BACKENDS = {"systemd-user", "systemd-root-broker"}
 SYSTEMD_SCOPES = {"user", "system"}
 ACTIVE_TASK_STATES = {"running", "outcome_unknown"}
+TASK_LEASE_DELEGATION_STATES = frozenset({"running"})
 
 
 def _now() -> int:
@@ -1114,6 +1115,49 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
         "probe": result,
         "observer": observer,
         "observed_at_unix": _now(),
+    }
+
+
+def server_task_lease_delegation_evidence(lease_owner_id: str) -> dict[str, Any]:
+    """Validate one live task and its complete current lease set for server delegation."""
+    if not isinstance(lease_owner_id, str):
+        raise ValueError("task lease owner must be text")
+    match = re.fullmatch(r"task:([0-9a-f]{24})", lease_owner_id)
+    if match is None:
+        raise ValueError("task lease owner is invalid")
+    task_id = match.group(1)
+    record = _row(task_id)
+    effective_owner = record.get("lease_owner_id") or _lease_owner(task_id)
+    if effective_owner != lease_owner_id:
+        raise ValueError("task record lease owner mismatch")
+    state = str(record.get("state", ""))
+    if state not in TASK_LEASE_DELEGATION_STATES:
+        raise ValueError(f"task state does not permit lease delegation: {state}")
+    resource_keys = _record_resource_keys(record)
+    if not resource_keys:
+        raise ValueError("task has no resource leases to delegate")
+    lease_evidence = resources.task_lease_delegation_evidence(
+        lease_owner_id,
+        task_id,
+        resource_keys,
+    )
+    task_binding = {
+        "task_id": task_id,
+        "lease_owner_id": lease_owner_id,
+        "state": state,
+        "attempt": int(record["attempt"]),
+        "updated_at_unix": int(record["updated_at_unix"]),
+        "resource_keys_sha256": lease_evidence["resource_keys_sha256"],
+        "lease_bindings_sha256": lease_evidence["lease_bindings_sha256"],
+    }
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_live_task_lease_delegation_evidence",
+        **task_binding,
+        "task_record_sha256": _sha256_json(task_binding),
+        "resource_keys": lease_evidence["resource_keys"],
+        "minimum_expires_at_unix": lease_evidence["minimum_expires_at_unix"],
+        "observed_at_unix": lease_evidence["observed_at_unix"],
     }
 
 
