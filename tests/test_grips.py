@@ -5303,6 +5303,131 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertEqual([], gh.calls)
 
+    def test_server_runtime_actor_identity_is_session_bound_and_tamper_evident(self) -> None:
+        class Session:
+            pass
+
+        first_session = Session()
+        second_session = Session()
+        first = merge_guard.issue_server_runtime_actor_identity(
+            first_session, profile="trusted-owner", now_unix=100
+        )
+        repeated = merge_guard.issue_server_runtime_actor_identity(
+            first_session, profile="trusted-owner", now_unix=101
+        )
+        second = merge_guard.issue_server_runtime_actor_identity(
+            second_session, profile="trusted-owner", now_unix=100
+        )
+
+        self.assertEqual(first["owner_id"], repeated["owner_id"])
+        self.assertNotEqual(first["owner_id"], second["owner_id"])
+        verified = merge_guard.verify_server_runtime_actor_identity(first, now_unix=100)
+        self.assertEqual(first["owner_id"], verified["owner_id"])
+
+        tampered = dict(first)
+        tampered["owner_id"] = "runtime-actor:" + "0" * 64
+        with self.assertRaisesRegex(ValueError, "proof"):
+            merge_guard.verify_server_runtime_actor_identity(tampered, now_unix=100)
+
+    def test_atomic_merge_guard_prefers_server_actor_to_caller_lease_owner(self) -> None:
+        class Session:
+            pass
+
+        parameters = authorized_captain_run_parameters()
+        identity = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        runner = merge_guard.CaptainMergeGuardRunner(
+            repo_path=Path.cwd(),
+            action=parameters["actions"][0],
+            parameters=parameters,
+            github_runner=FakeGh(),
+            execution_intent_sha256="f" * 64,
+            lease_owner_id="visible-foreign-owner",
+            server_actor_identity=identity,
+        )
+
+        self.assertEqual(identity["owner_id"], runner.lease_owner_id)
+        self.assertEqual("server-runtime-session-v1", runner.lease_owner_source)
+        self.assertTrue(runner.receipt["lease_owner_binding"]["server_authenticated"])
+        self.assertNotIn(
+            "server_authenticated_lease_owner_identity",
+            runner.receipt["does_not_establish"],
+        )
+        self.assertNotIn(identity["proof_sha256"], json.dumps(runner.receipt, sort_keys=True))
+
+    def test_atomic_merge_guard_server_actor_blocks_spoofed_visible_owner_lease(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        resource_keys = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=96,
+            base="main",
+            head="feat/captain",
+        )
+        head_component = next(
+            key
+            for key in resource_keys
+            if key.startswith("component:github-branch:")
+            and key.endswith(
+                ":" + merge_guard._merge_guard_identifier("branch", "feat/captain")
+            )
+        )
+        resources.acquire_resources(
+            "visible-foreign-owner",
+            [head_component],
+            purpose="foreign visible lease",
+            ttl_seconds=60,
+        )
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = (
+            "visible-foreign-owner"
+        )
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters,
+            context=parameters["execution_intent"]["context"],
+        )
+        parameters["_server_runtime_actor_identity"] = (
+            merge_guard.issue_server_runtime_actor_identity(
+                Session(), profile="trusted-owner"
+            )
+        )
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertEqual(
+            "server-runtime-session-v1",
+            execution["merge_lease_guard"]["lease_owner_binding"]["source"],
+        )
+        self.assertEqual(
+            "blocked_by_live_lease", execution["merge_lease_guard"]["status"]
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
     def test_atomic_merge_guard_hashes_raw_diff_bytes_without_newline_translation(self) -> None:
         raw_diff = b"captain-diff\r\n"
         parameters = authorized_captain_run_parameters()

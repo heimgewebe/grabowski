@@ -26,6 +26,13 @@ import urllib.parse
 import uuid
 
 from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import Context
+except ImportError:
+    fastmcp_module = sys.modules.get("mcp.server.fastmcp")
+    if getattr(fastmcp_module, "__file__", None) is not None:
+        raise
+    Context = Any  # Isolated tests install an intentionally minimal module double.
 from mcp.types import ToolAnnotations
 
 import grabowski_consumer_surface as consumer_surface
@@ -34,6 +41,7 @@ import grabowski_blockades as blockade_policy
 import grabowski_blockade_store as blockade_store
 
 import grabowski_grips
+import grabowski_merge_guard
 
 APP_NAME = "Grabowski"
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 5
@@ -6622,12 +6630,19 @@ def grip_run(
     parameters: dict[str, Any] | None = None,
     profile: str = "operator",
     allow_mutation: bool = False,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Run one allowlisted Grabowski grip and return its receipt-bound result."""
     _require_capability("terminal_execute")
     if allow_mutation:
         _require_mutations_enabled("terminal_execute")
     raw_parameters = parameters or {}
+    if "_server_runtime_actor_identity" in raw_parameters:
+        return grabowski_grips._blocked_surface_receipt(
+            name,
+            raw_parameters,
+            "caller supplied reserved server runtime actor identity",
+        )
     decision = _session_grip_policy_decision(name, raw_parameters)
     if not decision["allowed"]:
         return grabowski_grips._blocked_surface_receipt(
@@ -6637,6 +6652,32 @@ def grip_run(
         )
     dispatch_parameters = dict(raw_parameters)
     dispatch_parameters.pop("session_escalation", None)
+    if name == "captain-run":
+        if ctx is None:
+            return grabowski_grips._blocked_surface_receipt(
+                name,
+                raw_parameters,
+                "server runtime actor identity is unavailable",
+            )
+        session_profile = decision.get("session_profile")
+        actor_profile = (
+            session_profile.get("profile")
+            if isinstance(session_profile, dict)
+            else _session_profile_contract()["profile"]
+        )
+        try:
+            dispatch_parameters["_server_runtime_actor_identity"] = (
+                grabowski_merge_guard.issue_server_runtime_actor_identity(
+                    ctx.session,
+                    profile=str(actor_profile),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            return grabowski_grips._blocked_surface_receipt(
+                name,
+                raw_parameters,
+                f"server runtime actor identity failed: {type(exc).__name__}",
+            )
     if name == "connector-snapshot-bind":
         deployment = _deployment_metadata()
         tool_contract = _runtime_tool_contract_summary(deployment)

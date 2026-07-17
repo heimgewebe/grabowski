@@ -251,6 +251,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
                 lease_owner_id=str(
                     parameters["execution_intent"]["context"].get("lease_owner_id", "")
                 ),
+                server_actor_identity=parameters.get("_server_runtime_actor_identity"),
             )
             execution_result: dict[str, Any] = {
                 "action": "pr-merge",
