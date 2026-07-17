@@ -41,6 +41,27 @@ def _publisher() -> dict[str, object]:
     }
 
 
+def _bound_action(name: str) -> dict[str, object]:
+    example = json.loads(
+        (ROOT / "config" / "privileged-actions.example.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return json.loads(json.dumps(example["actions"][name]))
+
+
+def _canonical_publisher() -> dict[str, object]:
+    return _bound_action(cutover.PUBLISH_ACTION)
+
+
+def _lifecycle() -> dict[str, object]:
+    return _bound_action(cutover.BLOCKADE_LIFECYCLE_ACTION)
+
+
+def _root_task_action() -> dict[str, object]:
+    return _bound_action(cutover.ROOT_TASK_ACTION)
+
+
 def _power_action() -> dict[str, object]:
     return {
         "enabled": True,
@@ -78,7 +99,11 @@ def _example_config_text() -> str:
     return json.dumps(
         {
             "schema_version": 2,
-            "actions": {cutover.PUBLISH_ACTION: _publisher()},
+            "actions": {
+                cutover.PUBLISH_ACTION: _canonical_publisher(),
+                cutover.BLOCKADE_LIFECYCLE_ACTION: _lifecycle(),
+                cutover.ROOT_TASK_ACTION: _root_task_action(),
+            },
         },
         sort_keys=True,
     ) + "\n"
@@ -173,6 +198,130 @@ class RootbrokerCutoverTests(unittest.TestCase):
         )
         self.assertIn("operator_power_before_sha256", evidence)
         self.assertIn("publisher_sha256", evidence)
+
+    def test_merge_adds_commit_bound_root_task_action(self) -> None:
+        merged, evidence = cutover.merge_privileged_config(
+            _installed_config(),
+            publisher=_canonical_publisher(),
+            lifecycle=_lifecycle(),
+            root_task=_root_task_action(),
+        )
+
+        self.assertEqual(
+            merged["actions"][cutover.ROOT_TASK_ACTION],
+            _root_task_action(),
+        )
+        self.assertFalse(evidence["root_task_preexisting"])
+        self.assertIsNone(evidence["root_task_before_sha256"])
+        self.assertEqual(
+            evidence["root_task_sha256"],
+            hashlib.sha256(
+                cutover._canonical_json(_root_task_action())
+            ).hexdigest(),
+        )
+
+    def test_merge_accepts_exact_preexisting_root_task_action(self) -> None:
+        current = _installed_config()
+        current["actions"][cutover.ROOT_TASK_ACTION] = _root_task_action()
+
+        merged, evidence = cutover.merge_privileged_config(
+            current,
+            publisher=_canonical_publisher(),
+            lifecycle=_lifecycle(),
+            root_task=_root_task_action(),
+        )
+
+        self.assertEqual(
+            merged["actions"][cutover.ROOT_TASK_ACTION],
+            _root_task_action(),
+        )
+        self.assertTrue(evidence["root_task_preexisting"])
+        self.assertEqual(
+            evidence["root_task_before_sha256"],
+            evidence["root_task_sha256"],
+        )
+
+    def test_merge_rejects_drifted_preexisting_root_task_action(self) -> None:
+        current = _installed_config()
+        drifted = _root_task_action()
+        drifted["timeout_seconds"] = 61
+        current["actions"][cutover.ROOT_TASK_ACTION] = drifted
+
+        with self.assertRaisesRegex(
+            cutover.CutoverError, "differs from commit-bound"
+        ):
+            cutover.merge_privileged_config(
+                current,
+                publisher=_canonical_publisher(),
+                lifecycle=_lifecycle(),
+                root_task=_root_task_action(),
+            )
+
+    def test_merge_rejects_root_task_gate_drift(self) -> None:
+        root_task = _root_task_action()
+        root_task["start_gate"]["max_recovery_age_seconds"] = 3600
+
+        with self.assertRaisesRegex(
+            cutover.CutoverError, "differs from publisher"
+        ):
+            cutover.merge_privileged_config(
+                _installed_config(),
+                publisher=_canonical_publisher(),
+                lifecycle=_lifecycle(),
+                root_task=root_task,
+            )
+
+    def test_root_task_loader_rejects_broadened_command_catalog(self) -> None:
+        example = json.loads(_example_config_text())
+        example["actions"][cutover.ROOT_TASK_ACTION][
+            "allowed_argv_prefixes"
+        ].append(["/usr/bin/id"])
+        runner = FakeRunner(
+            blobs={
+                "config/privileged-actions.example.json": json.dumps(example)
+            }
+        )
+
+        with self.assertRaisesRegex(cutover.CutoverError, "catalog is invalid"):
+            cutover._root_task_action_from_repository(
+                Path("/tmp/repository"),
+                expected_head=HEAD,
+                runner=runner,
+            )
+
+    def test_root_task_loader_rejects_malformed_prefix_shape(self) -> None:
+        example = json.loads(_example_config_text())
+        example["actions"][cutover.ROOT_TASK_ACTION][
+            "allowed_argv_prefixes"
+        ] = [[{"not": "a string"}]]
+        runner = FakeRunner(
+            blobs={
+                "config/privileged-actions.example.json": json.dumps(example)
+            }
+        )
+
+        with self.assertRaisesRegex(cutover.CutoverError, "catalog is invalid"):
+            cutover._root_task_action_from_repository(
+                Path("/tmp/repository"),
+                expected_head=HEAD,
+                runner=runner,
+            )
+
+    def test_root_task_loader_rejects_broadened_cwd_pattern(self) -> None:
+        example = json.loads(_example_config_text())
+        example["actions"][cutover.ROOT_TASK_ACTION]["cwd_pattern"] = ".*"
+        runner = FakeRunner(
+            blobs={
+                "config/privileged-actions.example.json": json.dumps(example)
+            }
+        )
+
+        with self.assertRaisesRegex(cutover.CutoverError, "cwd pattern is invalid"):
+            cutover._root_task_action_from_repository(
+                Path("/tmp/repository"),
+                expected_head=HEAD,
+                runner=runner,
+            )
 
     def test_merge_rejects_disabled_operator_power_action(self) -> None:
         current = _installed_config()
@@ -316,7 +465,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 runner=runner,
             )
 
-            self.assertEqual(publisher, _publisher())
+            self.assertEqual(publisher, _canonical_publisher())
             self.assertIn(
                 cutover._git_argv(
                     repository,
@@ -417,8 +566,13 @@ class RootbrokerCutoverTests(unittest.TestCase):
             installed_config = json.loads(layout["config_target"].read_text())
             self.assertEqual(
                 installed_config["actions"][cutover.PUBLISH_ACTION],
-                _publisher(),
+                _canonical_publisher(),
             )
+            self.assertEqual(
+                installed_config["actions"][cutover.ROOT_TASK_ACTION],
+                _root_task_action(),
+            )
+            self.assertFalse(receipt["merge_evidence"]["root_task_preexisting"])
             power = installed_config["actions"][cutover.POWER_ACTION]
             self.assertEqual(
                 power["gate"]["configured_target"],

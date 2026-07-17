@@ -36,6 +36,7 @@ CONFIGURED_TARGET = "heimberry:rest-server/grabowski-recovery-probe"
 PUBLISH_ACTION = "publish_recovery_marker"
 POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
+ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
 
 
 class CutoverError(RuntimeError):
@@ -570,11 +571,124 @@ def _lifecycle_from_repository(
     return json.loads(json.dumps(lifecycle))
 
 
+def _root_task_action_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any]:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    root_task = actions.get(ROOT_TASK_ACTION)
+    if not isinstance(root_task, dict):
+        raise CutoverError("example catalog has no root task action")
+    required = {
+        "enabled",
+        "mode",
+        "target_pattern",
+        "cwd_pattern",
+        "timeout_seconds",
+        "max_argv",
+        "allow_shell",
+        "policy_intent",
+        "allowed_argv_prefixes",
+        "start_gate",
+    }
+    if set(root_task) != required:
+        raise CutoverError("root task action contract keys are invalid")
+    if root_task.get("enabled") is not True:
+        raise CutoverError("root task action must be enabled")
+    if root_task.get("mode") != "root-task-systemd":
+        raise CutoverError("root task action mode is invalid")
+    if root_task.get("allow_shell") is not False:
+        raise CutoverError("root task action must forbid shell execution")
+    if root_task.get("policy_intent") != "recovery-gated-root-task-catalog":
+        raise CutoverError("root task policy intent is invalid")
+    if root_task.get("timeout_seconds") != 60 or root_task.get("max_argv") != 16:
+        raise CutoverError("root task execution bounds are invalid")
+    if root_task.get("target_pattern") != r"\{.{1,49152}\}":
+        raise CutoverError("root task target pattern is invalid")
+    if root_task.get("cwd_pattern") != r"/[A-Za-z0-9._/@:+-]{0,999}":
+        raise CutoverError("root task cwd pattern is invalid")
+    prefixes = root_task.get("allowed_argv_prefixes")
+    expected_prefixes = {
+        ("/usr/local/bin/sleep-heimserver",),
+        ("/usr/local/bin/sleep-heim-pc",),
+        ("/usr/local/bin/sleep-heimberry",),
+    }
+    if not isinstance(prefixes, list) or any(
+        not isinstance(prefix, list)
+        or len(prefix) != 1
+        or not isinstance(prefix[0], str)
+        for prefix in prefixes
+    ):
+        raise CutoverError("root task command catalog is invalid")
+    if {tuple(prefix) for prefix in prefixes} != expected_prefixes:
+        raise CutoverError("root task command catalog is invalid")
+    gate = root_task.get("start_gate")
+    if not isinstance(gate, dict):
+        raise CutoverError("root task start gate is malformed")
+    required_gate = {
+        "kill_switch_path",
+        "legacy_kill_switch_path",
+        "recovery_marker_path",
+        "max_recovery_age_seconds",
+        "require_root_owned_gate_files",
+        "configured_target",
+    }
+    if set(gate) != required_gate:
+        raise CutoverError("root task start gate keys are invalid")
+    if gate.get("configured_target") != CONFIGURED_TARGET:
+        raise CutoverError("root task target differs from host contract")
+    return json.loads(json.dumps(root_task))
+
+
+def _validate_root_task_coherence(
+    root_task: dict[str, Any],
+    *,
+    publisher: dict[str, Any],
+    lifecycle: dict[str, Any] | None,
+) -> None:
+    if lifecycle is None:
+        raise CutoverError("root task cutover requires blockade lifecycle")
+    legacy_path = publisher.get("legacy_kill_switch_path")
+    if not isinstance(legacy_path, str) or not legacy_path.startswith("/"):
+        raise CutoverError("root task cutover requires publisher legacy path")
+    expected_gate = {
+        "kill_switch_path": publisher["kill_switch_path"],
+        "legacy_kill_switch_path": legacy_path,
+        "recovery_marker_path": publisher["destination_path"],
+        "max_recovery_age_seconds": publisher["max_recovery_age_seconds"],
+        "require_root_owned_gate_files": publisher[
+            "require_root_owned_destination"
+        ],
+        "configured_target": CONFIGURED_TARGET,
+    }
+    if root_task.get("start_gate") != expected_gate:
+        raise CutoverError("root task start gate differs from publisher contract")
+    if lifecycle.get("marker_path") != expected_gate["kill_switch_path"]:
+        raise CutoverError("root task gate differs from lifecycle marker")
+    if lifecycle.get("legacy_marker_path") != expected_gate[
+        "legacy_kill_switch_path"
+    ]:
+        raise CutoverError("root task gate differs from lifecycle legacy marker")
+
+
 def merge_privileged_config(
     current: dict[str, Any],
     *,
     publisher: dict[str, Any],
     lifecycle: dict[str, Any] | None = None,
+    root_task: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if set(current) != {"schema_version", "actions"}:
         raise CutoverError("installed privileged config has invalid top-level keys")
@@ -655,6 +769,19 @@ def merge_privileged_config(
         if lifecycle_gate != expected_lifecycle_gate:
             raise CutoverError("lifecycle recovery gate differs from publisher")
 
+    root_task_before = actions.get(ROOT_TASK_ACTION)
+    if root_task is not None:
+        _validate_root_task_coherence(
+            root_task,
+            publisher=publisher,
+            lifecycle=lifecycle,
+        )
+        if root_task_before is not None and root_task_before != root_task:
+            raise CutoverError(
+                "installed root task action differs from commit-bound contract"
+            )
+        merged_actions[ROOT_TASK_ACTION] = json.loads(json.dumps(root_task))
+
     expected_power = json.loads(json.dumps(power_before))
     if lifecycle is None:
         expected_power["gate"]["configured_target"] = CONFIGURED_TARGET
@@ -666,12 +793,23 @@ def merge_privileged_config(
     controlled = {PUBLISH_ACTION, POWER_ACTION}
     if lifecycle is not None:
         controlled.add(BLOCKADE_LIFECYCLE_ACTION)
+    if root_task is not None:
+        controlled.add(ROOT_TASK_ACTION)
     evidence = {
         "operator_power_before_sha256": _sha256(_canonical_json(power_before)),
         "operator_power_after_sha256": _sha256(_canonical_json(merged_power)),
         "publisher_sha256": _sha256(_canonical_json(publisher)),
         "lifecycle_sha256": (
             _sha256(_canonical_json(lifecycle)) if lifecycle is not None else None
+        ),
+        "root_task_sha256": (
+            _sha256(_canonical_json(root_task)) if root_task is not None else None
+        ),
+        "root_task_preexisting": root_task_before is not None,
+        "root_task_before_sha256": (
+            _sha256(_canonical_json(root_task_before))
+            if isinstance(root_task_before, dict)
+            else None
         ),
         "unrelated_action_names": sorted(
             name for name in actions if name not in controlled
@@ -1016,6 +1154,11 @@ def _apply_cutover_locked(
         expected_head=expected_head,
         runner=runner,
     )
+    root_task = _root_task_action_from_repository(
+        repository,
+        expected_head=expected_head,
+        runner=runner,
+    )
     if artifact_targets is None:
         _validate_recovery_source_dropin(
             source_artifacts,
@@ -1030,6 +1173,7 @@ def _apply_cutover_locked(
         current_config,
         publisher=publisher,
         lifecycle=lifecycle,
+        root_task=root_task,
     )
     merged_config_data = _canonical_json(merged_config)
 
@@ -1239,6 +1383,11 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         expected_head=expected_head,
         runner=runner,
     )
+    root_task = _root_task_action_from_repository(
+        repository,
+        expected_head=expected_head,
+        runner=runner,
+    )
     _validate_recovery_source_dropin(
         source_artifacts,
         publisher=publisher,
@@ -1249,6 +1398,7 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         current,
         publisher=publisher,
         lifecycle=lifecycle,
+        root_task=root_task,
     )
     return {
         "schema_version": 1,
