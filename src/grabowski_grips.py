@@ -732,10 +732,14 @@ def _default_github_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
     except subprocess.TimeoutExpired as exc:
         stdout_bytes = exc.stdout if isinstance(exc.stdout, bytes) else b""
         stderr_bytes = exc.stderr if isinstance(exc.stderr, bytes) else b""
+        partial_stderr = stderr_bytes.decode("utf-8", errors="replace").rstrip("\n")
+        timeout_message = "gh command timed out after 30 seconds"
+        if partial_stderr:
+            timeout_message += f"; partial stderr: {partial_stderr}"
         return {
             "returncode": 124,
             "stdout": stdout_bytes.decode("utf-8", errors="replace").rstrip("\n"),
-            "stderr": "gh command timed out after 30 seconds",
+            "stderr": timeout_message,
             "stdout_bytes": stdout_bytes,
             "stderr_bytes": stderr_bytes,
             "argv": command,
@@ -2107,11 +2111,23 @@ def _gate_identity_object(parameters: dict[str, Any], field: str) -> dict[str, A
     value = parameters[field]
     if not isinstance(value, dict) or not value or len(value) > 16:
         raise GripPreflightError(f"{field} must be a non-empty object with at most 16 fields")
-    normalized: dict[str, str] = {}
+    normalized: dict[str, Any] = {}
     for key, item in sorted(value.items()):
-        normalized[_bounded_contract_text(key, field=f"{field} key", maximum=64)] = _bounded_contract_text(
-            item, field=f"{field}.{key}", maximum=512
-        )
+        normalized_key = _bounded_contract_text(key, field=f"{field} key", maximum=64)
+        if isinstance(item, str):
+            normalized[normalized_key] = _bounded_contract_text(
+                item, field=f"{field}.{key}", maximum=512
+            )
+        elif isinstance(item, bool):
+            normalized[normalized_key] = item
+        elif isinstance(item, int):
+            if not -(2**63) <= item < 2**63:
+                raise GripPreflightError(f"{field}.{key} integer is outside the signed 64-bit range")
+            normalized[normalized_key] = item
+        else:
+            raise GripPreflightError(
+                f"{field}.{key} must be a string, integer, or boolean scalar"
+            )
     return normalized
 
 
@@ -2163,6 +2179,10 @@ def _run_gate_evidence_preflight(
     evidence_changed = attempt["evidence_changed"]
     if not isinstance(prior_attempt, bool) or not isinstance(evidence_changed, bool):
         raise GripPreflightError("attempt prior_attempt and evidence_changed must be booleans")
+    if evidence_changed and not prior_attempt:
+        raise GripPreflightError(
+            "attempt.evidence_changed must be false when prior_attempt is false"
+        )
     change_reference = attempt["change_reference"]
     if evidence_changed:
         change_reference = _bounded_contract_text(

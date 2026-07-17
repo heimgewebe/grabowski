@@ -325,14 +325,20 @@ def _database() -> sqlite3.Connection:
                         connection.execute(
                             f"ALTER TABLE tasks ADD COLUMN {name} {definition}"
                         )
-                connection.execute(
-                    "UPDATE tasks SET execution_backend='systemd-user' "
-                    "WHERE execution_backend IS NULL OR execution_backend=''"
-                )
-                connection.execute(
-                    "UPDATE tasks SET systemd_scope='user' "
-                    "WHERE systemd_scope IS NULL OR systemd_scope=''"
-                )
+                # Newly added NOT NULL columns already expose their SQLite
+                # defaults for every legacy row. Only repair these fields when
+                # they pre-existed, which preserves recovery from a partial
+                # migration without forcing two avoidable full-table writes.
+                if "execution_backend" in columns:
+                    connection.execute(
+                        "UPDATE tasks SET execution_backend='systemd-user' "
+                        "WHERE execution_backend IS NULL OR execution_backend=''"
+                    )
+                if "systemd_scope" in columns:
+                    connection.execute(
+                        "UPDATE tasks SET systemd_scope='user' "
+                        "WHERE systemd_scope IS NULL OR systemd_scope=''"
+                    )
                 connection.execute(
                     "UPDATE tasks SET authoritative_unit=unit "
                     "WHERE authoritative_unit IS NULL OR authoritative_unit=''"
@@ -654,6 +660,12 @@ def _task_lease_ttl(record: dict[str, Any], state: str) -> int:
             int(record["runtime_seconds"]) + 300,
         ),
     )
+
+
+def _effective_observed_state(record: dict[str, Any], observed_state: str) -> str:
+    """Preserve authoritative terminal truth before lease maintenance."""
+    stored_state = str(record["state"])
+    return stored_state if _is_terminal_state(stored_state) else observed_state
 
 
 def _maintain_record_resources(
@@ -1288,19 +1300,15 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
     operator._require_operator_capability("durable_job")
     record = _row(task_id)
     observation = _observe(record)
+    effective_state = _effective_observed_state(record, observation["state"])
+    lease_maintenance = _maintain_record_resources(record, effective_state)
+    if lease_maintenance is not None:
+        observation["lease_maintenance"] = lease_maintenance
     stored = _set_state(
         task_id,
         observation["state"],
         observation=observation,
     )
-    lease_maintenance = _maintain_record_resources(stored, stored["state"])
-    if lease_maintenance is not None:
-        observation["lease_maintenance"] = lease_maintenance
-        stored = _set_state(
-            task_id,
-            observation["state"],
-            observation=observation,
-        )
     if _state_releases_resources(observation["state"]):
         _release_record_resources(stored)
     result = _public(stored)
@@ -1375,11 +1383,11 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     else:
         state = "cancelled" if result["returncode"] == 0 else record["state"]
     cancel_observation = {"cancel": result}
-    stored = _set_state(task_id, state, observation=cancel_observation)
-    lease_maintenance = _maintain_record_resources(stored, stored["state"])
+    effective_state = _effective_observed_state(record, state)
+    lease_maintenance = _maintain_record_resources(record, effective_state)
     if lease_maintenance is not None:
         cancel_observation["lease_maintenance"] = lease_maintenance
-        stored = _set_state(task_id, state, observation=cancel_observation)
+    stored = _set_state(task_id, state, observation=cancel_observation)
     if _state_releases_resources(state):
         _release_record_resources(stored)
     audit = {
@@ -1613,21 +1621,15 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
         except PermissionError as exc:
             denied.append(_reconcile_observe_denial(record, exc))
             continue
+        effective_state = _effective_observed_state(record, observation["state"])
+        lease_maintenance = _maintain_record_resources(record, effective_state)
+        if lease_maintenance is not None:
+            observation["lease_maintenance"] = lease_maintenance
         stored = _set_state(
             record["task_id"],
             observation["state"],
             observation=observation,
         )
-        lease_maintenance = _maintain_record_resources(
-            stored, stored["state"]
-        )
-        if lease_maintenance is not None:
-            observation["lease_maintenance"] = lease_maintenance
-            stored = _set_state(
-                record["task_id"],
-                observation["state"],
-                observation=observation,
-            )
         if _state_releases_resources(observation["state"]):
             _release_record_resources(stored)
             released.append(stored["task_id"])
@@ -1671,21 +1673,15 @@ def reconcile_tasks_resume(
         except PermissionError as exc:
             blocked.append(_reconcile_observe_denial(record, exc))
             continue
+        effective_state = _effective_observed_state(record, observation["state"])
+        lease_maintenance = _maintain_record_resources(record, effective_state)
+        if lease_maintenance is not None:
+            observation["lease_maintenance"] = lease_maintenance
         stored = _set_state(
             record["task_id"],
             observation["state"],
             observation=observation,
         )
-        lease_maintenance = _maintain_record_resources(
-            stored, stored["state"]
-        )
-        if lease_maintenance is not None:
-            observation["lease_maintenance"] = lease_maintenance
-            stored = _set_state(
-                record["task_id"],
-                observation["state"],
-                observation=observation,
-            )
         if _state_releases_resources(observation["state"]):
             _release_record_resources(stored)
             released.append(stored["task_id"])

@@ -6,9 +6,9 @@ Wiederholte Fail-closed-Sperren sollen nicht durch Policy-Ausnahmen oder unverä
 
 ## `gate-evidence-preflight`
 
-Der Griff verlangt einen benannten Gate-Eigentümer, eine unveränderliche Policy-Grenze, Ziel, Scope, erwartete Identität sowie sechs Evidenzklassen: Leases, Dirty-State, laufende Arbeit, Receipt, Akzeptanz und Post-State-Readback. Evidenzreferenzen werden nur gehasht ausgegeben.
+Der Griff verlangt einen benannten Gate-Eigentümer, eine unveränderliche Policy-Grenze, Ziel, Scope, erwartete Identität sowie sechs Evidenzklassen: Leases, Dirty-State, laufende Arbeit, Receipt, Akzeptanz und Post-State-Readback. Identitätsobjekte behalten die JSON-Skalartypen String, Integer und Boolean unverändert; insbesondere bleibt eine PR-Nummer eine Zahl und erzeugt denselben kanonischen Hash wie das nachfolgende Gate-Ziel. Evidenzreferenzen werden nur als reproduzierbare SHA-256-Fingerprints ausgegeben; das ist keine geheime oder signierte Bindung.
 
-Ein erneuter Versuch nach einer früheren Ablehnung ist nur vorbereitet, wenn eine benannte Evidenz- oder Zielzustandsänderung vorliegt. Ein positives Ergebnis bedeutet ausschließlich, dass die Eingabe für eine erneute Gate-Auswertung vollständig ist.
+Ein erneuter Versuch nach einer früheren Ablehnung ist nur vorbereitet, wenn eine benannte Evidenz- oder Zielzustandsänderung vorliegt. Ein erster Versuch darf deshalb nicht bereits `evidence_changed=true` behaupten. Ein positives Ergebnis bedeutet ausschließlich, dass die Eingabe für eine erneute Gate-Auswertung vollständig ist.
 
 Der Griff erteilt insbesondere keine Ausführungsautorität, keinen Policy-Bypass, keine sichere Mutationswiederholung und keinen Gate-Pass.
 

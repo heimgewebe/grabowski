@@ -854,8 +854,10 @@ class TaskTests(unittest.TestCase):
                 )
                 connection.commit()
 
-            status = tasks.grabowski_task_status(started["task"]["task_id"])
+            with patch.object(tasks, "_set_state", wraps=tasks._set_state) as set_state:
+                status = tasks.grabowski_task_status(started["task"]["task_id"])
 
+        self.assertEqual(1, set_state.call_count)
         self.assertEqual(status["state"], "running")
         self.assertEqual(status["lease_maintenance"]["mode"], "reacquired")
         lease = tasks.resources.inspect_resource(resource_key)

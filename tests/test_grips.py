@@ -5183,6 +5183,23 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertRegex(guard["receipt_sha256"], r"[0-9a-f]{64}\Z")
         self.assertEqual([], resources.list_resources())
 
+    def test_default_github_runner_preserves_partial_stderr_on_timeout(self) -> None:
+        timeout = grips.subprocess.TimeoutExpired(
+            cmd=["gh", "pr", "view", "96"],
+            timeout=30,
+            output=b"partial output\n",
+            stderr=b"network warning\xff\n",
+        )
+        with patch.object(grips.subprocess, "run", side_effect=timeout):
+            result = grips._default_github_runner(Path.cwd(), ["pr", "view", "96"])
+
+        self.assertEqual(124, result["returncode"])
+        self.assertEqual(b"partial output\n", result["stdout_bytes"])
+        self.assertEqual(b"network warning\xff\n", result["stderr_bytes"])
+        self.assertIn("gh command timed out after 30 seconds", result["stderr"])
+        self.assertIn("network warning", result["stderr"])
+        self.assertIn("\ufffd", result["stderr"])
+
     def test_atomic_merge_guard_blocks_lease_acquired_after_review_before_dispatch(self) -> None:
         local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
         parameters = authorized_captain_run_parameters()
@@ -5445,6 +5462,10 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             )
         )
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        self.assertEqual(
+            "blocked_after_guard_revalidation_released",
+            execution["merge_lease_guard"]["status"],
+        )
         with resources._database() as connection:
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM leases").fetchone()[0])
 
@@ -6200,6 +6221,38 @@ class GateEvidenceConvergenceGripTests(unittest.TestCase):
         self.assertNotIn("SECRET-REF", serialized)
         self.assertTrue(all(len(item["reference_sha256"]) == 64 for item in output["evidence"]))
 
+    def test_gate_evidence_preflight_preserves_numeric_and_boolean_identity_types(self) -> None:
+        parameters = self.complete_gate_parameters()
+        parameters["target"] = {
+            "repo": "heimgewebe/grabowski",
+            "pr": 258,
+            "draft": False,
+        }
+        result = grips.grip_run("gate-evidence-preflight", parameters)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual(
+            grips.sha256_json(parameters["target"]),
+            result["output"]["target_sha256"],
+        )
+        self.assertNotEqual(
+            grips.sha256_json({"repo": "heimgewebe/grabowski", "pr": "258", "draft": "False"}),
+            result["output"]["target_sha256"],
+        )
+
+    def test_gate_evidence_preflight_rejects_change_flag_on_first_attempt(self) -> None:
+        parameters = self.complete_gate_parameters()
+        parameters["attempt"] = {
+            "prior_attempt": False,
+            "evidence_changed": True,
+            "change_reference": "not-a-retry",
+        }
+
+        result = grips.grip_run("gate-evidence-preflight", parameters)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("prior_attempt is false", result["output"]["error"])
+
     def test_gate_evidence_preflight_blocks_missing_and_unchanged_retry(self) -> None:
         parameters = self.complete_gate_parameters()
         parameters["evidence"]["receipt"] = {"status": "missing", "reference": "receipt absent"}
@@ -6281,6 +6334,36 @@ class GateEvidenceConvergenceGripTests(unittest.TestCase):
         self.assertEqual(1, result["output"]["counts"]["conflicted"])
         self.assertNotIn("SECRET-defect", grips.canonical_json(result))
         self.assertIn("automatic_closeout", result["output"]["does_not_establish"])
+
+    def test_convergence_state_classify_documents_terminal_priority_combinations(self) -> None:
+        def record(record_id: str, **evidence: object) -> dict[str, object]:
+            value = {
+                "record_id": record_id,
+                "observed_state": "failed",
+                "failure_evidence": "failure",
+                "expected_evidence": None,
+                "blocking_evidence": None,
+                "superseding_evidence": None,
+                "resolution_evidence": None,
+            }
+            value.update(evidence)
+            return value
+
+        result = grips.grip_run(
+            "convergence-state-classify",
+            {
+                "records": [
+                    record("resolved-blocked", resolution_evidence="receipt", blocking_evidence="old-gate"),
+                    record("superseded-blocked", superseding_evidence="replacement", blocking_evidence="old-gate"),
+                    record("terminal-conflict", resolution_evidence="receipt", superseding_evidence="replacement"),
+                ]
+            },
+        )
+
+        by_id = {item["record_id"]: item for item in result["output"]["records"]}
+        self.assertEqual("resolved", by_id["resolved-blocked"]["classification"])
+        self.assertEqual("superseded", by_id["superseded-blocked"]["classification"])
+        self.assertEqual("conflicted", by_id["terminal-conflict"]["classification"])
 
     def test_convergence_state_classify_rejects_duplicate_ids(self) -> None:
         duplicate = {

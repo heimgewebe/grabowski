@@ -97,6 +97,25 @@ class ResourceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resources.normalize_resource_key("port:70000")
 
+    def test_count_resources_uses_complete_aggregate_and_owner_filter(self) -> None:
+        resources.acquire_resources(
+            "owner-a", ["port:9222"], purpose="first", ttl_seconds=60
+        )
+        resources.acquire_resources(
+            "owner-b", ["port:9223"], purpose="second", ttl_seconds=60
+        )
+
+        self.assertEqual(2, resources.count_resources())
+        self.assertEqual(1, resources.count_resources(owner_id="owner-a"))
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=0 WHERE owner_id=?",
+                ("owner-b",),
+            )
+            connection.commit()
+        self.assertEqual(1, resources.count_resources())
+        self.assertEqual(2, resources.count_resources(include_expired=True))
+
     def test_atomic_conflict_does_not_partially_acquire(self) -> None:
         resources.acquire_resources(
             "owner-a", ["port:9222"], purpose="browser", ttl_seconds=60

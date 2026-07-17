@@ -182,6 +182,13 @@ class OperatorObligationTests(unittest.TestCase):
         self.assertTrue(result["attention_required"])
         self.assertTrue(all(item["continuation_required"] for item in result["records"]))
 
+        summary = obligation.list_obligations(
+            {"state": "attention", "summary_only": True}
+        )
+        self.assertEqual(3, summary["record_count"])
+        self.assertEqual([], summary["records"])
+        self.assertTrue(summary["attention_required"])
+
     def test_list_reports_projection_drift_as_attention_integrity_error(self) -> None:
         obligation.open_obligation(self._open_parameters())
         original_status = obligation.status_obligation

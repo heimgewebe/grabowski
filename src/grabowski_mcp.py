@@ -3794,17 +3794,14 @@ def _operator_system_overview(
     try:
         import grabowski_resources
 
-        lease_limit = 200
-        lease_payload = grabowski_resources.grabowski_resource_list(
+        active_count = grabowski_resources.count_resources(
             include_expired=False,
-            limit=lease_limit,
         )
-        active_count = lease_payload.get("count")
         leases = {
             "available": True,
             "active_count": active_count,
-            "bounded_limit": lease_limit,
-            "may_be_truncated": active_count == lease_limit,
+            "count_complete": True,
+            "may_be_truncated": False,
         }
     except Exception as exc:  # pragma: no cover - defensive status boundary
         errors.append({"component": "leases", "error": type(exc).__name__})
@@ -3813,7 +3810,11 @@ def _operator_system_overview(
 
         obligation_limit = 100
         obligation_payload = grabowski_operator_obligation.list_obligations(
-            {"state": "attention", "limit": obligation_limit}
+            {
+                "state": "attention",
+                "limit": obligation_limit,
+                "summary_only": True,
+            }
         )
         obligations = {
             "available": True,

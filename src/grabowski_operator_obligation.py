@@ -693,7 +693,7 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
     parameters = dict(parameters or {})
     _validate_exact_keys(
         parameters,
-        allowed={"state", "repo", "thread_id", "limit"},
+        allowed={"state", "repo", "thread_id", "limit", "summary_only"},
         required=set(),
         label="list parameters",
     )
@@ -708,6 +708,9 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
     thread_filter = parameters.get("thread_id")
     if thread_filter is not None:
         thread_filter = _validate_text(thread_filter, label="thread_id", maximum=1_024)
+    summary_only = parameters.get("summary_only", False)
+    if not isinstance(summary_only, bool):
+        raise OperatorObligationInputError("summary_only must be boolean")
     limit = parameters.get("limit", 20)
     if (
         not isinstance(limit, int)
@@ -735,6 +738,8 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
         }
 
     records: list[dict[str, Any]] = []
+    record_count = 0
+    matching_attention = False
     integrity_errors: list[dict[str, str]] = []
     entries: list[Path] = []
     scan_truncated = False
@@ -771,28 +776,30 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
             continue
         if thread_filter is not None and origin.get("thread_id") != thread_filter:
             continue
-        records.append(
-            {
-                "obligation_id": status["obligation_id"],
-                "state": status["state"],
-                "objective": status["objective"],
-                "origin": origin,
-                "created_at": status["created_at"],
-                "closed_at": status["closed_at"],
-                "continuation_required": requires_attention,
-                "response_may_end": status["response_may_end"],
-                "work_complete": status["work_complete"],
-                "recommended_next_action": status["recommended_next_action"],
-            }
-        )
-        if len(records) >= limit:
+        record_count += 1
+        matching_attention = matching_attention or requires_attention
+        if not summary_only:
+            records.append(
+                {
+                    "obligation_id": status["obligation_id"],
+                    "state": status["state"],
+                    "objective": status["objective"],
+                    "origin": origin,
+                    "created_at": status["created_at"],
+                    "closed_at": status["closed_at"],
+                    "continuation_required": requires_attention,
+                    "response_may_end": status["response_may_end"],
+                    "work_complete": status["work_complete"],
+                    "recommended_next_action": status["recommended_next_action"],
+                }
+            )
+        if record_count >= limit:
             scan_truncated = any(
                 remaining.name != ".lock"
                 for remaining in entries[index + 1 :]
             ) or scan_truncated
             break
 
-    matching_attention = any(item["continuation_required"] for item in records)
     attention_required = bool(integrity_errors or scan_truncated or matching_attention)
     if integrity_errors:
         next_action = "inspect integrity errors before relying on the affected obligations"
@@ -807,7 +814,7 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
         "repo_filter": repo_filter,
         "thread_id_filter": thread_filter,
         "records": records,
-        "record_count": len(records),
+        "record_count": record_count,
         "integrity_errors": integrity_errors,
         "scan_truncated": scan_truncated,
         "attention_required": attention_required,
