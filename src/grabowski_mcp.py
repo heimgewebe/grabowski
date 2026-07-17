@@ -6637,11 +6637,17 @@ def grip_run(
     if allow_mutation:
         _require_mutations_enabled("terminal_execute")
     raw_parameters = parameters or {}
-    if "_server_runtime_actor_identity" in raw_parameters:
+    reserved_server_parameters = sorted(
+        {"_server_runtime_actor_identity", "_server_task_lease_delegation"}.intersection(
+            raw_parameters
+        )
+    )
+    if reserved_server_parameters:
         return grabowski_grips._blocked_surface_receipt(
             name,
             raw_parameters,
-            "caller supplied reserved server runtime actor identity",
+            "caller supplied reserved server parameter: "
+            + ",".join(reserved_server_parameters),
         )
     decision = _session_grip_policy_decision(name, raw_parameters)
     if not decision["allowed"]:
@@ -6666,17 +6672,48 @@ def grip_run(
             else _session_profile_contract()["profile"]
         )
         try:
-            dispatch_parameters["_server_runtime_actor_identity"] = (
-                grabowski_merge_guard.issue_server_runtime_actor_identity(
-                    ctx.session,
-                    profile=str(actor_profile),
-                )
+            actor_identity = grabowski_merge_guard.issue_server_runtime_actor_identity(
+                ctx.session,
+                profile=str(actor_profile),
             )
-        except (TypeError, ValueError) as exc:
+            dispatch_parameters["_server_runtime_actor_identity"] = actor_identity
+            execution_intent = dispatch_parameters.get("execution_intent")
+            context = (
+                execution_intent.get("context")
+                if isinstance(execution_intent, dict)
+                else None
+            )
+            requested_lease_owner = (
+                context.get("lease_owner_id") if isinstance(context, dict) else None
+            )
+            if (
+                isinstance(requested_lease_owner, str)
+                and re.fullmatch(r"task:[0-9a-f]{24}", requested_lease_owner)
+                is not None
+            ):
+                import grabowski_tasks
+
+                task_evidence = (
+                    grabowski_tasks.server_task_lease_delegation_evidence(
+                        requested_lease_owner
+                    )
+                )
+                dispatch_parameters["_server_task_lease_delegation"] = (
+                    grabowski_merge_guard.issue_server_task_lease_delegation(
+                        actor_identity,
+                        task_evidence,
+                        captain_request_sha256_value=(
+                            grabowski_merge_guard.captain_request_sha256(
+                                dispatch_parameters
+                            )
+                        ),
+                    )
+                )
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
             return grabowski_grips._blocked_surface_receipt(
                 name,
                 raw_parameters,
-                f"server runtime actor identity failed: {type(exc).__name__}",
+                f"server runtime lease identity failed: {type(exc).__name__}",
             )
     if name == "connector-snapshot-bind":
         deployment = _deployment_metadata()

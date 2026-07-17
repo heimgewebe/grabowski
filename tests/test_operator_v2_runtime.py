@@ -606,8 +606,73 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         "captain-run", spoofed, ctx=RequestContext()
                     )
                 self.assertEqual("blocked", blocked["receipt"]["status"])
-                self.assertIn("reserved server runtime actor", blocked["output"]["error"])
+                self.assertIn("reserved server parameter", blocked["output"]["error"])
                 blocked_run.assert_not_called()
+
+                task_id = "a" * 24
+                task_owner = f"task:{task_id}"
+                task_parameters = dict(valid_parameters)
+                task_parameters["execution_intent"] = {
+                    "context": {"lease_owner_id": task_owner}
+                }
+                task_keys = ["component:test-task"]
+                task_binding = {
+                    "task_id": task_id,
+                    "lease_owner_id": task_owner,
+                    "state": "running",
+                    "attempt": 1,
+                    "updated_at_unix": int(__import__("time").time()),
+                    "resource_keys_sha256": (
+                        grabowski_mcp.grabowski_merge_guard._sha256_json(task_keys)
+                    ),
+                    "lease_bindings_sha256": "b" * 64,
+                }
+                task_evidence = {
+                    "schema_version": 1,
+                    "kind": "grabowski_live_task_lease_delegation_evidence",
+                    **task_binding,
+                    "task_record_sha256": (
+                        grabowski_mcp.grabowski_merge_guard._sha256_json(task_binding)
+                    ),
+                    "resource_keys": task_keys,
+                    "minimum_expires_at_unix": int(__import__("time").time()) + 60,
+                    "observed_at_unix": int(__import__("time").time()),
+                }
+                fake_tasks = types.SimpleNamespace(
+                    server_task_lease_delegation_evidence=lambda owner: (
+                        task_evidence if owner == task_owner else None
+                    )
+                )
+                with patch.dict(sys.modules, {"grabowski_tasks": fake_tasks}), patch.object(
+                    grabowski_mcp.grabowski_grips, "grip_run", return_value={"ok": True}
+                ) as task_run:
+                    task_result = grabowski_mcp.grip_run(
+                        "captain-run", task_parameters, ctx=RequestContext()
+                    )
+                self.assertEqual({"ok": True}, task_result)
+                task_dispatched = task_run.call_args.args[1]
+                task_actor = task_dispatched["_server_runtime_actor_identity"]
+                task_delegation = task_dispatched["_server_task_lease_delegation"]
+                verified_task = (
+                    grabowski_mcp.grabowski_merge_guard.verify_server_task_lease_delegation(
+                        task_delegation,
+                        actor_identity=task_actor,
+                        captain_request_sha256_value=(
+                            grabowski_mcp.grabowski_merge_guard.captain_request_sha256(
+                                task_dispatched
+                            )
+                        ),
+                    )
+                )
+                self.assertEqual(task_owner, verified_task["lease_owner_id"])
+
+                spoofed_task = dict(task_parameters)
+                spoofed_task["_server_task_lease_delegation"] = task_delegation
+                blocked_task = grabowski_mcp.grip_run(
+                    "captain-run", spoofed_task, ctx=RequestContext()
+                )
+                self.assertEqual("blocked", blocked_task["receipt"]["status"])
+                self.assertIn("reserved server parameter", blocked_task["output"]["error"])
 
                 unavailable = grabowski_mcp.grip_run(
                     "captain-run", valid_parameters, ctx=None
