@@ -3517,6 +3517,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             github_runner=gh,
         )
 
+        self.assertEqual("passed", result["status"])
+        self.assertEqual(result["receipt"]["receipt_sha256"], result["receipt_sha256"])
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("executed", result["output"]["decision"])
         self.assertEqual("passed", result["output"]["actions"][0]["captain_receipt"]["status"])

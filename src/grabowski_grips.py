@@ -826,7 +826,12 @@ def _finish(receipt: Receipt, status: str, phase: str, output: dict[str, Any] | 
     receipt["ended_at"] = utc_now()
     receipt["output_sha256"] = sha256_json(output)
     receipt["receipt_sha256"] = sha256_json({k: v for k, v in receipt.items() if k != "receipt_sha256"})
-    return {"receipt": receipt, "output": output}
+    return {
+        "status": status,
+        "receipt_sha256": receipt["receipt_sha256"],
+        "receipt": receipt,
+        "output": output,
+    }
 
 
 def _check(receipt: Receipt, check_id: str, status: str, detail: str) -> None:
