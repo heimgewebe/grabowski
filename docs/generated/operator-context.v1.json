@@ -2346,9 +2346,9 @@
       "src/grabowski_runtime.py": "aeda349023314b1ce8690ab034c161d659be146b1c80569e409b2ad57680f98e",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "b8d92b82b762b763941735ef6c1b87ecad78ab60166eeaf5dbd8ac66f4325258",
-      "src/grabowski_task_attention.py": "69144e4987648c2d632497a1f1bfdca3934a1f41b4c2abf481ddb4f746786a1e",
+      "src/grabowski_task_attention.py": "8833353556737cce9cae01b080cf5b1093d7df9f54472c893da6b6df8cbb1ad4",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "5957268f44dade6743e5c72c11fa3dc72d18c7abe82bc61e857e3a0011d8ca88",
+      "src/grabowski_tasks.py": "5994deaa706b1370659b835f8ff69aadb491e0ff30b94ba824ae06c9d0826434",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9051739e6d1d9b900181ecde39809845cb04578f5bf6960df6e51955ab6419ef",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import io
 import json
+import os
 import sqlite3
 from pathlib import Path
 import sys
@@ -224,6 +225,57 @@ class TaskTests(unittest.TestCase):
                 ttl_seconds=120,
                 metadata={"task_id": task_id, "attempt": 1},
             )
+
+    def test_lifecycle_receipt_link_race_with_legacy_primary_uses_lifecycle_path(self) -> None:
+        result = self._start(
+            resource_keys=["component:test-terminalization-receipt-race"]
+        )
+        task_id = str(result["task"]["task_id"])
+        record = tasks._row_raw(task_id)
+        observation = {"state": "failed", "source": "legacy-link-race"}
+        legacy_digest = tasks._write_outcome_receipt(
+            record,
+            "failed",
+            observation,
+        )
+        self.assertIsNotNone(legacy_digest)
+        primary_path = tasks.TASK_OUTCOMES_DIR / f"{task_id}.json"
+        lifecycle_path = tasks.TASK_OUTCOMES_DIR / f"{task_id}.lifecycle.json"
+        legacy_bytes = primary_path.read_bytes()
+        primary_path.unlink()
+        original_link = os.link
+        raced = False
+
+        def race_link(source: str, destination: str) -> None:
+            nonlocal raced
+            if not raced and Path(destination) == primary_path:
+                raced = True
+                primary_path.write_bytes(legacy_bytes)
+                os.chmod(primary_path, 0o600)
+                raise FileExistsError(destination)
+            original_link(source, destination)
+
+        with patch.object(tasks.os, "link", side_effect=race_link):
+            stored = tasks._set_state(
+                task_id,
+                "failed",
+                observation=observation,
+            )
+
+        self.assertTrue(raced)
+        self.assertEqual(legacy_digest, json.loads(primary_path.read_text())["receipt_sha256"])
+        self.assertTrue(lifecycle_path.exists())
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        self.assertEqual(2, lifecycle["schema_version"])
+        self.assertEqual("grabowski_task_lifecycle_receipt", lifecycle["kind"])
+        self.assertEqual(
+            lifecycle["receipt_sha256"],
+            tasks._sha256_json(
+                {key: value for key, value in lifecycle.items() if key != "receipt_sha256"}
+            ),
+        )
+        self.assertEqual(lifecycle["receipt_sha256"], stored["lifecycle_receipt_sha256"])
+        self.assertNotEqual(legacy_digest, stored["lifecycle_receipt_sha256"])
 
     def test_pending_resource_terminalization_recovers_task_projection_and_blocks_delegation(self) -> None:
         result = self._start(

@@ -113,6 +113,31 @@ def _state_releases_resources(state: str) -> bool:
     return _is_terminal_state(state)
 
 
+def _read_existing_outcome_receipt(
+    path: Path,
+    *,
+    transition_sha256: str | None,
+    allow_legacy: bool,
+) -> str | None:
+    existing = json.loads(path.read_text(encoding="utf-8"))
+    existing_digest = existing.get("receipt_sha256")
+    if not isinstance(existing_digest, str) or existing_digest != _sha256_json(
+        {key: value for key, value in existing.items() if key != "receipt_sha256"}
+    ):
+        raise RuntimeError("Stored task lifecycle receipt integrity is invalid")
+    if transition_sha256 is None:
+        return existing_digest
+    existing_terminalization = existing.get("terminalization")
+    if (
+        isinstance(existing_terminalization, dict)
+        and existing_terminalization.get("transition_sha256") == transition_sha256
+    ):
+        return existing_digest
+    if allow_legacy and existing.get("schema_version") == 1:
+        return None
+    raise RuntimeError("Stored task lifecycle receipt belongs to another transition")
+
+
 def _write_outcome_receipt(
     record: dict[str, Any],
     state: str,
@@ -123,12 +148,14 @@ def _write_outcome_receipt(
     if not _is_terminal_state(state):
         return None
     TASK_OUTCOMES_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = TASK_OUTCOMES_DIR / f"{record['task_id']}.json"
+    primary_path = TASK_OUTCOMES_DIR / f"{record['task_id']}.json"
     terminalization_payload: dict[str, Any] | None = None
+    transition_sha256: str | None = None
     if terminalization is not None:
+        transition_sha256 = terminalization["transition_sha256"]
         terminalization_payload = {
             "kind": terminalization["kind"],
-            "transition_sha256": terminalization["transition_sha256"],
+            "transition_sha256": transition_sha256,
             "task_projection_sha256": terminalization["task_projection_sha256"],
             "requested_resource_keys": terminalization["requested_resource_keys"],
             "requested_resource_keys_sha256": terminalization[
@@ -162,38 +189,25 @@ def _write_outcome_receipt(
         payload["kind"] = "grabowski_task_lifecycle_receipt"
         payload["terminalization"] = terminalization_payload
     payload["receipt_sha256"] = _sha256_json(
-        {k: v for k, v in payload.items() if k != "receipt_sha256"}
+        {key: value for key, value in payload.items() if key != "receipt_sha256"}
     )
-    if path.exists():
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        existing_digest = existing.get("receipt_sha256")
-        if existing_digest != _sha256_json(
-            {k: v for k, v in existing.items() if k != "receipt_sha256"}
-        ):
-            raise RuntimeError("Stored task lifecycle receipt integrity is invalid")
-        if terminalization is not None:
-            existing_terminalization = existing.get("terminalization")
-            if not isinstance(existing_terminalization, dict) or existing_terminalization.get(
-                "transition_sha256"
-            ) != terminalization["transition_sha256"]:
-                path = TASK_OUTCOMES_DIR / f"{record['task_id']}.lifecycle.json"
-                if path.exists():
-                    existing = json.loads(path.read_text(encoding="utf-8"))
-                    existing_digest = existing.get("receipt_sha256")
-                    if existing_digest != _sha256_json(
-                        {k: v for k, v in existing.items() if k != "receipt_sha256"}
-                    ):
-                        raise RuntimeError("Stored task lifecycle receipt integrity is invalid")
-                    existing_terminalization = existing.get("terminalization")
-                    if not isinstance(existing_terminalization, dict) or existing_terminalization.get(
-                        "transition_sha256"
-                    ) != terminalization["transition_sha256"]:
-                        raise RuntimeError("Stored task lifecycle receipt belongs to another transition")
-                    return str(existing_digest)
-            else:
-                return str(existing_digest)
-        else:
-            return str(existing_digest)
+
+    candidates = [(primary_path, terminalization is not None)]
+    if terminalization is not None:
+        candidates.append(
+            (TASK_OUTCOMES_DIR / f"{record['task_id']}.lifecycle.json", False)
+        )
+    for path, allow_legacy in candidates:
+        if not path.exists():
+            continue
+        existing_digest = _read_existing_outcome_receipt(
+            path,
+            transition_sha256=transition_sha256,
+            allow_legacy=allow_legacy,
+        )
+        if existing_digest is not None:
+            return existing_digest
+
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{record['task_id']}.", suffix=".tmp", dir=TASK_OUTCOMES_DIR
     )
@@ -204,21 +218,30 @@ def _write_outcome_receipt(
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_name, 0o600)
-        os.link(tmp_name, path)
-        directory_fd = os.open(TASK_OUTCOMES_DIR, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except FileExistsError:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        return str(existing["receipt_sha256"])
+        for path, allow_legacy in candidates:
+            try:
+                os.link(tmp_name, path)
+            except FileExistsError:
+                existing_digest = _read_existing_outcome_receipt(
+                    path,
+                    transition_sha256=transition_sha256,
+                    allow_legacy=allow_legacy,
+                )
+                if existing_digest is not None:
+                    return existing_digest
+                continue
+            directory_fd = os.open(TASK_OUTCOMES_DIR, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return str(payload["receipt_sha256"])
     finally:
         try:
             os.unlink(tmp_name)
         except FileNotFoundError:
             pass
-    return str(payload["receipt_sha256"])
+    raise RuntimeError("Task lifecycle receipt could not be persisted")
 
 def _classify_observation(result: dict[str, Any], properties: dict[str, str]) -> str:
     active = properties.get("ActiveState")

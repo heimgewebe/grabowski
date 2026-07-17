@@ -275,8 +275,11 @@ def _validate_expected_binding(
         raise TaskAttentionConflictError("current task binding does not match the expected decision target")
 
 
-def _outcome_path(task_id: str) -> Path:
-    return tasks.TASK_OUTCOMES_DIR / f"{task_id}.json"
+def _outcome_paths(task_id: str) -> tuple[Path, Path]:
+    return (
+        tasks.TASK_OUTCOMES_DIR / f"{task_id}.json",
+        tasks.TASK_OUTCOMES_DIR / f"{task_id}.lifecycle.json",
+    )
 
 
 def _validate_outcome_receipt(
@@ -480,18 +483,55 @@ def _read_valid_outcome(
     expected_receipt_sha256: str | None,
 ) -> tuple[dict[str, Any], str, str]:
     binding = _task_binding(record)
+    authoritative_receipt_sha256 = record.get("lifecycle_receipt_sha256")
+    if authoritative_receipt_sha256 is not None:
+        if (
+            not isinstance(authoritative_receipt_sha256, str)
+            or SHA256_RE.fullmatch(authoritative_receipt_sha256) is None
+        ):
+            raise TaskAttentionIntegrityError(
+                "task lifecycle task-row receipt binding is invalid"
+            )
+        if (
+            expected_receipt_sha256 is not None
+            and expected_receipt_sha256 != authoritative_receipt_sha256
+        ):
+            raise TaskAttentionConflictError(
+                "task outcome receipt does not match authoritative task-row hash"
+            )
+        expected_receipt_sha256 = authoritative_receipt_sha256
+
     _ensure_private_directory(tasks.TASK_OUTCOMES_DIR, create=False)
-    value, file_sha256 = _read_private_json(
-        _outcome_path(binding["task_id"]),
-        label="task outcome receipt",
-    )
-    receipt_sha256 = _validate_outcome_receipt(
-        value,
-        record=record,
-        binding=binding,
-        expected_receipt_sha256=expected_receipt_sha256,
-    )
-    return value, receipt_sha256, file_sha256
+    first_missing: FileNotFoundError | None = None
+    first_conflict: TaskAttentionConflictError | None = None
+    for path in _outcome_paths(binding["task_id"]):
+        try:
+            value, file_sha256 = _read_private_json(
+                path,
+                label="task outcome receipt",
+            )
+        except FileNotFoundError as exc:
+            if first_missing is None:
+                first_missing = exc
+            continue
+        try:
+            receipt_sha256 = _validate_outcome_receipt(
+                value,
+                record=record,
+                binding=binding,
+                expected_receipt_sha256=expected_receipt_sha256,
+            )
+        except TaskAttentionConflictError as exc:
+            if first_conflict is None:
+                first_conflict = exc
+            continue
+        return value, receipt_sha256, file_sha256
+
+    if first_conflict is not None:
+        raise first_conflict
+    if first_missing is not None:
+        raise first_missing
+    raise FileNotFoundError(f"No task outcome receipt for {binding['task_id']}")
 
 
 def _decision_path(binding: dict[str, Any]) -> Path:

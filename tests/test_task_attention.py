@@ -165,26 +165,20 @@ class TaskAttentionTests(unittest.TestCase):
             attention.record_decision(self._parameters(record, expected_attempt=2))
         self.assertEqual([], list(self.decisions.glob("*.json")))
 
-    def test_missing_or_wrong_outcome_receipt_blocks_decision(self) -> None:
+    def test_missing_outcome_receipt_blocks_decision(self) -> None:
         record = self._failed_task()
+        parameters = self._parameters(record)
         outcome_path = self.outcomes / f"{record['task_id']}.json"
         outcome_path.unlink()
         with self.assertRaises(FileNotFoundError):
-            attention.record_decision(self._parameters_from_missing(record))
+            attention.record_decision(parameters)
 
-    def _parameters_from_missing(self, record: dict[str, object]) -> dict[str, object]:
-        return {
-            "task_id": record["task_id"],
-            "decision": "closed",
-            "expected_attempt": record["attempt"],
-            "expected_unit": record["unit"],
-            "expected_authoritative_unit": record["authoritative_unit"],
-            "expected_argv_sha256": record["argv_sha256"],
-            "expected_execution_envelope_sha256": record["execution_envelope_sha256"],
-            "outcome_receipt_sha256": "a" * 64,
-            "authority": "operator:alex",
-            "evidence_ref": "bureau:event:597",
-        }
+    def test_wrong_expected_outcome_receipt_blocks_decision(self) -> None:
+        record = self._failed_task()
+        with self.assertRaises(attention.TaskAttentionConflictError):
+            attention.record_decision(
+                self._parameters(record, outcome_receipt_sha256="a" * 64)
+            )
 
     def test_manipulated_outcome_self_hash_is_rejected(self) -> None:
         record = self._failed_task()
@@ -196,6 +190,37 @@ class TaskAttentionTests(unittest.TestCase):
         os.chmod(outcome_path, 0o600)
         with self.assertRaises(attention.TaskAttentionIntegrityError):
             attention.record_decision(parameters)
+
+    def test_legacy_primary_receipt_does_not_hide_authoritative_lifecycle_receipt(self) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        primary_path = self.outcomes / f"{task_id}.json"
+        lifecycle_path = self.outcomes / f"{task_id}.lifecycle.json"
+        lifecycle = json.loads(primary_path.read_text(encoding="utf-8"))
+        primary_path.replace(lifecycle_path)
+
+        legacy = {
+            key: value
+            for key, value in lifecycle.items()
+            if key not in {"kind", "terminalization", "receipt_sha256"}
+        }
+        legacy["schema_version"] = 1
+        legacy["receipt_sha256"] = attention._sha256_json(legacy)
+        primary_path.write_text(
+            json.dumps(legacy, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(primary_path, 0o600)
+
+        expected = lifecycle["receipt_sha256"]
+        result = attention.record_decision(
+            self._parameters(record, outcome_receipt_sha256=expected)
+        )
+
+        self.assertEqual(expected, result["outcome_receipt_sha256"])
+        classified = attention._classify_record(tasks._row(task_id))
+        self.assertEqual("decision_closed", classified["classification"])
+        self.assertEqual(expected, classified["outcome_receipt_sha256"])
 
     def test_lifecycle_transition_tampering_is_rejected_after_outer_rehash(self) -> None:
         record = self._failed_task()
