@@ -169,6 +169,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_workspace_reconcile_stale` | agent-workspace | no | high | Mark one provably inactive stale workspace abandoned without stopping tasks, releasing resources or removing its checkout. |
 | `grabowski_agent_workspace_cleanup` | agent-workspace | no | high | Create durable recovery refs and remove one eligible closed writer checkout without deleting workspace evidence. |
 | `grabowski_agent_execution_route` | agent-workspace | yes | low | Recommend a lean R0-R3 direct, isolated, full-workspace, contrast or explicitly fork-gated competition route while keeping parallel writers advisory-only. |
+| `grabowski_coding_agent_catalog` | agent-workspace | yes | low | Read the validated canonical coding-model, harness, route and quota inventory without probing or executing external agents. |
+| `grabowski_coding_agent_route` | agent-workspace | yes | low | Recommend one zero-marginal-cost, quota-aware coding route and provider-independent reviewer without granting dispatch or execution authority. |
 | `grabowski_agent_competition_start` | agent-workspace | no | medium | Start one durable advisory-only external competitor or contrast programmer against a commit-bound context packet with a frozen runner and isolated provider workspace. |
 | `grabowski_agent_competition_status` | agent-workspace | yes | low | Read one external candidate task and validate its immutable advisory receipt. |
 | `grabowski_agent_competition_compare` | agent-workspace | yes | low | Generate a deterministic contrast matrix, consensus signals and validation opportunities from exactly two bound external candidates. |

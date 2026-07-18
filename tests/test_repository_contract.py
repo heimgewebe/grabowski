@@ -133,7 +133,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 145)
+        self.assertEqual(len(tools), 147)
         self.assertTrue(
             {
                 "grabowski_juno_status",

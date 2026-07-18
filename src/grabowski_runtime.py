@@ -21,6 +21,7 @@ import grabowski_recall
 import grabowski_resources
 import grabowski_tasks
 import grabowski_agent_competition
+import grabowski_coding_agent_router
 import grabowski_workers
 
 
