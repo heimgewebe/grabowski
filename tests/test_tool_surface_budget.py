@@ -50,10 +50,11 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         self.assertTrue(report["valid"], report)
         self.assertTrue(report["schema_valid"])
         self.assertEqual(report["baseline_tool_count"], 125)
-        self.assertEqual(report["current_tool_count"], 142)
-        self.assertEqual(report["growth"], 17)
-        self.assertEqual(report["accepted_addition_count"], 17)
+        self.assertEqual(report["current_tool_count"], 145)
+        self.assertEqual(report["growth"], 28)
+        self.assertEqual(report["accepted_addition_count"], 28)
         self.assertEqual(report["operation_count"], 3)
+        self.assertEqual(report["retired_tool_count"], 8)
 
     def test_unbudgeted_public_tool_is_rejected(self) -> None:
         runtime = copy.deepcopy(self.runtime)
@@ -111,15 +112,13 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
                 "evidence": "Dedicated capability and effect contract.",
             },
         }
-        report = self._validate(
-            contract, runtime=runtime, capabilities=capabilities
-        )
+        report = self._validate(contract, runtime=runtime, capabilities=capabilities)
         self.assertTrue(report["valid"], report)
         self.assertEqual(
             report["accepted_addition_count"],
             len(self.contract["accepted_additions"]) + 1,
         )
-        self.assertEqual(report["growth"], 18)
+        self.assertEqual(report["growth"], 29)
 
     def test_semantic_drift_of_existing_tool_is_rejected(self) -> None:
         capabilities = copy.deepcopy(self.capabilities)
@@ -127,9 +126,7 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
             item for item in capabilities["tools"] if item["tool"] == "grabowski_status"
         )
         status["risk_class"] = "high"
-        report = self._validate(
-            copy.deepcopy(self.contract), capabilities=capabilities
-        )
+        report = self._validate(copy.deepcopy(self.contract), capabilities=capabilities)
         self.assertFalse(report["valid"])
         self.assertIn("tool capability semantics drift", report["errors"][0])
 
@@ -165,9 +162,7 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         contract["baseline"]["tool_semantics_sha256"] = budget._sha256(
             contract["baseline"]["tools"]
         )
-        report = self._validate(
-            contract, runtime=runtime, capabilities=capabilities
-        )
+        report = self._validate(contract, runtime=runtime, capabilities=capabilities)
         self.assertFalse(report["valid"])
         self.assertIn("baseline anchor drift", report["errors"][0])
 
@@ -237,9 +232,7 @@ class OperationCatalogBindingTests(unittest.TestCase):
         with patch.object(
             operations, "OPERATIONS_CONFIG", budget.OPERATIONS_CATALOG_PATH
         ):
-            plan = operations._render(
-                "inspect-user-service", {"unit": "demo.service"}
-            )
+            plan = operations._render("inspect-user-service", {"unit": "demo.service"})
         self.assertEqual(
             plan["steps"][0]["argv"],
             [
