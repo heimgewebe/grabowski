@@ -273,6 +273,12 @@ class RepositoryContractTests(unittest.TestCase):
             )
         self.assertEqual(grip_imports - deployed_modules, set())
 
+    def test_bureau_intake_adapter_is_loaded_and_packaged(self) -> None:
+        runtime = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn("import grabowski_bureau_intake", runtime)
+        self.assertIn('"grabowski_bureau_intake"', pyproject)
+
     def test_task_attention_is_packaged_as_a_python_module(self) -> None:
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('"grabowski_task_attention"', pyproject)
