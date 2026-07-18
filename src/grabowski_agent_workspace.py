@@ -6188,22 +6188,40 @@ def _closed_workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
         ),
         "task_states": task_states,
         "nonterminal_roles": [],
+        "execution_live_roles": [],
+        "recovery_attention_roles": [],
+        "task_observation_error_roles": [],
         "live_resource_keys": [],
         "resource_observation_error": None,
         "session_live": False,
+        "operationally_live": False,
+        "session_only_non_authoritative": False,
         "unresolved_task_start_roles": [],
         "source": "complete_close_receipt",
     }
 
+
 def _workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
     task_states: dict[str, dict[str, Any]] = {}
     nonterminal_roles: list[str] = []
+    execution_live_roles: list[str] = []
+    recovery_attention_roles: list[str] = []
+    task_observation_error_roles: list[str] = []
     for role_name in ("writer", "tests", "review"):
         task_id = manifest.get("tasks", {}).get(role_name)
         public = _task_public(task_id)
         task_states[role_name] = public
-        if task_id is not None and not public.get("terminal"):
+        if task_id is None:
+            continue
+        state = str(public.get("state", "unknown"))
+        if not public.get("terminal"):
             nonterminal_roles.append(role_name)
+        if state in {"launching", "running"}:
+            execution_live_roles.append(role_name)
+        elif state in {"interrupted", "outcome_unknown"}:
+            recovery_attention_roles.append(role_name)
+        elif not public.get("terminal"):
+            task_observation_error_roles.append(role_name)
     resource_owner = manifest.get("resources", {}).get("owner_id")
     live_resource_keys: list[str] = []
     resource_observation_error: str | None = None
@@ -6227,6 +6245,13 @@ def _workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
     )
     start_intents = manifest.get("task_start_intents", {})
     unresolved_start_roles = sorted(start_intents) if isinstance(start_intents, dict) else ["invalid"]
+    operationally_live = bool(
+        execution_live_roles
+        or task_observation_error_roles
+        or live_resource_keys
+        or resource_observation_error
+        or unresolved_start_roles
+    )
     created_unix = _workspace_created_unix(manifest)
     stale_after_unix = (
         created_unix + STALE_WORKSPACE_MINIMUM_AGE_SECONDS
@@ -6242,9 +6267,14 @@ def _workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
         ),
         "task_states": task_states,
         "nonterminal_roles": nonterminal_roles,
+        "execution_live_roles": execution_live_roles,
+        "recovery_attention_roles": recovery_attention_roles,
+        "task_observation_error_roles": task_observation_error_roles,
         "live_resource_keys": live_resource_keys,
         "resource_observation_error": resource_observation_error,
         "session_live": session_live,
+        "operationally_live": operationally_live,
+        "session_only_non_authoritative": bool(session_live and not operationally_live),
         "unresolved_task_start_roles": unresolved_start_roles,
         "source": "live_runtime",
     }
@@ -6267,8 +6297,19 @@ def _stale_workspace_reconciliation_plan(
                 "minimum_age_seconds": STALE_WORKSPACE_MINIMUM_AGE_SECONDS,
             }
         )
+    # tmux is not authoritative evidence of operational liveness. However, the
+    # stale reconciler is deliberately non-destructive and therefore cannot
+    # close a workspace while an idle session would remain behind.
     if liveness.get("session_live"):
-        blockers.append({"code": "workspace_tmux_session_live"})
+        blockers.append(
+            {
+                "code": (
+                    "workspace_tmux_session_live"
+                    if liveness.get("operationally_live")
+                    else "workspace_idle_tmux_cleanup_required"
+                )
+            }
+        )
     if liveness.get("resource_observation_error"):
         blockers.append(
             {
@@ -6283,11 +6324,25 @@ def _stale_workspace_reconciliation_plan(
                 "resource_keys": liveness["live_resource_keys"],
             }
         )
-    if liveness.get("nonterminal_roles"):
+    if liveness.get("execution_live_roles"):
         blockers.append(
             {
                 "code": "workspace_tasks_nonterminal",
-                "roles": liveness["nonterminal_roles"],
+                "roles": liveness["execution_live_roles"],
+            }
+        )
+    if liveness.get("recovery_attention_roles"):
+        blockers.append(
+            {
+                "code": "workspace_tasks_require_reconciliation",
+                "roles": liveness["recovery_attention_roles"],
+            }
+        )
+    if liveness.get("task_observation_error_roles"):
+        blockers.append(
+            {
+                "code": "workspace_task_observation_error",
+                "roles": liveness["task_observation_error_roles"],
             }
         )
     if liveness.get("unresolved_task_start_roles"):
@@ -6638,6 +6693,14 @@ def grabowski_agent_workspace_cleanup_plan(
             for plan in plans
             if plan["stale_reconciliation"]["eligible"]
             and plan["stale_reconciliation"].get("reconciliation_kind") == "legacy_absence"
+        ),
+        "operationally_live_count": sum(
+            1 for plan in plans if plan["liveness"].get("operationally_live")
+        ),
+        "session_only_non_authoritative_count": sum(
+            1
+            for plan in plans
+            if plan["liveness"].get("session_only_non_authoritative")
         ),
         "blocked_count": sum(
             1

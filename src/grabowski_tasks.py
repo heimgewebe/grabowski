@@ -66,7 +66,8 @@ TASK_STATES = {
     "interrupted",
 }
 TASK_STATE_PROJECTIONS: dict[str, tuple[str, ...]] = {
-    "active": ("launching", "running", "interrupted"),
+    # "active" is current execution truth, not retained recovery history.
+    "active": ("launching", "running"),
     "attention": ("interrupted", "outcome_unknown", "failed", "timed_out", "signalled"),
     "terminal": ("completed", "failed", "cancelled", "timed_out", "signalled"),
 }
@@ -79,7 +80,7 @@ TASK_SCHEMA_V4_ADDITIVE_COLUMNS = {
     "terminalized_at_unix": ("INTEGER", 0, 0),
     "lifecycle_receipt_sha256": ("TEXT", 0, 0),
 }
-ACTIVE_TASK_STATES = {"running", "outcome_unknown"}
+LEASE_MAINTENANCE_TASK_STATES = {"running", "outcome_unknown"}
 TASK_LEASE_DELEGATION_STATES = frozenset({"running"})
 
 
@@ -799,7 +800,7 @@ def _maintain_record_resources(
     record: dict[str, Any],
     state: str,
 ) -> dict[str, Any] | None:
-    if state not in ACTIVE_TASK_STATES:
+    if state not in LEASE_MAINTENANCE_TASK_STATES:
         return None
     keys = _record_resource_keys(record)
     if not keys:
@@ -1257,8 +1258,10 @@ def _task_state_counts(
 
 
 def _task_recommended_next_action(state: str) -> str:
-    if state in {"launching", "running", "interrupted"}:
+    if state in {"launching", "running"}:
         return "read grabowski_task_status before deciding the next action"
+    if state == "interrupted":
+        return "run grabowski_task_reconcile_check and read current status before any retry"
     if state == "outcome_unknown":
         return "reconcile and read post-state before any unchanged retry"
     if state in {"failed", "timed_out", "signalled"}:
