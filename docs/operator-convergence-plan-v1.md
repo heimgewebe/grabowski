@@ -17,7 +17,7 @@ Reduce coordination cost without weakening fail-closed safety. The operator alre
 
 Bind merge dispatch to a fresh atomic snapshot of repository identity, pull-request head/base/diff, CI, review evidence, and resource leases. This work remains owned by the separate T057 stream and must not be duplicated here.
 
-### P1 — Active-state projection
+### P1a — Active-state projection
 
 Expose named task projections through the existing `grabowski_task_list` surface:
 
@@ -29,11 +29,11 @@ Expose named task projections through the existing `grabowski_task_list` surface
 
 Every response also returns exact state counts and projection counts from one SQLite read snapshot. Projections intentionally overlap and must not be summed. Unknown legacy states are counted explicitly and make the exact-state projection incomplete instead of disappearing silently. Historical rows remain in the task database.
 
-### P1 — Workspace liveness projection
+### P1b — Workspace liveness projection
 
-Derive operational workspace liveness from tasks that may still execute (`launching` or `running`), live resource leases, unresolved task-start intents, and observation errors. Retained recovery states such as `interrupted` or `outcome_unknown` remain explicit reconciliation blockers without claiming that execution is still live. tmux remains a non-authoritative process UI: a surviving idle session is reported, but it does not by itself block stale-workspace reconciliation or make historical work active again. Worktree cleanup remains separately protected by checkout coordination and dirty-state checks.
+Derive operational workspace liveness from tasks that may still execute (`launching` or `running`), live resource leases, unresolved task-start intents, and observation errors. Retained recovery states such as `interrupted` or `outcome_unknown` remain explicit reconciliation blockers without claiming that execution is still live. tmux remains a non-authoritative process UI: a surviving idle session is reported separately and does not make historical work active again. Because stale reconciliation is intentionally non-destructive, that idle session still blocks reconciliation with `workspace_idle_tmux_cleanup_required` until an explicit mutating closeout removes it. Worktree cleanup remains separately protected by checkout coordination and dirty-state checks.
 
-### P1 — Gate evidence preparation
+### P1c — Gate evidence preparation
 
 Repeated friction recommendations include a bounded repair contract:
 
@@ -46,11 +46,11 @@ Repeated friction recommendations include a bounded repair contract:
 
 The repair contract prepares evidence. It never bypasses a gate or starts work automatically.
 
-### P1 — Execution learning
+### P1d — Execution learning
 
 Record predicted-versus-actual outcomes automatically from terminal receipt-bound grips, tasks, jobs, and deployments. Promotion remains shadow-only until the ledger contains sufficient recent, reproducible evidence. High-risk and immutable boundaries remain excluded.
 
-### P1 — Exact deployment source identity
+### P1e — Exact deployment source identity
 
 Schedule self-deployment from an explicitly selected clean immutable source identity rather than ambient canonical-checkout state. Require exact head, clean status, provenance, lease evidence, preflight receipt, idempotent scheduling, and post-deployment readback.
 
