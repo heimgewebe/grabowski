@@ -1042,6 +1042,13 @@ def _run_node_form_action(
     node = shutil.which("node")
     if not node:
         raise RuntimeError("Node.js is required for browser CDP actions")
+    node_path = Path(node)
+    if not node_path.is_absolute():
+        raise RuntimeError("Node.js executable must resolve from an absolute alias")
+    node_target = node_path.resolve(strict=True)
+    node_metadata = node_target.stat()
+    if not stat.S_ISREG(node_metadata.st_mode) or not os.access(node_target, os.X_OK):
+        raise PermissionError("Node.js target is not an executable regular file")
     directory = Path(record["config_path"]).parent
     if directory.is_symlink() or WORKER_STATE not in directory.parents:
         raise PermissionError("worker action directory is outside worker state")
@@ -1055,7 +1062,7 @@ def _run_node_form_action(
         _write_private_action_file(request_path, _canonical_json(request) + "\n")
         created.append(request_path)
         execution = operator._run(
-            [str(Path(node).resolve(strict=True)), str(script_path), str(request_path)],
+            [str(node_path), str(script_path), str(request_path)],
             cwd=directory,
             timeout_seconds=timeout_seconds + 10,
             max_output_bytes=65536,
