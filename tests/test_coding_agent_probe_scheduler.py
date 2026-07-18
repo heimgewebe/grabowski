@@ -121,7 +121,7 @@ else:
         self,
     ) -> None:
         self.write_router()
-        environment = {name: "secret" for name in SCHEDULER.FORBIDDEN_API_KEY_ENV}
+        environment = {name: "" for name in SCHEDULER.FORBIDDEN_API_KEY_ENV}
         with mock.patch.dict(os.environ, environment, clear=False):
             result = SCHEDULER.main(self.arguments())
         self.assertEqual(0, result)
@@ -141,7 +141,8 @@ else:
         self.assertEqual(1, result)
         failure = json.loads(self.failure.read_text(encoding="utf-8"))
         self.assertEqual("failed", failure["status"])
-        self.assertIn("history", failure["error"])
+        self.assertEqual("ProbeSchedulerError", failure["error_type"])
+        self.assertEqual("probe_scheduler_failed_closed", failure["error"])
         self.assertFalse(self.receipt.exists())
 
     def test_router_digest_mismatch_fails_before_execution(self) -> None:
@@ -152,7 +153,8 @@ else:
         self.assertEqual(1, result)
         self.assertEqual(before, self.state.read_bytes())
         failure = json.loads(self.failure.read_text(encoding="utf-8"))
-        self.assertIn("digest pin", failure["error"])
+        self.assertEqual("ProbeSchedulerError", failure["error_type"])
+        self.assertEqual("probe_scheduler_failed_closed", failure["error"])
         self.assertFalse(self.receipt.exists())
 
     def test_tampered_probe_digest_fails_closed(self) -> None:
@@ -160,7 +162,8 @@ else:
         result = SCHEDULER.main(self.arguments())
         self.assertEqual(1, result)
         failure = json.loads(self.failure.read_text(encoding="utf-8"))
-        self.assertIn("digest", failure["error"])
+        self.assertEqual("ProbeSchedulerError", failure["error_type"])
+        self.assertEqual("probe_scheduler_failed_closed", failure["error"])
         self.assertFalse(self.receipt.exists())
 
     def test_lock_contention_is_a_clean_noop(self) -> None:

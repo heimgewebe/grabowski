@@ -347,9 +347,9 @@ def run_json_command(
     ):
         raise ProbeSchedulerError(f"command output exceeded the limit: {argv[-1]}")
     if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", errors="replace").strip()[:500]
         raise ProbeSchedulerError(
-            f"command returned {completed.returncode}: {argv[-1]}: {detail}"
+            f"command returned nonzero status for {argv[-1]} "
+            f"(exit {completed.returncode})"
         )
     try:
         value = json.loads(completed.stdout.decode("utf-8"))
@@ -419,7 +419,7 @@ def bounded_failure(exc: BaseException) -> dict[str, Any]:
         "status": "failed",
         "failed_at": iso_now(),
         "error_type": type(exc).__name__,
-        "error": str(exc)[:500],
+        "error": "probe_scheduler_failed_closed",
         "automatic_execution_authorized": False,
         "model_invocations": 0,
         "paid_api_requests_authorized": 0,
