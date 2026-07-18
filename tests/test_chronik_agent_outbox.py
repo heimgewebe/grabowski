@@ -1,7 +1,10 @@
 import json
+import hashlib
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -11,7 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import grabowski_chronik as chronik
+import grabowski_chronik as chronik  # noqa: E402
 
 
 def record(**overrides):
@@ -25,6 +28,90 @@ def record(**overrides):
     }
     value.update(overrides)
     return value
+
+
+def sha256_bytes(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def write_archive_fixture(root, source_name, events):
+    source_dir = root / "grabowski" / "chronik-outbox"
+    bundle_dir = source_dir / "bundles"
+    bundle_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    source_path = source_dir / source_name
+    source_raw = b"".join(
+        chronik._canonical_bytes(event) + b"\n" for event in events
+    )
+    source_sha256 = sha256_bytes(source_raw)
+    bundle_sha256 = sha256_bytes(source_raw)
+    bundle_file = f"grabowski-{bundle_sha256}.bundle.jsonl"
+    (bundle_dir / bundle_file).write_bytes(source_raw)
+    source_record = {
+        "schema_version": chronik.BUNDLE_SOURCE_SCHEMA,
+        "source_name": source_name,
+        "source_path": str(source_path),
+        "source_sha256": source_sha256,
+        "source_bytes": len(source_raw),
+        "offset": 0,
+        "event_ids": [event["event_id"] for event in events],
+        "terminal_kind": events[-1]["kind"],
+    }
+    source_record["record_sha256"] = sha256_bytes(
+        chronik._canonical_bytes(source_record)
+    )
+    manifest = {
+        "schema_version": chronik.BUNDLE_MANIFEST_SCHEMA,
+        "domain": "agent.ledger",
+        "created_at": "2026-07-18T00:00:00Z",
+        "bundle_file": bundle_file,
+        "bundle_sha256": bundle_sha256,
+        "bundle_bytes": len(source_raw),
+        "source_count": 1,
+        "event_count": len(events),
+        "sources": [source_record],
+        "historical_only": True,
+        "does_not_establish": ["writer_authority"],
+    }
+    manifest["manifest_sha256"] = sha256_bytes(
+        chronik._canonical_bytes(manifest)
+    )
+    manifest_file = f"grabowski-{bundle_sha256}.manifest.json"
+    (bundle_dir / manifest_file).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    index = {
+        "schema_version": chronik.ARCHIVE_INDEX_SCHEMA,
+        "domain": "agent.ledger",
+        "manifest_count": 1,
+        "source_count": 1,
+        "manifests": [
+            {"file": manifest_file, "sha256": manifest["manifest_sha256"]}
+        ],
+        "sources": [
+            {
+                "source_name": source_name,
+                "source_sha256": source_sha256,
+                "event_ids": [event["event_id"] for event in events],
+                "manifest_index": 0,
+            }
+        ],
+        "historical_only": True,
+        "authoritative": False,
+        "reconstructible": True,
+        "does_not_establish": ["writer_authority"],
+    }
+    index["index_sha256"] = sha256_bytes(chronik._canonical_bytes(index))
+    index_path = bundle_dir / chronik.ARCHIVE_INDEX_FILENAME
+    index_path.write_bytes(chronik._canonical_bytes(index) + b"\n")
+    return {
+        "source_path": source_path,
+        "bundle_path": bundle_dir / bundle_file,
+        "manifest_path": bundle_dir / manifest_file,
+        "index_path": index_path,
+        "index": index,
+        "manifest": manifest,
+    }
 
 
 class ChronikAgentOutboxTests(unittest.TestCase):
@@ -93,7 +180,10 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         event = json.loads(self.lines()[0])
         self.assertEqual(event["kind"], "agent.run.completed")
         self.assertEqual(event["data"], {"result": "completed", "operation": "other", "task_class": "other"})
-        self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name); os.environ[chronik.STATE_ROOT_ENV] = str(self.root)
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        os.environ[chronik.STATE_ROOT_ENV] = str(self.root)
         chronik.record_task_state(record(), "failed")
         event = json.loads(self.lines()[0])
         self.assertEqual(event["kind"], "agent.run.blocked")
@@ -197,6 +287,332 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         path.write_text(chronik.canonical_json(changed) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "different payload"):
             chronik.append_unique(path, event)
+
+    def test_archived_duplicate_is_not_recreated(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-archived-a1.jsonl", [event]
+        )
+
+        self.assertFalse(chronik.append_unique(fixture["source_path"], event))
+        self.assertFalse(fixture["source_path"].exists())
+        lock_path = fixture["source_path"].parent / chronik.WRITER_COMPACTION_LOCK_FILENAME
+        self.assertTrue(lock_path.is_file())
+        self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+
+    def test_archived_duplicate_matches_any_distinct_source_generation(self):
+        self.enable()
+        first_event = chronik.build_event(record(), "completed")
+        first = write_archive_fixture(
+            self.root, "grabowski_task-generation-a1.jsonl", [first_event]
+        )
+        second_event = chronik.build_event(
+            record(
+                task_id="d" * 24,
+                unit="grabowski-task-" + "d" * 24 + "-a1.service",
+            ),
+            "completed",
+        )
+        second = write_archive_fixture(
+            self.root, "grabowski_task-generation-a1.jsonl", [second_event]
+        )
+        manifests = [first["manifest"], second["manifest"]]
+        manifest_paths = [first["manifest_path"], second["manifest_path"]]
+        manifest_order = sorted(
+            range(2), key=lambda index: manifest_paths[index].name
+        )
+        manifest_index_by_original = {
+            original_index: sorted_index
+            for sorted_index, original_index in enumerate(manifest_order)
+        }
+        index = {
+            "schema_version": chronik.ARCHIVE_INDEX_SCHEMA,
+            "domain": "agent.ledger",
+            "manifest_count": 2,
+            "source_count": 2,
+            "manifests": [
+                {
+                    "file": manifest_paths[index].name,
+                    "sha256": manifests[index]["manifest_sha256"],
+                }
+                for index in manifest_order
+            ],
+            "sources": sorted(
+                [
+                    {
+                        "source_name": "grabowski_task-generation-a1.jsonl",
+                        "source_sha256": manifests[index]["sources"][0][
+                            "source_sha256"
+                        ],
+                        "event_ids": manifests[index]["sources"][0][
+                            "event_ids"
+                        ],
+                        "manifest_index": manifest_index_by_original[index],
+                    }
+                    for index in range(2)
+                ],
+                key=lambda item: (
+                    item["source_name"], item["source_sha256"]
+                ),
+            ),
+            "historical_only": True,
+            "authoritative": False,
+            "reconstructible": True,
+            "does_not_establish": ["writer_authority"],
+        }
+        index["index_sha256"] = sha256_bytes(chronik._canonical_bytes(index))
+        second["index_path"].write_bytes(
+            chronik._canonical_bytes(index) + b"\n"
+        )
+
+        self.assertFalse(
+            chronik.append_unique(second["source_path"], first_event)
+        )
+        self.assertFalse(
+            chronik.append_unique(second["source_path"], second_event)
+        )
+        self.assertFalse(second["source_path"].exists())
+
+    def test_archived_source_allows_disjoint_successor_generation(self):
+        self.enable()
+        archived = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-archived-a1.jsonl", [archived]
+        )
+        successor = chronik.build_event(
+            record(terminalized_at_unix=1_700_000_400), "completed"
+        )
+        self.assertNotEqual(successor["event_id"], archived["event_id"])
+
+        self.assertTrue(chronik.append_unique(fixture["source_path"], successor))
+        self.assertEqual(
+            [json.loads(line) for line in fixture["source_path"].read_text().splitlines()],
+            [successor],
+        )
+        self.assertFalse(chronik.append_unique(fixture["source_path"], successor))
+
+    def test_archived_event_id_payload_mismatch_fails_closed(self):
+        self.enable()
+        archived = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-archived-a1.jsonl", [archived]
+        )
+        forged = json.loads(json.dumps(archived))
+        forged["data"]["operation"] = "recovery"
+
+        with self.assertRaisesRegex(ValueError, "event_id does not match payload"):
+            chronik.append_unique(fixture["source_path"], forged)
+        self.assertFalse(fixture["source_path"].exists())
+
+    def test_missing_archive_index_with_manifests_fails_closed(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-missing-index-a1.jsonl", [event]
+        )
+        fixture["index_path"].unlink()
+
+        with self.assertRaisesRegex(ValueError, "index is missing"):
+            chronik.append_unique(fixture["source_path"], event)
+        self.assertFalse(fixture["source_path"].exists())
+
+    def test_archive_index_must_cover_every_manifest(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-extra-manifest-a1.jsonl", [event]
+        )
+        extra = fixture["manifest_path"].with_name("extra.manifest.json")
+        extra.write_bytes(fixture["manifest_path"].read_bytes())
+
+        with self.assertRaisesRegex(ValueError, "cover all bundle manifests"):
+            chronik.append_unique(fixture["source_path"], event)
+        self.assertFalse(fixture["source_path"].exists())
+
+    def test_corrupt_archive_index_fails_closed(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-archived-a1.jsonl", [event]
+        )
+        fixture["index_path"].write_text("{broken\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "invalid JSON"):
+            chronik.append_unique(fixture["source_path"], event)
+        self.assertFalse(fixture["source_path"].exists())
+
+    def test_manifest_or_bundle_mismatch_fails_closed(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-archived-a1.jsonl", [event]
+        )
+        fixture["bundle_path"].write_bytes(b"changed\n")
+
+        with self.assertRaisesRegex(ValueError, "bundle content mismatch"):
+            chronik.append_unique(fixture["source_path"], event)
+        self.assertFalse(fixture["source_path"].exists())
+
+    def test_manifest_cache_invalidates_after_bundle_change(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-archived-a1.jsonl", [event]
+        )
+        self.assertFalse(chronik.append_unique(fixture["source_path"], event))
+        fixture["bundle_path"].write_bytes(b"changed after cache\n")
+
+        with self.assertRaisesRegex(ValueError, "bundle content mismatch"):
+            chronik.append_unique(fixture["source_path"], event)
+        self.assertFalse(fixture["source_path"].exists())
+
+    def test_cache_invalidates_on_ctime_when_size_and_mtime_are_restored(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-ctime-a1.jsonl", [event]
+        )
+        self.assertFalse(chronik.append_unique(fixture["source_path"], event))
+        bundle = fixture["bundle_path"]
+        original = bundle.read_bytes()
+        original_stat = bundle.stat()
+        tampered = bytearray(original)
+        tampered[0] ^= 1
+        bundle.write_bytes(tampered)
+        os.utime(
+            bundle,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+
+        with self.assertRaises(ValueError):
+            chronik.append_unique(fixture["source_path"], event)
+        self.assertFalse(fixture["source_path"].exists())
+
+    def test_unchanged_archive_cache_avoids_reloading_large_files(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-cached-a1.jsonl", [event]
+        )
+        self.assertFalse(chronik.append_unique(fixture["source_path"], event))
+
+        with patch.object(
+            chronik, "_read_regular_file", wraps=chronik._read_regular_file
+        ) as reader:
+            self.assertFalse(
+                chronik.append_unique(fixture["source_path"], event)
+            )
+
+        reader.assert_not_called()
+        self.assertFalse(fixture["source_path"].exists())
+
+    def test_archive_index_cache_invalidates_after_atomic_replace(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        fixture = write_archive_fixture(
+            self.root, "grabowski_task-archived-a1.jsonl", [event]
+        )
+        self.assertFalse(chronik.append_unique(fixture["source_path"], event))
+        replacement = fixture["index_path"].with_name("replacement.json")
+        replacement.write_text("{broken\n", encoding="utf-8")
+        os.replace(replacement, fixture["index_path"])
+
+        with self.assertRaisesRegex(ValueError, "invalid JSON"):
+            chronik.append_unique(fixture["source_path"], event)
+        self.assertFalse(fixture["source_path"].exists())
+
+    def test_non_archived_source_still_writes_normally(self):
+        self.enable()
+        archived = chronik.build_event(record(), "completed")
+        write_archive_fixture(
+            self.root, "grabowski_task-other-a1.jsonl", [archived]
+        )
+        event = chronik.build_event(
+            record(task_id="c" * 24, unit="grabowski-task-" + "c" * 24 + "-a1.service"),
+            "completed",
+        )
+        path = chronik.outbox_path(event, self.root)
+
+        self.assertTrue(chronik.append_unique(path, event))
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_writer_rejects_symlinked_outbox_directory(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        source_dir = self.root / "grabowski" / "chronik-outbox"
+        target = self.root / "redirected-outbox"
+        source_dir.parent.mkdir(parents=True)
+        target.mkdir()
+        source_dir.symlink_to(target, target_is_directory=True)
+        path = source_dir / "grabowski_task-symlink-a1.jsonl"
+
+        with self.assertRaisesRegex(ValueError, "must be real"):
+            chronik.append_unique(path, event)
+
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_writer_rejects_hardlinked_compaction_lock(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        source_dir = self.root / "grabowski" / "chronik-outbox"
+        source_dir.mkdir(parents=True, mode=0o700)
+        origin = self.root / "shared-lock"
+        origin.write_text("", encoding="utf-8")
+        os.chmod(origin, 0o600)
+        os.link(origin, source_dir / chronik.WRITER_COMPACTION_LOCK_FILENAME)
+        path = source_dir / "grabowski_task-hardlink-a1.jsonl"
+
+        with self.assertRaisesRegex(ValueError, "private owned file"):
+            chronik.append_unique(path, event)
+
+        self.assertFalse(path.exists())
+
+    def test_writer_waits_for_compaction_lock(self):
+        self.enable()
+        event = chronik.build_event(record(), "completed")
+        path = chronik.outbox_path(event, self.root)
+        started = threading.Event()
+        completed = threading.Event()
+        results = []
+
+        def writer():
+            started.set()
+            results.append(chronik.append_unique(path, event))
+            completed.set()
+
+        with chronik._writer_compaction_lock(path.parent):
+            thread = threading.Thread(target=writer)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            time.sleep(0.05)
+            self.assertFalse(completed.is_set())
+        thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [True])
+        self.assertTrue(path.is_file())
+
+    def test_writer_lock_wait_is_bounded_and_safe_wrapper_reports_error(self):
+        self.enable()
+        value = record()
+        path = chronik.outbox_path(
+            chronik.build_event(value, "completed"), self.root
+        )
+
+        with patch.object(
+            chronik, "WRITER_COMPACTION_LOCK_TIMEOUT_SECONDS", 0.05
+        ):
+            with chronik._writer_compaction_lock(path.parent):
+                started = time.monotonic()
+                result = chronik.record_task_state_safely(value, "completed")
+                elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(result["written"])
+        self.assertIn("acquisition timed out", result["error"])
+        self.assertFalse(path.exists())
 
     def test_failure_is_non_blocking(self):
         bad_root = self.root / "occupied"

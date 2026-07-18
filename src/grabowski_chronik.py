@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
 import os
+import stat
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +22,18 @@ TASK_STATE_ROOT_FIELD = "chronik_outbox_state_root"
 TASK_CONTEXT_FIELD = "chronik_context_json"
 TRUTHY = {"1", "true", "yes", "on"}
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}
+ARCHIVE_INDEX_FILENAME = "archive-index.v1.json"
+ARCHIVE_INDEX_SCHEMA = "chronik-grabowski-outbox-archive-index.v1"
+BUNDLE_MANIFEST_SCHEMA = "chronik-grabowski-outbox-bundle-manifest.v1"
+BUNDLE_SOURCE_SCHEMA = "chronik-grabowski-outbox-bundle-source.v1"
+WRITER_COMPACTION_LOCK_FILENAME = ".writer-compaction.lock"
+WRITER_COMPACTION_LOCK_TIMEOUT_SECONDS = 5.0
+WRITER_COMPACTION_LOCK_POLL_SECONDS = 0.01
+MAX_ARCHIVE_INDEX_BYTES = 16 * 1024 * 1024
+MAX_BUNDLE_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_BUNDLE_BYTES = 128 * 1024 * 1024
+_ARCHIVE_INDEX_CACHE: dict[Path, tuple[tuple[int, int, int, int, int], dict[str, Any]]] = {}
+_MANIFEST_CACHE: dict[Path, tuple[tuple[int, int, int, int, int], dict[str, Any]]] = {}
 
 
 def enabled() -> bool:
@@ -40,7 +56,590 @@ def record_enabled(record: dict[str, Any]) -> bool:
 
 
 def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    return canonical_json(value).encode("utf-8")
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _valid_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _regular_file_identity(
+    path: Path,
+    *,
+    maximum: int,
+    label: str,
+    allow_missing: bool = False,
+) -> tuple[int, int, int, int, int] | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be opened safely: {exc}") from exc
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(f"{label} must be a regular file: {path}")
+        if file_stat.st_size <= 0 or file_stat.st_size > maximum:
+            raise ValueError(f"{label} has invalid size: {path}")
+        return _file_identity(file_stat)
+    finally:
+        os.close(descriptor)
+
+
+def _read_regular_file(
+    path: Path,
+    *,
+    maximum: int,
+    label: str,
+    allow_missing: bool = False,
+) -> tuple[bytes, tuple[int, int, int, int, int]] | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be opened safely: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} must be a regular file: {path}")
+        if before.st_size <= 0 or before.st_size > maximum:
+            raise ValueError(f"{label} has invalid size: {path}")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError(f"{label} changed during read: {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        if _file_identity(before) != _file_identity(after):
+            raise ValueError(f"{label} changed during read: {path}")
+        return b"".join(chunks), _file_identity(after)
+    finally:
+        os.close(descriptor)
+
+
+def _safe_basename(value: Any, *, suffix: str, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or Path(value).name != value
+        or not value.endswith(suffix)
+    ):
+        raise ValueError(f"invalid {label}")
+    return value
+
+
+def _validate_event_ids(value: Any, *, label: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) != len(set(value))
+        or any(
+            not isinstance(event_id, str)
+            or not event_id.startswith("sha256:")
+            or not _valid_sha256(event_id.removeprefix("sha256:"))
+            for event_id in value
+        )
+    ):
+        raise ValueError(f"invalid {label}")
+    return tuple(value)
+
+
+def _load_archive_index(index_path: Path) -> dict[str, Any] | None:
+    identity = _regular_file_identity(
+        index_path,
+        maximum=MAX_ARCHIVE_INDEX_BYTES,
+        label="Chronik archive index",
+        allow_missing=True,
+    )
+    if identity is None:
+        _ARCHIVE_INDEX_CACHE.pop(index_path, None)
+        return None
+    cached = _ARCHIVE_INDEX_CACHE.get(index_path)
+    if cached is not None and cached[0] == identity:
+        return cached[1]
+    loaded = _read_regular_file(
+        index_path,
+        maximum=MAX_ARCHIVE_INDEX_BYTES,
+        label="Chronik archive index",
+    )
+    assert loaded is not None
+    raw, read_identity = loaded
+    if read_identity != identity:
+        raise ValueError("Chronik archive index changed before read")
+    if not raw.endswith(b"\n"):
+        raise ValueError("Chronik archive index is incomplete")
+    try:
+        index = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Chronik archive index is invalid JSON") from exc
+    expected_keys = {
+        "authoritative",
+        "does_not_establish",
+        "domain",
+        "historical_only",
+        "index_sha256",
+        "manifest_count",
+        "manifests",
+        "reconstructible",
+        "schema_version",
+        "source_count",
+        "sources",
+    }
+    if not isinstance(index, dict) or set(index) != expected_keys:
+        raise ValueError("Chronik archive index has invalid fields")
+    if (
+        index["schema_version"] != ARCHIVE_INDEX_SCHEMA
+        or index["domain"] != "agent.ledger"
+        or index["historical_only"] is not True
+        or index["authoritative"] is not False
+        or index["reconstructible"] is not True
+    ):
+        raise ValueError("Chronik archive index has invalid contract")
+    claimed_digest = index.get("index_sha256")
+    unsigned = dict(index)
+    unsigned.pop("index_sha256", None)
+    if not _valid_sha256(claimed_digest) or claimed_digest != _sha256_bytes(
+        _canonical_bytes(unsigned)
+    ):
+        raise ValueError("Chronik archive index digest mismatch")
+    manifests = index.get("manifests")
+    if not isinstance(manifests, list):
+        raise ValueError("Chronik archive index manifests are invalid")
+    normalized_manifests: list[dict[str, str]] = []
+    manifest_names: list[str] = []
+    for manifest in manifests:
+        if not isinstance(manifest, dict) or set(manifest) != {"file", "sha256"}:
+            raise ValueError("Chronik archive index manifest fields are invalid")
+        manifest_name = _safe_basename(
+            manifest.get("file"), suffix=".manifest.json", label="manifest file"
+        )
+        manifest_digest = manifest.get("sha256")
+        if not _valid_sha256(manifest_digest):
+            raise ValueError("Chronik archive index manifest digest is invalid")
+        manifest_names.append(manifest_name)
+        normalized_manifests.append(
+            {"file": manifest_name, "sha256": manifest_digest}
+        )
+    if manifest_names != sorted(manifest_names) or len(manifest_names) != len(
+        set(manifest_names)
+    ):
+        raise ValueError("Chronik archive index manifests are not unique and sorted")
+    sources = index.get("sources")
+    if not isinstance(sources, list):
+        raise ValueError("Chronik archive index sources are invalid")
+    normalized_sources: dict[str, list[dict[str, Any]]] = {}
+    ordered_generations: list[tuple[str, str]] = []
+    for source in sources:
+        if not isinstance(source, dict) or set(source) != {
+            "event_ids",
+            "manifest_index",
+            "source_name",
+            "source_sha256",
+        }:
+            raise ValueError("Chronik archive index source fields are invalid")
+        source_name = _safe_basename(
+            source.get("source_name"), suffix=".jsonl", label="source name"
+        )
+        source_digest = source.get("source_sha256")
+        manifest_index = source.get("manifest_index")
+        if (
+            not _valid_sha256(source_digest)
+            or type(manifest_index) is not int
+            or manifest_index < 0
+            or manifest_index >= len(normalized_manifests)
+        ):
+            raise ValueError("Chronik archive index source contract is invalid")
+        generation = (source_name, source_digest)
+        ordered_generations.append(generation)
+        normalized_sources.setdefault(source_name, []).append(
+            {
+                "source_sha256": source_digest,
+                "event_ids": _validate_event_ids(
+                    source.get("event_ids"), label="archive event ids"
+                ),
+                "manifest_index": manifest_index,
+            }
+        )
+    if ordered_generations != sorted(ordered_generations) or len(
+        ordered_generations
+    ) != len(set(ordered_generations)):
+        raise ValueError(
+            "Chronik archive index source generations are not unique and sorted"
+        )
+    if (
+        type(index.get("manifest_count")) is not int
+        or index["manifest_count"] != len(normalized_manifests)
+        or type(index.get("source_count")) is not int
+        or index["source_count"] != len(ordered_generations)
+    ):
+        raise ValueError("Chronik archive index inventory mismatch")
+    normalized = {
+        "index_sha256": claimed_digest,
+        "manifests": normalized_manifests,
+        "sources": normalized_sources,
+    }
+    _ARCHIVE_INDEX_CACHE[index_path] = (read_identity, normalized)
+    return normalized
+
+
+def _load_manifest_sources(
+    manifest_path: Path,
+    *,
+    expected_sha256: str,
+) -> dict[str, dict[str, Any]]:
+    identity = _regular_file_identity(
+        manifest_path,
+        maximum=MAX_BUNDLE_MANIFEST_BYTES,
+        label="Chronik bundle manifest",
+    )
+    assert identity is not None
+    cached = _MANIFEST_CACHE.get(manifest_path)
+    if cached is not None and cached[0] == identity:
+        cached_value = cached[1]
+        bundle_path = manifest_path.parent / cached_value["bundle_file"]
+        try:
+            bundle_stat = bundle_path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError("Chronik bundle cannot be inspected safely") from exc
+        if (
+            cached_value["manifest_sha256"] != expected_sha256
+            or not stat.S_ISREG(bundle_stat.st_mode)
+            or _file_identity(bundle_stat) != cached_value["bundle_identity"]
+        ):
+            _MANIFEST_CACHE.pop(manifest_path, None)
+        else:
+            return cached_value["sources"]
+    loaded = _read_regular_file(
+        manifest_path,
+        maximum=MAX_BUNDLE_MANIFEST_BYTES,
+        label="Chronik bundle manifest",
+    )
+    assert loaded is not None
+    raw, read_identity = loaded
+    if read_identity != identity:
+        raise ValueError("Chronik bundle manifest changed before read")
+    if not raw.endswith(b"\n"):
+        raise ValueError("Chronik bundle manifest is incomplete")
+    try:
+        manifest = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Chronik bundle manifest is invalid JSON") from exc
+    expected_keys = {
+        "bundle_bytes",
+        "bundle_file",
+        "bundle_sha256",
+        "created_at",
+        "does_not_establish",
+        "domain",
+        "event_count",
+        "historical_only",
+        "manifest_sha256",
+        "schema_version",
+        "source_count",
+        "sources",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_keys:
+        raise ValueError("Chronik bundle manifest has invalid fields")
+    claimed_manifest_digest = manifest.get("manifest_sha256")
+    unsigned_manifest = dict(manifest)
+    unsigned_manifest.pop("manifest_sha256", None)
+    if (
+        manifest["schema_version"] != BUNDLE_MANIFEST_SCHEMA
+        or manifest["domain"] != "agent.ledger"
+        or manifest["historical_only"] is not True
+        or not _valid_sha256(claimed_manifest_digest)
+        or claimed_manifest_digest != _sha256_bytes(_canonical_bytes(unsigned_manifest))
+        or claimed_manifest_digest != expected_sha256
+    ):
+        raise ValueError("Chronik bundle manifest contract mismatch")
+    bundle_name = _safe_basename(
+        manifest.get("bundle_file"), suffix=".bundle.jsonl", label="bundle file"
+    )
+    bundle_digest = manifest.get("bundle_sha256")
+    if not _valid_sha256(bundle_digest):
+        raise ValueError("Chronik bundle digest is invalid")
+    bundle_path = manifest_path.parent / bundle_name
+    loaded_bundle = _read_regular_file(
+        bundle_path, maximum=MAX_BUNDLE_BYTES, label="Chronik bundle"
+    )
+    assert loaded_bundle is not None
+    bundle_raw, bundle_identity = loaded_bundle
+    if (
+        _sha256_bytes(bundle_raw) != bundle_digest
+        or type(manifest.get("bundle_bytes")) is not int
+        or manifest["bundle_bytes"] != len(bundle_raw)
+    ):
+        raise ValueError("Chronik bundle content mismatch")
+    source_records = manifest.get("sources")
+    if not isinstance(source_records, list):
+        raise ValueError("Chronik bundle sources are invalid")
+    sources: dict[str, dict[str, Any]] = {}
+    total_events = 0
+    for record in source_records:
+        expected_source_keys = {
+            "event_ids",
+            "offset",
+            "record_sha256",
+            "schema_version",
+            "source_bytes",
+            "source_name",
+            "source_path",
+            "source_sha256",
+            "terminal_kind",
+        }
+        if not isinstance(record, dict) or set(record) != expected_source_keys:
+            raise ValueError("Chronik bundle source fields are invalid")
+        claimed_record_digest = record.get("record_sha256")
+        unsigned_record = dict(record)
+        unsigned_record.pop("record_sha256", None)
+        source_name = _safe_basename(
+            record.get("source_name"), suffix=".jsonl", label="bundle source name"
+        )
+        event_ids = _validate_event_ids(
+            record.get("event_ids"), label="bundle event ids"
+        )
+        offset = record.get("offset")
+        source_bytes = record.get("source_bytes")
+        source_digest = record.get("source_sha256")
+        if (
+            record.get("schema_version") != BUNDLE_SOURCE_SCHEMA
+            or not _valid_sha256(claimed_record_digest)
+            or claimed_record_digest != _sha256_bytes(_canonical_bytes(unsigned_record))
+            or not _valid_sha256(source_digest)
+            or type(offset) is not int
+            or offset < 0
+            or type(source_bytes) is not int
+            or source_bytes <= 0
+            or offset + source_bytes > len(bundle_raw)
+            or Path(str(record.get("source_path"))).name != source_name
+            or source_name in sources
+        ):
+            raise ValueError("Chronik bundle source contract mismatch")
+        source_raw = bundle_raw[offset : offset + source_bytes]
+        if _sha256_bytes(source_raw) != source_digest:
+            raise ValueError("Chronik bundled source digest mismatch")
+        parsed_event_ids: list[str] = []
+        for line in source_raw.splitlines():
+            try:
+                parsed_event_ids.append(json.loads(line).get("event_id"))
+            except json.JSONDecodeError as exc:
+                raise ValueError("Chronik bundled source is invalid JSONL") from exc
+        if tuple(parsed_event_ids) != event_ids:
+            raise ValueError("Chronik bundled source event mismatch")
+        sources[source_name] = {
+            "source_sha256": source_digest,
+            "event_ids": event_ids,
+        }
+        total_events += len(event_ids)
+    if (
+        type(manifest.get("source_count")) is not int
+        or manifest["source_count"] != len(sources)
+        or type(manifest.get("event_count")) is not int
+        or manifest["event_count"] != total_events
+    ):
+        raise ValueError("Chronik bundle manifest inventory mismatch")
+    normalized = {
+        "manifest_sha256": claimed_manifest_digest,
+        "bundle_file": bundle_name,
+        "bundle_identity": bundle_identity,
+        "sources": sources,
+    }
+    _MANIFEST_CACHE[manifest_path] = (read_identity, normalized)
+    return sources
+
+
+def _bundle_manifest_names(bundle_dir: Path) -> tuple[str, ...]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(bundle_dir, flags)
+    except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        raise ValueError("Chronik bundle directory cannot be opened safely") from exc
+    try:
+        directory_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+            or directory_stat.st_mode & 0o022
+        ):
+            raise ValueError(
+                "Chronik bundle directory must be real, owned, and not broadly writable"
+            )
+        names: list[str] = []
+        for name in os.listdir(descriptor):
+            if not name.endswith(".manifest.json"):
+                continue
+            manifest_stat = os.stat(
+                name, dir_fd=descriptor, follow_symlinks=False
+            )
+            if not stat.S_ISREG(manifest_stat.st_mode):
+                raise ValueError("Chronik bundle manifest must be a regular file")
+            names.append(name)
+        return tuple(sorted(names))
+    finally:
+        os.close(descriptor)
+
+
+def _archived_event_ids(path: Path) -> tuple[str, ...] | None:
+    bundle_dir = path.parent / "bundles"
+    manifest_names = _bundle_manifest_names(bundle_dir)
+    index = _load_archive_index(bundle_dir / ARCHIVE_INDEX_FILENAME)
+    if index is None:
+        if manifest_names:
+            raise ValueError(
+                "Chronik archive index is missing while bundle manifests exist"
+            )
+        return None
+    indexed_manifest_names = tuple(
+        manifest["file"] for manifest in index["manifests"]
+    )
+    if indexed_manifest_names != manifest_names:
+        raise ValueError("Chronik archive index does not cover all bundle manifests")
+    generations = index["sources"].get(path.name)
+    if generations is None:
+        return None
+    archived_event_ids: list[str] = []
+    seen_event_ids: set[str] = set()
+    for indexed in generations:
+        manifest = index["manifests"][indexed["manifest_index"]]
+        manifest_sources = _load_manifest_sources(
+            bundle_dir / manifest["file"], expected_sha256=manifest["sha256"]
+        )
+        bound = manifest_sources.get(path.name)
+        if (
+            bound is None
+            or bound["source_sha256"] != indexed["source_sha256"]
+            or bound["event_ids"] != indexed["event_ids"]
+        ):
+            raise ValueError("Chronik archive index is not bound to its manifest")
+        for event_id_value in indexed["event_ids"]:
+            if event_id_value not in seen_event_ids:
+                seen_event_ids.add(event_id_value)
+                archived_event_ids.append(event_id_value)
+    return tuple(archived_event_ids)
+
+
+@contextmanager
+def _writer_compaction_lock(source_dir: Path):
+    source_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        source_stat = source_dir.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("Chronik outbox directory cannot be inspected safely") from exc
+    if (
+        not stat.S_ISDIR(source_stat.st_mode)
+        or source_stat.st_uid != os.geteuid()
+        or source_stat.st_mode & 0o022
+    ):
+        raise ValueError(
+            "Chronik outbox directory must be real, owned, and not broadly writable"
+        )
+    lock_path = source_dir / WRITER_COMPACTION_LOCK_FILENAME
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        file_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != os.geteuid()
+            or file_stat.st_nlink != 1
+        ):
+            raise ValueError(
+                "Chronik writer-compaction lock must be a private owned file"
+            )
+        os.fchmod(descriptor, 0o600)
+        deadline = time.monotonic() + WRITER_COMPACTION_LOCK_TIMEOUT_SECONDS
+        acquired = False
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Chronik writer-compaction lock acquisition timed out"
+                    ) from exc
+                time.sleep(min(WRITER_COMPACTION_LOCK_POLL_SECONDS, remaining))
+        try:
+            yield
+        finally:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _append_event(path: Path, event: dict[str, Any]) -> None:
+    payload = _canonical_bytes(event) + b"\n"
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("Chronik outbox source must be a regular file")
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("Chronik outbox write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def event_id(event: dict[str, Any]) -> str:
@@ -155,25 +754,34 @@ def outbox_path(event: dict[str, Any], root: Path | None = None) -> Path:
 
 
 def append_unique(path: Path, event: dict[str, Any]) -> bool:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                existing = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if existing.get("event_id") != event["event_id"]:
-                continue
-            if canonical_json(existing) != canonical_json(event):
-                raise ValueError("event_id already exists with different payload")
+    if event.get("event_id") != event_id(event):
+        raise ValueError("event_id does not match payload")
+    with _writer_compaction_lock(path.parent):
+        archived_event_ids = _archived_event_ids(path)
+        if archived_event_ids is not None and event["event_id"] in archived_event_ids:
             return False
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(canonical_json(event))
-        handle.write("\n")
-    os.chmod(path, 0o600)
-    return True
+        if path.exists():
+            loaded = _read_regular_file(
+                path, maximum=MAX_BUNDLE_BYTES, label="Chronik outbox source"
+            )
+            assert loaded is not None
+            raw, _ = loaded
+            for line in raw.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    existing = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if existing.get("event_id") != event["event_id"]:
+                    continue
+                if canonical_json(existing) != canonical_json(event):
+                    raise ValueError(
+                        "event_id already exists with different payload"
+                    )
+                return False
+        _append_event(path, event)
+        return True
 
 
 def record_task_state(record: dict[str, Any], state: str) -> dict[str, Any]:
