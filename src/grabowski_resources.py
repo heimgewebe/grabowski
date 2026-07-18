@@ -169,6 +169,17 @@ RESOURCE_SCHEMA_RECOVERY_INSTRUCTION = (
     "the observed schema or restore a verified backup before retrying."
 )
 
+RESOURCE_SCHEMA_ROLLING_UPGRADE = {
+    "current_runtime_current_store": "supported",
+    "current_runtime_supported_older_store": (
+        "supported_with_exclusive_migration"
+    ),
+    "current_runtime_newer_store": "fail_closed_without_mutation",
+    "pre_t062_runtime_overlap_with_future_schema": (
+        "unsupported_require_full_runtime_drain"
+    ),
+}
+
 
 @contextmanager
 def _resource_schema_directory_lock(parent: Path) -> Iterator[None]:
@@ -358,6 +369,7 @@ def _resource_schema_inventory() -> dict[str, Any]:
         "mutation_performed": False,
         "required_action": "initialize_on_first_write",
         "recovery_instruction": None,
+        "rolling_upgrade": dict(RESOURCE_SCHEMA_ROLLING_UPGRADE),
     }
     if not RESOURCE_DB.exists():
         return result
