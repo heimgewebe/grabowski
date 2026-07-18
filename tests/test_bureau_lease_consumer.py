@@ -288,6 +288,7 @@ class BureauLeaseConsumerTests(_BureauLeaseTestCase):
 
     def test_audit_contains_only_contract_summary(self) -> None:
         metadata = {
+            "lease_mode": "emergency-recovery",
             "bureau_phase": "emergency-recovery",
             "bureau_justification": "private recovery reason",
             "bureau_expected_state": "expected clean state",

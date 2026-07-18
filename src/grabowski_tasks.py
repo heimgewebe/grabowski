@@ -734,6 +734,119 @@ def _task_resource_keys(
     return sorted({*requested, implicit}), implicit
 
 
+def _workspace_scope_identity(workspace: str) -> tuple[str, str]:
+    head_result = operator._run(
+        ["git", "-C", workspace, "rev-parse", "HEAD"],
+        cwd=operator.HOME,
+        timeout_seconds=5,
+        max_output_bytes=4096,
+    )
+    raw_head = head_result.get("stdout", "").strip().lower()
+    if head_result.get("returncode") == 0 and re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?", raw_head
+    ):
+        head = raw_head
+    else:
+        head = "0" * 40
+    branch_result = operator._run(
+        ["git", "-C", workspace, "symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=operator.HOME,
+        timeout_seconds=5,
+        max_output_bytes=4096,
+    )
+    raw_branch = branch_result.get("stdout", "").strip()
+    if branch_result.get("returncode") == 0 and re.fullmatch(
+        r"[A-Za-z0-9._:@/+\-=]{1,512}", raw_branch
+    ):
+        branch = raw_branch
+    elif head != "0" * 40:
+        branch = f"detached/{head[:12]}"
+    else:
+        branch = "unversioned"
+    return head, branch
+
+
+def _whole_repository_scope_manifest(
+    resource_key: str, task_id: str
+) -> dict[str, Any]:
+    if not resource_key.startswith("repo:"):
+        raise ValueError("repository resource must use repo:<absolute-path> syntax")
+    workspace = resource_key.removeprefix("repo:")
+    head, branch = _workspace_scope_identity(workspace)
+    return {
+        "schema_version": 1,
+        "repository": workspace,
+        "task_id": task_id,
+        "base_head": head,
+        "head": head,
+        "branch": branch,
+        "worktree": workspace,
+        "effects": ["write"],
+        "paths": [workspace],
+        "components": [],
+        "runtime_resources": [],
+        "processes": [],
+        "deployments": [],
+        "migrations": [],
+        "generated_artifacts": [],
+        "shared_gates": [],
+    }
+
+
+def _task_repository_resource(resource_keys: list[str]) -> str | None:
+    broad_repository_keys = [
+        key
+        for key in resource_keys
+        if key.startswith("repo:")
+        and resources._scoped_repository_resource_root(key) is None
+    ]
+    if not broad_repository_keys:
+        return None
+    if len(broad_repository_keys) != 1:
+        raise ValueError("tasks may lease at most one broad repository")
+    return broad_repository_keys[0]
+
+
+def _record_implicit_workspace_resource(
+    record: dict[str, Any], repository_resource: str | None
+) -> str | None:
+    if repository_resource is None:
+        return None
+    command = json.loads(record["argv_json"])
+    workspace = _mutating_agent_workspace(
+        str(record["host"]), command, cwd=str(record["cwd"])
+    )
+    if workspace is None:
+        return None
+    candidate = resources.normalize_resource_key(f"repo:{workspace}")
+    return repository_resource if candidate == repository_resource else None
+
+
+def _task_lease_metadata(
+    *,
+    task_id: str,
+    host: str,
+    attempt: int,
+    repository_resource: str | None,
+    implicit_workspace_resource: str | None,
+    recovered_after_expiry: bool = False,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "task_id": task_id,
+        "host": host,
+        "attempt": attempt,
+        "implicit_workspace_resource_key": implicit_workspace_resource,
+    }
+    if recovered_after_expiry:
+        metadata["recovered_after_expiry"] = True
+    if repository_resource is not None:
+        metadata["scope_manifest"] = _whole_repository_scope_manifest(
+            repository_resource, task_id
+        )
+        metadata["scope_manifest_complete"] = True
+    return metadata
+
+
 def _chronik_context(host: str, resource_keys: list[str], operation: str) -> str:
     context: dict[str, str] = {
         "subject_scope": "host",
@@ -823,17 +936,23 @@ def _maintain_record_resources(
         # A lease may have expired between observations. Reacquire only when the
         # resource is still free; a foreign owner remains a hard conflict.
         try:
+            repository_resource = _task_repository_resource(keys)
+            implicit_workspace_resource = _record_implicit_workspace_resource(
+                record, repository_resource
+            )
             acquired = resources.acquire_resources(
                 owner,
                 keys,
                 purpose=f"persistent task {record['task_id']} lease recovery",
                 ttl_seconds=ttl,
-                metadata={
-                    "task_id": record["task_id"],
-                    "host": record["host"],
-                    "attempt": int(record["attempt"]),
-                    "recovered_after_expiry": True,
-                },
+                metadata=_task_lease_metadata(
+                    task_id=str(record["task_id"]),
+                    host=str(record["host"]),
+                    attempt=int(record["attempt"]),
+                    repository_resource=repository_resource,
+                    implicit_workspace_resource=implicit_workspace_resource,
+                    recovered_after_expiry=True,
+                ),
             )
         except Exception as exc:
             return {
@@ -1542,7 +1661,8 @@ def grabowski_task_start(
     """Start one persistent local or fleet task in its own systemd unit.
 
     Direct local write-capable agent CLIs receive an implicit repository lease
-    unless the caller supplies an explicit path or repository scope.
+    unless the caller supplies an explicit path or repository scope. Every
+    task-owned broad repository lease carries a complete whole-repository scope manifest.
     """
     target = fleet.fleet_host(host)
     command = _validate_command(argv)
@@ -1621,7 +1741,16 @@ def grabowski_task_start(
         "chronik_context_json": chronik_context_json,
     }
     lease_result = None
+    lease_metadata = None
+    repository_resource = _task_repository_resource(task_resources)
     if task_resources:
+        lease_metadata = _task_lease_metadata(
+            task_id=task_id,
+            host=host,
+            attempt=attempt,
+            repository_resource=repository_resource,
+            implicit_workspace_resource=implicit_workspace_resource,
+        )
         lease_result = resources.acquire_resources(
             lease_owner,
             task_resources,
@@ -1630,12 +1759,7 @@ def grabowski_task_start(
                 resources.MAX_TTL_SECONDS,
                 max(resources.MIN_TTL_SECONDS, runtime + 300),
             ),
-            metadata={
-                "task_id": task_id,
-                "host": host,
-                "attempt": attempt,
-                "implicit_workspace_resource_key": implicit_workspace_resource,
-            },
+            metadata=lease_metadata,
         )
     try:
         with _database_connection() as connection:
@@ -1690,6 +1814,13 @@ def grabowski_task_start(
         "resource_keys": task_resources,
         "requested_resource_keys": requested_resources,
         "implicit_workspace_resource_key": implicit_workspace_resource,
+        "repository_scope_manifest_sha256": (
+            hashlib.sha256(
+                _canonical_json(lease_metadata["scope_manifest"]).encode("utf-8")
+            ).hexdigest()
+            if lease_metadata is not None and "scope_manifest" in lease_metadata
+            else None
+        ),
         "resource_lease_expires_at_unix": (
             lease_result["expires_at_unix"] if lease_result else None
         ),

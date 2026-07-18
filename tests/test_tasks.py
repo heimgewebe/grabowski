@@ -1112,6 +1112,153 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["audit"]["implicit_workspace_resource_key"], key)
         lease = tasks.resources.inspect_resource(key)
         self.assertEqual(lease["owner_id"], result["task"]["lease_owner_id"])
+        with sqlite3.connect(self.resource_database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        metadata = json.loads(row[0])
+        self.assertIs(metadata["scope_manifest_complete"], True)
+        self.assertEqual(metadata["scope_manifest"]["repository"], str(self.root))
+        self.assertEqual(metadata["scope_manifest"]["paths"], [str(self.root)])
+        self.assertEqual(
+            metadata["scope_manifest"]["task_id"], result["task"]["task_id"]
+        )
+        self.assertEqual(metadata["scope_manifest"]["head"], "0" * 40)
+        self.assertEqual(metadata["scope_manifest"]["branch"], "unversioned")
+        self.assertRegex(
+            result["audit"]["repository_scope_manifest_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_expired_implicit_repository_lease_reacquires_complete_scope(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        running = _launcher()
+        running["stdout"] = (
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
+        )
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_dispatch", side_effect=[_launcher(), running]
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 161}
+        ):
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+            key = f"repo:{self.root}"
+            empty_json, empty_sha256 = tasks.resources._metadata({})
+            with sqlite3.connect(self.resource_database) as connection:
+                connection.execute(
+                    "UPDATE leases SET expires_at_unix=0, metadata_json=?, "
+                    "metadata_sha256=? WHERE resource_key=?",
+                    (empty_json, empty_sha256, key),
+                )
+                connection.commit()
+            status = tasks.grabowski_task_status(started["task"]["task_id"])
+
+        self.assertEqual(status["lease_maintenance"]["mode"], "reacquired")
+        with sqlite3.connect(self.resource_database) as connection:
+            metadata = json.loads(
+                connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()[0]
+            )
+        self.assertIs(metadata["scope_manifest_complete"], True)
+        self.assertIs(metadata["recovered_after_expiry"], True)
+        self.assertEqual(metadata["implicit_workspace_resource_key"], key)
+        self.assertEqual(metadata["scope_manifest"]["repository"], str(self.root))
+        self.assertEqual(metadata["scope_manifest"]["paths"], [str(self.root)])
+
+    def test_explicit_repository_task_scope_is_attested(self) -> None:
+        key = f"repo:{self.root}"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 160}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resource_keys=[key],
+            )
+        with sqlite3.connect(self.resource_database) as connection:
+            metadata = json.loads(
+                connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()[0]
+            )
+        self.assertIs(metadata["scope_manifest_complete"], True)
+        self.assertEqual(metadata["scope_manifest"]["repository"], str(self.root))
+        self.assertEqual(metadata["scope_manifest"]["paths"], [str(self.root)])
+        self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
+        self.assertRegex(
+            result["audit"]["repository_scope_manifest_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_broad_repository_task_path_with_scope_marker_is_attested(self) -> None:
+        for marker in ("branch", "operation"):
+            with self.subTest(marker=marker):
+                repository = self.root / f"repo:{marker}:literal"
+                repository.mkdir()
+                (repository / ".git").write_text("gitdir: /tmp/task-marker-repo\n")
+                key = f"repo:{repository}"
+                with patch.object(
+                    tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+                ), patch.object(
+                    tasks, "_dispatch", return_value=_launcher()
+                ), patch.object(tasks.base, "_append_audit"), patch.object(
+                    tasks, "_require_recovery_gate", return_value={"checked_at_unix": 163}
+                ):
+                    result = tasks.grabowski_task_start(
+                        "local",
+                        ["/bin/true"],
+                        cwd=str(repository),
+                        runtime_seconds=60,
+                        resource_keys=[key],
+                    )
+                with sqlite3.connect(self.resource_database) as connection:
+                    metadata = json.loads(
+                        connection.execute(
+                            "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+                        ).fetchone()[0]
+                    )
+                self.assertIs(metadata["scope_manifest_complete"], True)
+                self.assertEqual(
+                    metadata["scope_manifest"]["repository"], str(repository)
+                )
+                tasks.resources.release_resources(
+                    result["task"]["lease_owner_id"], [key]
+                )
+
+    def test_scoped_repository_task_key_binds_underlying_repository(self) -> None:
+        key = f"repo:{self.root}:branch:feat/scoped-task"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 162}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resource_keys=[key],
+            )
+        with sqlite3.connect(self.resource_database) as connection:
+            metadata = json.loads(
+                connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()[0]
+            )
+        self.assertNotIn("scope_manifest", metadata)
+        self.assertNotIn("scope_manifest_complete", metadata)
+        self.assertIsNone(result["audit"]["repository_scope_manifest_sha256"])
+        self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
 
     def test_mutating_agents_cannot_share_one_implicit_workspace(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]

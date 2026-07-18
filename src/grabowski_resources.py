@@ -2703,6 +2703,94 @@ def grabowski_resource_reconcile_obsolete_path_leases(
     return result
 
 
+def _scoped_repository_resource_root(resource_key: str) -> str | None:
+    """Return an existing Git root for one unambiguous scoped repo key.
+
+    Repository paths may themselves contain ``:branch:`` or ``:operation:``.
+    An existing full path is therefore always broad. A non-existing full path
+    is treated as scoped only when exactly one marker split resolves to an
+    existing checkout root with a .git entry; ambiguous inputs fail closed.
+    """
+    if not resource_key.startswith("repo:"):
+        return None
+    value = resource_key.removeprefix("repo:")
+    if os.path.lexists(value):
+        return None
+    candidates: set[str] = set()
+    for marker in (":branch:", ":operation:"):
+        start = 0
+        while True:
+            index = value.find(marker, start)
+            if index < 0:
+                break
+            repository = os.path.normpath(value[:index])
+            scope_value = value[index + len(marker) :]
+            if (
+                scope_value
+                and os.path.isabs(repository)
+                and os.path.isdir(repository)
+                and os.path.lexists(os.path.join(repository, ".git"))
+            ):
+                candidates.add(repository)
+            start = index + 1
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _public_repository_scope_keys(
+    resource_keys: list[str], metadata: dict[str, Any] | None
+) -> list[str]:
+    """Require broad public repository leases to declare one exact scope."""
+    keys = normalize_resource_keys(resource_keys)
+    repository_keys = [key for key in keys if key.startswith("repo:")]
+    if not repository_keys:
+        return keys
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    normalized_metadata = {} if metadata is None else dict(metadata)
+    if normalized_metadata.get("lease_mode") == "emergency-recovery":
+        return keys
+    scope = (
+        nonconflict.normalize_scope_manifest(normalized_metadata["scope_manifest"])
+        if "scope_manifest" in normalized_metadata
+        else None
+    )
+    scoped_repository_keys: list[str] = []
+    broad_repository_keys: list[str] = []
+    for key in repository_keys:
+        if scope is not None:
+            binding = _repository_resource_scope(key, repository=scope["repository"])
+            if binding is not None and binding["scope_kind"] in {"branch", "operation"}:
+                scoped_repository_keys.append(key)
+                continue
+        elif _scoped_repository_resource_root(key) is not None:
+            scoped_repository_keys.append(key)
+            continue
+        broad_repository_keys.append(key)
+    if scoped_repository_keys and scope is not None:
+        raise ValueError(
+            "scoped repository leases must not include metadata.scope_manifest; "
+            "the resource key is authoritative"
+        )
+    if not broad_repository_keys:
+        return keys
+    if normalized_metadata.get("scope_manifest_complete") is not True:
+        raise ValueError(
+            "public broad repository leases require metadata.scope_manifest_complete=true"
+        )
+    if scope is None:
+        raise ValueError(
+            "public broad repository leases require metadata.scope_manifest"
+        )
+    repository_key = f"repo:{scope['repository']}"
+    for key in broad_repository_keys:
+        if key == repository_key:
+            continue
+        raise ValueError(
+            "repository resource keys must match metadata.scope_manifest repository"
+        )
+    return keys
+
+
 @mcp.tool(name="grabowski_resource_acquire", annotations=MUTATING)
 def grabowski_resource_acquire(
     owner_id: str,
@@ -2712,11 +2800,18 @@ def grabowski_resource_acquire(
     metadata: dict[str, Any] | None = None,
     nonconflict_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Atomically acquire typed resource leases for one owner."""
+    """Atomically acquire typed resource leases for one owner.
+
+    Public broad repository resources require a complete exact scope manifest. An
+    explicit emergency-recovery lease remains a deliberately exclusive
+    fail-closed exception and cannot be used for non-conflict bypasses. Self-scoped
+    branch and operation keys are authoritative and reject scope manifests.
+    """
+    normalized_resource_keys = _public_repository_scope_keys(resource_keys, metadata)
     operator._require_operator_mutation("resource_lease")
     result = acquire_resources(
         owner_id,
-        resource_keys,
+        normalized_resource_keys,
         purpose=purpose,
         ttl_seconds=ttl_seconds,
         metadata=metadata,
