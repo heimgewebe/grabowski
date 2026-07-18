@@ -49,14 +49,17 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_rollback_text` | audit | no | medium | Restore a quarantined preimage from an audited replace transaction. |
 | `grabowski_verify_audit` | audit | yes | low | Verify the tamper-evident write audit hash chain. |
 | `latest_complete_bundles` | knowledge | yes | low | Read the curated latest-complete Lens and repoLens bundle registry. |
-| `rlens_bundle_discover` | knowledge | yes | low | Discover current rLens/repoLens bundles from the immutable local merges area. |
-| `rlens_bundle_status` | knowledge | yes | low | Read bounded manifest, health and sidecar status for one rLens bundle. |
-| `rlens_freshness_check` | knowledge | yes | low | Compare one rLens bundle commit with the current local repository HEAD. |
-| `rlens_preflight` | knowledge | yes | low | Run bounded rLens/RepoBrief consumption preflight for a selected bundle. |
-| `rlens_query` | knowledge | yes | low | Run a bounded read-only rLens/RepoBrief query and normalize result snippets and ranges. |
-| `rlens_query_existing_index` | knowledge | yes | low | Query a prebuilt rLens/RepoBrief index and return normalized bounded snippets and ranges. |
-| `rlens_range_get` | knowledge | yes | low | Resolve one bounded rLens/RepoBrief range reference without refreshing source artifacts. |
-| `rlens_context_pack` | knowledge | yes | low | Build a bounded rLens context pack for agent handoff and Bureau receipts. |
+| `repoground_bundle_discover` | knowledge | yes | low | Discover current RepoGround bundles from the immutable local bundle area. |
+| `repoground_bundle_status` | knowledge | yes | low | Read bounded manifest, health, and sidecar status for one RepoGround bundle. |
+| `repoground_freshness_check` | knowledge | yes | low | Compare one RepoGround bundle source commit with the current local repository HEAD. |
+| `repoground_preflight` | knowledge | yes | low | Run bounded RepoGround consumption preflight for a selected bundle. |
+| `repoground_query` | knowledge | yes | low | Run a bounded read-only RepoGround query and normalize snippets and ranges. |
+| `repoground_query_existing_index` | knowledge | yes | low | Query a prebuilt RepoGround index without refreshing or mutating the bundle. |
+| `repoground_range_get` | knowledge | yes | low | Resolve one bounded RepoGround range reference without refreshing source artifacts. |
+| `repoground_context_pack` | knowledge | yes | low | Build a bounded RepoGround context pack for agent handoff and Bureau receipts. |
+| `repoground_find_symbol` | knowledge | yes | low | Find bounded Python symbol definitions in an existing RepoGround bundle. |
+| `repoground_get_callers` | knowledge | yes | low | Read S1 callers while preserving unresolved references separately. |
+| `repoground_get_callees` | knowledge | yes | low | Read S1 callees while preserving S0 call sites separately. |
 | `grabowski_runtime_health` | context | yes | low | Read minimal deployment, audit and kill-switch health without path inventories. |
 | `grabowski_deployment_identity` | context | yes | low | Read bounded runtime identity and integrity flags without local paths. |
 | `grabowski_contract_drift` | context | yes | low | Read bounded runtime-contract and capability-catalog drift. |

@@ -435,10 +435,15 @@ CONNECTOR_DIAGNOSTIC_UNITS = (
 CONNECTOR_HTTP_STATUS_KEYS = (
     "status",
     "status_code",
+    "statusCode",
     "http_status",
     "http_status_code",
+    "httpStatus",
+    "httpStatusCode",
     "response_status",
     "response_code",
+    "responseStatus",
+    "responseCode",
 )
 CONNECTOR_ACTIVITY_MESSAGES = {
     "dispatcher forwarded command to MCP server": "forwarded_to_mcp",
@@ -642,6 +647,15 @@ def _looks_like_connector_transport(event: dict[str, Any], haystack: str) -> boo
     return surface == "connector" or "streamable_http" in haystack or "post /mcp" in haystack
 
 
+def _historical_http_status_counts(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Count distinct statuses in the supplied event window, once per event."""
+    counts: Counter[str] = Counter()
+    for event in events:
+        statuses = set(_explicit_http_statuses({"msg": _event_haystack(event)}))
+        counts.update(str(status) for status in statuses)
+    return dict(sorted(counts.items()))
+
+
 def connector_transport_diagnostics(events: list[dict[str, Any]]) -> dict[str, Any]:
     transport_events = [
         event
@@ -650,21 +664,52 @@ def connector_transport_diagnostics(events: list[dict[str, Any]]) -> dict[str, A
     ]
     unresolved_events = [event for event in transport_events if event.get("resolved") is not True]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "authority": "read_only_diagnostic_guidance",
         "event_count": len(transport_events),
         "unresolved_event_count": len(unresolved_events),
         "recent_event_ids": _proposal_event_ids(transport_events),
         "recent_event_ids_truncated": len(transport_events) > MAX_PROPOSAL_EVIDENCE_IDS,
+        "historical_http_status_counts": _historical_http_status_counts(transport_events),
+        "historical_http_status_counts_semantics": (
+            "bounded supplied friction-event window; each distinct status counts at most once "
+            "per event; not a time series or lifetime aggregate"
+        ),
         "recommended_bounded_probe": [
             "grabowski_status for runtime contract and client snapshot visibility",
             "grabowski_service_status for grabowski-operator.service and tunnel-client-grabowski.service",
-            "bounded recent journal search for streamable_http, Received exception from stream, POST /mcp, timeout and 502",
+            "bounded recent journal search for streamable_http, Received exception from stream, POST /mcp, timeout, 404 and 502",
             "one adjacent small typed read-only call to determine whether the transport failure is still active",
         ],
+        "pre_runtime_http_404_recovery": {
+            "authority": "guidance_only",
+            "machine_enforced": False,
+            "applicability": "caller_must_establish",
+            "recommended_action": "refresh_catalog_then_one_read_only_retry",
+            "caller_must_establish": [
+                "HTTP 404 was returned before any Grabowski receipt was observed",
+                "no target mutation may have occurred",
+            ],
+            "applies_when": (
+                "HTTP 404 is returned before any Grabowski receipt or target mutation is observed"
+            ),
+            "catalog_refresh_limit": 1,
+            "read_only_retry_limit": 1,
+            "sequence": [
+                "refresh or re-discover the connector tool catalog once",
+                "retry exactly one small typed read-only call",
+                "if HTTP 404 persists, keep the failure unresolved and stop before mutation",
+            ],
+            "success_semantics": (
+                "restored access is not root-cause proof and does not establish transport reliability"
+            ),
+        },
         "split_retry_policy": {
             "read_only_retry_limit": 1,
             "retry_shape": "split broad terminal calls into smaller typed or single-purpose read-only calls",
+            "pre_runtime_http_404_rule": (
+                "refresh the connector tool catalog once, then retry exactly one small typed read-only call"
+            ),
             "mutation_rule": "do not retry mutating work after a transport failure until target state is re-read",
             "record_rule": "record friction when a connector transport failure changes the operator path",
             "false_green_warning": "a successful retry does not prove the first failure was harmless",
@@ -808,8 +853,8 @@ def _explicit_http_statuses(payload: dict[str, Any]) -> list[int]:
     message = payload.get("msg")
     if isinstance(message, str):
         explicit_patterns = (
-            r"(?:status|status_code|http_status|response_status|response_code|code)\s*[=:]\s*(\d{3})(?!\d)",
-            r"HTTP/\d(?:\.\d)?\s+(\d{3})(?!\d)",
+            r"(?<![\w])(?:status(?:_?code)?|http_?status(?:_?code)?|response_?(?:status|code)|code)\s*[=:]\s*(\d{3})(?![\w])",
+            r"\bHTTP(?:/\d+(?:\.\d+)?)?(?:\s+status)?\s*[:=]?\s*(\d{3})(?![\w])",
             r"received exception from stream\s*:\s*([45]\d{2})(?=\s+(?:upstream|external|http|bad gateway|service error))",
             r"(?:upstream(?: or|/)external service|external service error)[^0-9]{0,32}([45]\d{2})(?!\d)",
         )

@@ -242,7 +242,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Return the curated latest-complete Lens/repoLens bundle registry.",
+      "description": "Return the curated latest-complete RepoGround bundle registry.",
       "effects": [],
       "id": "latest_complete_bundles",
       "purpose": "Read the curated latest-complete Lens and repoLens bundle registry.",
@@ -253,91 +253,124 @@
     },
     {
       "category": "knowledge",
-      "description": "Discover current rLens/repoLens bundles from the immutable local merges area.",
+      "description": "Discover current RepoGround bundles from the immutable local bundle area.",
       "effects": [],
-      "id": "rlens_bundle_discover",
-      "purpose": "Discover current rLens/repoLens bundles from the immutable local merges area.",
+      "id": "repoground_bundle_discover",
+      "purpose": "Discover current RepoGround bundles from the immutable local bundle area.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
-      "tool": "rlens_bundle_discover"
+      "tool": "repoground_bundle_discover"
     },
     {
       "category": "knowledge",
-      "description": "Return bounded manifest, health and sidecar status for one rLens bundle.",
+      "description": "Return bounded manifest, health and sidecar status for one RepoGround bundle.",
       "effects": [],
-      "id": "rlens_bundle_status",
-      "purpose": "Read bounded manifest, health and sidecar status for one rLens bundle.",
+      "id": "repoground_bundle_status",
+      "purpose": "Read bounded manifest, health, and sidecar status for one RepoGround bundle.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
-      "tool": "rlens_bundle_status"
+      "tool": "repoground_bundle_status"
     },
     {
       "category": "knowledge",
-      "description": "Compare one rLens bundle commit with the current local repository HEAD.",
+      "description": "Compare one RepoGround bundle source commit with the local repository HEAD.",
       "effects": [],
-      "id": "rlens_freshness_check",
-      "purpose": "Compare one rLens bundle commit with the current local repository HEAD.",
+      "id": "repoground_freshness_check",
+      "purpose": "Compare one RepoGround bundle source commit with the current local repository HEAD.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
-      "tool": "rlens_freshness_check"
+      "tool": "repoground_freshness_check"
     },
     {
       "category": "knowledge",
-      "description": "Return bounded rLens/RepoBrief preflight for an agent task profile.",
+      "description": "Return bounded RepoGround preflight for an agent task profile.",
       "effects": [],
-      "id": "rlens_preflight",
-      "purpose": "Run bounded rLens/RepoBrief consumption preflight for a selected bundle.",
+      "id": "repoground_preflight",
+      "purpose": "Run bounded RepoGround consumption preflight for a selected bundle.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
-      "tool": "rlens_preflight"
+      "tool": "repoground_preflight"
     },
     {
       "category": "knowledge",
-      "description": "Run a bounded read-only RepoBrief query and normalize result shapes.",
+      "description": "Run a bounded read-only RepoGround query and normalize result shapes.",
       "effects": [],
-      "id": "rlens_query",
-      "purpose": "Run a bounded read-only rLens/RepoBrief query and normalize result snippets and ranges.",
+      "id": "repoground_query",
+      "purpose": "Run a bounded read-only RepoGround query and normalize snippets and ranges.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
-      "tool": "rlens_query"
+      "tool": "repoground_query"
     },
     {
       "category": "knowledge",
-      "description": "Compatibility wrapper for querying a prebuilt RepoBrief index without refresh.",
+      "description": "Query a prebuilt RepoGround index without refreshing the bundle.",
       "effects": [],
-      "id": "rlens_query_existing_index",
-      "purpose": "Query a prebuilt rLens/RepoBrief index and return normalized bounded snippets and ranges.",
+      "id": "repoground_query_existing_index",
+      "purpose": "Query a prebuilt RepoGround index without refreshing or mutating the bundle.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
-      "tool": "rlens_query_existing_index"
+      "tool": "repoground_query_existing_index"
     },
     {
       "category": "knowledge",
-      "description": "Resolve one bounded RepoBrief range_ref without reading live workspace files.",
+      "description": "Resolve one bounded RepoGround range reference without live workspace reads.",
       "effects": [],
-      "id": "rlens_range_get",
-      "purpose": "Resolve one bounded rLens/RepoBrief range reference without refreshing source artifacts.",
+      "id": "repoground_range_get",
+      "purpose": "Resolve one bounded RepoGround range reference without refreshing source artifacts.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
-      "tool": "rlens_range_get"
+      "tool": "repoground_range_get"
     },
     {
       "category": "knowledge",
-      "description": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",
+      "description": "Build a bounded RepoGround context pack for agent handoff and Bureau receipts.",
       "effects": [],
-      "id": "rlens_context_pack",
-      "purpose": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",
+      "id": "repoground_context_pack",
+      "purpose": "Build a bounded RepoGround context pack for agent handoff and Bureau receipts.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
-      "tool": "rlens_context_pack"
+      "tool": "repoground_context_pack"
+    },
+    {
+      "category": "knowledge",
+      "description": "Find bounded Python symbol definitions in an existing RepoGround bundle.",
+      "effects": [],
+      "id": "repoground_find_symbol",
+      "purpose": "Find bounded Python symbol definitions in an existing RepoGround bundle.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_find_symbol"
+    },
+    {
+      "category": "knowledge",
+      "description": "Return S1 callers and separately visible unresolved references.",
+      "effects": [],
+      "id": "repoground_get_callers",
+      "purpose": "Read S1 callers while preserving unresolved references separately.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_get_callers"
+    },
+    {
+      "category": "knowledge",
+      "description": "Return S1 callees while retaining S0 call sites separately.",
+      "effects": [],
+      "id": "repoground_get_callees",
+      "purpose": "Read S1 callees while preserving S0 call sites separately.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_get_callees"
     },
     {
       "category": "context",
@@ -1970,14 +2003,17 @@
       "grabowski_rollback_text",
       "grabowski_verify_audit",
       "latest_complete_bundles",
-      "rlens_bundle_discover",
-      "rlens_bundle_status",
-      "rlens_freshness_check",
-      "rlens_preflight",
-      "rlens_query",
-      "rlens_query_existing_index",
-      "rlens_range_get",
-      "rlens_context_pack",
+      "repoground_bundle_discover",
+      "repoground_bundle_status",
+      "repoground_freshness_check",
+      "repoground_preflight",
+      "repoground_query",
+      "repoground_query_existing_index",
+      "repoground_range_get",
+      "repoground_context_pack",
+      "repoground_find_symbol",
+      "repoground_get_callers",
+      "repoground_get_callees",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -2306,7 +2342,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "21d6c6b1f7a1cbd83965ca2174ab1bcaebb72f9abc796dcdbb98e1dc5f0ead3d"
+      "sha256": "091f44be4294f46372df6d7475a2c02d0e5f1f15f6666ddfb1c0a0e852ffac75"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2314,7 +2350,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "61f5d0966448bd031a01a9b410b21cefc67e4a6b84a8045191d58ba83b5ba796"
+      "sha256": "4f66ae997c2facf06828832df6794e72cbfcb35c4873433fee018bf472dbbd45"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2330,7 +2366,7 @@
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "21d6c6b1f7a1cbd83965ca2174ab1bcaebb72f9abc796dcdbb98e1dc5f0ead3d",
+      "src/grabowski_capabilities.py": "091f44be4294f46372df6d7475a2c02d0e5f1f15f6666ddfb1c0a0e852ffac75",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "da41759813e9cf14bb7df17861c60ffb90a9369177d2bcd45c79df663b121bb2",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
@@ -2338,14 +2374,14 @@
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_convergence.py": "03ea75eb190ac08f29c4ec6c5ab1a14a631ce7c0cce4956ed6f437c492a6a635",
       "src/grabowski_fleet.py": "0daf060517bde7b17caf7dd1f684e29521fb7b7457d1bfd79b32cf28a15c3beb",
-      "src/grabowski_friction.py": "c894e6bd613e10db7e1dca82b155062fcbff8dc455bb3e59794c6686dc45a7bd",
+      "src/grabowski_friction.py": "673df67bac2b3e9aa3374992b4b243d367393dc87af673e863a3827ca044a0d8",
       "src/grabowski_grip_orchestration.py": "f9a7ad69853f5e6466689a554d8d6ce7b0accebc90ff9168174b6ae4fad87d4c",
       "src/grabowski_grips.py": "1e1431e89235ea23dad5e03134d2fb38423fcfde54ad5f5fe289f5308b8b4583",
       "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "ffcb8b7249cb49e2add7a9a306c25d18abd61293181e5133ccd1bdb8817c2a7f",
+      "src/grabowski_mcp.py": "3701aac9786f2bcd660a7f46c895c7b1056f2e5dc271ab550c3a9334b333de10",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
