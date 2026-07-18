@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -188,6 +189,51 @@ class ResourceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
             resources.count_resources()
 
+    def test_raced_away_current_resource_store_is_not_recreated(self) -> None:
+        with resources._database():
+            pass
+        self.database.unlink()
+        with patch.object(resources, "_preflight_resource_store", return_value="2"):
+            with self.assertRaises(sqlite3.OperationalError):
+                resources._database()
+        self.assertFalse(self.database.exists())
+
+    def test_corrupt_resource_store_fails_without_side_effects(self) -> None:
+        self.database.parent.mkdir(parents=True, exist_ok=True)
+        payload = b"not-a-sqlite-resource-store\x00corrupt"
+        self.database.write_bytes(payload)
+        before_stat = self.database.stat()
+        with self.assertRaisesRegex(RuntimeError, "corrupt"):
+            resources.count_resources()
+        self.assertEqual(payload, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(
+            [], list(self.database.parent.glob(self.database.name + "-*"))
+        )
+        self.assertEqual([], self._resource_migration_backups())
+
+    def test_malformed_resource_metadata_fails_without_side_effects(self) -> None:
+        self.database.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.database) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT, value TEXT NOT NULL);
+                INSERT INTO metadata VALUES('schema_version', '1');
+                INSERT INTO metadata VALUES('schema_version', '2');
+                CREATE TABLE leases (resource_key TEXT PRIMARY KEY);
+                """
+            )
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        with self.assertRaisesRegex(RuntimeError, "metadata table is malformed"):
+            resources.count_resources()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(
+            [], list(self.database.parent.glob(self.database.name + "-*"))
+        )
+        self.assertEqual([], self._resource_migration_backups())
+
     def test_unknown_resource_schema_still_fails_closed(self) -> None:
         resources.count_resources()
         with sqlite3.connect(self.database) as connection:
@@ -195,9 +241,20 @@ class ResourceTests(unittest.TestCase):
                 "UPDATE metadata SET value='3' WHERE key='schema_version'"
             )
             connection.commit()
-
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_sidecars = {
+            item.name for item in self.database.parent.glob(self.database.name + "-*")
+        }
         with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
             resources.count_resources()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(
+            before_sidecars,
+            {item.name for item in self.database.parent.glob(self.database.name + "-*")},
+        )
+        self.assertEqual([], self._resource_migration_backups())
 
     def test_normalizes_typed_resource_keys(self) -> None:
         self.assertEqual(resources.normalize_resource_key("port:09222"), "port:9222")
@@ -1187,6 +1244,63 @@ class ResourceTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             resources.renew_resources("owner-b", ["repo:/tmp/repo"])
 
+    def _resource_migration_backups(self) -> list[Path]:
+        return sorted(
+            self.database.parent.glob(
+                f"{self.database.name}.schema-*.backup"
+            )
+        )
+
+    def _create_resource_schema_v1(
+        self,
+    ) -> tuple[str, dict[str, object]]:
+        self.database.parent.mkdir(parents=True, exist_ok=True)
+        metadata_json, metadata_sha256 = resources._metadata(
+            {"task_id": "f" * 24, "purpose": "schema-migration"}
+        )
+        resource_key = "component:migration-semantic-preservation"
+        with sqlite3.connect(self.database) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO metadata(key, value) VALUES('schema_version', '1');
+                CREATE TABLE leases (
+                    resource_key TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    acquired_at_unix INTEGER NOT NULL,
+                    updated_at_unix INTEGER NOT NULL,
+                    expires_at_unix INTEGER NOT NULL,
+                    metadata_sha256 TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    reclaimed_from_owner TEXT
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO leases VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    resource_key,
+                    "task:" + "f" * 24,
+                    "semantic preservation fixture",
+                    101,
+                    102,
+                    103,
+                    metadata_sha256,
+                    metadata_json,
+                    "previous-owner",
+                ),
+            )
+            connection.row_factory = sqlite3.Row
+            original = dict(
+                connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?",
+                    (resource_key,),
+                ).fetchone()
+            )
+            connection.commit()
+        return resource_key, original
+
     def test_schema_v1_database_migrates_to_v2_without_losing_leases(self) -> None:
         self.database.parent.mkdir(parents=True)
         metadata_json, metadata_sha256 = resources._metadata({"task_id": "a" * 24})
@@ -1246,6 +1360,211 @@ class ResourceTests(unittest.TestCase):
                 tables
             )
         )
+        backups = self._resource_migration_backups()
+        self.assertEqual(1, len(backups))
+        self.assertEqual(0o400, backups[0].stat().st_mode & 0o777)
+        with sqlite3.connect(backups[0]) as backup:
+            self.assertEqual(
+                "1",
+                backup.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                "ok", backup.execute("PRAGMA integrity_check").fetchone()[0]
+            )
+            self.assertEqual(
+                "component:migration-preserved",
+                backup.execute("SELECT resource_key FROM leases").fetchone()[0],
+            )
+        with resources._database() as reopened:
+            self.assertEqual(0, reopened.total_changes)
+        self.assertEqual(backups, self._resource_migration_backups())
+
+    def test_resource_integrity_check_reports_busy_separately_from_corruption(self) -> None:
+        class BusyConnection:
+            def execute(self, statement: str) -> object:
+                raise sqlite3.OperationalError("database is busy")
+
+        with self.assertRaisesRegex(RuntimeError, "busy; retry"):
+            resources._resource_sqlite_integrity(
+                BusyConnection(),
+                "Resource database",
+            )
+
+    def test_current_resource_store_opens_without_backup_or_writes(self) -> None:
+        connection = resources._database()
+        connection.close()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_names = sorted(item.name for item in self.database.parent.iterdir())
+        self.assertEqual([], self._resource_migration_backups())
+        reopened = resources._database()
+        self.assertEqual(0, reopened.total_changes)
+        reopened.close()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(
+            before_names,
+            sorted(item.name for item in self.database.parent.iterdir()),
+        )
+        self.assertEqual([], self._resource_migration_backups())
+
+    def test_resource_backup_includes_committed_uncheckpointed_wal_data(self) -> None:
+        resource_key, _ = self._create_resource_schema_v1()
+        keeper = sqlite3.connect(self.database)
+        try:
+            self.assertEqual(
+                "wal",
+                keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+            )
+            keeper.execute(
+                "UPDATE leases SET updated_at_unix=999 WHERE resource_key=?",
+                (resource_key,),
+            )
+            keeper.commit()
+            self.assertTrue(Path(str(self.database) + "-wal").exists())
+            resources.list_resources()
+            backup = self._resource_migration_backups()[0]
+            with sqlite3.connect(backup) as connection:
+                self.assertEqual(
+                    999,
+                    connection.execute(
+                        "SELECT updated_at_unix FROM leases WHERE resource_key=?",
+                        (resource_key,),
+                    ).fetchone()[0],
+                )
+        finally:
+            keeper.close()
+
+    def test_resource_backup_failure_rolls_back_without_partial_schema(self) -> None:
+        resource_key, original = self._create_resource_schema_v1()
+        with patch.object(
+            resources.os,
+            "link",
+            side_effect=OSError("simulated resource backup publish failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "backup publish failure"):
+                resources.list_resources()
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            self.assertEqual(
+                "1",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                original,
+                dict(connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?",
+                    (resource_key,),
+                ).fetchone()),
+            )
+            self.assertEqual(
+                {"metadata", "leases"},
+                {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                    )
+                },
+            )
+        self.assertEqual([], self._resource_migration_backups())
+        self.assertEqual(
+            [], list(self.database.parent.glob(".*.backup.tmp"))
+        )
+        resources.list_resources()
+        self.assertEqual(1, len(self._resource_migration_backups()))
+
+    def test_interrupted_resource_migration_rolls_back_and_reuses_backup(self) -> None:
+        resource_key, original = self._create_resource_schema_v1()
+        with patch.object(
+            resources,
+            "_validate_resource_schema_current",
+            side_effect=RuntimeError("simulated resource validation failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "validation failure"):
+                resources.list_resources()
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            self.assertEqual(
+                "1",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                original,
+                dict(connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?",
+                    (resource_key,),
+                ).fetchone()),
+            )
+        backups = self._resource_migration_backups()
+        self.assertEqual(1, len(backups))
+        resources.list_resources()
+        self.assertEqual(backups, self._resource_migration_backups())
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                "2",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+
+    def test_tampered_resource_backup_blocks_retry(self) -> None:
+        self._create_resource_schema_v1()
+        with patch.object(
+            resources,
+            "_validate_resource_schema_current",
+            side_effect=RuntimeError("stop after resource backup"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after resource backup"):
+                resources.list_resources()
+        backup = self._resource_migration_backups()[0]
+        backup.chmod(0o600)
+        backup.write_bytes(b"not a sqlite database")
+        with self.assertRaisesRegex(RuntimeError, "corrupt"):
+            resources.list_resources()
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                "1",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+
+    def test_concurrent_resource_openers_create_one_verified_backup(self) -> None:
+        self._create_resource_schema_v1()
+        barrier = threading.Barrier(3)
+        errors: list[BaseException] = []
+
+        def open_store() -> None:
+            try:
+                barrier.wait(timeout=2)
+                with resources._database():
+                    pass
+            except BaseException as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=open_store) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait(timeout=2)
+        for worker in workers:
+            worker.join(timeout=5)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(self._resource_migration_backups()))
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                "2",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
 
     def test_schema_v2_missing_terminalization_table_fails_closed(self) -> None:
         self.database.parent.mkdir(parents=True)
