@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from pathlib import Path
 import sys
 import tempfile
@@ -198,6 +199,368 @@ class WorkerTests(unittest.TestCase):
             )
         self.assertEqual(status["state"], "interrupted")
         self.assertIsNone(workers.resources.inspect_resource("port:9227"))
+
+    def _running_browser(self, port: int = 9333) -> dict[str, object]:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            return workers.browser_start(str(self.binary), port=port, runtime_seconds=60)["worker"]
+
+    def _confirmation(
+        self,
+        worker_id: str,
+        *,
+        origin: str = "http://device.home.arpa",
+        identity: str = "#identity",
+        protected: str = "#protected",
+        submit: str = "button",
+        choice: str | None = None,
+    ) -> str:
+        scope, _, _ = workers._browser_form_action_scope(
+            worker_id,
+            origin,
+            {"identity": identity, "protected": protected, "submit": submit},
+            choice,
+        )
+        return workers._browser_form_confirmation(worker_id, origin, scope)
+
+    def test_stored_form_action_is_target_bound_and_redacted(self) -> None:
+        worker = self._running_browser()
+        payload = {
+            "schema_version": 1,
+            "ok": True,
+            "result_code": "ok",
+            "fill_confirmed": True,
+            "submitted": True,
+            "action_effect_observed": True,
+            "navigation_observed": False,
+            "form_disappeared": True,
+            "post_origin": "http://device.home.arpa",
+            "post_path_sha256": "a" * 64,
+            "remote_address_sha256": "d" * 64,
+            "cleaned": False,
+        }
+        audit_path = self.root / "audit.jsonl"
+        with patch.object(workers, "_canonical_local_origin", return_value=("http://device.home.arpa", "b" * 64, ["192.168.1.1"])), patch.object(
+            workers, "_run_node_form_action", return_value=payload
+        ) as action, patch.object(workers.base, "_append_audit") as append, patch.object(
+            workers.base, "_verify_audit_log", return_value={"last_record_sha256": "c" * 64}
+        ), patch.object(workers.base, "AUDIT_LOG", audit_path), patch.object(
+            workers, "_observe", return_value={"state": "running", "properties": {}, "probe": result(), "observed_at_unix": 1}
+        ):
+            response = workers.browser_stored_form_action(
+                worker["worker_id"],
+                expected_origin="http://device.home.arpa",
+                identity_selector="#identity",
+                protected_selector="#protected",
+                submit_selector="button[type=submit]",
+                identity_choice="operator",
+                confirmation=self._confirmation(
+                    worker["worker_id"],
+                    submit="button[type=submit]",
+                    choice="operator",
+                ),
+            )
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["submitted"])
+        self.assertNotIn("#identity", json.dumps(response))
+        self.assertNotIn("#protected", json.dumps(response))
+        request = action.call_args.args[1]
+        self.assertEqual(request["expected_origin"], "http://device.home.arpa")
+        record = append.call_args.args[0]
+        self.assertNotIn("identity_selector", record)
+        self.assertNotIn("protected_selector", record)
+        self.assertEqual(record["selector_sha256"]["identity"], workers._sha256_text("#identity"))
+        self.assertIsNone(workers.resources.inspect_resource(f"component:browser-action:{worker['worker_id']}"))
+
+    def test_stored_form_action_requires_exact_confirmation(self) -> None:
+        worker = self._running_browser(port=9334)
+        with patch.object(workers, "_canonical_local_origin", return_value=("http://device.home.arpa", "b" * 64, ["192.168.1.1"])), patch.object(
+            workers, "_run_node_form_action"
+        ) as action:
+            with self.assertRaisesRegex(PermissionError, "confirmation mismatch"):
+                workers.browser_stored_form_action(
+                    worker["worker_id"],
+                    expected_origin="http://device.home.arpa",
+                    identity_selector="#identity",
+                    protected_selector="#protected",
+                    submit_selector="button",
+                    confirmation="wrong",
+                )
+        action.assert_not_called()
+
+    def test_stored_form_action_rejects_public_resolution(self) -> None:
+        public_answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 80))]
+        with patch.object(workers.socket, "getaddrinfo", return_value=public_answer):
+            with self.assertRaisesRegex(PermissionError, "outside local"):
+                workers._canonical_local_origin("http://example.invalid")
+
+    def test_stored_form_action_rejects_multiline_selector(self) -> None:
+        with self.assertRaisesRegex(ValueError, "bounded single-line"):
+            workers._validate_form_selector("#field\nscript", "identity_selector")
+
+    def test_stored_form_action_fails_closed_when_browser_fill_is_absent(self) -> None:
+        worker = self._running_browser(port=9335)
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "result_code": "browser-fill",
+            "fill_confirmed": False,
+            "submitted": False,
+            "action_effect_observed": False,
+            "navigation_observed": False,
+            "form_disappeared": False,
+            "post_origin": None,
+            "post_path_sha256": None,
+            "remote_address_sha256": "d" * 64,
+            "cleaned": True,
+        }
+        with patch.object(workers, "_canonical_local_origin", return_value=("http://device.home.arpa", "b" * 64, ["192.168.1.1"])), patch.object(
+            workers, "_run_node_form_action", return_value=payload
+        ), patch.object(workers.base, "_append_audit") as append, patch.object(
+            workers.base, "_verify_audit_log", return_value={"last_record_sha256": "c" * 64}
+        ), patch.object(workers, "_observe", return_value={"state": "running", "properties": {}, "probe": result(), "observed_at_unix": 1}):
+            response = workers.browser_stored_form_action(
+                worker["worker_id"],
+                expected_origin="http://device.home.arpa",
+                identity_selector="#identity",
+                protected_selector="#protected",
+                submit_selector="button",
+                confirmation=self._confirmation(worker["worker_id"]),
+            )
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["result_code"], "browser-fill")
+        self.assertTrue(response["cleaned"])
+        self.assertTrue(append.call_args.args[0]["cleaned"])
+
+    def test_node_action_removes_private_request_files(self) -> None:
+        worker = self._running_browser(port=9336)
+        record = workers._row(worker["worker_id"])
+        output = json.dumps({
+            "schema_version": 1,
+            "ok": False,
+            "result_code": "transport",
+            "fill_confirmed": False,
+            "submitted": False,
+            "action_effect_observed": False,
+            "navigation_observed": False,
+            "form_disappeared": False,
+            "post_origin": None,
+            "post_path_sha256": None,
+            "remote_address_sha256": None,
+            "cleaned": False,
+        }) + "\n"
+        node = self.root / "node"
+        node.write_text("#!/bin/sh\nexit 0\n")
+        node.chmod(0o755)
+        with patch.object(workers.shutil, "which", return_value=str(node)), patch.object(
+            workers.operator, "_run", return_value=result(returncode=2, stdout=output)
+        ):
+            parsed = workers._run_node_form_action(
+                record,
+                {
+                    "schema_version": 1,
+                    "port": 9336,
+                    "expected_origin": "http://device.home.arpa",
+                    "allowed_addresses": ["192.168.1.1"],
+                    "cleanup_only": False,
+                    "selectors": {"identity": "#i", "protected": "#p", "submit": "button"},
+                    "identity_choice": None,
+                    "timeout_ms": 5000,
+                },
+                timeout_seconds=5,
+            )
+        self.assertEqual(parsed["result_code"], "transport")
+        instance = Path(record["config_path"]).parent
+        self.assertEqual(list(instance.glob(".stored-form-*")), [])
+
+    def test_stored_form_action_rejects_origin_path_query_and_fragment(self) -> None:
+        local_answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.1", 80))]
+        with patch.object(workers.socket, "getaddrinfo", return_value=local_answer):
+            for value in (
+                "http://device.home.arpa/login",
+                "http://device.home.arpa?next=login",
+                "http://device.home.arpa/#login",
+            ):
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "canonical"):
+                    workers._canonical_local_origin(value)
+
+    def test_stored_form_action_rejects_terminal_worker_before_transport(self) -> None:
+        worker = self._running_browser(port=9337)
+        completed = {
+            "state": "completed",
+            "properties": {},
+            "probe": result(),
+            "observed_at_unix": 1,
+        }
+        with patch.object(
+            workers,
+            "_canonical_local_origin",
+            return_value=("http://device.home.arpa", "b" * 64, ["192.168.1.1"]),
+        ), patch.object(workers, "_observe", return_value=completed), patch.object(
+            workers, "_run_node_form_action"
+        ) as action:
+            with self.assertRaisesRegex(RuntimeError, "not running"):
+                workers.browser_stored_form_action(
+                    worker["worker_id"],
+                    expected_origin="http://device.home.arpa",
+                    identity_selector="#identity",
+                    protected_selector="#protected",
+                    submit_selector="button",
+                    confirmation=self._confirmation(worker["worker_id"]),
+                )
+        action.assert_not_called()
+
+    def test_stored_form_action_audits_protocol_failure_after_cleanup_retry(self) -> None:
+        worker = self._running_browser(port=9338)
+        cleanup = {
+            "schema_version": 1,
+            "ok": True,
+            "result_code": "cleanup",
+            "fill_confirmed": False,
+            "submitted": False,
+            "action_effect_observed": False,
+            "navigation_observed": False,
+            "form_disappeared": False,
+            "post_origin": "http://device.home.arpa",
+            "post_path_sha256": None,
+            "remote_address_sha256": "d" * 64,
+            "cleaned": True,
+        }
+        audit_path = self.root / "audit.jsonl"
+        with patch.object(
+            workers,
+            "_canonical_local_origin",
+            return_value=("http://device.home.arpa", "b" * 64, ["192.168.1.1"]),
+        ), patch.object(
+            workers,
+            "_run_node_form_action",
+            side_effect=[RuntimeError("untrusted internal detail"), cleanup],
+        ) as action, patch.object(workers.base, "_append_audit") as append, patch.object(
+            workers.base, "_verify_audit_log", return_value={"last_record_sha256": "c" * 64}
+        ), patch.object(workers.base, "AUDIT_LOG", audit_path), patch.object(
+            workers,
+            "_observe",
+            return_value={"state": "running", "properties": {}, "probe": result(), "observed_at_unix": 1},
+        ):
+            response = workers.browser_stored_form_action(
+                worker["worker_id"],
+                expected_origin="http://device.home.arpa",
+                identity_selector="#identity",
+                protected_selector="#protected",
+                submit_selector="button",
+                confirmation=self._confirmation(worker["worker_id"]),
+            )
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["result_code"], "protocol")
+        self.assertNotIn("untrusted internal detail", json.dumps(response))
+        self.assertEqual(action.call_count, 2)
+        self.assertEqual(append.call_count, 2)
+        self.assertIs(action.call_args_list[1].args[1]["cleanup_only"], True)
+        record = append.call_args.args[0]
+        self.assertEqual(record["result_code"], "protocol")
+        self.assertIs(record["outcome_known"], False)
+        self.assertIsNone(record["ok"])
+        self.assertIsNone(record["submitted"])
+        self.assertTrue(record["cleaned"])
+        self.assertNotIn("untrusted internal detail", json.dumps(record))
+        self.assertIsNone(
+            workers.resources.inspect_resource(
+                f"component:browser-action:{worker['worker_id']}"
+            )
+        )
+
+    def test_stored_form_action_preserves_fixed_element_contract_failure(self) -> None:
+        worker = self._running_browser(port=9339)
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "result_code": "element-contract",
+            "fill_confirmed": False,
+            "submitted": False,
+            "action_effect_observed": False,
+            "navigation_observed": False,
+            "form_disappeared": False,
+            "post_origin": None,
+            "post_path_sha256": None,
+            "remote_address_sha256": "d" * 64,
+            "cleaned": True,
+        }
+        with patch.object(
+            workers,
+            "_canonical_local_origin",
+            return_value=("http://device.home.arpa", "b" * 64, ["192.168.1.1"]),
+        ), patch.object(workers, "_run_node_form_action", return_value=payload), patch.object(
+            workers.base, "_append_audit"
+        ), patch.object(
+            workers.base, "_verify_audit_log", return_value={"last_record_sha256": "c" * 64}
+        ), patch.object(
+            workers,
+            "_observe",
+            return_value={"state": "running", "properties": {}, "probe": result(), "observed_at_unix": 1},
+        ):
+            response = workers.browser_stored_form_action(
+                worker["worker_id"],
+                expected_origin="http://device.home.arpa",
+                identity_selector="#identity",
+                protected_selector="#protected",
+                submit_selector="button",
+                confirmation=self._confirmation(worker["worker_id"]),
+            )
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["result_code"], "element-contract")
+        self.assertTrue(response["cleaned"])
+
+    def test_stored_form_confirmation_changes_with_every_selector(self) -> None:
+        worker = self._running_browser(port=9340)
+        original = self._confirmation(worker["worker_id"])
+        for key, kwargs in (
+            ("identity", {"identity": "#other-identity"}),
+            ("protected", {"protected": "#other-protected"}),
+            ("submit", {"submit": "button.primary"}),
+            ("choice", {"choice": "other-user"}),
+        ):
+            with self.subTest(key=key):
+                self.assertNotEqual(original, self._confirmation(worker["worker_id"], **kwargs))
+
+    def test_stored_form_action_requires_worker_owned_port_lease(self) -> None:
+        worker = self._running_browser(port=9341)
+        workers.resources.release_resources(
+            f"worker:{worker['worker_id']}",
+            ["port:9341"],
+        )
+        with patch.object(
+            workers,
+            "_canonical_local_origin",
+            return_value=("http://device.home.arpa", "b" * 64, ["192.168.1.1"]),
+        ), patch.object(workers, "_observe", return_value={
+            "state": "running",
+            "properties": {},
+            "probe": result(),
+            "observed_at_unix": 1,
+        }), patch.object(workers, "_run_node_form_action") as action:
+            with self.assertRaisesRegex(RuntimeError, "no longer owns"):
+                workers.browser_stored_form_action(
+                    worker["worker_id"],
+                    expected_origin="http://device.home.arpa",
+                    identity_selector="#identity",
+                    protected_selector="#protected",
+                    submit_selector="button",
+                    confirmation=self._confirmation(worker["worker_id"]),
+                )
+        action.assert_not_called()
+
+    def test_stored_form_helper_uses_topmost_pointer_and_guarded_enter(self) -> None:
+        source = workers.BROWSER_FORM_NODE_SOURCE
+        self.assertIn("document.elementFromPoint", source)
+        self.assertIn("Input.dispatchMouseEvent", source)
+        self.assertIn("guardedEnter", source)
+        browser_fill = source.split("stage = 'browser-fill';", 1)[1].split(
+            "stage = 'submit-target';", 1
+        )[0]
+        self.assertNotIn(".focus()", browser_fill)
+        self.assertIn("await key('Tab', 'Tab', 9)", browser_fill)
+        self.assertIn("await guardedEnter()", browser_fill)
 
     def test_gui_fails_clearly_without_xvfb(self) -> None:
         with patch.object(workers.shutil, "which", return_value=None):
