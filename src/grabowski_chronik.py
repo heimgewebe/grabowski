@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,13 +43,35 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def event_id(kind: str, run_id: str) -> str:
-    raw = canonical_json({"schema_version": "agent-run-event.v0", "kind": kind, "run_id": run_id})
+def event_id(event: dict[str, Any]) -> str:
+    payload = dict(event)
+    payload.pop("event_id", None)
+    raw = canonical_json(payload)
     return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def now_z() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def _timestamp_from_unix(value: Any, *, field: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"task record is missing numeric {field}")
+    timestamp = float(value)
+    if not math.isfinite(timestamp):
+        raise ValueError(f"task record has non-finite {field}")
+    return (
+        datetime.fromtimestamp(timestamp, timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _event_timestamp(record: dict[str, Any], state: str) -> str:
+    if state in TERMINAL:
+        if record.get("terminalized_at_unix") is not None:
+            return _timestamp_from_unix(
+                record["terminalized_at_unix"], field="terminalized_at_unix"
+            )
+        return _timestamp_from_unix(record.get("updated_at_unix"), field="updated_at_unix")
+    return _timestamp_from_unix(record.get("created_at_unix"), field="created_at_unix")
 
 
 def state_root(record: dict[str, Any] | None = None) -> Path:
@@ -110,11 +133,10 @@ def build_event(record: dict[str, Any], state: str) -> dict[str, Any] | None:
     rid = run_id(record)
     context = _context(record)
     data = {**data, "operation": context["operation"], "task_class": context["task_class"]}
-    return {
+    event = {
         "schema_version": "agent-run-event.v0",
-        "event_id": event_id(kind, rid),
         "kind": kind,
-        "ts": now_z(),
+        "ts": _event_timestamp(record, state),
         "source": {"repo": "heimgewebe/grabowski", "component": "grabowski", "run_id": rid},
         "subject": _subject(context),
         "trust_tier": "observed" if state in TERMINAL else "declared",
@@ -123,6 +145,8 @@ def build_event(record: dict[str, Any], state: str) -> dict[str, Any] | None:
         "evidence_refs": [f"grabowski-task:{record['task_id']}", f"grabowski-unit:{record['unit']}"],
         "data": data,
     }
+    event["event_id"] = event_id(event)
+    return event
 
 
 def outbox_path(event: dict[str, Any], root: Path | None = None) -> Path:
@@ -137,10 +161,14 @@ def append_unique(path: Path, event: dict[str, Any]) -> bool:
             if not line.strip():
                 continue
             try:
-                if json.loads(line).get("event_id") == event["event_id"]:
-                    return False
+                existing = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if existing.get("event_id") != event["event_id"]:
+                continue
+            if canonical_json(existing) != canonical_json(event):
+                raise ValueError("event_id already exists with different payload")
+            return False
     with path.open("a", encoding="utf-8") as handle:
         handle.write(canonical_json(event))
         handle.write("\n")

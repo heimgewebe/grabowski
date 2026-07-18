@@ -58,6 +58,8 @@ For a local task with exactly one canonical `repo:/absolute/path` resource claim
 
 Every new event carries bounded `operation` and `task_class` fields. `chronik_operation` accepts only `implement`, `review`, `merge`, `deploy`, `runtime_verify`, `recovery` or `other`; the task class is derived deterministically from that value. Non-`other` operations require an enabled task-local outbox. Events never contain raw argv, cwd, environment variables, secrets or private filesystem paths.
 
+Event payloads are deterministic for one persisted task transition. `agent.run.started` uses the task creation timestamp; terminal events use the terminalization timestamp, falling back to the persisted update timestamp for legacy rows. The `event_id` is the SHA-256 of the complete canonical payload without the ID itself. Re-emitting the same transition therefore recreates byte-identical evidence, while changed timestamps, subjects or data receive a different ID. An existing ID with different payload fails closed.
+
 ## Safe temporary smoke
 
 Use a temporary state root and the deployed runtime interpreter.
@@ -67,7 +69,7 @@ tmp=$(mktemp -d)
 release="$HOME/.local/share/grabowski-mcp"
 GRABOWSKI_CHRONIK_AGENT_RUN_OUTBOX=1 \
 GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT="$tmp" \
-"$release/.venv/bin/python" -c 'import grabowski_chronik as c; r=c.record_task_state_safely({"task_id":"dddddddddddddddddddddddd","unit":"u","attempt":1}, "completed"); print(r)'
+"$release/.venv/bin/python" -c 'import grabowski_chronik as c; r=c.record_task_state_safely({"task_id":"dddddddddddddddddddddddd","unit":"u","attempt":1,"created_at_unix":1700000000,"updated_at_unix":1700000100,"terminalized_at_unix":1700000200}, "completed"); print(r)'
 find "$tmp" -name '*.jsonl' -print
 rm -rf "$tmp"
 ```
@@ -83,7 +85,7 @@ Expected result:
 A generated event must be readable by Chronik's demo view.
 
 ```bash
-/home/alex/repos/chronik/.venv/bin/python -c 'import sys; sys.path.insert(0,"/home/alex/.local/share/grabowski-mcp/inputs/src"); sys.path.insert(0,"/home/alex/repos/chronik"); import grabowski_chronik as c; from tools import agent_ledger_view as v; e=c.build_event({"task_id":"eeeeeeeeeeeeeeeeeeeeeeee","unit":"u","attempt":1,"chronik_context_json":{"subject_scope":"repository","repo":"heimgewebe/chronik","operation":"implement","task_class":"coding"}}, "completed"); rows=v.build_view([e]); print(len(rows), rows[0].repo, rows[0].result)'
+/home/alex/repos/chronik/.venv/bin/python -c 'import sys; sys.path.insert(0,"/home/alex/.local/share/grabowski-mcp/inputs/src"); sys.path.insert(0,"/home/alex/repos/chronik"); import grabowski_chronik as c; from tools import agent_ledger_view as v; e=c.build_event({"task_id":"eeeeeeeeeeeeeeeeeeeeeeee","unit":"u","attempt":1,"created_at_unix":1700000000,"updated_at_unix":1700000100,"terminalized_at_unix":1700000200,"chronik_context_json":{"subject_scope":"repository","repo":"heimgewebe/chronik","operation":"implement","task_class":"coding"}}, "completed"); rows=v.build_view([e]); print(len(rows), rows[0].repo, rows[0].result)'
 ```
 
 Expected result for this explicit repository-scoped demo: `1 heimgewebe/chronik completed`. Host-scoped events remain valid for import but are not rendered by this legacy repo-only demo view.

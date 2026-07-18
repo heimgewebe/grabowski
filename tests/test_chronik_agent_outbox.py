@@ -19,6 +19,9 @@ def record(**overrides):
         "task_id": "a" * 24,
         "unit": "grabowski-task-" + "a" * 24 + "-a1.service",
         "attempt": 1,
+        "created_at_unix": 1_700_000_000,
+        "updated_at_unix": 1_700_000_100,
+        "terminalized_at_unix": 1_700_000_200,
     }
     value.update(overrides)
     return value
@@ -146,6 +149,54 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         blocked = chronik.build_event(value, "failed")
         self.assertEqual(started["event_id"], chronik.build_event(value, "running")["event_id"])
         self.assertEqual(len({started["event_id"], completed["event_id"], blocked["event_id"]}), 3)
+        self.assertEqual(started["ts"], "2023-11-14T22:13:20Z")
+        self.assertEqual(completed["ts"], "2023-11-14T22:16:40Z")
+
+    def test_non_finite_persisted_timestamp_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "non-finite terminalized_at_unix"):
+            chronik.build_event(record(terminalized_at_unix=float("nan")), "failed")
+
+    def test_event_id_binds_timestamp_subject_and_data(self):
+        base = record(host="local")
+        original = chronik.build_event(base, "failed")
+        later = chronik.build_event(record(host="local", terminalized_at_unix=1_700_000_201), "failed")
+        changed_context = chronik.build_event(
+            record(
+                host="local",
+                chronik_context_json={
+                    "subject_scope": "host",
+                    "host": "heim-pc",
+                    "operation": "recovery",
+                    "task_class": "recovery",
+                },
+            ),
+            "failed",
+        )
+        self.assertNotEqual(original["event_id"], later["event_id"])
+        self.assertNotEqual(original["event_id"], changed_context["event_id"])
+
+    def test_recreated_outbox_event_is_byte_identical_for_same_task_projection(self):
+        self.enable()
+        value = record()
+        first = chronik.record_task_state(value, "failed")
+        path = Path(first["path"])
+        original = path.read_bytes()
+        path.unlink()
+        second = chronik.record_task_state(value, "failed")
+        self.assertTrue(second["written"])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_existing_event_id_with_different_payload_fails_closed(self):
+        self.enable()
+        value = record()
+        event = chronik.build_event(value, "failed")
+        path = chronik.outbox_path(event, self.root)
+        changed = json.loads(json.dumps(event))
+        changed["data"]["operation"] = "recovery"
+        path.parent.mkdir(parents=True)
+        path.write_text(chronik.canonical_json(changed) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "different payload"):
+            chronik.append_unique(path, event)
 
     def test_failure_is_non_blocking(self):
         bad_root = self.root / "occupied"
