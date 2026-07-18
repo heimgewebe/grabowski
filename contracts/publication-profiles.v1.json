@@ -1,24 +1,24 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "61f5d0966448bd031a01a9b410b21cefc67e4a6b84a8045191d58ba83b5ba796"
+    "sha256": "4f66ae997c2facf06828832df6794e72cbfcb35c4873433fee018bf472dbbd45"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "7f159a76f081f449f5ba9a91ee5a7ccf966d702a2d80cce9bf6919afa9ba9f50"
+    "sha256": "8aef4ef53ad26f04d8d6edd798cdec27ae66c655268cd3e9b2d343f8682b9e56"
   },
   "counts": {
     "core": 21,
-    "full": 142,
-    "operator": 127
+    "full": 145,
+    "operator": 130
   },
   "profiles": {
     "core": [
       "grabowski_verify_audit",
-      "rlens_bundle_discover",
-      "rlens_bundle_status",
-      "rlens_freshness_check",
-      "rlens_context_pack",
+      "repoground_bundle_discover",
+      "repoground_bundle_status",
+      "repoground_freshness_check",
+      "repoground_context_pack",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -57,14 +57,17 @@
       "grabowski_rollback_text",
       "grabowski_verify_audit",
       "latest_complete_bundles",
-      "rlens_bundle_discover",
-      "rlens_bundle_status",
-      "rlens_freshness_check",
-      "rlens_preflight",
-      "rlens_query",
-      "rlens_query_existing_index",
-      "rlens_range_get",
-      "rlens_context_pack",
+      "repoground_bundle_discover",
+      "repoground_bundle_status",
+      "repoground_freshness_check",
+      "repoground_preflight",
+      "repoground_query",
+      "repoground_query_existing_index",
+      "repoground_range_get",
+      "repoground_context_pack",
+      "repoground_find_symbol",
+      "repoground_get_callers",
+      "repoground_get_callees",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -200,14 +203,17 @@
       "grabowski_destroy_path",
       "grabowski_rollback_text",
       "latest_complete_bundles",
-      "rlens_bundle_discover",
-      "rlens_bundle_status",
-      "rlens_freshness_check",
-      "rlens_preflight",
-      "rlens_query",
-      "rlens_query_existing_index",
-      "rlens_range_get",
-      "rlens_context_pack",
+      "repoground_bundle_discover",
+      "repoground_bundle_status",
+      "repoground_freshness_check",
+      "repoground_preflight",
+      "repoground_query",
+      "repoground_query_existing_index",
+      "repoground_range_get",
+      "repoground_context_pack",
+      "repoground_find_symbol",
+      "repoground_get_callers",
+      "repoground_get_callees",
       "grabowski_runtime_health",
       "grabowski_contract_drift",
       "grabowski_runtime_deploy_schedule",
@@ -337,10 +343,10 @@
         "grabowski_service_logs",
         "grabowski_service_status",
         "grabowski_verify_audit",
-        "rlens_bundle_discover",
-        "rlens_bundle_status",
-        "rlens_context_pack",
-        "rlens_freshness_check"
+        "repoground_bundle_discover",
+        "repoground_bundle_status",
+        "repoground_context_pack",
+        "repoground_freshness_check"
       ],
       "read_only": true,
       "risk_classes": [
@@ -355,10 +361,10 @@
       "orientation_tools": [
         "grabowski_contract_drift",
         "grabowski_runtime_health",
-        "rlens_bundle_discover",
-        "rlens_bundle_status",
-        "rlens_context_pack",
-        "rlens_freshness_check"
+        "repoground_bundle_discover",
+        "repoground_bundle_status",
+        "repoground_context_pack",
+        "repoground_freshness_check"
       ],
       "selection": "all tools not in core plus orientation tools"
     }

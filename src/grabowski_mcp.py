@@ -26,6 +26,7 @@ import urllib.parse
 import uuid
 
 from mcp.server.fastmcp import FastMCP
+
 try:
     from mcp.server.fastmcp import Context
 except ImportError:
@@ -116,7 +117,9 @@ def _render_agent_instructions() -> str:
 
 AGENT_INSTRUCTIONS = _render_agent_instructions()
 AGENT_INSTRUCTIONS_BYTES = len(AGENT_INSTRUCTIONS.encode("utf-8"))
-AGENT_INSTRUCTIONS_SHA256 = hashlib.sha256(AGENT_INSTRUCTIONS.encode("utf-8")).hexdigest()
+AGENT_INSTRUCTIONS_SHA256 = hashlib.sha256(
+    AGENT_INSTRUCTIONS.encode("utf-8")
+).hexdigest()
 
 
 def _agent_instructions_metadata() -> dict[str, Any]:
@@ -134,12 +137,14 @@ STATE_DIR = HOME / ".local" / "state" / "grabowski"
 POLICY_PATH = HOME / ".config" / "grabowski" / "access.json"
 AUDIT_LOG = STATE_DIR / "write-audit.jsonl"
 QUARANTINE_DIR = STATE_DIR / "quarantine"
-CANONICAL_KILL_SWITCH_PATH = Path("/var/lib/grabowski/operator-blockade/operator-kill-switch")
+CANONICAL_KILL_SWITCH_PATH = Path(
+    "/var/lib/grabowski/operator-blockade/operator-kill-switch"
+)
 KILL_SWITCH_PATH = CANONICAL_KILL_SWITCH_PATH
 LEGACY_KILL_SWITCH_PATH = STATE_DIR / "operator-kill-switch"
 BLOCKADE_AUTHORITY_UID = 0
 BLOCKADE_MARKER_MODE = 0o644
-BUNDLE_REGISTRY = STATE_DIR / "rlens-latest-complete-bundles.tsv"
+BUNDLE_REGISTRY = STATE_DIR / "repoground-latest-complete-bundles.tsv"
 MERGES_ROOT = HOME / "repos" / "merges"
 AUDIT_SCHEMA_VERSION = 2
 MAX_AUDIT_BYTES = 16 * 1024 * 1024
@@ -194,241 +199,263 @@ ALL_CAPABILITIES = (
 )
 
 TOOL_CAPABILITY_REQUIREMENTS = {
-    'grabowski_status': (),
-    'grabowski_context': (),
-    'grip_list': ('file_read',),
-    'grip_run': ('terminal_execute',),
-    'grabowski_list_directory': ('file_read',),
-    'grabowski_stat': ('file_read',),
-    'grabowski_read_text': ('file_read',),
-    'grabowski_secret_inspect': ('secret_inspect',),
-    'grabowski_secret_reveal': ('secret_reveal',),
-    'grabowski_secret_use': ('secret_use',),
-    'grabowski_secret_export': ('secret_export',),
-    'grabowski_browser_profile_read': ('browser_profile_read',),
-    'grabowski_create_text': ('file_write',),
-    'grabowski_replace_text': ('file_write',),
-    'grabowski_remove_path': ('file_delete',),
-    'grabowski_restore_removed_path': ('file_delete',),
-    'grabowski_destroy_path': ('file_destroy',),
-    'grabowski_rollback_text': ('rollback_text',),
-    'grabowski_verify_audit': ('audit_verify',),
-    'latest_complete_bundles': ('bundle_registry',),
-    'rlens_bundle_discover': ('bundle_registry',),
-    'rlens_bundle_status': ('bundle_registry',),
-    'rlens_freshness_check': ('bundle_registry',),
-    'rlens_preflight': ('bundle_registry',),
-    'rlens_query': ('bundle_registry',),
-    'rlens_query_existing_index': ('bundle_registry',),
-    'rlens_range_get': ('bundle_registry',),
-    'rlens_context_pack': ('bundle_registry',),
-    'grabowski_runtime_health': (),
-    'grabowski_deployment_identity': (),
-    'grabowski_contract_drift': (),
-    'grabowski_checkout_summary': (),
-    'grabowski_git_status': (),
-    'grabowski_git_diff': (),
-    'grabowski_git_log': (),
-    'grabowski_git_show': (),
-    'grabowski_github_pr_view': ('github_cli',),
-    'grabowski_github_checks': ('github_cli',),
-    'grabowski_service_status': ('user_service_control',),
-    'grabowski_service_logs': ('user_service_control',),
-    'grabowski_runtime_deploy_schedule': ('durable_job', 'git_cli'),
-    'grabowski_agent_workspace_create': ('durable_job', 'git_cli', 'resource_lease', 'tmux_interaction'),
-    'grabowski_agent_workspace_status': ('durable_job', 'git_cli', 'tmux_interaction'),
-    'grabowski_agent_workspace_attach': ('tmux_interaction',),
-    'grabowski_agent_workspace_collect': ('durable_job', 'git_cli'),
-    'grabowski_agent_workspace_role_retry': ('durable_job', 'git_cli'),
-    'grabowski_agent_workspace_close': ('durable_job', 'resource_lease', 'tmux_interaction'),
-    'grabowski_agent_workspace_observe': ('durable_job', 'git_cli'),
-    'grabowski_agent_workspace_optimize': ('durable_job', 'git_cli'),
-    'grabowski_agent_workspace_cleanup_plan': ('durable_job', 'git_cli', 'resource_lease', 'tmux_interaction'),
-    'grabowski_agent_workspace_reconcile_stale': ('durable_job', 'git_cli', 'resource_lease', 'tmux_interaction'),
-    'grabowski_agent_workspace_cleanup': ('git_cli', 'resource_lease'),
-    'grabowski_agent_execution_route': (),
-    'grabowski_agent_competition_start': ('durable_job', 'git_cli'),
-    'grabowski_agent_competition_status': ('durable_job',),
-    'grabowski_agent_competition_compare': ('durable_job',),
-    'grabowski_terminal_run': ('terminal_execute',),
-    'grabowski_job_start': ('durable_job',),
-    'grabowski_job_status': ('durable_job',),
-    'grabowski_job_notification_list': ('durable_job',),
-    'grabowski_job_notification_ack': ('durable_job',),
-    'grabowski_job_logs': ('durable_job',),
-    'grabowski_job_cancel': ('durable_job',),
-    'grabowski_git': ('git_cli',),
-    'grabowski_git_branch': ('git_cli',),
-    'grabowski_checkout_inventory': ('git_cli',),
-    'grabowski_checkout_retain': ('git_cli', 'resource_lease'),
-    'grabowski_checkout_archive': ('git_cli', 'resource_lease'),
-    'grabowski_checkout_cleanup': ('git_cli', 'resource_lease'),
-    'grabowski_github': ('github_cli',),
-    'grabowski_user_service': ('user_service_control',),
-    'grabowski_tmux_list': ('tmux_interaction',),
-    'grabowski_tmux_capture': ('tmux_interaction',),
-    'grabowski_tmux_send': ('tmux_interaction',),
-    'grabowski_process_list': ('process_inspect',),
-    'grabowski_process_signal': ('process_signal',),
-    'grabowski_ports': ('port_inspect',),
-    'grabowski_privileged_action_reference': ('privileged_reference',),
-    'grabowski_power_run': ('power_execute',),
-    'grabowski_fleet_list': ('terminal_execute',),
-    'grabowski_fleet_run': ('terminal_execute',),
-    'grabowski_juno_status': ('terminal_execute',),
-    'grabowski_juno_pair': ('terminal_execute',),
-    'grabowski_juno_run': ('terminal_execute',),
-    'ipad_capability_manifest': ('terminal_execute',),
-    'ipad_storage_inventory': ('terminal_execute',),
-    'ipad_storage_grant_status': ('terminal_execute',),
-    'ipad_permission_probe': ('terminal_execute',),
-    'ipad_file_stat': ('terminal_execute',),
-    'ipad_directory_list': ('terminal_execute',),
-    'ipad_file_read': ('terminal_execute',),
-    'ipad_file_create': ('terminal_execute',),
-    'ipad_file_replace': ('terminal_execute',),
-    'grabowski_operation_list': ('terminal_execute',),
-    'grabowski_operation_plan': ('terminal_execute',),
-    'grabowski_operation_run': ('terminal_execute',),
-    'grabowski_privileged_broker_status': ('privileged_reference',),
-    'grabowski_task_start': ('durable_job',),
-    'grabowski_task_status': ('durable_job',),
-    'grabowski_task_logs': ('durable_job',),
-    'grabowski_task_cancel': ('durable_job',),
-    'grabowski_task_resume': ('durable_job',),
-    'grabowski_task_list': ('durable_job',),
-    'grabowski_task_reconcile_check': ('durable_job',),
-    'grabowski_task_reconcile_refresh': ('durable_job',),
-    'grabowski_task_reconcile_resume': ('durable_job',),
-    'grabowski_recovery_status': ('audit_verify',),
-    'grabowski_recovery_server_probe': ('file_write', 'secret_use', 'terminal_execute'),
-    'grabowski_operator_blockade_status': ('audit_verify',),
-    'grabowski_operator_blockade_engage': ('audit_verify', 'file_write'),
-    'grabowski_operator_blockade_disarm': ('audit_verify', 'file_move'),
-    'grabowski_operator_blockade_migrate_legacy': ('audit_verify', 'file_move'),
-    'grabowski_friction_record': ('friction_record',),
-    'grabowski_friction_resolve': ('friction_record',),
-    'grabowski_friction_summary': (),
-    'grabowski_execution_shape': (),
-    'grabowski_execution_outcome_record': ('friction_record',),
-    'grabowski_execution_governor_summary': (),
-    'grabowski_agent_bootstrap': (),
-    'grabowski_call_shape_check': (),
-    'grabowski_connector_transport_diagnostics': ('user_service_control',),
-    'grabowski_operator_recall_export': (),
-    'grabowski_resource_nonconflict_assess': ('resource_lease',),
-    'grabowski_resource_reconcile_obsolete_path_leases': ('resource_lease',),
-    'grabowski_resource_acquire': ('resource_lease',),
-    'grabowski_resource_renew': ('resource_lease',),
-    'grabowski_resource_release': ('resource_lease',),
-    'grabowski_resource_inspect': ('resource_lease',),
-    'grabowski_resource_list': ('resource_lease',),
-    'grabowski_task_reconcile': ('durable_job',),
-    'grabowski_artifact_stat': ('artifact_transfer',),
-    'grabowski_artifact_push': ('artifact_transfer',),
-    'grabowski_artifact_pull': ('artifact_transfer',),
-    'grabowski_browser_worker_start': ('browser_worker',),
-    'grabowski_browser_worker_stored_form_action': ('browser_worker',),
-    'grabowski_browser_worker_status': ('browser_worker',),
-    'grabowski_browser_worker_stop': ('browser_worker',),
-    'grabowski_browser_worker_list': ('browser_worker',),
-    'grabowski_gui_worker_start': ('gui_worker',),
-    'grabowski_gui_worker_status': ('gui_worker',),
-    'grabowski_gui_worker_stop': ('gui_worker',),
-    'grabowski_gui_worker_list': ('gui_worker',),
+    "grabowski_status": (),
+    "grabowski_context": (),
+    "grip_list": ("file_read",),
+    "grip_run": ("terminal_execute",),
+    "grabowski_list_directory": ("file_read",),
+    "grabowski_stat": ("file_read",),
+    "grabowski_read_text": ("file_read",),
+    "grabowski_secret_inspect": ("secret_inspect",),
+    "grabowski_secret_reveal": ("secret_reveal",),
+    "grabowski_secret_use": ("secret_use",),
+    "grabowski_secret_export": ("secret_export",),
+    "grabowski_browser_profile_read": ("browser_profile_read",),
+    "grabowski_create_text": ("file_write",),
+    "grabowski_replace_text": ("file_write",),
+    "grabowski_remove_path": ("file_delete",),
+    "grabowski_restore_removed_path": ("file_delete",),
+    "grabowski_destroy_path": ("file_destroy",),
+    "grabowski_rollback_text": ("rollback_text",),
+    "grabowski_verify_audit": ("audit_verify",),
+    "latest_complete_bundles": ("bundle_registry",),
+    "repoground_bundle_discover": ("bundle_registry",),
+    "repoground_bundle_status": ("bundle_registry",),
+    "repoground_freshness_check": ("bundle_registry",),
+    "repoground_preflight": ("bundle_registry",),
+    "repoground_query": ("bundle_registry",),
+    "repoground_query_existing_index": ("bundle_registry",),
+    "repoground_range_get": ("bundle_registry",),
+    "repoground_context_pack": ("bundle_registry",),
+    "repoground_find_symbol": ("bundle_registry",),
+    "repoground_get_callers": ("bundle_registry",),
+    "repoground_get_callees": ("bundle_registry",),
+    "grabowski_runtime_health": (),
+    "grabowski_deployment_identity": (),
+    "grabowski_contract_drift": (),
+    "grabowski_checkout_summary": (),
+    "grabowski_git_status": (),
+    "grabowski_git_diff": (),
+    "grabowski_git_log": (),
+    "grabowski_git_show": (),
+    "grabowski_github_pr_view": ("github_cli",),
+    "grabowski_github_checks": ("github_cli",),
+    "grabowski_service_status": ("user_service_control",),
+    "grabowski_service_logs": ("user_service_control",),
+    "grabowski_runtime_deploy_schedule": ("durable_job", "git_cli"),
+    "grabowski_agent_workspace_create": (
+        "durable_job",
+        "git_cli",
+        "resource_lease",
+        "tmux_interaction",
+    ),
+    "grabowski_agent_workspace_status": ("durable_job", "git_cli", "tmux_interaction"),
+    "grabowski_agent_workspace_attach": ("tmux_interaction",),
+    "grabowski_agent_workspace_collect": ("durable_job", "git_cli"),
+    "grabowski_agent_workspace_role_retry": ("durable_job", "git_cli"),
+    "grabowski_agent_workspace_close": (
+        "durable_job",
+        "resource_lease",
+        "tmux_interaction",
+    ),
+    "grabowski_agent_workspace_observe": ("durable_job", "git_cli"),
+    "grabowski_agent_workspace_optimize": ("durable_job", "git_cli"),
+    "grabowski_agent_workspace_cleanup_plan": (
+        "durable_job",
+        "git_cli",
+        "resource_lease",
+        "tmux_interaction",
+    ),
+    "grabowski_agent_workspace_reconcile_stale": (
+        "durable_job",
+        "git_cli",
+        "resource_lease",
+        "tmux_interaction",
+    ),
+    "grabowski_agent_workspace_cleanup": ("git_cli", "resource_lease"),
+    "grabowski_agent_execution_route": (),
+    "grabowski_agent_competition_start": ("durable_job", "git_cli"),
+    "grabowski_agent_competition_status": ("durable_job",),
+    "grabowski_agent_competition_compare": ("durable_job",),
+    "grabowski_terminal_run": ("terminal_execute",),
+    "grabowski_job_start": ("durable_job",),
+    "grabowski_job_status": ("durable_job",),
+    "grabowski_job_notification_list": ("durable_job",),
+    "grabowski_job_notification_ack": ("durable_job",),
+    "grabowski_job_logs": ("durable_job",),
+    "grabowski_job_cancel": ("durable_job",),
+    "grabowski_git": ("git_cli",),
+    "grabowski_git_branch": ("git_cli",),
+    "grabowski_checkout_inventory": ("git_cli",),
+    "grabowski_checkout_retain": ("git_cli", "resource_lease"),
+    "grabowski_checkout_archive": ("git_cli", "resource_lease"),
+    "grabowski_checkout_cleanup": ("git_cli", "resource_lease"),
+    "grabowski_github": ("github_cli",),
+    "grabowski_user_service": ("user_service_control",),
+    "grabowski_tmux_list": ("tmux_interaction",),
+    "grabowski_tmux_capture": ("tmux_interaction",),
+    "grabowski_tmux_send": ("tmux_interaction",),
+    "grabowski_process_list": ("process_inspect",),
+    "grabowski_process_signal": ("process_signal",),
+    "grabowski_ports": ("port_inspect",),
+    "grabowski_privileged_action_reference": ("privileged_reference",),
+    "grabowski_power_run": ("power_execute",),
+    "grabowski_fleet_list": ("terminal_execute",),
+    "grabowski_fleet_run": ("terminal_execute",),
+    "grabowski_juno_status": ("terminal_execute",),
+    "grabowski_juno_pair": ("terminal_execute",),
+    "grabowski_juno_run": ("terminal_execute",),
+    "ipad_capability_manifest": ("terminal_execute",),
+    "ipad_storage_inventory": ("terminal_execute",),
+    "ipad_storage_grant_status": ("terminal_execute",),
+    "ipad_permission_probe": ("terminal_execute",),
+    "ipad_file_stat": ("terminal_execute",),
+    "ipad_directory_list": ("terminal_execute",),
+    "ipad_file_read": ("terminal_execute",),
+    "ipad_file_create": ("terminal_execute",),
+    "ipad_file_replace": ("terminal_execute",),
+    "grabowski_operation_list": ("terminal_execute",),
+    "grabowski_operation_plan": ("terminal_execute",),
+    "grabowski_operation_run": ("terminal_execute",),
+    "grabowski_privileged_broker_status": ("privileged_reference",),
+    "grabowski_task_start": ("durable_job",),
+    "grabowski_task_status": ("durable_job",),
+    "grabowski_task_logs": ("durable_job",),
+    "grabowski_task_cancel": ("durable_job",),
+    "grabowski_task_resume": ("durable_job",),
+    "grabowski_task_list": ("durable_job",),
+    "grabowski_task_reconcile_check": ("durable_job",),
+    "grabowski_task_reconcile_refresh": ("durable_job",),
+    "grabowski_task_reconcile_resume": ("durable_job",),
+    "grabowski_recovery_status": ("audit_verify",),
+    "grabowski_recovery_server_probe": ("file_write", "secret_use", "terminal_execute"),
+    "grabowski_operator_blockade_status": ("audit_verify",),
+    "grabowski_operator_blockade_engage": ("audit_verify", "file_write"),
+    "grabowski_operator_blockade_disarm": ("audit_verify", "file_move"),
+    "grabowski_operator_blockade_migrate_legacy": ("audit_verify", "file_move"),
+    "grabowski_friction_record": ("friction_record",),
+    "grabowski_friction_resolve": ("friction_record",),
+    "grabowski_friction_summary": (),
+    "grabowski_execution_shape": (),
+    "grabowski_execution_outcome_record": ("friction_record",),
+    "grabowski_execution_governor_summary": (),
+    "grabowski_agent_bootstrap": (),
+    "grabowski_call_shape_check": (),
+    "grabowski_connector_transport_diagnostics": ("user_service_control",),
+    "grabowski_operator_recall_export": (),
+    "grabowski_resource_nonconflict_assess": ("resource_lease",),
+    "grabowski_resource_reconcile_obsolete_path_leases": ("resource_lease",),
+    "grabowski_resource_acquire": ("resource_lease",),
+    "grabowski_resource_renew": ("resource_lease",),
+    "grabowski_resource_release": ("resource_lease",),
+    "grabowski_resource_inspect": ("resource_lease",),
+    "grabowski_resource_list": ("resource_lease",),
+    "grabowski_task_reconcile": ("durable_job",),
+    "grabowski_artifact_stat": ("artifact_transfer",),
+    "grabowski_artifact_push": ("artifact_transfer",),
+    "grabowski_artifact_pull": ("artifact_transfer",),
+    "grabowski_browser_worker_start": ("browser_worker",),
+    "grabowski_browser_worker_stored_form_action": ("browser_worker",),
+    "grabowski_browser_worker_status": ("browser_worker",),
+    "grabowski_browser_worker_stop": ("browser_worker",),
+    "grabowski_browser_worker_list": ("browser_worker",),
+    "grabowski_gui_worker_start": ("gui_worker",),
+    "grabowski_gui_worker_status": ("gui_worker",),
+    "grabowski_gui_worker_stop": ("gui_worker",),
+    "grabowski_gui_worker_list": ("gui_worker",),
 }
 
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
-    'grabowski_github_pr_view',
-    'grabowski_github_checks',
-    'grabowski_service_status',
-    'grabowski_service_logs',
-    'grabowski_runtime_deploy_schedule',
-    'grabowski_agent_workspace_create',
-    'grabowski_agent_workspace_status',
-    'grabowski_agent_workspace_attach',
-    'grabowski_agent_workspace_collect',
-    'grabowski_agent_workspace_role_retry',
-    'grabowski_agent_workspace_close',
-    'grabowski_agent_workspace_observe',
-    'grabowski_agent_workspace_optimize',
-    'grabowski_agent_workspace_cleanup_plan',
-    'grabowski_agent_workspace_reconcile_stale',
-    'grabowski_agent_workspace_cleanup',
-    'grabowski_agent_competition_start',
-    'grabowski_agent_competition_status',
-    'grabowski_agent_competition_compare',
-    'grabowski_terminal_run',
-    'grabowski_job_start',
-    'grabowski_job_status',
-    'grabowski_job_notification_list',
-    'grabowski_job_notification_ack',
-    'grabowski_job_logs',
-    'grabowski_job_cancel',
-    'grabowski_git',
-    'grabowski_git_branch',
-    'grabowski_checkout_inventory',
-    'grabowski_checkout_retain',
-    'grabowski_checkout_archive',
-    'grabowski_checkout_cleanup',
-    'grabowski_github',
-    'grabowski_user_service',
-    'grabowski_tmux_list',
-    'grabowski_tmux_capture',
-    'grabowski_tmux_send',
-    'grabowski_process_list',
-    'grabowski_process_signal',
-    'grabowski_ports',
-    'grabowski_privileged_action_reference',
-    'grabowski_power_run',
-    'grabowski_fleet_list',
-    'grabowski_fleet_run',
-    'grabowski_juno_status',
-    'grabowski_juno_pair',
-    'grabowski_juno_run',
-    'ipad_capability_manifest',
-    'ipad_storage_inventory',
-    'ipad_storage_grant_status',
-    'ipad_permission_probe',
-    'ipad_file_stat',
-    'ipad_directory_list',
-    'ipad_file_read',
-    'ipad_file_create',
-    'ipad_file_replace',
-    'grabowski_operation_list',
-    'grabowski_operation_plan',
-    'grabowski_operation_run',
-    'grabowski_privileged_broker_status',
-    'grabowski_connector_transport_diagnostics',
-    'grabowski_task_start',
-    'grabowski_task_status',
-    'grabowski_task_logs',
-    'grabowski_task_cancel',
-    'grabowski_task_resume',
-    'grabowski_task_list',
-    'grabowski_task_reconcile_check',
-    'grabowski_task_reconcile_refresh',
-    'grabowski_task_reconcile_resume',
-    'grabowski_resource_nonconflict_assess',
-    'grabowski_resource_reconcile_obsolete_path_leases',
-    'grabowski_resource_acquire',
-    'grabowski_resource_renew',
-    'grabowski_resource_release',
-    'grabowski_resource_inspect',
-    'grabowski_resource_list',
-    'grabowski_task_reconcile',
-    'grabowski_artifact_stat',
-    'grabowski_artifact_push',
-    'grabowski_artifact_pull',
-    'grabowski_browser_worker_start',
-    'grabowski_browser_worker_stored_form_action',
-    'grabowski_browser_worker_status',
-    'grabowski_browser_worker_stop',
-    'grabowski_browser_worker_list',
-    'grabowski_gui_worker_start',
-    'grabowski_gui_worker_status',
-    'grabowski_gui_worker_stop',
-    'grabowski_gui_worker_list',
+    "grabowski_github_pr_view",
+    "grabowski_github_checks",
+    "grabowski_service_status",
+    "grabowski_service_logs",
+    "grabowski_runtime_deploy_schedule",
+    "grabowski_agent_workspace_create",
+    "grabowski_agent_workspace_status",
+    "grabowski_agent_workspace_attach",
+    "grabowski_agent_workspace_collect",
+    "grabowski_agent_workspace_role_retry",
+    "grabowski_agent_workspace_close",
+    "grabowski_agent_workspace_observe",
+    "grabowski_agent_workspace_optimize",
+    "grabowski_agent_workspace_cleanup_plan",
+    "grabowski_agent_workspace_reconcile_stale",
+    "grabowski_agent_workspace_cleanup",
+    "grabowski_agent_competition_start",
+    "grabowski_agent_competition_status",
+    "grabowski_agent_competition_compare",
+    "grabowski_terminal_run",
+    "grabowski_job_start",
+    "grabowski_job_status",
+    "grabowski_job_notification_list",
+    "grabowski_job_notification_ack",
+    "grabowski_job_logs",
+    "grabowski_job_cancel",
+    "grabowski_git",
+    "grabowski_git_branch",
+    "grabowski_checkout_inventory",
+    "grabowski_checkout_retain",
+    "grabowski_checkout_archive",
+    "grabowski_checkout_cleanup",
+    "grabowski_github",
+    "grabowski_user_service",
+    "grabowski_tmux_list",
+    "grabowski_tmux_capture",
+    "grabowski_tmux_send",
+    "grabowski_process_list",
+    "grabowski_process_signal",
+    "grabowski_ports",
+    "grabowski_privileged_action_reference",
+    "grabowski_power_run",
+    "grabowski_fleet_list",
+    "grabowski_fleet_run",
+    "grabowski_juno_status",
+    "grabowski_juno_pair",
+    "grabowski_juno_run",
+    "ipad_capability_manifest",
+    "ipad_storage_inventory",
+    "ipad_storage_grant_status",
+    "ipad_permission_probe",
+    "ipad_file_stat",
+    "ipad_directory_list",
+    "ipad_file_read",
+    "ipad_file_create",
+    "ipad_file_replace",
+    "grabowski_operation_list",
+    "grabowski_operation_plan",
+    "grabowski_operation_run",
+    "grabowski_privileged_broker_status",
+    "grabowski_connector_transport_diagnostics",
+    "grabowski_task_start",
+    "grabowski_task_status",
+    "grabowski_task_logs",
+    "grabowski_task_cancel",
+    "grabowski_task_resume",
+    "grabowski_task_list",
+    "grabowski_task_reconcile_check",
+    "grabowski_task_reconcile_refresh",
+    "grabowski_task_reconcile_resume",
+    "grabowski_resource_nonconflict_assess",
+    "grabowski_resource_reconcile_obsolete_path_leases",
+    "grabowski_resource_acquire",
+    "grabowski_resource_renew",
+    "grabowski_resource_release",
+    "grabowski_resource_inspect",
+    "grabowski_resource_list",
+    "grabowski_task_reconcile",
+    "grabowski_artifact_stat",
+    "grabowski_artifact_push",
+    "grabowski_artifact_pull",
+    "grabowski_browser_worker_start",
+    "grabowski_browser_worker_stored_form_action",
+    "grabowski_browser_worker_status",
+    "grabowski_browser_worker_stop",
+    "grabowski_browser_worker_list",
+    "grabowski_gui_worker_start",
+    "grabowski_gui_worker_status",
+    "grabowski_gui_worker_stop",
+    "grabowski_gui_worker_list",
 }
 DEFAULT_SECRET_USE_TIMEOUT_SECONDS = 30
 DEFAULT_SECRET_USE_OUTPUT_BYTES = 250_000
@@ -575,6 +602,7 @@ SECRET_REDACTIONS = (
     ),
 )
 
+
 def _deployment_manifest_path() -> Path:
     executable = Path(sys.executable)
     if executable.parent.name == "bin" and executable.parent.parent.name == ".venv":
@@ -699,7 +727,9 @@ def _validate_forbidden_hosts(value: Any, *, label: str) -> None:
 
 def _validate_risk_level(value: Any, *, label: str) -> None:
     if value not in SESSION_RISK_ORDER:
-        raise RuntimeError(f"Access policy {label} must be one of {list(SESSION_RISK_LEVELS)}")
+        raise RuntimeError(
+            f"Access policy {label} must be one of {list(SESSION_RISK_LEVELS)}"
+        )
 
 
 def _validate_policy(policy: Any) -> None:
@@ -711,7 +741,11 @@ def _validate_policy(policy: Any) -> None:
         raise RuntimeError(f"Unknown access policy fields: {unknown}")
 
     version = policy.get("version", 1)
-    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2}:
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in {1, 2}
+    ):
         raise RuntimeError("Access policy version must be 1 or 2")
     if version == 1 and V2_ONLY_POLICY_FIELDS & set(policy):
         raise RuntimeError("Typed secret/browser policy fields require version 2")
@@ -775,9 +809,7 @@ def _validate_policy(policy: Any) -> None:
             raise RuntimeError("Access policy capability_definitions must be an object")
         unknown_definitions = sorted(set(definitions) - set(ALL_CAPABILITIES))
         if unknown_definitions:
-            raise RuntimeError(
-                f"Unknown capability definitions: {unknown_definitions}"
-            )
+            raise RuntimeError(f"Unknown capability definitions: {unknown_definitions}")
         if not all(isinstance(value, str) and value for value in definitions.values()):
             raise RuntimeError("Capability definitions must be non-empty strings")
 
@@ -822,7 +854,9 @@ def _validate_policy(policy: Any) -> None:
                 )
         if "description" in profile and not isinstance(profile["description"], str):
             raise RuntimeError(f"Access profile {name} description must be a string")
-        if "trusted_owner" in profile and not isinstance(profile["trusted_owner"], bool):
+        if "trusted_owner" in profile and not isinstance(
+            profile["trusted_owner"], bool
+        ):
             raise RuntimeError(f"Access profile {name} trusted_owner must be a boolean")
         for key in ROOT_LIST_FIELDS:
             if key in profile:
@@ -836,7 +870,12 @@ def _validate_policy(policy: Any) -> None:
                 label=f"profile {name} capabilities",
             )
             capabilities = set(profile["capabilities"])
-            if capabilities & {"secret_inspect", "secret_reveal", "secret_use", "secret_export"}:
+            if capabilities & {
+                "secret_inspect",
+                "secret_reveal",
+                "secret_use",
+                "secret_export",
+            }:
                 if not _profile_root_values(policy, profile, "secret_roots"):
                     raise RuntimeError(
                         f"Access profile {name} enables secret capabilities "
@@ -861,11 +900,17 @@ def _validate_policy(policy: Any) -> None:
                     "browser_profile_roots"
                 )
         if "allowed_grips" in profile:
-            _validate_allowed_grips(profile["allowed_grips"], label=f"profile {name} allowed_grips")
+            _validate_allowed_grips(
+                profile["allowed_grips"], label=f"profile {name} allowed_grips"
+            )
         if "forbidden_hosts" in profile:
-            _validate_forbidden_hosts(profile["forbidden_hosts"], label=f"profile {name} forbidden_hosts")
+            _validate_forbidden_hosts(
+                profile["forbidden_hosts"], label=f"profile {name} forbidden_hosts"
+            )
         if "max_risk_level" in profile:
-            _validate_risk_level(profile["max_risk_level"], label=f"profile {name} max_risk_level")
+            _validate_risk_level(
+                profile["max_risk_level"], label=f"profile {name} max_risk_level"
+            )
 
 
 def _profile_root_values(
@@ -939,7 +984,9 @@ def _profile_values(policy: dict[str, Any], key: str) -> Any:
     return policy.get(key)
 
 
-def _profile_string_list(policy: dict[str, Any], key: str, default: list[str]) -> list[str]:
+def _profile_string_list(
+    policy: dict[str, Any], key: str, default: list[str]
+) -> list[str]:
     value = _profile_values(policy, key)
     if value is None:
         return list(default)
@@ -1015,7 +1062,9 @@ def _session_grip_policy_decision(
 
 def _validate_session_escalation(value: Any) -> None:
     if not isinstance(value, dict):
-        raise RuntimeError("session_escalation is required for high-risk grip execution")
+        raise RuntimeError(
+            "session_escalation is required for high-risk grip execution"
+        )
     required = {"target", "reason", "expires_at_unix"}
     missing = sorted(required - set(value))
     if missing:
@@ -1031,11 +1080,17 @@ def _validate_session_escalation(value: Any) -> None:
     if expires <= now:
         raise RuntimeError("session_escalation.expires_at_unix is expired")
     if expires > now + SESSION_ESCALATION_MAX_SECONDS:
-        raise RuntimeError("session_escalation.expires_at_unix is too far in the future")
+        raise RuntimeError(
+            "session_escalation.expires_at_unix is too far in the future"
+        )
     has_recovery = isinstance(value.get("recovery"), dict) and bool(value["recovery"])
-    has_irreversibility = isinstance(value.get("irreversibility"), dict) and bool(value["irreversibility"])
+    has_irreversibility = isinstance(value.get("irreversibility"), dict) and bool(
+        value["irreversibility"]
+    )
     if not (has_recovery or has_irreversibility):
-        raise RuntimeError("session_escalation requires recovery or irreversibility metadata")
+        raise RuntimeError(
+            "session_escalation requires recovery or irreversibility metadata"
+        )
 
 
 def _host_candidates_from_token(token: str) -> set[str]:
@@ -1065,9 +1120,14 @@ def _token_matches_forbidden_host(token: str, forbidden: set[str]) -> str | None
     return blocked[0] if blocked else None
 
 
-def _reject_forbidden_hosts_in_argv(argv: list[str], *, policy: dict[str, Any] | None = None) -> None:
+def _reject_forbidden_hosts_in_argv(
+    argv: list[str], *, policy: dict[str, Any] | None = None
+) -> None:
     source_policy = policy or _load_policy()
-    forbidden = {host.lower() for host in _profile_string_list(source_policy, "forbidden_hosts", [])}
+    forbidden = {
+        host.lower()
+        for host in _profile_string_list(source_policy, "forbidden_hosts", [])
+    }
     if not forbidden:
         return
     for token in argv:
@@ -1106,8 +1166,7 @@ def _root_values(policy: dict[str, Any], key: str) -> list[str]:
 def _configured_roots(key: str, policy: dict[str, Any] | None = None) -> list[Path]:
     source = _load_policy() if policy is None else policy
     return [
-        _policy_path(value).resolve(strict=False)
-        for value in _root_values(source, key)
+        _policy_path(value).resolve(strict=False) for value in _root_values(source, key)
     ]
 
 
@@ -1170,7 +1229,9 @@ def _effective_capabilities_for_tool(tool: str, policy: dict[str, Any]) -> set[s
     return effective
 
 
-def _capability_requirement_summary(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+def _capability_requirement_summary(
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     source = _load_policy() if policy is None else policy
     missing: list[dict[str, Any]] = []
     guarded = {
@@ -1180,12 +1241,16 @@ def _capability_requirement_summary(policy: dict[str, Any] | None = None) -> dic
     }
     for tool, required in sorted(guarded.items()):
         effective = _effective_capabilities_for_tool(tool, source)
-        missing_capabilities = [capability for capability in required if capability not in effective]
+        missing_capabilities = [
+            capability for capability in required if capability not in effective
+        ]
         if missing_capabilities:
-            missing.append({
-                "tool": tool,
-                "missing_capabilities": missing_capabilities,
-            })
+            missing.append(
+                {
+                    "tool": tool,
+                    "missing_capabilities": missing_capabilities,
+                }
+            )
     return {
         "known_tool_requirements": len(TOOL_CAPABILITY_REQUIREMENTS),
         "registered_tool_requirements": len(TOOL_CAPABILITY_REQUIREMENTS),
@@ -1261,9 +1326,9 @@ def _observe_blockade_marker(
                 "label": label,
             }
             digest = hashlib.sha256(
-                json.dumps(
-                    identity, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
             ).hexdigest()
             engaged_at = datetime.fromtimestamp(0, timezone.utc)
             diagnostic["source"] = f"{label}_observation_uncertain"
@@ -1285,9 +1350,9 @@ def _observe_blockade_marker(
                 "label": label,
             }
             digest = hashlib.sha256(
-                json.dumps(
-                    identity, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
             ).hexdigest()
             engaged_at = datetime.fromtimestamp(metadata.st_ctime, timezone.utc)
             diagnostic["source"] = f"{label}_unsafe_file"
@@ -1309,7 +1374,9 @@ def _observe_blockade_marker(
     return records, diagnostic
 
 
-def _operator_blockade_records() -> tuple[tuple[blockade_policy.BlockadeRecord, ...], dict[str, Any]]:
+def _operator_blockade_records() -> tuple[
+    tuple[blockade_policy.BlockadeRecord, ...], dict[str, Any]
+]:
     records: list[blockade_policy.BlockadeRecord] = []
     diagnostics: dict[str, Any] = {
         "marker_error": None,
@@ -1372,6 +1439,7 @@ def _operator_blockade_records() -> tuple[tuple[blockade_policy.BlockadeRecord, 
     diagnostics["marker_error"] = "; ".join(errors)[:1000] if errors else None
     return tuple(records), diagnostics
 
+
 def _kill_switch_state() -> dict[str, Any]:
     records, diagnostics = _operator_blockade_records()
     active = tuple(record for record in records if record.active_at())
@@ -1393,7 +1461,8 @@ def _kill_switch_state() -> dict[str, Any]:
         "path": str(KILL_SWITCH_PATH),
         "path_exists": KILL_SWITCH_PATH.exists() or KILL_SWITCH_PATH.is_symlink(),
         "canonical_path": str(KILL_SWITCH_PATH),
-        "canonical_path_exists": KILL_SWITCH_PATH.exists() or KILL_SWITCH_PATH.is_symlink(),
+        "canonical_path_exists": KILL_SWITCH_PATH.exists()
+        or KILL_SWITCH_PATH.is_symlink(),
         "legacy_path": str(LEGACY_KILL_SWITCH_PATH),
         "legacy_path_exists": (
             LEGACY_KILL_SWITCH_PATH.exists() or LEGACY_KILL_SWITCH_PATH.is_symlink()
@@ -1446,8 +1515,7 @@ def _require_blockade_allows_mutation(
         if strong_opaque_scopes:
             raise PermissionError(
                 "opaque command execution cannot prove isolation from active "
-                "path/repo blockades: "
-                + ",".join(strong_opaque_scopes)
+                "path/repo blockades: " + ",".join(strong_opaque_scopes)
             )
     decision = blockade_policy.evaluate_blockades(
         records,
@@ -1650,7 +1718,9 @@ def _removal_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def _verify_same_removal_target(target: Path, identity: tuple[int, int, int, int, int]) -> None:
+def _verify_same_removal_target(
+    target: Path, identity: tuple[int, int, int, int, int]
+) -> None:
     current = os.stat(target, follow_symlinks=False)
     if _removal_identity(current) != identity:
         raise RuntimeError("Removal target changed before mutation")
@@ -1706,8 +1776,7 @@ def _removal_snapshot(
 def _new_holding_path(target: Path) -> Path:
     for _attempt in range(20):
         candidate = (
-            target.parent
-            / f".{target.name}.grabowski-remove-{uuid.uuid4().hex[:12]}"
+            target.parent / f".{target.name}.grabowski-remove-{uuid.uuid4().hex[:12]}"
         )
         if not candidate.exists() and not candidate.is_symlink():
             return candidate
@@ -1801,7 +1870,9 @@ def _protected_generic_write_target(path: Path) -> bool:
         EXPECTED_STABLE_RUNTIME / "inputs" / "runtime-entrypoint.json",
     ]
     candidate = path.resolve(strict=False)
-    return any(_path_inside(candidate, root.resolve(strict=False)) for root in protected)
+    return any(
+        _path_inside(candidate, root.resolve(strict=False)) for root in protected
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -2067,7 +2138,11 @@ def _secret_text_snapshot(
     policy = _load_policy()
     byte_limit = _policy_limit(policy, "max_read_bytes")
     if max_bytes is not None:
-        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes < 1
+        ):
             raise ValueError("max_bytes must be a positive integer")
         byte_limit = min(byte_limit, max_bytes)
     snapshot = _read_bound_regular_bytes(path, byte_limit)
@@ -2122,12 +2197,16 @@ def _limit_text(text: str, max_output_bytes: int) -> tuple[str, bool]:
 
 
 def _contains_secret_variant(text: str, secret_data: bytes) -> bool:
-    return any(secret and secret in text for secret in _secret_redaction_values(secret_data))
+    return any(
+        secret and secret in text for secret in _secret_redaction_values(secret_data)
+    )
 
 
 def _reject_secret_variants_in_text(text: str, secret_data: bytes, label: str) -> None:
     if _contains_secret_variant(text, secret_data):
-        raise PermissionError(f"Secret value or encoded secret value may not appear in {label}")
+        raise PermissionError(
+            f"Secret value or encoded secret value may not appear in {label}"
+        )
 
 
 def _argv_sha256(argv: list[str]) -> str:
@@ -2480,8 +2559,7 @@ def _new_transaction_dir(operation: str, target: Path) -> tuple[str, Path]:
 
 def _write_json_evidence(path: Path, payload: dict[str, Any]) -> None:
     data = (
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-        + "\n"
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
     descriptor = os.open(
         path,
@@ -2496,11 +2574,7 @@ def _write_json_evidence(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _audit_record_hash(record: dict[str, Any]) -> str:
-    material = {
-        key: value
-        for key, value in record.items()
-        if key != "record_sha256"
-    }
+    material = {key: value for key, value in record.items() if key != "record_sha256"}
     encoded = json.dumps(
         material,
         ensure_ascii=False,
@@ -2829,12 +2903,7 @@ def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
 
 def _open_audit_append_target(path: Path) -> tuple[int, bool]:
     parent = _audit_parent(path)
-    flags = (
-        os.O_RDWR
-        | os.O_APPEND
-        | os.O_CLOEXEC
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    flags = os.O_RDWR | os.O_APPEND | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     created = False
     try:
         try:
@@ -2901,9 +2970,7 @@ def _append_audit(record: dict[str, Any]) -> None:
         try:
             status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
             if not status["valid"]:
-                raise RuntimeError(
-                    f"Audit log verification failed: {status['error']}"
-                )
+                raise RuntimeError(f"Audit log verification failed: {status['error']}")
 
             enriched = {**record}
             enriched.setdefault("timestamp", _utc_timestamp())
@@ -3030,7 +3097,8 @@ def _safe_relative_path(value: Any) -> bool:
 def _valid_agent_instructions_identity(value: Any) -> bool:
     return (
         isinstance(value, dict)
-        and set(value) == {
+        and set(value)
+        == {
             "schema_version",
             "version",
             "sha256",
@@ -3161,7 +3229,10 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         return False
     snapshot_paths = raw.get("snapshot_paths")
     if not isinstance(snapshot_paths, dict) or set(snapshot_paths) != {
-        "runtime_entrypoint", "runtime_input", "runtime_lock", "source",
+        "runtime_entrypoint",
+        "runtime_input",
+        "runtime_lock",
+        "source",
         "supporting_sources",
     }:
         return False
@@ -3273,7 +3344,9 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         raw.get("agent_instructions") == _agent_instructions_metadata()
     )
     release_root = manifest_path.parent.resolve()
-    snapshot_paths = raw.get("snapshot_paths") if isinstance(raw.get("snapshot_paths"), dict) else {}
+    snapshot_paths = (
+        raw.get("snapshot_paths") if isinstance(raw.get("snapshot_paths"), dict) else {}
+    )
     canonical_runtime = EXPECTED_STABLE_RUNTIME
     canonical_releases = canonical_runtime.parent / "grabowski-mcp-releases"
 
@@ -3290,7 +3363,10 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         )
     except (OSError, RuntimeError):
         release_path_valid = False
-    release_id_valid = isinstance(raw.get("release_id"), str) and raw.get("release_id") == release_root.name
+    release_id_valid = (
+        isinstance(raw.get("release_id"), str)
+        and raw.get("release_id") == release_root.name
+    )
     repo_head_valid = _is_lower_hex(raw.get("repo_head"), 40)
     runtime_pointer_valid = False
     try:
@@ -3301,21 +3377,24 @@ def _deployment_metadata_impl() -> dict[str, Any]:
     except (OSError, RuntimeError):
         runtime_pointer_valid = False
 
-    def snapshot_bytes(key: str, relative: str, limit: int = MAX_SNAPSHOT_BYTES) -> bytes | None:
+    def snapshot_bytes(
+        key: str, relative: str, limit: int = MAX_SNAPSHOT_BYTES
+    ) -> bytes | None:
         return _read_bound_regular_file(
-            snapshot_paths.get(key), release_root / relative, release_root, max_bytes=limit
+            snapshot_paths.get(key),
+            release_root / relative,
+            release_root,
+            max_bytes=limit,
         )
 
     runtime_input_data = snapshot_bytes("runtime_input", "inputs/runtime.in")
     runtime_lock_data = snapshot_bytes("runtime_lock", "inputs/runtime.lock.txt")
-    runtime_input_identity_valid = (
-        runtime_input_data is not None
-        and hashlib.sha256(runtime_input_data).hexdigest() == raw.get("runtime_input_sha256")
-    )
-    lock_identity_valid = (
-        runtime_lock_data is not None
-        and hashlib.sha256(runtime_lock_data).hexdigest() == raw.get("runtime_lock_sha256")
-    )
+    runtime_input_identity_valid = runtime_input_data is not None and hashlib.sha256(
+        runtime_input_data
+    ).hexdigest() == raw.get("runtime_input_sha256")
+    lock_identity_valid = runtime_lock_data is not None and hashlib.sha256(
+        runtime_lock_data
+    ).hexdigest() == raw.get("runtime_lock_sha256")
 
     expected_contract = release_root / "inputs/runtime-entrypoint.json"
     contract_data = _read_bound_regular_file(
@@ -3335,10 +3414,14 @@ def _deployment_metadata_impl() -> dict[str, Any]:
     entrypoint_contract_identity_valid = (
         contract_data is not None
         and contract_raw is not None
-        and hashlib.sha256(contract_data).hexdigest() == raw.get("entrypoint_contract_sha256")
+        and hashlib.sha256(contract_data).hexdigest()
+        == raw.get("entrypoint_contract_sha256")
         and _manifest_schema_valid({**raw, "entrypoint_contract": contract_raw})
     )
-    embedded_contract_valid = isinstance(raw.get("entrypoint_contract"), dict) and raw.get("entrypoint_contract") == contract_raw
+    embedded_contract_valid = (
+        isinstance(raw.get("entrypoint_contract"), dict)
+        and raw.get("entrypoint_contract") == contract_raw
+    )
 
     contract_sources: list[tuple[str, str]] = []
     if contract_raw is not None:
@@ -3385,9 +3468,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
             max_bytes=MAX_SNAPSHOT_BYTES,
         )
         expected_hash = (
-            source_hashes.get(module_name)
-            if isinstance(source_hashes, dict)
-            else None
+            source_hashes.get(module_name) if isinstance(source_hashes, dict) else None
         )
         snapshot_identity_by_module[module_name] = (
             snapshot_data is not None
@@ -3410,9 +3491,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         if origin is not None:
             module_origins[module_name] = origin
         recorded_module = (
-            module_paths.get(module_name)
-            if isinstance(module_paths, dict)
-            else None
+            module_paths.get(module_name) if isinstance(module_paths, dict) else None
         )
         module_data = (
             _read_bound_regular_file(
@@ -3441,9 +3520,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
     )
     entrypoint_module = contract_sources[0][0] if contract_sources else None
     entrypoint_origin = (
-        module_origins.get(entrypoint_module)
-        if entrypoint_module is not None
-        else None
+        module_origins.get(entrypoint_module) if entrypoint_module is not None else None
     )
     entrypoint_path_valid = (
         entrypoint_origin is not None
@@ -3462,68 +3539,93 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         release_python_identity_valid = (
             release_python == expected_python
             and release_python.exists()
-            and release_python.resolve(strict=True) == current_python.resolve(strict=True)
+            and release_python.resolve(strict=True)
+            == current_python.resolve(strict=True)
         )
         executable_identity_valid = (
             isinstance(raw.get("executable"), str)
             and Path(raw["executable"]) == release_python
-            and Path(raw["executable"]).resolve(strict=True) == current_python.resolve(strict=True)
+            and Path(raw["executable"]).resolve(strict=True)
+            == current_python.resolve(strict=True)
         )
     except (OSError, RuntimeError, ValueError):
         pass
 
     try:
-        pip_identity_valid = raw.get("pip_version") == f"pip {importlib.metadata.version('pip')}"
+        pip_identity_valid = (
+            raw.get("pip_version") == f"pip {importlib.metadata.version('pip')}"
+        )
     except importlib.metadata.PackageNotFoundError:
         pip_identity_valid = False
-    protocol_identity_valid = raw.get("mcp_protocol_version") in DEPLOYMENT_PROTOCOL_VERSIONS
+    protocol_identity_valid = (
+        raw.get("mcp_protocol_version") in DEPLOYMENT_PROTOCOL_VERSIONS
+    )
     python_runtime_identity_valid = (
         raw.get("python_version") == platform.python_version()
         and raw.get("python_implementation") == platform.python_implementation()
     )
     platform_identity_valid = raw.get("platform") == platform.platform()
 
-    artifact_integrity_valid = all((
-        schema_valid,
-        repo_head_valid,
-        runtime_input_identity_valid,
-        lock_identity_valid,
-        source_snapshot_identity_valid,
-        embedded_contract_valid,
-        entrypoint_contract_identity_valid,
-        agent_instructions_identity_valid,
-        protocol_identity_valid,
-    ))
-    runtime_binding_valid = all((
-        release_path_valid,
-        release_id_valid,
-        stable_runtime_manifest_valid,
-        runtime_pointer_valid,
-        source_identity_valid,
-        entrypoint_path_valid,
-        release_python_identity_valid,
-        executable_identity_valid,
-        pip_identity_valid,
-    ))
-    environment_compatibility_valid = all((
-        python_runtime_identity_valid,
-        platform_identity_valid,
-    ))
-    provenance_valid = all((
-        artifact_integrity_valid,
-        runtime_binding_valid,
-        environment_compatibility_valid,
-    ))
+    artifact_integrity_valid = all(
+        (
+            schema_valid,
+            repo_head_valid,
+            runtime_input_identity_valid,
+            lock_identity_valid,
+            source_snapshot_identity_valid,
+            embedded_contract_valid,
+            entrypoint_contract_identity_valid,
+            agent_instructions_identity_valid,
+            protocol_identity_valid,
+        )
+    )
+    runtime_binding_valid = all(
+        (
+            release_path_valid,
+            release_id_valid,
+            stable_runtime_manifest_valid,
+            runtime_pointer_valid,
+            source_identity_valid,
+            entrypoint_path_valid,
+            release_python_identity_valid,
+            executable_identity_valid,
+            pip_identity_valid,
+        )
+    )
+    environment_compatibility_valid = all(
+        (
+            python_runtime_identity_valid,
+            platform_identity_valid,
+        )
+    )
+    provenance_valid = all(
+        (
+            artifact_integrity_valid,
+            runtime_binding_valid,
+            environment_compatibility_valid,
+        )
+    )
 
     allowed = {
         key: raw.get(key)
         for key in (
-            "schema_version", "release_id", "repo_head",
-            "entrypoint_contract_sha256", "agent_instructions", "source_sha256",
-            "source_sha256s", "runtime_input_sha256", "runtime_lock_sha256",
-            "mcp_protocol_version", "python_version",
-            "python_implementation", "platform", "executable",
-            "pip_version", "created_at_unix", "completion_status",
+            "schema_version",
+            "release_id",
+            "repo_head",
+            "entrypoint_contract_sha256",
+            "agent_instructions",
+            "source_sha256",
+            "source_sha256s",
+            "runtime_input_sha256",
+            "runtime_lock_sha256",
+            "mcp_protocol_version",
+            "python_version",
+            "python_implementation",
+            "platform",
+            "executable",
+            "pip_version",
+            "created_at_unix",
+            "completion_status",
         )
     }
     return {
@@ -3566,9 +3668,7 @@ def _runtime_tool_contract_summary(
     manifest_error: str | None = None
     try:
         payload = json.loads(
-            _ensure_regular_text_file(DEPLOYMENT_MANIFEST, 2_000_000).decode(
-                "utf-8"
-            )
+            _ensure_regular_text_file(DEPLOYMENT_MANIFEST, 2_000_000).decode("utf-8")
         )
         contract = payload.get("entrypoint_contract", {})
         raw_expected = contract.get("expected_tools", [])
@@ -3646,9 +3746,7 @@ def _runtime_tool_contract_summary(
         "manifest_error": manifest_error,
         "client_snapshot": client_snapshot,
         "client_snapshot_observable": bool(client_snapshot.get("observable")),
-        "client_snapshot_verification_model": client_snapshot.get(
-            "verification_model"
-        ),
+        "client_snapshot_verification_model": client_snapshot.get("verification_model"),
         "refresh_required_when_client_count_or_hash_differs": True,
     }
 
@@ -3793,9 +3891,7 @@ def _operator_system_overview(
             "available": True,
             "state_counts": task_payload.get("state_counts", {}),
             "projection_counts": task_payload.get("projection_counts", {}),
-            "projection_counts_overlap": task_payload.get(
-                "projection_counts_overlap"
-            ),
+            "projection_counts_overlap": task_payload.get("projection_counts_overlap"),
             "unknown_state_count": task_payload.get("unknown_state_count"),
             "snapshot_complete": task_payload.get("state_counts_complete"),
         }
@@ -3836,13 +3932,13 @@ def _operator_system_overview(
             "bounded_limit": obligation_limit,
         }
     except Exception as exc:  # pragma: no cover - defensive status boundary
-        errors.append({"component": "operator_obligations", "error": type(exc).__name__})
+        errors.append(
+            {"component": "operator_obligations", "error": type(exc).__name__}
+        )
 
     snapshot_observable = bool(client_snapshot.get("observable"))
     unknown_state_count = tasks.get("unknown_state_count")
-    truth_model_ready = (
-        tasks.get("available") is True and unknown_state_count == 0
-    )
+    truth_model_ready = tasks.get("available") is True and unknown_state_count == 0
     components_observable = (
         not errors
         and leases.get("available") is True
@@ -3921,7 +4017,7 @@ def _operator_system_overview(
             "freshness": "must be read live for the selected target",
         },
         "repobrief": {
-            "authority": "rLens/RepoBrief bundle receipts",
+            "authority": "RepoGround bundle receipts",
             "observation_state": "target_required",
             "required_binding": ["repository", "bundle stem"],
             "freshness": "must be verified against the selected source commit",
@@ -3997,10 +4093,14 @@ def grabowski_status(
     integrity = {key: bool(deployment.get(key)) for key in integrity_fields}
     warnings: list[dict[str, Any]] = []
     if deployment.get("completion_status") != "complete" or not all(integrity.values()):
-        warnings.append({
-            "code": "deployment_integrity_incomplete",
-            "failed_checks": sorted(key for key, value in integrity.items() if not value),
-        })
+        warnings.append(
+            {
+                "code": "deployment_integrity_incomplete",
+                "failed_checks": sorted(
+                    key for key, value in integrity.items() if not value
+                ),
+            }
+        )
     if not bool(audit.get("valid")):
         warnings.append({"code": "audit_invalid", "error": audit.get("error")})
     if bool(kill_switch.get("engaged")):
@@ -4012,14 +4112,16 @@ def grabowski_status(
     client_snapshot = tool_contract.get("client_snapshot", {})
     if not bool(tool_contract.get("client_snapshot_observable")):
         snapshot_state = str(client_snapshot.get("state", "unavailable"))
-        warnings.append({
-            "code": f"client_snapshot_{snapshot_state}",
-            "verification_model": client_snapshot.get("verification_model"),
-            "detail": client_snapshot.get(
-                "recommended_next_action",
-                "bind the connector client snapshot to the current server contract",
-            ),
-        })
+        warnings.append(
+            {
+                "code": f"client_snapshot_{snapshot_state}",
+                "verification_model": client_snapshot.get("verification_model"),
+                "detail": client_snapshot.get(
+                    "recommended_next_action",
+                    "bind the connector client snapshot to the current server contract",
+                ),
+            }
+        )
     healthy = (
         deployment.get("completion_status") == "complete"
         and all(integrity.values())
@@ -4043,9 +4145,7 @@ def grabowski_status(
             )
         )
     elif system_overview is not None:
-        recommended_next_action = str(
-            system_overview["recommended_next_action"]
-        )
+        recommended_next_action = str(system_overview["recommended_next_action"])
     elif warnings:
         recommended_next_action = "inspect warnings before mutation"
     else:
@@ -4069,9 +4169,7 @@ def grabowski_status(
             "registered_tool_count": tool_contract.get("registered_tool_count"),
             "name_hash_contract": tool_contract.get("name_hash_contract"),
             "expected_names_sha256": tool_contract.get("expected_names_sha256"),
-            "registered_names_sha256": tool_contract.get(
-                "registered_names_sha256"
-            ),
+            "registered_names_sha256": tool_contract.get("registered_names_sha256"),
             "runtime_matches_deployment_contract": tool_contract.get(
                 "runtime_matches_deployment_contract"
             ),
@@ -4110,55 +4208,63 @@ def grabowski_status(
         assert system_overview is not None
         operating_protocol = _operator_relay_protocol()
         workspace_model = operating_protocol.get("workspace_execution_model", {})
-        base_payload.update({
-            "system_overview": system_overview,
-            "capabilities": sorted(_effective_capabilities(policy)),
-            "roots": {
-                "read": _profile_values(policy, "read_roots"),
-                "write": _profile_values(policy, "write_roots"),
-                "write_excluded": _profile_values(policy, "write_excluded_roots") or [],
-            },
-            "kill_switch": kill_switch,
-            "audit": {
-                "valid": audit.get("valid"),
-                "records": audit.get("records"),
-                "last_record_sha256": audit.get("last_record_sha256"),
-                "error": audit.get("error"),
-            },
-            "operating_protocol": {
-                "name": operating_protocol.get("name"),
-                "control_loop": operating_protocol.get("control_loop", []),
-                "external_agent_delegation": workspace_model.get(
-                    "external_agent_delegation"
-                ),
-                "automatic_patch_apply": workspace_model.get("automatic_patch_apply"),
-                "automatic_winner_selection": workspace_model.get(
-                    "automatic_winner_selection"
-                ),
-                "does_not_establish": operating_protocol.get(
-                    "does_not_establish", []
-                ),
-            },
-        })
+        base_payload.update(
+            {
+                "system_overview": system_overview,
+                "capabilities": sorted(_effective_capabilities(policy)),
+                "roots": {
+                    "read": _profile_values(policy, "read_roots"),
+                    "write": _profile_values(policy, "write_roots"),
+                    "write_excluded": _profile_values(policy, "write_excluded_roots")
+                    or [],
+                },
+                "kill_switch": kill_switch,
+                "audit": {
+                    "valid": audit.get("valid"),
+                    "records": audit.get("records"),
+                    "last_record_sha256": audit.get("last_record_sha256"),
+                    "error": audit.get("error"),
+                },
+                "operating_protocol": {
+                    "name": operating_protocol.get("name"),
+                    "control_loop": operating_protocol.get("control_loop", []),
+                    "external_agent_delegation": workspace_model.get(
+                        "external_agent_delegation"
+                    ),
+                    "automatic_patch_apply": workspace_model.get(
+                        "automatic_patch_apply"
+                    ),
+                    "automatic_winner_selection": workspace_model.get(
+                        "automatic_winner_selection"
+                    ),
+                    "does_not_establish": operating_protocol.get(
+                        "does_not_establish", []
+                    ),
+                },
+            }
+        )
     if selected_view == "evidence":
-        base_payload.update({
-            "operating_protocol": _operator_relay_protocol(),
-            "trusted_owner": _trusted_owner_enabled(policy),
-            "state_dir": str(STATE_DIR),
-            "policy_path": str(POLICY_PATH),
-            "read_roots": _profile_values(policy, "read_roots"),
-            "write_roots": _profile_values(policy, "write_roots"),
-            "write_excluded_roots": _profile_values(policy, "write_excluded_roots") or [],
-            "secret_roots": _secret_root_values(policy),
-            "browser_profile_roots": _browser_profile_root_values(policy),
-            "secret_export_roots": _secret_export_root_values(policy),
-            "latest_complete_bundles_path": str(BUNDLE_REGISTRY),
-            "latest_complete_bundles_exists": BUNDLE_REGISTRY.is_file(),
-            "deployment": deployment,
-            "tool_contract_evidence": tool_contract,
-            "capability_requirements": _capability_requirement_summary(policy),
-            "forbidden_capabilities": policy.get("forbidden_capabilities", []),
-        })
+        base_payload.update(
+            {
+                "operating_protocol": _operator_relay_protocol(),
+                "trusted_owner": _trusted_owner_enabled(policy),
+                "state_dir": str(STATE_DIR),
+                "policy_path": str(POLICY_PATH),
+                "read_roots": _profile_values(policy, "read_roots"),
+                "write_roots": _profile_values(policy, "write_roots"),
+                "write_excluded_roots": _profile_values(policy, "write_excluded_roots")
+                or [],
+                "secret_roots": _secret_root_values(policy),
+                "browser_profile_roots": _browser_profile_root_values(policy),
+                "secret_export_roots": _secret_export_root_values(policy),
+                "latest_complete_bundles_path": str(BUNDLE_REGISTRY),
+                "latest_complete_bundles_exists": BUNDLE_REGISTRY.is_file(),
+                "deployment": deployment,
+                "tool_contract_evidence": tool_contract,
+                "capability_requirements": _capability_requirement_summary(policy),
+                "forbidden_capabilities": policy.get("forbidden_capabilities", []),
+            }
+        )
     return _project_status_fields(base_payload, fields)
 
 
@@ -4208,7 +4314,13 @@ def grabowski_stat(path: str) -> dict[str, Any]:
     _require_capability("file_read")
     target = _resolve_existing(path, "read")
     st = _nofollow_metadata(target)
-    kind = "directory" if statmod.S_ISDIR(st.st_mode) else "file" if statmod.S_ISREG(st.st_mode) else "other"
+    kind = (
+        "directory"
+        if statmod.S_ISDIR(st.st_mode)
+        else "file"
+        if statmod.S_ISREG(st.st_mode)
+        else "other"
+    )
     result: dict[str, Any] = {
         "path": str(target),
         "type": kind,
@@ -4222,7 +4334,9 @@ def grabowski_stat(path: str) -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_read_text", annotations=READ_ANNOTATIONS)
-def grabowski_read_text(path: str, start_line: int = 1, max_lines: int = 400) -> dict[str, Any]:
+def grabowski_read_text(
+    path: str, start_line: int = 1, max_lines: int = 400
+) -> dict[str, Any]:
     """Read UTF-8 text from an allowed file and return a concurrency hash."""
     _require_capability("file_read")
     target = _resolve_existing(path, "read")
@@ -4254,7 +4368,13 @@ def grabowski_secret_inspect(path: str, max_entries: int = 100) -> dict[str, Any
     _require_capability("secret_inspect")
     target = _resolve_secret_existing(path)
     st = _nofollow_metadata(target)
-    kind = "directory" if statmod.S_ISDIR(st.st_mode) else "file" if statmod.S_ISREG(st.st_mode) else "other"
+    kind = (
+        "directory"
+        if statmod.S_ISDIR(st.st_mode)
+        else "file"
+        if statmod.S_ISREG(st.st_mode)
+        else "other"
+    )
     result: dict[str, Any] = {
         "path": str(target),
         "type": kind,
@@ -4327,7 +4447,9 @@ def grabowski_secret_reveal(
     )
     trusted_owner = _trusted_owner_enabled()
     if not trusted_owner and not acknowledge_context_exposure:
-        raise PermissionError("Secret reveal requires explicit context-exposure acknowledgement")
+        raise PermissionError(
+            "Secret reveal requires explicit context-exposure acknowledgement"
+        )
     if trusted_owner and not justification.strip():
         justification = "trusted-owner implicit reveal"
     if not isinstance(justification, str) or not justification.strip():
@@ -4335,9 +4457,13 @@ def grabowski_secret_reveal(
     if len(justification.encode("utf-8")) > 1000 or "\x00" in justification:
         raise ValueError("Secret reveal justification is too large or contains NUL")
     if _redact_sensitive_text(justification)[0] != justification:
-        raise ValueError("Secret reveal justification appears to contain secret material")
+        raise ValueError(
+            "Secret reveal justification appears to contain secret material"
+        )
     justification_sha256 = hashlib.sha256(justification.encode("utf-8")).hexdigest()
-    exposure_mode = "trusted-owner-policy" if trusted_owner else "explicit-acknowledgement"
+    exposure_mode = (
+        "trusted-owner-policy" if trusted_owner else "explicit-acknowledgement"
+    )
     transaction_id, transaction_dir = _new_transaction_dir("secret-reveal", target)
     active_profile = _active_profile(_load_policy())
     evidence = {
@@ -4359,28 +4485,30 @@ def grabowski_secret_reveal(
         },
     }
     _write_json_evidence(transaction_dir / "reveal.json", evidence)
-    _append_audit({
-        "timestamp": _utc_timestamp(),
-        "operation": "secret-reveal",
-        "transaction_id": transaction_id,
-        "path": str(target),
-        "before_sha256": None,
-        "after_sha256": snapshot["sha256"],
-        "bytes": snapshot["size"],
-        "backup": None,
-        "profile": active_profile["name"],
-        "capability": "secret_reveal",
-        "justification_sha256": justification_sha256,
-        "context_exposure_acknowledged": bool(acknowledge_context_exposure),
-        "exposure_mode": exposure_mode,
-        "postflight": evidence["postflight"],
-        "quarantine": {"directory": str(transaction_dir), "preimage_path": None},
-        "rollback": {
-            "available": False,
-            "reason": "secret reveal has no rollback artifact",
-            "created_sha256": None,
-        },
-    })
+    _append_audit(
+        {
+            "timestamp": _utc_timestamp(),
+            "operation": "secret-reveal",
+            "transaction_id": transaction_id,
+            "path": str(target),
+            "before_sha256": None,
+            "after_sha256": snapshot["sha256"],
+            "bytes": snapshot["size"],
+            "backup": None,
+            "profile": active_profile["name"],
+            "capability": "secret_reveal",
+            "justification_sha256": justification_sha256,
+            "context_exposure_acknowledged": bool(acknowledge_context_exposure),
+            "exposure_mode": exposure_mode,
+            "postflight": evidence["postflight"],
+            "quarantine": {"directory": str(transaction_dir), "preimage_path": None},
+            "rollback": {
+                "available": False,
+                "reason": "secret reveal has no rollback artifact",
+                "created_sha256": None,
+            },
+        }
+    )
     return {
         "path": str(target),
         "sha256": snapshot["sha256"],
@@ -4623,7 +4751,13 @@ def grabowski_browser_profile_read(
     _require_capability("browser_profile_read")
     target = _resolve_browser_profile_existing(path)
     st = _nofollow_metadata(target)
-    kind = "directory" if statmod.S_ISDIR(st.st_mode) else "file" if statmod.S_ISREG(st.st_mode) else "other"
+    kind = (
+        "directory"
+        if statmod.S_ISDIR(st.st_mode)
+        else "file"
+        if statmod.S_ISREG(st.st_mode)
+        else "other"
+    )
     result: dict[str, Any] = {
         "path": str(target),
         "type": kind,
@@ -4781,7 +4915,9 @@ def grabowski_create_text(path: str, content: str) -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_replace_text", annotations=REPLACE_ANNOTATIONS)
-def grabowski_replace_text(path: str, content: str, expected_sha256: str) -> dict[str, Any]:
+def grabowski_replace_text(
+    path: str, content: str, expected_sha256: str
+) -> dict[str, Any]:
     """Use this when an existing allowed UTF-8 text file must be replaced atomically. The exact SHA-256 returned by grabowski_read_text or grabowski_stat is required."""
     target, exists = _resolve_write_target(path)
     _require_mutations_enabled("file_write", path=str(target))
@@ -5163,7 +5299,9 @@ def grabowski_rollback_text(transaction_id: str) -> dict[str, Any]:
     if quarantine_path is None:
         raise ValueError("Audit transaction has no quarantine preimage")
     if quarantine_path.is_symlink() or not quarantine_path.is_file():
-        raise ValueError(f"Quarantine preimage is not a regular file: {quarantine_path}")
+        raise ValueError(
+            f"Quarantine preimage is not a regular file: {quarantine_path}"
+        )
     quarantine_root = _state_subdir(QUARANTINE_DIR)
     if not _path_inside(quarantine_path.resolve(strict=True), quarantine_root):
         raise PermissionError("Quarantine preimage is outside Grabowski state")
@@ -5259,36 +5397,36 @@ BUNDLE_REGISTRY_HEADER = (
     "output_health",
     "agent_reading_pack",
 )
-_RLENS_STEM_RE = re.compile(r"[A-Za-z0-9_.-]{1,160}\Z")
-_RLENS_REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,120}\Z")
+_REPOGROUND_STEM_RE = re.compile(r"[A-Za-z0-9_.-]{1,160}\Z")
+_REPOGROUND_REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,120}\Z")
 
 
-def _rlens_json(path: Path, *, max_bytes: int = 2_000_000) -> dict[str, Any]:
+def _repoground_json(path: Path, *, max_bytes: int = 2_000_000) -> dict[str, Any]:
     data = _ensure_regular_text_file(path, max_bytes)
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Invalid rLens JSON artifact: {path.name}") from exc
+        raise ValueError(f"Invalid RepoGround JSON artifact: {path.name}") from exc
     if not isinstance(value, dict):
-        raise ValueError(f"rLens artifact must be a JSON object: {path.name}")
+        raise ValueError(f"RepoGround artifact must be a JSON object: {path.name}")
     return value
 
 
-def _rlens_validate_repo(repo: str | None) -> str | None:
+def _repoground_validate_repo(repo: str | None) -> str | None:
     if repo is None or repo == "":
         return None
-    if not isinstance(repo, str) or not _RLENS_REPO_RE.fullmatch(repo):
+    if not isinstance(repo, str) or not _REPOGROUND_REPO_RE.fullmatch(repo):
         raise ValueError("repo must be a simple repository name")
     return repo
 
 
-def _rlens_validate_stem(stem: str) -> str:
-    if not isinstance(stem, str) or not _RLENS_STEM_RE.fullmatch(stem):
-        raise ValueError("stem must be a simple rLens bundle stem")
+def _repoground_validate_stem(stem: str) -> str:
+    if not isinstance(stem, str) or not _REPOGROUND_STEM_RE.fullmatch(stem):
+        raise ValueError("stem must be a simple RepoGround bundle stem")
     return stem
 
 
-def _rlens_repo_from_stem(stem: str) -> str:
+def _repoground_repo_from_stem(stem: str) -> str:
     if "-full-max-" in stem:
         return stem.split("-full-max-", 1)[0]
     if "-max-" in stem:
@@ -5296,34 +5434,34 @@ def _rlens_repo_from_stem(stem: str) -> str:
     return stem.split("-", 1)[0]
 
 
-def _rlens_stem_from_manifest(path: Path) -> str:
+def _repoground_stem_from_manifest(path: Path) -> str:
     name = path.name
     if not name.endswith(_BUNDLE_MANIFEST_SUFFIX):
-        raise ValueError("not an rLens bundle manifest")
+        raise ValueError("not a RepoGround bundle manifest")
     return name[: -len(_BUNDLE_MANIFEST_SUFFIX)]
 
 
-def _rlens_manifest_path(stem: str) -> Path:
-    stem = _rlens_validate_stem(stem)
+def _repoground_manifest_path(stem: str) -> Path:
+    stem = _repoground_validate_stem(stem)
     path = MERGES_ROOT / f"{stem}{_BUNDLE_MANIFEST_SUFFIX}"
     try:
         resolved = path.resolve(strict=False)
     except RuntimeError as exc:
-        raise PermissionError("Invalid rLens manifest path") from exc
+        raise PermissionError("Invalid RepoGround manifest path") from exc
     root = MERGES_ROOT.resolve(strict=False)
     if resolved != root and root not in resolved.parents:
-        raise PermissionError("rLens manifest path escaped merges root")
+        raise PermissionError("RepoGround manifest path escaped merges root")
     return path
 
 
-def _rlens_sidecar_path(stem: str, suffix: str) -> Path:
+def _repoground_sidecar_path(stem: str, suffix: str) -> Path:
     return MERGES_ROOT / f"{stem}{suffix}"
 
 
-def _rlens_sidecar_status(path: Path, *, keys: tuple[str, ...]) -> dict[str, Any]:
+def _repoground_sidecar_status(path: Path, *, keys: tuple[str, ...]) -> dict[str, Any]:
     if not path.is_file() or path.is_symlink():
         return {"exists": False, "path": str(path)}
-    doc = _rlens_json(path)
+    doc = _repoground_json(path)
     result: dict[str, Any] = {"exists": True, "path": str(path)}
     for key in keys:
         if key in doc:
@@ -5331,10 +5469,10 @@ def _rlens_sidecar_status(path: Path, *, keys: tuple[str, ...]) -> dict[str, Any
     return result
 
 
-def _rlens_output_health_status(path: Path) -> dict[str, Any]:
+def _repoground_output_health_status(path: Path) -> dict[str, Any]:
     if not path.is_file() or path.is_symlink():
         return {"exists": False, "path": str(path)}
-    doc = _rlens_json(path)
+    doc = _repoground_json(path)
     result: dict[str, Any] = {"exists": True, "path": str(path)}
     for key in ("verdict", "run_id", "created_at", "warnings", "dependencies"):
         if key in doc:
@@ -5356,10 +5494,12 @@ def _rlens_output_health_status(path: Path) -> dict[str, Any]:
     return result
 
 
-def _rlens_manifest_snapshot_provenance(doc: dict[str, Any], repo: str) -> dict[str, Any]:
-    """Return explicit source-repository provenance from a RepoBrief manifest.
+def _repoground_manifest_snapshot_provenance(
+    doc: dict[str, Any], repo: str
+) -> dict[str, Any]:
+    """Return explicit source-repository provenance from a RepoGround manifest.
 
-    ``generator.runtime.git_commit`` describes the Lenskit/rLens code that
+    ``generator.runtime.git_commit`` describes the RepoGround code that
     produced the bundle.  It is not the commit of the scanned repository.  The
     freshness check may only compare a commit to the live repository when the
     manifest exposes explicit snapshot/source provenance for that repository.
@@ -5392,14 +5532,23 @@ def _rlens_manifest_snapshot_provenance(doc: dict[str, Any], repo: str) -> dict[
     if fallback is None:
         return {"available": False, "reason": "snapshot_repository_entry_absent"}
 
-    commit = fallback.get("git_commit") or fallback.get("commit") or fallback.get("head")
+    commit = (
+        fallback.get("git_commit") or fallback.get("commit") or fallback.get("head")
+    )
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
         return {
             "available": False,
             "reason": "snapshot_repository_commit_absent",
             "repository": {
                 key: fallback.get(key)
-                for key in ("repo", "repository", "repo_id", "name", "ref", "remote_ref")
+                for key in (
+                    "repo",
+                    "repository",
+                    "repo_id",
+                    "name",
+                    "ref",
+                    "remote_ref",
+                )
                 if key in fallback
             },
         }
@@ -5417,24 +5566,25 @@ def _rlens_manifest_snapshot_provenance(doc: dict[str, Any], repo: str) -> dict[
     return result
 
 
-def _rlens_manifest_summary(path: Path) -> dict[str, Any]:
-    stem = _rlens_stem_from_manifest(path)
-    repo = _rlens_repo_from_stem(stem)
-    doc = _rlens_json(path)
+def _repoground_manifest_summary(path: Path) -> dict[str, Any]:
+    stem = _repoground_stem_from_manifest(path)
+    repo = _repoground_repo_from_stem(stem)
+    doc = _repoground_json(path)
     artifacts = doc.get("artifacts") if isinstance(doc.get("artifacts"), list) else []
     roles = sorted(
-        item.get("role") for item in artifacts
+        item.get("role")
+        for item in artifacts
         if isinstance(item, dict) and isinstance(item.get("role"), str)
     )
     runtime = (doc.get("generator") or {}).get("runtime")
     if not isinstance(runtime, dict):
         runtime = {}
-    snapshot = _rlens_manifest_snapshot_provenance(doc, repo)
+    snapshot = _repoground_manifest_snapshot_provenance(doc, repo)
     source_commit = snapshot.get("git_commit") if snapshot.get("available") else None
     source_dirty = snapshot.get("git_dirty") if snapshot.get("available") else None
     stat = path.stat()
-    health_path = _rlens_sidecar_path(stem, _BUNDLE_HEALTH_SUFFIX)
-    health = _rlens_sidecar_status(
+    health_path = _repoground_sidecar_path(stem, _BUNDLE_HEALTH_SUFFIX)
+    health = _repoground_sidecar_status(
         health_path,
         keys=("status", "evidence_level", "range_ref_resolution_status"),
     )
@@ -5457,35 +5607,37 @@ def _rlens_manifest_summary(path: Path) -> dict[str, Any]:
             "package_root": runtime.get("package_root"),
         },
         "post_emit_health": health,
-        "output_health": _rlens_output_health_status(
-            _rlens_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX)
+        "output_health": _repoground_output_health_status(
+            _repoground_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX)
         ),
     }
 
 
-def _rlens_iter_manifests(repo: str | None = None) -> list[Path]:
-    repo = _rlens_validate_repo(repo)
+def _repoground_iter_manifests(repo: str | None = None) -> list[Path]:
+    repo = _repoground_validate_repo(repo)
     if not MERGES_ROOT.is_dir() or MERGES_ROOT.is_symlink():
         return []
     manifests = [
-        path for path in MERGES_ROOT.glob(f"*{_BUNDLE_MANIFEST_SUFFIX}")
+        path
+        for path in MERGES_ROOT.glob(f"*{_BUNDLE_MANIFEST_SUFFIX}")
         if path.is_file() and not path.is_symlink()
     ]
     if repo is not None:
         manifests = [
-            path for path in manifests
-            if _rlens_repo_from_stem(_rlens_stem_from_manifest(path)) == repo
+            path
+            for path in manifests
+            if _repoground_repo_from_stem(_repoground_stem_from_manifest(path)) == repo
         ]
     manifests.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
     return manifests
 
 
-def _rlens_latest_manifest_by_repo() -> dict[str, Path]:
+def _repoground_latest_manifest_by_repo() -> dict[str, Path]:
     latest: dict[str, Path] = {}
     latest_key: dict[str, tuple[float, str]] = {}
-    for path in _rlens_iter_manifests(None):
-        stem = _rlens_stem_from_manifest(path)
-        repo = _rlens_repo_from_stem(stem)
+    for path in _repoground_iter_manifests(None):
+        stem = _repoground_stem_from_manifest(path)
+        repo = _repoground_repo_from_stem(stem)
         key = (path.stat().st_mtime, path.name)
         if repo not in latest or key > latest_key[repo]:
             latest[repo] = path
@@ -5493,17 +5645,21 @@ def _rlens_latest_manifest_by_repo() -> dict[str, Path]:
     return latest
 
 
-def _rlens_manifest_registry_row(path: Path) -> list[str]:
-    summary = _rlens_manifest_summary(path)
+def _repoground_manifest_registry_row(path: Path) -> list[str]:
+    summary = _repoground_manifest_summary(path)
     stem = str(summary["stem"])
     repo = str(summary["repo"])
     artifact_roles = set(summary.get("artifact_roles") or [])
+
     def rel(suffix: str) -> str:
         return "./merges/" + stem + suffix
+
     return [
         repo,
         stem,
-        datetime.fromtimestamp(int(summary["manifest_mtime_unix"]), timezone.utc).isoformat(),
+        datetime.fromtimestamp(
+            int(summary["manifest_mtime_unix"]), timezone.utc
+        ).isoformat(),
         "yes" if "agent_reading_pack" in artifact_roles else "no",
         rel("_merge.md"),
         rel(_BUNDLE_MANIFEST_SUFFIX),
@@ -5512,7 +5668,7 @@ def _rlens_manifest_registry_row(path: Path) -> list[str]:
     ]
 
 
-def _rlens_registry_row_status(row: list[str]) -> dict[str, Any]:
+def _repoground_registry_row_status(row: list[str]) -> dict[str, Any]:
     status: dict[str, Any] = {
         "valid": False,
         "header": False,
@@ -5532,23 +5688,25 @@ def _rlens_registry_row_status(row: list[str]) -> dict[str, Any]:
         status["reason"] = "short_row"
         return status
     try:
-        stem = _rlens_validate_stem(row[1])
+        stem = _repoground_validate_stem(row[1])
     except ValueError:
         status["reason"] = "invalid_stem"
         return status
-    manifest_path = _rlens_manifest_path(stem)
+    manifest_path = _repoground_manifest_path(stem)
     exists = manifest_path.is_file() and not manifest_path.is_symlink()
-    status.update({
-        "valid": exists,
-        "stem": stem,
-        "repo": row[0],
-        "manifest_exists": exists,
-        "reason": None if exists else "manifest_missing",
-    })
+    status.update(
+        {
+            "valid": exists,
+            "stem": stem,
+            "repo": row[0],
+            "manifest_exists": exists,
+            "reason": None if exists else "manifest_missing",
+        }
+    )
     return status
 
 
-def _rlens_git(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
+def _repoground_git(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
     completed = subprocess.run(
         ["git", "-C", str(repo_path), *args],
         check=False,
@@ -5556,31 +5714,39 @@ def _rlens_git(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
         stderr=subprocess.PIPE,
         text=True,
         timeout=10,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        env={
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
     )
     return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
 
 
-@mcp.tool(name="rlens_bundle_discover", annotations=READ_ANNOTATIONS)
-def rlens_bundle_discover(repo: str | None = None, max_candidates: int = 20) -> dict[str, Any]:
-    """Discover current rLens/repoLens bundles from the immutable local merges area."""
+@mcp.tool(name="repoground_bundle_discover", annotations=READ_ANNOTATIONS)
+def repoground_bundle_discover(
+    repo: str | None = None, max_candidates: int = 20
+) -> dict[str, Any]:
+    """Discover current RepoGround bundles from the immutable local bundle area."""
     _require_capability("bundle_registry")
     if not isinstance(max_candidates, int) or not 1 <= max_candidates <= 100:
         raise ValueError("max_candidates must be between 1 and 100")
-    manifests = _rlens_iter_manifests(repo)
-    candidates = [_rlens_manifest_summary(path) for path in manifests[:max_candidates]]
+    manifests = _repoground_iter_manifests(repo)
+    candidates = [
+        _repoground_manifest_summary(path) for path in manifests[:max_candidates]
+    ]
     return {
-        "kind": "grabowski.rlens_bundle_discovery",
+        "kind": "grabowski.repoground_bundle_discovery",
         "schema_version": 1,
         "merges_root": str(MERGES_ROOT),
-        "repo_filter": _rlens_validate_repo(repo),
+        "repo_filter": _repoground_validate_repo(repo),
         "exists": MERGES_ROOT.is_dir() and not MERGES_ROOT.is_symlink(),
         "candidate_count": len(candidates),
         "candidates": candidates,
         "registry_cache": {
             "path": str(BUNDLE_REGISTRY),
             "exists": BUNDLE_REGISTRY.is_file(),
-            "authority": "legacy_cache",
+            "authority": "registry_cache",
         },
         "does_not_establish": [
             "bundle_freshness_against_live_repo",
@@ -5591,24 +5757,28 @@ def rlens_bundle_discover(repo: str | None = None, max_candidates: int = 20) -> 
     }
 
 
-@mcp.tool(name="rlens_bundle_status", annotations=READ_ANNOTATIONS)
-def rlens_bundle_status(stem: str) -> dict[str, Any]:
-    """Return bounded manifest, health and sidecar status for one rLens bundle."""
+@mcp.tool(name="repoground_bundle_status", annotations=READ_ANNOTATIONS)
+def repoground_bundle_status(stem: str) -> dict[str, Any]:
+    """Return bounded manifest, health and sidecar status for one RepoGround bundle."""
     _require_capability("bundle_registry")
-    stem = _rlens_validate_stem(stem)
-    manifest_path = _rlens_manifest_path(stem)
+    stem = _repoground_validate_stem(stem)
+    manifest_path = _repoground_manifest_path(stem)
     if not manifest_path.is_file() or manifest_path.is_symlink():
-        return {"kind": "grabowski.rlens_bundle_status", "stem": stem, "exists": False}
-    summary = _rlens_manifest_summary(manifest_path)
-    surface = _rlens_sidecar_status(
-        _rlens_sidecar_path(stem, _BUNDLE_SURFACE_SUFFIX),
+        return {
+            "kind": "grabowski.repoground_bundle_status",
+            "stem": stem,
+            "exists": False,
+        }
+    summary = _repoground_manifest_summary(manifest_path)
+    surface = _repoground_sidecar_status(
+        _repoground_sidecar_path(stem, _BUNDLE_SURFACE_SUFFIX),
         keys=("status", "bundle_run_id"),
     )
-    output_health = _rlens_output_health_status(
-        _rlens_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX)
+    output_health = _repoground_output_health_status(
+        _repoground_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX)
     )
     return {
-        "kind": "grabowski.rlens_bundle_status",
+        "kind": "grabowski.repoground_bundle_status",
         "schema_version": 1,
         "exists": True,
         **summary,
@@ -5625,23 +5795,23 @@ def rlens_bundle_status(stem: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool(name="rlens_freshness_check", annotations=READ_ANNOTATIONS)
-def rlens_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
-    """Compare one rLens bundle commit with the current local repository HEAD."""
+@mcp.tool(name="repoground_freshness_check", annotations=READ_ANNOTATIONS)
+def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
+    """Compare one RepoGround bundle source commit with the local repository HEAD."""
     _require_capability("bundle_registry")
-    repo = _rlens_validate_repo(repo) or ""
+    repo = _repoground_validate_repo(repo) or ""
     if stem is None or stem == "":
-        manifests = _rlens_iter_manifests(repo)
+        manifests = _repoground_iter_manifests(repo)
         if not manifests:
             return {
-                "kind": "grabowski.rlens_freshness_check",
+                "kind": "grabowski.repoground_freshness_check",
                 "repo": repo,
                 "freshness": "unknown",
                 "reason": "no_bundle_found",
             }
-        stem = _rlens_stem_from_manifest(manifests[0])
-    stem = _rlens_validate_stem(stem)
-    status = rlens_bundle_status(stem)
+        stem = _repoground_stem_from_manifest(manifests[0])
+    stem = _repoground_validate_stem(stem)
+    status = repoground_bundle_status(stem)
     bundle_commit = status.get("git_commit") if status.get("exists") else None
     bundle_dirty = status.get("git_dirty") if status.get("exists") else None
     repo_path = (HOME / "repos" / repo).resolve(strict=False)
@@ -5650,15 +5820,19 @@ def rlens_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
         freshness = "unknown"
         reason = "repo_missing_or_invalid"
     else:
-        head_rc, head, head_err = _rlens_git(repo_path, ["rev-parse", "HEAD"])
-        dirty_rc, dirty_out, dirty_err = _rlens_git(repo_path, ["status", "--porcelain"])
-        live.update({
-            "head_returncode": head_rc,
-            "head": head if head_rc == 0 else None,
-            "dirty_returncode": dirty_rc,
-            "dirty": bool(dirty_out) if dirty_rc == 0 else None,
-            "error": head_err or dirty_err or None,
-        })
+        head_rc, head, head_err = _repoground_git(repo_path, ["rev-parse", "HEAD"])
+        dirty_rc, dirty_out, dirty_err = _repoground_git(
+            repo_path, ["status", "--porcelain"]
+        )
+        live.update(
+            {
+                "head_returncode": head_rc,
+                "head": head if head_rc == 0 else None,
+                "dirty_returncode": dirty_rc,
+                "dirty": bool(dirty_out) if dirty_rc == 0 else None,
+                "error": head_err or dirty_err or None,
+            }
+        )
         if head_rc != 0 or dirty_rc != 0:
             freshness = "unknown"
             reason = "git_unavailable"
@@ -5675,7 +5849,7 @@ def rlens_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
             freshness = "fresh_exact"
             reason = "bundle_commit_matches_clean_live_head"
     return {
-        "kind": "grabowski.rlens_freshness_check",
+        "kind": "grabowski.repoground_freshness_check",
         "schema_version": 1,
         "repo": repo,
         "stem": stem,
@@ -5699,33 +5873,37 @@ def rlens_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
     }
 
 
+_REPOGROUND_TASK_PROFILE_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}\Z")
 
-_RLENS_TASK_PROFILE_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}\Z")
 
-
-def _rlens_validate_task_profile(task_profile: str) -> str:
-    if not isinstance(task_profile, str) or not _RLENS_TASK_PROFILE_RE.fullmatch(task_profile):
-        raise ValueError("task_profile must be a simple rLens task profile")
+def _repoground_validate_task_profile(task_profile: str) -> str:
+    if not isinstance(task_profile, str) or not _REPOGROUND_TASK_PROFILE_RE.fullmatch(
+        task_profile
+    ):
+        raise ValueError("task_profile must be a simple RepoGround task profile")
     return task_profile
 
 
-def _rlens_file_sha256(path: Path) -> str:
+def _repoground_file_sha256(path: Path) -> str:
     return hashlib.sha256(_ensure_regular_text_file(path, 2_000_000)).hexdigest()
 
 
-def _rlens_agent_preflight(task_profile: str, manifest_path: Path) -> dict[str, Any]:
-    """Run Lenskit's own agent-consumption preflight when the local CLI is available."""
-    lenskit_repo = (HOME / "repos" / "lenskit").resolve(strict=False)
-    if not lenskit_repo.is_dir() or lenskit_repo.is_symlink():
+def _repoground_agent_preflight(
+    task_profile: str, manifest_path: Path
+) -> dict[str, Any]:
+    """Run RepoGround's agent-consumption preflight when the local CLI is available."""
+    repoground_repo = (HOME / "repos" / "repoground").resolve(strict=False)
+    if not repoground_repo.is_dir() or repoground_repo.is_symlink():
         return {
             "status": "unknown",
             "available": False,
-            "reason": "lenskit_repo_missing_or_invalid",
+            "reason": "repoground_repo_missing_or_invalid",
         }
     command = [
         "python3",
+        "-B",
         "-m",
-        "merger.lenskit.cli.main",
+        "merger.repoground.cli.main",
         "agent-consumption",
         "preflight",
         "--task-profile",
@@ -5735,13 +5913,17 @@ def _rlens_agent_preflight(task_profile: str, manifest_path: Path) -> dict[str, 
     ]
     completed = subprocess.run(
         command,
-        cwd=lenskit_repo,
+        cwd=repoground_repo,
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         timeout=30,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        env={
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
     )
     stdout = completed.stdout[:500_000]
     stderr = completed.stderr[:20_000]
@@ -5751,7 +5933,7 @@ def _rlens_agent_preflight(task_profile: str, manifest_path: Path) -> dict[str, 
             "available": True,
             "returncode": completed.returncode,
             "stderr": _redact_sensitive_text(stderr)[0],
-            "reason": "lenskit_preflight_failed",
+            "reason": "repoground_preflight_failed",
         }
     try:
         value = json.loads(stdout)
@@ -5760,55 +5942,54 @@ def _rlens_agent_preflight(task_profile: str, manifest_path: Path) -> dict[str, 
             "status": "unknown",
             "available": True,
             "returncode": completed.returncode,
-            "reason": "lenskit_preflight_invalid_json",
+            "reason": "repoground_preflight_invalid_json",
         }
     if not isinstance(value, dict):
         return {
             "status": "unknown",
             "available": True,
             "returncode": completed.returncode,
-            "reason": "lenskit_preflight_non_object",
+            "reason": "repoground_preflight_non_object",
         }
     value["available"] = True
     value["returncode"] = completed.returncode
     return value
 
 
-
-def _rlens_lenskit_repo() -> tuple[Path | None, dict[str, Any] | None]:
-    lenskit_repo = (HOME / "repos" / "lenskit").resolve(strict=False)
-    if not lenskit_repo.is_dir() or lenskit_repo.is_symlink():
+def _repoground_repo() -> tuple[Path | None, dict[str, Any] | None]:
+    repoground_repo = (HOME / "repos" / "repoground").resolve(strict=False)
+    if not repoground_repo.is_dir() or repoground_repo.is_symlink():
         return None, {
             "available": False,
             "status": "unknown",
-            "reason": "lenskit_repo_missing_or_invalid",
-            "lenskit_repo": str(lenskit_repo),
+            "reason": "repoground_repo_missing_or_invalid",
+            "repoground_repo": str(repoground_repo),
         }
-    return lenskit_repo, None
+    return repoground_repo, None
 
 
-def _rlens_lenskit_core_json(
+def _repoground_core_json(
     operation: str,
     manifest_path: Path,
     payload: dict[str, Any],
     *,
     timeout: int = 30,
 ) -> dict[str, Any]:
-    lenskit_repo, unavailable_result = _rlens_lenskit_repo()
+    repoground_repo, unavailable_result = _repoground_repo()
     if unavailable_result is not None:
         return unavailable_result
-    assert lenskit_repo is not None
-    script = r'''
+    assert repoground_repo is not None
+    script = r"""
 import json
 import sys
-from merger.lenskit.core import repobrief_access
+from merger.repoground.core import bundle_access, mcp_tools
 
 operation = sys.argv[1]
 manifest = sys.argv[2]
 payload = json.loads(sys.stdin.read() or "{}")
 
 if operation == "query_existing_index":
-    result = repobrief_access.query_existing_index(
+    result = bundle_access.query_existing_index(
         manifest,
         payload.get("query", ""),
         k=payload.get("k", 10),
@@ -5817,22 +5998,48 @@ if operation == "query_existing_index":
         project_sources=payload.get("project_sources", False),
     )
 elif operation == "range_get":
-    result = repobrief_access.range_get(manifest, payload.get("range_ref"))
+    result = bundle_access.range_get(manifest, payload.get("range_ref"))
+elif operation == "find_symbol":
+    result = mcp_tools.find_symbol(
+        bundle_manifest=manifest,
+        name=payload.get("name"),
+        kind=payload.get("kind"),
+        path=payload.get("path"),
+        k=payload.get("k", 25),
+    )
+elif operation == "get_callers":
+    result = mcp_tools.get_callers(
+        bundle_manifest=manifest,
+        name=payload.get("name"),
+        path=payload.get("path"),
+        k=payload.get("k", 25),
+    )
+elif operation == "get_callees":
+    result = mcp_tools.get_callees(
+        bundle_manifest=manifest,
+        name=payload.get("name"),
+        path=payload.get("path"),
+        k=payload.get("k", 25),
+    )
 else:
     raise SystemExit(f"unknown operation: {operation}")
 
 print(json.dumps(result, sort_keys=True))
-'''
+"""
     completed = subprocess.run(
-        ["python3", "-c", script, operation, str(manifest_path)],
-        cwd=lenskit_repo,
+        ["python3", "-B", "-c", script, operation, str(manifest_path)],
+        cwd=repoground_repo,
         check=False,
         input=json.dumps(payload, sort_keys=True),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         timeout=timeout,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        env={
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
     )
     stdout = completed.stdout[:500_000]
     stderr = completed.stderr[:20_000]
@@ -5842,7 +6049,7 @@ print(json.dumps(result, sort_keys=True))
             "status": "unknown",
             "returncode": completed.returncode,
             "stderr": _redact_sensitive_text(stderr)[0],
-            "reason": "lenskit_repobrief_access_failed",
+            "reason": "repoground_access_failed",
         }
     try:
         value = json.loads(stdout)
@@ -5851,21 +6058,21 @@ print(json.dumps(result, sort_keys=True))
             "available": False,
             "status": "unknown",
             "returncode": completed.returncode,
-            "reason": "lenskit_repobrief_access_invalid_json",
+            "reason": "repoground_access_invalid_json",
         }
     if not isinstance(value, dict):
         return {
             "available": False,
             "status": "unknown",
             "returncode": completed.returncode,
-            "reason": "lenskit_repobrief_access_non_object",
+            "reason": "repoground_access_non_object",
         }
     value.setdefault("available", value.get("status") == "available")
     value["returncode"] = completed.returncode
     return value
 
 
-def _rlens_lenskit_query_existing_index(
+def _repoground_query_existing_index(
     manifest_path: Path,
     query: str,
     *,
@@ -5874,7 +6081,7 @@ def _rlens_lenskit_query_existing_index(
     resolve_evidence: bool,
     project_sources: bool,
 ) -> dict[str, Any]:
-    return _rlens_lenskit_core_json(
+    return _repoground_core_json(
         "query_existing_index",
         manifest_path,
         {
@@ -5887,57 +6094,106 @@ def _rlens_lenskit_query_existing_index(
     )
 
 
-def _rlens_lenskit_range_get(manifest_path: Path, range_ref: dict[str, Any]) -> dict[str, Any]:
-    return _rlens_lenskit_core_json(
+def _repoground_range_get(
+    manifest_path: Path, range_ref: dict[str, Any]
+) -> dict[str, Any]:
+    return _repoground_core_json(
         "range_get",
         manifest_path,
         {"range_ref": range_ref},
     )
 
 
-def _rlens_text_excerpt(value: Any, *, max_chars: int = 1200) -> str | None:
+def _repoground_find_symbol(
+    manifest_path: Path,
+    *,
+    name: str,
+    kind: str | None,
+    path: str | None,
+    k: int,
+) -> dict[str, Any]:
+    return _repoground_core_json(
+        "find_symbol",
+        manifest_path,
+        {"name": name, "kind": kind, "path": path, "k": k},
+    )
+
+
+def _repoground_get_callers(
+    manifest_path: Path,
+    *,
+    name: str,
+    path: str | None,
+    k: int,
+) -> dict[str, Any]:
+    return _repoground_core_json(
+        "get_callers",
+        manifest_path,
+        {"name": name, "path": path, "k": k},
+    )
+
+
+def _repoground_get_callees(
+    manifest_path: Path,
+    *,
+    name: str,
+    path: str | None,
+    k: int,
+) -> dict[str, Any]:
+    return _repoground_core_json(
+        "get_callees",
+        manifest_path,
+        {"name": name, "path": path, "k": k},
+    )
+
+
+def _repoground_text_excerpt(value: Any, *, max_chars: int = 1200) -> str | None:
     if not isinstance(value, str):
         return None
     return value[:max_chars]
 
 
-def _rlens_list_of_dicts(value: Any) -> list[dict[str, Any]]:
-    return [item for item in (value if isinstance(value, list) else []) if isinstance(item, dict)]
+def _repoground_list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in (value if isinstance(value, list) else [])
+        if isinstance(item, dict)
+    ]
 
 
-def _rlens_extract_query_hits(payload: Any) -> tuple[list[dict[str, Any]], str]:
+def _repoground_extract_query_hits(payload: Any) -> tuple[list[dict[str, Any]], str]:
     if isinstance(payload, list):
-        return _rlens_list_of_dicts(payload), "bare_results_array"
+        return _repoground_list_of_dicts(payload), "bare_results_array"
     if not isinstance(payload, dict):
         return [], "non_object"
     resolved = payload.get("resolved_evidence")
     if isinstance(resolved, dict):
         resolved_hits = resolved.get("hits")
         if isinstance(resolved_hits, list):
-            return _rlens_list_of_dicts(resolved_hits), "resolved_evidence.hits"
+            return _repoground_list_of_dicts(resolved_hits), "resolved_evidence.hits"
     direct_results = payload.get("results")
     if isinstance(direct_results, list):
-        return _rlens_list_of_dicts(direct_results), "top_level_results"
+        return _repoground_list_of_dicts(direct_results), "top_level_results"
     query_result = payload.get("query_result")
     if isinstance(query_result, list):
-        return _rlens_list_of_dicts(query_result), "query_result_array"
+        return _repoground_list_of_dicts(query_result), "query_result_array"
     if isinstance(query_result, dict):
         nested_results = query_result.get("results")
         if isinstance(nested_results, list):
-            return _rlens_list_of_dicts(nested_results), "query_result.results"
+            return _repoground_list_of_dicts(nested_results), "query_result.results"
     return [], "no_results_array"
 
 
-def _rlens_source_projection_items(payload: Any) -> list[dict[str, Any]]:
+def _repoground_source_projection_items(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
     projection = payload.get("source_citation_projection")
     if not isinstance(projection, dict):
         return []
-    return _rlens_list_of_dicts(projection.get("items"))
+    return _repoground_list_of_dicts(projection.get("items"))
 
 
-def _rlens_range_identity_from_hit(hit: dict[str, Any]) -> dict[str, Any] | None:
+def _repoground_range_identity_from_hit(hit: dict[str, Any]) -> dict[str, Any] | None:
     for key in ("range_ref", "derived_range_ref", "content_range_ref"):
         value = hit.get(key)
         if isinstance(value, dict):
@@ -5945,24 +6201,36 @@ def _rlens_range_identity_from_hit(hit: dict[str, Any]) -> dict[str, Any] | None
     return None
 
 
-def _rlens_query_snippets(payload: Any, *, max_snippets: int = 5) -> dict[str, Any]:
-    projection_items = _rlens_source_projection_items(payload)
+def _repoground_query_snippets(
+    payload: Any, *, max_snippets: int = 5
+) -> dict[str, Any]:
+    projection_items = _repoground_source_projection_items(payload)
     snippets: list[dict[str, Any]] = []
     ranges: list[dict[str, Any]] = []
     if projection_items:
         for item in projection_items[:max_snippets]:
-            source_range = item.get("source_range") if isinstance(item.get("source_range"), dict) else None
+            source_range = (
+                item.get("source_range")
+                if isinstance(item.get("source_range"), dict)
+                else None
+            )
             snippet = {
                 "ordinal": item.get("ordinal", len(snippets)),
                 "path": item.get("path"),
                 "chunk_id": item.get("chunk_id"),
-                "text_excerpt": _rlens_text_excerpt(item.get("text_excerpt")),
+                "text_excerpt": _repoground_text_excerpt(item.get("text_excerpt")),
                 "range_status": item.get("range_status"),
                 "citation_status": item.get("citation_status"),
                 "citation_id": item.get("citation_id"),
-                "citation_range": item.get("citation_range") if isinstance(item.get("citation_range"), dict) else None,
-                "canonical_authority": item.get("canonical_authority") if isinstance(item.get("canonical_authority"), dict) else None,
-                "live_repo_address": item.get("live_repo_address") if isinstance(item.get("live_repo_address"), dict) else None,
+                "citation_range": item.get("citation_range")
+                if isinstance(item.get("citation_range"), dict)
+                else None,
+                "canonical_authority": item.get("canonical_authority")
+                if isinstance(item.get("canonical_authority"), dict)
+                else None,
+                "live_repo_address": item.get("live_repo_address")
+                if isinstance(item.get("live_repo_address"), dict)
+                else None,
                 "live_repo_address_status": item.get("live_repo_address_status"),
                 "source_range": source_range,
             }
@@ -5976,13 +6244,25 @@ def _rlens_query_snippets(payload: Any, *, max_snippets: int = 5) -> dict[str, A
             "ranges": ranges,
         }
 
-    hits, shape = _rlens_extract_query_hits(payload)
+    hits, shape = _repoground_extract_query_hits(payload)
     for ordinal, hit in enumerate(hits[:max_snippets]):
-        range_ref = _rlens_range_identity_from_hit(hit)
-        source_range = hit.get("source_range") if isinstance(hit.get("source_range"), dict) else None
-        canonical_authority = hit.get("canonical_authority") if isinstance(hit.get("canonical_authority"), dict) else None
-        live_repo_address = hit.get("live_repo_address") if isinstance(hit.get("live_repo_address"), dict) else None
-        text = _rlens_text_excerpt(
+        range_ref = _repoground_range_identity_from_hit(hit)
+        source_range = (
+            hit.get("source_range")
+            if isinstance(hit.get("source_range"), dict)
+            else None
+        )
+        canonical_authority = (
+            hit.get("canonical_authority")
+            if isinstance(hit.get("canonical_authority"), dict)
+            else None
+        )
+        live_repo_address = (
+            hit.get("live_repo_address")
+            if isinstance(hit.get("live_repo_address"), dict)
+            else None
+        )
+        text = _repoground_text_excerpt(
             hit.get("text_excerpt")
             if isinstance(hit.get("text_excerpt"), str)
             else hit.get("text")
@@ -5999,7 +6279,9 @@ def _rlens_query_snippets(payload: Any, *, max_snippets: int = 5) -> dict[str, A
             "text_excerpt": text,
             "range_ref": range_ref,
             "source_range": source_range,
-            "line_range": hit.get("line_range") if isinstance(hit.get("line_range"), dict) else None,
+            "line_range": hit.get("line_range")
+            if isinstance(hit.get("line_range"), dict)
+            else None,
             "citation_id": hit.get("citation_id"),
             "citation_status": hit.get("citation_status"),
             "citation_verified": hit.get("citation_verified"),
@@ -6020,21 +6302,32 @@ def _rlens_query_snippets(payload: Any, *, max_snippets: int = 5) -> dict[str, A
     }
 
 
-
-
-def _rlens_context_evidence_status(query: str | None, query_context: dict[str, Any], snippets: list[dict[str, Any]], ranges: list[dict[str, Any]]) -> tuple[str, str | None]:
+def _repoground_context_evidence_status(
+    query: str | None,
+    query_context: dict[str, Any],
+    snippets: list[dict[str, Any]],
+    ranges: list[dict[str, Any]],
+) -> tuple[str, str | None]:
     if not query:
         return "skipped", "query_not_provided"
     if not query_context.get("available", False):
-        reason = query_context.get("reason") or query_context.get("status") or "query_unavailable"
+        reason = (
+            query_context.get("reason")
+            or query_context.get("status")
+            or "query_unavailable"
+        )
         return "unavailable", str(reason)
-    citation_count = sum(1 for snippet in snippets if isinstance(snippet.get("citation_id"), str) and snippet.get("citation_id"))
+    citation_count = sum(
+        1
+        for snippet in snippets
+        if isinstance(snippet.get("citation_id"), str) and snippet.get("citation_id")
+    )
     if snippets and (ranges or citation_count):
         return "available", None
     return "degraded", "resolved_evidence_missing_snippets_ranges_or_citations"
 
 
-def _rlens_context_citation_ids(snippets: list[dict[str, Any]]) -> list[str]:
+def _repoground_context_citation_ids(snippets: list[dict[str, Any]]) -> list[str]:
     ids = []
     for snippet in snippets:
         citation_id = snippet.get("citation_id")
@@ -6043,51 +6336,63 @@ def _rlens_context_citation_ids(snippets: list[dict[str, Any]]) -> list[str]:
     return ids
 
 
-def _rlens_selected_manifest_for_repo(
+def _repoground_selected_manifest_for_repo(
     repo: str,
     stem: str | None,
 ) -> tuple[dict[str, Any], str | None, Path | None, dict[str, Any] | None]:
-    freshness = rlens_freshness_check(repo, stem)
+    freshness = repoground_freshness_check(repo, stem)
     selected_stem = freshness.get("stem")
     if not isinstance(selected_stem, str):
-        return freshness, None, None, {
-            "kind": "grabowski.rlens_selection",
-            "schema_version": 1,
-            "repo": repo,
-            "available": False,
-            "freshness": freshness,
-            "reason": "no_bundle_available",
-        }
-    status = rlens_bundle_status(selected_stem)
+        return (
+            freshness,
+            None,
+            None,
+            {
+                "kind": "grabowski.repoground_selection",
+                "schema_version": 1,
+                "repo": repo,
+                "available": False,
+                "freshness": freshness,
+                "reason": "no_bundle_available",
+            },
+        )
+    status = repoground_bundle_status(selected_stem)
     status_repo = status.get("repo") if isinstance(status, dict) else None
     if status.get("exists") and status_repo != repo:
-        return freshness, selected_stem, None, {
-            "kind": "grabowski.rlens_selection",
-            "schema_version": 1,
-            "repo": repo,
-            "stem": selected_stem,
-            "available": False,
-            "freshness": freshness,
-            "reason": "bundle_repo_mismatch",
-            "bundle_repo": status_repo,
-        }
-    return freshness, selected_stem, _rlens_manifest_path(selected_stem), None
+        return (
+            freshness,
+            selected_stem,
+            None,
+            {
+                "kind": "grabowski.repoground_selection",
+                "schema_version": 1,
+                "repo": repo,
+                "stem": selected_stem,
+                "available": False,
+                "freshness": freshness,
+                "reason": "bundle_repo_mismatch",
+                "bundle_repo": status_repo,
+            },
+        )
+    return freshness, selected_stem, _repoground_manifest_path(selected_stem), None
 
 
-@mcp.tool(name="rlens_preflight", annotations=READ_ANNOTATIONS)
-def rlens_preflight(
+@mcp.tool(name="repoground_preflight", annotations=READ_ANNOTATIONS)
+def repoground_preflight(
     repo: str,
     task_profile: str = "basic_repo_question",
     stem: str | None = None,
 ) -> dict[str, Any]:
-    """Return bounded rLens/RepoBrief preflight for an agent task profile."""
+    """Return bounded RepoGround preflight for an agent task profile."""
     _require_capability("bundle_registry")
-    repo = _rlens_validate_repo(repo) or ""
-    task_profile = _rlens_validate_task_profile(task_profile)
-    freshness, selected_stem, manifest_path, selection_error = _rlens_selected_manifest_for_repo(repo, stem)
+    repo = _repoground_validate_repo(repo) or ""
+    task_profile = _repoground_validate_task_profile(task_profile)
+    freshness, selected_stem, manifest_path, selection_error = (
+        _repoground_selected_manifest_for_repo(repo, stem)
+    )
     if selection_error is not None:
         return {
-            "kind": "grabowski.rlens_preflight",
+            "kind": "grabowski.repoground_preflight",
             "schema_version": 1,
             "repo": repo,
             "task_profile": task_profile,
@@ -6106,10 +6411,14 @@ def rlens_preflight(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
-    preflight = _rlens_agent_preflight(task_profile, manifest_path)
-    preflight_status = preflight.get("status") if isinstance(preflight.get("status"), str) else "unknown"
+    preflight = _repoground_agent_preflight(task_profile, manifest_path)
+    preflight_status = (
+        preflight.get("status")
+        if isinstance(preflight.get("status"), str)
+        else "unknown"
+    )
     return {
-        "kind": "grabowski.rlens_preflight",
+        "kind": "grabowski.repoground_preflight",
         "schema_version": 1,
         "repo": repo,
         "task_profile": task_profile,
@@ -6137,11 +6446,8 @@ def rlens_preflight(
     }
 
 
-
-
-
-@mcp.tool(name="rlens_query", annotations=READ_ANNOTATIONS)
-def rlens_query(
+@mcp.tool(name="repoground_query", annotations=READ_ANNOTATIONS)
+def repoground_query(
     repo: str,
     query: str,
     task_profile: str = "basic_repo_question",
@@ -6150,23 +6456,29 @@ def rlens_query(
     filters: dict[str, Any] | None = None,
     max_snippets: int = 5,
 ) -> dict[str, Any]:
-    """Run a bounded read-only RepoBrief query and normalize result shapes."""
+    """Run a bounded read-only RepoGround query and normalize result shapes."""
     _require_capability("bundle_registry")
-    repo = _rlens_validate_repo(repo) or ""
-    task_profile = _rlens_validate_task_profile(task_profile)
+    repo = _repoground_validate_repo(repo) or ""
+    task_profile = _repoground_validate_task_profile(task_profile)
     if not isinstance(query, str) or not query.strip() or len(query) > 500:
         raise ValueError("query must be a non-empty string up to 500 characters")
     if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= 100:
         raise ValueError("k must be an integer between 1 and 100")
     if filters is not None and not isinstance(filters, dict):
         raise ValueError("filters must be an object when provided")
-    if not isinstance(max_snippets, int) or isinstance(max_snippets, bool) or not 1 <= max_snippets <= 20:
+    if (
+        not isinstance(max_snippets, int)
+        or isinstance(max_snippets, bool)
+        or not 1 <= max_snippets <= 20
+    ):
         raise ValueError("max_snippets must be an integer between 1 and 20")
 
-    freshness, selected_stem, manifest_path, selection_error = _rlens_selected_manifest_for_repo(repo, stem)
+    freshness, selected_stem, manifest_path, selection_error = (
+        _repoground_selected_manifest_for_repo(repo, stem)
+    )
     if selection_error is not None:
         return {
-            "kind": "grabowski.rlens_query",
+            "kind": "grabowski.repoground_query",
             "schema_version": 1,
             "repo": repo,
             "task_profile": task_profile,
@@ -6193,7 +6505,7 @@ def rlens_query(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
-    lenskit_result = _rlens_lenskit_query_existing_index(
+    repoground_result = _repoground_query_existing_index(
         manifest_path,
         query,
         k=k,
@@ -6201,17 +6513,21 @@ def rlens_query(
         resolve_evidence=True,
         project_sources=True,
     )
-    snippets = _rlens_query_snippets(lenskit_result, max_snippets=max_snippets)
-    query_result = lenskit_result.get("query_result") if isinstance(lenskit_result, dict) else None
+    snippets = _repoground_query_snippets(repoground_result, max_snippets=max_snippets)
+    query_result = (
+        repoground_result.get("query_result")
+        if isinstance(repoground_result, dict)
+        else None
+    )
     result_count = None
     if isinstance(query_result, dict):
         if isinstance(query_result.get("count"), int):
             result_count = query_result.get("count")
         elif isinstance(query_result.get("results"), list):
             result_count = len(query_result["results"])
-    available = lenskit_result.get("status") == "available"
+    available = repoground_result.get("status") == "available"
     return {
-        "kind": "grabowski.rlens_query",
+        "kind": "grabowski.repoground_query",
         "schema_version": 1,
         "repo": repo,
         "task_profile": task_profile,
@@ -6220,7 +6536,7 @@ def rlens_query(
         "k": k,
         "filters": filters or {},
         "available": available,
-        "status": lenskit_result.get("status", "unknown"),
+        "status": repoground_result.get("status", "unknown"),
         "freshness": freshness,
         "query_shape": snippets["source_shape"],
         "normalized_query_shape": snippets["source_shape"],
@@ -6228,15 +6544,16 @@ def rlens_query(
         "result_count": result_count,
         "snippets": snippets["snippets"],
         "ranges": snippets["ranges"],
-        "lenskit_status": {
-            "kind": lenskit_result.get("kind"),
-            "status": lenskit_result.get("status"),
-            "error_code": lenskit_result.get("error_code"),
-            "reason": lenskit_result.get("reason"),
-            "returncode": lenskit_result.get("returncode"),
+        "repoground_status": {
+            "kind": repoground_result.get("kind"),
+            "status": repoground_result.get("status"),
+            "error_code": repoground_result.get("error_code"),
+            "reason": repoground_result.get("reason"),
+            "returncode": repoground_result.get("returncode"),
         },
-        "mutation_boundary": lenskit_result.get("mutation_boundary") or {"writes": [], "read_paths_do_not_refresh": True},
-        "evidence_resolution_used": lenskit_result.get("evidence_resolution_used"),
+        "mutation_boundary": repoground_result.get("mutation_boundary")
+        or {"writes": [], "read_paths_do_not_refresh": True},
+        "evidence_resolution_used": repoground_result.get("evidence_resolution_used"),
         "raw_results_included": False,
         "does_not_establish": [
             "actual_agent_reading",
@@ -6250,8 +6567,8 @@ def rlens_query(
     }
 
 
-@mcp.tool(name="rlens_query_existing_index", annotations=READ_ANNOTATIONS)
-def rlens_query_existing_index(
+@mcp.tool(name="repoground_query_existing_index", annotations=READ_ANNOTATIONS)
+def repoground_query_existing_index(
     repo: str,
     query: str,
     k: int = 5,
@@ -6260,9 +6577,9 @@ def rlens_query_existing_index(
     resolve_evidence: bool = True,
     project_sources: bool = True,
 ) -> dict[str, Any]:
-    """Compatibility wrapper for querying a prebuilt RepoBrief index without refresh."""
+    """Query a prebuilt RepoGround index without refreshing the bundle."""
     _require_capability("bundle_registry")
-    repo = _rlens_validate_repo(repo) or ""
+    repo = _repoground_validate_repo(repo) or ""
     if not isinstance(query, str) or not query.strip() or len(query) > 500:
         raise ValueError("query must be a non-empty string up to 500 characters")
     if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= 100:
@@ -6274,10 +6591,12 @@ def rlens_query_existing_index(
     if not isinstance(project_sources, bool):
         raise ValueError("project_sources must be a boolean")
 
-    freshness, selected_stem, manifest_path, selection_error = _rlens_selected_manifest_for_repo(repo, stem)
+    freshness, selected_stem, manifest_path, selection_error = (
+        _repoground_selected_manifest_for_repo(repo, stem)
+    )
     if selection_error is not None:
         return {
-            "kind": "grabowski.rlens_query_existing_index",
+            "kind": "grabowski.repoground_query_existing_index",
             "schema_version": 1,
             "repo": repo,
             "stem": selected_stem,
@@ -6305,7 +6624,7 @@ def rlens_query_existing_index(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
-    lenskit_result = _rlens_lenskit_query_existing_index(
+    repoground_result = _repoground_query_existing_index(
         manifest_path,
         query,
         k=k,
@@ -6313,17 +6632,21 @@ def rlens_query_existing_index(
         resolve_evidence=resolve_evidence,
         project_sources=project_sources,
     )
-    snippets = _rlens_query_snippets(lenskit_result, max_snippets=k)
-    query_result = lenskit_result.get("query_result") if isinstance(lenskit_result, dict) else None
+    snippets = _repoground_query_snippets(repoground_result, max_snippets=k)
+    query_result = (
+        repoground_result.get("query_result")
+        if isinstance(repoground_result, dict)
+        else None
+    )
     result_count = None
     if isinstance(query_result, dict):
         if isinstance(query_result.get("count"), int):
             result_count = query_result.get("count")
         elif isinstance(query_result.get("results"), list):
             result_count = len(query_result["results"])
-    available = lenskit_result.get("status") == "available"
+    available = repoground_result.get("status") == "available"
     return {
-        "kind": "grabowski.rlens_query_existing_index",
+        "kind": "grabowski.repoground_query_existing_index",
         "schema_version": 1,
         "repo": repo,
         "stem": selected_stem,
@@ -6331,7 +6654,7 @@ def rlens_query_existing_index(
         "k": k,
         "filters": filters or {},
         "available": available,
-        "status": lenskit_result.get("status", "unknown"),
+        "status": repoground_result.get("status", "unknown"),
         "freshness": freshness,
         "query_shape": snippets["source_shape"],
         "normalized_query_shape": snippets["source_shape"],
@@ -6339,15 +6662,16 @@ def rlens_query_existing_index(
         "result_count": result_count,
         "snippets": snippets["snippets"],
         "ranges": snippets["ranges"],
-        "lenskit_status": {
-            "kind": lenskit_result.get("kind"),
-            "status": lenskit_result.get("status"),
-            "error_code": lenskit_result.get("error_code"),
-            "reason": lenskit_result.get("reason"),
-            "returncode": lenskit_result.get("returncode"),
+        "repoground_status": {
+            "kind": repoground_result.get("kind"),
+            "status": repoground_result.get("status"),
+            "error_code": repoground_result.get("error_code"),
+            "reason": repoground_result.get("reason"),
+            "returncode": repoground_result.get("returncode"),
         },
-        "mutation_boundary": lenskit_result.get("mutation_boundary") or {"writes": [], "read_paths_do_not_refresh": True},
-        "evidence_resolution_used": lenskit_result.get("evidence_resolution_used"),
+        "mutation_boundary": repoground_result.get("mutation_boundary")
+        or {"writes": [], "read_paths_do_not_refresh": True},
+        "evidence_resolution_used": repoground_result.get("evidence_resolution_used"),
         "raw_results_included": False,
         "resolve_evidence": resolve_evidence,
         "project_sources": project_sources,
@@ -6363,21 +6687,23 @@ def rlens_query_existing_index(
     }
 
 
-@mcp.tool(name="rlens_range_get", annotations=READ_ANNOTATIONS)
-def rlens_range_get(
+@mcp.tool(name="repoground_range_get", annotations=READ_ANNOTATIONS)
+def repoground_range_get(
     repo: str,
     range_ref: dict[str, Any],
     stem: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve one bounded RepoBrief range_ref without reading live workspace files."""
+    """Resolve one bounded RepoGround range reference without live workspace reads."""
     _require_capability("bundle_registry")
-    repo = _rlens_validate_repo(repo) or ""
+    repo = _repoground_validate_repo(repo) or ""
     if not isinstance(range_ref, dict):
         raise ValueError("range_ref must be an object")
-    freshness, selected_stem, manifest_path, selection_error = _rlens_selected_manifest_for_repo(repo, stem)
+    freshness, selected_stem, manifest_path, selection_error = (
+        _repoground_selected_manifest_for_repo(repo, stem)
+    )
     if selection_error is not None:
         return {
-            "kind": "grabowski.rlens_range_get",
+            "kind": "grabowski.repoground_range_get",
             "schema_version": 1,
             "repo": repo,
             "stem": selected_stem,
@@ -6396,30 +6722,37 @@ def rlens_range_get(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
-    lenskit_result = _rlens_lenskit_range_get(manifest_path, range_ref)
-    range_value = lenskit_result.get("range") if isinstance(lenskit_result, dict) else None
-    if isinstance(range_value, dict) and isinstance(range_value.get("text"), str) and len(range_value["text"]) > 4000:
+    repoground_result = _repoground_range_get(manifest_path, range_ref)
+    range_value = (
+        repoground_result.get("range") if isinstance(repoground_result, dict) else None
+    )
+    if (
+        isinstance(range_value, dict)
+        and isinstance(range_value.get("text"), str)
+        and len(range_value["text"]) > 4000
+    ):
         range_value = dict(range_value)
         range_value["text"] = range_value["text"][:4000]
         range_value["text_truncated"] = True
     return {
-        "kind": "grabowski.rlens_range_get",
+        "kind": "grabowski.repoground_range_get",
         "schema_version": 1,
         "repo": repo,
         "stem": selected_stem,
-        "available": lenskit_result.get("status") == "available",
-        "status": lenskit_result.get("status", "unknown"),
+        "available": repoground_result.get("status") == "available",
+        "status": repoground_result.get("status", "unknown"),
         "freshness": freshness,
         "range_ref": range_ref,
         "range": range_value,
-        "lenskit_status": {
-            "kind": lenskit_result.get("kind"),
-            "status": lenskit_result.get("status"),
-            "error_code": lenskit_result.get("error_code"),
-            "reason": lenskit_result.get("reason"),
-            "returncode": lenskit_result.get("returncode"),
+        "repoground_status": {
+            "kind": repoground_result.get("kind"),
+            "status": repoground_result.get("status"),
+            "error_code": repoground_result.get("error_code"),
+            "reason": repoground_result.get("reason"),
+            "returncode": repoground_result.get("returncode"),
         },
-        "mutation_boundary": lenskit_result.get("mutation_boundary") or {"writes": [], "read_paths_do_not_refresh": True},
+        "mutation_boundary": repoground_result.get("mutation_boundary")
+        or {"writes": [], "read_paths_do_not_refresh": True},
         "does_not_establish": [
             "answer_correct",
             "repo_understood",
@@ -6431,8 +6764,8 @@ def rlens_range_get(
     }
 
 
-@mcp.tool(name="rlens_context_pack", annotations=READ_ANNOTATIONS)
-def rlens_context_pack(
+@mcp.tool(name="repoground_context_pack", annotations=READ_ANNOTATIONS)
+def repoground_context_pack(
     repo: str,
     task_profile: str = "basic_repo_question",
     stem: str | None = None,
@@ -6440,18 +6773,20 @@ def rlens_context_pack(
     k: int = 5,
     max_snippets: int = 5,
 ) -> dict[str, Any]:
-    """Build a bounded rLens context pack for agent handoff and Bureau receipts."""
+    """Build a bounded RepoGround context pack for agent handoff and Bureau receipts."""
     _require_capability("bundle_registry")
-    repo = _rlens_validate_repo(repo) or ""
-    task_profile = _rlens_validate_task_profile(task_profile)
+    repo = _repoground_validate_repo(repo) or ""
+    task_profile = _repoground_validate_task_profile(task_profile)
     if query is not None and not isinstance(query, str):
         raise ValueError("query must be a string when supplied")
     if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= 100:
         raise ValueError("k must be an integer between 1 and 100")
-    freshness, selected_stem, manifest_path, selection_error = _rlens_selected_manifest_for_repo(repo, stem)
+    freshness, selected_stem, manifest_path, selection_error = (
+        _repoground_selected_manifest_for_repo(repo, stem)
+    )
     if selection_error is not None:
         return {
-            "kind": "grabowski.rlens_context_pack",
+            "kind": "grabowski.repoground_context_pack",
             "schema_version": 1,
             "repo": repo,
             "task_profile": task_profile,
@@ -6476,16 +6811,33 @@ def rlens_context_pack(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
-    status = rlens_bundle_status(selected_stem)
-    manifest_sha = _rlens_file_sha256(manifest_path) if manifest_path.is_file() else None
-    preflight = _rlens_agent_preflight(task_profile, manifest_path)
-    preflight_status = preflight.get("status") if isinstance(preflight.get("status"), str) else "unknown"
-    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    live = freshness.get("live_repo") if isinstance(freshness.get("live_repo"), dict) else {}
-    bundle = freshness.get("bundle") if isinstance(freshness.get("bundle"), dict) else {}
+    status = repoground_bundle_status(selected_stem)
+    manifest_sha = (
+        _repoground_file_sha256(manifest_path) if manifest_path.is_file() else None
+    )
+    preflight = _repoground_agent_preflight(task_profile, manifest_path)
+    preflight_status = (
+        preflight.get("status")
+        if isinstance(preflight.get("status"), str)
+        else "unknown"
+    )
+    generated_at = (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    live = (
+        freshness.get("live_repo")
+        if isinstance(freshness.get("live_repo"), dict)
+        else {}
+    )
+    bundle = (
+        freshness.get("bundle") if isinstance(freshness.get("bundle"), dict) else {}
+    )
 
     if query:
-        query_context = rlens_query(
+        query_context = repoground_query(
             repo,
             query,
             task_profile=task_profile,
@@ -6506,14 +6858,17 @@ def rlens_context_pack(
             "ranges": [],
             "raw_results_included": False,
         }
-    snippets = _rlens_list_of_dicts(query_context.get("snippets"))
-    ranges = _rlens_list_of_dicts(query_context.get("ranges"))
-    evidence_status, evidence_reason = _rlens_context_evidence_status(query, query_context, snippets, ranges)
-    citation_ids = _rlens_context_citation_ids(snippets)
+    snippets = _repoground_list_of_dicts(query_context.get("snippets"))
+    ranges = _repoground_list_of_dicts(query_context.get("ranges"))
+    evidence_status, evidence_reason = _repoground_context_evidence_status(
+        query, query_context, snippets, ranges
+    )
+    citation_ids = _repoground_context_citation_ids(snippets)
     bounded_evidence = {
         "query": query,
         "k": k if query else None,
-        "normalized_query_shape": query_context.get("normalized_query_shape") or query_context.get("query_shape"),
+        "normalized_query_shape": query_context.get("normalized_query_shape")
+        or query_context.get("query_shape"),
         "resolved_evidence_status": evidence_status,
         "degradation_reason": evidence_reason,
         "hit_count": query_context.get("hit_count", 0),
@@ -6542,7 +6897,7 @@ def rlens_context_pack(
         "range_count": len(ranges),
         "citation_count": len(citation_ids),
         "resolved_evidence_status": evidence_status,
-        "source": "grabowski.rlens_context_pack",
+        "source": "grabowski.repoground_context_pack",
         "generated_at": generated_at,
         "does_not_establish": [
             "actual_agent_reading",
@@ -6554,7 +6909,7 @@ def rlens_context_pack(
         ],
     }
     return {
-        "kind": "grabowski.rlens_context_pack",
+        "kind": "grabowski.repoground_context_pack",
         "schema_version": 1,
         "repo": repo,
         "task_profile": task_profile,
@@ -6586,17 +6941,17 @@ def rlens_context_pack(
             "query_shape": query_context.get("query_shape"),
             "hit_count": query_context.get("hit_count", 0),
             "result_count": query_context.get("result_count"),
-            "lenskit_status": query_context.get("lenskit_status"),
+            "repoground_status": query_context.get("repoground_status"),
             "raw_results_included": False,
         },
         "bounded_evidence": bounded_evidence,
         "snippets": snippets,
         "ranges": ranges,
         "access_wrappers": {
-            "preflight": "rlens_preflight",
-            "query": "rlens_query_existing_index",
-            "range": "rlens_range_get",
-            "context_pack": "rlens_context_pack",
+            "preflight": "repoground_preflight",
+            "query": "repoground_query_existing_index",
+            "range": "repoground_range_get",
+            "context_pack": "repoground_context_pack",
             "raw_canonical_dump_included": False,
         },
         "agent_handoff": {
@@ -6615,6 +6970,221 @@ def rlens_context_pack(
             "runtime_correctness",
         ],
     }
+
+
+def _repoground_validate_navigation_input(
+    *,
+    name: str,
+    path: str | None,
+    k: int,
+) -> tuple[str, str | None, int]:
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or len(name) > 500
+        or "\x00" in name
+    ):
+        raise ValueError("name must be a bounded non-empty string")
+    if path is not None:
+        parts = path.split("/") if isinstance(path, str) else []
+        if (
+            not isinstance(path, str)
+            or not path
+            or len(path) > 2048
+            or "\x00" in path
+            or "\\" in path
+            or path.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError("path must be a normalized repository-relative POSIX path")
+    if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= 200:
+        raise ValueError("k must be an integer between 1 and 200")
+    return name.strip(), path, k
+
+
+def _repoground_navigation_unavailable(
+    *,
+    tool: str,
+    repo: str,
+    stem: str | None,
+    freshness: dict[str, Any],
+    selection_error: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "kind": f"grabowski.{tool}",
+        "schema_version": 1,
+        "repo": repo,
+        "stem": stem,
+        "available": False,
+        "status": "unavailable",
+        "freshness": freshness,
+        "reason": selection_error.get("reason"),
+        "bundle_repo": selection_error.get("bundle_repo"),
+        "result": None,
+        "mutation_boundary": {"writes": [], "read_paths_do_not_refresh": True},
+        "does_not_establish": [
+            "complete_call_graph",
+            "runtime_reachability",
+            "repo_understood",
+            "claims_true",
+            "runtime_correctness",
+        ],
+    }
+
+
+def _repoground_navigation_response(
+    *,
+    tool: str,
+    repo: str,
+    stem: str,
+    freshness: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    status = result.get("status", "unknown")
+    return {
+        "kind": f"grabowski.{tool}",
+        "schema_version": 1,
+        "repo": repo,
+        "stem": stem,
+        "available": status == "available",
+        "status": status,
+        "freshness": freshness,
+        "result": result,
+        "mutation_boundary": result.get("mutation_boundary")
+        or {"writes": [], "read_paths_do_not_refresh": True},
+        "does_not_establish": result.get("does_not_establish")
+        or [
+            "complete_call_graph",
+            "runtime_reachability",
+            "repo_understood",
+            "claims_true",
+            "runtime_correctness",
+        ],
+    }
+
+
+@mcp.tool(name="repoground_find_symbol", annotations=READ_ANNOTATIONS)
+def repoground_find_symbol(
+    repo: str,
+    name: str,
+    stem: str | None = None,
+    kind: str | None = None,
+    path: str | None = None,
+    k: int = 25,
+) -> dict[str, Any]:
+    """Find bounded Python symbol definitions in an existing RepoGround bundle."""
+    _require_capability("bundle_registry")
+    repo = _repoground_validate_repo(repo) or ""
+    name, path, k = _repoground_validate_navigation_input(name=name, path=path, k=k)
+    if kind is not None and kind not in {"class", "function", "async_function"}:
+        raise ValueError("kind must be class, function, async_function, or null")
+    freshness, selected_stem, manifest_path, selection_error = (
+        _repoground_selected_manifest_for_repo(repo, stem)
+    )
+    if selection_error is not None:
+        return _repoground_navigation_unavailable(
+            tool="repoground_find_symbol",
+            repo=repo,
+            stem=selected_stem,
+            freshness=freshness,
+            selection_error=selection_error,
+        )
+    assert isinstance(manifest_path, Path)
+    assert isinstance(selected_stem, str)
+    result = _repoground_find_symbol(
+        manifest_path,
+        name=name,
+        kind=kind,
+        path=path,
+        k=k,
+    )
+    return _repoground_navigation_response(
+        tool="repoground_find_symbol",
+        repo=repo,
+        stem=selected_stem,
+        freshness=freshness,
+        result=result,
+    )
+
+
+@mcp.tool(name="repoground_get_callers", annotations=READ_ANNOTATIONS)
+def repoground_get_callers(
+    repo: str,
+    name: str,
+    stem: str | None = None,
+    path: str | None = None,
+    k: int = 25,
+) -> dict[str, Any]:
+    """Return S1 callers and separately visible unresolved references."""
+    _require_capability("bundle_registry")
+    repo = _repoground_validate_repo(repo) or ""
+    name, path, k = _repoground_validate_navigation_input(name=name, path=path, k=k)
+    freshness, selected_stem, manifest_path, selection_error = (
+        _repoground_selected_manifest_for_repo(repo, stem)
+    )
+    if selection_error is not None:
+        return _repoground_navigation_unavailable(
+            tool="repoground_get_callers",
+            repo=repo,
+            stem=selected_stem,
+            freshness=freshness,
+            selection_error=selection_error,
+        )
+    assert isinstance(manifest_path, Path)
+    assert isinstance(selected_stem, str)
+    result = _repoground_get_callers(
+        manifest_path,
+        name=name,
+        path=path,
+        k=k,
+    )
+    return _repoground_navigation_response(
+        tool="repoground_get_callers",
+        repo=repo,
+        stem=selected_stem,
+        freshness=freshness,
+        result=result,
+    )
+
+
+@mcp.tool(name="repoground_get_callees", annotations=READ_ANNOTATIONS)
+def repoground_get_callees(
+    repo: str,
+    name: str,
+    stem: str | None = None,
+    path: str | None = None,
+    k: int = 25,
+) -> dict[str, Any]:
+    """Return S1 callees while retaining S0 call sites separately."""
+    _require_capability("bundle_registry")
+    repo = _repoground_validate_repo(repo) or ""
+    name, path, k = _repoground_validate_navigation_input(name=name, path=path, k=k)
+    freshness, selected_stem, manifest_path, selection_error = (
+        _repoground_selected_manifest_for_repo(repo, stem)
+    )
+    if selection_error is not None:
+        return _repoground_navigation_unavailable(
+            tool="repoground_get_callees",
+            repo=repo,
+            stem=selected_stem,
+            freshness=freshness,
+            selection_error=selection_error,
+        )
+    assert isinstance(manifest_path, Path)
+    assert isinstance(selected_stem, str)
+    result = _repoground_get_callees(
+        manifest_path,
+        name=name,
+        path=path,
+        k=k,
+    )
+    return _repoground_navigation_response(
+        tool="repoground_get_callees",
+        repo=repo,
+        stem=selected_stem,
+        freshness=freshness,
+        result=result,
+    )
 
 
 @mcp.tool(name="grip_list", annotations=READ_ANNOTATIONS)
@@ -6640,9 +7210,10 @@ def grip_run(
         _require_mutations_enabled("terminal_execute")
     raw_parameters = parameters or {}
     reserved_server_parameters = sorted(
-        {"_server_runtime_actor_identity", "_server_task_lease_delegation"}.intersection(
-            raw_parameters
-        )
+        {
+            "_server_runtime_actor_identity",
+            "_server_task_lease_delegation",
+        }.intersection(raw_parameters)
     )
     if reserved_server_parameters:
         return grabowski_grips._blocked_surface_receipt(
@@ -6695,10 +7266,8 @@ def grip_run(
             ):
                 import grabowski_tasks
 
-                task_evidence = (
-                    grabowski_tasks.server_task_lease_delegation_evidence(
-                        requested_lease_owner
-                    )
+                task_evidence = grabowski_tasks.server_task_lease_delegation_evidence(
+                    requested_lease_owner
                 )
                 dispatch_parameters["_server_task_lease_delegation"] = (
                     grabowski_merge_guard.issue_server_task_lease_delegation(
@@ -6722,9 +7291,7 @@ def grip_run(
         tool_contract = _runtime_tool_contract_summary(deployment)
         dispatch_parameters["_server_tool_contract"] = {
             "registered_tool_count": tool_contract.get("registered_tool_count"),
-            "registered_names_sha256": tool_contract.get(
-                "registered_names_sha256"
-            ),
+            "registered_names_sha256": tool_contract.get("registered_names_sha256"),
             "runtime_matches_deployment_contract": tool_contract.get(
                 "runtime_matches_deployment_contract"
             ),
@@ -6746,7 +7313,7 @@ def grip_run(
 
 @mcp.tool(name="latest_complete_bundles", annotations=READ_ANNOTATIONS)
 def latest_complete_bundles() -> dict[str, Any]:
-    """Return the curated latest-complete Lens/repoLens bundle registry."""
+    """Return the curated latest-complete RepoGround bundle registry."""
     _require_capability("bundle_registry")
     rows: list[list[str]] = []
     sha256: str | None = None
@@ -6757,38 +7324,49 @@ def latest_complete_bundles() -> dict[str, Any]:
             if not line or line.startswith("#"):
                 continue
             rows.append(line.split("\t"))
-    row_status = [_rlens_registry_row_status(row) for row in rows]
-    stale_rows = [item for item in row_status if item.get("is_header") is not True and not item.get("valid")]
-    valid_legacy_rows = [
-        row for row, status in zip(rows, row_status)
+    row_status = [_repoground_registry_row_status(row) for row in rows]
+    stale_rows = [
+        item
+        for item in row_status
+        if item.get("is_header") is not True and not item.get("valid")
+    ]
+    valid_registry_rows = [
+        row
+        for row, status in zip(rows, row_status)
         if status.get("is_header") is not True and status.get("valid") is True
     ]
     discovery_needed = not rows or bool(stale_rows)
     discovered: list[list[str]] = []
     if discovery_needed:
         discovered = [
-            _rlens_manifest_registry_row(path)
-            for _repo, path in sorted(_rlens_latest_manifest_by_repo().items())
+            _repoground_manifest_registry_row(path)
+            for _repo, path in sorted(_repoground_latest_manifest_by_repo().items())
         ]
     if not rows:
         effective_rows = discovered
         authority = "live_discovery"
     elif stale_rows:
-        legacy_repos = {row[0] for row in valid_legacy_rows if row}
-        discovery_additions = [row for row in discovered if row and row[0] not in legacy_repos]
-        effective_rows = [*valid_legacy_rows, *discovery_additions]
-        authority = "merged_legacy_live_discovery" if discovered else "legacy_cache_valid_rows"
+        registry_repos = {row[0] for row in valid_registry_rows if row}
+        discovery_additions = [
+            row for row in discovered if row and row[0] not in registry_repos
+        ]
+        effective_rows = [*valid_registry_rows, *discovery_additions]
+        authority = (
+            "merged_registry_live_discovery"
+            if discovered
+            else "registry_cache_valid_rows"
+        )
     else:
         effective_rows = rows
-        authority = "legacy_cache"
+        authority = "registry_cache"
     return {
         "path": str(BUNDLE_REGISTRY),
         "exists": BUNDLE_REGISTRY.is_file(),
         "sha256": sha256,
         "rows": effective_rows,
-        "legacy_rows": rows,
-        "legacy_row_status": row_status,
-        "stale_legacy_row_count": len(stale_rows),
+        "registry_rows": rows,
+        "registry_row_status": row_status,
+        "stale_registry_row_count": len(stale_rows),
         "live_discovery_row_count": len(discovered),
         "authority": authority,
         "does_not_establish": [

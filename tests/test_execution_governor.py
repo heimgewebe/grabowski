@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import inspect
 import json
+import re
 import time
 from pathlib import Path
 import unittest
@@ -72,7 +73,9 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         sys.modules["grabowski_operator_core"] = fake_operator
 
         name = f"_execution_governor_{id(self)}"
-        spec = importlib.util.spec_from_file_location(name, ROOT / "src/grabowski_friction.py")
+        spec = importlib.util.spec_from_file_location(
+            name, ROOT / "src/grabowski_friction.py"
+        )
         self.assertIsNotNone(spec)
         self.assertIsNotNone(spec.loader)
         module = importlib.util.module_from_spec(spec)
@@ -93,7 +96,9 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.addCleanup(restore_modules)
         module.FRICTION_LOG = root / "state" / "friction" / "events.jsonl"
         module.FRICTION_DECISION_LOG = root / "state" / "friction" / "decisions.jsonl"
-        module.EXECUTION_OUTCOME_LOG = root / "state" / "friction" / "execution-outcomes.jsonl"
+        module.EXECUTION_OUTCOME_LOG = (
+            root / "state" / "friction" / "execution-outcomes.jsonl"
+        )
         return module
 
     @staticmethod
@@ -117,7 +122,9 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         return module.execution_shape_recommendation(**values)
 
     def test_tools_and_capability_contract_are_registered(self) -> None:
-        friction_source = (ROOT / "src/grabowski_friction.py").read_text(encoding="utf-8")
+        friction_source = (ROOT / "src/grabowski_friction.py").read_text(
+            encoding="utf-8"
+        )
         mcp_source = (ROOT / "src/grabowski_mcp.py").read_text(encoding="utf-8")
         for name in (
             "grabowski_execution_shape",
@@ -125,12 +132,17 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
             "grabowski_execution_governor_summary",
         ):
             self.assertIn(f'name="{name}"', friction_source)
-            self.assertIn(f"'{name}'", mcp_source)
-        self.assertIn("'grabowski_execution_outcome_record': ('friction_record',)", mcp_source)
+            self.assertRegex(mcp_source, rf'["\']{re.escape(name)}["\']')
+        self.assertRegex(
+            mcp_source,
+            r'["\']grabowski_execution_outcome_record["\']:\s*\(["\']friction_record["\'],\)',
+        )
 
     def test_input_surface_is_typed_and_excludes_raw_command_text(self) -> None:
         module = self._load_module()
-        parameters = set(inspect.signature(module.execution_shape_recommendation).parameters)
+        parameters = set(
+            inspect.signature(module.execution_shape_recommendation).parameters
+        )
         self.assertNotIn("argv", parameters)
         self.assertNotIn("command", parameters)
         self.assertNotIn("secret", parameters)
@@ -213,7 +225,9 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertFalse(result["action_shape"]["isolated_mutation"])
         self.assertEqual(result["retry_policy"]["retry_limit"], 0)
         self.assertFalse(result["retry_policy"]["unchanged_retry_allowed"])
-        self.assertIn("unknown", result["retry_policy"]["possible_mutation_transport_rule"])
+        self.assertIn(
+            "unknown", result["retry_policy"]["possible_mutation_transport_rule"]
+        )
         self.assertTrue(result["post_state_readback"]["required"])
 
     def test_invalid_friction_evidence_stops_routing(self) -> None:
@@ -244,9 +258,13 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertIn("possible_mutation_outcome_unknown", result["reason_codes"])
         self.assertTrue(result["action_shape"]["state_readback_only"])
         self.assertFalse(result["action_shape"]["isolated_mutation"])
-        self.assertIn("read the exact target state", " ".join(result["preflight_required"]))
+        self.assertIn(
+            "read the exact target state", " ".join(result["preflight_required"])
+        )
 
-    def _nonconflict_proof(self, module, *, issued_at: int | None = None, ttl: int = 90):
+    def _nonconflict_proof(
+        self, module, *, issued_at: int | None = None, ttl: int = 90
+    ):
         now = int(time.time()) if issued_at is None else issued_at
         proof_root = Path("/tmp/grabowski-governor-proof")
         repository = str(proof_root / "repo")
@@ -372,7 +390,10 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result["recommended_route"], "operator_stop")
         self.assertFalse(result["route_feasible"])
-        self.assertIn("policy_gate_requires_deliberate_evidence_or_policy_decision", result["reason_codes"])
+        self.assertIn(
+            "policy_gate_requires_deliberate_evidence_or_policy_decision",
+            result["reason_codes"],
+        )
         self.assertEqual(result["retry_policy"]["retry_limit"], 0)
 
     def test_mutation_stops_on_resource_conflict_or_missing_readback(self) -> None:
@@ -485,7 +506,9 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
             1,
         )
 
-    def test_shadow_outcomes_create_low_risk_candidate_without_applying_it(self) -> None:
+    def test_shadow_outcomes_create_low_risk_candidate_without_applying_it(
+        self,
+    ) -> None:
         module = self._load_module()
         now = 1_783_773_600
         with patch.object(module.time, "time", return_value=now):
@@ -549,7 +572,9 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         old = now - module.EXECUTION_GOVERNOR_DECAY_SECONDS - 1
         module.EXECUTION_OUTCOME_LOG.parent.mkdir(parents=True, exist_ok=True)
 
-        def record(*, outcome_id: str, recorded_at: int, operation: str, risk: str, route: str):
+        def record(
+            *, outcome_id: str, recorded_at: int, operation: str, risk: str, route: str
+        ):
             return {
                 "schema_version": 1,
                 "outcome_id": outcome_id,
@@ -601,9 +626,13 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertEqual(candidate["status"], "excluded_high_risk")
         self.assertFalse(candidate["promotion_eligible"])
         self.assertIn("live_routing_promotion", summary["does_not_establish"])
-        self.assertIn("caller_supplied_outcome_correctness", summary["does_not_establish"])
+        self.assertIn(
+            "caller_supplied_outcome_correctness", summary["does_not_establish"]
+        )
 
-    def test_unrelated_historical_transport_does_not_force_every_read_to_split(self) -> None:
+    def test_unrelated_historical_transport_does_not_force_every_read_to_split(
+        self,
+    ) -> None:
         module = self._load_module()
         self._write_events(
             module,
@@ -622,7 +651,9 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         result = self._recommend(module, prior_failure_class="unknown")
         self.assertEqual(result["recommended_route"], "typed_tool")
         self.assertTrue(result["action_shape"]["batch_reads"])
-        self.assertNotIn("recurring_connector_transport_evidence", result["reason_codes"])
+        self.assertNotIn(
+            "recurring_connector_transport_evidence", result["reason_codes"]
+        )
         self.assertFalse(result["execution_authorized"])
 
     def test_parallel_outcome_appends_remain_unique_and_parseable(self) -> None:
@@ -714,9 +745,12 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         module.EXECUTION_OUTCOME_LOG.parent.mkdir(parents=True, exist_ok=True)
         module.EXECUTION_OUTCOME_LOG.write_text(
             "not-json\n"
-            + json.dumps(duplicate, sort_keys=True) + "\n"
-            + json.dumps(duplicate, sort_keys=True) + "\n"
-            + json.dumps(recent, sort_keys=True) + "\n",
+            + json.dumps(duplicate, sort_keys=True)
+            + "\n"
+            + json.dumps(duplicate, sort_keys=True)
+            + "\n"
+            + json.dumps(recent, sort_keys=True)
+            + "\n",
             encoding="utf-8",
         )
         module.EXECUTION_OUTCOME_LOG.chmod(0o600)
@@ -733,7 +767,9 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertTrue(candidate["circuit_breaker_open"])
         self.assertFalse(candidate["promotion_eligible"])
 
-    def test_future_dated_record_outside_summary_window_opens_integrity_gate(self) -> None:
+    def test_future_dated_record_outside_summary_window_opens_integrity_gate(
+        self,
+    ) -> None:
         module = self._load_module()
         now = 1_783_773_600
 
@@ -761,8 +797,10 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         recent = record(outcome_id="2" * 32, recorded_at=now)
         module.EXECUTION_OUTCOME_LOG.parent.mkdir(parents=True, exist_ok=True)
         module.EXECUTION_OUTCOME_LOG.write_text(
-            json.dumps(future, sort_keys=True) + "\n"
-            + json.dumps(recent, sort_keys=True) + "\n",
+            json.dumps(future, sort_keys=True)
+            + "\n"
+            + json.dumps(recent, sort_keys=True)
+            + "\n",
             encoding="utf-8",
         )
         module.EXECUTION_OUTCOME_LOG.chmod(0o600)
@@ -814,8 +852,10 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         }
         module.EXECUTION_OUTCOME_LOG.parent.mkdir(parents=True, exist_ok=True)
         module.EXECUTION_OUTCOME_LOG.write_text(
-            json.dumps(valid, sort_keys=True) + "\n"
-            + json.dumps(valid, sort_keys=True) + "\n"
+            json.dumps(valid, sort_keys=True)
+            + "\n"
+            + json.dumps(valid, sort_keys=True)
+            + "\n"
             + "not-json\n",
             encoding="utf-8",
         )
@@ -853,7 +893,9 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["schema_version"]["const"], 1)
         self.assertIn("evidence_ref", schema["required"])
         self.assertEqual(schema["properties"]["friction_event_ids"]["maxItems"], 20)
-        self.assertEqual(schema["properties"]["recommendation_id"]["pattern"], "^[0-9a-f]{64}$")
+        self.assertEqual(
+            schema["properties"]["recommendation_id"]["pattern"], "^[0-9a-f]{64}$"
+        )
 
     def test_outcome_record_rejects_unbounded_or_invalid_values(self) -> None:
         module = self._load_module()
