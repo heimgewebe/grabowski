@@ -594,6 +594,26 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         self.assertEqual(results, [True])
         self.assertTrue(path.is_file())
 
+    def test_writer_lock_wait_is_bounded_and_safe_wrapper_reports_error(self):
+        self.enable()
+        value = record()
+        path = chronik.outbox_path(
+            chronik.build_event(value, "completed"), self.root
+        )
+
+        with patch.object(
+            chronik, "WRITER_COMPACTION_LOCK_TIMEOUT_SECONDS", 0.05
+        ):
+            with chronik._writer_compaction_lock(path.parent):
+                started = time.monotonic()
+                result = chronik.record_task_state_safely(value, "completed")
+                elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(result["written"])
+        self.assertIn("acquisition timed out", result["error"])
+        self.assertFalse(path.exists())
+
     def test_failure_is_non_blocking(self):
         bad_root = self.root / "occupied"
         bad_root.write_text("x", encoding="utf-8")
