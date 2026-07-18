@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "e0d80154cebf9abdb6801c8452389f47d1ac1895b0c6b201004a3c2e66ba8adb",
+  "capability_source_sha256": "72163688bfe3661d1295cc325c4a9609a6db0cfc1b7590bf86766e372b362e9f",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "ed594c2eddf4c54c6c07446ec61441cf92d264ffd901dacd25a7241be3ed3446",
+  "contract_sha256": "6a403b6c950a051f65143628ced9a8b1308cacc41a98136aa7b56a59ada66108",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1363,6 +1363,71 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_operator_recall_export"
+    },
+    {
+      "category": "bureau",
+      "description": "Record one source-bound Bureau candidate through the canonical typed intake contract.",
+      "effects": [
+        "bureau_live_register_append",
+        "private_adapter_artifact"
+      ],
+      "id": "grabowski_bureau_candidate_record",
+      "purpose": "Record one source-bound candidate through Bureau's canonical append-only operator intake contract.",
+      "read_only": false,
+      "reversibility": "append-only-domain-event",
+      "risk_class": "medium",
+      "tool": "grabowski_bureau_candidate_record"
+    },
+    {
+      "category": "bureau",
+      "description": "Assess one Bureau candidate read-only against current canonical Registry truth.",
+      "effects": [],
+      "id": "grabowski_bureau_candidate_assess",
+      "purpose": "Assess one Bureau candidate read-only against current Registry and Live Register truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_bureau_candidate_assess"
+    },
+    {
+      "category": "bureau",
+      "description": "Create an immutable Bureau task proposal artifact without changing Registry or Queue truth.",
+      "effects": [
+        "private_proposal_artifact"
+      ],
+      "id": "grabowski_bureau_task_propose",
+      "purpose": "Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation.",
+      "read_only": false,
+      "reversibility": "artifact-preserving",
+      "risk_class": "medium",
+      "tool": "grabowski_bureau_task_propose"
+    },
+    {
+      "category": "bureau",
+      "description": "Validate one immutable Bureau proposal and report its exact publication resources without effects.",
+      "effects": [],
+      "id": "grabowski_bureau_task_publish_preview",
+      "purpose": "Validate one Bureau task proposal and return exact publication resources without effects.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_bureau_task_publish_preview"
+    },
+    {
+      "category": "bureau",
+      "description": "Acquire exact short Bureau leases, publish one reviewed task branch and PR, then release on a clear outcome.",
+      "effects": [
+        "resource_lease",
+        "git_branch",
+        "remote_branch",
+        "pull_request"
+      ],
+      "id": "grabowski_bureau_task_publish",
+      "purpose": "Acquire exact short Bureau leases and publish one reviewed task branch and pull request with bounded readback.",
+      "read_only": false,
+      "reversibility": "git-and-github-recovery",
+      "risk_class": "high",
+      "tool": "grabowski_bureau_task_publish"
     },
     {
       "category": "resource",

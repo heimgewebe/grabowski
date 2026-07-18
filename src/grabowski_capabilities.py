@@ -1101,6 +1101,52 @@ TOOL_PROFILES.update(
 )
 
 
+TOOL_PROFILES.update(
+    {
+        "grabowski_bureau_candidate_record": {
+            "category": "bureau",
+            "purpose": "Record one source-bound candidate through Bureau's canonical append-only operator intake contract.",
+            "risk_class": "medium",
+            "effects": ["bureau_live_register_append", "private_adapter_artifact"],
+            "reversibility": "append-only-domain-event",
+        },
+        "grabowski_bureau_candidate_assess": {
+            "category": "bureau",
+            "purpose": "Assess one Bureau candidate read-only against current Registry and Live Register truth.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_bureau_task_propose": {
+            "category": "bureau",
+            "purpose": "Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation.",
+            "risk_class": "medium",
+            "effects": ["private_proposal_artifact"],
+            "reversibility": "artifact-preserving",
+        },
+        "grabowski_bureau_task_publish_preview": {
+            "category": "bureau",
+            "purpose": "Validate one Bureau task proposal and return exact publication resources without effects.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_bureau_task_publish": {
+            "category": "bureau",
+            "purpose": "Acquire exact short Bureau leases and publish one reviewed task branch and pull request with bounded readback.",
+            "risk_class": "high",
+            "effects": [
+                "resource_lease",
+                "git_branch",
+                "remote_branch",
+                "pull_request",
+            ],
+            "reversibility": "git-and-github-recovery",
+        },
+    }
+)
+
+
 PROFILE_CATEGORIES: dict[str, set[str] | None] = {
     "concise": None,
     "repository-work": {
@@ -1118,6 +1164,7 @@ PROFILE_CATEGORIES: dict[str, set[str] | None] = {
         "recovery",
         "resource",
         "artifact",
+        "bureau",
         "browser-worker",
         "gui-worker",
         "agent-workspace",

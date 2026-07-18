@@ -365,9 +365,17 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_gui_worker_status": ("gui_worker",),
     "grabowski_gui_worker_stop": ("gui_worker",),
     "grabowski_gui_worker_list": ("gui_worker",),
+    "grabowski_bureau_candidate_record": ("terminal_execute",),
+    "grabowski_bureau_candidate_assess": (),
+    "grabowski_bureau_task_propose": ("terminal_execute",),
+    "grabowski_bureau_task_publish_preview": (),
+    "grabowski_bureau_task_publish": ("resource_lease", "terminal_execute"),
 }
 
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
+    "grabowski_bureau_candidate_record",
+    "grabowski_bureau_task_propose",
+    "grabowski_bureau_task_publish",
     "grabowski_github_pr_view",
     "grabowski_github_checks",
     "grabowski_service_status",

@@ -108,6 +108,11 @@
     "grabowski_execution_governor_summary",
     "grabowski_connector_transport_diagnostics",
     "grabowski_operator_recall_export",
+    "grabowski_bureau_candidate_record",
+    "grabowski_bureau_candidate_assess",
+    "grabowski_bureau_task_propose",
+    "grabowski_bureau_task_publish_preview",
+    "grabowski_bureau_task_publish",
     "grabowski_resource_nonconflict_assess",
     "grabowski_resource_reconcile_obsolete_path_leases",
     "grabowski_resource_acquire",
@@ -284,6 +289,10 @@
     {
       "module": "grabowski_bureau_leases",
       "source": "src/grabowski_bureau_leases.py"
+    },
+    {
+      "module": "grabowski_bureau_intake",
+      "source": "src/grabowski_bureau_intake.py"
     },
     {
       "module": "grabowski_nonconflict",

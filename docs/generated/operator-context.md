@@ -137,6 +137,11 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_execution_governor_summary` | operations-observability | yes | low | Summarize evidence thresholds, time decay and circuit-breaker state without enabling live routing. |
 | `grabowski_connector_transport_diagnostics` | operations-observability | yes | low | Run bounded read-only diagnostics for connector transport failures. |
 | `grabowski_operator_recall_export` | operations-observability | yes | low | Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth. |
+| `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
+| `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one Bureau candidate read-only against current Registry and Live Register truth. |
+| `grabowski_bureau_task_propose` | bureau | no | medium | Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation. |
+| `grabowski_bureau_task_publish_preview` | bureau | yes | low | Validate one Bureau task proposal and return exact publication resources without effects. |
+| `grabowski_bureau_task_publish` | bureau | no | high | Acquire exact short Bureau leases and publish one reviewed task branch and pull request with bounded readback. |
 | `grabowski_resource_nonconflict_assess` | resource | no | medium | Assess and audit complete, attested same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint. |
 | `grabowski_resource_reconcile_obsolete_path_leases` | resource | no | high | Release only unchanged exact path leases after an authoritative workspace-close or current successful durable-task outcome proves terminal owner work. |
 | `grabowski_resource_acquire` | resource | no | medium | Atomically acquire typed resource leases for one owner. |
