@@ -242,10 +242,10 @@
     },
     {
       "category": "knowledge",
-      "description": "Return the curated latest-complete RepoGround bundle registry.",
+      "description": "Return latest RepoGround publications with canonical catalog precedence.",
       "effects": [],
       "id": "latest_complete_bundles",
-      "purpose": "Read the curated latest-complete Lens and repoLens bundle registry.",
+      "purpose": "Read latest RepoGround publications with canonical catalog precedence.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -253,10 +253,10 @@
     },
     {
       "category": "knowledge",
-      "description": "Discover current RepoGround bundles from the immutable local bundle area.",
+      "description": "Discover current RepoGround bundles from the canonical publication catalog.",
       "effects": [],
       "id": "repoground_bundle_discover",
-      "purpose": "Discover current RepoGround bundles from the immutable local bundle area.",
+      "purpose": "Discover current RepoGround bundles from the canonical publication catalog.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -275,7 +275,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Compare one RepoGround bundle source commit with the local repository HEAD.",
+      "description": "Compare one RepoGround publication source commit with the local repository HEAD.",
       "effects": [],
       "id": "repoground_freshness_check",
       "purpose": "Compare one RepoGround bundle source commit with the current local repository HEAD.",
@@ -2063,7 +2063,8 @@
     "secret_export_roots": [],
     "secret_roots": [],
     "write_excluded_roots": [
-      "${HOME}/repos/merges"
+      "${HOME}/repos/merges",
+      "${HOME}/repos/manifest-publications"
     ],
     "write_roots": []
   },
@@ -2444,11 +2445,11 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "72163688bfe3661d1295cc325c4a9609a6db0cfc1b7590bf86766e372b362e9f"
+      "sha256": "87b5463fcb58632b88f8ea0e2c49dd2c672731e324fc665e1022840156020fdd"
     },
     "policy_example": {
       "path": "config/access.example.json",
-      "sha256": "d5465c54daf02560de270f0b5d96b92ed9b7596111e6662fa3b4d4479d3717c8"
+      "sha256": "476fbafcf084c6fb658c00c9509cde06e7a2874df7a2cc31964c8ba7d6284ac5"
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
@@ -2469,7 +2470,7 @@
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_intake.py": "96a037debe454a562b0e5729ca253004386807d435a0b35867b5745b7893908c",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "72163688bfe3661d1295cc325c4a9609a6db0cfc1b7590bf86766e372b362e9f",
+      "src/grabowski_capabilities.py": "87b5463fcb58632b88f8ea0e2c49dd2c672731e324fc665e1022840156020fdd",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "da41759813e9cf14bb7df17861c60ffb90a9369177d2bcd45c79df663b121bb2",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
@@ -2485,7 +2486,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "775d33ec033988461c05e9d5adba29d820dcdc4a5c08bc4458b6a865cb885f8f",
+      "src/grabowski_mcp.py": "60e2d9cf334ff70adba9ac57bf136d6382b619e2681447b225db9743f6d4a385",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
@@ -2497,7 +2498,7 @@
       "src/grabowski_read_surface.py": "c4f633a3303d08ac4916c034dc6d5c86d872daa7628704f3e1ba5b4d070917ac",
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
       "src/grabowski_recovery.py": "1c5b0843345f5aa7d1da7f3f0c5831e647f652c83eba7733b4a2c998d291c16d",
-      "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
+      "src/grabowski_repobrief.py": "dd76e9eb7d9ae95010e0379f7b63ab9cf76f8ed886263ca2871ae7c8610cd38c",
       "src/grabowski_resources.py": "d846feceb40f297561ade6fa1d39bc5831f8e5d59365ba90d55aa6430f5f6489",
       "src/grabowski_runtime.py": "cf83bd1d3578fbd94f6b447e8862d15ca656adc54eaf32e66e255b1115f842da",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",

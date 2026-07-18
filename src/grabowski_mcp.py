@@ -145,6 +145,12 @@ LEGACY_KILL_SWITCH_PATH = STATE_DIR / "operator-kill-switch"
 BLOCKADE_AUTHORITY_UID = 0
 BLOCKADE_MARKER_MODE = 0o644
 BUNDLE_REGISTRY = STATE_DIR / "repoground-latest-complete-bundles.tsv"
+REPOGROUND_PUBLICATION_ROOT = Path(
+    os.environ.get(
+        "GRABOWSKI_REPOGROUND_PUBLICATION_ROOT",
+        str(HOME / "repos" / "manifest-publications" / "bundles"),
+    )
+).expanduser()
 MERGES_ROOT = HOME / "repos" / "merges"
 AUDIT_SCHEMA_VERSION = 2
 MAX_AUDIT_BYTES = 16 * 1024 * 1024
@@ -5451,8 +5457,64 @@ def _repoground_stem_from_manifest(path: Path) -> str:
     return name[: -len(_BUNDLE_MANIFEST_SUFFIX)]
 
 
+def _repoground_path_is_bounded(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _repoground_manifest_catalog_info(path: Path) -> dict[str, Any]:
+    stem = _repoground_stem_from_manifest(path)
+    resolved = path.resolve(strict=False)
+    canonical_root = REPOGROUND_PUBLICATION_ROOT.resolve(strict=False)
+    if _repoground_path_is_bounded(resolved, canonical_root):
+        relative = resolved.relative_to(canonical_root)
+        parts = relative.parts
+        if len(parts) == 4:
+            repo_id, ref, run_id, _name = parts
+            repo = repo_id.rsplit("__", 1)[-1]
+            if _REPOGROUND_REPO_RE.fullmatch(repo):
+                return {
+                    "authority": "canonical_publication",
+                    "publication_root": str(canonical_root),
+                    "repo": repo,
+                    "repo_id": repo_id,
+                    "ref": ref,
+                    "publication_run_id": run_id,
+                    "stem": stem,
+                }
+    legacy_root = MERGES_ROOT.resolve(strict=False)
+    if _repoground_path_is_bounded(resolved, legacy_root):
+        return {
+            "authority": "legacy_merges_fallback",
+            "publication_root": str(legacy_root),
+            "repo": _repoground_repo_from_stem(stem),
+            "repo_id": None,
+            "ref": None,
+            "publication_run_id": None,
+            "stem": stem,
+        }
+    raise PermissionError("RepoGround manifest path is outside configured catalog roots")
+
+
 def _repoground_manifest_path(stem: str) -> Path:
     stem = _repoground_validate_stem(stem)
+    canonical_root = REPOGROUND_PUBLICATION_ROOT.resolve(strict=False)
+    if REPOGROUND_PUBLICATION_ROOT.is_dir() and not REPOGROUND_PUBLICATION_ROOT.is_symlink():
+        matches = [
+            candidate
+            for candidate in REPOGROUND_PUBLICATION_ROOT.glob(
+                f"*/*/*/{stem}{_BUNDLE_MANIFEST_SUFFIX}"
+            )
+            if candidate.is_file()
+            and not candidate.is_symlink()
+            and _repoground_path_is_bounded(candidate.resolve(), canonical_root)
+        ]
+        if matches:
+            matches.sort(key=lambda item: (item.stat().st_mtime, item.name), reverse=True)
+            return matches[0]
     path = MERGES_ROOT / f"{stem}{_BUNDLE_MANIFEST_SUFFIX}"
     try:
         resolved = path.resolve(strict=False)
@@ -5464,9 +5526,14 @@ def _repoground_manifest_path(stem: str) -> Path:
     return path
 
 
-def _repoground_sidecar_path(stem: str, suffix: str) -> Path:
-    return MERGES_ROOT / f"{stem}{suffix}"
-
+def _repoground_sidecar_path(
+    stem: str,
+    suffix: str,
+    *,
+    manifest_path: Path | None = None,
+) -> Path:
+    selected_manifest = manifest_path or _repoground_manifest_path(stem)
+    return selected_manifest.parent / f"{stem}{suffix}"
 
 def _repoground_sidecar_status(path: Path, *, keys: tuple[str, ...]) -> dict[str, Any]:
     if not path.is_file() or path.is_symlink():
@@ -5578,7 +5645,8 @@ def _repoground_manifest_snapshot_provenance(
 
 def _repoground_manifest_summary(path: Path) -> dict[str, Any]:
     stem = _repoground_stem_from_manifest(path)
-    repo = _repoground_repo_from_stem(stem)
+    catalog = _repoground_manifest_catalog_info(path)
+    repo = str(catalog["repo"])
     doc = _repoground_json(path)
     artifacts = doc.get("artifacts") if isinstance(doc.get("artifacts"), list) else []
     roles = sorted(
@@ -5593,7 +5661,9 @@ def _repoground_manifest_summary(path: Path) -> dict[str, Any]:
     source_commit = snapshot.get("git_commit") if snapshot.get("available") else None
     source_dirty = snapshot.get("git_dirty") if snapshot.get("available") else None
     stat = path.stat()
-    health_path = _repoground_sidecar_path(stem, _BUNDLE_HEALTH_SUFFIX)
+    health_path = _repoground_sidecar_path(
+        stem, _BUNDLE_HEALTH_SUFFIX, manifest_path=path
+    )
     health = _repoground_sidecar_status(
         health_path,
         keys=("status", "evidence_level", "range_ref_resolution_status"),
@@ -5602,6 +5672,10 @@ def _repoground_manifest_summary(path: Path) -> dict[str, Any]:
         "repo": repo,
         "stem": stem,
         "manifest_path": str(path),
+        "publication_authority": catalog["authority"],
+        "publication_root": catalog["publication_root"],
+        "publication_ref": catalog["ref"],
+        "publication_run_id": catalog["publication_run_id"],
         "manifest_mtime_unix": int(stat.st_mtime),
         "run_id": doc.get("run_id"),
         "created_at": doc.get("created_at"),
@@ -5618,13 +5692,37 @@ def _repoground_manifest_summary(path: Path) -> dict[str, Any]:
         },
         "post_emit_health": health,
         "output_health": _repoground_output_health_status(
-            _repoground_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX)
+            _repoground_sidecar_path(
+                stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX, manifest_path=path
+            )
         ),
     }
 
 
-def _repoground_iter_manifests(repo: str | None = None) -> list[Path]:
-    repo = _repoground_validate_repo(repo)
+def _repoground_canonical_manifests(repo: str | None) -> list[Path]:
+    if not REPOGROUND_PUBLICATION_ROOT.is_dir() or REPOGROUND_PUBLICATION_ROOT.is_symlink():
+        return []
+    root = REPOGROUND_PUBLICATION_ROOT.resolve()
+    manifests: list[Path] = []
+    for path in REPOGROUND_PUBLICATION_ROOT.glob(
+        f"*/*/*/*{_BUNDLE_MANIFEST_SUFFIX}"
+    ):
+        if not path.is_file() or path.is_symlink():
+            continue
+        resolved = path.resolve()
+        if not _repoground_path_is_bounded(resolved, root):
+            continue
+        try:
+            info = _repoground_manifest_catalog_info(path)
+        except (PermissionError, ValueError):
+            continue
+        if repo is None or info["repo"] == repo:
+            manifests.append(path)
+    manifests.sort(key=lambda item: (item.stat().st_mtime, item.name), reverse=True)
+    return manifests
+
+
+def _repoground_legacy_manifests(repo: str | None) -> list[Path]:
     if not MERGES_ROOT.is_dir() or MERGES_ROOT.is_symlink():
         return []
     manifests = [
@@ -5638,9 +5736,27 @@ def _repoground_iter_manifests(repo: str | None = None) -> list[Path]:
             for path in manifests
             if _repoground_repo_from_stem(_repoground_stem_from_manifest(path)) == repo
         ]
-    manifests.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    manifests.sort(key=lambda item: (item.stat().st_mtime, item.name), reverse=True)
     return manifests
 
+
+def _repoground_iter_manifests(repo: str | None = None) -> list[Path]:
+    repo = _repoground_validate_repo(repo)
+    canonical = _repoground_canonical_manifests(repo)
+    if repo is not None:
+        return canonical or _repoground_legacy_manifests(repo)
+    canonical_repos = {
+        str(_repoground_manifest_catalog_info(path)["repo"]) for path in canonical
+    }
+    legacy = [
+        path
+        for path in _repoground_legacy_manifests(None)
+        if _repoground_repo_from_stem(_repoground_stem_from_manifest(path))
+        not in canonical_repos
+    ]
+    manifests = [*canonical, *legacy]
+    manifests.sort(key=lambda item: (item.stat().st_mtime, item.name), reverse=True)
+    return manifests
 
 def _repoground_latest_manifest_by_repo() -> dict[str, Path]:
     latest: dict[str, Path] = {}
@@ -5661,8 +5777,17 @@ def _repoground_manifest_registry_row(path: Path) -> list[str]:
     repo = str(summary["repo"])
     artifact_roles = set(summary.get("artifact_roles") or [])
 
-    def rel(suffix: str) -> str:
-        return "./merges/" + stem + suffix
+    def display(candidate: Path) -> str:
+        try:
+            relative = candidate.resolve(strict=False).relative_to(
+                (HOME / "repos").resolve(strict=False)
+            )
+            return "./" + relative.as_posix()
+        except ValueError:
+            return str(candidate)
+
+    def sidecar(suffix: str) -> str:
+        return display(path.parent / f"{stem}{suffix}")
 
     return [
         repo,
@@ -5671,12 +5796,11 @@ def _repoground_manifest_registry_row(path: Path) -> list[str]:
             int(summary["manifest_mtime_unix"]), timezone.utc
         ).isoformat(),
         "yes" if "agent_reading_pack" in artifact_roles else "no",
-        rel("_merge.md"),
-        rel(_BUNDLE_MANIFEST_SUFFIX),
-        rel(_BUNDLE_OUTPUT_HEALTH_SUFFIX),
-        rel("_merge.agent_reading_pack.md"),
+        sidecar("_merge.md"),
+        display(path),
+        sidecar(_BUNDLE_OUTPUT_HEALTH_SUFFIX),
+        sidecar("_merge.agent_reading_pack.md"),
     ]
-
 
 def _repoground_registry_row_status(row: list[str]) -> dict[str, Any]:
     status: dict[str, Any] = {
@@ -5737,7 +5861,7 @@ def _repoground_git(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
 def repoground_bundle_discover(
     repo: str | None = None, max_candidates: int = 20
 ) -> dict[str, Any]:
-    """Discover current RepoGround bundles from the immutable local bundle area."""
+    """Discover current RepoGround bundles from the canonical publication catalog."""
     _require_capability("bundle_registry")
     if not isinstance(max_candidates, int) or not 1 <= max_candidates <= 100:
         raise ValueError("max_candidates must be between 1 and 100")
@@ -5745,18 +5869,44 @@ def repoground_bundle_discover(
     candidates = [
         _repoground_manifest_summary(path) for path in manifests[:max_candidates]
     ]
+    canonical_count = sum(
+        1
+        for candidate in candidates
+        if candidate.get("publication_authority") == "canonical_publication"
+    )
+    legacy_count = sum(
+        1
+        for candidate in candidates
+        if candidate.get("publication_authority") == "legacy_merges_fallback"
+    )
+    if canonical_count:
+        authority = "canonical_publication_catalog"
+    elif legacy_count:
+        authority = "legacy_merges_fallback"
+    else:
+        authority = "publication_unavailable"
     return {
         "kind": "grabowski.repoground_bundle_discovery",
-        "schema_version": 1,
+        "schema_version": 2,
+        "catalog": {
+            "authority": authority,
+            "canonical_root": str(REPOGROUND_PUBLICATION_ROOT),
+            "canonical_root_exists": REPOGROUND_PUBLICATION_ROOT.is_dir()
+            and not REPOGROUND_PUBLICATION_ROOT.is_symlink(),
+            "legacy_root": str(MERGES_ROOT),
+            "legacy_root_exists": MERGES_ROOT.is_dir() and not MERGES_ROOT.is_symlink(),
+            "canonical_candidate_count": canonical_count,
+            "legacy_fallback_candidate_count": legacy_count,
+        },
         "merges_root": str(MERGES_ROOT),
         "repo_filter": _repoground_validate_repo(repo),
-        "exists": MERGES_ROOT.is_dir() and not MERGES_ROOT.is_symlink(),
+        "exists": bool(candidates),
         "candidate_count": len(candidates),
         "candidates": candidates,
         "registry_cache": {
             "path": str(BUNDLE_REGISTRY),
             "exists": BUNDLE_REGISTRY.is_file(),
-            "authority": "registry_cache",
+            "authority": "non_authoritative_cache",
         },
         "does_not_establish": [
             "bundle_freshness_against_live_repo",
@@ -5781,11 +5931,15 @@ def repoground_bundle_status(stem: str) -> dict[str, Any]:
         }
     summary = _repoground_manifest_summary(manifest_path)
     surface = _repoground_sidecar_status(
-        _repoground_sidecar_path(stem, _BUNDLE_SURFACE_SUFFIX),
+        _repoground_sidecar_path(
+            stem, _BUNDLE_SURFACE_SUFFIX, manifest_path=manifest_path
+        ),
         keys=("status", "bundle_run_id"),
     )
     output_health = _repoground_output_health_status(
-        _repoground_sidecar_path(stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX)
+        _repoground_sidecar_path(
+            stem, _BUNDLE_OUTPUT_HEALTH_SUFFIX, manifest_path=manifest_path
+        )
     )
     return {
         "kind": "grabowski.repoground_bundle_status",
@@ -5805,9 +5959,38 @@ def repoground_bundle_status(stem: str) -> dict[str, Any]:
     }
 
 
+def _repoground_freshness_source(
+    repo: str, status: dict[str, Any]
+) -> tuple[Path, str, str | None]:
+    provenance = status.get("source_provenance")
+    repository = provenance.get("repository") if isinstance(provenance, dict) else None
+    source_name = repository.get("name") if isinstance(repository, dict) else None
+    publication_ref = status.get("publication_ref")
+    if (
+        status.get("publication_authority") == "canonical_publication"
+        and isinstance(source_name, str)
+        and re.fullmatch(r"[A-Za-z0-9._-]{1,255}", source_name)
+    ):
+        source_root = (HOME / "repos" / ".repoground-sources").resolve(strict=False)
+        candidate = source_root / source_name
+        try:
+            resolved = candidate.resolve(strict=False)
+        except RuntimeError:
+            resolved = candidate
+        if (
+            resolved != source_root
+            and source_root in resolved.parents
+            and candidate.is_dir()
+            and not candidate.is_symlink()
+        ):
+            ref = publication_ref if isinstance(publication_ref, str) else None
+            return candidate, "publication_source_checkout", ref
+    return (HOME / "repos" / repo).resolve(strict=False), "conventional_checkout", None
+
+
 @mcp.tool(name="repoground_freshness_check", annotations=READ_ANNOTATIONS)
 def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
-    """Compare one RepoGround bundle source commit with the local repository HEAD."""
+    """Compare one RepoGround publication source commit with the local repository HEAD."""
     _require_capability("bundle_registry")
     repo = _repoground_validate_repo(repo) or ""
     if stem is None or stem == "":
@@ -5815,56 +5998,96 @@ def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, 
         if not manifests:
             return {
                 "kind": "grabowski.repoground_freshness_check",
+                "schema_version": 2,
                 "repo": repo,
+                "stem": None,
                 "freshness": "unknown",
+                "freshness_status": "publication_unavailable",
                 "reason": "no_bundle_found",
             }
         stem = _repoground_stem_from_manifest(manifests[0])
     stem = _repoground_validate_stem(stem)
     status = repoground_bundle_status(stem)
-    bundle_commit = status.get("git_commit") if status.get("exists") else None
-    bundle_dirty = status.get("git_dirty") if status.get("exists") else None
-    repo_path = (HOME / "repos" / repo).resolve(strict=False)
-    live: dict[str, Any] = {"repo_path": str(repo_path), "exists": repo_path.is_dir()}
+    if not status.get("exists"):
+        return {
+            "kind": "grabowski.repoground_freshness_check",
+            "schema_version": 2,
+            "repo": repo,
+            "stem": stem,
+            "freshness": "unknown",
+            "freshness_status": "publication_unavailable",
+            "reason": "bundle_manifest_missing",
+        }
+    bundle_commit = status.get("git_commit")
+    bundle_dirty = status.get("git_dirty")
+    repo_path, source_kind, source_ref = _repoground_freshness_source(repo, status)
+    live: dict[str, Any] = {
+        "repo_path": str(repo_path),
+        "source_kind": source_kind,
+        "exists": repo_path.is_dir(),
+    }
     if not repo_path.is_dir() or repo_path.is_symlink():
         freshness = "unknown"
+        freshness_status = "source_unavailable"
         reason = "repo_missing_or_invalid"
     else:
-        head_rc, head, head_err = _repoground_git(repo_path, ["rev-parse", "HEAD"])
+        checkout_rc, checkout_head, checkout_err = _repoground_git(
+            repo_path, ["rev-parse", "HEAD"]
+        )
         dirty_rc, dirty_out, dirty_err = _repoground_git(
             repo_path, ["status", "--porcelain"]
         )
+        comparison_head = checkout_head if checkout_rc == 0 else None
+        comparison_ref = "HEAD"
+        remote_err = ""
+        if source_kind == "publication_source_checkout" and source_ref:
+            remote_ref = f"origin/{source_ref}"
+            remote_rc, remote_head, remote_err = _repoground_git(
+                repo_path, ["rev-parse", remote_ref]
+            )
+            if remote_rc == 0:
+                comparison_head = remote_head
+                comparison_ref = remote_ref
         live.update(
             {
-                "head_returncode": head_rc,
-                "head": head if head_rc == 0 else None,
+                "head_returncode": checkout_rc,
+                "checkout_head": checkout_head if checkout_rc == 0 else None,
+                "head": comparison_head,
+                "comparison_ref": comparison_ref,
                 "dirty_returncode": dirty_rc,
                 "dirty": bool(dirty_out) if dirty_rc == 0 else None,
-                "error": head_err or dirty_err or None,
+                "error": checkout_err or dirty_err or remote_err or None,
             }
         )
-        if head_rc != 0 or dirty_rc != 0:
+        if checkout_rc != 0 or dirty_rc != 0 or not isinstance(comparison_head, str):
             freshness = "unknown"
+            freshness_status = "source_unavailable"
             reason = "git_unavailable"
         elif not isinstance(bundle_commit, str):
             freshness = "unknown"
+            freshness_status = "provenance_missing"
             reason = "bundle_source_commit_unavailable"
-        elif bundle_commit != head:
+        elif bundle_commit != comparison_head:
             freshness = "stale_head"
+            freshness_status = "stale"
             reason = "bundle_commit_differs_from_live_head"
         elif live["dirty"] or bundle_dirty:
             freshness = "fresh_dirty_unverified"
+            freshness_status = "source_unavailable"
             reason = "commit_matches_but_dirty_worktree_identity_is_not_proven"
         else:
             freshness = "fresh_exact"
+            freshness_status = "fresh"
             reason = "bundle_commit_matches_clean_live_head"
     return {
         "kind": "grabowski.repoground_freshness_check",
-        "schema_version": 1,
+        "schema_version": 2,
         "repo": repo,
         "stem": stem,
         "bundle": {
-            "exists": status.get("exists", False),
+            "exists": True,
+            "manifest_path": status.get("manifest_path"),
+            "publication_authority": status.get("publication_authority"),
             "git_commit": bundle_commit,
             "git_dirty": bundle_dirty,
             "source_provenance": status.get("source_provenance"),
@@ -5873,6 +6096,7 @@ def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, 
         },
         "live_repo": live,
         "freshness": freshness,
+        "freshness_status": freshness_status,
         "reason": reason,
         "does_not_establish": [
             "dirty_worktree_identity",
@@ -6899,7 +7123,9 @@ def repoground_context_pack(
         "manifest_sha256": manifest_sha,
         "bundle_commit": bundle.get("git_commit"),
         "live_commit_at_claim": live.get("head"),
-        "freshness_status": freshness.get("freshness", "unknown"),
+        "freshness_status": freshness.get(
+            "freshness_status", freshness.get("freshness", "unknown")
+        ),
         "task_profile": task_profile,
         "preflight_status": preflight_status,
         "query_shape": bounded_evidence["normalized_query_shape"],
@@ -7323,7 +7549,7 @@ def grip_run(
 
 @mcp.tool(name="latest_complete_bundles", annotations=READ_ANNOTATIONS)
 def latest_complete_bundles() -> dict[str, Any]:
-    """Return the curated latest-complete RepoGround bundle registry."""
+    """Return latest RepoGround publications with canonical catalog precedence."""
     _require_capability("bundle_registry")
     rows: list[list[str]] = []
     sha256: str | None = None
@@ -7345,16 +7571,27 @@ def latest_complete_bundles() -> dict[str, Any]:
         for row, status in zip(rows, row_status)
         if status.get("is_header") is not True and status.get("valid") is True
     ]
-    discovery_needed = not rows or bool(stale_rows)
+    canonical_present = bool(_repoground_canonical_manifests(None))
+    discovery_needed = canonical_present or not rows or bool(stale_rows)
+    discovered_paths: list[Path] = []
     discovered: list[list[str]] = []
     if discovery_needed:
-        discovered = [
-            _repoground_manifest_registry_row(path)
-            for _repo, path in sorted(_repoground_latest_manifest_by_repo().items())
-        ]
-    if not rows:
+        latest = _repoground_latest_manifest_by_repo()
+        discovered_paths = [path for _repo, path in sorted(latest.items())]
+        discovered = [_repoground_manifest_registry_row(path) for path in discovered_paths]
+    canonical_count = sum(
+        1
+        for path in discovered_paths
+        if _repoground_manifest_catalog_info(path)["authority"]
+        == "canonical_publication"
+    )
+    legacy_count = len(discovered_paths) - canonical_count
+    if canonical_count:
         effective_rows = discovered
-        authority = "live_discovery"
+        authority = "canonical_live_discovery"
+    elif not rows:
+        effective_rows = discovered
+        authority = "live_discovery" if discovered else "publication_unavailable"
     elif stale_rows:
         registry_repos = {row[0] for row in valid_registry_rows if row}
         discovery_additions = [
@@ -7378,6 +7615,13 @@ def latest_complete_bundles() -> dict[str, Any]:
         "registry_row_status": row_status,
         "stale_registry_row_count": len(stale_rows),
         "live_discovery_row_count": len(discovered),
+        "canonical_publication_row_count": canonical_count,
+        "legacy_fallback_row_count": legacy_count,
+        "catalog": {
+            "canonical_root": str(REPOGROUND_PUBLICATION_ROOT),
+            "legacy_root": str(MERGES_ROOT),
+            "canonical_precedes_registry_and_legacy": True,
+        },
         "authority": authority,
         "does_not_establish": [
             "bundle_freshness_against_live_repo",

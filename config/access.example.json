@@ -114,7 +114,8 @@
         "${HOME}/.local/share/keyrings"
       ],
       "write_excluded_roots": [
-        "${HOME}/repos/merges"
+        "${HOME}/repos/merges",
+        "${HOME}/repos/manifest-publications"
       ],
       "write_roots": [
         "${HOME}"
@@ -149,7 +150,8 @@
       "secret_export_roots": [],
       "secret_roots": [],
       "write_excluded_roots": [
-        "${HOME}/repos/merges"
+        "${HOME}/repos/merges",
+        "${HOME}/repos/manifest-publications"
       ],
       "write_roots": [],
       "allowed_grips": [
@@ -197,7 +199,8 @@
       "secret_export_roots": [],
       "secret_roots": [],
       "write_excluded_roots": [
-        "${HOME}/repos/merges"
+        "${HOME}/repos/merges",
+        "${HOME}/repos/manifest-publications"
       ],
       "write_roots": [
         "${HOME}/repos",
@@ -242,7 +245,8 @@
       "secret_export_roots": [],
       "secret_roots": [],
       "write_excluded_roots": [
-        "${HOME}/repos/merges"
+        "${HOME}/repos/merges",
+        "${HOME}/repos/manifest-publications"
       ],
       "write_roots": [],
       "allowed_grips": [
@@ -266,7 +270,8 @@
   "secret_roots": [],
   "version": 2,
   "write_excluded_roots": [
-    "${HOME}/repos/merges"
+    "${HOME}/repos/merges",
+    "${HOME}/repos/manifest-publications"
   ],
   "write_roots": [],
   "allowed_grips": [

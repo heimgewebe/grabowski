@@ -55,11 +55,15 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.home = self.root / "home"
         self.merges = self.home / "repos" / "merges"
         self.merges.mkdir(parents=True)
+        self.publications = (
+            self.home / "repos" / "manifest-publications" / "bundles"
+        )
         self.state = self.home / ".local" / "state" / "grabowski"
         self.state.mkdir(parents=True)
         self.patches = [
             patch.object(mcp, "HOME", self.home),
             patch.object(mcp, "MERGES_ROOT", self.merges),
+            patch.object(mcp, "REPOGROUND_PUBLICATION_ROOT", self.publications),
             patch.object(
                 mcp,
                 "BUNDLE_REGISTRY",
@@ -137,6 +141,65 @@ class RepoGroundBundleToolTests(unittest.TestCase):
                             "validation": {"mode": "jsonschema", "reason": "available"},
                         },
                     },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return manifest
+
+    def _write_canonical_bundle(
+        self,
+        repo: str,
+        commit: str = "a" * 40,
+        *,
+        include_snapshot_provenance: bool = True,
+        run_id: str = "20260718T120000Z-test",
+    ) -> Path:
+        stem = f"heimgewebe__{repo}__main-max-260718-1200"
+        directory = self.publications / f"heimgewebe__{repo}" / "main" / run_id
+        directory.mkdir(parents=True, exist_ok=True)
+        manifest = directory / f"{stem}_merge.bundle.manifest.json"
+        doc = {
+            "kind": "repoground.bundle.manifest",
+            "run_id": f"{stem}-run",
+            "created_at": "2026-07-18T12:00:00Z",
+            "generator": {
+                "runtime": {"git_commit": "f" * 40, "git_dirty": False}
+            },
+            "artifacts": [
+                {"role": "canonical_md"},
+                {"role": "output_health"},
+                {"role": "python_symbol_index_json"},
+                {"role": "python_call_graph_json"},
+            ],
+        }
+        if include_snapshot_provenance:
+            doc["snapshot_provenance"] = {
+                "repositories": [
+                    {
+                        "name": f"heimgewebe__{repo}__main",
+                        "git_commit": commit,
+                        "git_dirty": False,
+                    }
+                ]
+            }
+        manifest.write_text(json.dumps(doc), encoding="utf-8")
+        (directory / f"{stem}_merge.bundle_health.post.json").write_text(
+            json.dumps(
+                {
+                    "status": "pass",
+                    "evidence_level": "range_strict",
+                    "range_ref_resolution_status": "ok",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (directory / f"{stem}_merge.output_health.json").write_text(
+            json.dumps(
+                {
+                    "verdict": "pass",
+                    "run_id": f"{stem}-run",
+                    "checks": {"range_ref_resolution_status": "ok"},
                 }
             ),
             encoding="utf-8",
@@ -225,6 +288,71 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertIn(
             "bundle_freshness_against_live_repo", result["does_not_establish"]
         )
+
+    def test_canonical_publications_for_repoground_and_weltgewebe_are_discovered(self) -> None:
+        for repo in ("repoground", "weltgewebe"):
+            manifest = self._write_canonical_bundle(repo)
+            with self.subTest(repo=repo):
+                result = mcp.repoground_bundle_discover(repo=repo)
+                self.assertEqual(result["candidate_count"], 1)
+                candidate = result["candidates"][0]
+                self.assertEqual(candidate["repo"], repo)
+                self.assertEqual(
+                    candidate["publication_authority"], "canonical_publication"
+                )
+                self.assertEqual(candidate["manifest_path"], str(manifest))
+                self.assertEqual(
+                    result["catalog"]["authority"], "canonical_publication_catalog"
+                )
+
+    def test_canonical_publication_precedes_legacy_for_all_consumers(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        legacy = self._write_bundle(
+            "demo-repo-max-260718-1300", commit="b" * 40
+        )
+        canonical = self._write_canonical_bundle("demo-repo", commit=head)
+        legacy.touch()
+
+        discovery = mcp.repoground_bundle_discover(repo="demo-repo")
+        self.assertEqual(discovery["candidate_count"], 1)
+        self.assertEqual(discovery["candidates"][0]["manifest_path"], str(canonical))
+
+        query_payload = {"status": "available", "query_result": {"results": []}}
+        with patch.object(
+            mcp, "_repoground_query_existing_index", return_value=query_payload
+        ) as query_helper:
+            result = mcp.repoground_query_existing_index("demo-repo", "target")
+        self.assertTrue(result["available"])
+        self.assertEqual(query_helper.call_args.args[0], canonical)
+
+        symbol_payload = {"status": "available", "result": {"hits": []}}
+        with patch.object(
+            mcp, "_repoground_find_symbol", return_value=symbol_payload
+        ) as symbol_helper:
+            symbol = mcp.repoground_find_symbol("demo-repo", "target")
+        self.assertTrue(symbol["available"])
+        self.assertEqual(symbol_helper.call_args.args[0], canonical)
+
+    def test_canonical_catalog_overrides_valid_legacy_registry_cache(self) -> None:
+        self._write_bundle("demo-repo-max-260718-1300")
+        canonical = self._write_canonical_bundle("demo-repo")
+        self.state.joinpath("repoground-latest-complete-bundles.tsv").write_text(
+            "repo\tstem\tlatest_mtime\thas_agent_reading_pack\tcanonical_md\tbundle_manifest\toutput_health\tagent_reading_pack\n"
+            "demo-repo\tdemo-repo-max-260718-1300\t2026-07-18T13:00:00Z\tno\t./merges/demo-repo-max-260718-1300_merge.md\t./merges/demo-repo-max-260718-1300_merge.bundle.manifest.json\t./merges/demo-repo-max-260718-1300_merge.output_health.json\t./merges/demo-repo-max-260718-1300_merge.agent_reading_pack.md\n",
+            encoding="utf-8",
+        )
+
+        result = mcp.latest_complete_bundles()
+
+        self.assertEqual(result["authority"], "canonical_live_discovery")
+        self.assertEqual(result["canonical_publication_row_count"], 1)
+        self.assertEqual(result["rows"][0][0], "demo-repo")
+        self.assertTrue(
+            result["rows"][0][5].endswith(
+                canonical.relative_to(self.home / "repos").as_posix()
+            )
+        )
+        self.assertNotIn("demo-repo-max-260718-1300", result["rows"][0][1])
 
     def test_bundle_status_reads_sidecars_without_content_dump(self) -> None:
         self._write_bundle("demo-repo-max-260701-1200")
@@ -366,9 +494,56 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         )
 
         self.assertEqual(result["freshness"], "fresh_exact")
+        self.assertEqual(result["freshness_status"], "fresh")
         self.assertEqual(result["bundle"]["git_commit"], head)
         self.assertEqual(result["live_repo"]["head"], head)
         self.assertFalse(result["live_repo"]["dirty"])
+
+    def test_canonical_freshness_prefers_clean_publication_source_checkout(self) -> None:
+        conventional, _head = self._git_repo("demo-repo")
+        conventional.joinpath("dirty.txt").write_text("foreign", encoding="utf-8")
+        source = (
+            self.home
+            / "repos"
+            / ".repoground-sources"
+            / "heimgewebe__demo-repo__main"
+        )
+        source.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=source,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"], cwd=source, check=True
+        )
+        source.joinpath("README.md").write_text("source", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=source, check=True)
+        subprocess.run(["git", "commit", "-qm", "source"], cwd=source, check=True)
+        source_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=source,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/main", source_head],
+            cwd=source,
+            check=True,
+        )
+        self._write_canonical_bundle("demo-repo", commit=source_head)
+
+        result = mcp.repoground_freshness_check("demo-repo")
+
+        self.assertEqual(result["freshness_status"], "fresh")
+        self.assertEqual(
+            result["live_repo"]["source_kind"], "publication_source_checkout"
+        )
+        self.assertEqual(result["live_repo"]["comparison_ref"], "origin/main")
+        self.assertEqual(result["live_repo"]["head"], source_head)
+        self.assertTrue(conventional.joinpath("dirty.txt").exists())
 
     def test_freshness_check_reports_stale_head_for_mismatched_commit(self) -> None:
         _repo, _head = self._git_repo("demo-repo")
@@ -379,6 +554,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         )
 
         self.assertEqual(result["freshness"], "stale_head")
+        self.assertEqual(result["freshness_status"], "stale")
         self.assertEqual(result["reason"], "bundle_commit_differs_from_live_head")
 
     def test_freshness_check_does_not_compare_generator_commit_to_live_head(
@@ -397,6 +573,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         )
 
         self.assertEqual(result["freshness"], "unknown")
+        self.assertEqual(result["freshness_status"], "provenance_missing")
         self.assertEqual(result["reason"], "bundle_source_commit_unavailable")
         self.assertIsNone(result["bundle"]["git_commit"])
         self.assertEqual(
@@ -404,6 +581,19 @@ class RepoGroundBundleToolTests(unittest.TestCase):
             "snapshot_provenance_absent",
         )
         self.assertEqual(result["bundle"]["generator_runtime"]["git_commit"], "b" * 40)
+
+    def test_freshness_statuses_fail_closed_when_source_or_publication_is_missing(self) -> None:
+        self._write_bundle("source-missing-max-260701-1200")
+
+        source_missing = mcp.repoground_freshness_check("source-missing")
+        publication_missing = mcp.repoground_freshness_check("publication-missing")
+
+        self.assertEqual(source_missing["freshness_status"], "source_unavailable")
+        self.assertEqual(source_missing["reason"], "repo_missing_or_invalid")
+        self.assertEqual(
+            publication_missing["freshness_status"], "publication_unavailable"
+        )
+        self.assertEqual(publication_missing["reason"], "no_bundle_found")
 
     def test_invalid_repo_name_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -430,6 +620,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(ref["manifest_sha256"], manifest_sha)
         self.assertEqual(ref["bundle_commit"], head)
         self.assertEqual(ref["live_commit_at_claim"], head)
+        self.assertEqual(ref["freshness_status"], "fresh")
         self.assertEqual(ref["preflight_status"], "pass")
 
     def test_context_pack_rejects_cross_repo_stem(self) -> None:

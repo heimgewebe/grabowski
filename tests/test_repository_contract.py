@@ -309,19 +309,17 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("pyyaml==6.0.3", lock_text)
         self.assertIn("--hash=sha256:", lock_text)
 
-    def test_merges_is_explicitly_read_only(self) -> None:
+    def test_repoground_publication_roots_are_explicitly_read_only(self) -> None:
         policy = json.loads(
             (ROOT / "config" / "access.example.json").read_text(encoding="utf-8")
         )
-        self.assertIn(
+        protected = {
             "${HOME}/repos/merges",
-            policy["write_excluded_roots"],
-        )
+            "${HOME}/repos/manifest-publications",
+        }
+        self.assertTrue(protected <= set(policy["write_excluded_roots"]))
         for profile in policy["profiles"].values():
-            self.assertIn(
-                "${HOME}/repos/merges",
-                profile["write_excluded_roots"],
-            )
+            self.assertTrue(protected <= set(profile["write_excluded_roots"]))
 
     def test_access_profiles_and_capabilities_are_explicit(self) -> None:
         policy = json.loads(

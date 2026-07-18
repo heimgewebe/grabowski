@@ -48,8 +48,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_destroy_path` | filesystem | no | high | Irreversibly remove one regular file or empty directory with a separate explicit capability. |
 | `grabowski_rollback_text` | audit | no | medium | Restore a quarantined preimage from an audited replace transaction. |
 | `grabowski_verify_audit` | audit | yes | low | Verify the tamper-evident write audit hash chain. |
-| `latest_complete_bundles` | knowledge | yes | low | Read the curated latest-complete Lens and repoLens bundle registry. |
-| `repoground_bundle_discover` | knowledge | yes | low | Discover current RepoGround bundles from the immutable local bundle area. |
+| `latest_complete_bundles` | knowledge | yes | low | Read latest RepoGround publications with canonical catalog precedence. |
+| `repoground_bundle_discover` | knowledge | yes | low | Discover current RepoGround bundles from the canonical publication catalog. |
 | `repoground_bundle_status` | knowledge | yes | low | Read bounded manifest, health, and sidecar status for one RepoGround bundle. |
 | `repoground_freshness_check` | knowledge | yes | low | Compare one RepoGround bundle source commit with the current local repository HEAD. |
 | `repoground_preflight` | knowledge | yes | low | Run bounded RepoGround consumption preflight for a selected bundle. |
@@ -189,7 +189,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 - Capabilities: `file_read`, `audit_verify`, `bundle_registry`, `process_inspect`, `port_inspect`, `friction_record`
 - Read roots: `${HOME}/repos`, `${HOME}/grabowski-workspace`, `${HOME}/.local/state/grabowski`
 - Write roots: `none`
-- Read-only exclusions: `${HOME}/repos/merges`
+- Read-only exclusions: `${HOME}/repos/merges`, `${HOME}/repos/manifest-publications`
 - Secret roots: `none`
 - Browser profile roots: `none`
 - Secret export roots: `none`

@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "72163688bfe3661d1295cc325c4a9609a6db0cfc1b7590bf86766e372b362e9f",
+  "capability_source_sha256": "87b5463fcb58632b88f8ea0e2c49dd2c672731e324fc665e1022840156020fdd",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "6a403b6c950a051f65143628ced9a8b1308cacc41a98136aa7b56a59ada66108",
   "integrity": {
@@ -254,10 +254,10 @@
     },
     {
       "category": "knowledge",
-      "description": "Return the curated latest-complete RepoGround bundle registry.",
+      "description": "Return latest RepoGround publications with canonical catalog precedence.",
       "effects": [],
       "id": "latest_complete_bundles",
-      "purpose": "Read the curated latest-complete Lens and repoLens bundle registry.",
+      "purpose": "Read latest RepoGround publications with canonical catalog precedence.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -265,10 +265,10 @@
     },
     {
       "category": "knowledge",
-      "description": "Discover current RepoGround bundles from the immutable local bundle area.",
+      "description": "Discover current RepoGround bundles from the canonical publication catalog.",
       "effects": [],
       "id": "repoground_bundle_discover",
-      "purpose": "Discover current RepoGround bundles from the immutable local bundle area.",
+      "purpose": "Discover current RepoGround bundles from the canonical publication catalog.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -287,7 +287,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Compare one RepoGround bundle source commit with the local repository HEAD.",
+      "description": "Compare one RepoGround publication source commit with the local repository HEAD.",
       "effects": [],
       "id": "repoground_freshness_check",
       "purpose": "Compare one RepoGround bundle source commit with the current local repository HEAD.",

@@ -144,14 +144,14 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "latest_complete_bundles": {
         "category": "knowledge",
-        "purpose": "Read the curated latest-complete Lens and repoLens bundle registry.",
+        "purpose": "Read latest RepoGround publications with canonical catalog precedence.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
     "repoground_bundle_discover": {
         "category": "knowledge",
-        "purpose": "Discover current RepoGround bundles from the immutable local bundle area.",
+        "purpose": "Discover current RepoGround bundles from the canonical publication catalog.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
