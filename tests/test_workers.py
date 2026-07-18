@@ -350,12 +350,14 @@ class WorkerTests(unittest.TestCase):
             "remote_address_sha256": None,
             "cleaned": False,
         }) + "\n"
+        node_target = self.root / "heim-node-tool"
+        node_target.write_text("#!/bin/sh\nexit 0\n")
+        node_target.chmod(0o755)
         node = self.root / "node"
-        node.write_text("#!/bin/sh\nexit 0\n")
-        node.chmod(0o755)
+        node.symlink_to(node_target)
         with patch.object(workers.shutil, "which", return_value=str(node)), patch.object(
             workers.operator, "_run", return_value=result(returncode=2, stdout=output)
-        ):
+        ) as run:
             parsed = workers._run_node_form_action(
                 record,
                 {
@@ -371,6 +373,8 @@ class WorkerTests(unittest.TestCase):
                 timeout_seconds=5,
             )
         self.assertEqual(parsed["result_code"], "transport")
+        self.assertEqual(run.call_args.args[0][0], str(node))
+        self.assertNotEqual(run.call_args.args[0][0], str(node_target))
         instance = Path(record["config_path"]).parent
         self.assertEqual(list(instance.glob(".stored-form-*")), [])
 
