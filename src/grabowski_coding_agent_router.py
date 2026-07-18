@@ -703,6 +703,23 @@ def _harness_quality(route: dict[str, Any], catalog: dict[str, Any]) -> float:
     )
 
 
+def _route_quota_pools(
+    route: dict[str, Any],
+    catalog: dict[str, Any],
+) -> list[str]:
+    """Expand declared pools to their full parent chain, preserving first use."""
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for pool_id in route["quota_pools"]:
+        current: str | None = pool_id
+        while current is not None:
+            if current not in seen:
+                expanded.append(current)
+                seen.add(current)
+            current = catalog["quota_pools"][current].get("parent_pool")
+    return expanded
+
+
 def _score_route(
     route: dict[str, Any],
     task_class: str,
@@ -808,7 +825,7 @@ def _score_route(
 
     scarcity = 0.0
     execution_eligible = True
-    for pool_id in route["quota_pools"]:
+    for pool_id in _route_quota_pools(route, catalog):
         allowed, pool_reasons, pool_scarcity, pool_execution = _pool_gate(
             pool_id, catalog, state, critical=bool(task.get("critical"))
         )

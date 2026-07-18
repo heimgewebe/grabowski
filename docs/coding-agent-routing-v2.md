@@ -26,3 +26,5 @@ Lokale Ergebnisse überschreiben Hersteller- und Benchmark-Priors erst ab fünf 
 Automatische Ausführung bleibt deaktiviert. Empfehlungen sind beratend, ein einzelner mutierender Writer bleibt Pflicht, kritische Reviews müssen aus einer anderen Providerfamilie stammen. PAYG, API-Key- und unbekannte Kostenpfade bleiben gesperrt.
 
 Statische Kosten-, PAYG-, Reserve- und Parallelitätspolitik stammt ausschließlich aus dem versionierten Katalog. Der dynamische Laufzeitstatus darf nur Verfügbarkeit, Restquote, Cooldown, aktive Sitzungen und Verifikationszeit ergänzen. Unbekannte Felder, ungültige Werte oder zukünftige Zeitstempel sperren den betroffenen Pool fail-closed.
+
+Kontingentpools bilden eine Elternkette. Der Router erweitert jeden an einer Route genannten Pool automatisch um alle Elternpools und prüft jeden Pool genau einmal. Sperre, Erschöpfung, Cooldown, Reservegrenze, Parallelitätsgrenze oder Kostenunsicherheit eines Elternpools sperrt damit auch jede Kindroute, selbst wenn der Elternpool in der Route nicht zusätzlich ausgeschrieben ist.

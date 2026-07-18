@@ -339,6 +339,55 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(cline[0])
         self.assertFalse(openrouter[0])
 
+    def test_parent_quota_pool_is_enforced_even_when_route_omits_it(self) -> None:
+        catalog = json.loads(json.dumps(self.catalog))
+        route = next(
+            item for item in catalog["routes"] if item["id"] == "agy-gemini-pro-high"
+        )
+        route["quota_pools"] = ["agy-gemini"]
+        self.assertEqual(
+            router._route_quota_pools(route, catalog),
+            ["agy-gemini", "agy-account"],
+        )
+
+        blocked_parent_states = (
+            {
+                "status": "exhausted",
+                "reset_at": "2099-01-01T00:00:00Z",
+            },
+            {"active_sessions": 2},
+            {"remaining_ratio": 0.10},
+        )
+        expected_reasons = (
+            "agy-account: pool status exhausted",
+            "agy-account: pool concurrency is saturated",
+            "agy-account: reserve floor reached (0.15)",
+        )
+        for parent_state, expected_reason in zip(
+            blocked_parent_states, expected_reasons, strict=True
+        ):
+            with self.subTest(parent_state=parent_state):
+                state = self._fresh_state()
+                state["pools"]["agy-account"] = parent_state
+                score, _, _, reasons, exclusion, execution = router._score_route(
+                    route,
+                    "complex-patch",
+                    catalog,
+                    state,
+                    changed_files=20,
+                    duration_minutes=180,
+                    novelty="high",
+                    risk_flags=[],
+                    latency_priority=False,
+                    reviewer=False,
+                    previous_group=None,
+                    previous_provider=None,
+                )
+                self.assertIsNone(score)
+                self.assertFalse(execution)
+                self.assertIn(expected_reason, exclusion)
+                self.assertIn(expected_reason, reasons)
+
     def test_runtime_pool_state_cannot_override_static_cost_or_payg_policy(
         self,
     ) -> None:
