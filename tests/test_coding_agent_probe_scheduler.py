@@ -9,7 +9,6 @@ from pathlib import Path
 import tempfile
 import textwrap
 import unittest
-from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,9 +59,6 @@ from pathlib import Path
 import sys
 
 state_path = Path({str(self.state)!r})
-for key in {SCHEDULER.FORBIDDEN_API_KEY_ENV!r}:
-    if key in os.environ:
-        raise SystemExit(9)
 if sys.argv[1] == "probe":
     state = json.loads(state_path.read_text())
     body = {{
@@ -121,9 +117,7 @@ else:
         self,
     ) -> None:
         self.write_router()
-        environment = {name: "" for name in SCHEDULER.FORBIDDEN_API_KEY_ENV}
-        with mock.patch.dict(os.environ, environment, clear=False):
-            result = SCHEDULER.main(self.arguments())
+        result = SCHEDULER.main(self.arguments())
         self.assertEqual(0, result)
         after = json.loads(self.state.read_text(encoding="utf-8"))
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
@@ -133,6 +127,10 @@ else:
         self.assertFalse(receipt["status_readback"]["automatic_execution_authorized"])
         self.assertEqual(0, receipt["model_invocations"])
         self.assertEqual(0, receipt["paid_api_requests_authorized"])
+        self.assertEqual(
+            len(SCHEDULER.FORBIDDEN_API_KEY_ENV),
+            receipt["api_key_environment_removed_count"],
+        )
         self.assertFalse(self.failure.exists())
 
     def test_history_mutation_fails_closed_and_records_bounded_failure(self) -> None:

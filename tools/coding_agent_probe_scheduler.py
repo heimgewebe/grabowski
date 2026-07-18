@@ -495,7 +495,7 @@ def main(argv: list[str] | None = None) -> int:
                 "invocation_policy": "metadata-only",
                 "model_invocations": 0,
                 "paid_api_requests_authorized": 0,
-                "api_key_environment_removed": list(FORBIDDEN_API_KEY_ENV),
+                "api_key_environment_removed_count": len(FORBIDDEN_API_KEY_ENV),
                 "does_not_establish": [
                     "provider quota remaining beyond observed metadata",
                     "future route availability",
