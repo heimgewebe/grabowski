@@ -350,7 +350,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "pr-create-or-update": GripSpec(
         name="pr-create-or-update",
-        version="1.1",
+        version="1.2",
         summary="Create or update an open PR with exact published-head and draft-state verification.",
         effect=MUTATING,
         required_parameters=("repo", "branch", "base", "expected_head", "title"),
@@ -2961,10 +2961,14 @@ def _run_pr_create_or_update(
     if viewed.get("baseRefName") != base or viewed.get("headRefName") != branch or viewed.get("headRefOid") != expected_head:
         _check(receipt, "pr_verify", "fail", json.dumps(viewed, sort_keys=True))
         raise GripActionError("PR verification did not match requested branch/base/head")
-    if viewed.get("isDraft") is not draft:
-        _check(receipt, "pr_draft_state", "fail", f"actual={viewed.get('isDraft')!r} expected={draft}")
-        raise GripActionError("PR draft verification did not match requested state")
     _check(receipt, "pr_verify", "pass", str(viewed.get("number")))
+    viewed_draft = viewed.get("isDraft")
+    if not isinstance(viewed_draft, bool):
+        _check(receipt, "pr_draft_state", "fail", f"actual={viewed_draft!r}")
+        raise GripActionError("PR draft state is unavailable during verification")
+    if viewed_draft is not draft:
+        _check(receipt, "pr_draft_state", "fail", f"actual={viewed_draft!r} expected={draft}")
+        raise GripActionError("PR draft verification did not match requested state")
     _check(receipt, "pr_draft_state", "pass", f"draft={draft}")
     return {
         "action": action,
