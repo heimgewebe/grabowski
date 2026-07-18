@@ -28,3 +28,17 @@ Automatische Ausführung bleibt deaktiviert. Empfehlungen sind beratend, ein ein
 Statische Kosten-, PAYG-, Reserve- und Parallelitätspolitik stammt ausschließlich aus dem versionierten Katalog. Der dynamische Laufzeitstatus darf nur Verfügbarkeit, Restquote, Cooldown, aktive Sitzungen und Verifikationszeit ergänzen. Unbekannte Felder, ungültige Werte oder zukünftige Zeitstempel sperren den betroffenen Pool fail-closed.
 
 Kontingentpools bilden eine Elternkette. Der Router erweitert jeden an einer Route genannten Pool automatisch um alle Elternpools und prüft jeden Pool genau einmal. Sperre, Erschöpfung, Cooldown, Reservegrenze, Parallelitätsgrenze oder Kostenunsicherheit eines Elternpools sperrt damit auch jede Kindroute, selbst wenn der Elternpool in der Route nicht zusätzlich ausgeschrieben ist.
+
+## Automatische Katalogaktualisierung
+
+Der Live-Katalog verfällt nach 3.600 Sekunden fail-closed. `grabowski-coding-agent-probe.timer` erneuert ihn deshalb alle 45 Minuten mit höchstens drei Minuten Jitter. Der Timer startet ausschließlich den bestehenden Metadatenpfad `agent-route probe`; er ruft keine Empfehlungs-, Beobachtungs- oder Ausführungsfunktion auf.
+
+`coding_agent_probe_scheduler.py` verlangt zusätzlich einen privaten SHA-256-Pin für die konkrete `agent-route`-Datei, öffnet diese ohne Symlink-Folge und führt beide Unterbefehle über denselben offenen Dateideskriptor aus. Danach entfernt es bekannte API-Key-Variablen aus der Kindprozessumgebung, hält eine nichtblockierende exklusive Sperre, begrenzt Laufzeit und Ausgabemenge und verlangt anschließend einen separaten `agent-route status`-Readback. Vorherige `history`-Daten müssen bytewertgleich in der JSON-Struktur erhalten bleiben. Der Router schreibt den eigentlichen State atomar; der Scheduler publiziert zusätzlich einen privaten atomaren Erfolgs- oder Fehlerbeleg. Ein gescheiterter Probe-Lauf autorisiert keine Ausführung und lässt den Router nach Ablauf der Freshness weiterhin fail-closed.
+
+Die versionierten Installationsquellen sind:
+
+- `tools/coding_agent_probe_scheduler.py`
+- `systemd/grabowski-coding-agent-probe.service.example`
+- `systemd/grabowski-coding-agent-probe.timer.example`
+
+Die Live-Ziele liegen unter `%h/.local/libexec/grabowski/` und `%h/.config/systemd/user/`; der aktuelle Router-Pin liegt privat unter `%h/.config/grabowski/coding-agent-probe-scheduler-router.sha256`. Nur `%h/.local/state/grabowski/coding-agent-router` ist für den Dienst schreibbar. Netzwerkzugriff wird nicht als Qualitäts- oder Modellausführung gewertet; die aufgerufenen Unterbefehle sind auf Versions-, Auth- und Modellinventar-Metadaten beschränkt.
