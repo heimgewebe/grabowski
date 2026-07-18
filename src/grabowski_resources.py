@@ -199,10 +199,27 @@ def _resource_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+class ResourceSchemaInventoryChanged(RuntimeError):
+    pass
+
+
+def _inventory_file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    status = path.stat()
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
 @contextmanager
 def _resource_inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
     wal_path = Path(str(path) + "-wal")
-    immutable = "&immutable=1" if not wal_path.exists() else ""
+    immutable_read = not wal_path.exists()
+    before_identity = _inventory_file_identity(path) if immutable_read else None
+    immutable = "&immutable=1" if immutable_read else ""
     connection = sqlite3.connect(
         path.absolute().as_uri() + f"?mode=ro{immutable}",
         uri=True,
@@ -214,6 +231,17 @@ def _resource_inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connecti
         yield connection
     finally:
         connection.close()
+        if immutable_read:
+            try:
+                after_identity = _inventory_file_identity(path)
+            except FileNotFoundError as exc:
+                raise ResourceSchemaInventoryChanged(
+                    "Store changed while schema inventory was read; retry inventory"
+                ) from exc
+            if wal_path.exists() or after_identity != before_identity:
+                raise ResourceSchemaInventoryChanged(
+                    "Store changed while schema inventory was read; retry inventory"
+                )
 
 
 def _resource_sqlite_integrity(
@@ -364,6 +392,17 @@ def _resource_schema_inventory() -> dict[str, Any]:
                 _validate_resource_schema_current(connection)
             else:
                 _validate_resource_schema_legacy(connection)
+    except ResourceSchemaInventoryChanged as exc:
+        result.update(
+            status="blocked",
+            required_action="retry_schema_inventory",
+            recovery_instruction=(
+                "Retry after the concurrent writer completes; do not mutate the store "
+                "from this inventory result."
+            ),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return result
     except (OSError, RuntimeError, sqlite3.DatabaseError) as exc:
         result.update(
             status="blocked",
