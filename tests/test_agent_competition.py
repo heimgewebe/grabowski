@@ -100,10 +100,20 @@ class AgentCompetitionTests(unittest.TestCase):
             "audit": {},
         }
 
+    def _authorized_start(self, **kwargs):
+        kwargs.setdefault("max_budget_usd", 2.0)
+        kwargs.setdefault("require_hard_budget", kwargs.get("provider") == "claude")
+        with mock.patch.dict(
+            os.environ,
+            {competition.EXTERNAL_PROVIDER_BUDGET_CAP_ENV: "10"},
+            clear=False,
+        ):
+            return competition.grabowski_agent_competition_start(**kwargs)
+
     def _start(self, *, provider: str = "claude", mode: str = "competitor", task: str = "Improve sample") -> dict:
         task_id = f"task-{provider}-{mode}"
         with mock.patch.object(competition.tasks, "grabowski_task_start", return_value=self._task_start(task_id)) as start:
-            result = competition.grabowski_agent_competition_start(
+            result = self._authorized_start(
                 request_id=f"test-{provider}-{mode}",
                 provider=provider,
                 mode=mode,
@@ -531,8 +541,8 @@ class AgentCompetitionTests(unittest.TestCase):
             "timeout_seconds": 120,
         }
         with mock.patch.object(competition.tasks, "grabowski_task_start", return_value=self._task_start(task_id)) as start:
-            first = competition.grabowski_agent_competition_start(**kwargs)
-            second = competition.grabowski_agent_competition_start(**kwargs)
+            first = self._authorized_start(**kwargs)
+            second = self._authorized_start(**kwargs)
         self.assertFalse(first["already_started"])
         self.assertTrue(second["already_started"])
         self.assertEqual(first["competition_id"], second["competition_id"])
@@ -540,7 +550,7 @@ class AgentCompetitionTests(unittest.TestCase):
         changed = dict(kwargs)
         changed["primary_summary"] = "different"
         with self.assertRaisesRegex(competition.AgentCompetitionError, "different competition contract"):
-            competition.grabowski_agent_competition_start(**changed)
+            self._authorized_start(**changed)
 
     def test_request_lock_blocks_overlapping_identical_start_window(self) -> None:
         identifier = "gac-claude-competitor-1111111111-2222222222"
@@ -607,7 +617,7 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertIsNone(status["task"])
         with mock.patch.object(competition.tasks, "grabowski_task_start") as start:
             with self.assertRaisesRegex(competition.AgentCompetitionError, "outcome is unresolved"):
-                competition.grabowski_agent_competition_start(
+                self._authorized_start(
                     request_id=request_id,
                     provider="claude",
                     mode="competitor",
@@ -627,7 +637,7 @@ class AgentCompetitionTests(unittest.TestCase):
         identifier = competition._competition_id("claude", "competitor", task_sha256, request_id)
         with mock.patch.object(competition.tasks, "grabowski_task_start", side_effect=RuntimeError("transport lost")):
             with self.assertRaisesRegex(RuntimeError, "transport lost"):
-                competition.grabowski_agent_competition_start(
+                self._authorized_start(
                     request_id=request_id,
                     provider="claude",
                     mode="competitor",
@@ -670,7 +680,7 @@ class AgentCompetitionTests(unittest.TestCase):
             mock.patch.object(competition.tasks, "grabowski_task_cancel", return_value=cancel_result) as cancel,
         ):
             with self.assertRaisesRegex(competition.AgentCompetitionError, "manifest publish failed"):
-                competition.grabowski_agent_competition_start(
+                self._authorized_start(
                     request_id=request_id,
                     provider="claude",
                     mode="competitor",
@@ -704,7 +714,7 @@ class AgentCompetitionTests(unittest.TestCase):
         competition._atomic_json(intent_path, intent)
         with mock.patch.object(competition.tasks, "grabowski_task_start") as start:
             with self.assertRaisesRegex(competition.AgentCompetitionError, "start intent contract is invalid"):
-                competition.grabowski_agent_competition_start(
+                self._authorized_start(
                     request_id="test-claude-competitor",
                     provider="claude",
                     mode="competitor",
@@ -724,7 +734,7 @@ class AgentCompetitionTests(unittest.TestCase):
         subprocess.run(["git", "commit", "-qm", "add secret-looking path"], cwd=self.repo, check=True)
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
         with self.assertRaisesRegex(competition.AgentCompetitionError, "sensitive-looking allowed"):
-            competition.grabowski_agent_competition_start(
+            self._authorized_start(
                 request_id="test-sensitive-scope",
                 provider="claude",
                 mode="competitor",
@@ -960,13 +970,75 @@ class AgentCompetitionTests(unittest.TestCase):
         )
 
 
+    def test_default_zero_budget_blocks_before_provider_task_start(self) -> None:
+        with mock.patch.object(competition.tasks, "grabowski_task_start") as start:
+            with self.assertRaisesRegex(competition.AgentCompetitionError, "zero-cost policy blocks"):
+                competition.grabowski_agent_competition_start(
+                    request_id="zero-cost-default",
+                    provider="claude",
+                    mode="competitor",
+                    repository=str(self.repo),
+                    expected_head=self.head,
+                    task="Review sample",
+                    allowed_paths=["src", "tests"],
+                    context_paths=["src/sample.py"],
+                    timeout_seconds=120,
+                )
+        start.assert_not_called()
+
+    def test_positive_budget_is_blocked_by_zero_runtime_policy_cap(self) -> None:
+        with (
+            mock.patch.dict(
+                os.environ,
+                {competition.EXTERNAL_PROVIDER_BUDGET_CAP_ENV: "0"},
+                clear=False,
+            ),
+            mock.patch.object(competition.tasks, "grabowski_task_start") as start,
+        ):
+            with self.assertRaisesRegex(competition.AgentCompetitionError, "policy cap of 0 USD"):
+                competition.grabowski_agent_competition_start(
+                    request_id="positive-budget-zero-cap",
+                    provider="claude",
+                    mode="competitor",
+                    repository=str(self.repo),
+                    expected_head=self.head,
+                    task="Review sample",
+                    allowed_paths=["src", "tests"],
+                    context_paths=["src/sample.py"],
+                    timeout_seconds=120,
+                    max_budget_usd=1.0,
+                    require_hard_budget=True,
+                )
+        start.assert_not_called()
+
+    def test_invalid_runtime_budget_cap_fails_closed(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {competition.EXTERNAL_PROVIDER_BUDGET_CAP_ENV: "not-a-number"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(competition.AgentCompetitionError, "must be a finite number"):
+                competition.grabowski_agent_competition_start(
+                    request_id="invalid-runtime-cap",
+                    provider="claude",
+                    mode="competitor",
+                    repository=str(self.repo),
+                    expected_head=self.head,
+                    task="Review sample",
+                    allowed_paths=["src", "tests"],
+                    context_paths=["src/sample.py"],
+                    timeout_seconds=120,
+                    max_budget_usd=1.0,
+                    require_hard_budget=True,
+                )
+
     def test_agy_budget_contract_is_explicit_and_hard_requirement_fails_closed(self) -> None:
         started = self._start(provider="agy")
         self.assertFalse(started["budget_contract"]["hard_limit"])
         self.assertEqual(started["budget_contract"]["enforcement"], "not_supported_by_provider")
         self.assertTrue(started["budget_contract"]["timeout_is_not_budget"])
         with self.assertRaisesRegex(competition.AgentCompetitionError, "cannot enforce a hard USD budget"):
-            competition.grabowski_agent_competition_start(
+            self._authorized_start(
                 request_id="agy-hard-budget",
                 provider="agy",
                 mode="contrast",
@@ -1011,7 +1083,7 @@ class AgentCompetitionTests(unittest.TestCase):
             mock.patch.object(competition.tasks, "grabowski_task_start", side_effect=RuntimeError("transport lost")),
             mock.patch.object(competition.tasks, "grabowski_task_list", side_effect=task_list),
         ):
-            result = competition.grabowski_agent_competition_start(
+            result = self._authorized_start(
                 request_id=request_id,
                 provider="claude",
                 mode="competitor",
@@ -1059,7 +1131,7 @@ class AgentCompetitionTests(unittest.TestCase):
             mock.patch.object(competition.tasks, "grabowski_task_list", side_effect=task_list),
         ):
             with self.assertRaisesRegex(RuntimeError, "transport lost"):
-                competition.grabowski_agent_competition_start(
+                self._authorized_start(
                     request_id=request_id,
                     provider="claude",
                     mode="competitor",
@@ -1140,7 +1212,7 @@ class AgentCompetitionTests(unittest.TestCase):
 
     def test_default_forbidden_allowed_scope_is_rejected(self) -> None:
         with self.assertRaisesRegex(competition.AgentCompetitionError, "default-forbidden allowed"):
-            competition.grabowski_agent_competition_start(
+            self._authorized_start(
                 request_id="forbidden-tree",
                 provider="claude",
                 mode="competitor",
@@ -1185,7 +1257,7 @@ class AgentCompetitionTests(unittest.TestCase):
             ),
             mock.patch.object(competition.tasks, "grabowski_task_cancel") as cancel,
         ):
-            result = competition.grabowski_agent_competition_start(
+            result = self._authorized_start(
                 request_id="manifest-readback",
                 provider="claude",
                 mode="competitor",
@@ -1365,7 +1437,7 @@ class AgentCompetitionTests(unittest.TestCase):
             path.unlink()
             competition._atomic_json(path, value)
         with mock.patch.object(competition.tasks, "grabowski_task_start") as start:
-            repeated = competition.grabowski_agent_competition_start(
+            repeated = self._authorized_start(
                 request_id="test-claude-competitor",
                 provider="claude",
                 mode="competitor",
