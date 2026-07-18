@@ -459,6 +459,9 @@ class WorkerTests(unittest.TestCase):
         self.assertIs(action.call_args_list[1].args[1]["cleanup_only"], True)
         record = append.call_args.args[0]
         self.assertEqual(record["result_code"], "protocol")
+        self.assertIs(record["outcome_known"], False)
+        self.assertIsNone(record["ok"])
+        self.assertIsNone(record["submitted"])
         self.assertTrue(record["cleaned"])
         self.assertNotIn("untrusted internal detail", json.dumps(record))
         self.assertIsNone(
