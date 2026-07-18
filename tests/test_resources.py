@@ -1410,6 +1410,84 @@ class ResourceTests(unittest.TestCase):
         )
         self.assertEqual([], self._resource_migration_backups())
 
+    def test_resource_schema_only_inventory_reports_migration_without_mutation(self) -> None:
+        self._create_resource_schema_v1()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_names = sorted(item.name for item in self.database.parent.iterdir())
+        inventory = resources.grabowski_resource_list(schema_only=True)
+        self.assertEqual("resources", inventory["store"])
+        self.assertEqual("1", inventory["observed_version"])
+        self.assertEqual("2", inventory["current_version"])
+        self.assertEqual(["1", "2"], inventory["supported_versions"])
+        self.assertEqual("migration_required", inventory["status"])
+        self.assertTrue(inventory["migration_required"])
+        self.assertFalse(inventory["write_compatible"])
+        self.assertFalse(inventory["mutation_performed"])
+        self.assertEqual(
+            [{
+                "from": "1",
+                "to": "2",
+                "lock": "exclusive_store_directory",
+                "transaction": "immediate",
+                "verified_backup_required": True,
+            }],
+            inventory["migration_path"],
+        )
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(before_names, sorted(item.name for item in self.database.parent.iterdir()))
+        self.assertEqual([], self._resource_migration_backups())
+        with self.assertRaisesRegex(ValueError, "schema_only must be boolean"):
+            resources.grabowski_resource_list(schema_only=1)
+
+    def test_current_resource_schema_inventory_is_byte_stable(self) -> None:
+        connection = resources._database()
+        connection.close()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_names = sorted(item.name for item in self.database.parent.iterdir())
+        inventory = resources.grabowski_resource_list(schema_only=True)
+        self.assertEqual("2", inventory["observed_version"])
+        self.assertEqual("current", inventory["status"])
+        self.assertTrue(inventory["write_compatible"])
+        self.assertFalse(inventory["migration_required"])
+        self.assertEqual("none", inventory["required_action"])
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(before_names, sorted(item.name for item in self.database.parent.iterdir()))
+
+    def test_resource_schema_inventory_reads_uncheckpointed_future_wal(self) -> None:
+        connection = resources._database()
+        connection.close()
+        keeper = sqlite3.connect(self.database)
+        try:
+            self.assertEqual("wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+            keeper.execute(
+                "UPDATE metadata SET value='3' WHERE key='schema_version'"
+            )
+            keeper.commit()
+            wal = Path(str(self.database) + "-wal")
+            self.assertTrue(wal.exists())
+            before_database = self.database.read_bytes()
+            before_wal = wal.read_bytes()
+            before_names = sorted(item.name for item in self.database.parent.iterdir())
+            inventory = resources.grabowski_resource_list(schema_only=True)
+            self.assertEqual("3", inventory["observed_version"])
+            self.assertEqual("unsupported_future", inventory["status"])
+            self.assertFalse(inventory["write_compatible"])
+            self.assertFalse(inventory["mutation_performed"])
+            self.assertIsNotNone(inventory["recovery_instruction"])
+            self.assertEqual(before_database, self.database.read_bytes())
+            self.assertEqual(before_wal, wal.read_bytes())
+            self.assertEqual(
+                before_names,
+                sorted(item.name for item in self.database.parent.iterdir()),
+            )
+            self.assertEqual([], self._resource_migration_backups())
+        finally:
+            keeper.close()
+
     def test_resource_backup_includes_committed_uncheckpointed_wal_data(self) -> None:
         resource_key, _ = self._create_resource_schema_v1()
         keeper = sqlite3.connect(self.database)

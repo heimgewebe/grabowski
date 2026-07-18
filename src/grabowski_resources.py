@@ -161,6 +161,13 @@ RESOURCE_LEASE_SHAPE = (
 RESOURCE_SCHEMA_V2_TABLES = frozenset({
     "metadata", "leases", "task_terminalizations", "task_authority_adoptions",
 })
+RESOURCE_CURRENT_SCHEMA_VERSION = "2"
+RESOURCE_SUPPORTED_SCHEMA_VERSIONS = ("1", "2")
+RESOURCE_SCHEMA_MIGRATION_PATHS = {"1": ("1", RESOURCE_CURRENT_SCHEMA_VERSION)}
+RESOURCE_SCHEMA_RECOVERY_INSTRUCTION = (
+    "Keep the resource store unchanged; use a runtime that explicitly supports "
+    "the observed schema or restore a verified backup before retrying."
+)
 
 
 @contextmanager
@@ -181,6 +188,23 @@ def _resource_schema_directory_lock(parent: Path) -> Iterator[None]:
 def _resource_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(
         path.absolute().as_uri() + "?mode=ro",
+        uri=True,
+        timeout=1,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+@contextmanager
+def _resource_inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
+    wal_path = Path(str(path) + "-wal")
+    immutable = "&immutable=1" if not wal_path.exists() else ""
+    connection = sqlite3.connect(
+        path.absolute().as_uri() + f"?mode=ro{immutable}",
         uri=True,
         timeout=1,
     )
@@ -289,6 +313,84 @@ def _validate_resource_schema_current(connection: sqlite3.Connection) -> None:
     if _resource_table_shape(connection, "leases") != RESOURCE_LEASE_SHAPE:
         raise RuntimeError("Unsupported resource database schema")
     _validate_additive_schema_v2(connection)
+
+
+def _resource_schema_inventory() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "store": "resources",
+        "database": str(RESOURCE_DB),
+        "observed_version": None,
+        "current_version": RESOURCE_CURRENT_SCHEMA_VERSION,
+        "supported_versions": list(RESOURCE_SUPPORTED_SCHEMA_VERSIONS),
+        "status": "uninitialized",
+        "migration_required": False,
+        "migration_path": [],
+        "write_compatible": False,
+        "mutation_performed": False,
+        "required_action": "initialize_on_first_write",
+        "recovery_instruction": None,
+    }
+    if not RESOURCE_DB.exists():
+        return result
+    if RESOURCE_DB.is_symlink() or not RESOURCE_DB.is_file():
+        result.update(
+            status="blocked",
+            required_action="inspect_store_path",
+            recovery_instruction=RESOURCE_SCHEMA_RECOVERY_INSTRUCTION,
+            error="Resource database must be a regular non-symlink file",
+        )
+        return result
+    if RESOURCE_DB.stat().st_size == 0:
+        return result
+    try:
+        with _resource_inventory_readonly_sqlite(RESOURCE_DB) as connection:
+            _resource_sqlite_integrity(connection, "Resource database", quick=True)
+            observed = _resource_schema_version(connection)
+            result["observed_version"] = observed
+            if observed not in RESOURCE_SUPPORTED_SCHEMA_VERSIONS:
+                future = (
+                    observed is not None
+                    and observed.isdecimal()
+                    and int(observed) > int(RESOURCE_CURRENT_SCHEMA_VERSION)
+                )
+                result.update(
+                    status="unsupported_future" if future else "unsupported_schema",
+                    required_action="upgrade_runtime_or_restore_verified_backup",
+                    recovery_instruction=RESOURCE_SCHEMA_RECOVERY_INSTRUCTION,
+                )
+                return result
+            if observed == RESOURCE_CURRENT_SCHEMA_VERSION:
+                _validate_resource_schema_current(connection)
+            else:
+                _validate_resource_schema_legacy(connection)
+    except (OSError, RuntimeError, sqlite3.DatabaseError) as exc:
+        result.update(
+            status="blocked",
+            required_action="restore_or_inspect_store",
+            recovery_instruction=RESOURCE_SCHEMA_RECOVERY_INSTRUCTION,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return result
+    if observed == RESOURCE_CURRENT_SCHEMA_VERSION:
+        result.update(status="current", write_compatible=True, required_action="none")
+        return result
+    path = RESOURCE_SCHEMA_MIGRATION_PATHS[observed]
+    result.update(
+        status="migration_required",
+        migration_required=True,
+        migration_path=[
+            {
+                "from": path[0],
+                "to": path[1],
+                "lock": "exclusive_store_directory",
+                "transaction": "immediate",
+                "verified_backup_required": True,
+            }
+        ],
+        required_action="open_with_current_runtime_to_migrate",
+    )
+    return result
 
 
 def _validate_resource_backup(
@@ -3214,9 +3316,14 @@ def grabowski_resource_list(
     owner_id: str | None = None,
     include_expired: bool = False,
     limit: int = 200,
+    schema_only: bool = False,
 ) -> dict[str, Any]:
-    """List bounded resource leases, optionally filtered by owner."""
+    """List bounded leases or inspect store-schema compatibility read-only."""
     operator._require_operator_capability("resource_lease")
+    if not isinstance(schema_only, bool):
+        raise ValueError("schema_only must be boolean")
+    if schema_only:
+        return _resource_schema_inventory()
     leases = list_resources(
         owner_id=owner_id,
         include_expired=include_expired,
