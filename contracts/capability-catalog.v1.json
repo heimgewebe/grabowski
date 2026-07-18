@@ -254,7 +254,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Return latest RepoGround publications with canonical catalog precedence.",
+      "description": "Return latest healthy RepoGround publications from one catalog resolution.",
       "effects": [],
       "id": "latest_complete_bundles",
       "purpose": "Read latest RepoGround publications with canonical catalog precedence.",
@@ -265,7 +265,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Discover current RepoGround bundles from the canonical publication catalog.",
+      "description": "Discover healthy RepoGround bundles from one deterministic publication catalog.",
       "effects": [],
       "id": "repoground_bundle_discover",
       "purpose": "Discover current RepoGround bundles from the canonical publication catalog.",
@@ -276,7 +276,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Return bounded manifest, health and sidecar status for one RepoGround bundle.",
+      "description": "Return bounded status for one uniquely identified RepoGround bundle.",
       "effects": [],
       "id": "repoground_bundle_status",
       "purpose": "Read bounded manifest, health, and sidecar status for one RepoGround bundle.",
@@ -287,7 +287,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Compare one RepoGround publication source commit with the local repository HEAD.",
+      "description": "Compare one healthy RepoGround publication with its local source identity.",
       "effects": [],
       "id": "repoground_freshness_check",
       "purpose": "Compare one RepoGround bundle source commit with the current local repository HEAD.",

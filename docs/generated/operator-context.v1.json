@@ -242,7 +242,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Return latest RepoGround publications with canonical catalog precedence.",
+      "description": "Return latest healthy RepoGround publications from one catalog resolution.",
       "effects": [],
       "id": "latest_complete_bundles",
       "purpose": "Read latest RepoGround publications with canonical catalog precedence.",
@@ -253,7 +253,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Discover current RepoGround bundles from the canonical publication catalog.",
+      "description": "Discover healthy RepoGround bundles from one deterministic publication catalog.",
       "effects": [],
       "id": "repoground_bundle_discover",
       "purpose": "Discover current RepoGround bundles from the canonical publication catalog.",
@@ -264,7 +264,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Return bounded manifest, health and sidecar status for one RepoGround bundle.",
+      "description": "Return bounded status for one uniquely identified RepoGround bundle.",
       "effects": [],
       "id": "repoground_bundle_status",
       "purpose": "Read bounded manifest, health, and sidecar status for one RepoGround bundle.",
@@ -275,7 +275,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Compare one RepoGround publication source commit with the local repository HEAD.",
+      "description": "Compare one healthy RepoGround publication with its local source identity.",
       "effects": [],
       "id": "repoground_freshness_check",
       "purpose": "Compare one RepoGround bundle source commit with the current local repository HEAD.",
@@ -2486,7 +2486,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "60e2d9cf334ff70adba9ac57bf136d6382b619e2681447b225db9743f6d4a385",
+      "src/grabowski_mcp.py": "e1594303164c66a3a05ab56ca9d990c84999177ec18bb65171ea86f75059f5d8",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
@@ -2498,7 +2498,7 @@
       "src/grabowski_read_surface.py": "c4f633a3303d08ac4916c034dc6d5c86d872daa7628704f3e1ba5b4d070917ac",
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
       "src/grabowski_recovery.py": "1c5b0843345f5aa7d1da7f3f0c5831e647f652c83eba7733b4a2c998d291c16d",
-      "src/grabowski_repobrief.py": "dd76e9eb7d9ae95010e0379f7b63ab9cf76f8ed886263ca2871ae7c8610cd38c",
+      "src/grabowski_repobrief.py": "a51936edf0f5b1da32e7b396696da81429cf5dc03d0a773852c6b3e35ce44d36",
       "src/grabowski_resources.py": "d846feceb40f297561ade6fa1d39bc5831f8e5d59365ba90d55aa6430f5f6489",
       "src/grabowski_runtime.py": "cf83bd1d3578fbd94f6b447e8862d15ca656adc54eaf32e66e255b1115f842da",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",

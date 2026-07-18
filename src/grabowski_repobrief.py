@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 from typing import Any, Callable
 
+import grabowski_repoground_catalog as repoground_catalog
+
 MAX_MANIFEST_BYTES = 1_000_000
 DEFAULT_PUBLICATION_ROOT = Path(
     os.environ.get(
@@ -50,9 +52,13 @@ def optional_git(repo: Path, runner: CommandRunner, argv: list[str]) -> dict[str
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
 
-def ref_candidates(repo: Path, runner: CommandRunner, orientation: dict[str, Any]) -> list[str]:
+def ref_candidates(
+    repo: Path, runner: CommandRunner, orientation: dict[str, Any]
+) -> list[str]:
     candidates: list[str] = []
-    origin_head = optional_git(repo, runner, ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
+    origin_head = optional_git(
+        repo, runner, ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"]
+    )
     if origin_head.get("returncode") == 0:
         raw = str(origin_head.get("stdout") or "").strip()
         if raw.startswith("origin/"):
@@ -91,7 +97,9 @@ def _resolve_bounded(base: Path, raw: str, *, kind: str) -> Path:
     return resolved
 
 
-def sidecar_path(manifest: dict[str, Any], manifest_path: Path, role: str) -> str | None:
+def sidecar_path(
+    manifest: dict[str, Any], manifest_path: Path, role: str
+) -> str | None:
     manifest_base = manifest_path.parent.resolve()
     artifacts = manifest.get("artifacts")
     bundle = manifest.get("bundleManifest")
@@ -131,42 +139,55 @@ def sidecar_path(manifest: dict[str, Any], manifest_path: Path, role: str) -> st
     return None
 
 
+def _publication_roots(publication_root: Path) -> tuple[Path, Path]:
+    if publication_root.name == "bundles":
+        return publication_root, publication_root.parent
+    nested = publication_root / "bundles"
+    canonical_root = (
+        nested if nested.is_dir() and not nested.is_symlink() else publication_root
+    )
+    return canonical_root, publication_root
+
+
+def _canonical_manifest_resolution(
+    publication_root: Path, repository: str
+) -> dict[str, Any]:
+    disabled_legacy_root = publication_root / ".repoground-no-legacy-fallback"
+    return repoground_catalog.resolve_catalog(
+        publication_root, disabled_legacy_root, repo=repository
+    )
+
+
 def _canonical_manifest_candidates(
     publication_root: Path, repository: str, refs: list[str]
 ) -> list[tuple[str, Path]]:
-    if publication_root.is_symlink() or not publication_root.is_dir():
-        return []
-    root = publication_root.resolve()
-    repo_root = publication_root / f"heimgewebe__{repository}"
+    resolution = _canonical_manifest_resolution(publication_root, repository)
     candidates: list[tuple[str, Path]] = []
-    for ref in refs:
-        ref_root = repo_root / ref
-        if ref_root.is_symlink() or not ref_root.is_dir():
-            continue
-        for manifest_path in ref_root.glob("*/*_merge.bundle.manifest.json"):
-            if not manifest_path.is_file() or manifest_path.is_symlink():
-                continue
-            resolved = manifest_path.resolve()
-            if _relative_to(resolved, root):
-                candidates.append((ref, manifest_path))
-    candidates.sort(
-        key=lambda item: (item[1].stat().st_mtime, item[1].name), reverse=True
-    )
+    for item in resolution.get("selected", []):
+        ref = item.get("ref")
+        manifest_path = item.get("manifest_path")
+        if ref in refs and isinstance(ref, str) and isinstance(manifest_path, str):
+            candidates.append((ref, Path(manifest_path)))
     return candidates
 
 
-def _legacy_manifest_path(
-    publication_root: Path, repository: str, ref: str
-) -> Path:
-    return publication_root / "external" / "repobrief" / repository / ref / "manifest.json"
+def _legacy_manifest_path(publication_root: Path, repository: str, ref: str) -> Path:
+    return (
+        publication_root / "external" / "repobrief" / repository / ref / "manifest.json"
+    )
 
-def read_manifest(manifest_path: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+
+def read_manifest(
+    manifest_path: Path,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     try:
         size = manifest_path.stat().st_size
     except FileNotFoundError:
         return None, unavailable("missing", manifest_path=str(manifest_path))
     except OSError as exc:
-        return None, unavailable("manifest_read_error", manifest_path=str(manifest_path), reason=str(exc))
+        return None, unavailable(
+            "manifest_read_error", manifest_path=str(manifest_path), reason=str(exc)
+        )
     if size > MAX_MANIFEST_BYTES:
         return None, unavailable(
             "manifest_too_large",
@@ -179,11 +200,21 @@ def read_manifest(manifest_path: Path) -> tuple[dict[str, Any] | None, dict[str,
     except FileNotFoundError:
         return None, unavailable("missing", manifest_path=str(manifest_path))
     except json.JSONDecodeError:
-        return None, unavailable("invalid_manifest", manifest_path=str(manifest_path), reason="manifest is not valid JSON")
+        return None, unavailable(
+            "invalid_manifest",
+            manifest_path=str(manifest_path),
+            reason="manifest is not valid JSON",
+        )
     except OSError as exc:
-        return None, unavailable("manifest_read_error", manifest_path=str(manifest_path), reason=str(exc))
+        return None, unavailable(
+            "manifest_read_error", manifest_path=str(manifest_path), reason=str(exc)
+        )
     if not isinstance(parsed, dict):
-        return None, unavailable("invalid_manifest", manifest_path=str(manifest_path), reason="manifest root must be an object")
+        return None, unavailable(
+            "invalid_manifest",
+            manifest_path=str(manifest_path),
+            reason="manifest root must be an object",
+        )
     return parsed, None
 
 
@@ -193,6 +224,7 @@ def _freshness_status(snapshot_commit: object, current_head: object) -> str:
     if not isinstance(current_head, str) or not current_head:
         return "source_unavailable"
     return "fresh" if snapshot_commit == current_head else "stale"
+
 
 def context(
     repo: Path,
@@ -238,15 +270,34 @@ def context(
             freshness_status="publication_unavailable",
         )
 
+    canonical_root, legacy_root = _publication_roots(publication_root)
     refs = ref_candidates(repo, runner, orientation)
-    canonical = _canonical_manifest_candidates(publication_root, repo_segment, refs)
+    canonical_resolution = _canonical_manifest_resolution(canonical_root, repo_segment)
+    canonical = _canonical_manifest_candidates(canonical_root, repo_segment, refs)
     candidates: list[tuple[str, Path, str]] = [
         (ref, manifest_path, "canonical_publication")
         for ref, manifest_path in canonical
     ]
+    canonical_identities = (canonical_resolution.get("aliases") or {}).get(
+        repo_segment, []
+    )
+    if not candidates and canonical_identities:
+        return unavailable(
+            "canonical_publication_unavailable",
+            repository=repo_segment,
+            publication_root=str(canonical_root),
+            freshness_status="publication_unavailable",
+            reason=canonical_resolution.get("reason"),
+            rejected_candidates=canonical_resolution.get("rejected", []),
+            ambiguous_candidates=canonical_resolution.get("ambiguous_candidates", []),
+        )
     if not candidates:
         candidates.extend(
-            (ref, _legacy_manifest_path(publication_root, repo_segment, ref), "legacy_repobrief_fallback")
+            (
+                ref,
+                _legacy_manifest_path(legacy_root, repo_segment, ref),
+                "legacy_repobrief_fallback",
+            )
             for ref in refs
         )
 
