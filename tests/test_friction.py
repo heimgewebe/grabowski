@@ -361,6 +361,41 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(recommendation["title"], "Add connector transport diagnostics")
         self.assertEqual(recommendation["evidence_event_ids"], ["transport-1", "transport-2"])
 
+    def test_connector_transport_history_bounds_pre_runtime_http_404_recovery(self) -> None:
+        module = self._load_module()
+        events = [
+            {
+                "event_id": "pre-runtime-404",
+                "kind": "connector_transport",
+                "surface": "connector",
+                "operation": "runtime health",
+                "symptom": "MCP tunnel returned HTTP 404 before any Grabowski receipt",
+                "resolved": False,
+            },
+            {
+                "event_id": "latency-only",
+                "kind": "connector_transport",
+                "surface": "connector",
+                "operation": "runtime health",
+                "symptom": "request completed after 404 ms",
+                "resolved": False,
+            },
+        ]
+
+        diagnostics = module.connector_transport_diagnostics(events)
+
+        self.assertEqual(diagnostics["schema_version"], 2)
+        self.assertEqual(diagnostics["historical_http_status_counts"], {"404": 1})
+        recovery = diagnostics["pre_runtime_http_404_recovery"]
+        self.assertEqual(recovery["catalog_refresh_limit"], 1)
+        self.assertEqual(recovery["read_only_retry_limit"], 1)
+        self.assertIn("stop before mutation", recovery["sequence"][-1])
+        self.assertIn("not root-cause proof", recovery["success_semantics"])
+        self.assertIn(
+            "retry exactly one small typed read-only call",
+            diagnostics["split_retry_policy"]["pre_runtime_http_404_rule"],
+        )
+
     def test_connector_transport_live_diagnostics_captures_bounded_runtime_receipt(self) -> None:
         module = self._load_module()
         module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
