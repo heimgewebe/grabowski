@@ -1350,7 +1350,7 @@
     },
     {
       "category": "resource",
-      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest. An\nexplicit emergency-recovery lease remains a deliberately exclusive\nfail-closed exception and cannot be used for non-conflict bypasses.",
+      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest. An\nexplicit emergency-recovery lease remains a deliberately exclusive\nfail-closed exception and cannot be used for non-conflict bypasses. Self-scoped\nbranch and operation keys are authoritative and reject scope manifests.",
       "effects": [
         "lease-create",
         "possible-expired-lease-reclaim"
@@ -2358,13 +2358,13 @@
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
       "src/grabowski_recovery.py": "1c5b0843345f5aa7d1da7f3f0c5831e647f652c83eba7733b4a2c998d291c16d",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
-      "src/grabowski_resources.py": "079be47b2d5c4f6def6fe2936340b7a89389edf2a67318a22dba510c46cac621",
+      "src/grabowski_resources.py": "04ad5b51fdf26a3b30100f46a340ba23498aab14dd4e658bcca53e465568309b",
       "src/grabowski_runtime.py": "aeda349023314b1ce8690ab034c161d659be146b1c80569e409b2ad57680f98e",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "b8d92b82b762b763941735ef6c1b87ecad78ab60166eeaf5dbd8ac66f4325258",
       "src/grabowski_task_attention.py": "8833353556737cce9cae01b080cf5b1093d7df9f54472c893da6b6df8cbb1ad4",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "9be975b445ad75961ff904316ea7d2489754d85b6dff0826f0c1bef7eca41214",
+      "src/grabowski_tasks.py": "3a288eef1d4a4721d074bfc97a65b054526e22d45d4784afec67dedcf81bf099",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "ce59a39a703b20517cd36681ef613b753b9ef819d7c3095e6c1ee7b66010b73e",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"

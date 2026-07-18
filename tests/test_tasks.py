@@ -1200,6 +1200,41 @@ class TaskTests(unittest.TestCase):
             r"^[0-9a-f]{64}$",
         )
 
+    def test_broad_repository_task_path_with_scope_marker_is_attested(self) -> None:
+        for marker in ("branch", "operation"):
+            with self.subTest(marker=marker):
+                repository = self.root / f"repo:{marker}:literal"
+                repository.mkdir()
+                (repository / ".git").write_text("gitdir: /tmp/task-marker-repo\n")
+                key = f"repo:{repository}"
+                with patch.object(
+                    tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+                ), patch.object(
+                    tasks, "_dispatch", return_value=_launcher()
+                ), patch.object(tasks.base, "_append_audit"), patch.object(
+                    tasks, "_require_recovery_gate", return_value={"checked_at_unix": 163}
+                ):
+                    result = tasks.grabowski_task_start(
+                        "local",
+                        ["/bin/true"],
+                        cwd=str(repository),
+                        runtime_seconds=60,
+                        resource_keys=[key],
+                    )
+                with sqlite3.connect(self.resource_database) as connection:
+                    metadata = json.loads(
+                        connection.execute(
+                            "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+                        ).fetchone()[0]
+                    )
+                self.assertIs(metadata["scope_manifest_complete"], True)
+                self.assertEqual(
+                    metadata["scope_manifest"]["repository"], str(repository)
+                )
+                tasks.resources.release_resources(
+                    result["task"]["lease_owner_id"], [key]
+                )
+
     def test_scoped_repository_task_key_binds_underlying_repository(self) -> None:
         key = f"repo:{self.root}:branch:feat/scoped-task"
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(

@@ -798,8 +798,7 @@ def _task_repository_resource(resource_keys: list[str]) -> str | None:
         key
         for key in resource_keys
         if key.startswith("repo:")
-        and ":branch:" not in key
-        and ":operation:" not in key
+        and resources._scoped_repository_resource_root(key) is None
     ]
     if not broad_repository_keys:
         return None

@@ -1362,7 +1362,7 @@
     },
     {
       "category": "resource",
-      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest. An\nexplicit emergency-recovery lease remains a deliberately exclusive\nfail-closed exception and cannot be used for non-conflict bypasses.",
+      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest. An\nexplicit emergency-recovery lease remains a deliberately exclusive\nfail-closed exception and cannot be used for non-conflict bypasses. Self-scoped\nbranch and operation keys are authoritative and reject scope manifests.",
       "effects": [
         "lease-create",
         "possible-expired-lease-reclaim"
