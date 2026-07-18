@@ -13,6 +13,8 @@ an Worker, kanonischen lokalen Origin und eine explizite Bestätigung gebunden.
 - Brave oder Chromium übernimmt das gespeicherte Ausfüllen über vertrauenswürdige CDP-Eingabeereignisse.
 - Toolantwort und Audit enthalten nur Boolesche Ergebnisse, kanonische Origins und SHA-256-Digests; keine Feldinhalte, Rohselektoren, Query-Strings oder Fragmente.
 - Bei fehlender Füllung, Protokollfehler oder nicht beobachtbarer Submit-Wirkung werden beide Zielfelder geleert.
+- Validierte Fehlversuche liefern ein strukturiertes `ok: false`-Receipt mit tatsächlichen Teilwirkungen und Cleanup-Status; interne Fehlertexte werden nicht ausgegeben.
+- Nach erfolgreicher Auslösung gilt der Cleanup als erfüllt, wenn das Formular verschwunden ist oder verbliebene Zielfelder unmittelbar geleert wurden.
 - Eine eigene Worker-Aktionslease verhindert parallele Formularaktionen.
 - Vor dem ersten CDP-Eingriff wird ein hashgebundener Audit-Intent dauerhaft geschrieben.
 - Der Action-Scope-Hash bindet Worker, Origin, alle drei Selektoren und die optionale Identitätsauswahl.

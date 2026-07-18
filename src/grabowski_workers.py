@@ -902,6 +902,7 @@ try {
     cleaned = await clearFields();
     throw new Error('post-origin');
   }
+  cleaned = formDisappeared ? true : await clearFields();
 
   emit({
     schema_version: 1,
@@ -915,7 +916,7 @@ try {
     post_origin: post ? post.origin : request.expected_origin,
     post_path_sha256: post ? digest(post.path) : null,
     remote_address_sha256: remoteAddressSha256,
-    cleaned: false,
+    cleaned,
   });
   }
 } catch (error) {
@@ -1316,14 +1317,11 @@ def browser_stored_form_action(
     }
     base._append_audit(audit)
     audit_sha256 = base._verify_audit_log(base.AUDIT_LOG)["last_record_sha256"]
-    if action_error is not None:
-        raise RuntimeError("browser stored-form action failed: protocol") from action_error
-    if payload["ok"] is not True:
-        raise RuntimeError(f"browser stored-form action failed: {payload['result_code']}")
     if payload["post_origin"] not in {None, origin}:
         raise RuntimeError("browser stored-form action changed to an unexpected origin")
     return {
         "schema_version": 1,
+        "ok": payload["ok"],
         "action_id": action_id,
         "worker_id": identifier,
         "expected_origin": origin,

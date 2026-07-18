@@ -261,6 +261,7 @@ class WorkerTests(unittest.TestCase):
                     choice="operator",
                 ),
             )
+        self.assertTrue(response["ok"])
         self.assertTrue(response["submitted"])
         self.assertNotIn("#identity", json.dumps(response))
         self.assertNotIn("#protected", json.dumps(response))
@@ -319,15 +320,17 @@ class WorkerTests(unittest.TestCase):
         ), patch.object(workers.base, "_append_audit") as append, patch.object(
             workers.base, "_verify_audit_log", return_value={"last_record_sha256": "c" * 64}
         ), patch.object(workers, "_observe", return_value={"state": "running", "properties": {}, "probe": result(), "observed_at_unix": 1}):
-            with self.assertRaisesRegex(RuntimeError, "browser-fill"):
-                workers.browser_stored_form_action(
-                    worker["worker_id"],
-                    expected_origin="http://device.home.arpa",
-                    identity_selector="#identity",
-                    protected_selector="#protected",
-                    submit_selector="button",
-                    confirmation=self._confirmation(worker["worker_id"]),
-                )
+            response = workers.browser_stored_form_action(
+                worker["worker_id"],
+                expected_origin="http://device.home.arpa",
+                identity_selector="#identity",
+                protected_selector="#protected",
+                submit_selector="button",
+                confirmation=self._confirmation(worker["worker_id"]),
+            )
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["result_code"], "browser-fill")
+        self.assertTrue(response["cleaned"])
         self.assertTrue(append.call_args.args[0]["cleaned"])
 
     def test_node_action_removes_private_request_files(self) -> None:
@@ -440,16 +443,17 @@ class WorkerTests(unittest.TestCase):
             "_observe",
             return_value={"state": "running", "properties": {}, "probe": result(), "observed_at_unix": 1},
         ):
-            with self.assertRaisesRegex(RuntimeError, "failed: protocol") as failure:
-                workers.browser_stored_form_action(
-                    worker["worker_id"],
-                    expected_origin="http://device.home.arpa",
-                    identity_selector="#identity",
-                    protected_selector="#protected",
-                    submit_selector="button",
-                    confirmation=self._confirmation(worker["worker_id"]),
-                )
-        self.assertNotIn("untrusted internal detail", str(failure.exception))
+            response = workers.browser_stored_form_action(
+                worker["worker_id"],
+                expected_origin="http://device.home.arpa",
+                identity_selector="#identity",
+                protected_selector="#protected",
+                submit_selector="button",
+                confirmation=self._confirmation(worker["worker_id"]),
+            )
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["result_code"], "protocol")
+        self.assertNotIn("untrusted internal detail", json.dumps(response))
         self.assertEqual(action.call_count, 2)
         self.assertEqual(append.call_count, 2)
         self.assertIs(action.call_args_list[1].args[1]["cleanup_only"], True)
@@ -492,15 +496,17 @@ class WorkerTests(unittest.TestCase):
             "_observe",
             return_value={"state": "running", "properties": {}, "probe": result(), "observed_at_unix": 1},
         ):
-            with self.assertRaisesRegex(RuntimeError, "element-contract"):
-                workers.browser_stored_form_action(
-                    worker["worker_id"],
-                    expected_origin="http://device.home.arpa",
-                    identity_selector="#identity",
-                    protected_selector="#protected",
-                    submit_selector="button",
-                    confirmation=self._confirmation(worker["worker_id"]),
-                )
+            response = workers.browser_stored_form_action(
+                worker["worker_id"],
+                expected_origin="http://device.home.arpa",
+                identity_selector="#identity",
+                protected_selector="#protected",
+                submit_selector="button",
+                confirmation=self._confirmation(worker["worker_id"]),
+            )
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["result_code"], "element-contract")
+        self.assertTrue(response["cleaned"])
 
     def test_stored_form_confirmation_changes_with_every_selector(self) -> None:
         worker = self._running_browser(port=9340)
