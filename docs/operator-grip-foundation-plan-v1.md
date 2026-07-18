@@ -175,7 +175,7 @@ Build these first because they reduce the most repeated friction.
    - structured push to a work branch with expected head, remote verification and receipt.
 
 6. `pr-create-or-update`
-   - create or update PR with title/body/base/head receipt.
+   - create or update a PR with exact title/body/base/head and requested draft state, then verify branch, base, head and `isDraft` from GitHub. Omitting `draft` preserves an existing PR's state and defaults only a newly created PR to ready.
 
 ### Wave 2: High-impact grips
 

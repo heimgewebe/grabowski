@@ -350,8 +350,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "pr-create-or-update": GripSpec(
         name="pr-create-or-update",
-        version="1.0",
-        summary="Create or update an open PR for the current published work branch.",
+        version="1.1",
+        summary="Create or update an open PR with exact published-head and draft-state verification.",
         effect=MUTATING,
         required_parameters=("repo", "branch", "base", "expected_head", "title"),
         acceptance_ids=("acceptance-1", "acceptance-2"),
@@ -2838,6 +2838,9 @@ def _run_pr_create_or_update(
         body = body_value
     else:
         raise GripPreflightError("body parameter must be a string when provided")
+    requested_draft: bool | None = None
+    if "draft" in parameters:
+        requested_draft = _bool_parameter(parameters, "draft", False)
     protected = parameters.get("protected_branches", ["main", "master"])
     if not isinstance(protected, list) or not all(isinstance(item, str) for item in protected):
         raise GripPreflightError("protected_branches must be a list of strings")
@@ -2887,7 +2890,7 @@ def _run_pr_create_or_update(
             "--state",
             "open",
             "--json",
-            "number,url,baseRefName,headRefName,headRefOid",
+            "number,url,baseRefName,headRefName,headRefOid,isDraft",
         ],
     ))
     existing = _open_pr_from_stdout(lookup)
@@ -2898,16 +2901,48 @@ def _run_pr_create_or_update(
         if existing.get("headRefOid") != expected_head:
             _check(receipt, "pr_head", "fail", f"actual={existing.get('headRefOid')} expected={expected_head}")
             raise GripPreflightError("existing PR head does not match expected_head")
+        existing_draft = existing.get("isDraft")
+        if not isinstance(existing_draft, bool):
+            _check(receipt, "existing_pr_draft_state", "fail", f"actual={existing_draft!r}")
+            raise GripActionError("existing PR draft state is unavailable")
+        _check(receipt, "existing_pr_draft_state", "pass", f"draft={existing_draft}")
+        draft = existing_draft if requested_draft is None else requested_draft
         _check(receipt, "existing_pr", "pass", str(existing.get("number")))
         edit_args = ["pr", "edit", str(existing["number"]), "--title", title]
         if body:
             edit_args.extend(["--body", body])
         _github(repo, github_runner, edit_args)
+        if requested_draft is None:
+            _check(receipt, "pr_draft_transition", "skip", f"request omitted; preserved draft={draft}")
+        elif existing_draft != draft:
+            ready_args = ["pr", "ready", str(existing["number"])]
+            if draft:
+                ready_args.append("--undo")
+            _github(repo, github_runner, ready_args)
+            _check(receipt, "pr_draft_transition", "pass", f"draft={draft}")
+        else:
+            _check(receipt, "pr_draft_transition", "skip", f"already draft={draft}")
         action = "updated"
         view_target = str(existing["number"])
     else:
         _check(receipt, "existing_pr", "skip", "no open PR for branch")
-        _github(repo, github_runner, ["pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body])
+        draft = False if requested_draft is None else requested_draft
+        create_args = [
+            "pr",
+            "create",
+            "--base",
+            base,
+            "--head",
+            branch,
+            "--title",
+            title,
+            "--body",
+            body,
+        ]
+        if draft:
+            create_args.append("--draft")
+        _github(repo, github_runner, create_args)
+        _check(receipt, "pr_draft_transition", "skip", f"created draft={draft}")
         action = "created"
         view_target = branch
     viewed = _json_stdout(_github(
@@ -2926,8 +2961,20 @@ def _run_pr_create_or_update(
     if viewed.get("baseRefName") != base or viewed.get("headRefName") != branch or viewed.get("headRefOid") != expected_head:
         _check(receipt, "pr_verify", "fail", json.dumps(viewed, sort_keys=True))
         raise GripActionError("PR verification did not match requested branch/base/head")
+    if viewed.get("isDraft") is not draft:
+        _check(receipt, "pr_draft_state", "fail", f"actual={viewed.get('isDraft')!r} expected={draft}")
+        raise GripActionError("PR draft verification did not match requested state")
     _check(receipt, "pr_verify", "pass", str(viewed.get("number")))
-    return {"action": action, "pr": viewed, "branch": branch, "base": base, "head": expected_head}
+    _check(receipt, "pr_draft_state", "pass", f"draft={draft}")
+    return {
+        "action": action,
+        "pr": viewed,
+        "branch": branch,
+        "base": base,
+        "head": expected_head,
+        "draft": draft,
+        "draft_requested": requested_draft,
+    }
 
 
 def _github_repo_from_remote_url(value: str) -> str | None:
