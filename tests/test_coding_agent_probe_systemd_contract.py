@@ -40,6 +40,32 @@ class CodingAgentProbeSystemdContractTests(unittest.TestCase):
         self.assertNotIn("agent-route recommend", unit)
         self.assertNotIn("agent-route observe", unit)
 
+    def test_user_service_avoids_capability_mutating_hardening(self) -> None:
+        unit = (SYSTEMD / "grabowski-coding-agent-probe.service.example").read_text(
+            encoding="utf-8"
+        )
+        # On the supported heim-pc user manager these directives terminate before
+        # ExecStart with status 218/CAPABILITIES. The remaining sandbox controls
+        # still provide read-only home/system access and a scoped writable state dir.
+        for incompatible_directive in (
+            "PrivateDevices=yes",
+            "ProtectKernelModules=yes",
+            "ProtectKernelLogs=yes",
+        ):
+            self.assertNotIn(incompatible_directive, unit)
+        for compatible_directive in (
+            "NoNewPrivileges=yes",
+            "PrivateTmp=yes",
+            "ProtectSystem=strict",
+            "ProtectHome=read-only",
+            "ProtectKernelTunables=yes",
+            "ProtectControlGroups=yes",
+            "RestrictSUIDSGID=yes",
+            "LockPersonality=yes",
+            "RestrictRealtime=yes",
+        ):
+            self.assertIn(compatible_directive, unit)
+
     def test_timer_refreshes_inside_the_one_hour_freshness_window(self) -> None:
         timer = (SYSTEMD / "grabowski-coding-agent-probe.timer.example").read_text(
             encoding="utf-8"
