@@ -1493,7 +1493,7 @@
     },
     {
       "category": "browser-worker",
-      "description": "Use browser-managed stored form data on one exact local origin and submit it.\n\nConfirmation must be one line containing the authorization prefix,\nworker id, canonical origin and the exact action-scope SHA-256. The result never\nreturns field contents, raw selectors, query strings or URL fragments.",
+      "description": "Use browser-managed stored form data on one exact local origin.\n\nConfirmation must be one line containing the authorization prefix,\nworker id, canonical origin and the exact action-scope SHA-256. The result never\nreturns field contents, raw selectors, query strings or URL fragments.\nReadiness mode verifies fill and clears the fields without submitting.",
       "effects": [
         "browser-input",
         "form-submit",
