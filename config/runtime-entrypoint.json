@@ -117,6 +117,7 @@
     "grabowski_artifact_push",
     "grabowski_artifact_pull",
     "grabowski_browser_worker_start",
+    "grabowski_browser_worker_stored_form_action",
     "grabowski_browser_worker_status",
     "grabowski_browser_worker_stop",
     "grabowski_browser_worker_list",

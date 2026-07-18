@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "c6a8526262f4eb0ba792d01ff063628f62fa9b3198815541a2881868d3bc3d13",
+  "capability_source_sha256": "21d6c6b1f7a1cbd83965ca2174ab1bcaebb72f9abc796dcdbb98e1dc5f0ead3d",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "cb5d6d196ea7d494b87448ae2790f64c5c008302ca85d8633c3b9a4da4e86067",
+  "contract_sha256": "61f5d0966448bd031a01a9b410b21cefc67e4a6b84a8045191d58ba83b5ba796",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1490,6 +1490,21 @@
       "reversibility": "worker-stop",
       "risk_class": "high",
       "tool": "grabowski_browser_worker_start"
+    },
+    {
+      "category": "browser-worker",
+      "description": "Use browser-managed stored form data on one exact local origin and submit it.\n\nConfirmation must be one line containing the authorization prefix,\nworker id, canonical origin and the exact action-scope SHA-256. The result never\nreturns field contents, raw selectors, query strings or URL fragments.",
+      "effects": [
+        "browser-input",
+        "form-submit",
+        "local-device-state-change"
+      ],
+      "id": "grabowski_browser_worker_stored_form_action",
+      "purpose": "Use browser-managed stored form data on one exact local-device origin without returning field contents.",
+      "read_only": false,
+      "reversibility": "target-dependent; fields cleared on failed or unobserved submission",
+      "risk_class": "high",
+      "tool": "grabowski_browser_worker_stored_form_action"
     },
     {
       "category": "browser-worker",

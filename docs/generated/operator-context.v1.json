@@ -1481,6 +1481,21 @@
     },
     {
       "category": "browser-worker",
+      "description": "Use browser-managed stored form data on one exact local origin and submit it.\n\nConfirmation must be one line containing the authorization prefix,\nworker id, canonical origin and the exact action-scope SHA-256. The result never\nreturns field contents, raw selectors, query strings or URL fragments.",
+      "effects": [
+        "browser-input",
+        "form-submit",
+        "local-device-state-change"
+      ],
+      "id": "grabowski_browser_worker_stored_form_action",
+      "purpose": "Use browser-managed stored form data on one exact local-device origin without returning field contents.",
+      "read_only": false,
+      "reversibility": "target-dependent; fields cleared on failed or unobserved submission",
+      "risk_class": "high",
+      "tool": "grabowski_browser_worker_stored_form_action"
+    },
+    {
+      "category": "browser-worker",
       "description": "Observe one isolated browser worker and release terminal leases.",
       "effects": [
         "state-refresh",
@@ -2052,6 +2067,7 @@
       "grabowski_artifact_push",
       "grabowski_artifact_pull",
       "grabowski_browser_worker_start",
+      "grabowski_browser_worker_stored_form_action",
       "grabowski_browser_worker_status",
       "grabowski_browser_worker_stop",
       "grabowski_browser_worker_list",
@@ -2290,7 +2306,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "c6a8526262f4eb0ba792d01ff063628f62fa9b3198815541a2881868d3bc3d13"
+      "sha256": "21d6c6b1f7a1cbd83965ca2174ab1bcaebb72f9abc796dcdbb98e1dc5f0ead3d"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2298,7 +2314,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "cb5d6d196ea7d494b87448ae2790f64c5c008302ca85d8633c3b9a4da4e86067"
+      "sha256": "61f5d0966448bd031a01a9b410b21cefc67e4a6b84a8045191d58ba83b5ba796"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2314,7 +2330,7 @@
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "c6a8526262f4eb0ba792d01ff063628f62fa9b3198815541a2881868d3bc3d13",
+      "src/grabowski_capabilities.py": "21d6c6b1f7a1cbd83965ca2174ab1bcaebb72f9abc796dcdbb98e1dc5f0ead3d",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "da41759813e9cf14bb7df17861c60ffb90a9369177d2bcd45c79df663b121bb2",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
@@ -2329,7 +2345,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "a670c71d7b0b0d1cf44d92b8486a5dd568b797976eb3e371ca380a40658671fe",
+      "src/grabowski_mcp.py": "ffcb8b7249cb49e2add7a9a306c25d18abd61293181e5133ccd1bdb8817c2a7f",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
@@ -2350,7 +2366,7 @@
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
       "src/grabowski_tasks.py": "973ee1b35ce7a48085e8c7afced184e06bf90555fa64d1dba7a8f9cb93f7c34e",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
-      "src/grabowski_workers.py": "9051739e6d1d9b900181ecde39809845cb04578f5bf6960df6e51955ab6419ef",
+      "src/grabowski_workers.py": "f6d1e24ce0aa602f1f5051f0c12f2ca47b83b5d31da16c9ff5234454fd6dbeba",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"
     }
   }

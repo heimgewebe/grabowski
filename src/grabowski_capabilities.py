@@ -757,6 +757,13 @@ TOOL_PROFILES.update(
                                                 'profile-create-or-use',
                                                 'loopback-listener'],
                                     'reversibility': 'worker-stop'},
+ 'grabowski_browser_worker_stored_form_action': {'category': 'browser-worker',
+                                                  'purpose': 'Use browser-managed stored form data on one exact local-device origin without returning field contents.',
+                                                  'risk_class': 'high',
+                                                  'effects': ['browser-input',
+                                                              'form-submit',
+                                                              'local-device-state-change'],
+                                                  'reversibility': 'target-dependent; fields cleared on failed or unobserved submission'},
  'grabowski_browser_worker_status': {'category': 'browser-worker',
                                      'purpose': 'Observe one isolated browser worker and reconcile '
                                                 'terminal leases.',
