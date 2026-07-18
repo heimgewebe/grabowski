@@ -9,10 +9,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import selectors
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Iterator
 
 
@@ -35,6 +38,11 @@ DEFAULT_FAILURE = DEFAULT_STATE_DIR / "probe-scheduler-failure.json"
 MAX_STATE_BYTES = 16 * 1024 * 1024
 MAX_ROUTER_BYTES = 2 * 1024 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
+IO_CHUNK_BYTES = 64 * 1024
+PRIVATE_DIRECTORY_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+SPECIAL_PERMISSION_BITS = stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+PROCESS_TERMINATION_GRACE_SECONDS = 2
 FORBIDDEN_API_KEY_ENV = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -114,7 +122,7 @@ def read_json(path: Path, *, required: bool = True) -> tuple[dict[str, Any], byt
         chunks: list[bytes] = []
         remaining = before.st_size
         while remaining:
-            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            chunk = os.read(descriptor, min(remaining, IO_CHUNK_BYTES))
             if not chunk:
                 raise ProbeSchedulerError(f"JSON file ended early: {path}")
             chunks.append(chunk)
@@ -168,6 +176,8 @@ def read_expected_router_sha256(path: Path) -> str:
             raise ProbeSchedulerError("router digest pin has an unexpected owner")
         if before.st_mode & 0o077:
             raise ProbeSchedulerError("router digest pin must be private")
+        if before.st_mode & SPECIAL_PERMISSION_BITS:
+            raise ProbeSchedulerError("router digest pin has unsafe special mode bits")
         if before.st_size < 64 or before.st_size > 128:
             raise ProbeSchedulerError("router digest pin has an invalid size")
         payload = os.read(descriptor, before.st_size + 1)
@@ -202,27 +212,62 @@ def read_expected_router_sha256(path: Path) -> str:
 
 
 def atomic_write_private(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
-    payload = json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        dir=path.parent,
-        text=True,
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=PRIVATE_DIRECTORY_MODE,
     )
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        directory_descriptor = os.open(path.parent, directory_flags)
+    except OSError as exc:
+        raise ProbeSchedulerError(
+            f"cannot open private output directory: {path.parent}"
+        ) from exc
+    temporary_descriptor = -1
+    temporary_name = ""
+    try:
+        directory_metadata = os.fstat(directory_descriptor)
+        if not stat.S_ISDIR(directory_metadata.st_mode):
+            raise ProbeSchedulerError("private output parent is not a directory")
+        if directory_metadata.st_uid != os.getuid():
+            raise ProbeSchedulerError("private output parent has an unexpected owner")
+        os.fchmod(directory_descriptor, PRIVATE_DIRECTORY_MODE)
+        payload = json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+        temporary_descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=path.parent,
+            text=True,
+        )
+        temporary_name = Path(temporary).name
+        os.fchmod(temporary_descriptor, PRIVATE_FILE_MODE)
+        handle = os.fdopen(temporary_descriptor, "w", encoding="utf-8")
+        temporary_descriptor = -1
+        with handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        temporary_name = ""
+        os.fsync(directory_descriptor)
     finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        if temporary_name:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+            except FileNotFoundError:
+                pass
+        os.close(directory_descriptor)
 
 
 def safe_unlink(path: Path) -> None:
@@ -232,7 +277,10 @@ def safe_unlink(path: Path) -> None:
         return
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
         raise ProbeSchedulerError(f"refusing to remove unsafe path: {path}")
-    path.unlink()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 @contextmanager
@@ -280,6 +328,8 @@ def validated_router(
             raise ProbeSchedulerError("router executable has an unexpected owner")
         if before.st_mode & 0o022:
             raise ProbeSchedulerError("router executable is group- or world-writable")
+        if before.st_mode & SPECIAL_PERMISSION_BITS:
+            raise ProbeSchedulerError("router executable has unsafe special mode bits")
         if before.st_mode & 0o111 == 0:
             raise ProbeSchedulerError("router executable is not executable")
         if before.st_size < 1 or before.st_size > MAX_ROUTER_BYTES:
@@ -322,6 +372,66 @@ def sanitized_environment() -> dict[str, str]:
     return environment
 
 
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def collect_bounded_process_output(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: int,
+    command_name: str,
+) -> tuple[bytes, bytes]:
+    if process.stdout is None or process.stderr is None:
+        raise ProbeSchedulerError("command pipes were not created")
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    selector = selectors.DefaultSelector()
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, data=name)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command_name, timeout_seconds)
+            for key, _ in selector.select(timeout=min(remaining, 0.25)):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), IO_CHUNK_BYTES)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                buffer = buffers[key.data]
+                if len(buffer) + len(chunk) > MAX_COMMAND_OUTPUT_BYTES:
+                    raise ProbeSchedulerError(
+                        f"command output exceeded the limit: {command_name}"
+                    )
+                buffer.extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and process.poll() is None:
+            raise subprocess.TimeoutExpired(command_name, timeout_seconds)
+        process.wait(timeout=max(remaining, 0.001))
+        return bytes(buffers["stdout"]), bytes(buffers["stderr"])
+    finally:
+        selector.close()
+
+
 def run_json_command(
     argv: list[str],
     *,
@@ -329,30 +439,41 @@ def run_json_command(
     timeout_seconds: int,
     pass_fds: tuple[int, ...] = (),
 ) -> dict[str, Any]:
+    process: subprocess.Popen[bytes] | None = None
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             argv,
-            check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
-            timeout=timeout_seconds,
             pass_fds=pass_fds,
+            bufsize=0,
+            start_new_session=True,
         )
+        try:
+            stdout, _stderr = collect_bounded_process_output(
+                process,
+                timeout_seconds=timeout_seconds,
+                command_name=argv[-1],
+            )
+        except BaseException:
+            terminate_process_group(process)
+            raise
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ProbeSchedulerError(f"command failed to execute: {argv[-1]}") from exc
-    if (
-        len(completed.stdout) > MAX_COMMAND_OUTPUT_BYTES
-        or len(completed.stderr) > MAX_COMMAND_OUTPUT_BYTES
-    ):
-        raise ProbeSchedulerError(f"command output exceeded the limit: {argv[-1]}")
-    if completed.returncode != 0:
+    finally:
+        if process is not None:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+    if process.returncode != 0:
         raise ProbeSchedulerError(
             f"command returned nonzero status for {argv[-1]} "
-            f"(exit {completed.returncode})"
+            f"(exit {process.returncode})"
         )
     try:
-        value = json.loads(completed.stdout.decode("utf-8"))
+        value = json.loads(stdout.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProbeSchedulerError(f"command did not return JSON: {argv[-1]}") from exc
     if not isinstance(value, dict):

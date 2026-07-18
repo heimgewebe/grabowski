@@ -23,6 +23,8 @@ class CodingAgentProbeSystemdContractTests(unittest.TestCase):
         self.assertIn("NoNewPrivileges=yes", unit)
         self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("ProtectHome=read-only", unit)
+        self.assertIn("MemoryMax=512M", unit)
+        self.assertIn("TasksMax=50", unit)
         self.assertIn(
             "ReadWritePaths=%h/.local/state/grabowski/coding-agent-router",
             unit,
