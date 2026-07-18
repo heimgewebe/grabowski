@@ -333,6 +333,18 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(response["cleaned"])
         self.assertTrue(append.call_args.args[0]["cleaned"])
 
+    def test_node_executable_preserves_public_symlink_name(self) -> None:
+        target = self.root / "heim-node-tool"
+        target.write_text("#!/bin/sh\nexit 0\n")
+        target.chmod(0o755)
+        public = self.root / "node"
+        public.symlink_to(target)
+        with patch.object(workers.shutil, "which", return_value=str(public)):
+            selected = workers._node_executable()
+        self.assertEqual(selected, public)
+        self.assertNotEqual(selected, target)
+        self.assertEqual(selected.name, "node")
+
     def test_node_action_removes_private_request_files(self) -> None:
         worker = self._running_browser(port=9336)
         record = workers._row(worker["worker_id"])
@@ -549,6 +561,28 @@ class WorkerTests(unittest.TestCase):
                     confirmation=self._confirmation(worker["worker_id"]),
                 )
         action.assert_not_called()
+
+    def test_stored_form_helper_arms_reload_waiters_before_reload(self) -> None:
+        source = workers.BROWSER_FORM_NODE_SOURCE
+        document_waiter = source.index(
+            "const documentResponsePromise = waitEvent('Network.responseReceived'"
+        )
+        load_waiter = source.index(
+            "const loadEventPromise = waitEvent('Page.loadEventFired')"
+        )
+        reload_call = source.index("call('Page.reload', {ignoreCache: true})")
+        joined_wait = source.index("const [, documentResponse] = await Promise.all([")
+        self.assertLess(document_waiter, reload_call)
+        self.assertLess(load_waiter, reload_call)
+        self.assertLess(joined_wait, reload_call)
+        self.assertIn("if (eventQueue.length > 128) eventQueue.shift();", source)
+
+    def test_stored_form_helper_preserves_verified_remote_digest_on_later_failure(self) -> None:
+        source = workers.BROWSER_FORM_NODE_SOURCE
+        self.assertIn("let remoteAddressSha256 = null;", source)
+        self.assertIn("remoteAddressSha256 = digest(remoteAddress);", source)
+        failure = source.rsplit("} catch (error) {", 1)[1]
+        self.assertIn("remote_address_sha256: remoteAddressSha256", failure)
 
     def test_stored_form_helper_uses_topmost_pointer_and_guarded_enter(self) -> None:
         source = workers.BROWSER_FORM_NODE_SOURCE

@@ -538,6 +538,7 @@ let submitted = false;
 let actionEffectObserved = false;
 let navigationObserved = false;
 let formDisappeared = false;
+let remoteAddressSha256 = null;
 
 function emit(payload, status = 0) {
   process.stdout.write(JSON.stringify(payload) + '\n');
@@ -740,20 +741,24 @@ try {
   const mainFrameId = frameTree.frameTree && frameTree.frameTree.frame
     ? frameTree.frameTree.frame.id : null;
   if (!mainFrameId) throw new Error('protocol');
-  await call('Page.reload', {ignoreCache: true});
-  const documentResponse = await waitEvent('Network.responseReceived', (params) => {
+  const documentResponsePromise = waitEvent('Network.responseReceived', (params) => {
     if (params.type !== 'Document' || params.frameId !== mainFrameId ||
         !params.response || typeof params.response.url !== 'string') return false;
     try { return new URL(params.response.url).origin === request.expected_origin; }
     catch { return false; }
   });
-  await waitEvent('Page.loadEventFired');
+  const loadEventPromise = waitEvent('Page.loadEventFired');
+  const [, documentResponse] = await Promise.all([
+    call('Page.reload', {ignoreCache: true}),
+    documentResponsePromise,
+    loadEventPromise,
+  ]);
   const remoteAddress = String(documentResponse.response.remoteIPAddress || '')
     .split('%', 1)[0].replace(/^\[|\]$/g, '');
   if (!remoteAddress || !request.allowed_addresses.includes(remoteAddress)) {
     throw new Error('target-origin');
   }
-  const remoteAddressSha256 = digest(remoteAddress);
+  remoteAddressSha256 = digest(remoteAddress);
   await sleep(100);
 
   if (request.cleanup_only === true) {
@@ -936,7 +941,7 @@ try {
     form_disappeared: formDisappeared,
     post_origin: null,
     post_path_sha256: null,
-    remote_address_sha256: null,
+    remote_address_sha256: remoteAddressSha256,
     cleaned,
   }, 2);
 } finally {
@@ -1033,15 +1038,27 @@ def _write_private_action_file(path: Path, payload: str) -> None:
         os.close(descriptor)
 
 
+def _node_executable() -> Path:
+    raw = shutil.which("node")
+    if not raw:
+        raise RuntimeError("Node.js is required for browser CDP actions")
+    public = Path(raw)
+    if not public.is_absolute() or public.name != "node":
+        raise PermissionError("Node.js public executable path is invalid")
+    resolved = public.resolve(strict=True)
+    metadata = resolved.stat()
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(public, os.X_OK):
+        raise PermissionError("Node.js executable target is unsafe")
+    return public
+
+
 def _run_node_form_action(
     record: dict[str, Any],
     request: dict[str, Any],
     *,
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    node = shutil.which("node")
-    if not node:
-        raise RuntimeError("Node.js is required for browser CDP actions")
+    node = _node_executable()
     directory = Path(record["config_path"]).parent
     if directory.is_symlink() or WORKER_STATE not in directory.parents:
         raise PermissionError("worker action directory is outside worker state")
@@ -1055,7 +1072,7 @@ def _run_node_form_action(
         _write_private_action_file(request_path, _canonical_json(request) + "\n")
         created.append(request_path)
         execution = operator._run(
-            [str(Path(node).resolve(strict=True)), str(script_path), str(request_path)],
+            [str(node), str(script_path), str(request_path)],
             cwd=directory,
             timeout_seconds=timeout_seconds + 10,
             max_output_bytes=65536,
