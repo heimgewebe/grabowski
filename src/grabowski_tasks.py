@@ -821,7 +821,6 @@ def _open_current_task_database() -> sqlite3.Connection:
     connection = _connect_existing_task_database()
     connection.row_factory = sqlite3.Row
     try:
-        _sqlite_integrity(connection, "Task database", quick=True)
         if _task_schema_version(connection) != "5":
             raise RuntimeError(
                 "Task database schema changed while opening; retry with a compatible runtime"
@@ -2812,6 +2811,16 @@ def grabowski_task_list(
     if not isinstance(schema_only, bool):
         raise ValueError("schema_only must be boolean")
     if schema_only:
+        if (
+            limit != 20
+            or state is not None
+            or view != "minimal"
+            or cursor is not None
+            or fields is not None
+        ):
+            raise ValueError(
+                "schema_only cannot be combined with task-list filters or projections"
+            )
         return _task_schema_inventory()
     selected_view = consumer_surface.normalize_view(view)
     _recover_pending_task_terminalizations()

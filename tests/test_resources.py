@@ -1440,6 +1440,8 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual([], self._resource_migration_backups())
         with self.assertRaisesRegex(ValueError, "schema_only must be boolean"):
             resources.grabowski_resource_list(schema_only=1)
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            resources.grabowski_resource_list(schema_only=True, owner_id="task:test")
 
     def test_current_resource_schema_inventory_is_byte_stable(self) -> None:
         connection = resources._database()
@@ -1447,6 +1449,15 @@ class ResourceTests(unittest.TestCase):
         before = self.database.read_bytes()
         before_stat = self.database.stat()
         before_names = sorted(item.name for item in self.database.parent.iterdir())
+        original_integrity = resources._resource_sqlite_integrity
+        with patch.object(
+            resources,
+            "_resource_sqlite_integrity",
+            wraps=original_integrity,
+        ) as integrity:
+            connection = resources._database()
+            connection.close()
+        self.assertEqual(1, integrity.call_count)
         inventory = resources.grabowski_resource_list(schema_only=True)
         self.assertEqual("2", inventory["observed_version"])
         self.assertEqual("current", inventory["status"])
