@@ -6,9 +6,13 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
+import sys
 import tempfile
 import textwrap
+import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -176,6 +180,114 @@ else:
         self.assertEqual(0, result)
         self.assertFalse(self.receipt.exists())
         self.assertFalse(self.failure.exists())
+
+    def test_router_special_mode_bits_fail_before_execution(self) -> None:
+        for special_bit in (stat.S_ISUID, stat.S_ISGID, stat.S_ISVTX):
+            with self.subTest(special_bit=oct(special_bit)):
+                self.write_router()
+                os.chmod(self.router, 0o700 | special_bit)
+                before = self.state.read_bytes()
+                result = SCHEDULER.main(self.arguments())
+                self.assertEqual(1, result)
+                self.assertEqual(before, self.state.read_bytes())
+                self.assertFalse(self.receipt.exists())
+                self.failure.unlink(missing_ok=True)
+
+    def test_router_digest_pin_special_mode_bits_fail_closed(self) -> None:
+        for special_bit in (stat.S_ISUID, stat.S_ISGID, stat.S_ISVTX):
+            with self.subTest(special_bit=oct(special_bit)):
+                self.write_router()
+                os.chmod(self.router_digest, 0o600 | special_bit)
+                before = self.state.read_bytes()
+                result = SCHEDULER.main(self.arguments())
+                self.assertEqual(1, result)
+                self.assertEqual(before, self.state.read_bytes())
+                self.assertFalse(self.receipt.exists())
+                self.failure.unlink(missing_ok=True)
+
+    def test_router_symlink_is_rejected_before_execution(self) -> None:
+        self.write_router()
+        real_router = self.root / "agent-route.real"
+        self.router.replace(real_router)
+        self.router.symlink_to(real_router)
+        before = self.state.read_bytes()
+        result = SCHEDULER.main(self.arguments())
+        self.assertEqual(1, result)
+        self.assertEqual(before, self.state.read_bytes())
+        self.assertFalse(self.receipt.exists())
+
+    def test_unreadable_state_fails_closed(self) -> None:
+        self.write_router()
+        os.chmod(self.state, 0o000)
+        try:
+            result = SCHEDULER.main(self.arguments())
+        finally:
+            os.chmod(self.state, 0o600)
+        self.assertEqual(1, result)
+        self.assertFalse(self.receipt.exists())
+        self.assertTrue(self.failure.exists())
+
+    def test_command_output_is_rejected_before_unbounded_buffering(self) -> None:
+        environment = dict(os.environ)
+        programs = {
+            "stdout": "import sys; sys.stdout.write('x' * 4096)",
+            "stderr": "import sys; sys.stderr.write('x' * 4096)",
+        }
+        for stream, program in programs.items():
+            with (
+                self.subTest(stream=stream),
+                mock.patch.object(SCHEDULER, "MAX_COMMAND_OUTPUT_BYTES", 1024),
+                self.assertRaisesRegex(
+                    SCHEDULER.ProbeSchedulerError,
+                    "command output exceeded the limit",
+                ),
+            ):
+                SCHEDULER.run_json_command(
+                    [sys.executable, "-c", program],
+                    environment=environment,
+                    timeout_seconds=5,
+                )
+
+    def test_command_timeout_terminates_the_child_process_group(self) -> None:
+        started = time.monotonic()
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError,
+            "command failed to execute",
+        ):
+            SCHEDULER.run_json_command(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                environment=dict(os.environ),
+                timeout_seconds=1,
+            )
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_invalid_command_json_fails_closed(self) -> None:
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError,
+            "command did not return JSON",
+        ):
+            SCHEDULER.run_json_command(
+                [sys.executable, "-c", "print('not-json')"],
+                environment=dict(os.environ),
+                timeout_seconds=5,
+            )
+
+    def test_atomic_write_uses_private_mode_without_path_chmod(self) -> None:
+        target = self.root / "nested" / "private.json"
+        with mock.patch.object(
+            SCHEDULER.os,
+            "chmod",
+            side_effect=AssertionError("path chmod is unsafe"),
+        ):
+            SCHEDULER.atomic_write_private(target, {"ok": True})
+        self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
+        self.assertEqual({"ok": True}, json.loads(target.read_text(encoding="utf-8")))
+
+    def test_safe_unlink_tolerates_disappearance_after_lstat(self) -> None:
+        target = self.root / "vanishing.json"
+        target.write_text("{}", encoding="utf-8")
+        with mock.patch.object(Path, "unlink", side_effect=FileNotFoundError):
+            SCHEDULER.safe_unlink(target)
 
 
 if __name__ == "__main__":

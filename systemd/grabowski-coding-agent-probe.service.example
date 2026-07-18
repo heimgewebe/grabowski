@@ -10,6 +10,8 @@ Type=oneshot
 ExecStart=%h/.local/libexec/grabowski/coding_agent_probe_scheduler.py
 TimeoutStartSec=3min
 TimeoutStopSec=10s
+MemoryMax=512M
+TasksMax=50
 KillMode=mixed
 UMask=0077
 Environment=PYTHONUNBUFFERED=1
