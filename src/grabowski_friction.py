@@ -435,10 +435,15 @@ CONNECTOR_DIAGNOSTIC_UNITS = (
 CONNECTOR_HTTP_STATUS_KEYS = (
     "status",
     "status_code",
+    "statusCode",
     "http_status",
     "http_status_code",
+    "httpStatus",
+    "httpStatusCode",
     "response_status",
     "response_code",
+    "responseStatus",
+    "responseCode",
 )
 CONNECTOR_ACTIVITY_MESSAGES = {
     "dispatcher forwarded command to MCP server": "forwarded_to_mcp",
@@ -643,7 +648,7 @@ def _looks_like_connector_transport(event: dict[str, Any], haystack: str) -> boo
 
 
 def _historical_http_status_counts(events: list[dict[str, Any]]) -> dict[str, int]:
-    """Count each explicit HTTP status at most once per friction event."""
+    """Count distinct statuses in the supplied event window, once per event."""
     counts: Counter[str] = Counter()
     for event in events:
         statuses = set(_explicit_http_statuses({"msg": _event_haystack(event)}))
@@ -666,6 +671,10 @@ def connector_transport_diagnostics(events: list[dict[str, Any]]) -> dict[str, A
         "recent_event_ids": _proposal_event_ids(transport_events),
         "recent_event_ids_truncated": len(transport_events) > MAX_PROPOSAL_EVIDENCE_IDS,
         "historical_http_status_counts": _historical_http_status_counts(transport_events),
+        "historical_http_status_counts_semantics": (
+            "bounded supplied friction-event window; each distinct status counts at most once "
+            "per event; not a time series or lifetime aggregate"
+        ),
         "recommended_bounded_probe": [
             "grabowski_status for runtime contract and client snapshot visibility",
             "grabowski_service_status for grabowski-operator.service and tunnel-client-grabowski.service",
@@ -675,6 +684,8 @@ def connector_transport_diagnostics(events: list[dict[str, Any]]) -> dict[str, A
         "pre_runtime_http_404_recovery": {
             "authority": "guidance_only",
             "machine_enforced": False,
+            "applicability": "caller_must_establish",
+            "recommended_action": "refresh_catalog_then_one_read_only_retry",
             "caller_must_establish": [
                 "HTTP 404 was returned before any Grabowski receipt was observed",
                 "no target mutation may have occurred",
@@ -842,8 +853,8 @@ def _explicit_http_statuses(payload: dict[str, Any]) -> list[int]:
     message = payload.get("msg")
     if isinstance(message, str):
         explicit_patterns = (
-            r"(?:status|status_code|http_status|response_status|response_code|code)\s*[=:]\s*(\d{3})(?!\d)",
-            r"\bHTTP(?:/\d(?:\.\d)?)?(?:\s+status)?\s*[:=]?\s*(\d{3})(?!\d)",
+            r"(?<![\w])(?:status(?:_?code)?|http_?status(?:_?code)?|response_?(?:status|code)|code)\s*[=:]\s*(\d{3})(?![\w])",
+            r"\bHTTP(?:/\d+(?:\.\d+)?)?(?:\s+status)?\s*[:=]?\s*(\d{3})(?![\w])",
             r"received exception from stream\s*:\s*([45]\d{2})(?=\s+(?:upstream|external|http|bad gateway|service error))",
             r"(?:upstream(?: or|/)external service|external service error)[^0-9]{0,32}([45]\d{2})(?!\d)",
         )
