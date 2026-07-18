@@ -6,6 +6,7 @@ import json
 import math
 import os
 import stat
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,8 @@ ARCHIVE_INDEX_SCHEMA = "chronik-grabowski-outbox-archive-index.v1"
 BUNDLE_MANIFEST_SCHEMA = "chronik-grabowski-outbox-bundle-manifest.v1"
 BUNDLE_SOURCE_SCHEMA = "chronik-grabowski-outbox-bundle-source.v1"
 WRITER_COMPACTION_LOCK_FILENAME = ".writer-compaction.lock"
+WRITER_COMPACTION_LOCK_TIMEOUT_SECONDS = 5.0
+WRITER_COMPACTION_LOCK_POLL_SECONDS = 0.01
 MAX_ARCHIVE_INDEX_BYTES = 16 * 1024 * 1024
 MAX_BUNDLE_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_BUNDLE_BYTES = 128 * 1024 * 1024
@@ -594,13 +597,27 @@ def _writer_compaction_lock(source_dir: Path):
                 "Chronik writer-compaction lock must be a private owned file"
             )
         os.fchmod(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
+        deadline = time.monotonic() + WRITER_COMPACTION_LOCK_TIMEOUT_SECONDS
+        acquired = False
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Chronik writer-compaction lock acquisition timed out"
+                    ) from exc
+                time.sleep(min(WRITER_COMPACTION_LOCK_POLL_SECONDS, remaining))
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            yield
         finally:
-            os.close(descriptor)
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _append_event(path: Path, event: dict[str, Any]) -> None:
