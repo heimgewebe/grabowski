@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -29,18 +30,28 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             patcher.stop()
         self.temp.cleanup()
 
+    def _mock_bound_launcher(self) -> mock.MagicMock:
+        bound_launcher = mock.MagicMock()
+        bound_launcher.return_value.__enter__.return_value = (
+            17,
+            "/proc/self/fd/17",
+        )
+        return bound_launcher
+
     def test_mutating_runtime_timeout_is_ambiguous_and_requires_readback(self) -> None:
-        runtime = {
-            "python_launcher": Path("/runtime/python"),
-            "module_paths": {"bureau.cli": Path("/runtime/bureau/cli.py")},
-            "package_files": {},
-            "package_paths": {},
-            "package_identities": {},
-        }
+        runtime = {"python_launcher": Path("/runtime/python")}
+        binding = mock.Mock()
+        bound_launcher = self._mock_bound_launcher()
         with (
             mock.patch.object(
                 intake.bureau_runtime, "_contract_runtime", return_value=runtime
             ),
+            mock.patch.object(
+                intake.bureau_runtime, "_assert_contract_runtime_unchanged"
+            ),
+            mock.patch.object(intake, "_managed_runtime_binding", return_value=binding),
+            mock.patch.object(intake, "_assert_managed_runtime_unchanged"),
+            mock.patch.object(intake, "_bound_launcher_fd", bound_launcher),
             mock.patch.object(
                 intake.bureau_runtime, "_safe_environment", return_value={}
             ),
@@ -63,18 +74,49 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             result["required_readback"], ["pull_request", "resource_leases"]
         )
 
-    def test_read_runtime_timeout_is_retryable_without_effect_claim(self) -> None:
-        runtime = {
-            "python_launcher": Path("/runtime/python"),
-            "module_paths": {"bureau.cli": Path("/runtime/bureau/cli.py")},
-            "package_files": {},
-            "package_paths": {},
-            "package_identities": {},
-        }
+    def test_preexec_drift_fails_without_effect_or_ambiguity(self) -> None:
+        runtime = {"python_launcher": Path("/runtime/python")}
+        binding = mock.Mock()
         with (
             mock.patch.object(
                 intake.bureau_runtime, "_contract_runtime", return_value=runtime
             ),
+            mock.patch.object(
+                intake.bureau_runtime,
+                "_assert_contract_runtime_unchanged",
+                side_effect=intake.bureau_runtime.BureauLeaseContractError(
+                    "contract-runtime-changed-before-exec"
+                ),
+            ),
+            mock.patch.object(intake, "_managed_runtime_binding", return_value=binding),
+            mock.patch.object(intake.subprocess, "run") as run,
+        ):
+            result = intake._invoke_bureau(
+                ["operator-task-publish"],
+                mutation=True,
+                required_readback=["pull_request"],
+            )
+        self.assertEqual(result["code"], "bureau-runtime-drift")
+        self.assertFalse(result["effect_started"])
+        self.assertFalse(result["ambiguity"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual(result["required_readback"], [])
+        run.assert_not_called()
+
+    def test_read_runtime_timeout_is_retryable_without_effect_claim(self) -> None:
+        runtime = {"python_launcher": Path("/runtime/python")}
+        binding = mock.Mock()
+        bound_launcher = self._mock_bound_launcher()
+        with (
+            mock.patch.object(
+                intake.bureau_runtime, "_contract_runtime", return_value=runtime
+            ),
+            mock.patch.object(
+                intake.bureau_runtime, "_assert_contract_runtime_unchanged"
+            ),
+            mock.patch.object(intake, "_managed_runtime_binding", return_value=binding),
+            mock.patch.object(intake, "_assert_managed_runtime_unchanged"),
+            mock.patch.object(intake, "_bound_launcher_fd", bound_launcher),
             mock.patch.object(
                 intake.bureau_runtime, "_safe_environment", return_value={}
             ),
@@ -88,6 +130,218 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertFalse(result["effect_started"])
         self.assertFalse(result["ambiguity"])
         self.assertTrue(result["retryable"])
+
+    def test_invoke_executes_the_exact_bound_launcher_descriptor(self) -> None:
+        runtime = {"python_launcher": Path("/runtime/python")}
+        binding = mock.Mock()
+        completed = subprocess.CompletedProcess(
+            ["bureau"],
+            0,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "result": {
+                        "kind": "bureau_candidate_assessment",
+                        "status": "ready",
+                    },
+                }
+            ),
+            "",
+        )
+        bound_launcher = self._mock_bound_launcher()
+        with (
+            mock.patch.object(
+                intake.bureau_runtime, "_contract_runtime", return_value=runtime
+            ),
+            mock.patch.object(
+                intake.bureau_runtime, "_assert_contract_runtime_unchanged"
+            ) as contract_readback,
+            mock.patch.object(intake, "_managed_runtime_binding", return_value=binding),
+            mock.patch.object(intake, "_assert_managed_runtime_unchanged") as readback,
+            mock.patch.object(intake, "_bound_launcher_fd", bound_launcher),
+            mock.patch.object(
+                intake.bureau_runtime,
+                "_safe_environment",
+                return_value={"PATH": "/usr/bin:/bin"},
+            ),
+            mock.patch.object(intake.subprocess, "run", return_value=completed) as run,
+        ):
+            result = intake._invoke_bureau(
+                ["--json", "--json-envelope", "operator-candidate-assess"]
+            )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "/runtime/python",
+                "-I",
+                "/proc/self/fd/17",
+                "--json",
+                "--json-envelope",
+                "operator-candidate-assess",
+            ],
+        )
+        self.assertEqual(run.call_args.kwargs["pass_fds"], (17,))
+        self.assertEqual(
+            run.call_args.kwargs["cwd"], intake.bureau_runtime.BUREAU_RUNTIME_ROOT
+        )
+        self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin:/bin"})
+        self.assertEqual(contract_readback.call_count, 2)
+        self.assertEqual(readback.call_count, 2)
+        bound_launcher.assert_called_once_with(binding)
+
+    def _managed_runtime_fixture(
+        self,
+    ) -> tuple[Path, Path, Path, Path, str, str]:
+        runtime_root = self.root / ".local/share/bureau"
+        snapshots_root = runtime_root / "registry-snapshots"
+        registry_root = snapshots_root / "snapshot-a"
+        registry_root.mkdir(parents=True)
+        source_commit = "a" * 40
+        tree_sha256 = "b" * 64
+        inventory_path = registry_root / ".bureau-runtime-snapshot.json"
+        inventory_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "bureau_registry_snapshot",
+                    "source_commit": source_commit,
+                    "tree_sha256": tree_sha256,
+                    "paths": ["registry/queue.json"],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        launcher_path = self.root / ".local/bin/bureau"
+        launcher_path.parent.mkdir(parents=True)
+        manifest_path = runtime_root / "deployment-manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "bureau_runtime_deployment",
+                    "launcher_path": str(launcher_path),
+                    "source_commit": source_commit,
+                    "canonical_registry_root": str(registry_root),
+                    "canonical_registry_inventory_path": str(inventory_path),
+                    "canonical_registry_inventory_sha256": hashlib.sha256(
+                        inventory_path.read_bytes()
+                    ).hexdigest(),
+                    "canonical_registry_tree_sha256": tree_sha256,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        launcher_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "# managed-by: heimgewebe-bureau-runtime-v1\n"
+            "from pathlib import Path\n"
+            f"manifest_path = Path(\n    {str(manifest_path)!r}\n)\n"
+            f"expected_manifest_sha256 = (\n    {manifest_sha256!r}\n)\n",
+            encoding="utf-8",
+        )
+        launcher_path.chmod(0o700)
+        return (
+            runtime_root,
+            launcher_path,
+            manifest_path,
+            inventory_path,
+            source_commit,
+            tree_sha256,
+        )
+
+    def test_managed_runtime_binding_binds_atomic_snapshots(self) -> None:
+        runtime_root, launcher, manifest, inventory, source_commit, tree_sha256 = (
+            self._managed_runtime_fixture()
+        )
+        with mock.patch.object(
+            intake.bureau_runtime, "BUREAU_RUNTIME_ROOT", runtime_root
+        ):
+            binding = intake._managed_runtime_binding()
+            intake._assert_managed_runtime_unchanged(binding)
+        self.assertEqual(binding.source_commit, source_commit)
+        self.assertEqual(binding.registry_tree_sha256, tree_sha256)
+        self.assertEqual(binding.launcher.path, launcher)
+        self.assertEqual(binding.manifest.path, manifest)
+        self.assertEqual(binding.inventory.path, inventory)
+        self.assertEqual(
+            binding.manifest.sha256,
+            hashlib.sha256(binding.manifest.raw).hexdigest(),
+        )
+        self.assertEqual(
+            binding.inventory.sha256,
+            hashlib.sha256(binding.inventory.raw).hexdigest(),
+        )
+
+    def test_managed_runtime_binding_rejects_launcher_manifest_digest_drift(
+        self,
+    ) -> None:
+        runtime_root, launcher, manifest, _, _, _ = self._managed_runtime_fixture()
+        launcher.write_text(
+            "#!/usr/bin/env python3\n"
+            "# managed-by: heimgewebe-bureau-runtime-v1\n"
+            "from pathlib import Path\n"
+            f"manifest_path = Path({str(manifest)!r})\n"
+            f"expected_manifest_sha256 = {'0' * 64!r}\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        with mock.patch.object(
+            intake.bureau_runtime, "BUREAU_RUNTIME_ROOT", runtime_root
+        ):
+            with self.assertRaisesRegex(
+                intake.bureau_runtime.BureauLeaseContractError,
+                "manifest-digest-mismatch",
+            ):
+                intake._managed_runtime_binding()
+
+    def test_managed_runtime_binding_rejects_dynamic_launcher_binding(self) -> None:
+        runtime_root, launcher, _, _, _, _ = self._managed_runtime_fixture()
+        launcher.write_text(
+            "#!/usr/bin/env python3\n"
+            "# managed-by: heimgewebe-bureau-runtime-v1\n"
+            "from pathlib import Path\n"
+            "manifest_path = Path(__import__('os').environ['MANIFEST'])\n"
+            f"expected_manifest_sha256 = {'0' * 64!r}\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        with mock.patch.object(
+            intake.bureau_runtime, "BUREAU_RUNTIME_ROOT", runtime_root
+        ):
+            with self.assertRaisesRegex(
+                intake.bureau_runtime.BureauLeaseContractError,
+                "manifest-path-binding-invalid",
+            ):
+                intake._managed_runtime_binding()
+
+    def test_managed_runtime_binding_reports_missing_inventory_precisely(self) -> None:
+        runtime_root, _, _, inventory, _, _ = self._managed_runtime_fixture()
+        inventory.unlink()
+        with mock.patch.object(
+            intake.bureau_runtime, "BUREAU_RUNTIME_ROOT", runtime_root
+        ):
+            with self.assertRaisesRegex(
+                intake.bureau_runtime.BureauLeaseContractError,
+                "canonical-registry-inventory-unavailable",
+            ):
+                intake._managed_runtime_binding()
+
+    def test_snapshot_readback_detects_identity_or_content_drift(self) -> None:
+        path = self.root / "binding.json"
+        path.write_text('{"value":1}\n', encoding="utf-8")
+        snapshot = intake._read_regular_file_snapshot(path, label="test-binding")
+        path.write_text('{"value":2}\n', encoding="utf-8")
+        with self.assertRaisesRegex(
+            intake.bureau_runtime.BureauLeaseContractError,
+            "test-binding-changed-during-call",
+        ):
+            intake._assert_snapshot_unchanged(snapshot, label="test-binding")
 
     def test_candidate_record_writes_digest_bound_private_request(self) -> None:
         request = {

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import ast
+from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
-from typing import Any
+from typing import Any, Iterator
 
 import grabowski_bureau_leases as bureau_runtime
 import grabowski_mcp as base
@@ -33,35 +37,231 @@ MAX_INPUT_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
 PROPOSAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
-_RUNTIME_WRAPPER = r"""
-import hashlib
-import importlib
-import json
-from pathlib import Path
-import sys
+MANAGED_LAUNCHER_MARKER = b"# managed-by: heimgewebe-bureau-runtime-v1\n"
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+MAX_RUNTIME_BINDING_BYTES = 4 * 1024 * 1024
 
-binding = json.loads(sys.argv[1])
-argv = json.loads(sys.argv[2])
 
-def digest(path_string):
-    return hashlib.sha256(Path(path_string).read_bytes()).hexdigest()
+@dataclass(frozen=True)
+class RegularFileSnapshot:
+    path: Path
+    device: int
+    inode: int
+    mode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    sha256: str
+    raw: bytes
 
-def verify_files():
-    for expected in binding["package_files"].values():
-        if digest(expected["path"]) != expected["sha256"]:
-            raise RuntimeError("bound Bureau package file changed")
+    @property
+    def identity(self) -> tuple[int, int, int, int, int, int, str]:
+        return (
+            self.device,
+            self.inode,
+            self.mode,
+            self.size,
+            self.mtime_ns,
+            self.ctime_ns,
+            self.sha256,
+        )
 
-verify_files()
-cli = importlib.import_module("bureau.cli")
-loaded = Path(cli.__file__).resolve()
-expected = Path(binding["module_paths"]["bureau.cli"]).resolve()
-if loaded != expected:
-    raise RuntimeError("unexpected Bureau CLI module path")
-verify_files()
-returncode = cli.main(argv)
-verify_files()
-raise SystemExit(returncode)
-"""
+
+@dataclass(frozen=True)
+class ManagedBureauRuntime:
+    launcher: RegularFileSnapshot
+    manifest: RegularFileSnapshot
+    inventory: RegularFileSnapshot
+    registry_root: Path
+    source_commit: str
+    registry_tree_sha256: str
+
+
+def _managed_launcher_path() -> Path:
+    return bureau_runtime.BUREAU_RUNTIME_ROOT.parent.parent / "bin/bureau"
+
+
+def _deployment_manifest_path() -> Path:
+    return bureau_runtime.BUREAU_RUNTIME_ROOT / "deployment-manifest.json"
+
+
+def _snapshot_from_fd(
+    descriptor: int,
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = MAX_RUNTIME_BINDING_BYTES,
+) -> RegularFileSnapshot:
+    try:
+        before = os.fstat(descriptor)
+    except OSError as exc:
+        raise bureau_runtime.BureauLeaseContractError(
+            f"{label}-fstat-failed",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    if not stat.S_ISREG(before.st_mode):
+        raise bureau_runtime.BureauLeaseContractError(f"{label}-not-regular")
+    if before.st_size > max_bytes:
+        raise bureau_runtime.BureauLeaseContractError(f"{label}-too-large")
+    chunks: list[bytes] = []
+    remaining = max_bytes + 1
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        path_metadata = path.lstat()
+    except OSError as exc:
+        raise bureau_runtime.BureauLeaseContractError(
+            f"{label}-read-failed",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    raw = b"".join(chunks)
+    if len(raw) > max_bytes:
+        raise bureau_runtime.BureauLeaseContractError(f"{label}-too-large")
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    path_identity = (
+        path_metadata.st_dev,
+        path_metadata.st_ino,
+        path_metadata.st_mode,
+        path_metadata.st_size,
+        path_metadata.st_mtime_ns,
+        path_metadata.st_ctime_ns,
+    )
+    if (
+        before_identity != after_identity
+        or after_identity != path_identity
+        or len(raw) != after.st_size
+        or not stat.S_ISREG(path_metadata.st_mode)
+    ):
+        raise bureau_runtime.BureauLeaseContractError(f"{label}-changed-during-read")
+    return RegularFileSnapshot(
+        path=path,
+        device=after.st_dev,
+        inode=after.st_ino,
+        mode=after.st_mode,
+        size=after.st_size,
+        mtime_ns=after.st_mtime_ns,
+        ctime_ns=after.st_ctime_ns,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        raw=raw,
+    )
+
+
+def _open_regular_file_snapshot(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = MAX_RUNTIME_BINDING_BYTES,
+) -> tuple[int, RegularFileSnapshot]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise bureau_runtime.BureauLeaseContractError(
+            f"{label}-unavailable",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    try:
+        snapshot = _snapshot_from_fd(
+            descriptor,
+            path,
+            label=label,
+            max_bytes=max_bytes,
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor, snapshot
+
+
+def _read_regular_file_snapshot(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = MAX_RUNTIME_BINDING_BYTES,
+) -> RegularFileSnapshot:
+    descriptor, snapshot = _open_regular_file_snapshot(
+        path,
+        label=label,
+        max_bytes=max_bytes,
+    )
+    os.close(descriptor)
+    return snapshot
+
+
+def _literal_launcher_assignment(tree: ast.Module, name: str) -> ast.expr:
+    matches: list[ast.expr] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id == name:
+            matches.append(node.value)
+    if len(matches) != 1:
+        raise bureau_runtime.BureauLeaseContractError(
+            "managed-launcher-binding-invalid",
+            details={"assignment": name, "count": len(matches)},
+        )
+    return matches[0]
+
+
+def _parse_managed_launcher_binding(
+    launcher: RegularFileSnapshot,
+) -> tuple[Path, str]:
+    if MANAGED_LAUNCHER_MARKER not in launcher.raw[:512]:
+        raise bureau_runtime.BureauLeaseContractError("managed-launcher-marker-missing")
+    try:
+        launcher_text = launcher.raw.decode("utf-8")
+        tree = ast.parse(launcher_text, filename=str(launcher.path), mode="exec")
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise bureau_runtime.BureauLeaseContractError(
+            "managed-launcher-syntax-invalid",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    manifest_expr = _literal_launcher_assignment(tree, "manifest_path")
+    digest_expr = _literal_launcher_assignment(tree, "expected_manifest_sha256")
+    if not (
+        isinstance(manifest_expr, ast.Call)
+        and isinstance(manifest_expr.func, ast.Name)
+        and manifest_expr.func.id == "Path"
+        and len(manifest_expr.args) == 1
+        and not manifest_expr.keywords
+        and isinstance(manifest_expr.args[0], ast.Constant)
+        and isinstance(manifest_expr.args[0].value, str)
+    ):
+        raise bureau_runtime.BureauLeaseContractError(
+            "managed-launcher-manifest-path-binding-invalid"
+        )
+    if not (
+        isinstance(digest_expr, ast.Constant)
+        and isinstance(digest_expr.value, str)
+        and SHA256_RE.fullmatch(digest_expr.value)
+    ):
+        raise bureau_runtime.BureauLeaseContractError(
+            "managed-launcher-manifest-digest-binding-invalid"
+        )
+    return Path(manifest_expr.args[0].value), digest_expr.value
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -117,23 +317,195 @@ def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
     return value
 
 
-def _runtime_binding(runtime: dict[str, Any]) -> str:
-    return json.dumps(
-        {
-            "module_paths": {
-                name: str(path) for name, path in runtime["module_paths"].items()
-            },
-            "package_files": {
-                relative: {
-                    "path": str(runtime["package_paths"][relative]),
-                    "sha256": identity["sha256"],
-                }
-                for relative, identity in runtime["package_identities"].items()
-            },
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+def _managed_runtime_binding() -> ManagedBureauRuntime:
+    launcher_path = _managed_launcher_path()
+    manifest_path = _deployment_manifest_path()
+    launcher = _read_regular_file_snapshot(launcher_path, label="managed-launcher")
+    if launcher.mode & 0o111 == 0:
+        raise bureau_runtime.BureauLeaseContractError("managed-launcher-not-executable")
+    configured_manifest, expected_manifest_sha256 = _parse_managed_launcher_binding(
+        launcher
     )
+    if configured_manifest != manifest_path:
+        raise bureau_runtime.BureauLeaseContractError(
+            "managed-launcher-manifest-path-mismatch"
+        )
+    manifest = _read_regular_file_snapshot(
+        manifest_path,
+        label="deployment-manifest",
+    )
+    if manifest.sha256 != expected_manifest_sha256:
+        raise bureau_runtime.BureauLeaseContractError(
+            "managed-launcher-manifest-digest-mismatch"
+        )
+    try:
+        manifest_value = json.loads(manifest.raw)
+        if (
+            manifest_value["schema_version"] != 1
+            or manifest_value["kind"] != "bureau_runtime_deployment"
+        ):
+            raise ValueError("unsupported deployment manifest")
+        if Path(manifest_value["launcher_path"]) != launcher_path:
+            raise ValueError("deployment manifest launcher path mismatch")
+        source_commit = manifest_value["source_commit"]
+        registry_tree_sha256 = manifest_value["canonical_registry_tree_sha256"]
+        inventory_sha256 = manifest_value["canonical_registry_inventory_sha256"]
+        if not SOURCE_COMMIT_RE.fullmatch(source_commit):
+            raise ValueError("invalid source commit")
+        if not SHA256_RE.fullmatch(registry_tree_sha256):
+            raise ValueError("invalid Registry tree digest")
+        if not SHA256_RE.fullmatch(inventory_sha256):
+            raise ValueError("invalid Registry inventory digest")
+        configured_registry_root = Path(manifest_value["canonical_registry_root"])
+        configured_inventory_path = Path(
+            manifest_value["canonical_registry_inventory_path"]
+        )
+        if (
+            not configured_registry_root.is_absolute()
+            or not configured_inventory_path.is_absolute()
+        ):
+            raise ValueError("canonical Registry paths must be absolute")
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise bureau_runtime.BureauLeaseContractError(
+            "deployment-manifest-invalid",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    try:
+        registry_root = configured_registry_root.resolve(strict=True)
+    except OSError as exc:
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-root-unavailable",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    if registry_root != configured_registry_root:
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-root-symlink-traversal"
+        )
+    try:
+        inventory_path = configured_inventory_path.resolve(strict=True)
+    except OSError as exc:
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-inventory-unavailable",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    if inventory_path != configured_inventory_path:
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-inventory-symlink-traversal"
+        )
+    configured_snapshots_root = (
+        bureau_runtime.BUREAU_RUNTIME_ROOT / "registry-snapshots"
+    )
+    try:
+        snapshots_root = configured_snapshots_root.resolve(strict=True)
+    except OSError as exc:
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-snapshots-root-unavailable",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    if snapshots_root != configured_snapshots_root or not snapshots_root.is_dir():
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-snapshots-root-invalid"
+        )
+    if not registry_root.is_dir() or not registry_root.is_relative_to(snapshots_root):
+        raise bureau_runtime.BureauLeaseContractError("canonical-registry-root-invalid")
+    if inventory_path.parent != registry_root:
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-inventory-path-invalid"
+        )
+    inventory = _read_regular_file_snapshot(
+        inventory_path,
+        label="canonical-registry-inventory",
+    )
+    if inventory.sha256 != inventory_sha256:
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-inventory-digest-mismatch"
+        )
+    try:
+        inventory_value = json.loads(inventory.raw)
+        paths = inventory_value["paths"]
+        if (
+            inventory_value["schema_version"] != 1
+            or inventory_value["kind"] != "bureau_registry_snapshot"
+            or inventory_value["source_commit"] != source_commit
+            or inventory_value["tree_sha256"] != registry_tree_sha256
+            or not isinstance(paths, list)
+            or not paths
+            or any(
+                not isinstance(item, str)
+                or not item
+                or Path(item).is_absolute()
+                or ".." in Path(item).parts
+                for item in paths
+            )
+            or len(paths) != len(set(paths))
+        ):
+            raise ValueError("invalid canonical Registry inventory")
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-inventory-invalid",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    return ManagedBureauRuntime(
+        launcher=launcher,
+        manifest=manifest,
+        inventory=inventory,
+        registry_root=registry_root,
+        source_commit=source_commit,
+        registry_tree_sha256=registry_tree_sha256,
+    )
+
+
+def _assert_snapshot_unchanged(
+    expected: RegularFileSnapshot,
+    *,
+    label: str,
+) -> None:
+    observed = _read_regular_file_snapshot(expected.path, label=f"{label}-readback")
+    if observed.identity != expected.identity:
+        raise bureau_runtime.BureauLeaseContractError(f"{label}-changed-during-call")
+
+
+def _assert_managed_runtime_unchanged(binding: ManagedBureauRuntime) -> None:
+    _assert_snapshot_unchanged(binding.launcher, label="managed-launcher")
+    _assert_snapshot_unchanged(binding.manifest, label="deployment-manifest")
+    _assert_snapshot_unchanged(
+        binding.inventory,
+        label="canonical-registry-inventory",
+    )
+    try:
+        observed_root = binding.registry_root.resolve(strict=True)
+    except OSError as exc:
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-root-readback-failed",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    if observed_root != binding.registry_root or not observed_root.is_dir():
+        raise bureau_runtime.BureauLeaseContractError(
+            "canonical-registry-root-changed-during-call"
+        )
+
+
+@contextmanager
+def _bound_launcher_fd(
+    binding: ManagedBureauRuntime,
+) -> Iterator[tuple[int, str]]:
+    descriptor, observed = _open_regular_file_snapshot(
+        binding.launcher.path,
+        label="managed-launcher-exec",
+    )
+    try:
+        if observed.identity != binding.launcher.identity:
+            raise bureau_runtime.BureauLeaseContractError(
+                "managed-launcher-changed-before-exec"
+            )
+        proc_fd_path = f"/proc/self/fd/{descriptor}"
+        if not Path("/proc/self/fd").is_dir():
+            raise bureau_runtime.BureauLeaseContractError(
+                "managed-launcher-fd-exec-unavailable"
+            )
+        yield descriptor, proc_fd_path
+    finally:
+        os.close(descriptor)
 
 
 def _adapter_failure(
@@ -171,27 +543,38 @@ def _invoke_bureau(
     readback = sorted(set(required_readback or []))
     try:
         runtime = bureau_runtime._contract_runtime()
+        managed_runtime = _managed_runtime_binding()
     except (OSError, RuntimeError, bureau_runtime.BureauLeaseContractError) as exc:
         return _adapter_failure(
             "bureau-runtime-unavailable",
             details={"error_type": type(exc).__name__},
         )
     try:
-        completed = subprocess.run(
-            [
-                str(runtime["python_launcher"]),
-                "-I",
-                "-c",
-                _RUNTIME_WRAPPER,
-                _runtime_binding(runtime),
-                json.dumps(arguments, separators=(",", ":")),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            env=bureau_runtime._safe_environment(),
+        bureau_runtime._assert_contract_runtime_unchanged(runtime)
+        _assert_managed_runtime_unchanged(managed_runtime)
+    except (OSError, RuntimeError, bureau_runtime.BureauLeaseContractError) as exc:
+        return _adapter_failure(
+            "bureau-runtime-drift",
+            details={"error_type": type(exc).__name__},
+            retryable=False,
         )
+    try:
+        with _bound_launcher_fd(managed_runtime) as (launcher_fd, launcher_argument):
+            completed = subprocess.run(
+                [
+                    str(runtime["python_launcher"]),
+                    "-I",
+                    launcher_argument,
+                    *arguments,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                cwd=bureau_runtime.BUREAU_RUNTIME_ROOT,
+                env=bureau_runtime._safe_environment(),
+                pass_fds=(launcher_fd,),
+            )
     except subprocess.TimeoutExpired:
         return _adapter_failure(
             "bureau-runtime-timeout",
@@ -200,6 +583,12 @@ def _invoke_bureau(
             required_readback=readback,
             retryable=not mutation,
         )
+    except bureau_runtime.BureauLeaseContractError as exc:
+        return _adapter_failure(
+            "bureau-runtime-drift",
+            details={"error_type": type(exc).__name__},
+            retryable=False,
+        )
     except OSError as exc:
         return _adapter_failure(
             "bureau-runtime-unavailable",
@@ -207,6 +596,7 @@ def _invoke_bureau(
         )
     try:
         bureau_runtime._assert_contract_runtime_unchanged(runtime)
+        _assert_managed_runtime_unchanged(managed_runtime)
     except (OSError, RuntimeError, bureau_runtime.BureauLeaseContractError) as exc:
         return _adapter_failure(
             "bureau-runtime-drift",
