@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -81,6 +82,14 @@ def _envelope(
 
 
 class ExternalReviewClaudeTests(unittest.TestCase):
+    def _authorized_build_command(self, **kwargs):
+        with mock.patch.dict(
+            os.environ,
+            {claude_review.EXTERNAL_PROVIDER_BUDGET_CAP_ENV: "10"},
+            clear=False,
+        ):
+            return claude_review.build_command(**kwargs)
+
     def _packet(self, root: Path) -> tuple[Path, str, Path, Path]:
         packet = root / "packet"
         packet.mkdir()
@@ -154,6 +163,11 @@ class ExternalReviewClaudeTests(unittest.TestCase):
                 claude_review,
                 "run_checked",
                 return_value=subprocess.CompletedProcess(["/usr/bin/claude", "--version"], 0, "2.1.206 (Claude Code)\n", ""),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {claude_review.EXTERNAL_PROVIDER_BUDGET_CAP_ENV: "10"},
+                clear=False,
             ),
             mock.patch.object(
                 claude_review.subprocess,
@@ -433,9 +447,47 @@ class ExternalReviewClaudeTests(unittest.TestCase):
                 )
             self.assertFalse((root / "evidence.json").exists())
 
+    def test_default_zero_budget_blocks_before_claude_execution(self) -> None:
+        self.assertEqual(claude_review.DEFAULT_MAX_BUDGET_USD, 0.0)
+        with self.assertRaisesRegex(claude_review.ClaudeReviewError, "zero-cost policy blocks"):
+            claude_review.build_command(
+                claude_bin="claude",
+                model="opus",
+                effort="high",
+                max_budget_usd=claude_review.DEFAULT_MAX_BUDGET_USD,
+            )
+
+    def test_positive_budget_is_blocked_by_zero_runtime_policy_cap(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {claude_review.EXTERNAL_PROVIDER_BUDGET_CAP_ENV: "0"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(claude_review.ClaudeReviewError, "policy cap of 0 USD"):
+                claude_review.build_command(
+                    claude_bin="claude",
+                    model="opus",
+                    effort="high",
+                    max_budget_usd=1.0,
+                )
+
+    def test_invalid_runtime_budget_cap_fails_closed(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {claude_review.EXTERNAL_PROVIDER_BUDGET_CAP_ENV: "nan"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(claude_review.ClaudeReviewError, "must be a finite number"):
+                claude_review.build_command(
+                    claude_bin="claude",
+                    model="opus",
+                    effort="high",
+                    max_budget_usd=1.0,
+                )
+
     def test_adapter_and_gate_share_an_executable_contract(self) -> None:
         self.assertEqual(claude_review.REVIEW_SCHEMA, review_gate.CLAUDE_PACKET_REVIEW_SCHEMA)
-        command = claude_review.build_command(
+        command = self._authorized_build_command(
             claude_bin="claude",
             model="opus",
             effort="high",
@@ -463,7 +515,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
         self.assertLess(prompt.index(closing), prompt.index("Everything between the nonce-bound fences"))
 
     def test_unknown_command_shape_is_rejected(self) -> None:
-        command = claude_review.build_command(
+        command = self._authorized_build_command(
             claude_bin="claude",
             model="opus",
             effort="high",

@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import secrets
@@ -19,7 +20,8 @@ SEVERITIES = {"critical", "high", "medium", "low"}
 DEFAULT_TIMEOUT_MINUTES = 30
 DEFAULT_MODEL = "opus"
 DEFAULT_EFFORT = "high"
-DEFAULT_MAX_BUDGET_USD = 2.0
+DEFAULT_MAX_BUDGET_USD = 0.0
+EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
 DEFAULT_MAX_PROMPT_BYTES = 750_000
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -54,6 +56,21 @@ REVIEW_SCHEMA: dict[str, Any] = {
 
 class ClaudeReviewError(RuntimeError):
     pass
+
+
+def external_provider_budget_cap() -> float:
+    raw = os.environ.get(EXTERNAL_PROVIDER_BUDGET_CAP_ENV, "0").strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ClaudeReviewError(
+            f"{EXTERNAL_PROVIDER_BUDGET_CAP_ENV} must be a finite number in [0, 10]"
+        ) from exc
+    if not math.isfinite(value) or not 0 <= value <= 10:
+        raise ClaudeReviewError(
+            f"{EXTERNAL_PROVIDER_BUDGET_CAP_ENV} must be a finite number in [0, 10]"
+        )
+    return value
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -221,8 +238,17 @@ def build_command(*, claude_bin: str, model: str, effort: str, max_budget_usd: f
         raise ClaudeReviewError(f"Claude packet review requires model {DEFAULT_MODEL}")
     if effort != DEFAULT_EFFORT:
         raise ClaudeReviewError(f"Claude packet review requires effort {DEFAULT_EFFORT}")
-    if not math.isfinite(max_budget_usd) or max_budget_usd <= 0:
-        raise ClaudeReviewError("Claude packet review budget must be a positive finite number")
+    if not math.isfinite(max_budget_usd) or max_budget_usd < 0:
+        raise ClaudeReviewError("Claude packet review budget must be a non-negative finite number")
+    policy_cap_usd = external_provider_budget_cap()
+    if max_budget_usd > policy_cap_usd:
+        raise ClaudeReviewError(
+            f"max_budget_usd exceeds the configured external-provider policy cap of {policy_cap_usd:g} USD"
+        )
+    if max_budget_usd == 0:
+        raise ClaudeReviewError(
+            "zero-cost policy blocks external Claude review; pass an explicit positive max_budget_usd only after an administrator raises the external-provider policy cap"
+        )
     schema = json.dumps(REVIEW_SCHEMA, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return [
         "claude",

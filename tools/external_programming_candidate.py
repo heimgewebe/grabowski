@@ -30,6 +30,7 @@ SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TEMP_OUTPUT_RE = re.compile(r"^\.(?P<target>[A-Za-z0-9._-]{1,100})\.(?P<pid>[0-9]+)\.(?P<nonce>[0-9a-f]{16})\.tmp$")
 PROVIDERS = {"claude", "agy"}
+EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
 MODES = {"competitor", "contrast"}
 CONFIDENCE = {"low", "medium", "high"}
 DEFAULT_FORBIDDEN_COMPONENTS = frozenset({
@@ -73,6 +74,21 @@ CANDIDATE_SCHEMA: dict[str, Any] = {
 
 class CandidateError(RuntimeError):
     pass
+
+
+def external_provider_budget_cap() -> float:
+    raw = os.environ.get(EXTERNAL_PROVIDER_BUDGET_CAP_ENV, "0").strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise CandidateError(
+            f"{EXTERNAL_PROVIDER_BUDGET_CAP_ENV} must be a finite number in [0, 10]"
+        ) from exc
+    if not math.isfinite(value) or not 0 <= value <= 10:
+        raise CandidateError(
+            f"{EXTERNAL_PROVIDER_BUDGET_CAP_ENV} must be a finite number in [0, 10]"
+        )
+    return value
 
 
 def canonical_json(value: Any) -> str:
@@ -1015,7 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw-output", required=True)
     parser.add_argument("--stderr-output", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=900)
-    parser.add_argument("--max-budget-usd", type=float, default=2.0)
+    parser.add_argument("--max-budget-usd", type=float, default=0.0)
     args = parser.parse_args(argv)
     try:
         if not 30 <= args.timeout_seconds <= 3600:
@@ -1054,6 +1070,21 @@ def main(argv: list[str] | None = None) -> int:
         raw_output_path = bound_output_path(args.raw_output, directory=candidate_directory, expected_name="raw-output.json")
         stderr_output_path = bound_output_path(args.stderr_output, directory=candidate_directory, expected_name="stderr.txt")
         packet = validate_packet(load_private_json(packet_path, label="candidate packet"))
+        if (
+            isinstance(args.max_budget_usd, bool)
+            or not math.isfinite(args.max_budget_usd)
+            or not 0 <= args.max_budget_usd <= 10
+        ):
+            raise CandidateError("max_budget_usd must be in [0, 10]")
+        policy_cap_usd = external_provider_budget_cap()
+        if args.max_budget_usd > policy_cap_usd:
+            raise CandidateError(
+                f"--max-budget-usd exceeds the configured external-provider policy cap of {policy_cap_usd:g} USD"
+            )
+        if args.max_budget_usd == 0:
+            raise CandidateError(
+                "zero-cost policy blocks external provider execution; pass an explicit positive --max-budget-usd only after an administrator raises the external-provider policy cap"
+            )
         if packet["schema_version"] == 2:
             budget_contract = validate_budget_contract(
                 packet["budget_contract"],
