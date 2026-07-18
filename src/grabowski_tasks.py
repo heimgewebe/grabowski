@@ -330,6 +330,17 @@ TASK_SCHEMA_V4_COLUMNS = frozenset(TASK_SCHEMA_V5_COLUMN_SHAPES) - {
 TASK_SCHEMA_REQUIRED_INDEXES = frozenset({
     "tasks_state_created_task_idx", "tasks_created_task_idx",
 })
+TASK_CURRENT_SCHEMA_VERSION = "5"
+TASK_SUPPORTED_SCHEMA_VERSIONS = ("1", "2", "3", "4", "5")
+TASK_SCHEMA_MIGRATION_PATHS = {
+    version: (version, TASK_CURRENT_SCHEMA_VERSION)
+    for version in TASK_SUPPORTED_SCHEMA_VERSIONS
+    if version != TASK_CURRENT_SCHEMA_VERSION
+}
+TASK_SCHEMA_RECOVERY_INSTRUCTION = (
+    "Keep the task store unchanged; use a runtime that explicitly supports the "
+    "observed schema or restore a verified backup before retrying."
+)
 
 
 @contextmanager
@@ -350,6 +361,23 @@ def _schema_directory_lock(parent: Path) -> Iterator[None]:
 def _readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(
         path.absolute().as_uri() + "?mode=ro",
+        uri=True,
+        timeout=1,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+@contextmanager
+def _inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
+    wal_path = Path(str(path) + "-wal")
+    immutable = "&immutable=1" if not wal_path.exists() else ""
+    connection = sqlite3.connect(
+        path.absolute().as_uri() + f"?mode=ro{immutable}",
         uri=True,
         timeout=1,
     )
@@ -499,6 +527,84 @@ def _validate_task_schema_current(connection: sqlite3.Connection) -> None:
             "Task database schema 5 indexes are incomplete: "
             + ", ".join(sorted(missing_indexes))
         )
+
+
+def _task_schema_inventory() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "store": "tasks",
+        "database": str(TASK_DB),
+        "observed_version": None,
+        "current_version": TASK_CURRENT_SCHEMA_VERSION,
+        "supported_versions": list(TASK_SUPPORTED_SCHEMA_VERSIONS),
+        "status": "uninitialized",
+        "migration_required": False,
+        "migration_path": [],
+        "write_compatible": False,
+        "mutation_performed": False,
+        "required_action": "initialize_on_first_write",
+        "recovery_instruction": None,
+    }
+    if not TASK_DB.exists():
+        return result
+    if TASK_DB.is_symlink() or not TASK_DB.is_file():
+        result.update(
+            status="blocked",
+            required_action="inspect_store_path",
+            recovery_instruction=TASK_SCHEMA_RECOVERY_INSTRUCTION,
+            error="Task database must be a regular non-symlink file",
+        )
+        return result
+    if TASK_DB.stat().st_size == 0:
+        return result
+    try:
+        with _inventory_readonly_sqlite(TASK_DB) as connection:
+            _sqlite_integrity(connection, "Task database", quick=True)
+            observed = _task_schema_version(connection)
+            result["observed_version"] = observed
+            if observed not in TASK_SUPPORTED_SCHEMA_VERSIONS:
+                future = (
+                    observed is not None
+                    and observed.isdecimal()
+                    and int(observed) > int(TASK_CURRENT_SCHEMA_VERSION)
+                )
+                result.update(
+                    status="unsupported_future" if future else "unsupported_schema",
+                    required_action="upgrade_runtime_or_restore_verified_backup",
+                    recovery_instruction=TASK_SCHEMA_RECOVERY_INSTRUCTION,
+                )
+                return result
+            if observed == TASK_CURRENT_SCHEMA_VERSION:
+                _validate_task_schema_current(connection)
+            else:
+                _validate_task_schema_legacy(connection, observed)
+    except (OSError, RuntimeError, sqlite3.DatabaseError) as exc:
+        result.update(
+            status="blocked",
+            required_action="restore_or_inspect_store",
+            recovery_instruction=TASK_SCHEMA_RECOVERY_INSTRUCTION,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return result
+    if observed == TASK_CURRENT_SCHEMA_VERSION:
+        result.update(status="current", write_compatible=True, required_action="none")
+        return result
+    path = TASK_SCHEMA_MIGRATION_PATHS[observed]
+    result.update(
+        status="migration_required",
+        migration_required=True,
+        migration_path=[
+            {
+                "from": path[0],
+                "to": path[1],
+                "lock": "exclusive_store_directory",
+                "transaction": "immediate",
+                "verified_backup_required": True,
+            }
+        ],
+        required_action="open_with_current_runtime_to_migrate",
+    )
+    return result
 
 
 def _validate_task_backup(
@@ -2699,9 +2805,14 @@ def grabowski_task_list(
     view: str = "minimal",
     cursor: str | None = None,
     fields: list[str] | None = None,
+    schema_only: bool = False,
 ) -> dict[str, Any]:
-    """List persistent tasks with keyset pagination and compact default records."""
+    """List persistent tasks or inspect store-schema compatibility read-only."""
     operator._require_operator_capability("durable_job")
+    if not isinstance(schema_only, bool):
+        raise ValueError("schema_only must be boolean")
+    if schema_only:
+        return _task_schema_inventory()
     selected_view = consumer_surface.normalize_view(view)
     _recover_pending_task_terminalizations()
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
