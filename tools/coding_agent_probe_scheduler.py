@@ -373,21 +373,32 @@ def sanitized_environment() -> dict[str, str]:
 
 
 def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    process_group_id = process.pid
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group_id, signal.SIGTERM)
     except ProcessLookupError:
         pass
     try:
         process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        pass
+
+    # The group leader may exit on SIGTERM while a descendant ignores it.
+    # Escalate the original process group regardless of the leader state.
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.returncode is None:
         try:
             process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             pass
+
+
+def bounded_output_read_size(buffered_bytes: int) -> int:
+    remaining_capacity = MAX_COMMAND_OUTPUT_BYTES - buffered_bytes
+    return min(IO_CHUNK_BYTES, remaining_capacity + 1)
 
 
 def collect_bounded_process_output(
@@ -410,14 +421,15 @@ def collect_bounded_process_output(
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(command_name, timeout_seconds)
             for key, _ in selector.select(timeout=min(remaining, 0.25)):
+                buffer = buffers[key.data]
+                chunk_size = bounded_output_read_size(len(buffer))
                 try:
-                    chunk = os.read(key.fileobj.fileno(), IO_CHUNK_BYTES)
+                    chunk = os.read(key.fileobj.fileno(), chunk_size)
                 except BlockingIOError:
                     continue
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
-                buffer = buffers[key.data]
                 if len(buffer) + len(chunk) > MAX_COMMAND_OUTPUT_BYTES:
                     raise ProbeSchedulerError(
                         f"command output exceeded the limit: {command_name}"
