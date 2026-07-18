@@ -1481,7 +1481,7 @@
     },
     {
       "category": "browser-worker",
-      "description": "Use browser-managed stored form data on one exact local origin and submit it.\n\nConfirmation must be one line containing the authorization prefix,\nworker id, canonical origin and the exact action-scope SHA-256. The result never\nreturns field contents, raw selectors, query strings or URL fragments.",
+      "description": "Use browser-managed stored form data on one exact local origin.\n\nConfirmation must be one line containing the authorization prefix,\nworker id, canonical origin and the exact action-scope SHA-256. The result never\nreturns field contents, raw selectors, query strings or URL fragments.\nReadiness mode verifies fill and clears the fields without submitting.",
       "effects": [
         "browser-input",
         "form-submit",
@@ -2366,7 +2366,7 @@
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
       "src/grabowski_tasks.py": "3a288eef1d4a4721d074bfc97a65b054526e22d45d4784afec67dedcf81bf099",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
-      "src/grabowski_workers.py": "ce59a39a703b20517cd36681ef613b753b9ef819d7c3095e6c1ee7b66010b73e",
+      "src/grabowski_workers.py": "4492ef8656e3cffd10ef0cdb9a4cef28a86ee6379d9f5bf8e4212b902d23226f",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"
     }
   }

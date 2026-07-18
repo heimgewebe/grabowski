@@ -215,12 +215,14 @@ class WorkerTests(unittest.TestCase):
         protected: str = "#protected",
         submit: str = "button",
         choice: str | None = None,
+        action_mode: str = "submit",
     ) -> str:
         scope, _, _ = workers._browser_form_action_scope(
             worker_id,
             origin,
             {"identity": identity, "protected": protected, "submit": submit},
             choice,
+            action_mode,
         )
         return workers._browser_form_confirmation(worker_id, origin, scope)
 
@@ -272,6 +274,159 @@ class WorkerTests(unittest.TestCase):
         self.assertNotIn("protected_selector", record)
         self.assertEqual(record["selector_sha256"]["identity"], workers._sha256_text("#identity"))
         self.assertIsNone(workers.resources.inspect_resource(f"component:browser-action:{worker['worker_id']}"))
+
+    def test_stored_form_readiness_is_fill_only_and_cleans_fields(self) -> None:
+        worker = self._running_browser(port=9342)
+        payload = {
+            "schema_version": 1,
+            "ok": True,
+            "result_code": "ready",
+            "fill_confirmed": True,
+            "submitted": False,
+            "action_effect_observed": False,
+            "navigation_observed": False,
+            "form_disappeared": False,
+            "post_origin": "http://device.home.arpa",
+            "post_path_sha256": None,
+            "remote_address_sha256": "d" * 64,
+            "cleaned": True,
+        }
+        with patch.object(
+            workers,
+            "_canonical_local_origin",
+            return_value=("http://device.home.arpa", "b" * 64, ["192.168.1.1"]),
+        ), patch.object(workers, "_run_node_form_action", return_value=payload) as action, patch.object(
+            workers.base, "_append_audit"
+        ) as append, patch.object(
+            workers.base, "_verify_audit_log", return_value={"last_record_sha256": "c" * 64}
+        ), patch.object(
+            workers,
+            "_observe",
+            return_value={"state": "running", "properties": {}, "probe": result(), "observed_at_unix": 1},
+        ):
+            response = workers.browser_stored_form_action(
+                worker["worker_id"],
+                expected_origin="http://device.home.arpa",
+                identity_selector="#identity",
+                protected_selector="#protected",
+                submit_selector="button",
+                action_mode="readiness",
+                confirmation=self._confirmation(worker["worker_id"], action_mode="readiness"),
+            )
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["result_code"], "ready")
+        self.assertIs(response["submitted"], False)
+        self.assertIs(response["cleaned"], True)
+        self.assertEqual(response["action_mode"], "readiness")
+        self.assertEqual(action.call_args.args[1]["action_mode"], "readiness")
+        self.assertEqual(append.call_args.args[0]["action_mode"], "readiness")
+        self.assertEqual(
+            response["does_not_establish"],
+            [
+                "authentication_success",
+                "future_submit_success",
+                "browser_profile_contains_a_reusable_stored_entry",
+            ],
+        )
+
+    def test_stored_form_action_rejects_invalid_mode_before_transport(self) -> None:
+        worker = self._running_browser(port=9344)
+        with patch.object(workers, "_canonical_local_origin") as origin, patch.object(
+            workers, "_run_node_form_action"
+        ) as action:
+            with self.assertRaisesRegex(ValueError, "action_mode"):
+                workers.browser_stored_form_action(
+                    worker["worker_id"],
+                    expected_origin="http://device.home.arpa",
+                    identity_selector="#identity",
+                    protected_selector="#protected",
+                    submit_selector="button",
+                    action_mode="inspect",
+                    confirmation="unused",
+                )
+        origin.assert_not_called()
+        action.assert_not_called()
+
+    def test_stored_form_readiness_rejects_drifted_success_receipts(self) -> None:
+        worker = self._running_browser(port=9345)
+        base_payload = {
+            "schema_version": 1,
+            "ok": True,
+            "result_code": "ready",
+            "fill_confirmed": True,
+            "submitted": False,
+            "action_effect_observed": False,
+            "navigation_observed": False,
+            "form_disappeared": False,
+            "post_origin": "http://device.home.arpa",
+            "post_path_sha256": None,
+            "remote_address_sha256": "d" * 64,
+            "cleaned": True,
+        }
+        record = workers._row(worker["worker_id"])
+        request = {
+            "schema_version": 1,
+            "port": 9345,
+            "expected_origin": "http://device.home.arpa",
+            "allowed_addresses": ["192.168.1.1"],
+            "cleanup_only": False,
+            "action_mode": "readiness",
+            "selectors": {"identity": "#i", "protected": "#p", "submit": "button"},
+            "identity_choice": None,
+            "timeout_ms": 5000,
+        }
+        for key, value in (
+            ("form_disappeared", True),
+            ("post_origin", "http://other.home.arpa"),
+            ("post_path_sha256", "a" * 64),
+        ):
+            with self.subTest(key=key):
+                payload = {**base_payload, key: value}
+                execution = result(stdout=json.dumps(payload) + "\n")
+                node = self.root / f"node-{key}"
+                node.write_text("#!/bin/sh\nexit 0\n")
+                node.chmod(0o755)
+                with patch.object(workers.shutil, "which", return_value=str(node)), patch.object(
+                    workers.operator, "_run", return_value=execution
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "readiness receipt"):
+                        workers._run_node_form_action(
+                            record,
+                            request,
+                            timeout_seconds=5,
+                        )
+
+    def test_stored_form_readiness_confirmation_cannot_authorize_submit(self) -> None:
+        worker = self._running_browser(port=9343)
+        readiness_confirmation = self._confirmation(
+            worker["worker_id"], action_mode="readiness"
+        )
+        with patch.object(
+            workers,
+            "_canonical_local_origin",
+            return_value=("http://device.home.arpa", "b" * 64, ["192.168.1.1"]),
+        ), patch.object(workers, "_run_node_form_action") as action:
+            with self.assertRaisesRegex(PermissionError, "confirmation mismatch"):
+                workers.browser_stored_form_action(
+                    worker["worker_id"],
+                    expected_origin="http://device.home.arpa",
+                    identity_selector="#identity",
+                    protected_selector="#protected",
+                    submit_selector="button",
+                    action_mode="submit",
+                    confirmation=readiness_confirmation,
+                )
+        action.assert_not_called()
+
+    def test_stored_form_readiness_helper_clears_before_submit_branch(self) -> None:
+        source = workers.BROWSER_FORM_NODE_SOURCE
+        readiness = source.index("if (request.action_mode === 'readiness')")
+        clear = source.index("cleaned = await clearFields();", readiness)
+        ready_receipt = source.index("result_code: 'ready'", readiness)
+        submit = source.index("stage = 'submit-target';", readiness)
+        self.assertLess(readiness, clear)
+        self.assertLess(clear, ready_receipt)
+        self.assertLess(ready_receipt, submit)
 
     def test_stored_form_action_requires_exact_confirmation(self) -> None:
         worker = self._running_browser(port=9334)
@@ -523,6 +678,7 @@ class WorkerTests(unittest.TestCase):
             ("protected", {"protected": "#other-protected"}),
             ("submit", {"submit": "button.primary"}),
             ("choice", {"choice": "other-user"}),
+            ("action_mode", {"action_mode": "readiness"}),
         ):
             with self.subTest(key=key):
                 self.assertNotEqual(original, self._confirmation(worker["worker_id"], **kwargs))
