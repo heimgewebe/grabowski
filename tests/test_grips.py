@@ -2401,6 +2401,31 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pass", checks["pr_verify"])
         self.assertEqual("pass", checks["pr_draft_state"])
 
+    def test_pr_create_or_update_creates_ready_when_draft_is_explicitly_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_gh = FakeGh()
+            result = grips.run_grip(
+                "pr-create-or-update",
+                {
+                    "repo": tmp,
+                    "branch": "feat/work",
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "title": "Ready",
+                    "draft": False,
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", head="a" * 40),
+                github_runner=fake_gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        create_call = next(call for call in fake_gh.calls if call[:2] == ("pr", "create"))
+        self.assertNotIn("--draft", create_call)
+        self.assertFalse(result["output"]["draft"])
+        self.assertFalse(result["output"]["draft_requested"])
+        self.assertFalse(result["output"]["pr"]["isDraft"])
+
     def test_pr_create_or_update_creates_draft_and_verifies_exact_state(self) -> None:
         view = {
             "number": 77,
@@ -2578,7 +2603,47 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("failed", result["receipt"]["status"])
         self.assertIn("draft verification", result["output"]["error"])
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["pr_verify"])
         self.assertEqual("fail", checks["pr_draft_state"])
+        check_ids = [item["id"] for item in result["receipt"]["checks"]]
+        self.assertLess(check_ids.index("pr_verify"), check_ids.index("pr_draft_state"))
+
+    def test_pr_create_or_update_fails_closed_when_draft_readback_is_not_boolean(self) -> None:
+        base_view = {
+            "number": 77,
+            "url": "https://github.com/heimgewebe/grabowski/pull/77",
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": "feat/work",
+            "headRefOid": "a" * 40,
+            "mergeable": "MERGEABLE",
+        }
+        for label, actual in (("missing", None), ("string", "false")):
+            with self.subTest(label=label):
+                view = dict(base_view)
+                if label != "missing":
+                    view["isDraft"] = actual
+                with tempfile.TemporaryDirectory() as tmp:
+                    result = grips.run_grip(
+                        "pr-create-or-update",
+                        {
+                            "repo": tmp,
+                            "branch": "feat/work",
+                            "base": "main",
+                            "expected_head": "a" * 40,
+                            "title": "Ready",
+                            "draft": False,
+                        },
+                        allow_mutation=True,
+                        command_runner=FakeGit(branch="feat/work", head="a" * 40),
+                        github_runner=FakeGh(view=view),
+                    )
+
+                self.assertEqual("failed", result["receipt"]["status"])
+                self.assertIn("draft state is unavailable", result["output"]["error"])
+                checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+                self.assertEqual("pass", checks["pr_verify"])
+                self.assertEqual("fail", checks["pr_draft_state"])
 
     def test_pr_create_or_update_blocks_ambiguous_open_pr_list(self) -> None:
         existing = [
