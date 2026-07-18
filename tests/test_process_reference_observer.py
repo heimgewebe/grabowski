@@ -20,10 +20,14 @@ SPEC.loader.exec_module(observer)
 
 class ProcessReferenceObserverTests(unittest.TestCase):
     def make_root(self) -> tempfile.TemporaryDirectory[str]:
-        return tempfile.TemporaryDirectory(prefix="observer-root-", dir="/home/alex/repos")
+        return tempfile.TemporaryDirectory(prefix="observer-root-")
 
     def allowed(self, root: Path):
-        return patch.object(observer, "ALLOWED_ROOTS", (root,))
+        return patch.multiple(
+            observer,
+            ALLOWED_ROOTS=(root,),
+            EXPECTED_TARGET_UID=os.getuid(),
+        )
 
     def request(self, root: str, **overrides: object) -> dict[str, object]:
         value: dict[str, object] = {

@@ -677,6 +677,8 @@ def _validate_process_reference_observation(
     errors = value.get("errors")
     if not isinstance(errors, list) or errors != sorted(set(errors)) or not all(isinstance(item, str) and item for item in errors):
         raise RuntimeError("process reference observation errors are invalid")
+    if value["complete"] != (errors == []):
+        raise RuntimeError("process reference observation completeness contradicts errors")
     references = value.get("path_references")
     if not isinstance(references, list) or len(references) > 64:
         raise RuntimeError("process reference observation references are invalid")

@@ -1127,8 +1127,36 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
                 max_file_descriptors=10,
             )
 
+    def test_process_reference_observation_rejects_inconsistent_completion(self) -> None:
+        roots = ["/home/alex/repos/example/target"]
+        for complete, errors in ((True, ["scan-incomplete"]), (False, [])):
+            with self.subTest(complete=complete, errors=errors):
+                material = {
+                    "kind": privileged.PROCESS_REFERENCE_KIND,
+                    "schema_version": 1,
+                    "complete": complete,
+                    "target_uid": 1000,
+                    "roots": roots,
+                    "process_count": 1,
+                    "open_file_descriptors_checked": 1,
+                    "path_references": [],
+                    "errors": errors,
+                }
+                value = {
+                    **material,
+                    "observation_sha256": privileged._canonical_sha256(material),
+                }
+                with self.assertRaisesRegex(RuntimeError, "completeness contradicts errors"):
+                    privileged._validate_process_reference_observation(
+                        value,
+                        roots=roots,
+                        target_uid=1000,
+                        max_processes=10,
+                        max_file_descriptors=10,
+                    )
+
     def test_observe_process_references_binds_request_and_cleans_reference(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="privileged-observer-", dir="/home/alex/repos") as directory, tempfile.TemporaryDirectory() as state:
+        with tempfile.TemporaryDirectory(prefix="privileged-observer-") as directory, tempfile.TemporaryDirectory() as state:
             root = Path(directory)
             roots = [str(root)]
             material = {
