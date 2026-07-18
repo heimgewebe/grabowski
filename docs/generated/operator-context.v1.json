@@ -2392,6 +2392,10 @@
         "source": "src/grabowski_repobrief.py"
       },
       {
+        "module": "grabowski_repoground_catalog",
+        "source": "src/grabowski_repoground_catalog.py"
+      },
+      {
         "module": "grabowski_agent_workspace",
         "source": "src/grabowski_agent_workspace.py"
       },
@@ -2453,7 +2457,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "6a403b6c950a051f65143628ced9a8b1308cacc41a98136aa7b56a59ada66108"
+      "sha256": "2c47105e3c8ecbb2fa715edab91920c1911a6397c4fc90d6e621306d0c1806bc"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2499,6 +2503,7 @@
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
       "src/grabowski_recovery.py": "1c5b0843345f5aa7d1da7f3f0c5831e647f652c83eba7733b4a2c998d291c16d",
       "src/grabowski_repobrief.py": "a51936edf0f5b1da32e7b396696da81429cf5dc03d0a773852c6b3e35ce44d36",
+      "src/grabowski_repoground_catalog.py": "0f9d54ef6af5041036c202818968b887824c50f87dd811def917755a33417c32",
       "src/grabowski_resources.py": "d846feceb40f297561ade6fa1d39bc5831f8e5d59365ba90d55aa6430f5f6489",
       "src/grabowski_runtime.py": "cf83bd1d3578fbd94f6b447e8862d15ca656adc54eaf32e66e255b1115f842da",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",

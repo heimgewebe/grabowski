@@ -323,6 +323,10 @@
       "source": "src/grabowski_repobrief.py"
     },
     {
+      "module": "grabowski_repoground_catalog",
+      "source": "src/grabowski_repoground_catalog.py"
+    },
+    {
       "module": "grabowski_agent_workspace",
       "source": "src/grabowski_agent_workspace.py"
     },

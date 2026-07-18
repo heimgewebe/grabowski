@@ -273,6 +273,38 @@ class RepositoryContractTests(unittest.TestCase):
             )
         self.assertEqual(grip_imports - deployed_modules, set())
 
+    def test_runtime_supporting_source_imports_are_in_deployment_source_set(
+        self,
+    ) -> None:
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        deployed_modules = {
+            contract["module"],
+            *(item["module"] for item in contract["supporting_sources"]),
+        }
+        missing: dict[str, list[str]] = {}
+        for item in contract["supporting_sources"]:
+            module = item["module"]
+            tree = ast.parse((ROOT / item["source"]).read_text(encoding="utf-8"))
+            imports: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    candidates = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    candidates = [node.module or ""]
+                else:
+                    continue
+                imports.update(
+                    candidate.split(".", 1)[0]
+                    for candidate in candidates
+                    if candidate.startswith("grabowski_")
+                )
+            absent = sorted(imports - deployed_modules)
+            if absent:
+                missing[module] = absent
+        self.assertEqual({}, missing)
+
     def test_bureau_intake_adapter_is_loaded_and_packaged(self) -> None:
         runtime = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
