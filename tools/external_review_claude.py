@@ -19,7 +19,7 @@ SEVERITIES = {"critical", "high", "medium", "low"}
 DEFAULT_TIMEOUT_MINUTES = 30
 DEFAULT_MODEL = "opus"
 DEFAULT_EFFORT = "high"
-DEFAULT_MAX_BUDGET_USD = 2.0
+DEFAULT_MAX_BUDGET_USD = 0.0
 DEFAULT_MAX_PROMPT_BYTES = 750_000
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -221,8 +221,12 @@ def build_command(*, claude_bin: str, model: str, effort: str, max_budget_usd: f
         raise ClaudeReviewError(f"Claude packet review requires model {DEFAULT_MODEL}")
     if effort != DEFAULT_EFFORT:
         raise ClaudeReviewError(f"Claude packet review requires effort {DEFAULT_EFFORT}")
-    if not math.isfinite(max_budget_usd) or max_budget_usd <= 0:
-        raise ClaudeReviewError("Claude packet review budget must be a positive finite number")
+    if not math.isfinite(max_budget_usd) or max_budget_usd < 0:
+        raise ClaudeReviewError("Claude packet review budget must be a non-negative finite number")
+    if max_budget_usd == 0:
+        raise ClaudeReviewError(
+            "zero-cost policy blocks external Claude review; pass an explicit positive max_budget_usd only with fresh cost authorization"
+        )
     schema = json.dumps(REVIEW_SCHEMA, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return [
         "claude",

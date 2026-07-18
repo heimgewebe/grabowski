@@ -115,3 +115,7 @@ Increase depth when late findings or escaped defects cluster in a tier. Reduce d
 ## Optional external diagnostics
 
 External review tools remain available for unusual uncertainty, incident analysis, or a deliberate second opinion. Their evidence may be supplied with `--external-review-evidence`; invalid evidence produces warnings, not a merge block. Legacy Claude packet requirements, policy waivers, and `self_review_required=false` are deprecated. External review output does not satisfy or shorten the required self-review loop.
+
+## Cost policy
+
+External providers default to a `0 USD` budget and are blocked before process launch. A live run requires an explicit positive maximum. Agent competition additionally requires a provider-enforced hard USD limit by default. Providers without a hard limit remain blocked unless the caller explicitly weakens that gate. Prior budget authorizations do not carry forward.

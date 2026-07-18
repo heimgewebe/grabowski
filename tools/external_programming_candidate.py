@@ -1015,7 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw-output", required=True)
     parser.add_argument("--stderr-output", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=900)
-    parser.add_argument("--max-budget-usd", type=float, default=2.0)
+    parser.add_argument("--max-budget-usd", type=float, default=0.0)
     args = parser.parse_args(argv)
     try:
         if not 30 <= args.timeout_seconds <= 3600:
@@ -1054,6 +1054,16 @@ def main(argv: list[str] | None = None) -> int:
         raw_output_path = bound_output_path(args.raw_output, directory=candidate_directory, expected_name="raw-output.json")
         stderr_output_path = bound_output_path(args.stderr_output, directory=candidate_directory, expected_name="stderr.txt")
         packet = validate_packet(load_private_json(packet_path, label="candidate packet"))
+        if (
+            isinstance(args.max_budget_usd, bool)
+            or not math.isfinite(args.max_budget_usd)
+            or not 0 <= args.max_budget_usd <= 10
+        ):
+            raise CandidateError("max_budget_usd must be in [0, 10]")
+        if args.max_budget_usd == 0:
+            raise CandidateError(
+                "zero-cost policy blocks external provider execution; pass an explicit positive --max-budget-usd only with fresh cost authorization"
+            )
         if packet["schema_version"] == 2:
             budget_contract = validate_budget_contract(
                 packet["budget_contract"],

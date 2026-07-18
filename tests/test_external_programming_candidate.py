@@ -74,6 +74,11 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
         os.chmod(path, 0o600)
         return path
 
+    def _authorized_main(self, argv: list[str]) -> int:
+        if "--max-budget-usd" not in argv:
+            argv = [*argv, "--max-budget-usd", "2.0"]
+        return candidate_tool.main(argv)
+
     def _prepare_frozen_runner(self, directory: Path) -> tuple[Path, bytes, Path]:
         runner_bytes = Path(candidate_tool.__file__).read_bytes()
         runner = directory / "runner.py"
@@ -364,7 +369,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 mock.patch.object(candidate_tool, "run_bounded_process", side_effect=fake_bounded),
                 mock.patch.dict(os.environ, {"PATH": "/usr/bin", "HOME": str(root), "SECRET_TOKEN": "hidden"}, clear=True),
             ):
-                result = candidate_tool.main([
+                result = self._authorized_main([
                     "--packet", str(packet_path),
                     "--output", str(output),
                     "--raw-output", str(raw),
@@ -396,7 +401,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             runner.write_bytes(runner_bytes + b"\n# tampered\n")
             runner.chmod(0o600)
             with mock.patch.object(candidate_tool, "__file__", str(runner)):
-                result = candidate_tool.main([
+                result = self._authorized_main([
                     "--packet", str(packet_path),
                     "--output", str(directory / "receipt.json"),
                     "--raw-output", str(directory / "raw-output.json"),
@@ -447,7 +452,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 mock.patch.object(candidate_tool.shutil, "which", return_value="/usr/bin/true"),
                 mock.patch.object(candidate_tool, "run_bounded_process", side_effect=fake_bounded),
             ):
-                result = candidate_tool.main([
+                result = self._authorized_main([
                     "--packet", str(packet_path),
                     "--output", str(directory / "receipt.json"),
                     "--raw-output", str(directory / "raw-output.json"),
@@ -468,7 +473,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             runner, runner_bytes, _ = self._prepare_frozen_runner(directory)
             packet_path = self._packet(directory, repo, runner_bytes=runner_bytes)
             with mock.patch.object(candidate_tool, "__file__", str(runner)):
-                result = candidate_tool.main([
+                result = self._authorized_main([
                 "--packet", str(packet_path),
                 "--output", str(root / "receipt.json"),
                 "--raw-output", str(directory / "raw-output.json"),
@@ -535,6 +540,37 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             self.assertFalse(atomic.exists())
             self.assertTrue(fresh.exists())
 
+    def test_main_default_zero_budget_blocks_before_provider_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            directory = root / "candidate"
+            directory.mkdir(mode=0o700)
+            runner, runner_bytes, _ = self._prepare_frozen_runner(directory)
+            packet_path = self._packet(
+                directory,
+                repo,
+                provider="claude",
+                runner_bytes=runner_bytes,
+                schema_version=2,
+                max_budget_usd=2.0,
+            )
+            with (
+                mock.patch.object(candidate_tool, "__file__", str(runner)),
+                mock.patch.object(candidate_tool, "run_bounded_process") as bounded,
+            ):
+                result = candidate_tool.main([
+                    "--packet", str(packet_path),
+                    "--output", str(directory / "receipt.json"),
+                    "--raw-output", str(directory / "raw-output.json"),
+                    "--stderr-output", str(directory / "stderr.txt"),
+                    "--timeout-seconds", "60",
+                ])
+            self.assertEqual(result, 2)
+            bounded.assert_not_called()
+
     def test_v2_main_rejects_cli_budget_mismatch_before_provider_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -556,7 +592,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 mock.patch.object(candidate_tool, "__file__", str(runner)),
                 mock.patch.object(candidate_tool, "run_bounded_process") as bounded,
             ):
-                result = candidate_tool.main([
+                result = self._authorized_main([
                     "--packet", str(packet_path),
                     "--output", str(directory / "receipt.json"),
                     "--raw-output", str(directory / "raw-output.json"),

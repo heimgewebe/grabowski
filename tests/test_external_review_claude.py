@@ -433,6 +433,16 @@ class ExternalReviewClaudeTests(unittest.TestCase):
                 )
             self.assertFalse((root / "evidence.json").exists())
 
+    def test_default_zero_budget_blocks_before_claude_execution(self) -> None:
+        self.assertEqual(claude_review.DEFAULT_MAX_BUDGET_USD, 0.0)
+        with self.assertRaisesRegex(claude_review.ClaudeReviewError, "zero-cost policy blocks"):
+            claude_review.build_command(
+                claude_bin="claude",
+                model="opus",
+                effort="high",
+                max_budget_usd=claude_review.DEFAULT_MAX_BUDGET_USD,
+            )
+
     def test_adapter_and_gate_share_an_executable_contract(self) -> None:
         self.assertEqual(claude_review.REVIEW_SCHEMA, review_gate.CLAUDE_PACKET_REVIEW_SCHEMA)
         command = claude_review.build_command(

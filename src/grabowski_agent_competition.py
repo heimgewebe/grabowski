@@ -1731,8 +1731,8 @@ def grabowski_agent_competition_start(
     forbidden_paths: list[str] | None = None,
     primary_summary: str = "",
     timeout_seconds: int = 900,
-    max_budget_usd: float = 2.0,
-    require_hard_budget: bool = False,
+    max_budget_usd: float = 0.0,
+    require_hard_budget: bool = True,
 ) -> dict[str, Any]:
     """Start one durable advisory-only external competitor or contrast programmer."""
     operator._require_operator_capability("git_cli")
@@ -1745,9 +1745,18 @@ def grabowski_agent_competition_start(
         raise AgentCompetitionError("provider or mode is unsupported")
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 30 <= timeout_seconds <= 3600:
         raise AgentCompetitionError("timeout_seconds must be between 30 and 3600")
-    if isinstance(max_budget_usd, bool) or not isinstance(max_budget_usd, (int, float)) or not 0 < float(max_budget_usd) <= 10:
-        raise AgentCompetitionError("max_budget_usd must be in (0, 10]")
+    if (
+        isinstance(max_budget_usd, bool)
+        or not isinstance(max_budget_usd, (int, float))
+        or not math.isfinite(float(max_budget_usd))
+        or not 0 <= float(max_budget_usd) <= 10
+    ):
+        raise AgentCompetitionError("max_budget_usd must be in [0, 10]")
     hard_budget_required = _strict_bool(require_hard_budget, "require_hard_budget")
+    if float(max_budget_usd) == 0:
+        raise AgentCompetitionError(
+            "zero-cost policy blocks external provider execution; pass an explicit positive max_budget_usd only with fresh cost authorization"
+        )
     budget_contract = _budget_contract(
         provider_value,
         float(max_budget_usd),
