@@ -1790,6 +1790,28 @@
     },
     {
       "category": "agent-workspace",
+      "description": "Read the validated canonical coding-model, harness, route and quota inventory.",
+      "effects": [],
+      "id": "grabowski_coding_agent_catalog",
+      "purpose": "Read the validated canonical coding-model, harness, route and quota inventory without probing or executing external agents.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_coding_agent_catalog"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Recommend one zero-marginal-cost coding route without authorizing execution.",
+      "effects": [],
+      "id": "grabowski_coding_agent_route",
+      "purpose": "Recommend one zero-marginal-cost, quota-aware coding route and provider-independent reviewer without granting dispatch or execution authority.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_coding_agent_route"
+    },
+    {
+      "category": "agent-workspace",
       "description": "Start one durable advisory-only external competitor or contrast programmer.",
       "effects": [
         "state-create",
@@ -2123,6 +2145,8 @@
       "grabowski_agent_workspace_reconcile_stale",
       "grabowski_agent_workspace_cleanup",
       "grabowski_agent_execution_route",
+      "grabowski_coding_agent_catalog",
+      "grabowski_coding_agent_route",
       "grabowski_agent_competition_start",
       "grabowski_agent_competition_status",
       "grabowski_agent_competition_compare",
@@ -2187,6 +2211,10 @@
       {
         "module": "grabowski_agent_competition",
         "source": "src/grabowski_agent_competition.py"
+      },
+      {
+        "module": "grabowski_coding_agent_router",
+        "source": "src/grabowski_coding_agent_router.py"
       },
       {
         "module": "grabowski_capabilities",
@@ -2342,7 +2370,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "091f44be4294f46372df6d7475a2c02d0e5f1f15f6666ddfb1c0a0e852ffac75"
+      "sha256": "e0d80154cebf9abdb6801c8452389f47d1ac1895b0c6b201004a3c2e66ba8adb"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2350,7 +2378,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "4f66ae997c2facf06828832df6794e72cbfcb35c4873433fee018bf472dbbd45"
+      "sha256": "ed594c2eddf4c54c6c07446ec61441cf92d264ffd901dacd25a7241be3ed3446"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2366,10 +2394,11 @@
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "091f44be4294f46372df6d7475a2c02d0e5f1f15f6666ddfb1c0a0e852ffac75",
+      "src/grabowski_capabilities.py": "e0d80154cebf9abdb6801c8452389f47d1ac1895b0c6b201004a3c2e66ba8adb",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "da41759813e9cf14bb7df17861c60ffb90a9369177d2bcd45c79df663b121bb2",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
+      "src/grabowski_coding_agent_router.py": "714b55085050179784fb25412443cac4597c8f8671e9a4b5b41ff42e07422e3b",
       "src/grabowski_command_identity.py": "03bf7193851846d1f5b4d1bfe71a787937e424804f875ba4e021233ddbc842c9",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_convergence.py": "03ea75eb190ac08f29c4ec6c5ab1a14a631ce7c0cce4956ed6f437c492a6a635",
@@ -2381,7 +2410,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "3701aac9786f2bcd660a7f46c895c7b1056f2e5dc271ab550c3a9334b333de10",
+      "src/grabowski_mcp.py": "52589355975bd4b86b703aac779a16d9a2a3d3754109413e9545e49ec5a72ad6",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
@@ -2395,7 +2424,7 @@
       "src/grabowski_recovery.py": "1c5b0843345f5aa7d1da7f3f0c5831e647f652c83eba7733b4a2c998d291c16d",
       "src/grabowski_repobrief.py": "25a577015ecf42e787b54f32874ca64a595437aec6d6d854e7c7bd3b61c9a4c1",
       "src/grabowski_resources.py": "d846feceb40f297561ade6fa1d39bc5831f8e5d59365ba90d55aa6430f5f6489",
-      "src/grabowski_runtime.py": "aeda349023314b1ce8690ab034c161d659be146b1c80569e409b2ad57680f98e",
+      "src/grabowski_runtime.py": "7a32106b8ca9a88fc7b2c3f4a7c01de5a24647196c222afe85ba9754fce8ffae",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "b8d92b82b762b763941735ef6c1b87ecad78ab60166eeaf5dbd8ac66f4325258",
       "src/grabowski_task_attention.py": "8833353556737cce9cae01b080cf5b1093d7df9f54472c893da6b6df8cbb1ad4",

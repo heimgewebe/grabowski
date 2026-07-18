@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "091f44be4294f46372df6d7475a2c02d0e5f1f15f6666ddfb1c0a0e852ffac75",
+  "capability_source_sha256": "e0d80154cebf9abdb6801c8452389f47d1ac1895b0c6b201004a3c2e66ba8adb",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "4f66ae997c2facf06828832df6794e72cbfcb35c4873433fee018bf472dbbd45",
+  "contract_sha256": "ed594c2eddf4c54c6c07446ec61441cf92d264ffd901dacd25a7241be3ed3446",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1799,6 +1799,28 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_agent_execution_route"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Read the validated canonical coding-model, harness, route and quota inventory.",
+      "effects": [],
+      "id": "grabowski_coding_agent_catalog",
+      "purpose": "Read the validated canonical coding-model, harness, route and quota inventory without probing or executing external agents.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_coding_agent_catalog"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Recommend one zero-marginal-cost coding route without authorizing execution.",
+      "effects": [],
+      "id": "grabowski_coding_agent_route",
+      "purpose": "Recommend one zero-marginal-cost, quota-aware coding route and provider-independent reviewer without granting dispatch or execution authority.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_coding_agent_route"
     },
     {
       "category": "agent-workspace",

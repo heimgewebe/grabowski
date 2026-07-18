@@ -1055,6 +1055,20 @@ TOOL_PROFILES.update(
             ],
             "reversibility": "restore-from-checkout-archive",
         },
+        "grabowski_coding_agent_catalog": {
+            "category": "agent-workspace",
+            "purpose": "Read the validated canonical coding-model, harness, route and quota inventory without probing or executing external agents.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_coding_agent_route": {
+            "category": "agent-workspace",
+            "purpose": "Recommend one zero-marginal-cost, quota-aware coding route and provider-independent reviewer without granting dispatch or execution authority.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
         "grabowski_agent_execution_route": {
             "category": "agent-workspace",
             "purpose": "Recommend a lean R0-R3 direct, isolated, full-workspace, contrast or explicitly fork-gated competition route while keeping parallel writers advisory-only.",

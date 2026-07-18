@@ -140,6 +140,8 @@
     "grabowski_agent_workspace_reconcile_stale",
     "grabowski_agent_workspace_cleanup",
     "grabowski_agent_execution_route",
+    "grabowski_coding_agent_catalog",
+    "grabowski_coding_agent_route",
     "grabowski_agent_competition_start",
     "grabowski_agent_competition_status",
     "grabowski_agent_competition_compare",
@@ -206,6 +208,10 @@
     {
       "module": "grabowski_agent_competition",
       "source": "src/grabowski_agent_competition.py"
+    },
+    {
+      "module": "grabowski_coding_agent_router",
+      "source": "src/grabowski_coding_agent_router.py"
     },
     {
       "module": "grabowski_capabilities",
