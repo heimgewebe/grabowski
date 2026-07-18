@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import signal
 from pathlib import Path
 import stat
 import sys
@@ -49,6 +50,15 @@ class CodingAgentProbeSchedulerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    @staticmethod
+    def _process_is_live(process_id: int) -> bool:
+        try:
+            stat_payload = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            return False
+        state = stat_payload.rsplit(")", 1)[1].strip().split(maxsplit=1)[0]
+        return state != "Z"
 
     def write_router(
         self, *, mutate_history: bool = False, tamper_digest: bool = False
@@ -216,6 +226,29 @@ else:
         self.assertEqual(before, self.state.read_bytes())
         self.assertFalse(self.receipt.exists())
 
+    def test_state_symlink_is_rejected_before_execution(self) -> None:
+        self.write_router()
+        real_state = self.root / "state.real.json"
+        self.state.replace(real_state)
+        self.state.symlink_to(real_state)
+        before = real_state.read_bytes()
+        result = SCHEDULER.main(self.arguments())
+        self.assertEqual(1, result)
+        self.assertEqual(before, real_state.read_bytes())
+        self.assertFalse(self.receipt.exists())
+        self.assertTrue(self.failure.exists())
+
+    def test_router_digest_pin_directory_fails_before_execution(self) -> None:
+        self.write_router()
+        before = self.state.read_bytes()
+        self.router_digest.unlink()
+        self.router_digest.mkdir()
+        result = SCHEDULER.main(self.arguments())
+        self.assertEqual(1, result)
+        self.assertEqual(before, self.state.read_bytes())
+        self.assertFalse(self.receipt.exists())
+        self.assertTrue(self.failure.exists())
+
     def test_unreadable_state_fails_closed(self) -> None:
         self.write_router()
         os.chmod(self.state, 0o000)
@@ -260,6 +293,49 @@ else:
                 timeout_seconds=1,
             )
         self.assertLess(time.monotonic() - started, 5)
+
+    def test_timeout_kills_term_resistant_descendant_after_leader_exit(self) -> None:
+        child_pid_path = self.root / "term-resistant-child.pid"
+        program = "\n".join(
+            (
+                "import signal, subprocess, sys, time",
+                "child = subprocess.Popen(",
+                "    [sys.executable, '-c',",
+                "     'import os, signal, sys, time; '",
+                "     'signal.signal(signal.SIGTERM, signal.SIG_IGN); '",
+                "     'open(sys.argv[1], \"w\").write(str(os.getpid())); '",
+                "     'time.sleep(30)', sys.argv[1]],",
+                "    stdout=subprocess.DEVNULL,",
+                "    stderr=subprocess.DEVNULL,",
+                ")",
+                "time.sleep(30)",
+            )
+        )
+        child_pid = None
+        try:
+            with self.assertRaisesRegex(
+                SCHEDULER.ProbeSchedulerError,
+                "command failed to execute",
+            ):
+                SCHEDULER.run_json_command(
+                    [sys.executable, "-c", program, str(child_pid_path)],
+                    environment=dict(os.environ),
+                    timeout_seconds=1,
+                )
+            child_pid = int(child_pid_path.read_text(encoding="ascii"))
+            deadline = time.monotonic() + 2
+            while self._process_is_live(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(self._process_is_live(child_pid))
+        finally:
+            if child_pid is not None and self._process_is_live(child_pid):
+                os.kill(child_pid, signal.SIGKILL)
+
+    def test_output_reads_never_exceed_remaining_budget_plus_one(self) -> None:
+        with mock.patch.object(SCHEDULER, "MAX_COMMAND_OUTPUT_BYTES", 1024):
+            self.assertEqual(1025, SCHEDULER.bounded_output_read_size(0))
+            self.assertEqual(25, SCHEDULER.bounded_output_read_size(1000))
+            self.assertEqual(1, SCHEDULER.bounded_output_read_size(1024))
 
     def test_invalid_command_json_fails_closed(self) -> None:
         with self.assertRaisesRegex(
