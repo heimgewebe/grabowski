@@ -27,6 +27,131 @@
         "tool": "grabowski_browser_worker_stored_form_action"
       }
     },
+    "grabowski_bureau_candidate_assess": {
+      "evidence_refs": [
+        "bureau:OPERATOR-MACHINE-READABILITY-V1-T017",
+        "docs:bureau-operator-intake-adapter-v1.md",
+        "tests:test_bureau_intake_adapter.py"
+      ],
+      "exception_detail": {
+        "claim": "grabowski_bureau_candidate_assess owns only its declared Bureau operator-intake boundary.",
+        "evidence": "Digest-bound private artifacts, runtime package identity checks, typed Bureau payload passthrough, exact short leases, no merge path and focused success/conflict/ambiguity tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic operation or terminal command was rejected because it would expose broader authority and would not preserve Bureau domain errors, exact resource bindings, adapter idempotency and ambiguity handling.",
+      "rationale": "Canonical candidate assessment is a bounded Bureau read contract; a generic command would widen authority and obscure advisory-only semantics.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "bureau",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_bureau_candidate_assess"
+      }
+    },
+    "grabowski_bureau_candidate_record": {
+      "evidence_refs": [
+        "bureau:OPERATOR-MACHINE-READABILITY-V1-T017",
+        "docs:bureau-operator-intake-adapter-v1.md",
+        "tests:test_bureau_intake_adapter.py"
+      ],
+      "exception_detail": {
+        "claim": "grabowski_bureau_candidate_record owns only its declared Bureau operator-intake boundary.",
+        "evidence": "Digest-bound private artifacts, runtime package identity checks, typed Bureau payload passthrough, exact short leases, no merge path and focused success/conflict/ambiguity tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic operation or terminal command was rejected because it would expose broader authority and would not preserve Bureau domain errors, exact resource bindings, adapter idempotency and ambiguity handling.",
+      "rationale": "Canonical source-bound candidate intake is a distinct Bureau authority; a generic terminal call would expose arbitrary command execution and lose typed idempotency and provenance.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "bureau",
+        "effects": [
+          "bureau_live_register_append",
+          "private_adapter_artifact"
+        ],
+        "read_only": false,
+        "reversibility": "append-only-domain-event",
+        "risk_class": "medium",
+        "tool": "grabowski_bureau_candidate_record"
+      }
+    },
+    "grabowski_bureau_task_propose": {
+      "evidence_refs": [
+        "bureau:OPERATOR-MACHINE-READABILITY-V1-T017",
+        "docs:bureau-operator-intake-adapter-v1.md",
+        "tests:test_bureau_intake_adapter.py"
+      ],
+      "exception_detail": {
+        "claim": "grabowski_bureau_task_propose owns only its declared Bureau operator-intake boundary.",
+        "evidence": "Digest-bound private artifacts, runtime package identity checks, typed Bureau payload passthrough, exact short leases, no merge path and focused success/conflict/ambiguity tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic operation or terminal command was rejected because it would expose broader authority and would not preserve Bureau domain errors, exact resource bindings, adapter idempotency and ambiguity handling.",
+      "rationale": "Proposal creation owns immutable digest-bound adapter artifacts while leaving Registry and Queue untouched; generic filesystem and terminal surfaces are broader.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "bureau",
+        "effects": [
+          "private_proposal_artifact"
+        ],
+        "read_only": false,
+        "reversibility": "artifact-preserving",
+        "risk_class": "medium",
+        "tool": "grabowski_bureau_task_propose"
+      }
+    },
+    "grabowski_bureau_task_publish": {
+      "evidence_refs": [
+        "bureau:OPERATOR-MACHINE-READABILITY-V1-T017",
+        "docs:bureau-operator-intake-adapter-v1.md",
+        "tests:test_bureau_intake_adapter.py"
+      ],
+      "exception_detail": {
+        "claim": "grabowski_bureau_task_publish owns only its declared Bureau operator-intake boundary.",
+        "evidence": "Digest-bound private artifacts, runtime package identity checks, typed Bureau payload passthrough, exact short leases, no merge path and focused success/conflict/ambiguity tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic operation or terminal command was rejected because it would expose broader authority and would not preserve Bureau domain errors, exact resource bindings, adapter idempotency and ambiguity handling.",
+      "rationale": "Publication combines Bureau-owned validation with exact short leases, bounded receipt readback and no merge authority; splitting across generic tools would weaken the atomic contract.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "bureau",
+        "effects": [
+          "git_branch",
+          "pull_request",
+          "remote_branch",
+          "resource_lease"
+        ],
+        "read_only": false,
+        "reversibility": "git-and-github-recovery",
+        "risk_class": "high",
+        "tool": "grabowski_bureau_task_publish"
+      }
+    },
+    "grabowski_bureau_task_publish_preview": {
+      "evidence_refs": [
+        "bureau:OPERATOR-MACHINE-READABILITY-V1-T017",
+        "docs:bureau-operator-intake-adapter-v1.md",
+        "tests:test_bureau_intake_adapter.py"
+      ],
+      "exception_detail": {
+        "claim": "grabowski_bureau_task_publish_preview owns only its declared Bureau operator-intake boundary.",
+        "evidence": "Digest-bound private artifacts, runtime package identity checks, typed Bureau payload passthrough, exact short leases, no merge path and focused success/conflict/ambiguity tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic operation or terminal command was rejected because it would expose broader authority and would not preserve Bureau domain errors, exact resource bindings, adapter idempotency and ambiguity handling.",
+      "rationale": "Publication preview exposes exact Bureau validation and lease requirements without effect; it is narrower than generic command execution.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "bureau",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_bureau_task_publish_preview"
+      }
+    },
     "grabowski_coding_agent_catalog": {
       "evidence_refs": [
         "bureau:event-707",

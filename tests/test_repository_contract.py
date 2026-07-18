@@ -12,9 +12,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertTrue((ROOT / "src" / "grabowski_mcp.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_client_snapshot.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_operator.py").is_file())
-        self.assertTrue(
-            (ROOT / "src" / "grabowski_runtime_extensions.py").is_file()
-        )
+        self.assertTrue((ROOT / "src" / "grabowski_runtime_extensions.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_checkouts.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_runtime.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_read_surface.py").is_file())
@@ -22,9 +20,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertTrue((ROOT / "src" / "grabowski_merge_guard.py").is_file())
 
     def test_grabowski_tool_names_are_present(self) -> None:
-        source = (
-            ROOT / "src" / "grabowski_mcp.py"
-        ).read_text(encoding="utf-8")
+        source = (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
         expected = {
             "grabowski_status",
             "grabowski_list_directory",
@@ -49,9 +45,9 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("heim_assi_status", source)
 
     def test_extension_tool_names_are_present(self) -> None:
-        source = (
-            ROOT / "src" / "grabowski_runtime_extensions.py"
-        ).read_text(encoding="utf-8")
+        source = (ROOT / "src" / "grabowski_runtime_extensions.py").read_text(
+            encoding="utf-8"
+        )
         self.assertIn('name="grabowski_context"', source)
         self.assertIn('name="grabowski_git_branch"', source)
         self.assertIn("connector_snapshot_observable", source)
@@ -59,7 +55,9 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_status_exposes_live_tool_contract_fingerprint(self) -> None:
         source = (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
-        self.assertIn("tool_contract = _runtime_tool_contract_summary(deployment)", source)
+        self.assertIn(
+            "tool_contract = _runtime_tool_contract_summary(deployment)", source
+        )
         self.assertIn('"tool_contract": {', source)
         self.assertIn('"registered_names_sha256"', source)
         self.assertIn('"client_snapshot": client_snapshot', source)
@@ -75,8 +73,13 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('"grabowski_micro_task"', source)
         self.assertIn('"routing_roles"', source)
         self.assertIn('"execution_priority"', source)
-        self.assertIn('"chatgpt_operator_adaptive_workspace_external_competition_when_high_value"', source)
-        self.assertIn('"external_programming_modes": ["competitor", "contrast"]', source)
+        self.assertIn(
+            '"chatgpt_operator_adaptive_workspace_external_competition_when_high_value"',
+            source,
+        )
+        self.assertIn(
+            '"external_programming_modes": ["competitor", "contrast"]', source
+        )
         self.assertIn('"automatic_winner_selection": False', source)
         self.assertIn('"chatgpt_operator_external_opt_in_agy_print"', source)
         self.assertIn('"cline"', source)
@@ -92,9 +95,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("tools/operator_patch_relay.py", makefile)
 
     def test_status_exposes_deployment_provenance(self) -> None:
-        source = (
-            ROOT / "src" / "grabowski_mcp.py"
-        ).read_text(encoding="utf-8")
+        source = (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
         self.assertIn("DEPLOYMENT_MANIFEST", source)
         self.assertIn("deployment = _deployment_metadata()", source)
         self.assertIn('"deployment": deployment', source)
@@ -123,9 +124,7 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_runtime_entrypoint_contract_exists(self) -> None:
         contract = json.loads(
-            (
-                ROOT / "config" / "runtime-entrypoint.json"
-            ).read_text(encoding="utf-8")
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
         )
         self.assertEqual(contract["schema_version"], 2)
         self.assertEqual(contract["mode"], "module")
@@ -133,7 +132,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 147)
+        self.assertEqual(len(tools), 152)
         self.assertTrue(
             {
                 "grabowski_juno_status",
@@ -191,22 +190,60 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("grabowski_execution_governor_summary", tools)
         self.assertIn("grabowski_connector_transport_diagnostics", tools)
         self.assertIn("grabowski_operator_recall_export", tools)
-        supporting = {item["module"]: item["source"] for item in contract["supporting_sources"]}
-        self.assertEqual(supporting["grabowski_operator_core"], "src/grabowski_operator.py")
-        self.assertEqual(supporting["grabowski_read_surface"], "src/grabowski_read_surface.py")
-        self.assertEqual(supporting["grabowski_self_deploy"], "src/grabowski_self_deploy.py")
+        supporting = {
+            item["module"]: item["source"] for item in contract["supporting_sources"]
+        }
+        self.assertEqual(
+            supporting["grabowski_operator_core"], "src/grabowski_operator.py"
+        )
+        self.assertEqual(
+            supporting["grabowski_read_surface"], "src/grabowski_read_surface.py"
+        )
+        self.assertEqual(
+            supporting["grabowski_self_deploy"], "src/grabowski_self_deploy.py"
+        )
         self.assertEqual(
             supporting["grabowski_privileged_broker"],
             "src/grabowski_privileged_broker.py",
         )
-        self.assertEqual(supporting["grabowski_grip_orchestration"], "src/grabowski_grip_orchestration.py")
-        self.assertEqual(supporting["grabowski_merge_guard"], "src/grabowski_merge_guard.py")
+        self.assertEqual(
+            supporting["grabowski_grip_orchestration"],
+            "src/grabowski_grip_orchestration.py",
+        )
+        self.assertEqual(
+            supporting["grabowski_merge_guard"], "src/grabowski_merge_guard.py"
+        )
         self.assertEqual(
             supporting["grabowski_task_attention"],
             "src/grabowski_task_attention.py",
         )
-        for module in ("grabowski_mcp", "grabowski_grips", "grabowski_convergence", "grabowski_grip_orchestration", "grabowski_merge_guard", "grabowski_operator_obligation", "grabowski_capabilities", "grabowski_runtime_extensions", "grabowski_read_surface", "grabowski_self_deploy", "grabowski_checkouts", "grabowski_fleet", "grabowski_operations", "grabowski_privileged", "grabowski_privileged_broker", "grabowski_tasks", "grabowski_task_attention", "grabowski_recovery", "grabowski_friction", "grabowski_agent_bootstrap", "grabowski_recall", "grabowski_consumer_surface", "grabowski_private_io", "grabowski_job_origin", "grabowski_job_finalizer"):
-
+        for module in (
+            "grabowski_mcp",
+            "grabowski_grips",
+            "grabowski_convergence",
+            "grabowski_grip_orchestration",
+            "grabowski_merge_guard",
+            "grabowski_operator_obligation",
+            "grabowski_capabilities",
+            "grabowski_runtime_extensions",
+            "grabowski_read_surface",
+            "grabowski_self_deploy",
+            "grabowski_checkouts",
+            "grabowski_fleet",
+            "grabowski_operations",
+            "grabowski_privileged",
+            "grabowski_privileged_broker",
+            "grabowski_tasks",
+            "grabowski_task_attention",
+            "grabowski_recovery",
+            "grabowski_friction",
+            "grabowski_agent_bootstrap",
+            "grabowski_recall",
+            "grabowski_consumer_surface",
+            "grabowski_private_io",
+            "grabowski_job_origin",
+            "grabowski_job_finalizer",
+        ):
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
 
@@ -235,6 +272,12 @@ class RepositoryContractTests(unittest.TestCase):
                 if candidate.startswith("grabowski_")
             )
         self.assertEqual(grip_imports - deployed_modules, set())
+
+    def test_bureau_intake_adapter_is_loaded_and_packaged(self) -> None:
+        runtime = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn("import grabowski_bureau_intake", runtime)
+        self.assertIn('"grabowski_bureau_intake"', pyproject)
 
     def test_task_attention_is_packaged_as_a_python_module(self) -> None:
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -268,9 +311,7 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_merges_is_explicitly_read_only(self) -> None:
         policy = json.loads(
-            (
-                ROOT / "config" / "access.example.json"
-            ).read_text(encoding="utf-8")
+            (ROOT / "config" / "access.example.json").read_text(encoding="utf-8")
         )
         self.assertIn(
             "${HOME}/repos/merges",
@@ -284,9 +325,7 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_access_profiles_and_capabilities_are_explicit(self) -> None:
         policy = json.loads(
-            (
-                ROOT / "config" / "access.example.json"
-            ).read_text(encoding="utf-8")
+            (ROOT / "config" / "access.example.json").read_text(encoding="utf-8")
         )
         self.assertEqual(policy["active_profile"], "observe")
         self.assertEqual(policy["version"], 2)
@@ -376,9 +415,9 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_home_wide_operator_example_is_not_live_metadata(self) -> None:
         policy = json.loads(
-            (
-                ROOT / "config" / "access.home-wide-operator.example.json"
-            ).read_text(encoding="utf-8")
+            (ROOT / "config" / "access.home-wide-operator.example.json").read_text(
+                encoding="utf-8"
+            )
         )
         self.assertEqual(policy["active_profile"], "break-glass")
         self.assertEqual(policy["version"], 2)
@@ -400,9 +439,9 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_home_wide_profiles_with_home_roots_keep_typed_roots(self) -> None:
         policy = json.loads(
-            (
-                ROOT / "config" / "access.home-wide-operator.example.json"
-            ).read_text(encoding="utf-8")
+            (ROOT / "config" / "access.home-wide-operator.example.json").read_text(
+                encoding="utf-8"
+            )
         )
         expected_secret_roots = set(policy["secret_roots"])
         expected_browser_roots = set(policy["browser_profile_roots"])
@@ -425,22 +464,31 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_access_policy_schema_versions_are_separate(self) -> None:
         v1 = json.loads(
-            (
-                ROOT / "contracts" / "access-policy.v1.schema.json"
-            ).read_text(encoding="utf-8")
+            (ROOT / "contracts" / "access-policy.v1.schema.json").read_text(
+                encoding="utf-8"
+            )
         )
         v2 = json.loads(
-            (
-                ROOT / "contracts" / "access-policy.v2.schema.json"
-            ).read_text(encoding="utf-8")
+            (ROOT / "contracts" / "access-policy.v2.schema.json").read_text(
+                encoding="utf-8"
+            )
         )
         self.assertEqual(v1["properties"]["version"]["const"], 1)
         self.assertEqual(v2["properties"]["version"]["const"], 2)
         self.assertNotIn("secret_roots", v1["properties"])
         self.assertIn("secret_roots", v2["properties"])
-        self.assertIn("allowed_grips", v2["properties"]["profiles"]["additionalProperties"]["required"])
-        self.assertIn("forbidden_hosts", v2["properties"]["profiles"]["additionalProperties"]["required"])
-        self.assertIn("max_risk_level", v2["properties"]["profiles"]["additionalProperties"]["required"])
+        self.assertIn(
+            "allowed_grips",
+            v2["properties"]["profiles"]["additionalProperties"]["required"],
+        )
+        self.assertIn(
+            "forbidden_hosts",
+            v2["properties"]["profiles"]["additionalProperties"]["required"],
+        )
+        self.assertIn(
+            "max_risk_level",
+            v2["properties"]["profiles"]["additionalProperties"]["required"],
+        )
 
     def test_privileged_reference_contract_exists(self) -> None:
         contract = json.loads(

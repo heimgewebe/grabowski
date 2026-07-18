@@ -19,6 +19,7 @@ import grabowski_friction
 import grabowski_agent_bootstrap
 import grabowski_recall
 import grabowski_resources
+import grabowski_bureau_intake
 import grabowski_tasks
 import grabowski_agent_competition
 import grabowski_coding_agent_router

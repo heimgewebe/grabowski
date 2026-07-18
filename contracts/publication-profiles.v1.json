@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "ed594c2eddf4c54c6c07446ec61441cf92d264ffd901dacd25a7241be3ed3446"
+    "sha256": "6a403b6c950a051f65143628ced9a8b1308cacc41a98136aa7b56a59ada66108"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "51e3b332e2c88a995ef6815459a3c0095b1b1260d93b754dab7f624f66b7e2cb"
+    "sha256": "d9e7c11295f30ea551ec5f739dd36d057fcda7f8d33814e93f8d61efbb38b8e0"
   },
   "counts": {
     "core": 21,
-    "full": 147,
-    "operator": 132
+    "full": 152,
+    "operator": 137
   },
   "profiles": {
     "core": [
@@ -145,6 +145,11 @@
       "grabowski_execution_governor_summary",
       "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
+      "grabowski_bureau_candidate_record",
+      "grabowski_bureau_candidate_assess",
+      "grabowski_bureau_task_propose",
+      "grabowski_bureau_task_publish_preview",
+      "grabowski_bureau_task_publish",
       "grabowski_resource_nonconflict_assess",
       "grabowski_resource_reconcile_obsolete_path_leases",
       "grabowski_resource_acquire",
@@ -279,6 +284,11 @@
       "grabowski_execution_governor_summary",
       "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
+      "grabowski_bureau_candidate_record",
+      "grabowski_bureau_candidate_assess",
+      "grabowski_bureau_task_propose",
+      "grabowski_bureau_task_publish_preview",
+      "grabowski_bureau_task_publish",
       "grabowski_resource_nonconflict_assess",
       "grabowski_resource_reconcile_obsolete_path_leases",
       "grabowski_resource_acquire",
