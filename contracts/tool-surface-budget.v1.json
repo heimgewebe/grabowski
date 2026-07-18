@@ -1341,128 +1341,31 @@
     ]
   },
   "accepted_additions": {
-    "grabowski_operator_blockade_status": {
+    "grabowski_browser_worker_stored_form_action": {
       "justification_kind": "distinct_authority_boundary",
-      "rationale": "Blockade observation must remain available while ordinary mutation authority is frozen and therefore requires a separately reviewable immutable recovery surface.",
+      "rationale": "Expose one exact, target-bound browser-managed form action instead of arbitrary caller-supplied CDP or JavaScript authority; bind the action to a running worker, its owner-held loopback port, a canonical local origin, the browser-observed remote address, hashed selectors and an explicit call-scope confirmation.",
       "evidence_refs": [
-        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
-        "tests:test_blockade_runtime.py"
+        "docs:browser-stored-form-action.md",
+        "tests:test_workers.py",
+        "bureau:event-666"
       ],
-      "operation_alternative_considered": "A typed operation was rejected because operation dispatch itself is mutation-gated and cannot guarantee the immutable status lane during a blockade.",
+      "operation_alternative_considered": "A generic browser or terminal operation was rejected because it would permit caller-controlled script execution or expose browser-managed field contents. This tool owns only the fixed CDP sequence required for one local-device form action and returns receipt-safe booleans and hashes.",
       "exception_detail": {
-        "claim": "The tool owns only immutable blockade observation authority.",
-        "evidence": "Read-only annotation, empty effects, scoped decision tests and no filesystem mutation."
+        "claim": "The tool owns a distinct browser-managed local form authority with no general JavaScript, field-content disclosure or arbitrary-navigation surface.",
+        "evidence": "Exact origin and remote-IP binding, owner-held port lease, pre-action audit intent, action-scope confirmation, fixed CDP methods, cleanup fallbacks, redacted receipts and focused negative tests."
       },
       "tool_contract": {
-        "tool": "grabowski_operator_blockade_status",
-        "category": "recovery",
-        "authority_class": "read",
-        "risk_class": "low",
-        "read_only": true,
-        "effects": [],
-        "reversibility": "not-applicable"
-      }
-    },
-    "grabowski_operator_blockade_engage": {
-      "justification_kind": "distinct_authority_boundary",
-      "rationale": "The typed operator surface exposes one create-only, schema-valid, audit-bound authority for canonical blockade engagement; generic filesystem tools and explicitly targeted direct-command arguments are denied.",
-      "evidence_refs": [
-        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
-        "docs/proofs/operator-blockade-store-v1.md",
-        "tests:test_blockade_runtime.py"
-      ],
-      "operation_alternative_considered": "A typed operation was rejected because generic operation execution would inherit broader terminal or file authority and could not enforce the exact marker transaction contract.",
-      "exception_detail": {
-        "claim": "The tool exclusively owns canonical typed blockade engagement.",
-        "evidence": "Generic filesystem tools and explicit direct-command targets reject the marker; active strong scoped blockades also close opaque command channels. Same-UID out-of-band execution is not claimed as a kernel boundary."
-      },
-      "tool_contract": {
-        "tool": "grabowski_operator_blockade_engage",
-        "category": "recovery",
+        "tool": "grabowski_browser_worker_stored_form_action",
+        "category": "browser-worker",
         "authority_class": "mutation",
         "risk_class": "high",
         "read_only": false,
         "effects": [
-          "audit-record",
-          "blockade-marker-create"
+          "browser-input",
+          "form-submit",
+          "local-device-state-change"
         ],
-        "reversibility": "evidence-bound-disarm"
-      }
-    },
-    "grabowski_operator_blockade_disarm": {
-      "justification_kind": "distinct_authority_boundary",
-      "rationale": "Disarm must remain a narrowly evidence-bound recovery authority distinct from ordinary mutation and require exact hashes, fresh recovery evidence and reversible quarantine.",
-      "evidence_refs": [
-        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
-        "docs/proofs/operator-blockade-store-v1.md",
-        "tests:test_blockade_runtime.py"
-      ],
-      "operation_alternative_considered": "A typed operation was rejected because the generic operation authority cannot safely bypass a blockade while preserving exact marker identity, rollback and recovery-gate requirements.",
-      "exception_detail": {
-        "claim": "The tool exclusively owns exact in-band blockade disarm.",
-        "evidence": "Hash-bound preconditions, external-stop denial, recovery checks, quarantine receipts and restore-on-audit-failure tests."
-      },
-      "tool_contract": {
-        "tool": "grabowski_operator_blockade_disarm",
-        "category": "recovery",
-        "authority_class": "mutation",
-        "risk_class": "high",
-        "read_only": false,
-        "effects": [
-          "audit-record",
-          "blockade-marker-quarantine"
-        ],
-        "reversibility": "hash-bound-restore-on-failure"
-      }
-    },
-    "grabowski_operator_blockade_migrate_legacy": {
-      "justification_kind": "distinct_authority_boundary",
-      "rationale": "Legacy migration must remain a dedicated create-first authority that can operate while the legacy hard stop is active, bind exact preimage hashes, publish the root-owned marker before locally removing the unchanged legacy record and retain both markers fail-closed if cleanup cannot be proven.",
-      "evidence_refs": [
-        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T002",
-        "docs:operator-blockade-authority-v2.md",
-        "tests:test_blockade_authority.py",
-        "tests:test_blockade_runtime.py"
-      ],
-      "operation_alternative_considered": "A generic operation was rejected because ordinary mutation is correctly blocked by the legacy marker and cannot obtain the root-owned parent, peer-cgroup, create-first and exact rollback invariants.",
-      "exception_detail": {
-        "claim": "The tool exclusively owns exact typed legacy-to-root blockade migration.",
-        "evidence": "Exact ID and hash preconditions, migration-intent and completion audits, create-only root publication, operator-local exact legacy removal, dual-marker retention on cleanup failure and post-state readback tests."
-      },
-      "tool_contract": {
-        "tool": "grabowski_operator_blockade_migrate_legacy",
-        "category": "recovery",
-        "authority_class": "mutation",
-        "risk_class": "high",
-        "read_only": false,
-        "effects": [
-          "audit-record",
-          "blockade-marker-create",
-          "blockade-marker-remove"
-        ],
-        "reversibility": "create-first-fail-closed-dual-marker"
-      }
-    },
-    "grabowski_juno_status": {
-      "justification_kind": "distinct_authority_boundary",
-      "rationale": "Provide bounded observation of the private Juno device worker without generic command access.",
-      "evidence_refs": [
-        "docs:juno-ipad-agent.md",
-        "tests:test_juno_tools.py"
-      ],
-      "operation_alternative_considered": "A generic operation was rejected because the private device protocol, local consent, exact instance binding and receipts require one cohesive typed boundary.",
-      "exception_detail": {
-        "claim": "grabowski_juno_status owns only its declared Juno device authority.",
-        "evidence": "Bounded protocol handling, exact identity checks, private key handling, receipts and integration tests."
-      },
-      "tool_contract": {
-        "tool": "grabowski_juno_status",
-        "category": "device-worker",
-        "authority_class": "read",
-        "risk_class": "low",
-        "read_only": true,
-        "effects": [],
-        "reversibility": "not-applicable"
+        "reversibility": "target-dependent; fields cleared on failed or unobserved submission"
       }
     },
     "grabowski_juno_pair": {
@@ -1517,6 +1420,130 @@
         "reversibility": "job-dependent-with-local-stop-switch"
       }
     },
+    "grabowski_juno_status": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Provide bounded observation of the private Juno device worker without generic command access.",
+      "evidence_refs": [
+        "docs:juno-ipad-agent.md",
+        "tests:test_juno_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because the private device protocol, local consent, exact instance binding and receipts require one cohesive typed boundary.",
+      "exception_detail": {
+        "claim": "grabowski_juno_status owns only its declared Juno device authority.",
+        "evidence": "Bounded protocol handling, exact identity checks, private key handling, receipts and integration tests."
+      },
+      "tool_contract": {
+        "tool": "grabowski_juno_status",
+        "category": "device-worker",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "grabowski_operator_blockade_disarm": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Disarm must remain a narrowly evidence-bound recovery authority distinct from ordinary mutation and require exact hashes, fresh recovery evidence and reversible quarantine.",
+      "evidence_refs": [
+        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
+        "docs/proofs/operator-blockade-store-v1.md",
+        "tests:test_blockade_runtime.py"
+      ],
+      "operation_alternative_considered": "A typed operation was rejected because the generic operation authority cannot safely bypass a blockade while preserving exact marker identity, rollback and recovery-gate requirements.",
+      "exception_detail": {
+        "claim": "The tool exclusively owns exact in-band blockade disarm.",
+        "evidence": "Hash-bound preconditions, external-stop denial, recovery checks, quarantine receipts and restore-on-audit-failure tests."
+      },
+      "tool_contract": {
+        "tool": "grabowski_operator_blockade_disarm",
+        "category": "recovery",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "audit-record",
+          "blockade-marker-quarantine"
+        ],
+        "reversibility": "hash-bound-restore-on-failure"
+      }
+    },
+    "grabowski_operator_blockade_engage": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "The typed operator surface exposes one create-only, schema-valid, audit-bound authority for canonical blockade engagement; generic filesystem tools and explicitly targeted direct-command arguments are denied.",
+      "evidence_refs": [
+        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
+        "docs/proofs/operator-blockade-store-v1.md",
+        "tests:test_blockade_runtime.py"
+      ],
+      "operation_alternative_considered": "A typed operation was rejected because generic operation execution would inherit broader terminal or file authority and could not enforce the exact marker transaction contract.",
+      "exception_detail": {
+        "claim": "The tool exclusively owns canonical typed blockade engagement.",
+        "evidence": "Generic filesystem tools and explicit direct-command targets reject the marker; active strong scoped blockades also close opaque command channels. Same-UID out-of-band execution is not claimed as a kernel boundary."
+      },
+      "tool_contract": {
+        "tool": "grabowski_operator_blockade_engage",
+        "category": "recovery",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "audit-record",
+          "blockade-marker-create"
+        ],
+        "reversibility": "evidence-bound-disarm"
+      }
+    },
+    "grabowski_operator_blockade_migrate_legacy": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Legacy migration must remain a dedicated create-first authority that can operate while the legacy hard stop is active, bind exact preimage hashes, publish the root-owned marker before locally removing the unchanged legacy record and retain both markers fail-closed if cleanup cannot be proven.",
+      "evidence_refs": [
+        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T002",
+        "docs:operator-blockade-authority-v2.md",
+        "tests:test_blockade_authority.py",
+        "tests:test_blockade_runtime.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because ordinary mutation is correctly blocked by the legacy marker and cannot obtain the root-owned parent, peer-cgroup, create-first and exact rollback invariants.",
+      "exception_detail": {
+        "claim": "The tool exclusively owns exact typed legacy-to-root blockade migration.",
+        "evidence": "Exact ID and hash preconditions, migration-intent and completion audits, create-only root publication, operator-local exact legacy removal, dual-marker retention on cleanup failure and post-state readback tests."
+      },
+      "tool_contract": {
+        "tool": "grabowski_operator_blockade_migrate_legacy",
+        "category": "recovery",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "audit-record",
+          "blockade-marker-create",
+          "blockade-marker-remove"
+        ],
+        "reversibility": "create-first-fail-closed-dual-marker"
+      }
+    },
+    "grabowski_operator_blockade_status": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Blockade observation must remain available while ordinary mutation authority is frozen and therefore requires a separately reviewable immutable recovery surface.",
+      "evidence_refs": [
+        "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
+        "tests:test_blockade_runtime.py"
+      ],
+      "operation_alternative_considered": "A typed operation was rejected because operation dispatch itself is mutation-gated and cannot guarantee the immutable status lane during a blockade.",
+      "exception_detail": {
+        "claim": "The tool owns only immutable blockade observation authority.",
+        "evidence": "Read-only annotation, empty effects, scoped decision tests and no filesystem mutation."
+      },
+      "tool_contract": {
+        "tool": "grabowski_operator_blockade_status",
+        "category": "recovery",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
     "ipad_capability_manifest": {
       "justification_kind": "distinct_authority_boundary",
       "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
@@ -1531,106 +1558,6 @@
       },
       "tool_contract": {
         "tool": "ipad_capability_manifest",
-        "category": "device-storage",
-        "authority_class": "mutation",
-        "risk_class": "medium",
-        "read_only": false,
-        "effects": [
-          "device-job-execute",
-          "receipt-create"
-        ],
-        "reversibility": "not-applicable-device-job-and-receipt-retained"
-      }
-    },
-    "ipad_storage_inventory": {
-      "justification_kind": "distinct_authority_boundary",
-      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
-      "evidence_refs": [
-        "docs:juno-ipad-storage.md",
-        "tests:test_juno_storage_tools.py"
-      ],
-      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
-      "exception_detail": {
-        "claim": "ipad_storage_inventory owns only its declared bounded iPad storage authority.",
-        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
-      },
-      "tool_contract": {
-        "tool": "ipad_storage_inventory",
-        "category": "device-storage",
-        "authority_class": "mutation",
-        "risk_class": "medium",
-        "read_only": false,
-        "effects": [
-          "device-job-execute",
-          "receipt-create"
-        ],
-        "reversibility": "not-applicable-device-job-and-receipt-retained"
-      }
-    },
-    "ipad_storage_grant_status": {
-      "justification_kind": "distinct_authority_boundary",
-      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
-      "evidence_refs": [
-        "docs:juno-ipad-storage.md",
-        "tests:test_juno_storage_tools.py"
-      ],
-      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
-      "exception_detail": {
-        "claim": "ipad_storage_grant_status owns only its declared bounded iPad storage authority.",
-        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
-      },
-      "tool_contract": {
-        "tool": "ipad_storage_grant_status",
-        "category": "device-storage",
-        "authority_class": "mutation",
-        "risk_class": "medium",
-        "read_only": false,
-        "effects": [
-          "device-job-execute",
-          "receipt-create"
-        ],
-        "reversibility": "not-applicable-device-job-and-receipt-retained"
-      }
-    },
-    "ipad_permission_probe": {
-      "justification_kind": "distinct_authority_boundary",
-      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
-      "evidence_refs": [
-        "docs:juno-ipad-storage.md",
-        "tests:test_juno_storage_tools.py"
-      ],
-      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
-      "exception_detail": {
-        "claim": "ipad_permission_probe owns only its declared bounded iPad storage authority.",
-        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
-      },
-      "tool_contract": {
-        "tool": "ipad_permission_probe",
-        "category": "device-storage",
-        "authority_class": "mutation",
-        "risk_class": "medium",
-        "read_only": false,
-        "effects": [
-          "device-job-execute",
-          "receipt-create"
-        ],
-        "reversibility": "not-applicable-device-job-and-receipt-retained"
-      }
-    },
-    "ipad_file_stat": {
-      "justification_kind": "distinct_authority_boundary",
-      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
-      "evidence_refs": [
-        "docs:juno-ipad-storage.md",
-        "tests:test_juno_storage_tools.py"
-      ],
-      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
-      "exception_detail": {
-        "claim": "ipad_file_stat owns only its declared bounded iPad storage authority.",
-        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
-      },
-      "tool_contract": {
-        "tool": "ipad_file_stat",
         "category": "device-storage",
         "authority_class": "mutation",
         "risk_class": "medium",
@@ -1667,32 +1594,6 @@
         "reversibility": "not-applicable-device-job-and-receipt-retained"
       }
     },
-    "ipad_file_read": {
-      "justification_kind": "distinct_authority_boundary",
-      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
-      "evidence_refs": [
-        "docs:juno-ipad-storage.md",
-        "tests:test_juno_storage_tools.py"
-      ],
-      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
-      "exception_detail": {
-        "claim": "ipad_file_read owns only its declared bounded iPad storage authority.",
-        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
-      },
-      "tool_contract": {
-        "tool": "ipad_file_read",
-        "category": "device-storage",
-        "authority_class": "mutation",
-        "risk_class": "high",
-        "read_only": false,
-        "effects": [
-          "device-file-content-return",
-          "device-job-execute",
-          "receipt-create"
-        ],
-        "reversibility": "not-applicable-device-job-and-receipt-retained"
-      }
-    },
     "ipad_file_create": {
       "justification_kind": "distinct_authority_boundary",
       "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
@@ -1717,6 +1618,32 @@
           "receipt-create"
         ],
         "reversibility": "manual-exact-file-removal-not-exposed"
+      }
+    },
+    "ipad_file_read": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_file_read owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_file_read",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "device-file-content-return",
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
       }
     },
     "ipad_file_replace": {
@@ -1746,35 +1673,415 @@
         "reversibility": "preimage-dependent-not-automatically-retained"
       }
     },
-    "grabowski_browser_worker_stored_form_action": {
+    "ipad_file_stat": {
       "justification_kind": "distinct_authority_boundary",
-      "rationale": "Expose one exact, target-bound browser-managed form action instead of arbitrary caller-supplied CDP or JavaScript authority; bind the action to a running worker, its owner-held loopback port, a canonical local origin, the browser-observed remote address, hashed selectors and an explicit call-scope confirmation.",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
       "evidence_refs": [
-        "docs:browser-stored-form-action.md",
-        "tests:test_workers.py",
-        "bureau:event-666"
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
       ],
-      "operation_alternative_considered": "A generic browser or terminal operation was rejected because it would permit caller-controlled script execution or expose browser-managed field contents. This tool owns only the fixed CDP sequence required for one local-device form action and returns receipt-safe booleans and hashes.",
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
       "exception_detail": {
-        "claim": "The tool owns a distinct browser-managed local form authority with no general JavaScript, field-content disclosure or arbitrary-navigation surface.",
-        "evidence": "Exact origin and remote-IP binding, owner-held port lease, pre-action audit intent, action-scope confirmation, fixed CDP methods, cleanup fallbacks, redacted receipts and focused negative tests."
+        "claim": "ipad_file_stat owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
       },
       "tool_contract": {
-        "tool": "grabowski_browser_worker_stored_form_action",
-        "category": "browser-worker",
+        "tool": "ipad_file_stat",
+        "category": "device-storage",
         "authority_class": "mutation",
-        "risk_class": "high",
+        "risk_class": "medium",
         "read_only": false,
         "effects": [
-          "browser-input",
-          "form-submit",
-          "local-device-state-change"
+          "device-job-execute",
+          "receipt-create"
         ],
-        "reversibility": "target-dependent; fields cleared on failed or unobserved submission"
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "ipad_permission_probe": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_permission_probe owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_permission_probe",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "ipad_storage_grant_status": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_storage_grant_status owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_storage_grant_status",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "ipad_storage_inventory": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact locally consented iPad storage operation instead of arbitrary device code; bind it to agent instance, grant evidence, provider, path and operation-specific preconditions.",
+      "evidence_refs": [
+        "docs:juno-ipad-storage.md",
+        "tests:test_juno_storage_tools.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because local iPadOS consent, security-scoped bookmark resolution, exact agent-instance binding and device receipts form one private device boundary.",
+      "exception_detail": {
+        "claim": "ipad_storage_inventory owns only its declared bounded iPad storage authority.",
+        "evidence": "Operation-specific inputs and tests; no recursive mutation, move or user-facing delete surface."
+      },
+      "tool_contract": {
+        "tool": "ipad_storage_inventory",
+        "category": "device-storage",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
+    "repoground_bundle_discover": {
+      "justification_kind": "material_call_shape",
+      "rationale": "The canonical RepoGround identity must be directly selectable as the sole supported public interface after the explicit hard cut.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because agent consumers require a stable typed read signature; retaining an alias was explicitly rejected.",
+      "exception_detail": {
+        "claim": "This addition establishes the only public RepoGround name without expanding mutation authority.",
+        "evidence": "Only the canonical read-only tool is registered; tests prove all legacy aliases are absent."
+      },
+      "tool_contract": {
+        "tool": "repoground_bundle_discover",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "repoground_bundle_status": {
+      "justification_kind": "material_call_shape",
+      "rationale": "The canonical RepoGround identity must be directly selectable as the sole supported public interface after the explicit hard cut.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because agent consumers require a stable typed read signature; retaining an alias was explicitly rejected.",
+      "exception_detail": {
+        "claim": "This addition establishes the only public RepoGround name without expanding mutation authority.",
+        "evidence": "Only the canonical read-only tool is registered; tests prove all legacy aliases are absent."
+      },
+      "tool_contract": {
+        "tool": "repoground_bundle_status",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "repoground_context_pack": {
+      "justification_kind": "material_call_shape",
+      "rationale": "The canonical RepoGround identity must be directly selectable as the sole supported public interface after the explicit hard cut.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because agent consumers require a stable typed read signature; retaining an alias was explicitly rejected.",
+      "exception_detail": {
+        "claim": "This addition establishes the only public RepoGround name without expanding mutation authority.",
+        "evidence": "Only the canonical read-only tool is registered; tests prove all legacy aliases are absent."
+      },
+      "tool_contract": {
+        "tool": "repoground_context_pack",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "repoground_find_symbol": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Exact symbol-index lookup is a distinct bounded read shape that cannot be represented faithfully by free-text retrieval without losing symbol identity.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic query operation was rejected because it would collapse symbol identity, graph direction, and S0/S1 negative semantics into an untyped result.",
+      "exception_detail": {
+        "claim": "This tool owns only bounded symbol-index lookup over an existing verified bundle.",
+        "evidence": "Read-only annotations, bounded inputs, verified manifest selection, and regression tests preserve RepoGround result semantics."
+      },
+      "tool_contract": {
+        "tool": "repoground_find_symbol",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "repoground_freshness_check": {
+      "justification_kind": "material_call_shape",
+      "rationale": "The canonical RepoGround identity must be directly selectable as the sole supported public interface after the explicit hard cut.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because agent consumers require a stable typed read signature; retaining an alias was explicitly rejected.",
+      "exception_detail": {
+        "claim": "This addition establishes the only public RepoGround name without expanding mutation authority.",
+        "evidence": "Only the canonical read-only tool is registered; tests prove all legacy aliases are absent."
+      },
+      "tool_contract": {
+        "tool": "repoground_freshness_check",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "repoground_get_callees": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Callee navigation has a distinct caller-to-target direction and must preserve resolved S1 targets separately from S0 call sites.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic query operation was rejected because it would collapse symbol identity, graph direction, and S0/S1 negative semantics into an untyped result.",
+      "exception_detail": {
+        "claim": "This tool owns only bounded caller-to-target navigation over existing call-graph evidence.",
+        "evidence": "Read-only annotations, bounded inputs, verified manifest selection, and regression tests preserve RepoGround result semantics."
+      },
+      "tool_contract": {
+        "tool": "repoground_get_callees",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "repoground_get_callers": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Caller navigation has a distinct target-to-caller direction and preserves S1 edges separately from unresolved textual references.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic query operation was rejected because it would collapse symbol identity, graph direction, and S0/S1 negative semantics into an untyped result.",
+      "exception_detail": {
+        "claim": "This tool owns only bounded target-to-caller navigation over existing call-graph evidence.",
+        "evidence": "Read-only annotations, bounded inputs, verified manifest selection, and regression tests preserve RepoGround result semantics."
+      },
+      "tool_contract": {
+        "tool": "repoground_get_callers",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "repoground_preflight": {
+      "justification_kind": "material_call_shape",
+      "rationale": "The canonical RepoGround identity must be directly selectable as the sole supported public interface after the explicit hard cut.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because agent consumers require a stable typed read signature; retaining an alias was explicitly rejected.",
+      "exception_detail": {
+        "claim": "This addition establishes the only public RepoGround name without expanding mutation authority.",
+        "evidence": "Only the canonical read-only tool is registered; tests prove all legacy aliases are absent."
+      },
+      "tool_contract": {
+        "tool": "repoground_preflight",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "repoground_query": {
+      "justification_kind": "material_call_shape",
+      "rationale": "The canonical RepoGround identity must be directly selectable as the sole supported public interface after the explicit hard cut.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because agent consumers require a stable typed read signature; retaining an alias was explicitly rejected.",
+      "exception_detail": {
+        "claim": "This addition establishes the only public RepoGround name without expanding mutation authority.",
+        "evidence": "Only the canonical read-only tool is registered; tests prove all legacy aliases are absent."
+      },
+      "tool_contract": {
+        "tool": "repoground_query",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "repoground_query_existing_index": {
+      "justification_kind": "material_call_shape",
+      "rationale": "The canonical RepoGround identity must be directly selectable as the sole supported public interface after the explicit hard cut.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because agent consumers require a stable typed read signature; retaining an alias was explicitly rejected.",
+      "exception_detail": {
+        "claim": "This addition establishes the only public RepoGround name without expanding mutation authority.",
+        "evidence": "Only the canonical read-only tool is registered; tests prove all legacy aliases are absent."
+      },
+      "tool_contract": {
+        "tool": "repoground_query_existing_index",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
+    },
+    "repoground_range_get": {
+      "justification_kind": "material_call_shape",
+      "rationale": "The canonical RepoGround identity must be directly selectable as the sole supported public interface after the explicit hard cut.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "operation_alternative_considered": "A generic operation was rejected because agent consumers require a stable typed read signature; retaining an alias was explicitly rejected.",
+      "exception_detail": {
+        "claim": "This addition establishes the only public RepoGround name without expanding mutation authority.",
+        "evidence": "Only the canonical read-only tool is registered; tests prove all legacy aliases are absent."
+      },
+      "tool_contract": {
+        "tool": "repoground_range_get",
+        "category": "knowledge",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
       }
     }
   },
-  "retired_tools": {},
+  "retired_tools": {
+    "rlens_bundle_discover": {
+      "reason": "Removed from the runtime by the explicit RepoGround hard-cut decision; no legacy public alias remains.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "compatibility": "No compatibility alias. Callers must use the corresponding canonical repoground_* tool."
+    },
+    "rlens_bundle_status": {
+      "reason": "Removed from the runtime by the explicit RepoGround hard-cut decision; no legacy public alias remains.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "compatibility": "No compatibility alias. Callers must use the corresponding canonical repoground_* tool."
+    },
+    "rlens_context_pack": {
+      "reason": "Removed from the runtime by the explicit RepoGround hard-cut decision; no legacy public alias remains.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "compatibility": "No compatibility alias. Callers must use the corresponding canonical repoground_* tool."
+    },
+    "rlens_freshness_check": {
+      "reason": "Removed from the runtime by the explicit RepoGround hard-cut decision; no legacy public alias remains.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "compatibility": "No compatibility alias. Callers must use the corresponding canonical repoground_* tool."
+    },
+    "rlens_preflight": {
+      "reason": "Removed from the runtime by the explicit RepoGround hard-cut decision; no legacy public alias remains.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "compatibility": "No compatibility alias. Callers must use the corresponding canonical repoground_* tool."
+    },
+    "rlens_query": {
+      "reason": "Removed from the runtime by the explicit RepoGround hard-cut decision; no legacy public alias remains.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "compatibility": "No compatibility alias. Callers must use the corresponding canonical repoground_* tool."
+    },
+    "rlens_query_existing_index": {
+      "reason": "Removed from the runtime by the explicit RepoGround hard-cut decision; no legacy public alias remains.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "compatibility": "No compatibility alias. Callers must use the corresponding canonical repoground_* tool."
+    },
+    "rlens_range_get": {
+      "reason": "Removed from the runtime by the explicit RepoGround hard-cut decision; no legacy public alias remains.",
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#673",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "compatibility": "No compatibility alias. Callers must use the corresponding canonical repoground_* tool."
+    }
+  },
   "operation_catalog": {
     "schema_version": 1,
     "operation_count": 3,

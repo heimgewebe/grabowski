@@ -329,29 +329,71 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             for mutation, pattern in (
                 ({"unexpected": True}, "Unknown access policy fields"),
                 (
-                    {"profiles": {"strict": {**strict["profiles"]["strict"], "capabilities": ["file_read", "file_read"]}}},
+                    {
+                        "profiles": {
+                            "strict": {
+                                **strict["profiles"]["strict"],
+                                "capabilities": ["file_read", "file_read"],
+                            }
+                        }
+                    },
                     "duplicates",
                 ),
                 (
-                    {"profiles": {"strict": {**strict["profiles"]["strict"], "capabilities": ["not_real"]}}},
+                    {
+                        "profiles": {
+                            "strict": {
+                                **strict["profiles"]["strict"],
+                                "capabilities": ["not_real"],
+                            }
+                        }
+                    },
                     "Unknown access capabilities",
                 ),
                 ({"max_read_bytes": 0}, "Invalid access policy limit"),
                 ({"active_profile": "missing"}, "Active access profile is not defined"),
                 (
-                    {"profiles": {"strict": {**strict["profiles"]["strict"], "allowed_grips": ["not-a-grip"]}}},
+                    {
+                        "profiles": {
+                            "strict": {
+                                **strict["profiles"]["strict"],
+                                "allowed_grips": ["not-a-grip"],
+                            }
+                        }
+                    },
                     "Unknown allowed grips",
                 ),
                 (
-                    {"profiles": {"strict": {**strict["profiles"]["strict"], "forbidden_hosts": ["bad/host"]}}},
+                    {
+                        "profiles": {
+                            "strict": {
+                                **strict["profiles"]["strict"],
+                                "forbidden_hosts": ["bad/host"],
+                            }
+                        }
+                    },
                     "bare hostnames",
                 ),
                 (
-                    {"profiles": {"strict": {**strict["profiles"]["strict"], "max_risk_level": "root"}}},
+                    {
+                        "profiles": {
+                            "strict": {
+                                **strict["profiles"]["strict"],
+                                "max_risk_level": "root",
+                            }
+                        }
+                    },
                     "max_risk_level",
                 ),
                 (
-                    {"profiles": {"strict": {**strict["profiles"]["strict"], "forbid_symlinks": False}}},
+                    {
+                        "profiles": {
+                            "strict": {
+                                **strict["profiles"]["strict"],
+                                "forbid_symlinks": False,
+                            }
+                        }
+                    },
                     "Unknown access profile fields",
                 ),
             ):
@@ -428,8 +470,13 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             profile = policy["profiles"]["test"]
             profile["allowed_grips"] = ["repo-orient"]
             profile["max_risk_level"] = "low"
-            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
-                grabowski_mcp, "_load_policy", return_value=policy
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patch.object(grabowski_mcp, "_load_policy", return_value=policy),
             ):
                 contract = grabowski_mcp._session_profile_contract()
                 self.assertEqual(contract["read_roots"], [str(work)])
@@ -452,7 +499,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     allow_mutation=True,
                 )
                 self.assertEqual(blocked_name["receipt"]["status"], "blocked")
-                self.assertIn("session profile blocks grip", blocked_name["output"]["error"])
+                self.assertIn(
+                    "session profile blocks grip", blocked_name["output"]["error"]
+                )
 
                 blocked_high = grabowski_mcp._session_grip_policy_decision(
                     "captain-run",
@@ -471,8 +520,13 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             policy = json.loads((root / "access.json").read_text(encoding="utf-8"))
             policy["profiles"]["test"]["allowed_grips"] = ["repo-orient"]
             policy["profiles"]["test"]["max_risk_level"] = "low"
-            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
-                grabowski_mcp, "_load_policy", return_value=policy
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patch.object(grabowski_mcp, "_load_policy", return_value=policy),
             ):
                 with self.assertRaisesRegex(PermissionError, "terminal_execute"):
                     grabowski_mcp.grip_run(
@@ -503,25 +557,30 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             "registered_names_sha256": "a" * 64,
             "runtime_matches_deployment_contract": True,
         }
-        with patch.object(grabowski_mcp, "_require_capability"), patch.object(
-            grabowski_mcp, "_require_mutations_enabled"
-        ), patch.object(
-            grabowski_mcp,
-            "_session_grip_policy_decision",
-            return_value={"allowed": True},
-        ), patch.object(
-            grabowski_mcp,
-            "_deployment_metadata",
-            return_value=deployment,
-        ), patch.object(
-            grabowski_mcp,
-            "_runtime_tool_contract_summary",
-            return_value=contract,
-        ) as summary, patch.object(
-            grabowski_mcp.grabowski_grips,
-            "grip_run",
-            return_value={"ok": True},
-        ) as run:
+        with (
+            patch.object(grabowski_mcp, "_require_capability"),
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(
+                grabowski_mcp,
+                "_session_grip_policy_decision",
+                return_value={"allowed": True},
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_deployment_metadata",
+                return_value=deployment,
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_runtime_tool_contract_summary",
+                return_value=contract,
+            ) as summary,
+            patch.object(
+                grabowski_mcp.grabowski_grips,
+                "grip_run",
+                return_value={"ok": True},
+            ) as run,
+        ):
             result = grabowski_mcp.grip_run(
                 "connector-snapshot-bind",
                 client_parameters,
@@ -556,10 +615,17 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             policy = json.loads((root / "access.json").read_text(encoding="utf-8"))
             policy["profiles"]["test"]["allowed_grips"] = ["captain-run"]
             policy["profiles"]["test"]["max_risk_level"] = "high"
-            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
-                grabowski_mcp, "_load_policy", return_value=policy
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patch.object(grabowski_mcp, "_load_policy", return_value=policy),
             ):
-                missing = grabowski_mcp._session_grip_policy_decision("captain-run", {"actions": []})
+                missing = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run", {"actions": []}
+                )
                 self.assertFalse(missing["allowed"])
                 self.assertIn("session_escalation", missing["escalation_error"])
 
@@ -584,7 +650,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 class RequestContext:
                     session = Session()
 
-                with patch.object(grabowski_mcp.grabowski_grips, "grip_run", return_value={"ok": True}) as run:
+                with patch.object(
+                    grabowski_mcp.grabowski_grips, "grip_run", return_value={"ok": True}
+                ) as run:
                     result = grabowski_mcp.grip_run(
                         "captain-run", valid_parameters, ctx=RequestContext()
                     )
@@ -601,7 +669,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
 
                 spoofed = dict(valid_parameters)
                 spoofed["_server_runtime_actor_identity"] = identity
-                with patch.object(grabowski_mcp.grabowski_grips, "grip_run") as blocked_run:
+                with patch.object(
+                    grabowski_mcp.grabowski_grips, "grip_run"
+                ) as blocked_run:
                     blocked = grabowski_mcp.grip_run(
                         "captain-run", spoofed, ctx=RequestContext()
                     )
@@ -643,9 +713,14 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         task_evidence if owner == task_owner else None
                     )
                 )
-                with patch.dict(sys.modules, {"grabowski_tasks": fake_tasks}), patch.object(
-                    grabowski_mcp.grabowski_grips, "grip_run", return_value={"ok": True}
-                ) as task_run:
+                with (
+                    patch.dict(sys.modules, {"grabowski_tasks": fake_tasks}),
+                    patch.object(
+                        grabowski_mcp.grabowski_grips,
+                        "grip_run",
+                        return_value={"ok": True},
+                    ) as task_run,
+                ):
                     task_result = grabowski_mcp.grip_run(
                         "captain-run", task_parameters, ctx=RequestContext()
                     )
@@ -653,16 +728,14 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 task_dispatched = task_run.call_args.args[1]
                 task_actor = task_dispatched["_server_runtime_actor_identity"]
                 task_delegation = task_dispatched["_server_task_lease_delegation"]
-                verified_task = (
-                    grabowski_mcp.grabowski_merge_guard.verify_server_task_lease_delegation(
-                        task_delegation,
-                        actor_identity=task_actor,
-                        captain_request_sha256_value=(
-                            grabowski_mcp.grabowski_merge_guard.captain_request_sha256(
-                                task_dispatched
-                            )
-                        ),
-                    )
+                verified_task = grabowski_mcp.grabowski_merge_guard.verify_server_task_lease_delegation(
+                    task_delegation,
+                    actor_identity=task_actor,
+                    captain_request_sha256_value=(
+                        grabowski_mcp.grabowski_merge_guard.captain_request_sha256(
+                            task_dispatched
+                        )
+                    ),
                 )
                 self.assertEqual(task_owner, verified_task["lease_owner_id"])
 
@@ -672,7 +745,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     "captain-run", spoofed_task, ctx=RequestContext()
                 )
                 self.assertEqual("blocked", blocked_task["receipt"]["status"])
-                self.assertIn("reserved server parameter", blocked_task["output"]["error"])
+                self.assertIn(
+                    "reserved server parameter", blocked_task["output"]["error"]
+                )
 
                 unavailable = grabowski_mcp.grip_run(
                     "captain-run", valid_parameters, ctx=None
@@ -692,23 +767,46 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             )
             policy = json.loads((root / "access.json").read_text(encoding="utf-8"))
             policy["profiles"]["test"]["forbidden_hosts"] = ["prod.example"]
-            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
-                grabowski_mcp, "_load_policy", return_value=policy
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patch.object(grabowski_mcp, "_load_policy", return_value=policy),
             ):
                 with self.assertRaisesRegex(PermissionError, "Forbidden host"):
-                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "prod.example", "hostname"], policy=policy)
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(
+                        ["ssh", "prod.example", "hostname"], policy=policy
+                    )
                 with self.assertRaisesRegex(PermissionError, "Forbidden host"):
-                    grabowski_mcp._reject_forbidden_hosts_in_argv(["curl", "https://prod.example/status"], policy=policy)
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(
+                        ["curl", "https://prod.example/status"], policy=policy
+                    )
 
-                policy["profiles"]["test"]["forbidden_hosts"] = ["wg-prod-1", "heim-pc", "heimserver"]
+                policy["profiles"]["test"]["forbidden_hosts"] = [
+                    "wg-prod-1",
+                    "heim-pc",
+                    "heimserver",
+                ]
                 with self.assertRaisesRegex(PermissionError, "wg-prod-1"):
-                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "wg-prod-1", "hostname"], policy=policy)
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(
+                        ["ssh", "wg-prod-1", "hostname"], policy=policy
+                    )
                 with self.assertRaisesRegex(PermissionError, "heim-pc"):
-                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heim-pc", "hostname"], policy=policy)
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(
+                        ["ssh", "heim-pc", "hostname"], policy=policy
+                    )
                 with self.assertRaisesRegex(PermissionError, "heimserver"):
-                    grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heimserver", "hostname"], policy=policy)
-                grabowski_mcp._reject_forbidden_hosts_in_argv(["ssh", "heimberry", "hostname"], policy=policy)
-                grabowski_mcp._reject_forbidden_hosts_in_argv(["echo", "heim", "pc", "hostname"], policy=policy)
+                    grabowski_mcp._reject_forbidden_hosts_in_argv(
+                        ["ssh", "heimserver", "hostname"], policy=policy
+                    )
+                grabowski_mcp._reject_forbidden_hosts_in_argv(
+                    ["ssh", "heimberry", "hostname"], policy=policy
+                )
+                grabowski_mcp._reject_forbidden_hosts_in_argv(
+                    ["echo", "heim", "pc", "hostname"], policy=policy
+                )
 
     def test_write_outside_profile_scope_remains_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -719,13 +817,17 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             )
             outside = root / "outside.txt"
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
-                with self.assertRaisesRegex(PermissionError, "outside configured write roots"):
+                with self.assertRaisesRegex(
+                    PermissionError, "outside configured write roots"
+                ):
                     grabowski_mcp.grabowski_create_text(str(outside), "blocked\n")
 
     def test_audit_chain_rejects_unhashed_record_after_v2_transition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _work, _secret, _browser, _export, state, *patches = self._patched_runtime(root)
+            _work, _secret, _browser, _export, state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 audit = state / "write-audit.jsonl"
                 legacy = {"operation": "legacy", "timestamp": "before-v2"}
@@ -765,7 +867,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_replace_quarantines_preimage_and_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(root)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 target = work / "note.txt"
                 target.write_text("before\n", encoding="utf-8")
@@ -803,7 +907,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         )
         expected_tools = set(contract["expected_tools"])
 
-        self.assertEqual(set(grabowski_mcp.TOOL_CAPABILITY_REQUIREMENTS), expected_tools)
+        self.assertEqual(
+            set(grabowski_mcp.TOOL_CAPABILITY_REQUIREMENTS), expected_tools
+        )
 
     def test_tool_capability_requirements_reference_known_capabilities(self) -> None:
         all_capabilities = set(grabowski_mcp.ALL_CAPABILITIES)
@@ -864,15 +970,20 @@ class OperatorV2RuntimeTests(unittest.TestCase):
 
         missing = {
             item["tool"]: item["missing_capabilities"]
-            for item in status["capability_requirements"]["missing_enabled_requirements"]
+            for item in status["capability_requirements"][
+                "missing_enabled_requirements"
+            ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 142)
+        self.assertEqual(summary["registered_tool_requirements"], 145)
         self.assertEqual(missing["grabowski_remove_path"], ["file_delete"])
         self.assertEqual(missing["grabowski_restore_removed_path"], ["file_delete"])
-        self.assertEqual(missing["rlens_bundle_discover"], ["bundle_registry"])
+        self.assertEqual(missing["repoground_bundle_discover"], ["bundle_registry"])
         self.assertEqual(missing["grip_run"], ["terminal_execute"])
-        self.assertEqual(missing["grabowski_connector_transport_diagnostics"], ["user_service_control"])
+        self.assertEqual(
+            missing["grabowski_connector_transport_diagnostics"],
+            ["user_service_control"],
+        )
         self.assertNotIn("grabowski_destroy_path", missing)
         self.assertNotIn("grabowski_friction_summary", missing)
 
@@ -966,7 +1077,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         "empty_directory",
                     )
 
-    def test_remove_reuses_write_guards_for_sensitive_excluded_and_protected_roots(self) -> None:
+    def test_remove_reuses_write_guards_for_sensitive_excluded_and_protected_roots(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             capabilities = [
@@ -1022,7 +1135,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_destroy_path_requires_separate_capability_and_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(root)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 target = work / "denied.txt"
                 target.write_text("denied\n", encoding="utf-8")
@@ -1111,7 +1226,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 ),
                 patch.object(grabowski_mcp, "_excluded_roots", return_value=[]),
                 patch.object(grabowski_mcp, "_path_is_sensitive", return_value=False),
-                patch.object(grabowski_mcp, "_trusted_owner_enabled", return_value=True),
+                patch.object(
+                    grabowski_mcp, "_trusted_owner_enabled", return_value=True
+                ),
             ):
                 marker_path = grabowski_mcp.KILL_SWITCH_PATH
                 with self.assertRaisesRegex(PermissionError, "typed lifecycle tools"):
@@ -1142,8 +1259,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_path_blockade_applies_to_generic_file_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work, _secret, _browser, _export, _state, *patches = (
-                self._patched_runtime(root)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root
             )
             blocked = work / "blocked"
             blocked.mkdir()
@@ -1182,9 +1299,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         str(blocked / "denied.txt"), "denied\n"
                     )
                 allowed = work / "allowed.txt"
-                result = grabowski_mcp.grabowski_create_text(
-                    str(allowed), "allowed\n"
-                )
+                result = grabowski_mcp.grabowski_create_text(str(allowed), "allowed\n")
                 self.assertTrue(allowed.is_file())
                 self.assertEqual(result["after_sha256"], _sha256(allowed))
 
@@ -1230,7 +1345,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_generic_tools_cannot_cross_secret_or_browser_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work, secret, browser, _export, _state, *patches = self._patched_runtime(root)
+            work, secret, browser, _export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 secret_file = secret / "token.txt"
                 browser_file = browser / "prefs.js"
@@ -1238,7 +1355,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 browser_file.write_text("user_pref('x', true);\n", encoding="utf-8")
 
                 listing = grabowski_mcp.grabowski_list_directory(str(work))
-                entry_types = {entry["name"]: entry["type"] for entry in listing["entries"]}
+                entry_types = {
+                    entry["name"]: entry["type"] for entry in listing["entries"]
+                }
                 self.assertEqual(entry_types[".ssh"], "secret-root")
                 self.assertEqual(entry_types["browser"], "browser-profile-root")
 
@@ -1265,7 +1384,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_secret_inspect_and_reveal_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _work, secret, _browser, _export, state, *patches = self._patched_runtime(root)
+            _work, secret, _browser, _export, state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 secret_value = "plain-secret-value-12345"
                 target = secret / "token.txt"
@@ -1284,7 +1405,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "acknowledgement"):
                     grabowski_mcp.grabowski_secret_reveal(str(target), source_sha)
                 reveal = grabowski_mcp.grabowski_secret_reveal(
-                    str(target), source_sha,
+                    str(target),
+                    source_sha,
                     justification="Need raw value for explicit diagnostic comparison",
                     acknowledge_context_exposure=True,
                 )
@@ -1328,7 +1450,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_secret_use_consumes_secret_without_leaking_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work, secret, _browser, _export, state, *patches = self._patched_runtime(root)
+            work, secret, _browser, _export, state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 secret_value = "plain-secret-use-value-12345!"
                 source = secret / "token.txt"
@@ -1355,7 +1479,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 )
 
                 encoded = base64.b64encode(secret_value.encode()).decode()
-                urlsafe = base64.urlsafe_b64encode(secret_value.encode()).decode().rstrip("=")
+                urlsafe = (
+                    base64.urlsafe_b64encode(secret_value.encode()).decode().rstrip("=")
+                )
                 quoted = urllib.parse.quote_from_bytes(secret_value.encode(), safe="")
                 self.assertEqual(result["returncode"], 0)
                 self.assertIn("<REDACTED>", result["stdout"])
@@ -1372,7 +1498,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_secret_use_rejects_shell_and_cleans_temp_fallback_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work, secret, _browser, _export, state, *patches = self._patched_runtime(root)
+            work, secret, _browser, _export, state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 source = secret / "token.txt"
                 source.write_text("temp-cleanup-secret", encoding="utf-8")
@@ -1430,7 +1558,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_secret_export_is_hash_bound_local_create_only_and_audited(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _work, secret, _browser, export, state, *patches = self._patched_runtime(root)
+            _work, secret, _browser, export, state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 secret_value = "export-secret-value-12345"
                 source = secret / "config"
@@ -1477,10 +1607,14 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_browser_profile_read_text_and_binary_metadata_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _work, _secret, browser, _export, _state, *patches = self._patched_runtime(root)
+            _work, _secret, browser, _export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 prefs = browser / "prefs.js"
-                prefs.write_text("user_pref('browser.startup.page', 1);\n", encoding="utf-8")
+                prefs.write_text(
+                    "user_pref('browser.startup.page', 1);\n", encoding="utf-8"
+                )
                 cookies = browser / "Cookies"
                 cookies.write_bytes(b"SQLite format 3\x00secret-cookie")
 
@@ -1489,7 +1623,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 prefs_result = grabowski_mcp.grabowski_browser_profile_read(str(prefs))
                 self.assertTrue(prefs_result["content_returned"])
                 self.assertIn("browser.startup.page", prefs_result["text"])
-                cookies_result = grabowski_mcp.grabowski_browser_profile_read(str(cookies))
+                cookies_result = grabowski_mcp.grabowski_browser_profile_read(
+                    str(cookies)
+                )
                 self.assertFalse(cookies_result["content_returned"])
                 self.assertIn("sha256", cookies_result)
                 self.assertNotIn("secret-cookie", json.dumps(cookies_result))
@@ -1497,7 +1633,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_secret_use_rejects_secret_variants_in_argv_and_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work, secret, _browser, _export, _state, *patches = self._patched_runtime(root)
+            work, secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 value = "variant-secret-value-12345"
                 source = secret / "token.txt"
@@ -1532,7 +1670,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_secret_use_blocks_combined_shell_flags_and_env_to_shell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work, secret, _browser, _export, _state, *patches = self._patched_runtime(root)
+            work, secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 source = secret / "token.txt"
                 source.write_text("shell-guard-secret", encoding="utf-8")
@@ -1555,7 +1695,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_secret_use_bounds_child_output_while_draining(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work, secret, _browser, _export, _state, *patches = self._patched_runtime(root)
+            work, secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 source = secret / "token.txt"
                 source.write_text("output-secret", encoding="utf-8")
@@ -1577,13 +1719,16 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_secret_reveal_writes_value_free_audit_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _work, secret, _browser, _export, state, *patches = self._patched_runtime(root)
+            _work, secret, _browser, _export, state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 value = "audited-reveal-secret-12345"
                 source = secret / "token.txt"
                 source.write_text(value, encoding="utf-8")
                 result = grabowski_mcp.grabowski_secret_reveal(
-                    str(source), _sha256(source),
+                    str(source),
+                    _sha256(source),
                     justification="Verify value-free reveal audit evidence",
                     acknowledge_context_exposure=True,
                 )
@@ -1597,22 +1742,31 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_secret_reveal_requires_valid_audit_chain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _work, secret, _browser, _export, _state, *patches = self._patched_runtime(root)
+            _work, secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 source = secret / "token.txt"
                 source.write_text("chain-guard-secret", encoding="utf-8")
                 grabowski_mcp.AUDIT_LOG.write_text("not-json\n", encoding="utf-8")
 
-                with self.assertRaisesRegex(RuntimeError, "Audit log verification failed"):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Audit log verification failed"
+                ):
                     grabowski_mcp.grabowski_secret_reveal(str(source), _sha256(source))
 
     def test_browser_profile_read_redacts_sensitive_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _work, _secret, browser, _export, _state, *patches = self._patched_runtime(root)
+            _work, _secret, browser, _export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 prefs = browser / "prefs.js"
-                prefs.write_text("token=" + "Bearer " + "abcdefghijkl" + "mnopqrstuvwxyz" + "\n", encoding="utf-8")
+                prefs.write_text(
+                    "token=" + "Bearer " + "abcdefghijkl" + "mnopqrstuvwxyz" + "\n",
+                    encoding="utf-8",
+                )
                 result = grabowski_mcp.grabowski_browser_profile_read(str(prefs))
                 self.assertTrue(result["content_returned"])
                 self.assertIn("<REDACTED>", result["text"])
@@ -1621,7 +1775,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_secret_export_removes_new_target_when_postflight_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _work, secret, _browser, export, _state, *patches = self._patched_runtime(root)
+            _work, secret, _browser, export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 source = secret / "config"
                 source.write_text("cleanup-secret", encoding="utf-8")
@@ -1634,7 +1790,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         result = {**result, "sha256": "0" * 64}
                     return result
 
-                with patch.object(grabowski_mcp, "_read_bound_regular_bytes", side_effect=failing_read):
+                with patch.object(
+                    grabowski_mcp, "_read_bound_regular_bytes", side_effect=failing_read
+                ):
                     with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
                         grabowski_mcp.grabowski_secret_export(
                             str(source),
@@ -1646,7 +1804,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_kill_switch_blocks_use_and_export_but_not_secret_reads(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work, secret, _browser, export, _state, *patches = self._patched_runtime(root)
+            work, secret, _browser, export, _state, *patches = self._patched_runtime(
+                root
+            )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 source = secret / "token.txt"
                 source.write_text("kill-switch-secret", encoding="utf-8")
@@ -1659,7 +1819,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     grabowski_mcp.grabowski_secret_reveal(
-                        str(source), source_sha,
+                        str(source),
+                        source_sha,
                         justification="Confirm read path remains available during kill switch",
                         acknowledge_context_exposure=True,
                     )["text"],
@@ -1700,7 +1861,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 source_sha = _sha256(source)
                 calls = [
                     lambda: grabowski_mcp.grabowski_secret_inspect(str(source)),
-                    lambda: grabowski_mcp.grabowski_secret_reveal(str(source), source_sha),
+                    lambda: grabowski_mcp.grabowski_secret_reveal(
+                        str(source), source_sha
+                    ),
                     lambda: grabowski_mcp.grabowski_secret_use(
                         str(source),
                         source_sha,

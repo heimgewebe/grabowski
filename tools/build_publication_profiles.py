@@ -32,18 +32,18 @@ CORE_TOOLS = {
     "grabowski_fleet_list",
     "grabowski_privileged_broker_status",
     "grabowski_recovery_status",
-    "rlens_bundle_discover",
-    "rlens_bundle_status",
-    "rlens_freshness_check",
-    "rlens_context_pack",
+    "repoground_bundle_discover",
+    "repoground_bundle_status",
+    "repoground_freshness_check",
+    "repoground_context_pack",
 }
 OPERATOR_ORIENTATION_TOOLS = {
     "grabowski_runtime_health",
     "grabowski_contract_drift",
-    "rlens_bundle_discover",
-    "rlens_bundle_status",
-    "rlens_freshness_check",
-    "rlens_context_pack",
+    "repoground_bundle_discover",
+    "repoground_bundle_status",
+    "repoground_freshness_check",
+    "repoground_context_pack",
 }
 
 
