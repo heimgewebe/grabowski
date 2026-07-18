@@ -146,6 +146,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_artifact_push` | artifact | no | high | Push one hash-bound regular file to a registered SSH fleet host. |
 | `grabowski_artifact_pull` | artifact | no | high | Pull one hash-bound regular file from a registered SSH fleet host. |
 | `grabowski_browser_worker_start` | browser-worker | no | high | Start an agent-owned browser with a loopback-only debugging endpoint. |
+| `grabowski_browser_worker_stored_form_action` | browser-worker | no | high | Use browser-managed stored form data on one exact local-device origin without returning field contents. |
 | `grabowski_browser_worker_status` | browser-worker | yes | low | Observe one isolated browser worker and reconcile terminal leases. |
 | `grabowski_browser_worker_stop` | browser-worker | no | medium | Stop one isolated browser worker and clean ephemeral state. |
 | `grabowski_browser_worker_list` | browser-worker | yes | low | List isolated agent-owned browser workers. |

@@ -1745,6 +1745,33 @@
         ],
         "reversibility": "preimage-dependent-not-automatically-retained"
       }
+    },
+    "grabowski_browser_worker_stored_form_action": {
+      "justification_kind": "distinct_authority_boundary",
+      "rationale": "Expose one exact, target-bound browser-managed form action instead of arbitrary caller-supplied CDP or JavaScript authority; bind the action to a running worker, its owner-held loopback port, a canonical local origin, the browser-observed remote address, hashed selectors and an explicit call-scope confirmation.",
+      "evidence_refs": [
+        "docs:browser-stored-form-action.md",
+        "tests:test_workers.py",
+        "bureau:event-666"
+      ],
+      "operation_alternative_considered": "A generic browser or terminal operation was rejected because it would permit caller-controlled script execution or expose browser-managed field contents. This tool owns only the fixed CDP sequence required for one local-device form action and returns receipt-safe booleans and hashes.",
+      "exception_detail": {
+        "claim": "The tool owns a distinct browser-managed local form authority with no general JavaScript, field-content disclosure or arbitrary-navigation surface.",
+        "evidence": "Exact origin and remote-IP binding, owner-held port lease, pre-action audit intent, action-scope confirmation, fixed CDP methods, cleanup fallbacks, redacted receipts and focused negative tests."
+      },
+      "tool_contract": {
+        "tool": "grabowski_browser_worker_stored_form_action",
+        "category": "browser-worker",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "browser-input",
+          "form-submit",
+          "local-device-state-change"
+        ],
+        "reversibility": "target-dependent; fields cleared on failed or unobserved submission"
+      }
     }
   },
   "retired_tools": {},

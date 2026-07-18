@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import sqlite3
 import stat
 import sys
 import time
 import uuid
 from typing import Any
+from urllib.parse import urlsplit
 
 import grabowski_mcp as base
 import grabowski_resources as resources
@@ -488,6 +492,863 @@ def _start(
         raise
 
 
+BROWSER_FORM_SELECTOR = re.compile(r"[^\x00\r\n]{1,512}\Z")
+BROWSER_FORM_CHOICE = re.compile(r"[^\x00\r\n]{1,256}\Z")
+BROWSER_FORM_CONFIRMATION_PREFIX = "AUTHORIZE_BROWSER_STORED_FORM_ACTION"
+BROWSER_FORM_RESULT_CODES = {
+    "ok",
+    "target-discovery",
+    "target-origin",
+    "transport",
+    "element-contract",
+    "identity-choice",
+    "browser-fill",
+    "submit-target",
+    "submit-effect",
+    "post-origin",
+    "protocol",
+    "cleanup",
+}
+BROWSER_FORM_LOCAL_V4 = tuple(
+    ipaddress.ip_network(value)
+    for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+BROWSER_FORM_LOCAL_V6 = ipaddress.ip_network("fc00::/7")
+BROWSER_FORM_NODE_SOURCE = r"""
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+
+const request = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const digest = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+const RESULT_CODES = new Set([
+  'ok', 'target-discovery', 'target-origin', 'transport', 'element-contract',
+  'identity-choice', 'browser-fill', 'submit-target', 'submit-effect',
+  'post-origin', 'protocol', 'cleanup',
+]);
+let ws = null;
+let nextId = 1;
+const pending = new Map();
+const eventQueue = [];
+const eventWaiters = [];
+let stage = 'target-discovery';
+let cleaned = false;
+let fillConfirmed = false;
+let submitted = false;
+let actionEffectObserved = false;
+let navigationObserved = false;
+let formDisappeared = false;
+
+function emit(payload, status = 0) {
+  process.stdout.write(JSON.stringify(payload) + '\n');
+  process.exitCode = status;
+}
+
+function expression(selectors, body) {
+  return `(() => { const s = ${JSON.stringify(selectors)}; ${body} })()`;
+}
+
+async function connect(url) {
+  return await new Promise((resolve, reject) => {
+    ws = new WebSocket(url);
+    const timer = setTimeout(() => reject(new Error('transport')), request.timeout_ms);
+    ws.onopen = () => { clearTimeout(timer); resolve(); };
+    ws.onerror = () => { clearTimeout(timer); reject(new Error('transport')); };
+    ws.onmessage = (event) => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.id && pending.has(message.id)) {
+        const entry = pending.get(message.id);
+        pending.delete(message.id);
+        clearTimeout(entry.timer);
+        if (message.error) entry.reject(new Error('protocol'));
+        else entry.resolve(message.result || {});
+        return;
+      }
+      if (typeof message.method !== 'string') return;
+      for (let index = 0; index < eventWaiters.length; index += 1) {
+        const waiter = eventWaiters[index];
+        if (waiter.method !== message.method || !waiter.predicate(message.params || {})) continue;
+        eventWaiters.splice(index, 1);
+        clearTimeout(waiter.timer);
+        waiter.resolve(message.params || {});
+        return;
+      }
+      eventQueue.push(message);
+      if (eventQueue.length > 128) eventQueue.shift();
+    };
+    ws.onclose = () => {
+      for (const entry of pending.values()) {
+        clearTimeout(entry.timer);
+        entry.reject(new Error('transport'));
+      }
+      pending.clear();
+    };
+  });
+}
+
+async function call(method, params = {}) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('transport');
+  const id = nextId++;
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error('protocol'));
+    }, request.timeout_ms);
+    pending.set(id, {resolve, reject, timer});
+    ws.send(JSON.stringify({id, method, params}));
+  });
+}
+
+async function waitEvent(method, predicate = () => true) {
+  const existing = eventQueue.findIndex((message) =>
+    message.method === method && predicate(message.params || {})
+  );
+  if (existing >= 0) {
+    const [message] = eventQueue.splice(existing, 1);
+    return message.params || {};
+  }
+  return await new Promise((resolve, reject) => {
+    const waiter = {method, predicate, resolve, reject, timer: null};
+    waiter.timer = setTimeout(() => {
+      const index = eventWaiters.indexOf(waiter);
+      if (index >= 0) eventWaiters.splice(index, 1);
+      reject(new Error('protocol'));
+    }, request.timeout_ms);
+    eventWaiters.push(waiter);
+  });
+}
+
+async function evaluate(source) {
+  const response = await call('Runtime.evaluate', {
+    expression: source,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (response.exceptionDetails) throw new Error('protocol');
+  return response.result ? response.result.value : undefined;
+}
+
+async function key(key, code, virtualKeyCode) {
+  const common = {key, code, windowsVirtualKeyCode: virtualKeyCode, nativeVirtualKeyCode: virtualKeyCode};
+  await call('Input.dispatchKeyEvent', {type: 'rawKeyDown', ...common});
+  await call('Input.dispatchKeyEvent', {type: 'keyUp', ...common});
+}
+
+async function clickSelector(selectorName, failureCode) {
+  const source = `(() => {
+    const s = ${JSON.stringify(request.selectors)};
+    const selectorName = ${JSON.stringify(selectorName)};
+    let element = null;
+    try { element = document.querySelector(s[selectorName]); } catch { return null; }
+    if (!element || !element.isConnected) return null;
+    const rect = element.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const top = document.elementFromPoint(x, y);
+    if (!(top === element || element.contains(top))) return null;
+    return {x, y};
+  })()`;
+  const point = await evaluate(source);
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+    throw new Error(failureCode);
+  }
+  await call('Input.dispatchMouseEvent', {type: 'mouseMoved', x: point.x, y: point.y});
+  await call('Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: point.x, y: point.y, button: 'left', clickCount: 1,
+  });
+  await call('Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: point.x, y: point.y, button: 'left', clickCount: 1,
+  });
+}
+
+async function guardedEnter() {
+  const guardSource = `(() => {
+    const key = '__grabowskiStoredFormEnterGuard';
+    if (window[key]) window.removeEventListener('keydown', window[key], true);
+    const handler = (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    window[key] = handler;
+    window.addEventListener('keydown', handler, true);
+    return true;
+  })()`;
+  const removeSource = `(() => {
+    const key = '__grabowskiStoredFormEnterGuard';
+    if (!window[key]) return false;
+    window.removeEventListener('keydown', window[key], true);
+    delete window[key];
+    return true;
+  })()`;
+  await evaluate(guardSource);
+  try {
+    await key('Enter', 'Enter', 13);
+  } finally {
+    try { await evaluate(removeSource); } catch {}
+  }
+}
+
+async function clearFields() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try {
+    return Boolean(await evaluate(expression(request.selectors, `
+      let changed = false;
+      for (const selector of [s.identity, s.protected]) {
+        let element = null;
+        try { element = document.querySelector(selector); } catch { continue; }
+        if (!element || !('value' in element)) continue;
+        element.value = '';
+        element.dispatchEvent(new Event('input', {bubbles: true}));
+        element.dispatchEvent(new Event('change', {bubbles: true}));
+        changed = true;
+      }
+      return changed;
+    `)));
+  } catch {
+    return false;
+  }
+}
+
+try {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), request.timeout_ms);
+  const response = await fetch(`http://127.0.0.1:${request.port}/json/list`, {signal: controller.signal});
+  clearTimeout(timer);
+  if (!response.ok) throw new Error('target-discovery');
+  const targets = await response.json();
+  const matches = targets.filter((target) => {
+    if (target.type !== 'page' || typeof target.webSocketDebuggerUrl !== 'string') return false;
+    try {
+      const page = new URL(target.url);
+      const endpoint = new URL(target.webSocketDebuggerUrl);
+      const loopbackHosts = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+      return page.origin === request.expected_origin && endpoint.protocol === 'ws:' &&
+        loopbackHosts.has(endpoint.hostname) && Number(endpoint.port) === request.port;
+    } catch { return false; }
+  });
+  if (matches.length !== 1) throw new Error('target-origin');
+
+  stage = 'transport';
+  await connect(matches[0].webSocketDebuggerUrl);
+  await call('Runtime.enable');
+  await call('Page.enable');
+  await call('Network.enable');
+  await call('Network.setCacheDisabled', {cacheDisabled: true});
+  const frameTree = await call('Page.getFrameTree');
+  const mainFrameId = frameTree.frameTree && frameTree.frameTree.frame
+    ? frameTree.frameTree.frame.id : null;
+  if (!mainFrameId) throw new Error('protocol');
+  await call('Page.reload', {ignoreCache: true});
+  const documentResponse = await waitEvent('Network.responseReceived', (params) => {
+    if (params.type !== 'Document' || params.frameId !== mainFrameId ||
+        !params.response || typeof params.response.url !== 'string') return false;
+    try { return new URL(params.response.url).origin === request.expected_origin; }
+    catch { return false; }
+  });
+  await waitEvent('Page.loadEventFired');
+  const remoteAddress = String(documentResponse.response.remoteIPAddress || '')
+    .split('%', 1)[0].replace(/^\[|\]$/g, '');
+  if (!remoteAddress || !request.allowed_addresses.includes(remoteAddress)) {
+    throw new Error('target-origin');
+  }
+  const remoteAddressSha256 = digest(remoteAddress);
+  await sleep(100);
+
+  if (request.cleanup_only === true) {
+    cleaned = await clearFields();
+    emit({
+      schema_version: 1, ok: true, result_code: 'cleanup', fill_confirmed: false,
+      submitted: false, action_effect_observed: false, navigation_observed: false,
+      form_disappeared: false, post_origin: request.expected_origin,
+      post_path_sha256: null, remote_address_sha256: remoteAddressSha256, cleaned,
+    });
+  } else {
+  stage = 'element-contract';
+  const inspected = await evaluate(expression(request.selectors, `
+    const visible = (element) => {
+      if (!element || !element.isConnected) return false;
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+    let identity, protectedField, submit;
+    try {
+      identity = document.querySelector(s.identity);
+      protectedField = document.querySelector(s.protected);
+      submit = document.querySelector(s.submit);
+    } catch {
+      return {valid: false};
+    }
+    const identityTag = identity ? identity.tagName.toLowerCase() : '';
+    const identityType = identityTag === 'input' ? (identity.type || 'text').toLowerCase() : identityTag;
+    const protectedType = protectedField && protectedField.tagName.toLowerCase() === 'input'
+      ? (protectedField.type || 'text').toLowerCase() : '';
+    const submitTag = submit ? submit.tagName.toLowerCase() : '';
+    const submitType = submitTag === 'input' || submitTag === 'button'
+      ? (submit.type || 'submit').toLowerCase() : submitTag;
+    return {
+      valid: Boolean(identity && protectedField && submit),
+      origin: location.origin,
+      identity_type: identityType,
+      protected_type: protectedType,
+      submit_type: submitType,
+      identity_visible: visible(identity),
+      protected_visible: visible(protectedField),
+      submit_visible: visible(submit),
+      identity_disabled: Boolean(identity && identity.disabled),
+      protected_disabled: Boolean(protectedField && protectedField.disabled),
+      submit_disabled: Boolean(submit && submit.disabled),
+    };
+  `));
+  const allowedIdentity = new Set(['text', 'email', 'select']);
+  const allowedSubmit = new Set(['submit', 'button']);
+  if (!inspected || !inspected.valid || inspected.origin !== request.expected_origin ||
+      !allowedIdentity.has(inspected.identity_type) || inspected.protected_type !== 'password' ||
+      !allowedSubmit.has(inspected.submit_type) || !inspected.identity_visible ||
+      !inspected.protected_visible || !inspected.submit_visible || inspected.identity_disabled ||
+      inspected.protected_disabled || inspected.submit_disabled) {
+    throw new Error('element-contract');
+  }
+
+  if (request.identity_choice !== null) {
+    stage = 'identity-choice';
+    const choiceApplied = await evaluate(expression(request.selectors, `
+      const element = document.querySelector(s.identity);
+      const choice = ${JSON.stringify(request.identity_choice)};
+      if (element.tagName.toLowerCase() === 'select') {
+        const option = Array.from(element.options).find((candidate) =>
+          candidate.value === choice || candidate.textContent.trim() === choice
+        );
+        if (!option) return false;
+        element.value = option.value;
+      } else {
+        element.value = choice;
+      }
+      element.dispatchEvent(new Event('input', {bubbles: true}));
+      element.dispatchEvent(new Event('change', {bubbles: true}));
+      return true;
+    `));
+    if (!choiceApplied) throw new Error('identity-choice');
+  }
+
+  stage = 'browser-fill';
+  const initialTarget = (
+    request.identity_choice === null && ['text', 'email'].includes(inspected.identity_type)
+  ) ? 'identity' : 'protected';
+  await clickSelector(initialTarget, 'browser-fill');
+  await key('ArrowDown', 'ArrowDown', 40);
+  await key('Tab', 'Tab', 9);
+  await sleep(350);
+  let filled = await evaluate(expression(request.selectors, `
+    const identity = document.querySelector(s.identity);
+    const protectedField = document.querySelector(s.protected);
+    const identityReady = identity.tagName.toLowerCase() === 'select'
+      ? Boolean(identity.value) : Boolean(identity.value && identity.value.length > 0);
+    return {identity_filled: identityReady, protected_filled: Boolean(protectedField.value && protectedField.value.length > 0)};
+  `));
+  if (!filled.identity_filled || !filled.protected_filled) {
+    await clickSelector('protected', 'browser-fill');
+    await key('ArrowDown', 'ArrowDown', 40);
+    await guardedEnter();
+    await sleep(350);
+    filled = await evaluate(expression(request.selectors, `
+      const identity = document.querySelector(s.identity);
+      const protectedField = document.querySelector(s.protected);
+      const identityReady = identity.tagName.toLowerCase() === 'select'
+        ? Boolean(identity.value) : Boolean(identity.value && identity.value.length > 0);
+      return {identity_filled: identityReady, protected_filled: Boolean(protectedField.value && protectedField.value.length > 0)};
+    `));
+  }
+  if (!filled.identity_filled || !filled.protected_filled) throw new Error('browser-fill');
+  fillConfirmed = true;
+
+  stage = 'submit-target';
+  const before = await evaluate(`({origin: location.origin, path: location.pathname})`);
+  await clickSelector('submit', 'submit-target');
+  submitted = true;
+
+  stage = 'submit-effect';
+  const deadline = Date.now() + Math.min(5000, request.timeout_ms);
+  let post = null;
+  let effect = false;
+  while (Date.now() < deadline) {
+    await sleep(200);
+    try {
+      post = await evaluate(expression(request.selectors, `
+        let protectedField = null;
+        try { protectedField = document.querySelector(s.protected); } catch {}
+        return {origin: location.origin, path: location.pathname, protected_present: Boolean(protectedField)};
+      `));
+      formDisappeared = !post.protected_present;
+      effect = post.origin !== before.origin || post.path !== before.path || formDisappeared;
+      if (effect) {
+        actionEffectObserved = true;
+        navigationObserved = post.origin !== before.origin || post.path !== before.path;
+        break;
+      }
+    } catch {
+      // A navigation can temporarily destroy the execution context. Retry until
+      // the new document is readable and its exact origin can be verified.
+      continue;
+    }
+  }
+  if (!effect) {
+    cleaned = await clearFields();
+    throw new Error('submit-effect');
+  }
+  if (post && post.origin !== request.expected_origin) {
+    cleaned = await clearFields();
+    throw new Error('post-origin');
+  }
+  cleaned = formDisappeared ? true : await clearFields();
+
+  emit({
+    schema_version: 1,
+    ok: true,
+    result_code: 'ok',
+    fill_confirmed: fillConfirmed,
+    submitted,
+    action_effect_observed: actionEffectObserved,
+    navigation_observed: navigationObserved,
+    form_disappeared: formDisappeared,
+    post_origin: post ? post.origin : request.expected_origin,
+    post_path_sha256: post ? digest(post.path) : null,
+    remote_address_sha256: remoteAddressSha256,
+    cleaned,
+  });
+  }
+} catch (error) {
+  if (!cleaned) cleaned = await clearFields();
+  const message = error && typeof error.message === 'string' ? error.message : '';
+  const code = RESULT_CODES.has(message)
+    ? message
+    : (RESULT_CODES.has(stage) ? stage : 'protocol');
+  emit({
+    schema_version: 1,
+    ok: false,
+    result_code: code,
+    fill_confirmed: fillConfirmed,
+    submitted,
+    action_effect_observed: actionEffectObserved,
+    navigation_observed: navigationObserved,
+    form_disappeared: formDisappeared,
+    post_origin: null,
+    post_path_sha256: null,
+    remote_address_sha256: null,
+    cleaned,
+  }, 2);
+} finally {
+  try { if (ws) ws.close(); } catch {}
+}
+"""
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _validate_form_selector(value: str, label: str) -> str:
+    if not isinstance(value, str) or BROWSER_FORM_SELECTOR.fullmatch(value) is None:
+        raise ValueError(f"{label} must be bounded single-line selector text")
+    return value
+
+
+def _validate_identity_choice(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or BROWSER_FORM_CHOICE.fullmatch(value) is None:
+        raise ValueError("identity_choice must be bounded single-line text")
+    return value
+
+
+def _canonical_local_origin(value: str) -> tuple[str, str, list[str]]:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 1024:
+        raise ValueError("expected_origin must be bounded text")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.hostname
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("expected_origin must be one canonical HTTP(S) origin")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("expected_origin contains an invalid port") from exc
+    hostname = parsed.hostname.lower().rstrip(".")
+    if not hostname:
+        raise ValueError("expected_origin hostname is empty")
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("expected_origin hostname is invalid") from exc
+    default_port = 443 if parsed.scheme == "https" else 80
+    service_port = port or default_port
+    try:
+        answers = socket.getaddrinfo(hostname, service_port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise RuntimeError("expected_origin hostname did not resolve") from exc
+    addresses = sorted({answer[4][0].split("%", 1)[0] for answer in answers})
+    if not addresses:
+        raise RuntimeError("expected_origin hostname has no addresses")
+    for raw in addresses:
+        address = ipaddress.ip_address(raw)
+        if address.version == 4:
+            allowed = (
+                address.is_loopback
+                or address.is_link_local
+                or any(address in network for network in BROWSER_FORM_LOCAL_V4)
+            )
+        else:
+            allowed = (
+                address.is_loopback
+                or address.is_link_local
+                or address in BROWSER_FORM_LOCAL_V6
+            )
+        if not allowed:
+            raise PermissionError("expected_origin resolved outside local address space")
+    host_text = f"[{hostname}]" if ":" in hostname else hostname
+    port_text = "" if service_port == default_port else f":{service_port}"
+    origin = f"{parsed.scheme}://{host_text}{port_text}"
+    return origin, _sha256_text("\n".join(addresses)), addresses
+
+
+def _write_private_action_file(path: Path, payload: str) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        data = payload.encode("utf-8")
+        while data:
+            written = os.write(descriptor, data)
+            if written <= 0:
+                raise OSError("browser action file write made no progress")
+            data = data[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _run_node_form_action(
+    record: dict[str, Any],
+    request: dict[str, Any],
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    node = shutil.which("node")
+    if not node:
+        raise RuntimeError("Node.js is required for browser CDP actions")
+    directory = Path(record["config_path"]).parent
+    if directory.is_symlink() or WORKER_STATE not in directory.parents:
+        raise PermissionError("worker action directory is outside worker state")
+    token = uuid.uuid4().hex
+    script_path = directory / f".stored-form-{token}.mjs"
+    request_path = directory / f".stored-form-{token}.json"
+    created: list[Path] = []
+    try:
+        _write_private_action_file(script_path, BROWSER_FORM_NODE_SOURCE)
+        created.append(script_path)
+        _write_private_action_file(request_path, _canonical_json(request) + "\n")
+        created.append(request_path)
+        execution = operator._run(
+            [str(Path(node).resolve(strict=True)), str(script_path), str(request_path)],
+            cwd=directory,
+            timeout_seconds=timeout_seconds + 10,
+            max_output_bytes=65536,
+        )
+    finally:
+        for created_path in reversed(created):
+            try:
+                created_path.unlink()
+            except FileNotFoundError:
+                pass
+    lines = [line for line in execution.get("stdout", "").splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError("browser action returned no receipt")
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("browser action returned an invalid receipt") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise RuntimeError("browser action receipt schema mismatch")
+    code = payload.get("result_code")
+    if code not in BROWSER_FORM_RESULT_CODES:
+        raise RuntimeError("browser action receipt result code is invalid")
+    for key in (
+        "ok",
+        "fill_confirmed",
+        "submitted",
+        "action_effect_observed",
+        "navigation_observed",
+        "form_disappeared",
+        "cleaned",
+    ):
+        if not isinstance(payload.get(key), bool):
+            raise RuntimeError("browser action receipt boolean contract mismatch")
+    post_origin = payload.get("post_origin")
+    if post_origin is not None and not isinstance(post_origin, str):
+        raise RuntimeError("browser action receipt origin contract mismatch")
+    post_path_sha256 = payload.get("post_path_sha256")
+    if post_path_sha256 is not None and (
+        not isinstance(post_path_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", post_path_sha256) is None
+    ):
+        raise RuntimeError("browser action receipt path digest contract mismatch")
+    remote_address_sha256 = payload.get("remote_address_sha256")
+    if remote_address_sha256 is not None and (
+        not isinstance(remote_address_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", remote_address_sha256) is None
+    ):
+        raise RuntimeError("browser action receipt remote-address digest mismatch")
+    cleanup_only = request.get("cleanup_only") is True
+    if cleanup_only:
+        if code != "cleanup" or payload["ok"] is not True or payload["submitted"] is not False:
+            raise RuntimeError("browser cleanup receipt semantic mismatch")
+    elif payload["ok"] is True:
+        if (
+            code != "ok"
+            or payload["fill_confirmed"] is not True
+            or payload["submitted"] is not True
+            or payload["action_effect_observed"] is not True
+        ):
+            raise RuntimeError("browser action success receipt semantic mismatch")
+    elif code in {"ok", "cleanup"}:
+        raise RuntimeError("browser action failure receipt semantic mismatch")
+    if execution["returncode"] == 0 and payload["ok"] is not True:
+        raise RuntimeError("browser action success exit disagrees with receipt")
+    if execution["returncode"] != 0 and payload["ok"] is not False:
+        raise RuntimeError("browser action failure exit disagrees with receipt")
+    return payload
+
+
+def _browser_form_action_scope(
+    worker_id: str,
+    origin: str,
+    selectors: dict[str, str],
+    identity_choice: str | None,
+) -> tuple[str, dict[str, str], str | None]:
+    selector_hashes = {
+        key: _sha256_text(selectors[key])
+        for key in ("identity", "protected", "submit")
+    }
+    choice_hash = _sha256_text(identity_choice) if identity_choice is not None else None
+    scope = {
+        "schema_version": 1,
+        "worker_id": worker_id,
+        "expected_origin": origin,
+        "selector_sha256": selector_hashes,
+        "identity_choice_sha256": choice_hash,
+    }
+    return _sha256_text(_canonical_json(scope)), selector_hashes, choice_hash
+
+
+def _browser_form_confirmation(worker_id: str, origin: str, scope_sha256: str) -> str:
+    return f"{BROWSER_FORM_CONFIRMATION_PREFIX} {worker_id} {origin} {scope_sha256}"
+
+
+def browser_stored_form_action(
+    worker_id: str,
+    *,
+    expected_origin: str,
+    identity_selector: str,
+    protected_selector: str,
+    submit_selector: str,
+    confirmation: str,
+    identity_choice: str | None = None,
+    timeout_seconds: int = 15,
+) -> dict[str, Any]:
+    identifier = _validate_worker_id(worker_id)
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 5 <= timeout_seconds <= 30:
+        raise ValueError("timeout_seconds must be between 5 and 30")
+    selectors = {
+        "identity": _validate_form_selector(identity_selector, "identity_selector"),
+        "protected": _validate_form_selector(protected_selector, "protected_selector"),
+        "submit": _validate_form_selector(submit_selector, "submit_selector"),
+    }
+    choice = _validate_identity_choice(identity_choice)
+    origin, address_sha256, allowed_addresses = _canonical_local_origin(expected_origin)
+    action_scope_sha256, selector_hashes, choice_hash = _browser_form_action_scope(
+        identifier, origin, selectors, choice
+    )
+    expected_confirmation = _browser_form_confirmation(
+        identifier, origin, action_scope_sha256
+    )
+    if confirmation != expected_confirmation:
+        raise PermissionError("browser stored-form action confirmation mismatch")
+    public = worker_status(identifier, expected_kind="browser")
+    if public["state"] != "running":
+        raise RuntimeError("browser worker is not running")
+    record = _row(identifier)
+    if not isinstance(record.get("port"), int):
+        raise RuntimeError("browser worker has no CDP port")
+    port_lease = resources.inspect_resource(f"port:{record['port']}")
+    if port_lease is None or port_lease.get("owner_id") != f"worker:{identifier}":
+        raise RuntimeError("browser worker no longer owns its CDP port")
+
+    action_id = uuid.uuid4().hex
+    owner = f"browser-action:{action_id}"
+    lease_key = f"component:browser-action:{identifier}"
+    resources.acquire_resources(
+        owner,
+        [lease_key],
+        purpose="target-bound browser stored-form action",
+        ttl_seconds=timeout_seconds + 30,
+        metadata={
+            "worker_id": identifier,
+            "expected_origin": origin,
+            "action_scope_sha256": action_scope_sha256,
+        },
+    )
+    try:
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "browser-worker-stored-form-action-intent",
+                "action_id": action_id,
+                "worker_id": identifier,
+                "kind": "browser",
+                "unit": record["unit"],
+                "expected_origin": origin,
+                "resolved_addresses_sha256": address_sha256,
+                "action_scope_sha256": action_scope_sha256,
+                "selector_sha256": selector_hashes,
+                "identity_choice_sha256": choice_hash,
+                "confirmation_sha256": _sha256_text(confirmation),
+            }
+        )
+        intent_record_sha256 = base._verify_audit_log(base.AUDIT_LOG)[
+            "last_record_sha256"
+        ]
+    except Exception:
+        try:
+            resources.release_resources(owner, [lease_key])
+        except (PermissionError, ValueError):
+            pass
+        raise
+    payload: dict[str, Any]
+    action_error: Exception | None = None
+    try:
+        payload = _run_node_form_action(
+            record,
+            {
+                "schema_version": 1,
+                "port": record["port"],
+                "expected_origin": origin,
+                "allowed_addresses": allowed_addresses,
+                "cleanup_only": False,
+                "selectors": selectors,
+                "identity_choice": choice,
+                "timeout_ms": timeout_seconds * 1000,
+            },
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as exc:
+        action_error = exc
+        cleaned = False
+        remote_address_sha256: str | None = None
+        try:
+            cleanup = _run_node_form_action(
+                record,
+                {
+                    "schema_version": 1,
+                    "port": record["port"],
+                    "expected_origin": origin,
+                    "allowed_addresses": allowed_addresses,
+                    "cleanup_only": True,
+                    "selectors": selectors,
+                    "identity_choice": None,
+                    "timeout_ms": timeout_seconds * 1000,
+                },
+                timeout_seconds=timeout_seconds,
+            )
+            cleaned = cleanup["cleaned"]
+            remote_address_sha256 = cleanup["remote_address_sha256"]
+        except Exception:
+            pass
+        payload = {
+            "schema_version": 1,
+            "ok": None,
+            "result_code": "protocol",
+            "fill_confirmed": None,
+            "submitted": None,
+            "action_effect_observed": None,
+            "navigation_observed": None,
+            "form_disappeared": None,
+            "post_origin": None,
+            "post_path_sha256": None,
+            "remote_address_sha256": remote_address_sha256,
+            "cleaned": cleaned,
+        }
+    finally:
+        try:
+            resources.release_resources(owner, [lease_key])
+        except (PermissionError, ValueError):
+            pass
+
+    audit = {
+        "timestamp_unix": _now(),
+        "operation": "browser-worker-stored-form-action",
+        "action_id": action_id,
+        "worker_id": identifier,
+        "kind": "browser",
+        "unit": record["unit"],
+        "expected_origin": origin,
+        "resolved_addresses_sha256": address_sha256,
+        "action_scope_sha256": action_scope_sha256,
+        "selector_sha256": selector_hashes,
+        "identity_choice_sha256": choice_hash,
+        "confirmation_sha256": _sha256_text(confirmation),
+        "intent_record_sha256": intent_record_sha256,
+        "result_code": payload["result_code"],
+        "outcome_known": action_error is None,
+        "ok": payload["ok"],
+        "fill_confirmed": payload["fill_confirmed"],
+        "submitted": payload["submitted"],
+        "action_effect_observed": payload["action_effect_observed"],
+        "navigation_observed": payload["navigation_observed"],
+        "form_disappeared": payload["form_disappeared"],
+        "post_origin": payload["post_origin"],
+        "post_path_sha256": payload["post_path_sha256"],
+        "remote_address_sha256": payload["remote_address_sha256"],
+        "cleaned": payload["cleaned"],
+    }
+    base._append_audit(audit)
+    audit_sha256 = base._verify_audit_log(base.AUDIT_LOG)["last_record_sha256"]
+    if payload["post_origin"] not in {None, origin}:
+        raise RuntimeError("browser stored-form action changed to an unexpected origin")
+    return {
+        "schema_version": 1,
+        "ok": payload["ok"],
+        "action_id": action_id,
+        "worker_id": identifier,
+        "expected_origin": origin,
+        "resolved_addresses_sha256": address_sha256,
+        "action_scope_sha256": action_scope_sha256,
+        "selector_sha256": selector_hashes,
+        "identity_choice_sha256": choice_hash,
+        "intent_record_sha256": intent_record_sha256,
+        "result_code": payload["result_code"],
+        "fill_confirmed": payload["fill_confirmed"],
+        "submitted": payload["submitted"],
+        "action_effect_observed": payload["action_effect_observed"],
+        "navigation_observed": payload["navigation_observed"],
+        "form_disappeared": payload["form_disappeared"],
+        "post_origin": payload["post_origin"],
+        "post_path_sha256": payload["post_path_sha256"],
+        "remote_address_sha256": payload["remote_address_sha256"],
+        "cleaned": payload["cleaned"],
+        "audit_record_sha256": audit_sha256,
+        "does_not_establish": [
+            "authentication_success_without_target-specific readback",
+            "absence_of_server_side_effects_beyond_the_submitted_form",
+        ],
+    }
+
+
 def browser_start(
     executable: str,
     *,
@@ -692,6 +1553,36 @@ def grabowski_browser_worker_start(
     )
     _audit("browser-worker-start", result)
     return result
+
+
+@mcp.tool(name="grabowski_browser_worker_stored_form_action", annotations=MUTATING)
+def grabowski_browser_worker_stored_form_action(
+    worker_id: str,
+    expected_origin: str,
+    identity_selector: str,
+    protected_selector: str,
+    submit_selector: str,
+    confirmation: str,
+    identity_choice: str | None = None,
+    timeout_seconds: int = 15,
+) -> dict[str, Any]:
+    """Use browser-managed stored form data on one exact local origin and submit it.
+
+    Confirmation must be one line containing the authorization prefix,
+    worker id, canonical origin and the exact action-scope SHA-256. The result never
+    returns field contents, raw selectors, query strings or URL fragments.
+    """
+    operator._require_operator_mutation("browser_worker")
+    return browser_stored_form_action(
+        worker_id,
+        expected_origin=expected_origin,
+        identity_selector=identity_selector,
+        protected_selector=protected_selector,
+        submit_selector=submit_selector,
+        confirmation=confirmation,
+        identity_choice=identity_choice,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 @mcp.tool(name="grabowski_browser_worker_status", annotations=READ_ONLY)
