@@ -369,7 +369,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
                 "kind": "connector_transport",
                 "surface": "connector",
                 "operation": "runtime health",
-                "symptom": "MCP tunnel returned HTTP 404 before any Grabowski receipt",
+                "symptom": "MCP tunnel returned HTTP 404; response_status=404 before any Grabowski receipt",
                 "resolved": False,
             },
             {
@@ -387,6 +387,9 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(diagnostics["schema_version"], 2)
         self.assertEqual(diagnostics["historical_http_status_counts"], {"404": 1})
         recovery = diagnostics["pre_runtime_http_404_recovery"]
+        self.assertEqual(recovery["authority"], "guidance_only")
+        self.assertFalse(recovery["machine_enforced"])
+        self.assertEqual(len(recovery["caller_must_establish"]), 2)
         self.assertEqual(recovery["catalog_refresh_limit"], 1)
         self.assertEqual(recovery["read_only_retry_limit"], 1)
         self.assertIn("stop before mutation", recovery["sequence"][-1])
@@ -395,6 +398,24 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             "retry exactly one small typed read-only call",
             diagnostics["split_retry_policy"]["pre_runtime_http_404_rule"],
         )
+
+    def test_explicit_http_status_parser_is_symmetric_deduplicated_and_bounded(self) -> None:
+        module = self._load_module()
+        cases = {
+            "HTTP 302": [302],
+            "HTTP status: 404": [404],
+            "HTTP/1.1 502": [502],
+            "status=503": [503],
+            "HTTP 404; response_status=404": [404],
+            "request completed after 404 ms": [],
+            "error 404 in comment": [],
+            "version 4040": [],
+            "HTTP 999": [],
+        }
+
+        for message, expected in cases.items():
+            with self.subTest(message=message):
+                self.assertEqual(module._explicit_http_statuses({"msg": message}), expected)
 
     def test_connector_transport_live_diagnostics_captures_bounded_runtime_receipt(self) -> None:
         module = self._load_module()
@@ -475,6 +496,10 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             "active",
         )
         self.assertEqual(diagnostics["schema_version"], 3)
+        self.assertEqual(
+            diagnostics["friction_log"]["connector_transport_diagnostics"]["schema_version"],
+            2,
+        )
         self.assertTrue(diagnostics["live_transport_errors_observed"])
         probe = diagnostics["journal_transport_probes"]["grabowski-operator.service"]
         self.assertEqual(probe["max_lines"], 25)

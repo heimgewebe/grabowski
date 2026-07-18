@@ -642,6 +642,15 @@ def _looks_like_connector_transport(event: dict[str, Any], haystack: str) -> boo
     return surface == "connector" or "streamable_http" in haystack or "post /mcp" in haystack
 
 
+def _historical_http_status_counts(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Count each explicit HTTP status at most once per friction event."""
+    counts: Counter[str] = Counter()
+    for event in events:
+        statuses = set(_explicit_http_statuses({"msg": _event_haystack(event)}))
+        counts.update(str(status) for status in statuses)
+    return dict(sorted(counts.items()))
+
+
 def connector_transport_diagnostics(events: list[dict[str, Any]]) -> dict[str, Any]:
     transport_events = [
         event
@@ -649,10 +658,6 @@ def connector_transport_diagnostics(events: list[dict[str, Any]]) -> dict[str, A
         if classify_friction_event(event) == "connector_transport"
     ]
     unresolved_events = [event for event in transport_events if event.get("resolved") is not True]
-    historical_http_statuses: Counter[str] = Counter()
-    for event in transport_events:
-        for status in _explicit_http_statuses({"msg": _event_haystack(event)}):
-            historical_http_statuses[str(status)] += 1
     return {
         "schema_version": 2,
         "authority": "read_only_diagnostic_guidance",
@@ -660,7 +665,7 @@ def connector_transport_diagnostics(events: list[dict[str, Any]]) -> dict[str, A
         "unresolved_event_count": len(unresolved_events),
         "recent_event_ids": _proposal_event_ids(transport_events),
         "recent_event_ids_truncated": len(transport_events) > MAX_PROPOSAL_EVIDENCE_IDS,
-        "historical_http_status_counts": dict(sorted(historical_http_statuses.items())),
+        "historical_http_status_counts": _historical_http_status_counts(transport_events),
         "recommended_bounded_probe": [
             "grabowski_status for runtime contract and client snapshot visibility",
             "grabowski_service_status for grabowski-operator.service and tunnel-client-grabowski.service",
@@ -668,6 +673,12 @@ def connector_transport_diagnostics(events: list[dict[str, Any]]) -> dict[str, A
             "one adjacent small typed read-only call to determine whether the transport failure is still active",
         ],
         "pre_runtime_http_404_recovery": {
+            "authority": "guidance_only",
+            "machine_enforced": False,
+            "caller_must_establish": [
+                "HTTP 404 was returned before any Grabowski receipt was observed",
+                "no target mutation may have occurred",
+            ],
             "applies_when": (
                 "HTTP 404 is returned before any Grabowski receipt or target mutation is observed"
             ),
@@ -832,8 +843,7 @@ def _explicit_http_statuses(payload: dict[str, Any]) -> list[int]:
     if isinstance(message, str):
         explicit_patterns = (
             r"(?:status|status_code|http_status|response_status|response_code|code)\s*[=:]\s*(\d{3})(?!\d)",
-            r"\bHTTP(?:\s+status)?\s*[:=]?\s*([45]\d{2})(?!\d)",
-            r"HTTP/\d(?:\.\d)?\s+(\d{3})(?!\d)",
+            r"\bHTTP(?:/\d(?:\.\d)?)?(?:\s+status)?\s*[:=]?\s*(\d{3})(?!\d)",
             r"received exception from stream\s*:\s*([45]\d{2})(?=\s+(?:upstream|external|http|bad gateway|service error))",
             r"(?:upstream(?: or|/)external service|external service error)[^0-9]{0,32}([45]\d{2})(?!\d)",
         )

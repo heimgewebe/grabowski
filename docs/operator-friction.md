@@ -92,9 +92,43 @@ Retry policy:
 
 `grabowski_friction_summary` includes `connector_transport_diagnostics`. This is diagnostic guidance only. It does not prove root cause, command success, safe mutation retry, connector vendor repair or transport reliability.
 
-`grabowski_connector_transport_diagnostics` turns the same guidance into a bounded read-only diagnostic receipt. It reads recent friction events, `grabowski_status`, fixed user-service status for `grabowski-operator.service` and `tunnel-client-grabowski.service`, and JSON journal records from bounded recent samples. Schema version 3 remains stable; its nested guidance schema version 2 adds explicit historical HTTP status counts. A cleanup issue is classified as planned lifecycle only when its exact known shutdown message, expected component, complete, timestamp-ordered `OnStop hook executing`/`executed` sequence and process invocation are bound to the same later successful systemd stop record through `MESSAGE_ID`, `USER_UNIT`, `USER_INVOCATION_ID`, `JOB_TYPE=stop` and `JOB_RESULT=done`. Missing, mismatched or failed stop evidence remains a transport error.
+`grabowski_connector_transport_diagnostics` returns two explicitly separate schema levels:
 
-A pre-runtime `HTTP 404` means the platform or connector route failed before Grabowski returned any receipt. Only in that exact case, and only when no target mutation may have happened, the bounded recovery is: refresh or re-discover the connector tool catalog once, then retry exactly one small typed read-only call. A second `404` remains unresolved and blocks mutation. A successful retry proves restored access only; it does not prove root cause, harmlessness or future transport reliability. Bare latency such as `404 ms` is not treated as an HTTP status.
+- The public live diagnostic receipt remains top-level `schema_version: 3`.
+- Its nested `friction_log.connector_transport_diagnostics` guidance object is `schema_version: 2`; this object adds `historical_http_status_counts` and `pre_runtime_http_404_recovery`.
+
+The tool reads recent friction events, `grabowski_status`, fixed user-service status for `grabowski-operator.service` and `tunnel-client-grabowski.service`, and JSON journal records from bounded recent samples. A cleanup issue is classified as planned lifecycle only when its exact known shutdown message, expected component, complete, timestamp-ordered `OnStop hook executing`/`executed` sequence and process invocation are bound to the same later successful systemd stop record through `MESSAGE_ID`, `USER_UNIT`, `USER_INVOCATION_ID`, `JOB_TYPE=stop` and `JOB_RESULT=done`. Missing, mismatched or failed stop evidence remains a transport error.
+
+`pre_runtime_http_404_recovery` is guidance, not an enforced state machine. The receipt exposes `authority: guidance_only`, `machine_enforced: false` and the conditions the caller must establish. Grabowski cannot prove from its own logs that a platform-side `404` occurred before the request reached Grabowski or that no mutation may have happened.
+
+| Situation | Evidence required | Allowed recovery | Mutation rule |
+|---|---|---|---|
+| Pre-runtime explicit `HTTP 404` | No Grabowski receipt observed and no mutation may have occurred | Refresh or re-discover the tool catalog once, then retry one small typed read-only call | Blocked |
+| Runtime `5xx` or timeout | Bounded status, service and journal probes | One smaller typed read-only retry | No mutation retry before target-state readback |
+| Possible mutation outcome unknown | Target may have changed despite transport failure | Read the exact target state only | Retry blocked until readback |
+| Failure persists | Second failure or insufficient evidence | Keep unresolved and stop | Blocked |
+
+A successful read-only retry proves restored access only; it does not prove root cause, harmlessness or future transport reliability. The parser recognizes explicit syntax such as `HTTP 302`, `HTTP status: 404`, `HTTP/1.1 502` and `status=503`. Bare numbers without HTTP-status syntax, such as `404 ms`, `error 404 in comment` or `version 4040`, are not statuses.
+
+Minimal shape:
+
+```json
+{
+  "schema_version": 3,
+  "friction_log": {
+    "connector_transport_diagnostics": {
+      "schema_version": 2,
+      "historical_http_status_counts": {"404": 1},
+      "pre_runtime_http_404_recovery": {
+        "authority": "guidance_only",
+        "machine_enforced": false,
+        "catalog_refresh_limit": 1,
+        "read_only_retry_limit": 1
+      }
+    }
+  }
+}
+```
 
 For genuine errors, `window_state` distinguishes `no_errors`, `errors_without_later_activity` and `errors_followed_by_activity`; an output-truncated journal is reported as `indeterminate_truncated`; failed, timed-out or partially unparsable probes are `indeterminate_incomplete`. Neither state can establish absence of errors or later recovery. `post_error_activity_counts` shows bounded forwarding or control-plane acknowledgements after the last error. This is recovery evidence, not proof that the earlier error was harmless or that the transport is currently reliable. The compatibility field `live_transport_errors_observed` therefore means only that an error exists in the bounded journal window; its explicit semantics field prevents interpreting it as current-outage proof. HTTP codes still come only from explicit structured fields or explicit status syntax. Samples contain only bounded timestamp, invocation, level, component, status and error-domain fields; raw log messages are not returned. This remains diagnostic evidence only and does not authorize retry, mutation, merge, deploy or policy exceptions.
 
