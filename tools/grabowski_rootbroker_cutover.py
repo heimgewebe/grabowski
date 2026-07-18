@@ -22,6 +22,7 @@ BLOCKADE_STORE_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade
 BLOCKADE_AUTHORITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_authority.py")
 BROKER_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
 BROKER_WRAPPER_TARGET = Path("/usr/local/libexec/grabowski-privileged-broker")
+PROCESS_OBSERVER_TARGET = Path("/usr/local/libexec/grabowski-process-reference-observer")
 REQUEST_CLIENT_TARGET = Path("/usr/local/bin/grabowski-privileged-request")
 CUTOVER_HELPER_TARGET = Path("/usr/local/libexec/grabowski-rootbroker-cutover")
 BROKER_SERVICE_TARGET = Path("/etc/systemd/system/grabowski-privileged-broker@.service")
@@ -37,6 +38,7 @@ PUBLISH_ACTION = "publish_recovery_marker"
 POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
+PROCESS_OBSERVER_ACTION = "observe_process_references"
 
 
 class CutoverError(RuntimeError):
@@ -79,6 +81,12 @@ ARTIFACTS = (
     Artifact(
         "tools/grabowski_privileged_broker.py",
         BROKER_WRAPPER_TARGET,
+        0o755,
+        True,
+    ),
+    Artifact(
+        "tools/grabowski_process_reference_observer.py",
+        PROCESS_OBSERVER_TARGET,
         0o755,
         True,
     ),
@@ -652,6 +660,41 @@ def _root_task_action_from_repository(
     return json.loads(json.dumps(root_task))
 
 
+
+def _process_observer_action_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any]:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    observer = actions.get(PROCESS_OBSERVER_ACTION)
+    if not isinstance(observer, dict):
+        raise CutoverError("example catalog has no process reference observer")
+    required = {"enabled", "target_pattern", "argv", "timeout_seconds"}
+    if set(observer) != required:
+        raise CutoverError("process reference observer contract keys are invalid")
+    if observer.get("enabled") is not True:
+        raise CutoverError("process reference observer must be enabled")
+    if observer.get("target_pattern") != r"\{.{1,49152}\}":
+        raise CutoverError("process reference observer target pattern is invalid")
+    if observer.get("argv") != [str(PROCESS_OBSERVER_TARGET), "{target}"]:
+        raise CutoverError("process reference observer argv is invalid")
+    if observer.get("timeout_seconds") != 30:
+        raise CutoverError("process reference observer timeout is invalid")
+    return json.loads(json.dumps(observer))
+
+
 def _validate_root_task_coherence(
     root_task: dict[str, Any],
     *,
@@ -689,6 +732,7 @@ def merge_privileged_config(
     publisher: dict[str, Any],
     lifecycle: dict[str, Any] | None = None,
     root_task: dict[str, Any] | None = None,
+    process_observer: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if set(current) != {"schema_version", "actions"}:
         raise CutoverError("installed privileged config has invalid top-level keys")
@@ -709,6 +753,9 @@ def merge_privileged_config(
     merged = json.loads(json.dumps(current))
     merged_actions = merged["actions"]
     merged_actions[PUBLISH_ACTION] = json.loads(json.dumps(publisher))
+    process_observer_before = actions.get(PROCESS_OBSERVER_ACTION)
+    if process_observer is not None:
+        merged_actions[PROCESS_OBSERVER_ACTION] = json.loads(json.dumps(process_observer))
     merged_power = merged_actions[POWER_ACTION]
     merged_gate = merged_power["gate"]
     if lifecycle is None:
@@ -795,6 +842,8 @@ def merge_privileged_config(
         controlled.add(BLOCKADE_LIFECYCLE_ACTION)
     if root_task is not None:
         controlled.add(ROOT_TASK_ACTION)
+    if process_observer is not None:
+        controlled.add(PROCESS_OBSERVER_ACTION)
     evidence = {
         "operator_power_before_sha256": _sha256(_canonical_json(power_before)),
         "operator_power_after_sha256": _sha256(_canonical_json(merged_power)),
@@ -806,6 +855,15 @@ def merge_privileged_config(
             _sha256(_canonical_json(root_task)) if root_task is not None else None
         ),
         "root_task_preexisting": root_task_before is not None,
+        "process_observer_sha256": (
+            _sha256(_canonical_json(process_observer))
+            if process_observer is not None else None
+        ),
+        "process_observer_preexisting": process_observer_before is not None,
+        "process_observer_before_sha256": (
+            _sha256(_canonical_json(process_observer_before))
+            if isinstance(process_observer_before, dict) else None
+        ),
         "root_task_before_sha256": (
             _sha256(_canonical_json(root_task_before))
             if isinstance(root_task_before, dict)
@@ -1159,6 +1217,9 @@ def _apply_cutover_locked(
         expected_head=expected_head,
         runner=runner,
     )
+    process_observer = _process_observer_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     if artifact_targets is None:
         _validate_recovery_source_dropin(
             source_artifacts,
@@ -1174,6 +1235,7 @@ def _apply_cutover_locked(
         publisher=publisher,
         lifecycle=lifecycle,
         root_task=root_task,
+        process_observer=process_observer,
     )
     merged_config_data = _canonical_json(merged_config)
 
@@ -1388,6 +1450,9 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         expected_head=expected_head,
         runner=runner,
     )
+    process_observer = _process_observer_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     _validate_recovery_source_dropin(
         source_artifacts,
         publisher=publisher,
@@ -1399,6 +1464,7 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         publisher=publisher,
         lifecycle=lifecycle,
         root_task=root_task,
+        process_observer=process_observer,
     )
     return {
         "schema_version": 1,

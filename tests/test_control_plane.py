@@ -1002,6 +1002,9 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             "BindReadOnlyPaths=-/home/alex/.local/state/grabowski/operator-kill-switch",
             service_unit,
         )
+        self.assertNotIn("BindReadOnlyPaths=-/home/alex/repos\n", service_unit)
+        for path in privileged.PROCESS_REFERENCE_ALLOWED_ROOTS:
+            self.assertIn(f"BindReadOnlyPaths=-{path}", service_unit)
         self.assertNotIn("BindPaths=/home/alex", service_unit)
         self.assertNotIn("ProtectHome=yes", service_unit)
         self.assertIn("ExecStart=/usr/local/libexec/grabowski-privileged-broker", service_unit)
@@ -1100,6 +1103,72 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
                 result = privileged.grabowski_privileged_broker_status()
             self.assertFalse(result["ready"])
             self.assertTrue(result["fail_closed"])
+
+    def test_process_reference_observation_rejects_tampered_hash(self) -> None:
+        roots = ["/home/alex/repos/example/target"]
+        material = {
+            "kind": privileged.PROCESS_REFERENCE_KIND,
+            "schema_version": 1,
+            "complete": True,
+            "target_uid": 1000,
+            "roots": roots,
+            "process_count": 1,
+            "open_file_descriptors_checked": 1,
+            "path_references": [],
+            "errors": [],
+        }
+        value = {**material, "observation_sha256": "0" * 64}
+        with self.assertRaisesRegex(RuntimeError, "hash"):
+            privileged._validate_process_reference_observation(
+                value,
+                roots=roots,
+                target_uid=1000,
+                max_processes=10,
+                max_file_descriptors=10,
+            )
+
+    def test_observe_process_references_binds_request_and_cleans_reference(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="privileged-observer-", dir="/home/alex/repos") as directory, tempfile.TemporaryDirectory() as state:
+            root = Path(directory)
+            roots = [str(root)]
+            material = {
+                "kind": privileged.PROCESS_REFERENCE_KIND,
+                "schema_version": 1,
+                "complete": True,
+                "target_uid": os.getuid(),
+                "roots": roots,
+                "process_count": 2,
+                "open_file_descriptors_checked": 3,
+                "path_references": [],
+                "errors": [],
+            }
+            observation = {**material, "observation_sha256": privileged._canonical_sha256(material)}
+            outer = {
+                "returncode": 0,
+                "timed_out": False,
+                "stdout": json.dumps(observation, sort_keys=True),
+            }
+            completed = subprocess.CompletedProcess(
+                ["grabowski-privileged-request"],
+                0,
+                json.dumps(outer).encode("utf-8"),
+                b"",
+            )
+            reference_root = Path(state)
+            with patch.object(privileged, "PROCESS_REFERENCE_ALLOWED_ROOTS", (root,)), patch.object(privileged, "POWER_REFERENCE_DIR", reference_root), patch.object(
+                privileged,
+                "grabowski_privileged_broker_status",
+                return_value={"ready": True, "request_client": "/usr/local/bin/grabowski-privileged-request"},
+            ), patch.object(
+                privileged.subprocess, "run", return_value=completed
+            ), patch.object(privileged, "_append_operator_audit") as audit:
+                result = privileged.observe_process_references(
+                    roots, target_uid=os.getuid(), max_processes=10, max_file_descriptors=10
+                )
+            self.assertEqual(result, observation)
+            self.assertEqual(list(reference_root.iterdir()), [])
+            audit.assert_called_once()
+            self.assertTrue(audit.call_args.args[0]["complete"])
 
     def test_connector_probe_detects_snapshot_drift(self) -> None:
         spec = importlib.util.spec_from_file_location(
