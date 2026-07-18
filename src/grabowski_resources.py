@@ -589,7 +589,6 @@ def _open_current_resource_database() -> sqlite3.Connection:
     connection = _connect_existing_resource_database()
     connection.row_factory = sqlite3.Row
     try:
-        _resource_sqlite_integrity(connection, "Resource database", quick=True)
         if _resource_schema_version(connection) != "2":
             raise RuntimeError(
                 "Resource database schema changed while opening; retry with a compatible runtime"
@@ -3323,6 +3322,10 @@ def grabowski_resource_list(
     if not isinstance(schema_only, bool):
         raise ValueError("schema_only must be boolean")
     if schema_only:
+        if owner_id is not None or include_expired or limit != 200:
+            raise ValueError(
+                "schema_only cannot be combined with resource-list filters"
+            )
         return _resource_schema_inventory()
     leases = list_resources(
         owner_id=owner_id,

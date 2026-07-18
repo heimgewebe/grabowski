@@ -2074,6 +2074,8 @@ class TaskTests(unittest.TestCase):
         self.assertEqual([], self._task_migration_backups())
         with self.assertRaisesRegex(ValueError, "schema_only must be boolean"):
             tasks.grabowski_task_list(schema_only=1)
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            tasks.grabowski_task_list(schema_only=True, limit=1)
 
     def test_current_task_schema_inventory_is_byte_stable(self) -> None:
         connection = tasks._database()
@@ -2081,6 +2083,15 @@ class TaskTests(unittest.TestCase):
         before = self.database.read_bytes()
         before_stat = self.database.stat()
         before_names = sorted(item.name for item in self.database.parent.iterdir())
+        original_integrity = tasks._sqlite_integrity
+        with patch.object(
+            tasks,
+            "_sqlite_integrity",
+            wraps=original_integrity,
+        ) as integrity:
+            connection = tasks._database()
+            connection.close()
+        self.assertEqual(1, integrity.call_count)
         inventory = tasks.grabowski_task_list(schema_only=True)
         self.assertEqual("5", inventory["observed_version"])
         self.assertEqual("current", inventory["status"])
