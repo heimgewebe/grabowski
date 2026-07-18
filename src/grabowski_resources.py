@@ -389,6 +389,34 @@ def _scope_manifest_from_metadata(metadata: dict[str, Any], *, required: bool) -
     return nonconflict.normalize_scope_manifest(value)
 
 
+def repository_scope_manifest_for_owner(
+    owner_id: str, resource_key: str
+) -> dict[str, Any] | None:
+    """Read one owner-bound broad repository manifest, including after expiry."""
+    owner = _owner(owner_id)
+    key = normalize_resource_key(resource_key)
+    if not key.startswith("repo:") or scoped_repository_resource_root(key) is not None:
+        raise ValueError("resource_key must be one broad repository lease")
+    with _database() as connection:
+        row = connection.execute(
+            "SELECT * FROM leases WHERE resource_key=?", (key,)
+        ).fetchone()
+    if row is None:
+        return None
+    if row["owner_id"] != owner:
+        raise PermissionError("repository lease is owned by another owner")
+    metadata = _row_metadata(row)
+    _, observed_metadata_sha256 = _metadata(metadata)
+    if row["metadata_sha256"] != observed_metadata_sha256:
+        raise RuntimeError("repository lease metadata hash does not match")
+    manifest = _scope_manifest_from_metadata(metadata, required=False)
+    if manifest is None:
+        return None
+    if f"repo:{manifest['repository']}" != key:
+        raise RuntimeError("repository lease scope does not match resource key")
+    return manifest
+
+
 def _path_is_within_repository(resource_key: str, repository: str) -> bool:
     if not resource_key.startswith("path:"):
         return False
@@ -2703,6 +2731,99 @@ def grabowski_resource_reconcile_obsolete_path_leases(
     return result
 
 
+def scoped_repository_resource_root(resource_key: str) -> str | None:
+    """Return an existing Git root for one unambiguous scoped repo key.
+
+    Repository paths may themselves contain ``:branch:`` or ``:operation:``.
+    An existing full path is therefore always broad. A non-existing full path
+    is treated as scoped only when exactly one marker split resolves to an
+    existing checkout root with a .git entry; ambiguous inputs fail closed.
+    """
+    if not resource_key.startswith("repo:"):
+        return None
+    value = resource_key.removeprefix("repo:")
+    if os.path.lexists(value):
+        return None
+    candidates: set[str] = set()
+    for marker in (":branch:", ":operation:"):
+        start = 0
+        while True:
+            index = value.find(marker, start)
+            if index < 0:
+                break
+            repository = os.path.normpath(value[:index])
+            scope_value = value[index + len(marker) :]
+            if (
+                scope_value
+                and os.path.isabs(repository)
+                and os.path.isdir(repository)
+                and os.path.lexists(os.path.join(repository, ".git"))
+            ):
+                candidates.add(repository)
+            start = index + len(marker)
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _public_repository_scope_keys(
+    resource_keys: list[str], metadata: dict[str, Any] | None
+) -> list[str]:
+    """Require broad public repository leases to declare one exact scope."""
+    keys = normalize_resource_keys(resource_keys)
+    repository_keys = [key for key in keys if key.startswith("repo:")]
+    if not repository_keys:
+        return keys
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    normalized_metadata = {} if metadata is None else dict(metadata)
+    if normalized_metadata.get("lease_mode") == "emergency-recovery":
+        return keys
+    scope = (
+        nonconflict.normalize_scope_manifest(normalized_metadata["scope_manifest"])
+        if "scope_manifest" in normalized_metadata
+        else None
+    )
+    scoped_repository_keys: list[str] = []
+    broad_repository_keys: list[str] = []
+    for key in repository_keys:
+        binding = (
+            _repository_resource_scope(key, repository=scope["repository"])
+            if scope is not None
+            else None
+        )
+        manifest_scoped = (
+            binding is not None
+            and binding["scope_kind"] in {"branch", "operation"}
+        )
+        filesystem_scoped = scoped_repository_resource_root(key) is not None
+        if manifest_scoped or filesystem_scoped:
+            scoped_repository_keys.append(key)
+            continue
+        broad_repository_keys.append(key)
+    if scoped_repository_keys and scope is not None:
+        raise ValueError(
+            "scoped repository leases must not include metadata.scope_manifest; "
+            "the resource key is authoritative"
+        )
+    if not broad_repository_keys:
+        return keys
+    if normalized_metadata.get("scope_manifest_complete") is not True:
+        raise ValueError(
+            "public broad repository leases require metadata.scope_manifest_complete=true"
+        )
+    if scope is None:
+        raise ValueError(
+            "public broad repository leases require metadata.scope_manifest"
+        )
+    repository_key = f"repo:{scope['repository']}"
+    for key in broad_repository_keys:
+        if key == repository_key:
+            continue
+        raise ValueError(
+            "repository resource keys must match metadata.scope_manifest repository"
+        )
+    return keys
+
+
 @mcp.tool(name="grabowski_resource_acquire", annotations=MUTATING)
 def grabowski_resource_acquire(
     owner_id: str,
@@ -2712,11 +2833,18 @@ def grabowski_resource_acquire(
     metadata: dict[str, Any] | None = None,
     nonconflict_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Atomically acquire typed resource leases for one owner."""
+    """Atomically acquire typed resource leases for one owner.
+
+    Public broad repository resources require a complete exact scope manifest. An
+    explicit emergency-recovery lease remains a deliberately exclusive
+    fail-closed exception and cannot be used for non-conflict bypasses. Self-scoped
+    branch and operation keys are authoritative and reject scope manifests.
+    """
+    normalized_resource_keys = _public_repository_scope_keys(resource_keys, metadata)
     operator._require_operator_mutation("resource_lease")
     result = acquire_resources(
         owner_id,
-        resource_keys,
+        normalized_resource_keys,
         purpose=purpose,
         ttl_seconds=ttl_seconds,
         metadata=metadata,

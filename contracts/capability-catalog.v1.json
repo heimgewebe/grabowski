@@ -1039,7 +1039,7 @@
     },
     {
       "category": "task",
-      "description": "Start one persistent local or fleet task in its own systemd unit.\n\nDirect local write-capable agent CLIs receive an implicit repository lease\nunless the caller supplies an explicit path or repository scope.",
+      "description": "Start one persistent local or fleet task in its own systemd unit.\n\nDirect local write-capable agent CLIs receive an implicit repository lease\nunless the caller supplies an explicit path or repository scope. Every\ntask-owned broad repository lease carries a complete whole-repository scope manifest.",
       "effects": [
         "process-start",
         "state-create",
@@ -1362,7 +1362,7 @@
     },
     {
       "category": "resource",
-      "description": "Atomically acquire typed resource leases for one owner.",
+      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest. An\nexplicit emergency-recovery lease remains a deliberately exclusive\nfail-closed exception and cannot be used for non-conflict bypasses. Self-scoped\nbranch and operation keys are authoritative and reject scope manifests.",
       "effects": [
         "lease-create",
         "possible-expired-lease-reclaim"
@@ -1493,7 +1493,7 @@
     },
     {
       "category": "browser-worker",
-      "description": "Use browser-managed stored form data on one exact local origin and submit it.\n\nConfirmation must be one line containing the authorization prefix,\nworker id, canonical origin and the exact action-scope SHA-256. The result never\nreturns field contents, raw selectors, query strings or URL fragments.",
+      "description": "Use browser-managed stored form data on one exact local origin.\n\nConfirmation must be one line containing the authorization prefix,\nworker id, canonical origin and the exact action-scope SHA-256. The result never\nreturns field contents, raw selectors, query strings or URL fragments.\nReadiness mode verifies fill and clears the fields without submitting.",
       "effects": [
         "browser-input",
         "form-submit",

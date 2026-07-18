@@ -1112,6 +1112,247 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["audit"]["implicit_workspace_resource_key"], key)
         lease = tasks.resources.inspect_resource(key)
         self.assertEqual(lease["owner_id"], result["task"]["lease_owner_id"])
+        with sqlite3.connect(self.resource_database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        metadata = json.loads(row[0])
+        self.assertIs(metadata["scope_manifest_complete"], True)
+        self.assertEqual(metadata["scope_manifest"]["repository"], str(self.root))
+        self.assertEqual(metadata["scope_manifest"]["paths"], [str(self.root)])
+        self.assertEqual(
+            metadata["scope_manifest"]["task_id"], result["task"]["task_id"]
+        )
+        self.assertEqual(metadata["scope_manifest"]["head"], "0" * 40)
+        self.assertEqual(metadata["scope_manifest"]["branch"], "unversioned")
+        self.assertRegex(
+            result["audit"]["repository_scope_manifest_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_expired_implicit_repository_lease_reacquires_complete_scope(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        running = _launcher()
+        running["stdout"] = (
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
+        )
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_dispatch", side_effect=[_launcher(), running]
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 161}
+        ), patch.object(
+            tasks, "_workspace_scope_identity",
+            side_effect=[("a" * 40, "main"), ("b" * 40, "feat/changed")],
+        ) as identity:
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+            key = f"repo:{self.root}"
+            empty_json, empty_sha256 = tasks.resources._metadata({})
+            with sqlite3.connect(self.resource_database) as connection:
+                connection.execute(
+                    "UPDATE leases SET expires_at_unix=0, metadata_json=?, "
+                    "metadata_sha256=? WHERE resource_key=?",
+                    (empty_json, empty_sha256, key),
+                )
+                connection.commit()
+            status = tasks.grabowski_task_status(started["task"]["task_id"])
+
+        self.assertEqual(status["lease_maintenance"]["mode"], "reacquired")
+        with sqlite3.connect(self.resource_database) as connection:
+            metadata = json.loads(
+                connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()[0]
+            )
+        self.assertIs(metadata["scope_manifest_complete"], True)
+        self.assertIs(metadata["recovered_after_expiry"], True)
+        self.assertEqual(metadata["implicit_workspace_resource_key"], key)
+        self.assertEqual(metadata["scope_manifest"]["repository"], str(self.root))
+        self.assertEqual(metadata["scope_manifest"]["paths"], [str(self.root)])
+        self.assertEqual(metadata["scope_manifest"]["head"], "a" * 40)
+        self.assertEqual(metadata["scope_manifest"]["branch"], "main")
+        self.assertEqual(identity.call_count, 1)
+        with sqlite3.connect(self.database) as connection:
+            stored = json.loads(connection.execute(
+                "SELECT repository_scope_manifest_json FROM tasks WHERE task_id=?",
+                (started["task"]["task_id"],),
+            ).fetchone()[0])
+        self.assertEqual(stored, metadata["scope_manifest"])
+
+    def test_schema4_task_recovers_manifest_from_expired_lease_metadata(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        running = _launcher()
+        running["stdout"] = (
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
+        )
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_dispatch", side_effect=[_launcher(), running]
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 164}
+        ), patch.object(
+            tasks, "_workspace_scope_identity",
+            side_effect=[("c" * 40, "main"), ("d" * 40, "feat/changed")],
+        ) as identity:
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+            key = f"repo:{self.root}"
+            with sqlite3.connect(self.database) as connection:
+                connection.execute(
+                    "UPDATE tasks SET repository_scope_manifest_json=NULL WHERE task_id=?",
+                    (started["task"]["task_id"],),
+                )
+                connection.commit()
+            with sqlite3.connect(self.resource_database) as connection:
+                connection.execute(
+                    "UPDATE leases SET expires_at_unix=0 WHERE resource_key=?",
+                    (key,),
+                )
+                connection.commit()
+            status = tasks.grabowski_task_status(started["task"]["task_id"])
+
+        self.assertEqual(status["lease_maintenance"]["mode"], "reacquired")
+        with sqlite3.connect(self.resource_database) as connection:
+            metadata = json.loads(connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()[0])
+        self.assertEqual(metadata["scope_manifest"]["head"], "c" * 40)
+        self.assertEqual(metadata["scope_manifest"]["branch"], "main")
+        self.assertEqual(identity.call_count, 1)
+
+    def test_legacy_task_without_scope_evidence_fails_closed_on_reacquire(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        running = _launcher()
+        running["stdout"] = (
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
+        )
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_dispatch", side_effect=[_launcher(), running]
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 165}
+        ), patch.object(
+            tasks, "_workspace_scope_identity",
+            side_effect=[("e" * 40, "main"), ("f" * 40, "feat/changed")],
+        ) as identity:
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+            key = f"repo:{self.root}"
+            with sqlite3.connect(self.database) as connection:
+                connection.execute(
+                    "UPDATE tasks SET repository_scope_manifest_json=NULL WHERE task_id=?",
+                    (started["task"]["task_id"],),
+                )
+                connection.commit()
+            with sqlite3.connect(self.resource_database) as connection:
+                connection.execute("DELETE FROM leases WHERE resource_key=?", (key,))
+                connection.commit()
+            status = tasks.grabowski_task_status(started["task"]["task_id"])
+
+        self.assertFalse(status["lease_maintenance"]["maintained"])
+        self.assertEqual(status["lease_maintenance"]["mode"], "failed")
+        self.assertIn("scope manifest evidence is required", status["lease_maintenance"]["error"])
+        self.assertIsNone(tasks.resources.inspect_resource(key))
+        self.assertEqual(identity.call_count, 1)
+
+    def test_explicit_repository_task_scope_is_attested(self) -> None:
+        key = f"repo:{self.root}"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 160}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resource_keys=[key],
+            )
+        with sqlite3.connect(self.resource_database) as connection:
+            metadata = json.loads(
+                connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()[0]
+            )
+        self.assertIs(metadata["scope_manifest_complete"], True)
+        self.assertEqual(metadata["scope_manifest"]["repository"], str(self.root))
+        self.assertEqual(metadata["scope_manifest"]["paths"], [str(self.root)])
+        self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
+        self.assertRegex(
+            result["audit"]["repository_scope_manifest_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_broad_repository_task_path_with_scope_marker_is_attested(self) -> None:
+        for marker in ("branch", "operation"):
+            with self.subTest(marker=marker):
+                repository = self.root / f"repo:{marker}:literal"
+                repository.mkdir()
+                (repository / ".git").write_text("gitdir: /tmp/task-marker-repo\n")
+                key = f"repo:{repository}"
+                with patch.object(
+                    tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+                ), patch.object(
+                    tasks, "_dispatch", return_value=_launcher()
+                ), patch.object(tasks.base, "_append_audit"), patch.object(
+                    tasks, "_require_recovery_gate", return_value={"checked_at_unix": 163}
+                ):
+                    result = tasks.grabowski_task_start(
+                        "local",
+                        ["/bin/true"],
+                        cwd=str(repository),
+                        runtime_seconds=60,
+                        resource_keys=[key],
+                    )
+                with sqlite3.connect(self.resource_database) as connection:
+                    metadata = json.loads(
+                        connection.execute(
+                            "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+                        ).fetchone()[0]
+                    )
+                self.assertIs(metadata["scope_manifest_complete"], True)
+                self.assertEqual(
+                    metadata["scope_manifest"]["repository"], str(repository)
+                )
+                tasks.resources.release_resources(
+                    result["task"]["lease_owner_id"], [key]
+                )
+
+    def test_scoped_repository_task_key_binds_underlying_repository(self) -> None:
+        key = f"repo:{self.root}:branch:feat/scoped-task"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 162}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resource_keys=[key],
+            )
+        with sqlite3.connect(self.resource_database) as connection:
+            metadata = json.loads(
+                connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()[0]
+            )
+        self.assertNotIn("scope_manifest", metadata)
+        self.assertNotIn("scope_manifest_complete", metadata)
+        self.assertIsNone(result["audit"]["repository_scope_manifest_sha256"])
+        self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
 
     def test_mutating_agents_cannot_share_one_implicit_workspace(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
@@ -1628,7 +1869,7 @@ class TaskTests(unittest.TestCase):
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(tasks)")}
             indexes = {row[1] for row in migrated.execute("PRAGMA index_list(tasks)")}
             journal_mode = migrated.execute("PRAGMA journal_mode").fetchone()[0]
-        self.assertEqual(version, "4")
+        self.assertEqual(version, "5")
         self.assertIn("resource_keys_json", columns)
         self.assertIn("lease_owner_id", columns)
         self.assertIn("request_id", columns)
@@ -1642,6 +1883,7 @@ class TaskTests(unittest.TestCase):
         self.assertIn("execution_backend", columns)
         self.assertIn("systemd_scope", columns)
         self.assertIn("authoritative_unit", columns)
+        self.assertIn("repository_scope_manifest_json", columns)
         self.assertIn("tasks_state_created_task_idx", indexes)
         self.assertIn("tasks_created_task_idx", indexes)
         self.assertEqual(journal_mode, "wal")
@@ -1649,7 +1891,7 @@ class TaskTests(unittest.TestCase):
             self.assertEqual(
                 reopened.total_changes,
                 0,
-                "schema-4 fast path must not repeat migration writes",
+                "schema-5 fast path must not repeat migration writes",
             )
 
     def _promote_to_additive_schema_v4(self, *, incomplete: bool = False) -> str:
@@ -1657,6 +1899,7 @@ class TaskTests(unittest.TestCase):
         with tasks._database():
             pass
         with sqlite3.connect(self.database) as connection:
+            connection.execute("ALTER TABLE tasks DROP COLUMN repository_scope_manifest_json")
             connection.execute("ALTER TABLE tasks DROP COLUMN lifecycle_receipt_sha256")
             connection.execute("ALTER TABLE tasks DROP COLUMN terminalized_at_unix")
             connection.execute("ALTER TABLE tasks DROP COLUMN terminalization_sha256")
@@ -1694,14 +1937,18 @@ class TaskTests(unittest.TestCase):
             connection.commit()
         return task_id
 
-    def test_additive_schema_v4_preserves_terminalization_state(self) -> None:
+    def test_additive_schema_v4_migrates_and_preserves_terminalization_state(self) -> None:
         task_id = self._promote_to_additive_schema_v4()
         listed = tasks.grabowski_task_list(limit=10)
         self.assertTrue(any(item["task_id"] == task_id for item in listed["tasks"]))
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual("4", connection.execute(
+            self.assertEqual("5", connection.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()[0])
+            self.assertIn(
+                "repository_scope_manifest_json",
+                {row[1] for row in connection.execute("PRAGMA table_info(tasks)")},
+            )
             self.assertEqual(
                 ("c" * 64, 42, "e" * 64),
                 connection.execute(
@@ -1715,9 +1962,24 @@ class TaskTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "schema 4 is incomplete"):
             tasks.grabowski_task_list()
 
+    def test_schema_v4_unknown_column_fails_closed_without_version_flip(self) -> None:
+        self._promote_to_additive_schema_v4()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("ALTER TABLE tasks ADD COLUMN unknown_future_field TEXT")
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "schema 4 is incomplete or unsupported"):
+            tasks.grabowski_task_list()
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                "4",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+
     def test_unknown_task_schema_still_fails_closed(self) -> None:
         with tasks._database() as connection:
-            connection.execute("UPDATE metadata SET value='5' WHERE key='schema_version'")
+            connection.execute("UPDATE metadata SET value='6' WHERE key='schema_version'")
             connection.commit()
         with self.assertRaisesRegex(RuntimeError, "Unsupported task database schema"):
             tasks.grabowski_task_list()
@@ -1735,13 +1997,13 @@ class TaskTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "schema 3 is incomplete"):
             tasks.grabowski_task_list()
 
-    def test_schema_v4_missing_index_fails_closed_without_repair_write(self) -> None:
+    def test_schema_v5_missing_index_fails_closed_without_repair_write(self) -> None:
         with tasks._database() as connection:
             self.assertEqual(
                 connection.execute(
                     "SELECT value FROM metadata WHERE key='schema_version'"
                 ).fetchone()[0],
-                "4",
+                "5",
             )
         with sqlite3.connect(self.database) as connection:
             connection.execute("DROP INDEX tasks_created_task_idx")

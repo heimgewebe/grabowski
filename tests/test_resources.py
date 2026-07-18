@@ -1278,6 +1278,189 @@ class ResourceTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "may not be a symlink"):
             resources.list_resources()
 
+    def test_repository_scope_manifest_for_owner_reads_expired_owned_lease(self) -> None:
+        key = f"repo:{self.root}"
+        scope = self.scope_manifest(self.root, name="expired", path=self.root)
+        resources.acquire_resources(
+            "owner-a",
+            [key],
+            purpose="expired broad repository lease",
+            ttl_seconds=60,
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=0 WHERE resource_key=?", (key,)
+            )
+            connection.commit()
+        recovered = resources.repository_scope_manifest_for_owner("owner-a", key)
+        self.assertEqual(recovered, resources.nonconflict.normalize_scope_manifest(scope))
+
+    def test_repository_scope_manifest_for_owner_rejects_owner_and_hash_drift(self) -> None:
+        key = f"repo:{self.root}"
+        scope = self.scope_manifest(self.root, name="integrity", path=self.root)
+        resources.acquire_resources(
+            "owner-a",
+            [key],
+            purpose="integrity-bound broad repository lease",
+            ttl_seconds=60,
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+        )
+        with self.assertRaisesRegex(PermissionError, "another owner"):
+            resources.repository_scope_manifest_for_owner("owner-b", key)
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE leases SET metadata_json='{}' WHERE resource_key=?", (key,)
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "metadata hash"):
+            resources.repository_scope_manifest_for_owner("owner-a", key)
+
+    def test_public_tool_rejects_unscoped_repository_lease(self) -> None:
+        with patch.object(resources.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(
+                ValueError, "scope_manifest_complete=true"
+            ):
+                resources.grabowski_resource_acquire(
+                    "owner-a",
+                    [f"repo:{self.root}"],
+                    "repository work",
+                    60,
+                )
+        self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_public_tool_preserves_self_scoped_repository_lease(self) -> None:
+        (self.root / ".git").write_text("gitdir: /tmp/public-scoped-repo\n")
+        key = f"repo:{self.root}:branch:feat/scoped"
+        with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
+            resources.base, "_append_audit"
+        ):
+            result = resources.grabowski_resource_acquire(
+                "owner-a",
+                [key],
+                "scoped branch work",
+                60,
+            )
+        self.assertEqual(result["leases"][0]["resource_key"], key)
+
+    def test_scoped_repository_resource_root_scans_multiple_markers(self) -> None:
+        (self.root / ".git").write_text("gitdir: /tmp/multi-marker-repo\n")
+        key = f"repo:{self.root}:branch:feat/work:operation:deploy"
+        self.assertEqual(resources.scoped_repository_resource_root(key), str(self.root))
+
+    def test_public_tool_rejects_manifest_on_self_scoped_repository_lease(self) -> None:
+        (self.root / ".git").write_text("gitdir: /tmp/public-scoped-repo\n")
+        key = f"repo:{self.root}:branch:feat/scoped"
+        scope = self.scope_manifest(self.root, name="scoped", path=self.root)
+        with patch.object(resources.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(
+                ValueError, "scoped repository leases must not include"
+            ):
+                resources.grabowski_resource_acquire(
+                    "owner-a",
+                    [key],
+                    "scoped branch work",
+                    60,
+                    {
+                        "scope_manifest": scope,
+                        "scope_manifest_complete": True,
+                    },
+                )
+
+    def test_public_tool_treats_existing_marker_paths_as_broad(self) -> None:
+        for marker in ("branch", "operation"):
+            with self.subTest(marker=marker):
+                repository = self.root / f"repo:{marker}:literal"
+                repository.mkdir()
+                (repository / ".git").write_text("gitdir: /tmp/marker-repo\n")
+                with patch.object(resources.operator, "_require_operator_mutation"):
+                    with self.assertRaisesRegex(
+                        ValueError, "scope_manifest_complete=true"
+                    ):
+                        resources.grabowski_resource_acquire(
+                            "owner-a",
+                            [f"repo:{repository}"],
+                            "broad marker repository work",
+                            60,
+                        )
+                self.database.unlink(missing_ok=True)
+
+    def test_public_tool_rejects_manifest_for_other_scoped_repository(self) -> None:
+        (self.root / ".git").write_text("gitdir: /tmp/manifest-repo\n")
+        other = self.root / "other-scoped-repository"
+        other.mkdir()
+        (other / ".git").write_text("gitdir: /tmp/other-scoped-repo\n")
+        key = f"repo:{other}:branch:feat/scoped"
+        scope = self.scope_manifest(self.root, name="mismatch", path=self.root)
+        with patch.object(resources.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(ValueError, "scoped repository leases must not include"):
+                resources.grabowski_resource_acquire(
+                    "owner-a", [key], "mismatched scoped branch work", 60,
+                    {"scope_manifest": scope, "scope_manifest_complete": True},
+                )
+
+    def test_public_tool_accepts_complete_repository_scope(self) -> None:
+        scope = self.scope_manifest(
+            self.root,
+            name="public",
+            path=self.root,
+        )
+        with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
+            resources.base, "_append_audit"
+        ):
+            result = resources.grabowski_resource_acquire(
+                "owner-a",
+                [f"repo:{self.root}"],
+                "repository work",
+                60,
+                {
+                    "scope_manifest": scope,
+                    "scope_manifest_complete": True,
+                },
+            )
+        self.assertEqual(result["leases"][0]["resource_key"], f"repo:{self.root}")
+
+    def test_public_tool_rejects_repository_scope_identity_mismatch(self) -> None:
+        scope = self.scope_manifest(
+            self.root,
+            name="public",
+            path=self.root,
+        )
+        other = self.root.parent / "other-repository"
+        with patch.object(resources.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(
+                ValueError, "must match metadata.scope_manifest repository"
+            ):
+                resources.grabowski_resource_acquire(
+                    "owner-a",
+                    [f"repo:{other}"],
+                    "repository work",
+                    60,
+                    {
+                        "scope_manifest": scope,
+                        "scope_manifest_complete": True,
+                    },
+                )
+
+    def test_public_tool_preserves_explicit_emergency_repository_exclusion(self) -> None:
+        with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
+            resources.base, "_append_audit"
+        ):
+            result = resources.grabowski_resource_acquire(
+                "owner-a",
+                [f"repo:{self.root}"],
+                "emergency recovery",
+                60,
+                {"lease_mode": "emergency-recovery"},
+            )
+        self.assertEqual(result["leases"][0]["resource_key"], f"repo:{self.root}")
+
     def test_tool_audits_hash_only_metadata(self) -> None:
         with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
             resources.base, "_append_audit"

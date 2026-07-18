@@ -508,6 +508,7 @@ BROWSER_FORM_RESULT_CODES = {
     "post-origin",
     "protocol",
     "cleanup",
+    "ready",
 }
 BROWSER_FORM_LOCAL_V4 = tuple(
     ipaddress.ip_network(value)
@@ -524,7 +525,7 @@ const digest = (value) => crypto.createHash('sha256').update(value, 'utf8').dige
 const RESULT_CODES = new Set([
   'ok', 'target-discovery', 'target-origin', 'transport', 'element-contract',
   'identity-choice', 'browser-fill', 'submit-target', 'submit-effect',
-  'post-origin', 'protocol', 'cleanup',
+  'post-origin', 'protocol', 'cleanup', 'ready',
 ]);
 let ws = null;
 let nextId = 1;
@@ -864,6 +865,17 @@ try {
   if (!filled.identity_filled || !filled.protected_filled) throw new Error('browser-fill');
   fillConfirmed = true;
 
+  if (request.action_mode === 'readiness') {
+    stage = 'cleanup';
+    cleaned = await clearFields();
+    if (!cleaned) throw new Error('cleanup');
+    emit({
+      schema_version: 1, ok: true, result_code: 'ready', fill_confirmed: true,
+      submitted: false, action_effect_observed: false, navigation_observed: false,
+      form_disappeared: false, post_origin: request.expected_origin,
+      post_path_sha256: null, remote_address_sha256: remoteAddressSha256, cleaned: true,
+    });
+  } else {
   stage = 'submit-target';
   const before = await evaluate(`({origin: location.origin, path: location.pathname})`);
   await clickSelector('submit', 'submit-target');
@@ -919,6 +931,7 @@ try {
     cleaned,
   });
   }
+  }
 } catch (error) {
   if (!cleaned) cleaned = await clearFields();
   const message = error && typeof error.message === 'string' ? error.message : '';
@@ -952,6 +965,12 @@ def _sha256_text(value: str) -> str:
 def _validate_form_selector(value: str, label: str) -> str:
     if not isinstance(value, str) or BROWSER_FORM_SELECTOR.fullmatch(value) is None:
         raise ValueError(f"{label} must be bounded single-line selector text")
+    return value
+
+
+def _validate_form_action_mode(value: str) -> str:
+    if value not in {"submit", "readiness"}:
+        raise ValueError("action_mode must be submit or readiness")
     return value
 
 
@@ -1112,18 +1131,32 @@ def _run_node_form_action(
     ):
         raise RuntimeError("browser action receipt remote-address digest mismatch")
     cleanup_only = request.get("cleanup_only") is True
+    readiness = request.get("action_mode") == "readiness"
     if cleanup_only:
         if code != "cleanup" or payload["ok"] is not True or payload["submitted"] is not False:
             raise RuntimeError("browser cleanup receipt semantic mismatch")
     elif payload["ok"] is True:
-        if (
+        if readiness:
+            if (
+                code != "ready"
+                or payload["fill_confirmed"] is not True
+                or payload["submitted"] is not False
+                or payload["action_effect_observed"] is not False
+                or payload["navigation_observed"] is not False
+                or payload["form_disappeared"] is not False
+                or payload["post_origin"] != request.get("expected_origin")
+                or payload["post_path_sha256"] is not None
+                or payload["cleaned"] is not True
+            ):
+                raise RuntimeError("browser readiness receipt semantic mismatch")
+        elif (
             code != "ok"
             or payload["fill_confirmed"] is not True
             or payload["submitted"] is not True
             or payload["action_effect_observed"] is not True
         ):
             raise RuntimeError("browser action success receipt semantic mismatch")
-    elif code in {"ok", "cleanup"}:
+    elif code in {"ok", "ready", "cleanup"}:
         raise RuntimeError("browser action failure receipt semantic mismatch")
     if execution["returncode"] == 0 and payload["ok"] is not True:
         raise RuntimeError("browser action success exit disagrees with receipt")
@@ -1137,6 +1170,7 @@ def _browser_form_action_scope(
     origin: str,
     selectors: dict[str, str],
     identity_choice: str | None,
+    action_mode: str = "submit",
 ) -> tuple[str, dict[str, str], str | None]:
     selector_hashes = {
         key: _sha256_text(selectors[key])
@@ -1149,6 +1183,7 @@ def _browser_form_action_scope(
         "expected_origin": origin,
         "selector_sha256": selector_hashes,
         "identity_choice_sha256": choice_hash,
+        "action_mode": action_mode,
     }
     return _sha256_text(_canonical_json(scope)), selector_hashes, choice_hash
 
@@ -1166,6 +1201,7 @@ def browser_stored_form_action(
     submit_selector: str,
     confirmation: str,
     identity_choice: str | None = None,
+    action_mode: str = "submit",
     timeout_seconds: int = 15,
 ) -> dict[str, Any]:
     identifier = _validate_worker_id(worker_id)
@@ -1177,9 +1213,10 @@ def browser_stored_form_action(
         "submit": _validate_form_selector(submit_selector, "submit_selector"),
     }
     choice = _validate_identity_choice(identity_choice)
+    mode = _validate_form_action_mode(action_mode)
     origin, address_sha256, allowed_addresses = _canonical_local_origin(expected_origin)
     action_scope_sha256, selector_hashes, choice_hash = _browser_form_action_scope(
-        identifier, origin, selectors, choice
+        identifier, origin, selectors, choice, mode
     )
     expected_confirmation = _browser_form_confirmation(
         identifier, origin, action_scope_sha256
@@ -1225,6 +1262,7 @@ def browser_stored_form_action(
                 "selector_sha256": selector_hashes,
                 "identity_choice_sha256": choice_hash,
                 "confirmation_sha256": _sha256_text(confirmation),
+                "action_mode": mode,
             }
         )
         intent_record_sha256 = base._verify_audit_log(base.AUDIT_LOG)[
@@ -1247,6 +1285,7 @@ def browser_stored_form_action(
                 "expected_origin": origin,
                 "allowed_addresses": allowed_addresses,
                 "cleanup_only": False,
+                "action_mode": mode,
                 "selectors": selectors,
                 "identity_choice": choice,
                 "timeout_ms": timeout_seconds * 1000,
@@ -1309,6 +1348,7 @@ def browser_stored_form_action(
         "selector_sha256": selector_hashes,
         "identity_choice_sha256": choice_hash,
         "confirmation_sha256": _sha256_text(confirmation),
+        "action_mode": mode,
         "intent_record_sha256": intent_record_sha256,
         "result_code": payload["result_code"],
         "outcome_known": action_error is None,
@@ -1337,6 +1377,7 @@ def browser_stored_form_action(
         "action_scope_sha256": action_scope_sha256,
         "selector_sha256": selector_hashes,
         "identity_choice_sha256": choice_hash,
+        "action_mode": mode,
         "intent_record_sha256": intent_record_sha256,
         "result_code": payload["result_code"],
         "fill_confirmed": payload["fill_confirmed"],
@@ -1349,10 +1390,18 @@ def browser_stored_form_action(
         "remote_address_sha256": payload["remote_address_sha256"],
         "cleaned": payload["cleaned"],
         "audit_record_sha256": audit_sha256,
-        "does_not_establish": [
-            "authentication_success_without_target-specific readback",
-            "absence_of_server_side_effects_beyond_the_submitted_form",
-        ],
+        "does_not_establish": (
+            [
+                "authentication_success_without_target-specific readback",
+                "absence_of_server_side_effects_beyond_the_submitted_form",
+            ]
+            if mode == "submit"
+            else [
+                "authentication_success",
+                "future_submit_success",
+                "browser_profile_contains_a_reusable_stored_entry",
+            ]
+        ),
     }
 
 
@@ -1571,13 +1620,15 @@ def grabowski_browser_worker_stored_form_action(
     submit_selector: str,
     confirmation: str,
     identity_choice: str | None = None,
+    action_mode: str = "submit",
     timeout_seconds: int = 15,
 ) -> dict[str, Any]:
-    """Use browser-managed stored form data on one exact local origin and submit it.
+    """Use browser-managed stored form data on one exact local origin.
 
     Confirmation must be one line containing the authorization prefix,
     worker id, canonical origin and the exact action-scope SHA-256. The result never
     returns field contents, raw selectors, query strings or URL fragments.
+    Readiness mode verifies fill and clears the fields without submitting.
     """
     operator._require_operator_mutation("browser_worker")
     return browser_stored_form_action(
@@ -1588,6 +1639,7 @@ def grabowski_browser_worker_stored_form_action(
         submit_selector=submit_selector,
         confirmation=confirmation,
         identity_choice=identity_choice,
+        action_mode=action_mode,
         timeout_seconds=timeout_seconds,
     )
 
