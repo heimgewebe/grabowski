@@ -5,9 +5,13 @@ ConditionPathExists=%h/.local/libexec/grabowski/component_watchdog.py
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 %h/.local/libexec/grabowski/component_watchdog.py --component tunnel --service tunnel-client-grabowski.service --profile grabowski --health-url http://127.0.0.1:18080/healthz --ready-url http://127.0.0.1:18080/readyz
+ExecStart=/usr/bin/python3 %h/.local/libexec/grabowski/component_watchdog.py --component tunnel --service tunnel-client-grabowski.service --profile grabowski --health-url http://127.0.0.1:18080/healthz --ready-url http://127.0.0.1:18080/readyz --failure-threshold 3 --max-restarts 3 --restart-window 900 --backoff-base 60 --backoff-max 900
+# Exit 1 (failure observed / restart deferred) is routine evidence, not a unit
+# failure. Exits 2 (indeterminate), 3 (budget exhausted) and 4 (restart did not
+# recover) keep marking the unit failed.
 SuccessExitStatus=1
-TimeoutStartSec=45
+# Worst case: probe + systemctl restart + bounded recovery re-probe loop.
+TimeoutStartSec=90
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes

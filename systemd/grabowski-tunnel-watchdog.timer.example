@@ -5,6 +5,10 @@ Description=Run Grabowski tunnel watchdog
 OnBootSec=45s
 OnUnitActiveSec=30s
 AccuracySec=5s
+# RandomizedDelaySec only decorrelates timer firings across units. Restart
+# pacing (exponential backoff with jitter and persisted
+# next_restart_not_before) lives in component_watchdog.py; systemd 249 has no
+# RestartSteps, so the semantic watchdog carries the backoff.
 RandomizedDelaySec=3s
 Persistent=true
 Unit=grabowski-tunnel-watchdog.service

@@ -10,6 +10,10 @@ Type=simple
 EnvironmentFile=%h/.config/tunnel-client/grabowski.runtime.env
 WorkingDirectory=%h
 ExecStart=%h/.local/bin/tunnel-client run --profile grabowski
+# Restart=on-failure is the fast fallback for main-process death only. Degraded
+# but active states are the semantic watchdog's job; escalating restart pacing
+# lives there (systemd 249 has no RestartSteps). Keep RestartSec flat so this
+# unit does not carry a second, competing backoff truth.
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=30
