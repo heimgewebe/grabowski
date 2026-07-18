@@ -19,6 +19,7 @@ import grabowski_chronik as chronik
 import grabowski_privileged as privileged
 import grabowski_recovery as recovery
 import grabowski_resources as resources
+import grabowski_nonconflict as nonconflict
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
 try:
@@ -79,6 +80,10 @@ TASK_SCHEMA_V4_ADDITIVE_COLUMNS = {
     "terminalization_sha256": ("TEXT", 0, 0),
     "terminalized_at_unix": ("INTEGER", 0, 0),
     "lifecycle_receipt_sha256": ("TEXT", 0, 0),
+}
+TASK_SCHEMA_V5_ADDITIVE_COLUMNS = {
+    **TASK_SCHEMA_V4_ADDITIVE_COLUMNS,
+    "repository_scope_manifest_json": ("TEXT", 0, 0),
 }
 LEASE_MAINTENANCE_TASK_STATES = {"running", "outcome_unknown"}
 TASK_LEASE_DELEGATION_STATES = frozenset({"running"})
@@ -323,31 +328,35 @@ def _database() -> sqlite3.Connection:
         "chronik_context_json",
         "terminalization_sha256", "terminalized_at_unix",
         "lifecycle_receipt_sha256",
+        "repository_scope_manifest_json",
     }
     required_indexes = {
         "tasks_state_created_task_idx",
         "tasks_created_task_idx",
     }
-    schema3_required_columns = required_columns - {
+    schema4_required_columns = required_columns - {
+        "repository_scope_manifest_json",
+    }
+    schema3_required_columns = schema4_required_columns - {
         "terminalization_sha256",
         "terminalized_at_unix",
         "lifecycle_receipt_sha256",
     }
 
     version = schema_version()
-    if version not in {None, "1", "2", "3", "4"}:
+    if version not in {None, "1", "2", "3", "4", "5"}:
         connection.close()
         raise RuntimeError("Unsupported task database schema")
 
-    # Established schema-4 databases stay read-only here. Legacy migrations,
+    # Established schema-5 databases stay read-only here. Legacy migrations,
     # backfills, index validation and the version flip are serialized together.
-    if version != "4":
+    if version != "5":
         connection.execute("BEGIN IMMEDIATE")
         try:
             # Re-read after acquiring the writer lock because another process
             # may have completed the migration while this connection waited.
             version = schema_version()
-            if version not in {None, "1", "2", "3", "4"}:
+            if version not in {None, "1", "2", "3", "4", "5"}:
                 raise RuntimeError("Unsupported task database schema")
             if version is None:
                 if table_exists("metadata") or table_exists("tasks"):
@@ -398,18 +407,41 @@ def _database() -> sqlite3.Connection:
                         chronik_context_json TEXT,
                         terminalization_sha256 TEXT,
                         terminalized_at_unix INTEGER,
-                        lifecycle_receipt_sha256 TEXT
+                        lifecycle_receipt_sha256 TEXT,
+                        repository_scope_manifest_json TEXT
                     )
                     """
                 )
                 connection.execute(
-                    "INSERT INTO metadata(key, value) VALUES('schema_version', '4')"
+                    "INSERT INTO metadata(key, value) VALUES('schema_version', '5')"
                 )
-            elif version in {"1", "2", "3"}:
+            elif version in {"1", "2", "3", "4"}:
                 if not table_exists("metadata") or not table_exists("tasks"):
                     raise RuntimeError("Legacy task database is structurally incomplete")
                 columns = task_columns()
-                if version == "3":
+                if version == "4":
+                    schema4_shapes = {
+                        str(row["name"]): (
+                            str(row["type"]).upper(),
+                            int(row["notnull"]),
+                            int(row["pk"]),
+                        )
+                        for row in connection.execute("PRAGMA table_info(tasks)")
+                    }
+                    if set(schema4_shapes) != schema4_required_columns or any(
+                        schema4_shapes.get(name) != expected
+                        for name, expected in TASK_SCHEMA_V4_ADDITIVE_COLUMNS.items()
+                    ):
+                        raise RuntimeError(
+                            "Task database schema 4 is incomplete or unsupported"
+                        )
+                    missing_schema4_indexes = required_indexes - task_indexes()
+                    if missing_schema4_indexes:
+                        raise RuntimeError(
+                            "Task database schema 4 indexes are incomplete: "
+                            + ", ".join(sorted(missing_schema4_indexes))
+                        )
+                elif version == "3":
                     missing_schema3_columns = schema3_required_columns - columns
                     if missing_schema3_columns:
                         raise RuntimeError(
@@ -440,6 +472,7 @@ def _database() -> sqlite3.Connection:
                     ("terminalization_sha256", "TEXT"),
                     ("terminalized_at_unix", "INTEGER"),
                     ("lifecycle_receipt_sha256", "TEXT"),
+                    ("repository_scope_manifest_json", "TEXT"),
                 )
                 for name, definition in additions:
                     if name not in columns:
@@ -465,7 +498,7 @@ def _database() -> sqlite3.Connection:
                     "WHERE authoritative_unit IS NULL OR authoritative_unit=''"
                 )
                 connection.execute(
-                    "UPDATE metadata SET value='4' WHERE key='schema_version'"
+                    "UPDATE metadata SET value='5' WHERE key='schema_version'"
                 )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS tasks_state_created_task_idx "
@@ -485,31 +518,31 @@ def _database() -> sqlite3.Connection:
     if missing_columns:
         connection.close()
         raise RuntimeError(
-            "Task database schema 4 is incomplete: "
+            "Task database schema 5 is incomplete: "
             + ", ".join(sorted(missing_columns))
         )
     missing_indexes = required_indexes - task_indexes()
     if missing_indexes:
         connection.close()
         raise RuntimeError(
-            "Task database schema 4 indexes are incomplete: "
+            "Task database schema 5 indexes are incomplete: "
             + ", ".join(sorted(missing_indexes))
         )
     effective_version = schema_version()
-    if effective_version == "4":
+    if effective_version == "5":
         columns = {
             str(row["name"]): (
                 str(row["type"]).upper(), int(row["notnull"]), int(row["pk"])
             )
             for row in connection.execute("PRAGMA table_info(tasks)")
         }
-        expected_names = required_columns | set(TASK_SCHEMA_V4_ADDITIVE_COLUMNS)
+        expected_names = required_columns | set(TASK_SCHEMA_V5_ADDITIVE_COLUMNS)
         if set(columns) != expected_names or any(
             columns.get(name) != expected
-            for name, expected in TASK_SCHEMA_V4_ADDITIVE_COLUMNS.items()
+            for name, expected in TASK_SCHEMA_V5_ADDITIVE_COLUMNS.items()
         ):
             connection.close()
-            raise RuntimeError("Task database schema 4 is incomplete or unsupported")
+            raise RuntimeError("Task database schema 5 is incomplete or unsupported")
     try:
         os.chmod(TASK_DB, 0o600)
     except FileNotFoundError:
@@ -773,24 +806,26 @@ def _whole_repository_scope_manifest(
         raise ValueError("repository resource must use repo:<absolute-path> syntax")
     workspace = resource_key.removeprefix("repo:")
     head, branch = _workspace_scope_identity(workspace)
-    return {
-        "schema_version": 1,
-        "repository": workspace,
-        "task_id": task_id,
-        "base_head": head,
-        "head": head,
-        "branch": branch,
-        "worktree": workspace,
-        "effects": ["write"],
-        "paths": [workspace],
-        "components": [],
-        "runtime_resources": [],
-        "processes": [],
-        "deployments": [],
-        "migrations": [],
-        "generated_artifacts": [],
-        "shared_gates": [],
-    }
+    return nonconflict.normalize_scope_manifest(
+        {
+            "schema_version": 1,
+            "repository": workspace,
+            "task_id": task_id,
+            "base_head": head,
+            "head": head,
+            "branch": branch,
+            "worktree": workspace,
+            "effects": ["write"],
+            "paths": [workspace],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+    )
 
 
 def _task_repository_resource(resource_keys: list[str]) -> str | None:
@@ -798,7 +833,7 @@ def _task_repository_resource(resource_keys: list[str]) -> str | None:
         key
         for key in resource_keys
         if key.startswith("repo:")
-        and resources._scoped_repository_resource_root(key) is None
+        and resources.scoped_repository_resource_root(key) is None
     ]
     if not broad_repository_keys:
         return None
@@ -822,6 +857,32 @@ def _record_implicit_workspace_resource(
     return repository_resource if candidate == repository_resource else None
 
 
+def _record_repository_scope_manifest(
+    record: dict[str, Any], repository_resource: str | None
+) -> dict[str, Any] | None:
+    raw = record.get("repository_scope_manifest_json")
+    if raw is None or raw == "":
+        if repository_resource is None:
+            return None
+        return resources.repository_scope_manifest_for_owner(
+            str(record.get("lease_owner_id") or _lease_owner(record["task_id"])),
+            repository_resource,
+        )
+    if repository_resource is None:
+        raise RuntimeError(
+            "stored repository scope manifest has no broad repository resource"
+        )
+    try:
+        manifest = nonconflict.normalize_scope_manifest(json.loads(str(raw)))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("stored repository scope manifest is invalid") from exc
+    if f"repo:{manifest['repository']}" != repository_resource:
+        raise RuntimeError(
+            "stored repository scope manifest does not match repository resource"
+        )
+    return manifest
+
+
 def _task_lease_metadata(
     *,
     task_id: str,
@@ -829,6 +890,7 @@ def _task_lease_metadata(
     attempt: int,
     repository_resource: str | None,
     implicit_workspace_resource: str | None,
+    repository_scope_manifest: dict[str, Any] | None = None,
     recovered_after_expiry: bool = False,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
@@ -840,9 +902,14 @@ def _task_lease_metadata(
     if recovered_after_expiry:
         metadata["recovered_after_expiry"] = True
     if repository_resource is not None:
-        metadata["scope_manifest"] = _whole_repository_scope_manifest(
-            repository_resource, task_id
-        )
+        if repository_scope_manifest is None:
+            raise RuntimeError(
+                "repository scope manifest evidence is required for repository lease"
+            )
+        manifest = nonconflict.normalize_scope_manifest(repository_scope_manifest)
+        if f"repo:{manifest['repository']}" != repository_resource:
+            raise ValueError("repository scope manifest must match repository resource")
+        metadata["scope_manifest"] = manifest
         metadata["scope_manifest_complete"] = True
     return metadata
 
@@ -940,6 +1007,9 @@ def _maintain_record_resources(
             implicit_workspace_resource = _record_implicit_workspace_resource(
                 record, repository_resource
             )
+            repository_scope_manifest = _record_repository_scope_manifest(
+                record, repository_resource
+            )
             acquired = resources.acquire_resources(
                 owner,
                 keys,
@@ -951,6 +1021,7 @@ def _maintain_record_resources(
                     attempt=int(record["attempt"]),
                     repository_resource=repository_resource,
                     implicit_workspace_resource=implicit_workspace_resource,
+                    repository_scope_manifest=repository_scope_manifest,
                     recovered_after_expiry=True,
                 ),
             )
@@ -1693,6 +1764,12 @@ def grabowski_task_start(
     )
     task_id = uuid.uuid4().hex[:24]
     lease_owner = _lease_owner(task_id)
+    repository_resource = _task_repository_resource(task_resources)
+    repository_scope_manifest = (
+        _whole_repository_scope_manifest(repository_resource, task_id)
+        if repository_resource is not None
+        else None
+    )
     execution_backend, systemd_scope = _execution_contract(target, command)
     if (
         execution_backend == "systemd-root-broker"
@@ -1739,10 +1816,14 @@ def grabowski_task_start(
         "chronik_outbox_enabled": chronik_enabled,
         "chronik_outbox_state_root": chronik_state_root,
         "chronik_context_json": chronik_context_json,
+        "repository_scope_manifest_json": (
+            _canonical_json(repository_scope_manifest)
+            if repository_scope_manifest is not None
+            else None
+        ),
     }
     lease_result = None
     lease_metadata = None
-    repository_resource = _task_repository_resource(task_resources)
     if task_resources:
         lease_metadata = _task_lease_metadata(
             task_id=task_id,
@@ -1750,6 +1831,7 @@ def grabowski_task_start(
             attempt=attempt,
             repository_resource=repository_resource,
             implicit_workspace_resource=implicit_workspace_resource,
+            repository_scope_manifest=repository_scope_manifest,
         )
         lease_result = resources.acquire_resources(
             lease_owner,
@@ -1773,7 +1855,7 @@ def grabowski_task_start(
                 last_observation_json, resource_keys_json, lease_owner_id,
                 execution_backend, systemd_scope, authoritative_unit,
                 chronik_outbox_enabled, chronik_outbox_state_root,
-                chronik_context_json
+                chronik_context_json, repository_scope_manifest_json
             ) VALUES(
                 :task_id, :host, :unit, :attempt, :state, :resume_policy,
                 :argv_json, :argv_sha256, :cwd, :runtime_seconds,
@@ -1782,7 +1864,7 @@ def grabowski_task_start(
                 :last_observation_json, :resource_keys_json, :lease_owner_id,
                 :execution_backend, :systemd_scope, :authoritative_unit,
                 :chronik_outbox_enabled, :chronik_outbox_state_root,
-                :chronik_context_json
+                :chronik_context_json, :repository_scope_manifest_json
             )
             """,
                 record,

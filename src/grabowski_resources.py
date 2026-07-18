@@ -389,6 +389,34 @@ def _scope_manifest_from_metadata(metadata: dict[str, Any], *, required: bool) -
     return nonconflict.normalize_scope_manifest(value)
 
 
+def repository_scope_manifest_for_owner(
+    owner_id: str, resource_key: str
+) -> dict[str, Any] | None:
+    """Read one owner-bound broad repository manifest, including after expiry."""
+    owner = _owner(owner_id)
+    key = normalize_resource_key(resource_key)
+    if not key.startswith("repo:") or scoped_repository_resource_root(key) is not None:
+        raise ValueError("resource_key must be one broad repository lease")
+    with _database() as connection:
+        row = connection.execute(
+            "SELECT * FROM leases WHERE resource_key=?", (key,)
+        ).fetchone()
+    if row is None:
+        return None
+    if row["owner_id"] != owner:
+        raise PermissionError("repository lease is owned by another owner")
+    metadata = _row_metadata(row)
+    _, observed_metadata_sha256 = _metadata(metadata)
+    if row["metadata_sha256"] != observed_metadata_sha256:
+        raise RuntimeError("repository lease metadata hash does not match")
+    manifest = _scope_manifest_from_metadata(metadata, required=False)
+    if manifest is None:
+        return None
+    if f"repo:{manifest['repository']}" != key:
+        raise RuntimeError("repository lease scope does not match resource key")
+    return manifest
+
+
 def _path_is_within_repository(resource_key: str, repository: str) -> bool:
     if not resource_key.startswith("path:"):
         return False
@@ -2703,7 +2731,7 @@ def grabowski_resource_reconcile_obsolete_path_leases(
     return result
 
 
-def _scoped_repository_resource_root(resource_key: str) -> str | None:
+def scoped_repository_resource_root(resource_key: str) -> str | None:
     """Return an existing Git root for one unambiguous scoped repo key.
 
     Repository paths may themselves contain ``:branch:`` or ``:operation:``.
@@ -2732,7 +2760,7 @@ def _scoped_repository_resource_root(resource_key: str) -> str | None:
                 and os.path.lexists(os.path.join(repository, ".git"))
             ):
                 candidates.add(repository)
-            start = index + 1
+            start = index + len(marker)
     return next(iter(candidates)) if len(candidates) == 1 else None
 
 
@@ -2757,12 +2785,17 @@ def _public_repository_scope_keys(
     scoped_repository_keys: list[str] = []
     broad_repository_keys: list[str] = []
     for key in repository_keys:
-        if scope is not None:
-            binding = _repository_resource_scope(key, repository=scope["repository"])
-            if binding is not None and binding["scope_kind"] in {"branch", "operation"}:
-                scoped_repository_keys.append(key)
-                continue
-        elif _scoped_repository_resource_root(key) is not None:
+        binding = (
+            _repository_resource_scope(key, repository=scope["repository"])
+            if scope is not None
+            else None
+        )
+        manifest_scoped = (
+            binding is not None
+            and binding["scope_kind"] in {"branch", "operation"}
+        )
+        filesystem_scoped = scoped_repository_resource_root(key) is not None
+        if manifest_scoped or filesystem_scoped:
             scoped_repository_keys.append(key)
             continue
         broad_repository_keys.append(key)
