@@ -21,6 +21,15 @@
       ],
       "timeout_seconds": 30
     },
+    "observe_process_references": {
+      "enabled": true,
+      "target_pattern": "\\{.{1,49152}\\}",
+      "argv": [
+        "/usr/local/libexec/grabowski-process-reference-observer",
+        "{target}"
+      ],
+      "timeout_seconds": 30
+    },
     "publish_recovery_marker": {
       "enabled": true,
       "mode": "recovery-marker-publish",

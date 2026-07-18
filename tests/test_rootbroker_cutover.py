@@ -103,6 +103,7 @@ def _example_config_text() -> str:
                 cutover.PUBLISH_ACTION: _canonical_publisher(),
                 cutover.BLOCKADE_LIFECYCLE_ACTION: _lifecycle(),
                 cutover.ROOT_TASK_ACTION: _root_task_action(),
+                cutover.PROCESS_OBSERVER_ACTION: _bound_action(cutover.PROCESS_OBSERVER_ACTION),
             },
         },
         sort_keys=True,

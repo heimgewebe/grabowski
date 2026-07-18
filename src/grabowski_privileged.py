@@ -105,6 +105,17 @@ def grabowski_privileged_broker_status() -> dict[str, Any]:
 
 POWER_ACTION = "operator_power_argv"
 RECOVERY_PUBLISH_ACTION = "publish_recovery_marker"
+PROCESS_REFERENCE_ACTION = "observe_process_references"
+PROCESS_REFERENCE_KIND = "grabowski_process_reference_observation"
+PROCESS_REFERENCE_ALLOWED_ROOTS = (
+    Path("/home/alex/repos/.weltgewebe-worktrees"),
+    Path("/home/alex/worktrees"),
+    Path("/home/alex/repos/.semantah-worktrees"),
+    Path("/home/alex/repos/.heimlern-worktrees"),
+    Path("/home/alex/repos/.operator-redundancy-worktrees"),
+    Path("/home/alex/repos/.hauski-worktrees"),
+    Path("/home/alex/repos/.worktree-target-quarantine"),
+)
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_SYSTEMD_ACTION = "operator_root_task_systemd_unit"
 POWER_REFERENCE_TTL_SECONDS = 900
@@ -608,6 +619,174 @@ def run_blockade_lifecycle_reference(
         "lifecycle": lifecycle,
         "stderr": stderr,
     }
+
+
+def _normalize_process_reference_roots(roots: list[str]) -> list[str]:
+    if not isinstance(roots, list) or not 1 <= len(roots) <= 256:
+        raise ValueError("roots must be a non-empty bounded list")
+    allowed = PROCESS_REFERENCE_ALLOWED_ROOTS
+    normalized: list[str] = []
+    for raw in roots:
+        if not isinstance(raw, str) or not raw or "\x00" in raw:
+            raise ValueError("root must be a non-empty path")
+        path = Path(raw)
+        if not path.is_absolute() or os.path.normpath(raw) != raw:
+            raise ValueError("root must be canonical and absolute")
+        if path.resolve(strict=True) != path or path.is_symlink() or not path.is_dir():
+            raise ValueError("root must be a canonical non-symlink directory")
+        if not any(os.path.commonpath((str(path), str(prefix))) == str(prefix) for prefix in allowed):
+            raise ValueError("root is outside the allowed prefixes")
+        normalized.append(str(path))
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("roots must not contain duplicates")
+    return sorted(normalized)
+
+
+def _validate_process_reference_observation(
+    value: Any,
+    *,
+    roots: list[str],
+    target_uid: int,
+    max_processes: int,
+    max_file_descriptors: int,
+) -> dict[str, Any]:
+    required = {
+        "kind", "schema_version", "complete", "target_uid", "roots",
+        "process_count", "open_file_descriptors_checked", "path_references",
+        "errors", "observation_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise RuntimeError("process reference observation keys are invalid")
+    digest = value.get("observation_sha256")
+    material = dict(value)
+    material.pop("observation_sha256", None)
+    if not isinstance(digest, str) or digest != _canonical_sha256(material):
+        raise RuntimeError("process reference observation hash is invalid")
+    if value.get("kind") != PROCESS_REFERENCE_KIND or value.get("schema_version") != 1:
+        raise RuntimeError("process reference observation contract is invalid")
+    if value.get("target_uid") != target_uid or value.get("roots") != roots:
+        raise RuntimeError("process reference observation request binding is invalid")
+    if not isinstance(value.get("complete"), bool):
+        raise RuntimeError("process reference observation completeness is invalid")
+    process_count = value.get("process_count")
+    fd_count = value.get("open_file_descriptors_checked")
+    if isinstance(process_count, bool) or not isinstance(process_count, int) or not 0 <= process_count <= max_processes:
+        raise RuntimeError("process reference observation process count is invalid")
+    if isinstance(fd_count, bool) or not isinstance(fd_count, int) or not 0 <= fd_count <= max_file_descriptors:
+        raise RuntimeError("process reference observation descriptor count is invalid")
+    errors = value.get("errors")
+    if not isinstance(errors, list) or errors != sorted(set(errors)) or not all(isinstance(item, str) and item for item in errors):
+        raise RuntimeError("process reference observation errors are invalid")
+    if value["complete"] != (errors == []):
+        raise RuntimeError("process reference observation completeness contradicts errors")
+    references = value.get("path_references")
+    if not isinstance(references, list) or len(references) > 64:
+        raise RuntimeError("process reference observation references are invalid")
+    normalized_refs: list[tuple[int, int, str, str, str]] = []
+    for item in references:
+        if not isinstance(item, dict) or set(item) != {"pid", "uid", "kind", "root", "path"}:
+            raise RuntimeError("process reference item is invalid")
+        pid, uid = item["pid"], item["uid"]
+        kind, root, path = item["kind"], item["root"], item["path"]
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise RuntimeError("process reference pid is invalid")
+        if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
+            raise RuntimeError("process reference uid is invalid")
+        if kind not in {"cwd", "exe", "root", "fd"} or root not in roots:
+            raise RuntimeError("process reference classification is invalid")
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise RuntimeError("process reference path is invalid")
+        try:
+            if os.path.commonpath((path, root)) != root:
+                raise RuntimeError("process reference path escapes its root")
+        except ValueError as exc:
+            raise RuntimeError("process reference path is invalid") from exc
+        normalized_refs.append((pid, uid, kind, root, path))
+    if normalized_refs != sorted(set(normalized_refs)):
+        raise RuntimeError("process reference observations are not stable and unique")
+    return value
+
+
+def observe_process_references(
+    roots: list[str],
+    *,
+    target_uid: int,
+    max_processes: int = 4096,
+    max_file_descriptors: int = 32768,
+) -> dict[str, Any]:
+    normalized_roots = _normalize_process_reference_roots(roots)
+    if isinstance(target_uid, bool) or not isinstance(target_uid, int) or target_uid != os.getuid():
+        raise ValueError("target_uid must match the requesting workstation owner")
+    if isinstance(max_processes, bool) or not isinstance(max_processes, int) or not 1 <= max_processes <= 65536:
+        raise ValueError("max_processes is invalid")
+    if isinstance(max_file_descriptors, bool) or not isinstance(max_file_descriptors, int) or not 1 <= max_file_descriptors <= 1_000_000:
+        raise ValueError("max_file_descriptors is invalid")
+    broker = grabowski_privileged_broker_status()
+    if not broker.get("ready"):
+        raise PermissionError("privileged broker is not ready")
+    target = json.dumps(
+        {
+            "schema_version": 1,
+            "target_uid": target_uid,
+            "roots": normalized_roots,
+            "max_processes": max_processes,
+            "max_file_descriptors": max_file_descriptors,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    reference = _create_privileged_reference(
+        action=PROCESS_REFERENCE_ACTION,
+        target=target,
+        justification="Observe bounded process path references before worktree target maintenance",
+    )
+    reference_path = _write_power_reference(reference)
+    try:
+        completed = subprocess.run(
+            [str(broker["request_client"]), str(reference_path)],
+            cwd="/",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=45,
+            check=False,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        )
+    finally:
+        reference_path.unlink(missing_ok=True)
+    if completed.returncode != 0:
+        raise RuntimeError("process reference broker request failed")
+    try:
+        outer = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("process reference broker response is invalid") from exc
+    if not isinstance(outer, dict) or outer.get("returncode") != 0 or outer.get("timed_out") is not False:
+        raise RuntimeError("process reference broker execution failed")
+    inner_raw = outer.get("stdout")
+    if not isinstance(inner_raw, str):
+        raise RuntimeError("process reference broker omitted observer output")
+    try:
+        inner = json.loads(inner_raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("process reference observer output is invalid") from exc
+    observation = _validate_process_reference_observation(
+        inner,
+        roots=normalized_roots,
+        target_uid=target_uid,
+        max_processes=max_processes,
+        max_file_descriptors=max_file_descriptors,
+    )
+    _append_operator_audit({
+        "tool": "observe_process_references",
+        "action": PROCESS_REFERENCE_ACTION,
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+        "observation_sha256": observation["observation_sha256"],
+        "complete": observation["complete"],
+        "reference_count": len(observation["path_references"]),
+    })
+    return observation
 
 
 @mcp.tool(name="grabowski_power_run", annotations=MUTATING)
