@@ -273,6 +273,38 @@ class RepositoryContractTests(unittest.TestCase):
             )
         self.assertEqual(grip_imports - deployed_modules, set())
 
+    def test_runtime_supporting_source_imports_are_in_deployment_source_set(
+        self,
+    ) -> None:
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        deployed_modules = {
+            contract["module"],
+            *(item["module"] for item in contract["supporting_sources"]),
+        }
+        missing: dict[str, list[str]] = {}
+        for item in contract["supporting_sources"]:
+            module = item["module"]
+            tree = ast.parse((ROOT / item["source"]).read_text(encoding="utf-8"))
+            imports: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    candidates = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    candidates = [node.module or ""]
+                else:
+                    continue
+                imports.update(
+                    candidate.split(".", 1)[0]
+                    for candidate in candidates
+                    if candidate.startswith("grabowski_")
+                )
+            absent = sorted(imports - deployed_modules)
+            if absent:
+                missing[module] = absent
+        self.assertEqual({}, missing)
+
     def test_bureau_intake_adapter_is_loaded_and_packaged(self) -> None:
         runtime = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -309,19 +341,17 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("pyyaml==6.0.3", lock_text)
         self.assertIn("--hash=sha256:", lock_text)
 
-    def test_merges_is_explicitly_read_only(self) -> None:
+    def test_repoground_publication_roots_are_explicitly_read_only(self) -> None:
         policy = json.loads(
             (ROOT / "config" / "access.example.json").read_text(encoding="utf-8")
         )
-        self.assertIn(
+        protected = {
             "${HOME}/repos/merges",
-            policy["write_excluded_roots"],
-        )
+            "${HOME}/repos/manifest-publications",
+        }
+        self.assertTrue(protected <= set(policy["write_excluded_roots"]))
         for profile in policy["profiles"].values():
-            self.assertIn(
-                "${HOME}/repos/merges",
-                profile["write_excluded_roots"],
-            )
+            self.assertTrue(protected <= set(profile["write_excluded_roots"]))
 
     def test_access_profiles_and_capabilities_are_explicit(self) -> None:
         policy = json.loads(
