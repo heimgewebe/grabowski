@@ -42,14 +42,49 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertNotIn("BindsTo=", text)
         self.assertNotIn("PartOf=", text)
 
-    def test_watchdogs_run_every_thirty_seconds(self) -> None:
+    def test_watchdog_cadence_matches_probe_cost(self) -> None:
+        operator = (
+            ROOT / "systemd" / "grabowski-operator-watchdog.timer.example"
+        ).read_text(encoding="utf-8")
+        tunnel = (
+            ROOT / "systemd" / "grabowski-tunnel-watchdog.timer.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn("OnUnitActiveSec=60s", operator)
+        self.assertIn("OnUnitActiveSec=30s", tunnel)
+        self.assertIn("Persistent=true", operator)
+        self.assertIn("Persistent=true", tunnel)
+
+    def test_component_watchdogs_are_productive_not_advisory(self) -> None:
+        for name in (
+            "grabowski-operator-watchdog.service.example",
+            "grabowski-tunnel-watchdog.service.example",
+        ):
+            text = (ROOT / "systemd" / name).read_text(encoding="utf-8")
+            self.assertNotIn("--check-only", text)
+            self.assertIn("SuccessExitStatus=1", text)
+            self.assertIn("TimeoutStartSec=90", text)
+            self.assertIn("--failure-threshold 3", text)
+            self.assertIn("--max-restarts 3", text)
+            self.assertIn("--restart-window 900", text)
+            self.assertIn("--backoff-base 60", text)
+            self.assertIn("--backoff-max 900", text)
+        operator = (
+            ROOT / "systemd" / "grabowski-operator-watchdog.service.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1", operator)
+        self.assertNotIn("--mcp-url", operator)
+
+    def test_timers_keep_decorrelation_while_watchdog_owns_backoff(self) -> None:
         for name in (
             "grabowski-operator-watchdog.timer.example",
             "grabowski-tunnel-watchdog.timer.example",
         ):
             text = (ROOT / "systemd" / name).read_text(encoding="utf-8")
-            self.assertIn("OnUnitActiveSec=30s", text)
-            self.assertIn("Persistent=true", text)
+            self.assertIn("RandomizedDelaySec=3s", text)
+            # systemd 249 has no RestartSteps; backoff lives in the watchdog.
+            self.assertNotIn("RestartSteps", "".join(
+                line for line in text.splitlines() if not line.startswith("#")
+            ))
 
 
 if __name__ == "__main__":

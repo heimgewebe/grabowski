@@ -1,3 +1,6 @@
+# Mirrors the start-limit budget of the versioned unit for installs whose base
+# unit predates it. Values must stay identical to
+# tunnel-client-grabowski.service.example so there is exactly one budget truth.
 [Unit]
 StartLimitIntervalSec=5min
 StartLimitBurst=5

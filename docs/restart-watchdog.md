@@ -46,6 +46,144 @@ Ein inaktiver Dienst wird absichtlich nicht durch den semantischen Wächter
 wiederbelebt. Dadurch bleibt ein manueller `systemctl --user stop` wirksam.
 Der Tod des Hauptprozesses bleibt Aufgabe von `Restart=on-failure`.
 
+## Komponenten-Watchdogs: Operator- und Tunnel-Härtung
+
+Neben dem kombinierten Wächter (`tools/watchdog_runtime.py`) existieren zwei
+getrennte Komponenten-Watchdogs auf Basis von `tools/component_watchdog.py`:
+`grabowski-operator-watchdog` und `grabowski-tunnel-watchdog`. Jeder startet
+ausschließlich seinen eigenen Dienst neu.
+
+### Vollständiger read-only MCP-Lebenszyklus (Operator)
+
+Der Operator-Probe erzeugt **keine zweite Sitzung am stateful Live-HTTP-Port**.
+Eine solche konkurrierende Initialisierung kann am Sitzungs-Erzeugungslock des
+MCP-Servers blockieren und den zu prüfenden Pfad selbst verschlechtern.
+Stattdessen kombiniert der Watchdog zwei getrennte Belege:
+
+1. Der laufende `grabowski-operator.service`, seine MainPID, sein Listener und
+   die Bindung an die erwartete deployte Runtime werden geprüft.
+2. Aus genau dieser Runtime wird ein isolierter, kurzlebiger
+   `grabowski_operator --transport stdio`-Prozess gestartet.
+3. Über newline-gerahmtes JSON-RPC läuft der vollständige MCP-Lebenszyklus:
+   `initialize`, `notifications/initialized`, danach `tools/call` mit exakt
+   `grabowski_runtime_health` und leeren Argumenten. `tools/list` findet nicht
+   statt und ist kein Ersatz für den echten Toolaufruf.
+4. Akzeptiert werden nur eine formgültige Initialize-Antwort, ein boolesches
+   `isError` ungleich `true` und ein Tool-Payload mit `healthy: true`.
+   `healthy: false` wird als `mcp-runtime-unhealthy` sichtbar, führt aber als
+   `indeterminate` nicht zu einer Operator-Restart-Schleife.
+5. stdin wird anschließend geschlossen; der Kindprozess muss innerhalb des
+   begrenzten Shutdown-Fensters sauber enden. Andernfalls wird er zuerst mit
+   TERM, danach nötigenfalls mit KILL beendet und der Probe bleibt fehlgeschlagen.
+
+Grenzen: ein gemeinsamer Lebenszyklus-Timeout (`--http-timeout`, historischer
+Kompatibilitätsname; Standard 2 s), maximal 64 KiB stdout-Protokollantwort,
+kein Netzwerkzugriff des Probes und keine Zielmutation. stderr des isolierten
+Kindprozesses wird verworfen, damit es weder den JSON-RPC-Kanal beschädigt noch
+einen Pipe-Stau erzeugt. `PYTHONDONTWRITEBYTECODE=1` verhindert Schreibnebenwirkungen
+im deployten Runtime-Baum.
+
+Der Probe belegt damit Live-Prozessidentität sowie die Start-, Protokoll- und
+Toolfähigkeit derselben deployten Runtime. Er belegt ausdrücklich **nicht**,
+dass eine neue HTTP-MCP-Sitzung parallel zum produktiven Connector eröffnet
+werden kann. Genau diese Nichtstörung erlaubt eine produktive Watchdog-Unit;
+`--check-only` bleibt für manuelle Diagnose verfügbar.
+
+### Backoff mit Jitter und persistenter Sperrzeit
+
+Failure-Threshold (3 aufeinanderfolgende Fehlmessungen) und Restart-Budget
+(3 Neustarts pro 15 Minuten) bleiben unverändert fail-closed und werden vor
+dem Backoff geprüft. Zusätzlich trägt der State einen begrenzten
+exponentiellen Restart-Backoff:
+
+- Nach jedem Watchdog-Neustart steigt `backoff_level`; die nominale
+  Verzögerung ist `backoff_base * 2^(level-1)` (Standard 60 s Basis), darauf
+  kommen bis zu 20 % Jitter aus einer injizierbaren, deterministisch testbaren
+  Quelle. Das Endergebnis wird hart auf `backoff_max` begrenzt (Standard
+  900 s); Jitter kann die Obergrenze nicht überschreiten.
+- `next_restart_not_before` wird als absoluter Unix-Zeitstempel persistiert.
+  Es gibt keine Schlafschleife: fällig ist der nächste Neustart erst, wenn ein
+  späterer Timerlauf den Zeitpunkt überschritten hat; vorher endet der Lauf
+  mit dem Ereignis `restart_deferred`.
+- Ein gesunder Lauf setzt Fehlerserie und Backoff zurück;
+  `restart_generation` bleibt als monotone lokale Watchdog-Neustartnummer
+  erhalten. Sie ist ausdrücklich keine Tunnel-Verbindungs- oder
+  MCP-Sitzungsgeneration.
+- Alte State-Dateien ohne Backoff-Felder werden sicher gelesen (Felder
+  defaulten zu 0); formwidrige Werte führen fail-closed zu
+  `invalid-state-shape` ohne Neustart.
+
+Backoff- und lokale Restart-Evidenz erscheint in den JSON-Ereignissen
+`restarting`, `restart_deferred`, `recovered`, `restart_unhealthy`,
+`restart_budget_exhausted` und `healthy` (`backoff_level`,
+`next_restart_not_before`, `restart_generation`).
+
+### Arbeitsteilung mit systemd 249
+
+systemd 249 kennt kein `RestartSteps`; eskalierendes Restart-Pacing kann dort
+nicht deklariert werden. Die Aufteilung ist deshalb:
+
+- `Restart=on-failure` mit flachem `RestartSec=5` bleibt der schnelle
+  Fallback ausschließlich für den Tod des Hauptprozesses. Die Unit trägt
+  bewusst keine zweite, konkurrierende Backoff-Wahrheit.
+- `StartLimitIntervalSec`/`StartLimitBurst` begrenzen Startschleifen; das
+  Drop-in `80-restart-budget.conf` spiegelt exakt die Werte der versionierten
+  Unit (eine Budget-Wahrheit).
+- `RandomizedDelaySec=3s` in den Timern bleibt reine äußere Entkopplung der
+  Timerläufe; der semantische Watchdog trägt den eigentlichen Backoff. Der
+  leichte Tunnelcheck läuft alle 30 s, der rund 0,8 s teure stdio-Operatorcheck
+  alle 60 s, um unnötige Prozess- und Importlast zu halbieren.
+- `SuccessExitStatus=1` wertet Routine-Evidenz (Fehlmessung, aufgeschobener
+  Neustart) nicht als Unit-Fehler; Exit 2/3/4 (indeterminate, Budget
+  erschöpft, Neustart ohne Genesung) bleiben sichtbare Fehler.
+  `TimeoutStartSec=90` deckt den ungünstigsten Pfad Probe + Neustart +
+  begrenzte Genesungsprüfung ab.
+
+### Geltungsbereich und Grenzen
+
+Die beiden Komponentenprüfungen liefern getrennte lokale Belege:
+Der Tunnel-Watchdog prüft dessen `/healthz` und `/readyz`; der
+Operator-Watchdog prüft Live-Prozess/Listener und ruft das Read-Tool
+`grabowski_runtime_health` in einem isolierten stdio-MCP-Prozess aus derselben
+deployten Runtime auf. Das beweist weder den produktiven HTTP-Sitzungspfad noch
+einen durchgängigen Pfad Tunnel → Operator oder den
+ChatGPT-Control-Plane-Roundtrip.
+
+Connection-Generation, das Verwerfen veralteter Antworten und die
+Neuerkennung des Tool-Katalogs durch den Client liegen außerhalb dieses
+Repositories. Der Probe selbst führt keine Zielmutation aus. Der produktive
+Watchdog besitzt als eng begrenzte Eingriffsautorität ausschließlich
+`systemctl --user restart` für genau seine eigene Komponente.
+
+### Installation der Komponenten-Watchdogs
+
+```bash
+install -m 0700 \
+  tools/component_watchdog.py \
+  "$HOME/.local/libexec/grabowski/component_watchdog.py"
+
+install -m 0600 \
+  systemd/grabowski-operator-watchdog.service.example \
+  "$HOME/.config/systemd/user/grabowski-operator-watchdog.service"
+install -m 0600 \
+  systemd/grabowski-operator-watchdog.timer.example \
+  "$HOME/.config/systemd/user/grabowski-operator-watchdog.timer"
+install -m 0600 \
+  systemd/grabowski-tunnel-watchdog.service.example \
+  "$HOME/.config/systemd/user/grabowski-tunnel-watchdog.service"
+install -m 0600 \
+  systemd/grabowski-tunnel-watchdog.timer.example \
+  "$HOME/.config/systemd/user/grabowski-tunnel-watchdog.timer"
+
+systemctl --user daemon-reload
+systemctl --user enable --now \
+  grabowski-operator-watchdog.timer grabowski-tunnel-watchdog.timer
+```
+
+Die State-Dateien liegen unter
+`~/.local/state/grabowski/<component>-watchdog-state.json` und enthalten nur
+Zähler und Unix-Zeitstempel.
+
 ## Deployment-Koordination
 
 Der Wächter hält während Prüfung und möglichem Neustart einen Shared-Lock auf
@@ -117,11 +255,11 @@ Ein gesunder Lauf erzeugt ein einzelnes JSON-Ereignis
 `grabowski.watchdog.healthy`. Ein fehlender Operator ist auch bei grünen HTTP-
 Endpunkten `unhealthy`.
 
-Der produktive End-to-End-Test am 25. Juni 2026 bestätigte die gesamte Kette:
-Nach dem gezielten Tod des Operators meldeten zwei Timerläufe
-`failure-observed`; der dritte Lauf startete den Dienst neu. Nach 85 Sekunden
-liefen eine neue Tunnel-MainPID und eine neue Operator-PID. Der unabhängige
-Fallback-Restart wurde nicht benötigt.
+Der produktive Restart-Integrationstest am 25. Juni 2026 bestätigte den
+damaligen lokalen Wiederanlaufvertrag: Nach dem gezielten Tod des Operators
+meldeten zwei Timerläufe `failure-observed`; der dritte Lauf startete den
+Dienst neu. Nach 85 Sekunden liefen eine neue Tunnel-MainPID und eine neue
+Operator-PID. Das war kein Beleg für einen ChatGPT-Control-Plane-Roundtrip.
 
 ## Wartung und Rollback
 
