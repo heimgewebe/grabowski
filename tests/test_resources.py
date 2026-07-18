@@ -1425,6 +1425,18 @@ class ResourceTests(unittest.TestCase):
         self.assertFalse(inventory["write_compatible"])
         self.assertFalse(inventory["mutation_performed"])
         self.assertEqual(
+            "supported_with_exclusive_migration",
+            inventory["rolling_upgrade"][
+                "current_runtime_supported_older_store"
+            ],
+        )
+        self.assertEqual(
+            "unsupported_require_full_runtime_drain",
+            inventory["rolling_upgrade"][
+                "pre_t062_runtime_overlap_with_future_schema"
+            ],
+        )
+        self.assertEqual(
             [{
                 "from": "1",
                 "to": "2",
@@ -1515,6 +1527,18 @@ class ResourceTests(unittest.TestCase):
             self.assertEqual("unsupported_future", inventory["status"])
             self.assertFalse(inventory["write_compatible"])
             self.assertFalse(inventory["mutation_performed"])
+            self.assertEqual(
+                "fail_closed_without_mutation",
+                inventory["rolling_upgrade"][
+                    "current_runtime_newer_store"
+                ],
+            )
+            self.assertEqual(
+                "unsupported_require_full_runtime_drain",
+                inventory["rolling_upgrade"][
+                    "pre_t062_runtime_overlap_with_future_schema"
+                ],
+            )
             self.assertIsNotNone(inventory["recovery_instruction"])
             self.assertEqual(before_database, self.database.read_bytes())
             self.assertEqual(before_wal, wal.read_bytes())
