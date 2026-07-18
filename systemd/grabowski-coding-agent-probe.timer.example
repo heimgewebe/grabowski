@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh the advisory Grabowski coding-agent catalog before it expires
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=45min
+RandomizedDelaySec=3min
+AccuracySec=1min
+Persistent=true
+Unit=grabowski-coding-agent-probe.service
+
+[Install]
+WantedBy=timers.target
