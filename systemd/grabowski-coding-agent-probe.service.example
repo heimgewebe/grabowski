@@ -21,15 +21,13 @@ Environment=GEMINI_API_KEY=
 Environment=GOOGLE_API_KEY=
 Environment=OPENROUTER_API_KEY=
 Environment=AZURE_OPENAI_API_KEY=
+# Keep this subset compatible with an unprivileged systemd user manager.
 NoNewPrivileges=yes
 PrivateTmp=yes
-PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.local/state/grabowski/coding-agent-router
 ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
