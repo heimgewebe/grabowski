@@ -149,58 +149,79 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
-    "rlens_bundle_discover": {
+    "repoground_bundle_discover": {
         "category": "knowledge",
-        "purpose": "Discover current rLens/repoLens bundles from the immutable local merges area.",
+        "purpose": "Discover current RepoGround bundles from the immutable local bundle area.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
-    "rlens_bundle_status": {
+    "repoground_bundle_status": {
         "category": "knowledge",
-        "purpose": "Read bounded manifest, health and sidecar status for one rLens bundle.",
+        "purpose": "Read bounded manifest, health, and sidecar status for one RepoGround bundle.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
-    "rlens_freshness_check": {
+    "repoground_freshness_check": {
         "category": "knowledge",
-        "purpose": "Compare one rLens bundle commit with the current local repository HEAD.",
+        "purpose": "Compare one RepoGround bundle source commit with the current local repository HEAD.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
-    "rlens_preflight": {
+    "repoground_preflight": {
         "category": "knowledge",
-        "purpose": "Run bounded rLens/RepoBrief consumption preflight for a selected bundle.",
+        "purpose": "Run bounded RepoGround consumption preflight for a selected bundle.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
-    "rlens_query": {
+    "repoground_query": {
         "category": "knowledge",
-        "purpose": "Run a bounded read-only rLens/RepoBrief query and normalize result snippets and ranges.",
+        "purpose": "Run a bounded read-only RepoGround query and normalize snippets and ranges.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
-    "rlens_query_existing_index": {
+    "repoground_query_existing_index": {
         "category": "knowledge",
-        "purpose": "Query a prebuilt rLens/RepoBrief index and return normalized bounded snippets and ranges.",
+        "purpose": "Query a prebuilt RepoGround index without refreshing or mutating the bundle.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
-    "rlens_range_get": {
+    "repoground_range_get": {
         "category": "knowledge",
-        "purpose": "Resolve one bounded rLens/RepoBrief range reference without refreshing source artifacts.",
+        "purpose": "Resolve one bounded RepoGround range reference without refreshing source artifacts.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
-    "rlens_context_pack": {
+    "repoground_context_pack": {
         "category": "knowledge",
-        "purpose": "Build a bounded rLens context pack for agent handoff and Bureau receipts.",
+        "purpose": "Build a bounded RepoGround context pack for agent handoff and Bureau receipts.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "repoground_find_symbol": {
+        "category": "knowledge",
+        "purpose": "Find bounded Python symbol definitions in an existing RepoGround bundle.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "repoground_get_callers": {
+        "category": "knowledge",
+        "purpose": "Read S1 callers while preserving unresolved references separately.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "repoground_get_callees": {
+        "category": "knowledge",
+        "purpose": "Read S1 callees while preserving S0 call sites separately.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
@@ -391,7 +412,11 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "device-worker",
         "purpose": "Pair one exact Juno session after local consent and explicit escalation.",
         "risk_class": "high",
-        "effects": ["device-key-create", "local-secret-create-or-replace", "receipt-create"],
+        "effects": [
+            "device-key-create",
+            "local-secret-create-or-replace",
+            "receipt-create",
+        ],
         "reversibility": "remove-both-pairing-files-and-restart",
     },
     "grabowski_juno_run": {
@@ -447,7 +472,11 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "device-storage",
         "purpose": "Read one exact granted iPad file with size and SHA-256 evidence.",
         "risk_class": "high",
-        "effects": ["device-job-execute", "device-file-content-return", "receipt-create"],
+        "effects": [
+            "device-job-execute",
+            "device-file-content-return",
+            "receipt-create",
+        ],
         "reversibility": "not-applicable-device-job-and-receipt-retained",
     },
     "ipad_file_create": {
@@ -461,7 +490,12 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "device-storage",
         "purpose": "Perform one hash-bound same-directory replace with immediate preimage recheck and post-readback inside one exact locally granted scope.",
         "risk_class": "high",
-        "effects": ["device-job-execute", "device-file-replace", "temporary-file-create", "receipt-create"],
+        "effects": [
+            "device-job-execute",
+            "device-file-replace",
+            "temporary-file-create",
+            "receipt-create",
+        ],
         "reversibility": "preimage-dependent-not-automatically-retained",
     },
     "grabowski_operation_list": {
@@ -744,73 +778,77 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["local-file-create-or-replace", "temporary-file-create"],
         "reversibility": "destination-preimage-dependent",
     },
-
 }
 
 
 TOOL_PROFILES.update(
-{'grabowski_browser_worker_start': {'category': 'browser-worker',
-                                    'purpose': 'Start an agent-owned browser with a loopback-only '
-                                               'debugging endpoint.',
-                                    'risk_class': 'high',
-                                    'effects': ['process-start',
-                                                'profile-create-or-use',
-                                                'loopback-listener'],
-                                    'reversibility': 'worker-stop'},
- 'grabowski_browser_worker_stored_form_action': {'category': 'browser-worker',
-                                                  'purpose': 'Use browser-managed stored form data on one exact local-device origin without returning field contents.',
-                                                  'risk_class': 'high',
-                                                  'effects': ['browser-input',
-                                                              'form-submit',
-                                                              'local-device-state-change'],
-                                                  'reversibility': 'target-dependent; fields cleared on failed or unobserved submission'},
- 'grabowski_browser_worker_status': {'category': 'browser-worker',
-                                     'purpose': 'Observe one isolated browser worker and reconcile '
-                                                'terminal leases.',
-                                     'risk_class': 'low',
-                                     'effects': ['state-refresh', 'possible-lease-release'],
-                                     'reversibility': 'not-applicable'},
- 'grabowski_browser_worker_stop': {'category': 'browser-worker',
-                                   'purpose': 'Stop one isolated browser worker and clean '
-                                              'ephemeral state.',
-                                   'risk_class': 'medium',
-                                   'effects': ['process-stop',
-                                               'lease-release',
-                                               'ephemeral-state-remove'],
-                                   'reversibility': 'worker-restart'},
- 'grabowski_browser_worker_list': {'category': 'browser-worker',
-                                   'purpose': 'List isolated agent-owned browser workers.',
-                                   'risk_class': 'low',
-                                   'effects': [],
-                                   'reversibility': 'not-applicable'},
- 'grabowski_gui_worker_start': {'category': 'gui-worker',
-                                'purpose': 'Start an argv-only GUI worker on an isolated Xvfb '
-                                           'display.',
-                                'risk_class': 'high',
-                                'effects': ['process-start',
-                                            'display-create',
-                                            'ephemeral-state-create'],
-                                'reversibility': 'worker-stop'},
- 'grabowski_gui_worker_status': {'category': 'gui-worker',
-                                 'purpose': 'Observe one isolated GUI worker and reconcile '
-                                            'terminal leases.',
-                                 'risk_class': 'low',
-                                 'effects': ['state-refresh', 'possible-lease-release'],
-                                 'reversibility': 'not-applicable'},
- 'grabowski_gui_worker_stop': {'category': 'gui-worker',
-                               'purpose': 'Stop one isolated GUI worker and clean ephemeral XDG '
-                                          'state.',
-                               'risk_class': 'medium',
-                               'effects': ['process-stop',
-                                           'lease-release',
-                                           'ephemeral-state-remove'],
-                               'reversibility': 'worker-restart'},
- 'grabowski_gui_worker_list': {'category': 'gui-worker',
-                               'purpose': 'List isolated GUI workers.',
-                               'risk_class': 'low',
-                               'effects': [],
-                               'reversibility': 'not-applicable'}}
-
+    {
+        "grabowski_browser_worker_start": {
+            "category": "browser-worker",
+            "purpose": "Start an agent-owned browser with a loopback-only "
+            "debugging endpoint.",
+            "risk_class": "high",
+            "effects": ["process-start", "profile-create-or-use", "loopback-listener"],
+            "reversibility": "worker-stop",
+        },
+        "grabowski_browser_worker_stored_form_action": {
+            "category": "browser-worker",
+            "purpose": "Use browser-managed stored form data on one exact local-device origin without returning field contents.",
+            "risk_class": "high",
+            "effects": ["browser-input", "form-submit", "local-device-state-change"],
+            "reversibility": "target-dependent; fields cleared on failed or unobserved submission",
+        },
+        "grabowski_browser_worker_status": {
+            "category": "browser-worker",
+            "purpose": "Observe one isolated browser worker and reconcile "
+            "terminal leases.",
+            "risk_class": "low",
+            "effects": ["state-refresh", "possible-lease-release"],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_browser_worker_stop": {
+            "category": "browser-worker",
+            "purpose": "Stop one isolated browser worker and clean ephemeral state.",
+            "risk_class": "medium",
+            "effects": ["process-stop", "lease-release", "ephemeral-state-remove"],
+            "reversibility": "worker-restart",
+        },
+        "grabowski_browser_worker_list": {
+            "category": "browser-worker",
+            "purpose": "List isolated agent-owned browser workers.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_gui_worker_start": {
+            "category": "gui-worker",
+            "purpose": "Start an argv-only GUI worker on an isolated Xvfb display.",
+            "risk_class": "high",
+            "effects": ["process-start", "display-create", "ephemeral-state-create"],
+            "reversibility": "worker-stop",
+        },
+        "grabowski_gui_worker_status": {
+            "category": "gui-worker",
+            "purpose": "Observe one isolated GUI worker and reconcile terminal leases.",
+            "risk_class": "low",
+            "effects": ["state-refresh", "possible-lease-release"],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_gui_worker_stop": {
+            "category": "gui-worker",
+            "purpose": "Stop one isolated GUI worker and clean ephemeral XDG state.",
+            "risk_class": "medium",
+            "effects": ["process-stop", "lease-release", "ephemeral-state-remove"],
+            "reversibility": "worker-restart",
+        },
+        "grabowski_gui_worker_list": {
+            "category": "gui-worker",
+            "purpose": "List isolated GUI workers.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+    }
 )
 
 
@@ -928,7 +966,13 @@ TOOL_PROFILES.update(
             "category": "agent-workspace",
             "purpose": "Create one task-bound four-pane tmux workspace with one isolated writer worktree.",
             "risk_class": "high",
-            "effects": ["worktree-create", "branch-create", "task-start", "tmux-session-create", "lease-create"],
+            "effects": [
+                "worktree-create",
+                "branch-create",
+                "task-start",
+                "tmux-session-create",
+                "lease-create",
+            ],
             "reversibility": "close-and-preserved-worktree",
         },
         "grabowski_agent_workspace_status": {
@@ -963,7 +1007,12 @@ TOOL_PROFILES.update(
             "category": "agent-workspace",
             "purpose": "Close one collected workspace while preserving its branch and writer worktree.",
             "risk_class": "high",
-            "effects": ["possible-task-stop", "tmux-session-remove", "lease-release", "receipt-create"],
+            "effects": [
+                "possible-task-stop",
+                "tmux-session-remove",
+                "lease-release",
+                "receipt-create",
+            ],
             "reversibility": "preserved-worktree-and-branch",
         },
         "grabowski_agent_workspace_observe": {
@@ -998,7 +1047,12 @@ TOOL_PROFILES.update(
             "category": "agent-workspace",
             "purpose": "Create durable recovery refs and remove one eligible closed writer checkout without deleting workspace evidence.",
             "risk_class": "high",
-            "effects": ["checkout-archive", "recovery-ref-create", "worktree-remove", "receipt-create"],
+            "effects": [
+                "checkout-archive",
+                "recovery-ref-create",
+                "worktree-remove",
+                "receipt-create",
+            ],
             "reversibility": "restore-from-checkout-archive",
         },
         "grabowski_agent_execution_route": {
@@ -1117,9 +1171,7 @@ def classify_contract(expected_tools: Iterable[str]) -> dict[str, list[str]]:
     return {
         "missing_profiles": sorted(expected - catalogued),
         "orphan_profiles": sorted(catalogued - expected),
-        "duplicate_tools": sorted(
-            {name for name in names if names.count(name) > 1}
-        ),
+        "duplicate_tools": sorted({name for name in names if names.count(name) > 1}),
     }
 
 
