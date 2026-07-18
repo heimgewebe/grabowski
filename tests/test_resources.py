@@ -1468,6 +1468,33 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(before_names, sorted(item.name for item in self.database.parent.iterdir()))
 
+    def test_resource_schema_inventory_blocks_if_wal_appears_during_immutable_read(self) -> None:
+        connection = resources._database()
+        connection.close()
+        wal = Path(str(self.database) + "-wal")
+        self.assertFalse(wal.exists())
+        original = resources._resource_schema_version
+
+        def create_wal_during_read(connection: sqlite3.Connection) -> str | None:
+            version = original(connection)
+            wal.write_bytes(b"concurrent-writer-marker")
+            return version
+
+        try:
+            with patch.object(
+                resources,
+                "_resource_schema_version",
+                side_effect=create_wal_during_read,
+            ):
+                inventory = resources.grabowski_resource_list(schema_only=True)
+            self.assertEqual("blocked", inventory["status"])
+            self.assertEqual("retry_schema_inventory", inventory["required_action"])
+            self.assertFalse(inventory["write_compatible"])
+            self.assertFalse(inventory["mutation_performed"])
+            self.assertIn("changed while schema inventory", inventory["error"])
+        finally:
+            wal.unlink(missing_ok=True)
+
     def test_resource_schema_inventory_reads_uncheckpointed_future_wal(self) -> None:
         connection = resources._database()
         connection.close()
