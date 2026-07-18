@@ -214,6 +214,9 @@ class FakeGh:
             return {"returncode": 0, "stdout": str(self.view["url"]), "stderr": ""}
         if argv[:2] == ["pr", "edit"]:
             return {"returncode": 0, "stdout": "", "stderr": ""}
+        if argv[:2] == ["pr", "ready"]:
+            self.view["isDraft"] = "--undo" in argv
+            return {"returncode": 0, "stdout": "", "stderr": ""}
         if argv[:2] == ["pr", "diff"]:
             return {"returncode": 0, "stdout": self.diff_text, "stderr": ""}
         if argv[:2] == ["pr", "merge"]:
@@ -2390,12 +2393,65 @@ class GripFoundationTests(unittest.TestCase):
         list_call = next(call for call in fake_gh.calls if call[:2] == ("pr", "list"))
         self.assertNotIn("--jq", list_call)
         self.assertIn(("pr", "create", "--base", "main", "--head", "feat/work", "--title", "Test", "--body", "Body"), fake_gh.calls)
+        self.assertFalse(result["output"]["draft"])
+        self.assertIsNone(result["output"]["draft_requested"])
+        self.assertFalse(result["output"]["pr"]["isDraft"])
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["remote_head"])
         self.assertEqual("pass", checks["pr_verify"])
+        self.assertEqual("pass", checks["pr_draft_state"])
+
+    def test_pr_create_or_update_creates_draft_and_verifies_exact_state(self) -> None:
+        view = {
+            "number": 77,
+            "url": "https://github.com/heimgewebe/grabowski/pull/77",
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": "feat/work",
+            "headRefOid": "a" * 40,
+            "isDraft": True,
+            "mergeable": "MERGEABLE",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_gh = FakeGh(view=view)
+            result = grips.run_grip(
+                "pr-create-or-update",
+                {
+                    "repo": tmp,
+                    "branch": "feat/work",
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "title": "Draft",
+                    "draft": True,
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", head="a" * 40),
+                github_runner=fake_gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["draft"])
+        self.assertTrue(result["output"]["draft_requested"])
+        self.assertTrue(result["output"]["pr"]["isDraft"])
+        self.assertIn(
+            (
+                "pr",
+                "create",
+                "--base",
+                "main",
+                "--head",
+                "feat/work",
+                "--title",
+                "Draft",
+                "--body",
+                "",
+                "--draft",
+            ),
+            fake_gh.calls,
+        )
 
     def test_pr_create_or_update_updates_existing_matching_pr(self) -> None:
-        existing = {"number": 77, "url": "https://github.com/heimgewebe/grabowski/pull/77", "baseRefName": "main", "headRefName": "feat/work", "headRefOid": "a" * 40}
+        existing = {"number": 77, "url": "https://github.com/heimgewebe/grabowski/pull/77", "baseRefName": "main", "headRefName": "feat/work", "headRefOid": "a" * 40, "isDraft": False}
         with tempfile.TemporaryDirectory() as tmp:
             fake_gh = FakeGh(existing=existing)
             result = grips.run_grip(
@@ -2409,6 +2465,120 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("updated", result["output"]["action"])
         self.assertIn(("pr", "edit", "77", "--title", "Updated"), fake_gh.calls)
+        self.assertIsNone(result["output"]["draft_requested"])
+        self.assertFalse(any(call[:2] == ("pr", "ready") for call in fake_gh.calls))
+
+    def test_pr_create_or_update_preserves_existing_draft_when_parameter_is_omitted(self) -> None:
+        existing = {"number": 77, "url": "https://github.com/heimgewebe/grabowski/pull/77", "baseRefName": "main", "headRefName": "feat/work", "headRefOid": "a" * 40, "isDraft": True}
+        view = {
+            "number": 77,
+            "url": "https://github.com/heimgewebe/grabowski/pull/77",
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": "feat/work",
+            "headRefOid": "a" * 40,
+            "isDraft": True,
+            "mergeable": "MERGEABLE",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_gh = FakeGh(existing=existing, view=view)
+            result = grips.run_grip(
+                "pr-create-or-update",
+                {"repo": tmp, "branch": "feat/work", "base": "main", "expected_head": "a" * 40, "title": "Preserve"},
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", head="a" * 40),
+                github_runner=fake_gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["draft"])
+        self.assertIsNone(result["output"]["draft_requested"])
+        self.assertFalse(any(call[:2] == ("pr", "ready") for call in fake_gh.calls))
+
+    def test_pr_create_or_update_converts_existing_ready_pr_to_draft(self) -> None:
+        existing = {"number": 77, "url": "https://github.com/heimgewebe/grabowski/pull/77", "baseRefName": "main", "headRefName": "feat/work", "headRefOid": "a" * 40, "isDraft": False}
+        view = {
+            "number": 77,
+            "url": "https://github.com/heimgewebe/grabowski/pull/77",
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": "feat/work",
+            "headRefOid": "a" * 40,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_gh = FakeGh(existing=existing, view=view)
+            result = grips.run_grip(
+                "pr-create-or-update",
+                {"repo": tmp, "branch": "feat/work", "base": "main", "expected_head": "a" * 40, "title": "Draft", "draft": True},
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", head="a" * 40),
+                github_runner=fake_gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertIn(("pr", "ready", "77", "--undo"), fake_gh.calls)
+        self.assertTrue(result["output"]["pr"]["isDraft"])
+
+    def test_pr_create_or_update_converts_existing_draft_pr_to_ready(self) -> None:
+        existing = {"number": 77, "url": "https://github.com/heimgewebe/grabowski/pull/77", "baseRefName": "main", "headRefName": "feat/work", "headRefOid": "a" * 40, "isDraft": True}
+        view = {
+            "number": 77,
+            "url": "https://github.com/heimgewebe/grabowski/pull/77",
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": "feat/work",
+            "headRefOid": "a" * 40,
+            "isDraft": True,
+            "mergeable": "MERGEABLE",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_gh = FakeGh(existing=existing, view=view)
+            result = grips.run_grip(
+                "pr-create-or-update",
+                {"repo": tmp, "branch": "feat/work", "base": "main", "expected_head": "a" * 40, "title": "Ready", "draft": False},
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", head="a" * 40),
+                github_runner=fake_gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertIn(("pr", "ready", "77"), fake_gh.calls)
+        self.assertFalse(result["output"]["pr"]["isDraft"])
+
+    def test_pr_create_or_update_rejects_non_boolean_draft_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_git = FakeGit(branch="feat/work", head="a" * 40)
+            fake_gh = FakeGh()
+            result = grips.run_grip(
+                "pr-create-or-update",
+                {"repo": tmp, "branch": "feat/work", "base": "main", "expected_head": "a" * 40, "title": "Invalid", "draft": "true"},
+                allow_mutation=True,
+                command_runner=fake_git,
+                github_runner=fake_gh,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("draft must be a boolean", result["output"]["error"])
+        self.assertEqual([], fake_git.calls)
+        self.assertEqual([], fake_gh.calls)
+
+    def test_pr_create_or_update_fails_closed_on_draft_readback_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_gh = FakeGh()
+            result = grips.run_grip(
+                "pr-create-or-update",
+                {"repo": tmp, "branch": "feat/work", "base": "main", "expected_head": "a" * 40, "title": "Draft", "draft": True},
+                allow_mutation=True,
+                command_runner=FakeGit(branch="feat/work", head="a" * 40),
+                github_runner=fake_gh,
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("draft verification", result["output"]["error"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["pr_draft_state"])
 
     def test_pr_create_or_update_blocks_ambiguous_open_pr_list(self) -> None:
         existing = [
