@@ -1200,6 +1200,31 @@ class TaskTests(unittest.TestCase):
             r"^[0-9a-f]{64}$",
         )
 
+    def test_scoped_repository_task_key_binds_underlying_repository(self) -> None:
+        key = f"repo:{self.root}:branch:feat/scoped-task"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 162}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resource_keys=[key],
+            )
+        with sqlite3.connect(self.resource_database) as connection:
+            metadata = json.loads(
+                connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()[0]
+            )
+        self.assertNotIn("scope_manifest", metadata)
+        self.assertNotIn("scope_manifest_complete", metadata)
+        self.assertIsNone(result["audit"]["repository_scope_manifest_sha256"])
+        self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
+
     def test_mutating_agents_cannot_share_one_implicit_workspace(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(

@@ -794,12 +794,18 @@ def _whole_repository_scope_manifest(
 
 
 def _task_repository_resource(resource_keys: list[str]) -> str | None:
-    repository_keys = [key for key in resource_keys if key.startswith("repo:")]
-    if not repository_keys:
+    broad_repository_keys = [
+        key
+        for key in resource_keys
+        if key.startswith("repo:")
+        and ":branch:" not in key
+        and ":operation:" not in key
+    ]
+    if not broad_repository_keys:
         return None
-    if len(repository_keys) != 1:
-        raise ValueError("tasks may lease at most one repository")
-    return repository_keys[0]
+    if len(broad_repository_keys) != 1:
+        raise ValueError("tasks may lease at most one broad repository")
+    return broad_repository_keys[0]
 
 
 def _record_implicit_workspace_resource(
@@ -1657,7 +1663,7 @@ def grabowski_task_start(
 
     Direct local write-capable agent CLIs receive an implicit repository lease
     unless the caller supplies an explicit path or repository scope. Every
-    task-owned repository lease carries a complete whole-repository scope manifest.
+    task-owned broad repository lease carries a complete whole-repository scope manifest.
     """
     target = fleet.fleet_host(host)
     command = _validate_command(argv)

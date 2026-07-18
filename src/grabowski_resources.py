@@ -2709,7 +2709,12 @@ def _public_repository_scope_keys(
     """Require public repository leases to declare one complete exact scope."""
     keys = normalize_resource_keys(resource_keys)
     repository_keys = [key for key in keys if key.startswith("repo:")]
-    if not repository_keys:
+    broad_repository_keys = [
+        key
+        for key in repository_keys
+        if ":branch:" not in key and ":operation:" not in key
+    ]
+    if not broad_repository_keys:
         return keys
     if metadata is not None and not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
@@ -2725,14 +2730,9 @@ def _public_repository_scope_keys(
     scope = nonconflict.normalize_scope_manifest(
         normalized_metadata["scope_manifest"]
     )
-    repository_prefix = f"repo:{scope['repository']}"
-    allowed_prefixes = (
-        repository_prefix,
-        f"{repository_prefix}:branch:",
-        f"{repository_prefix}:operation:",
-    )
-    for key in repository_keys:
-        if key == allowed_prefixes[0] or key.startswith(allowed_prefixes[1:]):
+    repository_key = f"repo:{scope['repository']}"
+    for key in broad_repository_keys:
+        if key == repository_key:
             continue
         raise ValueError(
             "repository resource keys must match metadata.scope_manifest repository"
@@ -2751,7 +2751,7 @@ def grabowski_resource_acquire(
 ) -> dict[str, Any]:
     """Atomically acquire typed resource leases for one owner.
 
-    Public repository resources require a complete exact scope manifest. An
+    Public broad repository resources require a complete exact scope manifest. An
     explicit emergency-recovery lease remains a deliberately exclusive
     fail-closed exception and cannot be used for non-conflict bypasses.
     """

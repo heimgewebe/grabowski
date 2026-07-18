@@ -1291,6 +1291,19 @@ class ResourceTests(unittest.TestCase):
                 )
         self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
 
+    def test_public_tool_preserves_self_scoped_repository_lease(self) -> None:
+        key = f"repo:{self.root}:branch:feat/scoped"
+        with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
+            resources.base, "_append_audit"
+        ):
+            result = resources.grabowski_resource_acquire(
+                "owner-a",
+                [key],
+                "scoped branch work",
+                60,
+            )
+        self.assertEqual(result["leases"][0]["resource_key"], key)
+
     def test_public_tool_accepts_complete_repository_scope(self) -> None:
         scope = self.scope_manifest(
             self.root,
