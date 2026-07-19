@@ -2344,6 +2344,10 @@
         "source": "src/grabowski_command_identity.py"
       },
       {
+        "module": "grabowski_sqlite_store",
+        "source": "src/grabowski_sqlite_store.py"
+      },
+      {
         "module": "grabowski_tasks",
         "source": "src/grabowski_tasks.py"
       },
@@ -2473,7 +2477,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "fdc92f471a9540d22426a7b6a3f0261cf53fed1ead52b1c1b5adce02493fa81c"
+      "sha256": "1add9fdbb62bceb194a539c647d84ff6ebe738fb3de46a54df2b3e768e2de47c"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2520,13 +2524,14 @@
       "src/grabowski_recovery.py": "1c5b0843345f5aa7d1da7f3f0c5831e647f652c83eba7733b4a2c998d291c16d",
       "src/grabowski_repobrief.py": "cdec704a822293cf194db6f0dff6481b3f3c4679d4a5b58756a0ea235c052e0a",
       "src/grabowski_repoground_catalog.py": "4981ef23c7cdada7d96d51803c63c8702effb095193271dbf51294bd199fd851",
-      "src/grabowski_resources.py": "a33d0de4b2dcd866e5ec828726242f430375ce7662aa36cf0c5c239d9489fa3a",
+      "src/grabowski_resources.py": "cd6b68aabe44ad53dcded80104637c188e404e24b9393469b7f048beb8554fc0",
       "src/grabowski_runtime.py": "cf83bd1d3578fbd94f6b447e8862d15ca656adc54eaf32e66e255b1115f842da",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "b8d92b82b762b763941735ef6c1b87ecad78ab60166eeaf5dbd8ac66f4325258",
+      "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
       "src/grabowski_task_attention.py": "8833353556737cce9cae01b080cf5b1093d7df9f54472c893da6b6df8cbb1ad4",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "284169d47ce88a9fd05844055ae8aec32fa76bd2413d1627c43be79044aa6348",
+      "src/grabowski_tasks.py": "dfe744aeb12537808ee0d168d6c26549ea04cc95fb567392ec375ad66869b2d4",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9be067c783e69b810470d233d14dd09e3e214d23e4815235c09f533e901a0178",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"
