@@ -269,7 +269,7 @@ class AuditInterprocessLockTests(unittest.TestCase):
                 self.assertTrue(status["valid"], status)
                 self.assertEqual(status["records"], 0)
 
-    def test_append_refuses_to_cross_audit_byte_limit(self) -> None:
+    def test_append_refuses_impossible_audit_capacity_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
             state.mkdir(mode=0o700)
@@ -277,10 +277,10 @@ class AuditInterprocessLockTests(unittest.TestCase):
             with patches[0], patches[1], patches[2], patches[3]:
                 grabowski_mcp._append_audit({"operation": "first"})
                 before = audit.read_bytes()
-                with patch.object(
-                    grabowski_mcp,
-                    "MAX_AUDIT_BYTES",
-                    len(before) + 1,
+                with (
+                    patch.object(grabowski_mcp, "MAX_AUDIT_BYTES", len(before) + 1),
+                    patch.object(grabowski_mcp, "AUDIT_ROTATION_RESERVE_BYTES", 1),
+                    patch.object(grabowski_mcp, "MAX_AUDIT_RECORD_BYTES", len(before)),
                 ):
                     with self.assertRaisesRegex(ValueError, "byte limit"):
                         grabowski_mcp._append_audit({"operation": "blocked"})

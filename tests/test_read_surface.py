@@ -203,12 +203,49 @@ class ReadSurfaceTests(unittest.TestCase):
             "repo_head": "a" * 40,
         }
         deployment.update({key: True for key in read_surface.DEPLOYMENT_INTEGRITY_FIELDS})
-        with patch.object(read_surface.base, "_deployment_metadata", return_value=deployment):
+        audit = {
+            "valid": True,
+            "audit_writable": True,
+            "audit_state": "ready",
+            "active_bytes": 123,
+            "max_bytes": 456,
+            "remaining_bytes": 333,
+            "reserve_bytes": 64,
+            "rotation_required": False,
+            "archived_segment_count": 2,
+            "total_records": 99,
+        }
+        with (
+            patch.object(read_surface.base, "_deployment_metadata", return_value=deployment),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=audit),
+        ):
             health = read_surface.grabowski_runtime_health()
         self.assertEqual(health["service"], "grabowski-mcp")
         self.assertEqual(health["service_model"]["operator_unit"], "grabowski-operator.service")
         self.assertEqual(health["service_model"]["tunnel_unit"], "tunnel-client-grabowski.service")
         self.assertEqual(health["service_model"]["deployment_release"], "release-1")
+        self.assertTrue(health["healthy"])
+        self.assertTrue(health["audit_writable"])
+        self.assertEqual(health["audit_active_bytes"], 123)
+        self.assertEqual(health["audit_archived_segment_count"], 2)
+
+    def test_runtime_health_is_not_healthy_when_audit_is_valid_but_not_writable(self) -> None:
+        deployment = {"completion_status": "complete"}
+        deployment.update({key: True for key in read_surface.DEPLOYMENT_INTEGRITY_FIELDS})
+        audit = {
+            "valid": True,
+            "audit_writable": False,
+            "audit_state": "storage_exhausted",
+        }
+        with (
+            patch.object(read_surface.base, "_deployment_metadata", return_value=deployment),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=audit),
+        ):
+            health = read_surface.grabowski_runtime_health()
+        self.assertFalse(health["healthy"])
+        self.assertTrue(health["audit_valid"])
+        self.assertFalse(health["audit_writable"])
+        self.assertEqual(health["audit_state"], "storage_exhausted")
 
     def test_github_fields_exclude_body_and_comments(self) -> None:
         fields = set(read_surface.GITHUB_PR_FIELDS)
