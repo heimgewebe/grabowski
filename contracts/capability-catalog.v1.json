@@ -1140,7 +1140,7 @@
     },
     {
       "category": "task",
-      "description": "List persistent tasks with keyset pagination and compact default records.",
+      "description": "List persistent tasks or inspect store-schema compatibility read-only.",
       "effects": [],
       "id": "grabowski_task_list",
       "purpose": "List recent persistent task records with optional state filtering.",
@@ -1512,7 +1512,7 @@
     },
     {
       "category": "resource",
-      "description": "List bounded resource leases, optionally filtered by owner.",
+      "description": "List bounded leases or inspect store-schema compatibility read-only.",
       "effects": [],
       "id": "grabowski_resource_list",
       "purpose": "List bounded typed resource leases with optional owner filtering.",
