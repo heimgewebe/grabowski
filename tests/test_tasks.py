@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import io
 import json
 import os
@@ -2094,6 +2095,203 @@ class RuntimeContractTests(unittest.TestCase):
             "grabowski_agent_workspace_close",
         ):
             self.assertIn(tool, expected)
+
+
+class ChronikCodingMemoryToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.repository = self.root / "chronik"
+        self.data_dir = self.root / "chronik-data"
+        tools_dir = self.repository / "tools"
+        tools_dir.mkdir(parents=True)
+        self.cli = tools_dir / "coding_memory.py"
+        self.cli.write_text(
+            """#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--data-dir', required=True)
+sub = parser.add_subparsers(dest='command', required=True)
+imp = sub.add_parser('import')
+imp.add_argument('input', type=Path)
+query = sub.add_parser('query')
+target = query.add_mutually_exclusive_group(required=True)
+target.add_argument('--repo')
+target.add_argument('--host')
+query.add_argument('--component')
+query.add_argument('--operation')
+query.add_argument('--task-class')
+query.add_argument('--outcome')
+query.add_argument('--since')
+query.add_argument('--limit', type=int, default=20)
+args = parser.parse_args()
+data_dir = Path(args.data_dir)
+if args.command == 'import':
+    data_dir.mkdir(parents=True, exist_ok=True)
+    events = [json.loads(line) for line in args.input.read_text().splitlines() if line]
+    ledger = data_dir / 'event-ids.json'
+    existing = set(json.loads(ledger.read_text())) if ledger.exists() else set()
+    incoming = {event['event_id'] for event in events}
+    new = sorted(incoming - existing)
+    ledger.write_text(json.dumps(sorted(existing | incoming)))
+    receipt = {'schema_version': 'chronik-import-receipt.v1', 'domain': 'agent.ledger', 'event_ids': sorted(incoming), 'requested': len(incoming), 'imported': len(new), 'skipped_existing': len(incoming) - len(new), 'recorded_at': '2026-07-19T00:00:00Z', 'source_sha256': __import__('hashlib').sha256(b'\\n'.join(json.dumps(event, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode() for event in events)).hexdigest(), 'historical_only': True, 'does_not_establish': ['current_git_state', 'current_ci_state', 'current_runtime_state', 'safe_retry']}
+    unsigned = json.dumps(receipt, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
+    receipt['receipt_sha256'] = __import__('hashlib').sha256(unsigned).hexdigest()
+    print(json.dumps(receipt))
+else:
+    if args.component == 'fail':
+        raise SystemExit(2)
+    target_value = args.repo or args.host
+    events = [
+        {'event_id': 'sha256:' + 'a' * 64, 'target': target_value, 'operation': args.operation or 'other'},
+        {'event_id': 'sha256:' + 'b' * 64, 'target': target_value, 'operation': args.operation or 'other'},
+    ]
+    print(json.dumps({'schema_version': 'chronik-coding-history.v1', 'events': events, 'event_ids': [event['event_id'] for event in events], 'historical_only': True, 'does_not_establish': ['current_git_state', 'current_ci_state', 'current_runtime_state', 'safe_retry', 'writer_authority']}))
+""",
+            encoding="utf-8",
+        )
+        self.outbox_dir = self.root / "state" / "grabowski" / "chronik-outbox"
+        self.outbox_dir.mkdir(parents=True)
+        context = {
+            "subject_scope": "repository",
+            "repo": "heimgewebe/grabowski",
+            "operation": "implement",
+            "task_class": "coding",
+        }
+        event = tasks.chronik.build_event(
+            {
+                "task_id": "c" * 24,
+                "unit": "grabowski-task-" + "c" * 24 + "-a1.service",
+                "attempt": 1,
+                "created_at_unix": 1_700_000_000,
+                "updated_at_unix": 1_700_000_100,
+                "terminalized_at_unix": 1_700_000_200,
+                "chronik_context_json": context,
+            },
+            "completed",
+        )
+        self.source = (
+            self.outbox_dir / "grabowski_task-cccccccccccccccccccccccc-a1.jsonl"
+        )
+        self.source.write_bytes(tasks.chronik._canonical_bytes(event) + b"\n")
+        self.environment = patch.dict(
+            os.environ,
+            {
+                tasks.chronik.CODING_MEMORY_REPO_ENV: str(self.repository),
+                tasks.chronik.CODING_MEMORY_DATA_DIR_ENV: str(self.data_dir),
+                tasks.chronik.STATE_ROOT_ENV: str(self.root / "state"),
+            },
+            clear=False,
+        )
+        self.environment.start()
+
+    def tearDown(self) -> None:
+        self.environment.stop()
+        self.temporary.cleanup()
+
+    def test_outbox_import_is_idempotent_hash_bound_and_preserves_source(self) -> None:
+        before = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            first = tasks.grabowski_chronik_outbox_import(str(self.source))
+            second = tasks.grabowski_chronik_outbox_import(str(self.source))
+        self.assertTrue(first["available"])
+        self.assertTrue(first["imported"])
+        self.assertEqual(1, first["chronik_result"]["imported"])
+        self.assertEqual(0, second["chronik_result"]["imported"])
+        self.assertEqual(1, second["chronik_result"]["skipped_existing"])
+        self.assertTrue(first["source_unchanged"])
+        self.assertEqual(before, hashlib.sha256(self.source.read_bytes()).hexdigest())
+        self.assertRegex(first["receipt_sha256"], r"[0-9a-f]{64}\Z")
+
+    def test_outbox_import_rejects_noncanonical_state_root(self) -> None:
+        foreign = self.root / "foreign" / "chronik-outbox" / self.source.name
+        foreign.parent.mkdir(parents=True)
+        foreign.write_bytes(self.source.read_bytes())
+        with patch.object(tasks.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(ValueError, "configured state root"):
+                tasks.grabowski_chronik_outbox_import(str(foreign))
+
+    def test_outbox_import_rejects_unredacted_event(self) -> None:
+        event = json.loads(self.source.read_text(encoding="utf-8"))
+        event["data"]["argv"] = ["secret"]
+        event["event_id"] = tasks.chronik.event_id(event)
+        self.source.write_bytes(tasks.chronik._canonical_bytes(event) + b"\n")
+        with patch.object(tasks.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(ValueError, "not redacted"):
+                tasks.grabowski_chronik_outbox_import(str(self.source))
+
+    def test_history_is_bounded_and_explicitly_historical(self) -> None:
+        with patch.object(tasks.operator, "_require_operator_capability"):
+            result = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski",
+                operation="implement",
+                limit=1,
+            )
+        self.assertTrue(result["available"])
+        self.assertTrue(result["historical_only"])
+        self.assertEqual(1, len(result["events"]))
+        self.assertEqual(1, len(result["history"]["event_ids"]))
+        for claim in tasks.chronik.CODING_MEMORY_DOES_NOT_ESTABLISH:
+            self.assertIn(claim, result["does_not_establish"])
+            self.assertIn(claim, result["history"]["does_not_establish"])
+        self.assertRegex(result["result_sha256"], r"[0-9a-f]{64}\Z")
+
+    def test_stale_cli_contract_is_visible_without_success_claim(self) -> None:
+        self.cli.write_text(
+            "import json\nprint(json.dumps({'schema_version': 'legacy-import.v0'}))\n",
+            encoding="utf-8",
+        )
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            result = tasks.grabowski_chronik_outbox_import(str(self.source))
+        self.assertFalse(result["available"])
+        self.assertFalse(result["imported"])
+        self.assertTrue(result["outcome_unknown"])
+        self.assertIn("stale", result["failure"]["contract_error"])
+
+    def test_missing_or_failing_cli_is_visible_without_exception(self) -> None:
+        self.cli.unlink()
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            imported = tasks.grabowski_chronik_outbox_import(str(self.source))
+        self.assertFalse(imported["available"])
+        self.assertFalse(imported["imported"])
+        self.assertEqual(
+            "chronik_coding_memory_cli_unavailable", imported["failure"]["code"]
+        )
+        self.setUp_cli_for_failure()
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            failed_import = tasks.grabowski_chronik_outbox_import(str(self.source))
+        self.assertFalse(failed_import["available"])
+        self.assertFalse(failed_import["imported"])
+        self.assertTrue(failed_import["outcome_unknown"])
+        self.assertTrue(failed_import["source_unchanged"])
+        with patch.object(tasks.operator, "_require_operator_capability"):
+            history = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski", component="fail"
+            )
+        self.assertFalse(history["available"])
+        self.assertEqual("chronik_coding_memory_cli_failed", history["failure"]["code"])
+        self.assertEqual([], history["events"])
+
+    def setUp_cli_for_failure(self) -> None:
+        self.cli.write_text(
+            "import sys\nraise SystemExit(2)\n",
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":
