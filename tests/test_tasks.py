@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import io
 import json
 import os
@@ -1885,7 +1885,7 @@ class TaskTests(unittest.TestCase):
         }
         with tasks._database():
             pass
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection:
             columns = [
                 str(row[1])
                 for row in connection.execute("PRAGMA table_info(tasks)")
