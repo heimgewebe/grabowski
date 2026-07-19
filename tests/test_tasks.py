@@ -2156,7 +2156,30 @@ class TaskTests(unittest.TestCase):
             before_database = self.database.read_bytes()
             before_wal = wal.read_bytes()
             before_names = sorted(item.name for item in self.database.parent.iterdir())
-            inventory = tasks.grabowski_task_list(schema_only=True)
+            original_connect = sqlite3.connect
+            source_uri = self.database.absolute().as_uri()
+
+            def reject_source_sqlite_open(
+                database: object,
+                *args: object,
+                **kwargs: object,
+            ) -> sqlite3.Connection:
+                database_text = str(database)
+                if (
+                    database_text == str(self.database)
+                    or database_text.startswith(source_uri)
+                ):
+                    raise AssertionError(
+                        "Task schema inventory must not open the source database when WAL is present"
+                    )
+                return original_connect(database, *args, **kwargs)
+
+            with patch.object(
+                tasks.sqlite3,
+                "connect",
+                side_effect=reject_source_sqlite_open,
+            ):
+                inventory = tasks.grabowski_task_list(schema_only=True)
             self.assertEqual("6", inventory["observed_version"])
             self.assertEqual("unsupported_future", inventory["status"])
             self.assertFalse(inventory["write_compatible"])

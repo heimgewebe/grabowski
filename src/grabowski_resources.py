@@ -225,34 +225,115 @@ def _inventory_file_identity(path: Path) -> tuple[int, int, int, int, int]:
     )
 
 
+def _inventory_status_identity(
+    status: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _inventory_assert_identity(
+    path: Path,
+    expected: tuple[int, int, int, int, int],
+) -> None:
+    try:
+        status = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise ResourceSchemaInventoryChanged(
+            "Store changed while schema inventory was read; retry inventory"
+        ) from exc
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or _inventory_status_identity(status) != expected
+    ):
+        raise ResourceSchemaInventoryChanged(
+            "Store changed while schema inventory was read; retry inventory"
+        )
+
+
+def _inventory_copy_regular_file(source: Path, target: Path) -> tuple[int, int, int, int, int]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise ResourceSchemaInventoryChanged(
+            "Store changed while schema inventory was read; retry inventory"
+        ) from exc
+    try:
+        before_status = os.fstat(descriptor)
+        if not stat.S_ISREG(before_status.st_mode):
+            raise ResourceSchemaInventoryChanged(
+                "Store changed while schema inventory was read; retry inventory"
+            )
+        before = _inventory_status_identity(before_status)
+        with os.fdopen(os.dup(descriptor), "rb") as source_handle:
+            with target.open("xb") as target_handle:
+                while True:
+                    chunk = source_handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    target_handle.write(chunk)
+        os.chmod(target, 0o600)
+        after = _inventory_status_identity(os.fstat(descriptor))
+        if after != before:
+            raise ResourceSchemaInventoryChanged(
+                "Store changed while schema inventory was read; retry inventory"
+            )
+        _inventory_assert_identity(source, before)
+        return before
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
 def _resource_inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
     wal_path = Path(str(path) + "-wal")
-    immutable_read = not wal_path.exists()
-    before_identity = _inventory_file_identity(path) if immutable_read else None
-    immutable = "&immutable=1" if immutable_read else ""
-    connection = sqlite3.connect(
-        path.absolute().as_uri() + f"?mode=ro{immutable}",
-        uri=True,
-        timeout=1,
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only=ON")
-    try:
-        yield connection
-    finally:
-        connection.close()
-        if immutable_read:
-            try:
-                after_identity = _inventory_file_identity(path)
-            except FileNotFoundError as exc:
-                raise ResourceSchemaInventoryChanged(
-                    "Store changed while schema inventory was read; retry inventory"
-                ) from exc
-            if wal_path.exists() or after_identity != before_identity:
+    wal_present = wal_path.exists() or wal_path.is_symlink()
+    if not wal_present:
+        before_identity = _inventory_file_identity(path)
+        connection = sqlite3.connect(
+            path.absolute().as_uri() + "?mode=ro&immutable=1",
+            uri=True,
+            timeout=1,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        try:
+            yield connection
+        finally:
+            connection.close()
+            _inventory_assert_identity(path, before_identity)
+            if wal_path.exists() or wal_path.is_symlink():
                 raise ResourceSchemaInventoryChanged(
                     "Store changed while schema inventory was read; retry inventory"
                 )
+        return
+
+    with tempfile.TemporaryDirectory(
+        prefix="grabowski-resource-schema-inventory-",
+    ) as temporary_directory:
+        snapshot = Path(temporary_directory) / path.name
+        snapshot_wal = Path(str(snapshot) + "-wal")
+        database_identity = _inventory_copy_regular_file(path, snapshot)
+        wal_identity = _inventory_copy_regular_file(wal_path, snapshot_wal)
+        connection = sqlite3.connect(snapshot, timeout=1)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        try:
+            yield connection
+        finally:
+            connection.close()
+            _inventory_assert_identity(path, database_identity)
+            _inventory_assert_identity(wal_path, wal_identity)
 
 
 def _resource_sqlite_integrity(
