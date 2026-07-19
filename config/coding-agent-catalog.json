@@ -608,7 +608,7 @@
       "same_task_peer_use": true,
       "top_class_routes": [
         "codex-sol-high",
-        "claude-fable-5-high"
+        "claude-fable-5-writer-high"
       ],
       "upper_work_routes": [
         "codex-sol-medium",
@@ -1240,10 +1240,52 @@
       "burn_weight": 2.4,
       "delegation_overhead_minutes": 7,
       "effort": "high",
-      "enabled": true,
+      "disabled_reason": "Compatibility alias retained as plan-only; use claude-fable-5-writer-high for separately authorized mutation or claude-fable-5-review-high for active review ranking.",
+      "enabled": false,
       "harness": "claude",
       "harness_quality": 9,
       "id": "claude-fable-5-high",
+      "independence_group": "anthropic-fable",
+      "min_duration_minutes": 20,
+      "model": "claude-fable-5",
+      "priority": 108,
+      "quality_class": "S",
+      "quota_pools": [
+        "claude-pro"
+      ],
+      "task_affinity": {
+        "critical-review": 15,
+        "independent-review": 14,
+        "security-review": 12
+      },
+      "task_classes": [
+        "independent-review",
+        "critical-review",
+        "security-review"
+      ],
+      "tier": "critical",
+      "review_only": true
+    },
+    {
+      "argv_prefix": [
+        "claude",
+        "-p",
+        "--safe-mode",
+        "--permission-mode",
+        "acceptEdits",
+        "--model",
+        "claude-fable-5",
+        "--effort",
+        "high"
+      ],
+      "base_quality_rank": 100,
+      "burn_weight": 2.4,
+      "delegation_overhead_minutes": 7,
+      "effort": "high",
+      "enabled": true,
+      "harness": "claude",
+      "harness_quality": 9,
+      "id": "claude-fable-5-writer-high",
       "independence_group": "anthropic-fable",
       "min_duration_minutes": 20,
       "model": "claude-fable-5",
@@ -1260,24 +1302,65 @@
       "task_affinity": {
         "architecture": 22,
         "complex-patch": 18,
-        "critical-review": 15,
         "deep-debug": 16,
-        "independent-review": 14,
         "long-agent": 34,
         "migration": 38,
-        "refactor": 12,
-        "security-review": 12
+        "refactor": 12
       },
       "task_classes": [
         "architecture",
         "complex-patch",
-        "critical-review",
         "deep-debug",
-        "independent-review",
         "long-agent",
         "refactor",
-        "security-review",
         "migration"
+      ],
+      "tier": "critical",
+      "writer_only": true
+    },
+    {
+      "argv_prefix": [
+        "claude",
+        "-p",
+        "--safe-mode",
+        "--permission-mode",
+        "plan",
+        "--model",
+        "claude-fable-5",
+        "--effort",
+        "high"
+      ],
+      "base_quality_rank": 100,
+      "burn_weight": 2.4,
+      "delegation_overhead_minutes": 7,
+      "effort": "high",
+      "enabled": true,
+      "harness": "claude",
+      "harness_quality": 9,
+      "id": "claude-fable-5-review-high",
+      "independence_group": "anthropic-fable",
+      "min_duration_minutes": 20,
+      "model": "claude-fable-5",
+      "priority": 108,
+      "quality_class": "S",
+      "quota_pools": [
+        "claude-pro"
+      ],
+      "review_only": true,
+      "risk_affinity": {
+        "multi-stage": 10,
+        "ui-product": 8,
+        "uncertain-scope": 8
+      },
+      "task_affinity": {
+        "critical-review": 15,
+        "independent-review": 14,
+        "security-review": 12
+      },
+      "task_classes": [
+        "independent-review",
+        "critical-review",
+        "security-review"
       ],
       "tier": "critical"
     },
@@ -1309,6 +1392,7 @@
       "quota_pools": [
         "claude-pro"
       ],
+      "review_only": true,
       "risk_affinity": {
         "judgment-critical": 14,
         "multi-service": 8,
@@ -1316,26 +1400,14 @@
         "uncertainty-heavy": 12
       },
       "task_affinity": {
-        "architecture": 18,
-        "complex-patch": 8,
         "critical-review": 26,
-        "deep-debug": 25,
         "independent-review": 18,
-        "long-agent": 8,
-        "migration": 14,
-        "refactor": 8,
         "security-review": 24
       },
       "task_classes": [
-        "architecture",
-        "complex-patch",
-        "critical-review",
-        "deep-debug",
         "independent-review",
-        "long-agent",
-        "refactor",
-        "security-review",
-        "migration"
+        "critical-review",
+        "security-review"
       ],
       "tier": "critical"
     },
@@ -1754,12 +1826,9 @@
       "quota_pools": [
         "local-compute"
       ],
+      "review_only": true,
       "task_classes": [
-        "mechanical",
-        "triage",
-        "docs",
-        "tests",
-        "local-private"
+        "independent-review"
       ],
       "tier": "fast"
     },

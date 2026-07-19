@@ -187,6 +187,131 @@ def _route_map(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {route["id"]: route for route in catalog["routes"]}
 
 
+_PERMISSION_MODE_FLAGS = ("--permission-mode", "--approval-mode")
+
+
+def _validated_route_argv_prefix(route: dict[str, Any]) -> list[str]:
+    argv = route.get("argv_prefix")
+    identifier = route.get("id")
+    label = identifier if isinstance(identifier, str) and identifier else "route"
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or any(not isinstance(argument, str) or not argument for argument in argv)
+    ):
+        raise CodingAgentRouterError(f"{label}: invalid argv_prefix")
+    return argv
+
+
+def _route_permission_mode(route: dict[str, Any]) -> str | None:
+    raw_argv = route.get("argv_prefix")
+    if route.get("controller") is True and (raw_argv is None or raw_argv == []):
+        return None
+    argv = _validated_route_argv_prefix(route)
+    identifier = route.get("id")
+    label = identifier if isinstance(identifier, str) and identifier else "route"
+    modes: list[str] = []
+    for index, argument in enumerate(argv):
+        for flag in _PERMISSION_MODE_FLAGS:
+            if argument == flag:
+                if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+                    raise CodingAgentRouterError(f"{label}: {flag} is missing a value")
+                modes.append(argv[index + 1])
+            elif argument.startswith(f"{flag}="):
+                value = argument.split("=", 1)[1]
+                if not value:
+                    raise CodingAgentRouterError(f"{label}: {flag} has an empty value")
+                modes.append(value)
+    distinct_modes = set(modes)
+    if len(distinct_modes) > 1:
+        raise CodingAgentRouterError(f"{label}: conflicting permission modes")
+    return modes[0] if modes else None
+
+
+def _route_uses_plan_mode(route: dict[str, Any]) -> bool:
+    return _route_permission_mode(route) == "plan"
+
+
+def _review_task_class_set(catalog: dict[str, Any]) -> frozenset[str]:
+    return frozenset(
+        task_class
+        for task_class, task in catalog["task_classes"].items()
+        if isinstance(task, dict) and task.get("independent_review") is True
+    )
+
+
+def _route_task_partitions(
+    route: dict[str, Any],
+    catalog: dict[str, Any],
+    review_task_classes: frozenset[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    review_classes = (
+        _review_task_class_set(catalog)
+        if review_task_classes is None
+        else review_task_classes
+    )
+    task_classes = route.get("task_classes", [])
+    writer_capabilities = [
+        task_class for task_class in task_classes if task_class not in review_classes
+    ]
+    review_capabilities = [
+        task_class for task_class in task_classes if task_class in review_classes
+    ]
+    return writer_capabilities, review_capabilities
+
+
+def _route_capabilities_from_partitions(
+    route: dict[str, Any],
+    writer_capabilities: list[str],
+    review_capabilities: list[str],
+) -> dict[str, Any]:
+    writer_capable = bool(writer_capabilities) and route.get("review_only") is not True
+    review_capable = bool(review_capabilities) and route.get("writer_only") is not True
+    if writer_capable and review_capable:
+        route_role = "writer-reviewer"
+    elif writer_capable:
+        route_role = "writer"
+    elif review_capable:
+        route_role = "reviewer"
+    else:
+        route_role = "none"
+    return {
+        "route_role": route_role,
+        "writer_only": route.get("writer_only") is True,
+        "review_only": route.get("review_only") is True,
+        "writer_capable": writer_capable,
+        "review_capable": review_capable,
+        "writer_capabilities": writer_capabilities if writer_capable else [],
+        "review_capabilities": review_capabilities if review_capable else [],
+    }
+
+
+def _route_capabilities(
+    route: dict[str, Any],
+    catalog: dict[str, Any],
+    review_task_classes: frozenset[str] | None = None,
+) -> dict[str, Any]:
+    writer_capabilities, review_capabilities = _route_task_partitions(
+        route, catalog, review_task_classes
+    )
+    return _route_capabilities_from_partitions(
+        route, writer_capabilities, review_capabilities
+    )
+
+
+def _route_derivations(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    review_task_classes = _review_task_class_set(catalog)
+    return {
+        route["id"]: {
+            "permission_mode": _route_permission_mode(route),
+            "capabilities": _route_capabilities(
+                route, catalog, review_task_classes
+            ),
+        }
+        for route in catalog["routes"]
+    }
+
+
 def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
     if catalog.get("schema_version") != 2:
         raise CodingAgentRouterError("catalog schema_version must be 2")
@@ -209,6 +334,7 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
         | set(catalog["policy"].get("controller_owned_task_classes", []))
         | {"general"}
     )
+    review_task_classes = _review_task_class_set(catalog)
     for route in catalog["routes"]:
         if not isinstance(route, dict):
             raise CodingAgentRouterError("catalog route must be an object")
@@ -236,6 +362,50 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
             raise CodingAgentRouterError(f"{identifier}: invalid task classes")
         if not isinstance(route.get("independence_group"), str):
             raise CodingAgentRouterError(f"{identifier}: missing independence group")
+        permission_mode = _route_permission_mode(route)
+        for role_flag in ("writer_only", "review_only"):
+            if role_flag in route and not isinstance(route[role_flag], bool):
+                raise CodingAgentRouterError(
+                    f"{identifier}: {role_flag} must be a boolean"
+                )
+        if route.get("writer_only") is True and route.get("review_only") is True:
+            raise CodingAgentRouterError(
+                f"{identifier}: writer_only and review_only are mutually exclusive"
+            )
+        if route.get("writer_only") is True and permission_mode == "plan":
+            raise CodingAgentRouterError(
+                f"{identifier}: writer-only route cannot use plan mode"
+            )
+        if permission_mode == "plan" and route.get("review_only") is not True:
+            raise CodingAgentRouterError(
+                f"{identifier}: plan-mode route must be review_only"
+            )
+        writer_task_classes, route_review_task_classes = _route_task_partitions(
+            route, catalog, review_task_classes
+        )
+        capabilities = _route_capabilities_from_partitions(
+            route, writer_task_classes, route_review_task_classes
+        )
+        if route.get("writer_only") is True and (
+            not writer_task_classes or route_review_task_classes
+        ):
+            raise CodingAgentRouterError(
+                f"{identifier}: writer_only route must have writer tasks and no review tasks"
+            )
+        if route.get("review_only") is True and (
+            not route_review_task_classes or writer_task_classes
+        ):
+            raise CodingAgentRouterError(
+                f"{identifier}: review_only route must have review tasks and no writer tasks"
+            )
+        if (
+            route.get("enabled") is True
+            and route.get("controller") is not True
+            and not (capabilities["writer_capable"] or capabilities["review_capable"])
+        ):
+            raise CodingAgentRouterError(
+                f"{identifier}: enabled external route has no actual capability"
+            )
         quality_class = route.get("quality_class")
         if quality_class not in QUALITY_CLASSES:
             raise CodingAgentRouterError(f"{identifier}: invalid quality class")
@@ -734,8 +904,11 @@ def _score_route(
     reviewer: bool,
     previous_group: str | None,
     previous_provider: str | None,
+    capabilities: dict[str, Any] | None = None,
 ) -> tuple[float | None, float, float, list[str], list[str], bool]:
     reasons: list[str] = []
+    if capabilities is None:
+        capabilities = _route_capabilities(route, catalog)
     if route.get("enabled") is not True or route.get("controller") is True:
         return None, 0.0, 0.0, reasons, ["disabled or controller route"], False
     available, availability_reason = _route_available(route, catalog, state)
@@ -783,8 +956,10 @@ def _score_route(
             ["critical task requires an explicitly critical-eligible route"],
             False,
         )
-    if reviewer and route.get("writer_only"):
-        return None, 0.0, 0.0, reasons, ["writer-only route"], False
+    if reviewer and not capabilities["review_capable"]:
+        return None, 0.0, 0.0, reasons, ["route is not reviewer-capable"], False
+    if not reviewer and not capabilities["writer_capable"]:
+        return None, 0.0, 0.0, reasons, ["route is not writer-capable"], False
     if duration_minutes < int(route.get("min_duration_minutes", 0)):
         return None, 0.0, 0.0, reasons, ["delegation overhead exceeds task size"], False
     if latency_priority and route.get("remote"):
@@ -918,6 +1093,7 @@ def _recommendation(
     reasons: list[str],
     catalog: dict[str, Any],
     execution_eligible: bool,
+    derivation: dict[str, Any],
 ) -> dict[str, Any]:
     model = catalog["models"][route["model"]]
     return {
@@ -937,10 +1113,12 @@ def _recommendation(
         "quality_score": quality_score,
         "adaptive_score": adaptive_score,
         "score": score,
-        "argv_prefix": route.get("argv_prefix", []),
+        "argv_prefix": route["argv_prefix"],
+        "permission_mode": derivation["permission_mode"],
         "reasons": reasons,
         "quality_evidence": model.get("evidence"),
         "execution_eligible_if_separately_authorized": execution_eligible,
+        **derivation["capabilities"],
     }
 
 
@@ -948,13 +1126,28 @@ def _rank_routes(
     task_class: str,
     catalog: dict[str, Any],
     state: dict[str, Any],
+    route_derivations: dict[str, dict[str, Any]] | None = None,
     **inputs: Any,
 ) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
     ranked: list[dict[str, Any]] = []
     excluded: dict[str, list[str]] = {}
+    derivations = (
+        _route_derivations(catalog)
+        if route_derivations is None
+        else route_derivations
+    )
     for route in catalog["routes"]:
+        derivation = derivations[route["id"]]
+        capabilities = derivation["capabilities"]
         score, quality_score, adaptive_score, reasons, exclusion, execution_eligible = (
-            _score_route(route, task_class, catalog, state, **inputs)
+            _score_route(
+                route,
+                task_class,
+                catalog,
+                state,
+                capabilities=capabilities,
+                **inputs,
+            )
         )
         if score is None:
             excluded[route["id"]] = exclusion
@@ -968,6 +1161,7 @@ def _rank_routes(
                 reasons,
                 catalog,
                 execution_eligible,
+                derivation,
             )
         )
     if not ranked:
@@ -1051,6 +1245,7 @@ def grabowski_coding_agent_catalog(include_disabled: bool = False) -> dict[str, 
     include_disabled_value = _strict_bool(include_disabled, "include_disabled")
     catalog, validation = _load_catalog()
     state = _load_state()
+    route_derivations = _route_derivations(catalog)
     routes_by_model: dict[str, list[dict[str, Any]]] = {
         model_id: [] for model_id in catalog["models"]
     }
@@ -1065,6 +1260,10 @@ def grabowski_coding_agent_catalog(include_disabled: bool = False) -> dict[str, 
                 "tier": route.get("tier"),
                 "quota_pools": route["quota_pools"],
                 "disabled_reason": route.get("disabled_reason"),
+                "permission_mode": route_derivations[route["id"]][
+                    "permission_mode"
+                ],
+                **route_derivations[route["id"]]["capabilities"],
             }
         )
     models = []
@@ -1175,6 +1374,7 @@ def grabowski_coding_agent_route(
             "catalog_sha256": validation["catalog_sha256"],
             "automatic_execution_authorized": False,
         }
+    route_derivations = _route_derivations(catalog)
     common = {
         "changed_files": changed_value,
         "duration_minutes": duration_value,
@@ -1182,13 +1382,16 @@ def grabowski_coding_agent_route(
         "risk_flags": flags,
         "latency_priority": latency_value,
     }
+    task = catalog["task_classes"][task_value]
+    primary_is_reviewer = task.get("independent_review") is True
     ranked, excluded = _rank_routes(
         task_value,
         catalog,
         state,
-        reviewer=False,
+        reviewer=primary_is_reviewer,
         previous_group=None,
         previous_provider=None,
+        route_derivations=route_derivations,
         **common,
     )
     if not ranked:
@@ -1210,7 +1413,6 @@ def grabowski_coding_agent_route(
         and candidate["quality_class"] == primary["quality_class"]
     ]
     reviewers: list[dict[str, Any]] = []
-    task = catalog["task_classes"][task_value]
     review_required = review_value or bool(task.get("critical"))
     if review_required:
         review_task = (
@@ -1223,6 +1425,7 @@ def grabowski_coding_agent_route(
             reviewer=True,
             previous_group=primary["independence_group"],
             previous_provider=primary["provider_family"],
+            route_derivations=route_derivations,
             **common,
         )
         if candidates:
@@ -1238,6 +1441,7 @@ def grabowski_coding_agent_route(
         "decision": "route",
         "catalog_sha256": validation["catalog_sha256"],
         "task_class": task_value,
+        "primary_role": "reviewer" if primary_is_reviewer else "writer",
         "input": {
             "changed_files": changed_value,
             "duration_minutes": duration_value,
