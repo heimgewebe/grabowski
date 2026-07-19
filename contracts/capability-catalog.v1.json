@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "0965cde817e8a53e759e250a40188677663d067f26c0751377e9ab2463f34cdd",
+  "capability_source_sha256": "6f0e402bdf3c3f017e82be36d5f91d98f635e15cef45c9b1aeeeb7c2349179c0",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "2c47105e3c8ecbb2fa715edab91920c1911a6397c4fc90d6e621306d0c1806bc",
+  "contract_sha256": "fdc92f471a9540d22426a7b6a3f0261cf53fed1ead52b1c1b5adce02493fa81c",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1769,6 +1769,21 @@
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_role_retry"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Start one operator-bound replacement writer after a proven terminal failure.",
+      "effects": [
+        "task-start",
+        "receipt-create",
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_writer_handoff",
+      "purpose": "Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence.",
+      "read_only": false,
+      "reversibility": "preserved-worktree-and-receipts",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_writer_handoff"
     },
     {
       "category": "agent-workspace",

@@ -167,6 +167,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_workspace_attach` | agent-workspace | yes | low | Return the exact attach command for an existing non-authoritative tmux workspace UI. |
 | `grabowski_agent_workspace_collect` | agent-workspace | no | high | Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt. |
 | `grabowski_agent_workspace_role_retry` | agent-workspace | no | high | Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot. |
+| `grabowski_agent_workspace_writer_handoff` | agent-workspace | no | high | Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence. |
 | `grabowski_agent_workspace_close` | agent-workspace | no | high | Close one collected workspace while preserving its branch and writer worktree. |
 | `grabowski_agent_workspace_observe` | agent-workspace | yes | low | Read one bounded immutable workspace event timeline and emit a facts/inferences/proposals process report. |
 | `grabowski_agent_workspace_optimize` | agent-workspace | yes | low | Derive advisory cross-workspace optimization proposals from at least two immutable reports. |
