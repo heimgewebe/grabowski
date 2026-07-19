@@ -12,7 +12,7 @@ Synthese: Wenn ChatGPT ein einzelner Griff verwehrt ist, wird genau dieser Griff
 
 Dieses Protokoll legt fest, wie mit blockierten ChatGPT/Grabowski-Operationen umzugehen ist, ohne ChatGPT als Operator abzugeben.
 
-Es etabliert keinen neuen Privilegienpfad, keine dauerhafte Agentenautonomie und keinen Ersatz fuer bestehende Grabowski-Policies. Es beschreibt eine Betriebsregel: direkt ausfuehren, falls eng genug; sonst einen einzelnen Griff abgeben; danach Ergebnis pruefen und wieder aufnehmen.
+Es etabliert keinen neuen Privilegienpfad, keine dauerhafte Agentenautonomie und keinen Ersatz fuer bestehende Grabowski-Policies. Es beschreibt eine Betriebsregel: ChatGPT/Grabowski fuehrt autoritative Arbeit immer direkt aus. Nur ein technisch blockierter Einzelgriff darf als begrenzter Micro-Handoff ausgefuehrt werden; externe Modelle duerfen darueber hinaus ausschliesslich beraten, reviewen oder einen ausdruecklich angeforderten isolierten Kontrast liefern.
 
 ## Nutzer-Eskalationsgrenze
 
@@ -63,25 +63,24 @@ Die kleinste Handlung muss beantworten:
 Danach wird nach Aufgabenklasse geroutet.
 
 4. **ChatGPT Operator**
-   - Standard fuer alle Lanes: Captain, Writer, Tests, kritischen Review, Integration und Recovery.
-   - Ein gemeinsamer Operator-Kontext ist der Normalfall; der Workspace erzeugt keine Kopien dieses ChatGPT-Kontexts.
-   - Der Operator delegiert nur opt-in, wenn ein Helfer mehr Skalierung, unabhaengigen Kontrast oder einen Kapazitaets-Fallback liefert.
-   - Der Operator bleibt fuer Scope, Receipts, Tests, Commit, Push, Merge und Deploy verantwortlich.
+   - Autoritativer Standard fuer alle Lanes und jede Aufgabengroesse: Captain, Writer, Tests, kritischer Review, Integration, Merge, Deployment, Closeout und Recovery.
+   - Ein gemeinsamer Operator-Kontext ist der Normalfall; grosse Arbeit wird zerlegt und isoliert, aber nicht wegen Umfang oder Kapazitaet an einen externen Writer abgegeben.
+   - Der Operator bleibt fuer Livezustand, Scope, Planung, Aenderung, Receipts, Tests und jede Wirkung verantwortlich.
 
-5. **Delegierte Coding-Agenten**
-   - Externe Coding-Agenten sind standardmaessig aus; Delegation ist opt-in.
-   - Prioritaet bei belegtem Delegationsnutzen: **Claude -> Codex -> agy -> Cline**.
-   - Groessere Implementierungspakete enden nach Diff, Test oder Stop-Bericht.
-   - Default: kein Commit, kein Push, kein Merge.
+5. **Externe Review- und Kontrastagenten**
+   - Externe Modelle besitzen keine autoritative Writer-Rolle und keinen Kapazitaets-Fallback.
+   - Zulassige Rollen sind unabhaengiger Review sowie ausdruecklich angeforderte isolierte Kontrast- oder Wettbewerbsprogrammierung.
+   - Auswahlprioritaet innerhalb dieser beratenden Rollen: **Claude -> Codex -> agy -> Cline**.
+   - Ergebnisse bleiben advisory-only: keine automatische Patchuebernahme, kein Commit, kein Push, kein Merge und kein Deploy.
 
-6. **agy print / Ollama API**
-   - `agy --print` ist nach dem Operator ein Helfer fuer schnelle leichte Denk-, Sortier- und Klassifikationsgriffe.
-   - Ollama API mit qwen coder ist Standard fuer lokale Mikro-Reasoning- und Shell-Vorschlagsgriffe ohne Cloud.
-   - Beide erzeugen kurze Receipts; sie treffen keine Merge-, Push- oder Deploy-Entscheidungen.
+6. **agy print / lokale KI**
+   - `agy --print` und lokale Modelle duerfen kurze beratende Denk-, Sortier- oder Kontrastgriffe liefern.
+   - Sie sind weder Standardpfad fuer direkte Arbeit noch Ersatz bei grossem Umfang.
+   - Jeder Griff endet mit einem begrenzten Receipt; Entscheidungen und Umsetzung bleiben bei ChatGPT/Grabowski.
 
-7. **Claude Review**
-   - Claude liefert nach dem Operator unabhaengigen Kontrast fuer Architektur-, Sicherheits- oder Review-Fragen.
-   - Default: lesen, bewerten, Risiken benennen; keine Mutation.
+7. **Unabhaengiger Review**
+   - Externe Reviewer pruefen nach einem operatorseitigen Plan, Diff oder Ergebnis Architektur, Sicherheit, Quellen, Failure Paths und Tests.
+   - Default: lesen, bewerten, Risiken benennen; Befunde bleiben bis zur direkten Pruefung durch den Operator beratend.
 
 8. **tmux / agy Session**
    - tmux ist Standard fuer vorhandene Sessions, Capture und Resume-Kontexte.
@@ -103,7 +102,7 @@ Danach wird nach Aufgabenklasse geroutet.
 | Status/Health blockiert | engeres Typed Tool oder Micro-Task | geringes Risiko, sofort pruefbar | Status JSON oder Logtail |
 | Repo-/Branch-Lage fuer Zielrepo unklar | Steuerboard operator report | leichtes read-only Lagebild ohne Freigabe | operator-report JSON, nur zielrelevante Felder |
 | kurzer Shell-Griff blockiert | Grabowski Micro-Task | bleibt unter Grabowski-Audit | task_id, status, logs |
-| komplexer Code-/Repo-Slice | ChatGPT Operator; delegiert Claude -> Codex -> agy -> Cline | Operator haelt Scope und Integration, Helfer liefern Skalierung oder Kontrast | diff, changed files, Tests |
+| komplexer Code-/Repo-Slice | ChatGPT/Grabowski direkt | Auch grosse Implementierungen bleiben operatorseitig; externe Modelle duerfen nur Review oder ausdruecklichen Kontrast liefern | diff, changed files, Tests |
 | lokaler Patch aus Chat/Artefakt | operator_patch_relay.py | prueft und wendet lokal mit Head- und Dirty-Gates an | JSON-Receipt plus Git-Diff |
 | Review-/Architekturunsicherheit | Claude Review | bessere Kontrastpruefung | Review mit konkreten Befunden |
 | interaktive Sessionfrage | tmux capture, agy bei besserem Resume | Resume-naehe | Capture-Auszug, naechste Eingabe |
@@ -196,31 +195,31 @@ Freie Fantasietypen sind ungueltig. Ein fehlgeschlagener Resource-Key ist kein P
 
 ### ChatGPT Operator
 
-ChatGPT ist nicht eine weitere Workspace-Rolle, sondern der uebergeordnete und standardmaessige Ausfuehrer aller Lanes. Der Operator bearbeitet Codeaenderungen, Tests, Integration, kritischen Selbstreview und Recovery mit einem gemeinsamen Gesamtkontext selbst. Agent Workspace ist ein optionales Isolations- und Delegationsinstrument, kein Pflichtpfad und keine Vervielfaeltigung des aktuellen ChatGPT-Modells.
+ChatGPT/Grabowski ist der autoritative Ausfuehrer aller Lanes und aller Aufgabengroessen. Der Operator prueft den Livezustand, plant, programmiert, testet, integriert, reviewed kritisch, merged, deployt und schliesst ab. Ein Workspace darf Isolation liefern, aber keinen externen Primaer-Writer erzeugen.
 
 ### Claude
 
-Claude ist der primaere delegierte Coding-Agent und zugleich ein unabhaengiger Review- und Architekturhelfer. Claude soll schwierige Invarianten, Sicherheitslogik und Alternativen pruefen. Claude ist nicht der Standardgriff fuer schnelle Shell-Aktionen.
+Claude ist eine bevorzugte unabhaengige Review- und Urteilsroute fuer schwierige Invarianten, Sicherheitslogik, Architektur und Quellen. Mutierende Nutzung ist nur als ausdruecklich angeforderter, isolierter Kontrast erlaubt; das Resultat bleibt advisory-only.
 
 ### Codex
 
-Codex ist der zweite delegierte Helfer fuer komplexe Code- und Repo-Slices. Der richtige Modus ist `exec` oder `review`: begrenzter Scope, kein Commit, kein Push, Stop nach Diff oder Test.
+Codex ist eine Review- und Kontrastroute fuer Code- und Repo-Slices. `review` ist der Normalfall; ein mutierender Gegenentwurf muss isoliert, ausdruecklich angefordert und auf Diff/Test begrenzt sein. Er besitzt keine Integrationsautoritaet.
 
 ### agy
 
-agy ist der dritte delegierte Coding-Agent und nach dem Operator ein Helfer fuer schnelle leichte One-Shots per `agy --print`. Fuer interaktive Arbeitsraeume und Resume ist agy nur dann besser als tmux, wenn der Ruecknahmebeleg klarer ist.
+agy vereinheitlicht externe Review- und Kontrastrouten und kann kurze beratende One-Shots liefern. Es ist kein Kapazitaetsersatz fuer direkte Operatorarbeit und darf keine autoritative Writerrolle erzeugen.
 
 ### Cline
 
-Cline ist der vierte delegierte Coding-Agent und wird nur genutzt, wenn Claude, Codex und agy nicht geeignet oder nicht verfuegbar sind. Auch Cline erhaelt begrenzten Scope und keine automatische Commit-, Push-, Merge- oder Deploy-Autoritaet.
+Cline ist eine nachrangige Review- oder Kontrastroute, wenn die bevorzugten Wege nicht geeignet sind. Auch hier bleiben Scope, Patchuebernahme und alle Wirkungen beim Operator.
 
 ### Lokale KI / Goose / Ollama
 
-Ollama ist Standard fuer lokale Mikro-Reasoning-Aufgaben ueber die HTTP API, bevorzugt mit qwen coder. Lokale KI darf nicht zum heimlichen Daueroperator werden.
+Lokale Modelle duerfen als begrenztes Hilfslicht fuer Review, Klassifikation oder Kontrast dienen. Sie werden nicht zum Daueroperator oder Primaer-Writer.
 
 ### Aider
 
-Lokale Patchdateien sollen zuerst ueber `tools/operator_patch_relay.py` laufen. Aider bleibt ein Kandidat fuer Patch-Slices. Aider wird gegen Codex anhand von Diff-Qualitaet, Scope-Treue und Testbelegen verglichen, nicht anhand von Versprechen.
+Lokale Patchdateien laufen zuerst ueber `tools/operator_patch_relay.py`. Aider darf hoechstens einen isolierten Kontrastpatch erzeugen; ChatGPT/Grabowski prueft und uebernimmt ihn gegebenenfalls selbst.
 
 ## Risikoklassen
 
@@ -264,4 +263,4 @@ Dieses Protokoll etabliert nicht:
 
 ## Kurzform
 
-Grabowski bleibt die Hand. ChatGPT bedient standardmaessig alle Lanes mit einem gemeinsamen Kontext. Externe Coding-Agenten sind opt-in und folgen bei belegtem Nutzen Claude, Codex, agy und Cline. Lokale KI bleibt Hilfslicht.
+Grabowski bleibt die Hand. ChatGPT fuehrt jede autoritative Arbeit direkt aus, auch grosse. Externe Modelle sind auf unabhaengigen Review und ausdruecklich angeforderten isolierten Kontrast beschraenkt; lokale KI bleibt Hilfslicht.

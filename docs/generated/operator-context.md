@@ -9,16 +9,16 @@ This document describes the repository contract. Current runtime state must be r
 - Name: `Operator Relay v0`
 - Source: `docs/blocked-action-protocol-v0.md`
 - Control loop: typed Grabowski tool first; if blocked, one bounded Grabowski Micro-Task; then read a receipt before deciding the next step.
-- Execution priority: ChatGPT operator first; delegated coding agents follow Claude, Codex, agy, then Cline.
-- Workspace routing: use direct operator execution for small low-risk edits; use isolated role evidence for long, risky, parallel or state-uncertain work.
-- External programming: at most two opt-in competitor/contrast candidates may challenge the primary approach; their patches remain advisory and are never applied or selected automatically.
-- Operator-first work: task decomposition, bounded code changes, integration, critical self-review and recovery.
-- Complex code task: the operator remains integrator; high-value design spaces may add bounded Claude/agy competition or contrast before the normal Writer, Tests and Review path.
-- Quick light reasoning: operator first, then agy `--print` when delegation adds value.
-- Local micro reasoning: Ollama API with qwen coder.
+- Execution priority: ChatGPT/Grabowski performs authoritative work; external review or contrast selection follows Claude, Codex, agy, then Cline.
+- Workspace routing: authoritative implementation stays with the direct ChatGPT/Grabowski operator for every task size.
+- External programming: agents are limited to explicit advisory contrast or competition; their patches are never applied or selected automatically.
+- Operator-first work: state inspection, planning, all code changes, tests, integration, merge, deployment and closeout.
+- Complex code task: the operator remains the only authoritative writer; independent agents may review or compare an alternative after the operator plan or candidate exists.
+- Quick light reasoning: ChatGPT operator directly.
+- Local micro reasoning: ChatGPT operator directly.
 - Patch file relay: local patch files use `tools/operator_patch_relay.py` for check/apply receipts before user manual execution.
-- Review: operator first; Claude provides independent architecture and safety contrast.
-- Session: tmux first; agy only when available and better for resume.
+- Review: operator verifies directly; Claude may provide independent architecture and safety findings.
+- Session: direct operator context first; tmux or agy may preserve a bounded advisory session when useful.
 - Steuerboard: `operator report` is a lightweight read-only repo-state context signal; no separate trial/noise logging; never an approval gate.
 
 ## Contract integrity
@@ -162,21 +162,21 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_gui_worker_status` | gui-worker | yes | low | Observe one isolated GUI worker and reconcile terminal leases. |
 | `grabowski_gui_worker_stop` | gui-worker | no | medium | Stop one isolated GUI worker and clean ephemeral XDG state. |
 | `grabowski_gui_worker_list` | gui-worker | yes | low | List current or historical GUI workers with fresh read-only active observation. |
-| `grabowski_agent_workspace_create` | agent-workspace | no | high | Create one task-bound four-pane tmux workspace with one isolated writer worktree. |
+| `grabowski_agent_workspace_create` | agent-workspace | no | high | Create one explicitly requested advisory contrast workspace while ChatGPT/Grabowski remains the authoritative writer. |
 | `grabowski_agent_workspace_status` | agent-workspace | yes | low | Derive workspace state from Grabowski tasks, Git and tmux without treating pane state as success. |
 | `grabowski_agent_workspace_attach` | agent-workspace | yes | low | Return the exact attach command for an existing non-authoritative tmux workspace UI. |
-| `grabowski_agent_workspace_collect` | agent-workspace | no | high | Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt. |
+| `grabowski_agent_workspace_collect` | agent-workspace | no | high | Freeze advisory contrast evidence, run read-only tests and review, and write a head- and diff-bound receipt. |
 | `grabowski_agent_workspace_role_retry` | agent-workspace | no | high | Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot. |
-| `grabowski_agent_workspace_writer_handoff` | agent-workspace | no | high | Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence. |
+| `grabowski_agent_workspace_writer_handoff` | agent-workspace | no | high | Start one operator-bound replacement contrast writer after a proven terminal failure without granting authoritative writer status. |
 | `grabowski_agent_workspace_close` | agent-workspace | no | high | Close one collected workspace while preserving its branch and writer worktree. |
 | `grabowski_agent_workspace_observe` | agent-workspace | yes | low | Read one bounded immutable workspace event timeline and emit a facts/inferences/proposals process report. |
 | `grabowski_agent_workspace_optimize` | agent-workspace | yes | low | Derive advisory cross-workspace optimization proposals from at least two immutable reports. |
 | `grabowski_agent_workspace_cleanup_plan` | agent-workspace | yes | low | Inventory closed workspace checkout cleanup eligibility while preserving manifests, receipts and event logs. |
 | `grabowski_agent_workspace_reconcile_stale` | agent-workspace | no | high | Mark one provably inactive stale workspace abandoned without stopping tasks, releasing resources or removing its checkout. |
 | `grabowski_agent_workspace_cleanup` | agent-workspace | no | high | Create durable recovery refs and remove one eligible closed writer checkout without deleting workspace evidence. |
-| `grabowski_agent_execution_route` | agent-workspace | yes | low | Recommend a lean R0-R3 direct, isolated, full-workspace, contrast or explicitly fork-gated competition route while keeping parallel writers advisory-only. |
+| `grabowski_agent_execution_route` | agent-workspace | yes | low | Return direct_operator for every authoritative task and optionally describe explicitly requested advisory contrast or competition candidates. |
 | `grabowski_coding_agent_catalog` | agent-workspace | yes | low | Read the validated canonical coding-model, harness, route and quota inventory without probing or executing external agents. |
-| `grabowski_coding_agent_route` | agent-workspace | yes | low | Recommend one zero-marginal-cost, quota-aware coding route and provider-independent reviewer without granting dispatch or execution authority. |
+| `grabowski_coding_agent_route` | agent-workspace | yes | low | Keep every authoritative implementation on grabowski-primary and rank external routes only for independent review. |
 | `grabowski_agent_competition_start` | agent-workspace | no | medium | Start one durable advisory-only external competitor or contrast programmer against a commit-bound context packet with a frozen runner and isolated provider workspace. |
 | `grabowski_agent_competition_status` | agent-workspace | yes | low | Read one external candidate task and validate its immutable advisory receipt. |
 | `grabowski_agent_competition_compare` | agent-workspace | yes | low | Generate a deterministic contrast matrix, consensus signals and validation opportunities from exactly two bound external candidates. |

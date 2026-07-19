@@ -1689,7 +1689,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Create one four-role tmux workspace with one isolated durable writer task.",
+      "description": "Create one explicit advisory contrast workspace; direct work stays authoritative.",
       "effects": [
         "worktree-create",
         "branch-create",
@@ -1698,7 +1698,7 @@
         "lease-create"
       ],
       "id": "grabowski_agent_workspace_create",
-      "purpose": "Create one task-bound four-pane tmux workspace with one isolated writer worktree.",
+      "purpose": "Create one explicitly requested advisory contrast workspace while ChatGPT/Grabowski remains the authoritative writer.",
       "read_only": false,
       "reversibility": "close-and-preserved-worktree",
       "risk_class": "high",
@@ -1737,7 +1737,7 @@
         "task-state-refresh"
       ],
       "id": "grabowski_agent_workspace_collect",
-      "purpose": "Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt.",
+      "purpose": "Freeze advisory contrast evidence, run read-only tests and review, and write a head- and diff-bound receipt.",
       "read_only": false,
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
@@ -1767,7 +1767,7 @@
         "task-state-refresh"
       ],
       "id": "grabowski_agent_workspace_writer_handoff",
-      "purpose": "Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence.",
+      "purpose": "Start one operator-bound replacement contrast writer after a proven terminal failure without granting authoritative writer status.",
       "read_only": false,
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
@@ -1859,10 +1859,10 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Recommend a lean R0-R3 route without authorizing parallel writers.",
+      "description": "Keep implementation direct and optionally recommend advisory contrast.",
       "effects": [],
       "id": "grabowski_agent_execution_route",
-      "purpose": "Recommend a lean R0-R3 direct, isolated, full-workspace, contrast or explicitly fork-gated competition route while keeping parallel writers advisory-only.",
+      "purpose": "Return direct_operator for every authoritative task and optionally describe explicitly requested advisory contrast or competition candidates.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -1881,10 +1881,10 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Recommend one zero-marginal-cost coding route without authorizing execution.",
+      "description": "Keep authoritative implementation direct; rank agents only for review.",
       "effects": [],
       "id": "grabowski_coding_agent_route",
-      "purpose": "Recommend one zero-marginal-cost, quota-aware coding route and provider-independent reviewer without granting dispatch or execution authority.",
+      "purpose": "Keep every authoritative implementation on grabowski-primary and rank external routes only for independent review.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -1992,60 +1992,67 @@
     "name": "Operator Relay v0",
     "operator_first_for": [
       "task_decomposition",
-      "bounded_code_change",
+      "all_code_changes",
+      "tests",
       "integration",
       "critical_self_review",
+      "merge",
+      "deployment",
+      "closeout",
       "recovery"
     ],
     "routing_roles": {
       "audit": "grabowski_git",
-      "complex_code_task": "chatgpt_operator_adaptive_workspace_external_competition_when_high_value",
-      "local_micro_reasoning": "ollama_api_qwen_coder",
+      "complex_code_task": "chatgpt_operator_direct_external_review_or_explicit_contrast",
+      "local_micro_reasoning": "chatgpt_operator_direct",
       "memory_prioritization": "bureau",
-      "patch_fallback": "aider_no_auto_commit",
+      "patch_fallback": "chatgpt_operator_direct",
       "patch_file_relay": "operator_patch_relay",
-      "quick_light_reasoning": "chatgpt_operator_external_opt_in_agy_print",
+      "quick_light_reasoning": "chatgpt_operator_direct",
       "repo_state_context": "steuerboard_operator_report",
-      "security_or_architecture_review": "chatgpt_operator_external_opt_in_claude",
-      "session_resume": "tmux_first_agy_when_useful",
+      "security_or_architecture_review": "chatgpt_operator_plus_external_independent_review",
+      "session_resume": "chatgpt_operator_direct",
       "shell_or_git_grip": "grabowski_task"
     },
-    "rule": "Keep ChatGPT as operator and execute bounded work first. Delegate only when a helper adds useful scale or independent contrast.",
+    "rule": "ChatGPT/Grabowski performs authoritative work directly at every scale. External agents are advisory reviewers or explicitly requested isolated contrast programmers only.",
     "workspace_execution_model": {
       "automatic_patch_apply": false,
       "automatic_winner_selection": false,
-      "default": "adaptive_operator_routing",
+      "capacity_fallback_to_external_writer": false,
+      "default": "direct_operator",
       "delegation_triggers": [
-        "high_novelty_design_space",
-        "independent_contrast",
-        "multiple_plausible_implementations",
-        "security_schema_or_concurrency_risk",
-        "capacity_fallback"
+        "independent_review",
+        "security_or_architecture_review",
+        "explicit_contrast_request",
+        "multiple_plausible_implementations_for_comparison"
       ],
       "direct_operator_for": [
-        "small_low_risk_fix",
-        "simple_document_change",
-        "bounded_deterministic_edit"
-      ],
-      "external_agent_delegation": "adaptive_opt_in",
-      "external_candidate_authority": "advisory_only",
-      "external_programming_modes": [
-        "competitor",
-        "contrast"
-      ],
-      "full_workspace_for": [
+        "all_authoritative_implementation",
+        "all_task_sizes",
         "runtime_or_security_change",
         "long_or_multi_file_implementation",
         "parallel_or_foreign_state",
         "connector_or_execution_state_uncertainty"
       ],
+      "external_agent_delegation": "review_or_explicit_contrast_only",
+      "external_candidate_authority": "advisory_only",
+      "external_primary_writer_forbidden": true,
+      "external_programming_modes": [
+        "competitor",
+        "contrast"
+      ],
+      "full_workspace_for": [],
       "lane_owner": "chatgpt_operator",
       "max_external_candidates": 2,
       "operator_self_serves_lanes": [
         "captain",
         "writer",
         "tests",
-        "review"
+        "review",
+        "integration",
+        "merge",
+        "deployment",
+        "closeout"
       ],
       "role_evidence_isolated": true,
       "workspace_not_universal": true
@@ -2458,6 +2465,10 @@
       {
         "module": "grabowski_juno_storage",
         "source": "src/grabowski_juno_storage.py"
+      },
+      {
+        "module": "grabowski_operator_relay",
+        "source": "src/grabowski_operator_relay.py"
       }
     ]
   },
@@ -2465,11 +2476,11 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "2eff269804f2bae21634f5c6929db36c7a165722812659b28df777f16340cafa"
+      "sha256": "7eeab5c1947fd56f64b297bcd5ccab2bcb182feca5310328be89cfa7dc9e9497"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "6f0e402bdf3c3f017e82be36d5f91d98f635e15cef45c9b1aeeeb7c2349179c0"
+      "sha256": "78b0f12335f5ca124ade07c69d2be1256432a8df0ec16dbea94f576fee66635c"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2477,14 +2488,14 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "1add9fdbb62bceb194a539c647d84ff6ebe738fb3de46a54df2b3e768e2de47c"
+      "sha256": "db5c07d232cadf76644ef62f91a0f62136fc747f6e0fce781a4562944f6f9361"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
-      "src/grabowski_agent_competition.py": "a73185abdcd26b6bad07b1fc5511182b820fd0e7b6eee3fbb9b558f5df83f442",
+      "src/grabowski_agent_competition.py": "d570ae640c971ff1487db9e28bce19f42caa69f414eb2cb91ffe3be3bfc60c5d",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "8bf6d2f6906360715b1b87e2cc736ddb0f3d8ec5b8e531d867f886c4a117d5eb",
+      "src/grabowski_agent_workspace.py": "2515452d674a346d62aadf411af4dd85704ee5836fccfb61fce17b5e8f082789",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "040e2272ff0345608f512ccc59b1bec6997d3b39da4e9caceaca967c03d6b85d",
@@ -2494,11 +2505,11 @@
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_intake.py": "1a130619c17e4a4b7b06134cd71dac98b738dac1b5299ce082737b251a20891f",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "6f0e402bdf3c3f017e82be36d5f91d98f635e15cef45c9b1aeeeb7c2349179c0",
+      "src/grabowski_capabilities.py": "78b0f12335f5ca124ade07c69d2be1256432a8df0ec16dbea94f576fee66635c",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "e44d25d955ab35efbfe3ec381f84395f070d37fcd8726a0488269a47137ade8f",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
-      "src/grabowski_coding_agent_router.py": "10c6c69f6c879693239abcea581d01a27dbd84af7cbbd78c03d06d919cc7f5d6",
+      "src/grabowski_coding_agent_router.py": "d6f11515407697cec9f71be7c63f86e593161af5ab57a11bb0ec6b2c69fbbac0",
       "src/grabowski_command_identity.py": "03bf7193851846d1f5b4d1bfe71a787937e424804f875ba4e021233ddbc842c9",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_convergence.py": "03ea75eb190ac08f29c4ec6c5ab1a14a631ce7c0cce4956ed6f437c492a6a635",
@@ -2510,12 +2521,13 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "80c501e6a9519522a1a8ad9cf6b138b6eefc56e29e387d5fc1e593355bf8a514",
+      "src/grabowski_mcp.py": "2b5d514ee2f029173f8093a7149939b838b99f223f4715571e2a9328bd01286d",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
       "src/grabowski_operator.py": "674c070df71d3538e6dd8edc6e373a57563650015a6d8bedae91133e4b486666",
       "src/grabowski_operator_obligation.py": "a18dd9e4c9b2915aecdf51897b38da08dc1b557541e823e9fb3bd7a0e470c085",
+      "src/grabowski_operator_relay.py": "278ca5a0618967a582e1a6da12a295e6618ee72ca19547fa34ac0931a6ff4fae",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "ea0cd51630be7362a985ed0a56288d521c9d3b7341218d656306643e6c27a498",
       "src/grabowski_privileged_broker.py": "605e8f7b7946c5907c3844e47451b63497ad3948eac92804e28be44fb4c30ffa",

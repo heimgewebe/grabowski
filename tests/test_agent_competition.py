@@ -286,10 +286,13 @@ class AgentCompetitionTests(unittest.TestCase):
             decision_fork=True,
             architecture_hypotheses=2,
         )
-        self.assertEqual(competitive["execution_mode"], "workspace_with_competition")
+        self.assertEqual(competitive["execution_mode"], "direct_operator")
         self.assertEqual(competitive["risk_tier"], "R3")
-        self.assertEqual(competitive["route_policy_version"], "workspace-routing-v2.1")
+        self.assertEqual(competitive["route_policy_version"], "direct-first-routing-v3.0")
         self.assertFalse(competitive["automatic_winner_selection"])
+        self.assertTrue(competitive["direct_implementation_required"])
+        self.assertTrue(competitive["external_primary_writer_forbidden"])
+        self.assertFalse(competitive["full_workspace"])
         self.assertEqual(len(competitive["external_candidates"]), 2)
 
 
@@ -308,8 +311,8 @@ class AgentCompetitionTests(unittest.TestCase):
             novelty="low",
             available_external_agents=["claude"],
         )
-        self.assertEqual(four_files["execution_mode"], "isolated_worktree")
-        self.assertEqual(six_files["execution_mode"], "isolated_worktree")
+        self.assertEqual(four_files["execution_mode"], "direct_operator")
+        self.assertEqual(six_files["execution_mode"], "direct_operator")
         self.assertEqual(four_files["risk_tier"], "R1")
         self.assertFalse(four_files["full_workspace"])
 
@@ -329,11 +332,9 @@ class AgentCompetitionTests(unittest.TestCase):
             decision_fork=True,
             architecture_hypotheses=2,
         )
-        self.assertEqual(contrast["execution_mode"], "workspace_with_contrast")
+        self.assertEqual(contrast["execution_mode"], "direct_operator")
         self.assertEqual(len(contrast["external_candidates"]), 1)
-        self.assertEqual(
-            competition_route["execution_mode"], "workspace_with_competition"
-        )
+        self.assertEqual(competition_route["execution_mode"], "direct_operator")
         self.assertEqual(len(competition_route["external_candidates"]), 2)
 
     def test_parallelization_candidate_does_not_authorize_or_change_live_route(self) -> None:
@@ -351,8 +352,12 @@ class AgentCompetitionTests(unittest.TestCase):
         )
         self.assertEqual(candidate["score"], baseline["score"])
         self.assertEqual(candidate["execution_mode"], baseline["execution_mode"])
-        self.assertTrue(
+        self.assertFalse(
             candidate["parallel_writer_pilot"]["eligible_for_assessment"]
+        )
+        self.assertIn(
+            "direct-first policy",
+            candidate["parallel_writer_pilot"]["assessment_blockers"][0],
         )
         self.assertFalse(
             candidate["parallel_writer_pilot"]["execution_authorized"]
@@ -1291,7 +1296,7 @@ class AgentCompetitionTests(unittest.TestCase):
             risk_flags=["security"],
             available_external_agents=["claude", "agy"],
         )
-        self.assertEqual(result["execution_mode"], "full_workspace")
+        self.assertEqual(result["execution_mode"], "direct_operator")
         self.assertEqual(result["external_candidates"], [])
 
 
