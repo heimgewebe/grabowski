@@ -60,7 +60,7 @@ def _parse_created_at(value: object) -> tuple[str, float] | None:
     return value, utc.timestamp()
 
 
-def _read_json(
+def read_json_object(
     path: Path, max_bytes: int
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
     flags = os.O_RDONLY | os.O_CLOEXEC
@@ -114,48 +114,56 @@ def _read_json(
     return value, None, digest
 
 
-def _catalog_info(
-    path: Path, canonical_root: Path, legacy_root: Path
-) -> dict[str, Any]:
+def catalog_info(path: Path, canonical_root: Path, legacy_root: Path) -> dict[str, Any]:
+    """Classify one manifest without silently downgrading malformed canonical paths."""
     if path.is_symlink():
         raise CatalogError("manifest_symlink")
     resolved = path.resolve(strict=False)
     canonical = canonical_root.resolve(strict=False)
     legacy = legacy_root.resolve(strict=False)
     stem = _stem(path)
+    canonical_error: str | None = None
     if _bounded(resolved, canonical):
         parts = resolved.relative_to(canonical).parts
         if len(parts) != 4:
-            raise CatalogError("canonical_path_shape_invalid")
-        repo_id, ref, publication_run_id, filename = parts
-        if filename != path.name:
-            raise CatalogError("canonical_filename_mismatch")
-        if "__" not in repo_id:
-            raise CatalogError("canonical_repo_id_invalid")
-        owner, repo = repo_id.split("__", 1)
-        if not _safe_segment(owner) or not _safe_segment(repo):
-            raise CatalogError("canonical_repo_id_invalid")
-        if not _safe_segment(ref) or not _safe_segment(publication_run_id):
-            raise CatalogError("canonical_ref_or_run_invalid")
-        if not stem.startswith(f"{repo_id}__{ref}-"):
-            raise CatalogError("canonical_stem_identity_mismatch")
-        return {
-            "authority": "canonical_publication",
-            "authority_rank": 2,
-            "owner": owner,
-            "repo": repo,
-            "repo_id": repo_id,
-            "ref": ref,
-            "publication_run_id": publication_run_id,
-            "stem": stem,
-        }
-    if _bounded(resolved, legacy):
+            canonical_error = "canonical_path_shape_invalid"
+        else:
+            repo_id, ref, publication_run_id, filename = parts
+            if filename != path.name:
+                canonical_error = "canonical_filename_mismatch"
+            elif "__" not in repo_id:
+                canonical_error = "canonical_repo_id_invalid"
+            else:
+                owner, repo = repo_id.split("__", 1)
+                if not _safe_segment(owner) or not _safe_segment(repo):
+                    canonical_error = "canonical_repo_id_invalid"
+                elif not _safe_segment(ref) or not _safe_segment(publication_run_id):
+                    canonical_error = "canonical_ref_or_run_invalid"
+                elif not stem.startswith(f"{repo_id}__{ref}-"):
+                    canonical_error = "canonical_stem_identity_mismatch"
+                else:
+                    return {
+                        "authority": "canonical_publication",
+                        "authority_rank": 2,
+                        "publication_root": str(canonical_root),
+                        "owner": owner,
+                        "repo": repo,
+                        "repo_id": repo_id,
+                        "ref": ref,
+                        "publication_run_id": publication_run_id,
+                        "stem": stem,
+                    }
+
+    # Legacy manifests are flat by contract.  This narrow direct-child rule
+    # permits overlapping roots without relabelling malformed canonical trees.
+    if _bounded(resolved, legacy) and resolved.parent == legacy:
         repo = _repo_from_stem(stem)
         if not _safe_segment(repo):
             raise CatalogError("legacy_repo_invalid")
         return {
             "authority": "legacy_merges_fallback",
             "authority_rank": 1,
+            "publication_root": str(legacy_root),
             "owner": None,
             "repo": repo,
             "repo_id": None,
@@ -163,6 +171,8 @@ def _catalog_info(
             "publication_run_id": None,
             "stem": stem,
         }
+    if canonical_error is not None:
+        raise CatalogError(canonical_error)
     raise CatalogError("manifest_outside_catalog_roots")
 
 
@@ -265,6 +275,7 @@ def _base_rejection(
                 key: info.get(key)
                 for key in (
                     "authority",
+                    "publication_root",
                     "owner",
                     "repo",
                     "repo_id",
@@ -286,11 +297,11 @@ def inspect_candidate(
     path: Path, canonical_root: Path, legacy_root: Path
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     try:
-        info = _catalog_info(path, canonical_root, legacy_root)
+        info = catalog_info(path, canonical_root, legacy_root)
     except (CatalogError, OSError, RuntimeError) as exc:
         return None, _base_rejection(path, None, str(exc))
 
-    document, error, manifest_sha = _read_json(path, MAX_MANIFEST_BYTES)
+    document, error, manifest_sha = read_json_object(path, MAX_MANIFEST_BYTES)
     if error or document is None:
         rejection = _base_rejection(path, info, f"manifest_{error or 'invalid'}")
         rejection["manifest_sha256"] = manifest_sha
@@ -339,7 +350,7 @@ def inspect_candidate(
     stem = str(info["stem"])
     bundle_health_path = path.parent / f"{stem}{BUNDLE_HEALTH_SUFFIX}"
     output_health_path = path.parent / f"{stem}{OUTPUT_HEALTH_SUFFIX}"
-    bundle_health, bundle_error, _bundle_sha = _read_json(
+    bundle_health, bundle_error, _bundle_sha = read_json_object(
         bundle_health_path, MAX_HEALTH_BYTES
     )
     if bundle_error or bundle_health is None:
@@ -353,7 +364,7 @@ def inspect_candidate(
         rejection["manifest_sha256"] = manifest_sha
         rejection["bundle_health_status"] = bundle_health.get("status")
         return None, rejection
-    output_health, output_error, _output_sha = _read_json(
+    output_health, output_error, _output_sha = read_json_object(
         output_health_path, MAX_HEALTH_BYTES
     )
     if output_error or output_health is None:
@@ -402,6 +413,7 @@ def scan_catalog(canonical_root: Path, legacy_root: Path) -> dict[str, Any]:
         paths.extend(legacy_root.glob(f"*{MANIFEST_SUFFIX}"))
     healthy: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+    rejected_total_count = 0
     identified_repo_ids: set[str] = set()
     for path in sorted(set(paths), key=str):
         record, rejection = inspect_candidate(path, canonical_root, legacy_root)
@@ -414,8 +426,10 @@ def scan_catalog(canonical_root: Path, legacy_root: Path) -> dict[str, Any]:
             identified_repo_ids.add(str(value["repo_id"]))
         if record is not None:
             healthy.append(record)
-        elif rejection is not None and len(rejected) < MAX_REJECTIONS:
-            rejected.append(rejection)
+        elif rejection is not None:
+            rejected_total_count += 1
+            if len(rejected) < MAX_REJECTIONS:
+                rejected.append(rejection)
     healthy.sort(
         key=lambda item: (
             int(item["authority_rank"]),
@@ -432,6 +446,8 @@ def scan_catalog(canonical_root: Path, legacy_root: Path) -> dict[str, Any]:
     return {
         "healthy": healthy,
         "rejected": rejected,
+        "rejected_total_count": rejected_total_count,
+        "rejected_truncated": rejected_total_count > len(rejected),
         "identified_repo_ids": sorted(identified_repo_ids),
         "aliases": aliases,
     }
@@ -477,9 +493,23 @@ def resolve_catalog(
     *,
     repo: str | None = None,
     stem: str | None = None,
+    refs: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     scanned = scan_catalog(canonical_root, legacy_root)
     healthy = list(scanned["healthy"])
+    normalized_refs: tuple[str, ...] | None = None
+    if refs is not None:
+        if not isinstance(refs, (list, tuple)):
+            raise ValueError("refs must be a list or tuple of safe ref names")
+        values: list[str] = []
+        for ref in refs:
+            safe = _safe_segment(ref)
+            if safe is None:
+                raise ValueError("refs must contain only safe ref names")
+            if safe not in values:
+                values.append(safe)
+        normalized_refs = tuple(values)
+        healthy = [item for item in healthy if item.get("ref") in normalized_refs]
     rejected = list(scanned["rejected"])
     aliases = scanned["aliases"]
 
@@ -492,6 +522,8 @@ def resolve_catalog(
             "selected": [],
             "rejected": _matching_rejections(rejected, repo=repo, stem=stem),
             "aliases": aliases,
+            "rejected_total_count": scanned["rejected_total_count"],
+            "rejected_truncated": scanned["rejected_truncated"],
         }
 
     if stem is not None:
@@ -529,6 +561,8 @@ def resolve_catalog(
                 "selected": [selected],
                 "rejected": _matching_rejections(rejected, repo=repo, stem=stem),
                 "aliases": aliases,
+                "rejected_total_count": scanned["rejected_total_count"],
+                "rejected_truncated": scanned["rejected_truncated"],
             }
         return {
             "available": False,
@@ -538,6 +572,8 @@ def resolve_catalog(
             "selected": [],
             "rejected": _matching_rejections(rejected, repo=repo, stem=stem),
             "aliases": aliases,
+            "rejected_total_count": scanned["rejected_total_count"],
+            "rejected_truncated": scanned["rejected_truncated"],
         }
 
     if repo is not None:
@@ -564,6 +600,8 @@ def resolve_catalog(
                 "ambiguous_candidates": [public_candidate(item) for item in ambiguous],
                 "rejected": _matching_rejections(rejected, repo=repo, stem=None),
                 "aliases": aliases,
+                "rejected_total_count": scanned["rejected_total_count"],
+                "rejected_truncated": scanned["rejected_truncated"],
             }
         selected = dict(selected)
         selected["selected"] = True
@@ -574,6 +612,8 @@ def resolve_catalog(
             "selected": [selected],
             "rejected": _matching_rejections(rejected, repo=repo, stem=None),
             "aliases": aliases,
+            "rejected_total_count": scanned["rejected_total_count"],
+            "rejected_truncated": scanned["rejected_truncated"],
         }
 
     selected_records: list[dict[str, Any]] = []
@@ -644,6 +684,8 @@ def resolve_catalog(
         "selected": selected_records,
         "rejected": [*rejected, *selection_rejections][:MAX_REJECTIONS],
         "aliases": aliases,
+        "rejected_total_count": scanned["rejected_total_count"],
+        "rejected_truncated": scanned["rejected_truncated"],
     }
 
 
@@ -703,6 +745,7 @@ def public_candidate(record: dict[str, Any]) -> dict[str, Any]:
             "selected",
             "healthy",
             "authority",
+            "publication_root",
             "owner",
             "repo",
             "repo_id",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -34,6 +35,57 @@ def manifest(
         "artifacts": [{"role": "agent_reading_pack", "path": artifact_path}],
     }
     (base / "manifest.json").write_text(json.dumps(data))
+
+
+def canonical_manifest(
+    publication_root: Path,
+    *,
+    ref: str,
+    run_dir: str,
+    created_at: str,
+) -> Path:
+    repo_id = "heimgewebe__demo"
+    stem = f"{repo_id}__{ref}-max-{run_dir[:8]}-{run_dir[9:13]}"
+    base = publication_root / repo_id / ref / run_dir
+    base.mkdir(parents=True)
+    (base / f"{stem}_merge.agent_reading_pack.md").write_text(ref, encoding="utf-8")
+    (base / f"{stem}_merge.md").write_text(ref, encoding="utf-8")
+    path = base / f"{stem}_merge.bundle.manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "kind": "repoground.bundle.manifest",
+                "run_id": f"{stem}-run",
+                "created_at": created_at,
+                "snapshot_provenance": {
+                    "repositories": [
+                        {
+                            "name": f"{repo_id}__{ref}",
+                            "git_commit": "a" * 40,
+                            "git_dirty": False,
+                        }
+                    ]
+                },
+                "artifacts": [
+                    {
+                        "role": "agent_reading_pack",
+                        "path": f"{stem}_merge.agent_reading_pack.md",
+                    },
+                    {"role": "canonical_md", "path": f"{stem}_merge.md"},
+                    {"role": "output_health"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (base / f"{stem}_merge.bundle_health.post.json").write_text(
+        json.dumps({"status": "pass"}), encoding="utf-8"
+    )
+    (base / f"{stem}_merge.output_health.json").write_text(
+        json.dumps({"verdict": "pass", "run_id": f"{stem}-run"}),
+        encoding="utf-8",
+    )
+    return path
 
 
 class RBLookupTests(unittest.TestCase):
@@ -142,6 +194,61 @@ class RBLookupTests(unittest.TestCase):
                 f"{stem}_merge.agent_reading_pack.md"
             )
         )
+
+    def test_requested_ref_is_selected_before_newer_unrequested_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "demo"
+            repo_path.mkdir()
+            publication_root = root / "pub"
+            main = canonical_manifest(
+                publication_root,
+                ref="main",
+                run_dir="20260718T120000Z-main",
+                created_at="2026-07-18T12:00:00Z",
+            )
+            canonical_manifest(
+                publication_root,
+                ref="feature",
+                run_dir="20260718T130000Z-feature",
+                created_at="2026-07-18T13:00:00Z",
+            )
+            with patch.object(
+                rb.repoground_catalog,
+                "scan_catalog",
+                wraps=rb.repoground_catalog.scan_catalog,
+            ) as scan:
+                got = rb.context(
+                    repo_path,
+                    runner,
+                    {"root": str(repo_path), "branch": "main", "head": "a" * 40},
+                    {"repobrief_publication_root": str(publication_root)},
+                )
+
+        self.assertTrue(got["available"])
+        self.assertEqual(str(main), got["manifest_path"])
+        self.assertEqual("main", got["ref"])
+        self.assertEqual(1, scan.call_count)
+
+    def test_legacy_manifest_reader_rejects_symlink_and_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target.json"
+            target.write_text("{}", encoding="utf-8")
+            for kind in ("symlink", "hardlink"):
+                with self.subTest(kind=kind):
+                    candidate = root / f"{kind}.json"
+                    if kind == "symlink":
+                        candidate.symlink_to(target)
+                    else:
+                        os.link(target, candidate)
+                    parsed, error = rb.read_manifest(candidate)
+                    self.assertIsNone(parsed)
+                    self.assertEqual("manifest_read_error", error["status"])
+                    self.assertEqual(
+                        "symlink" if kind == "symlink" else "hardlinked",
+                        error["reason"],
+                    )
 
     def test_default_bundles_root_still_finds_legacy_repobrief_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
