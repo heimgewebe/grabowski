@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+def operator_relay_protocol() -> dict[str, Any]:
+    """Return the canonical direct-first operator-routing contract."""
+    return {
+        "name": "Operator Relay v0",
+        "doc_path": "docs/blocked-action-protocol-v0.md",
+        "rule": "ChatGPT/Grabowski performs authoritative work directly at every scale. External agents are advisory reviewers or explicitly requested isolated contrast programmers only.",
+        "control_loop": [
+            "typed_grabowski_tool",
+            "grabowski_micro_task",
+            "receipt_before_next_step",
+        ],
+        "execution_priority": [
+            "chatgpt_operator",
+            "claude",
+            "codex",
+            "agy",
+            "cline",
+        ],
+        "coding_agent_priority": [
+            "claude",
+            "codex",
+            "agy",
+            "cline",
+        ],
+        "workspace_execution_model": {
+            "default": "direct_operator",
+            "lane_owner": "chatgpt_operator",
+            "operator_self_serves_lanes": [
+                "captain",
+                "writer",
+                "tests",
+                "review",
+                "integration",
+                "merge",
+                "deployment",
+                "closeout",
+            ],
+            "role_evidence_isolated": True,
+            "workspace_not_universal": True,
+            "direct_operator_for": [
+                "all_authoritative_implementation",
+                "all_task_sizes",
+                "runtime_or_security_change",
+                "long_or_multi_file_implementation",
+                "parallel_or_foreign_state",
+                "connector_or_execution_state_uncertainty",
+            ],
+            "full_workspace_for": [],
+            "external_agent_delegation": "review_or_explicit_contrast_only",
+            "delegation_triggers": [
+                "independent_review",
+                "security_or_architecture_review",
+                "explicit_contrast_request",
+                "multiple_plausible_implementations_for_comparison",
+            ],
+            "external_programming_modes": ["competitor", "contrast"],
+            "max_external_candidates": 2,
+            "external_candidate_authority": "advisory_only",
+            "external_primary_writer_forbidden": True,
+            "capacity_fallback_to_external_writer": False,
+            "automatic_patch_apply": False,
+            "automatic_winner_selection": False,
+        },
+        "operator_first_for": [
+            "task_decomposition",
+            "all_code_changes",
+            "tests",
+            "integration",
+            "critical_self_review",
+            "merge",
+            "deployment",
+            "closeout",
+            "recovery",
+        ],
+        "routing_roles": {
+            "complex_code_task": "chatgpt_operator_direct_external_review_or_explicit_contrast",
+            "quick_light_reasoning": "chatgpt_operator_direct",
+            "local_micro_reasoning": "chatgpt_operator_direct",
+            "shell_or_git_grip": "grabowski_task",
+            "security_or_architecture_review": "chatgpt_operator_plus_external_independent_review",
+            "session_resume": "chatgpt_operator_direct",
+            "memory_prioritization": "bureau",
+            "patch_file_relay": "operator_patch_relay",
+            "patch_fallback": "chatgpt_operator_direct",
+            "audit": "grabowski_git",
+            "repo_state_context": "steuerboard_operator_report",
+        },
+        "does_not_establish": [
+            "new_privileges",
+            "automatic_merge",
+            "automatic_push",
+            "automatic_deploy",
+            "free_shell_as_default_path",
+            "durable_agent_autonomy",
+            "steuerboard_report_action_approval",
+        ],
+    }

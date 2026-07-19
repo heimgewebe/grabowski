@@ -971,7 +971,7 @@ TOOL_PROFILES.update(
     {
         "grabowski_agent_workspace_create": {
             "category": "agent-workspace",
-            "purpose": "Create one task-bound four-pane tmux workspace with one isolated writer worktree.",
+            "purpose": "Create one explicitly requested advisory contrast workspace while ChatGPT/Grabowski remains the authoritative writer.",
             "risk_class": "high",
             "effects": [
                 "worktree-create",
@@ -998,7 +998,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_agent_workspace_collect": {
             "category": "agent-workspace",
-            "purpose": "Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt.",
+            "purpose": "Freeze advisory contrast evidence, run read-only tests and review, and write a head- and diff-bound receipt.",
             "risk_class": "high",
             "effects": ["task-start", "receipt-create", "task-state-refresh"],
             "reversibility": "preserved-worktree-and-receipts",
@@ -1012,7 +1012,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_agent_workspace_writer_handoff": {
             "category": "agent-workspace",
-            "purpose": "Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence.",
+            "purpose": "Start one operator-bound replacement contrast writer after a proven terminal failure without granting authoritative writer status.",
             "risk_class": "high",
             "effects": ["task-start", "receipt-create", "task-state-refresh"],
             "reversibility": "preserved-worktree-and-receipts",
@@ -1078,14 +1078,14 @@ TOOL_PROFILES.update(
         },
         "grabowski_coding_agent_route": {
             "category": "agent-workspace",
-            "purpose": "Recommend one zero-marginal-cost, quota-aware coding route and provider-independent reviewer without granting dispatch or execution authority.",
+            "purpose": "Keep every authoritative implementation on grabowski-primary and rank external routes only for independent review.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",
         },
         "grabowski_agent_execution_route": {
             "category": "agent-workspace",
-            "purpose": "Recommend a lean R0-R3 direct, isolated, full-workspace, contrast or explicitly fork-gated competition route while keeping parallel writers advisory-only.",
+            "purpose": "Return direct_operator for every authoritative task and optionally describe explicitly requested advisory contrast or competition candidates.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",
