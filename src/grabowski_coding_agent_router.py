@@ -187,6 +187,58 @@ def _route_map(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {route["id"]: route for route in catalog["routes"]}
 
 
+def _route_uses_plan_mode(route: dict[str, Any]) -> bool:
+    argv = route.get("argv_prefix", [])
+    return any(
+        argument in {"--permission-mode", "--approval-mode"}
+        and argv[index + 1] == "plan"
+        for index, argument in enumerate(argv[:-1])
+    )
+
+
+def _route_task_partitions(
+    route: dict[str, Any], catalog: dict[str, Any]
+) -> tuple[list[str], list[str]]:
+    review_task_classes = {
+        task_class
+        for task_class, task in catalog["task_classes"].items()
+        if task.get("independent_review") is True
+    }
+    task_classes = route.get("task_classes", [])
+    writer_capabilities = [
+        task_class for task_class in task_classes if task_class not in review_task_classes
+    ]
+    review_capabilities = [
+        task_class for task_class in task_classes if task_class in review_task_classes
+    ]
+    return writer_capabilities, review_capabilities
+
+
+def _route_capabilities(
+    route: dict[str, Any], catalog: dict[str, Any]
+) -> dict[str, Any]:
+    writer_capabilities, review_capabilities = _route_task_partitions(route, catalog)
+    writer_capable = bool(writer_capabilities) and route.get("review_only") is not True
+    review_capable = bool(review_capabilities) and route.get("writer_only") is not True
+    if writer_capable and review_capable:
+        route_role = "writer-reviewer"
+    elif writer_capable:
+        route_role = "writer"
+    elif review_capable:
+        route_role = "reviewer"
+    else:
+        route_role = "none"
+    return {
+        "route_role": route_role,
+        "writer_only": route.get("writer_only") is True,
+        "review_only": route.get("review_only") is True,
+        "writer_capable": writer_capable,
+        "review_capable": review_capable,
+        "writer_capabilities": writer_capabilities if writer_capable else [],
+        "review_capabilities": review_capabilities if review_capable else [],
+    }
+
+
 def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
     if catalog.get("schema_version") != 2:
         raise CodingAgentRouterError("catalog schema_version must be 2")
@@ -236,6 +288,49 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
             raise CodingAgentRouterError(f"{identifier}: invalid task classes")
         if not isinstance(route.get("independence_group"), str):
             raise CodingAgentRouterError(f"{identifier}: missing independence group")
+        for role_flag in ("writer_only", "review_only"):
+            if role_flag in route and not isinstance(route[role_flag], bool):
+                raise CodingAgentRouterError(
+                    f"{identifier}: {role_flag} must be a boolean"
+                )
+        if route.get("writer_only") is True and route.get("review_only") is True:
+            raise CodingAgentRouterError(
+                f"{identifier}: writer_only and review_only are mutually exclusive"
+            )
+        if route.get("writer_only") is True and _route_uses_plan_mode(route):
+            raise CodingAgentRouterError(
+                f"{identifier}: writer-only route cannot use plan mode"
+            )
+        if _route_uses_plan_mode(route) and route.get("review_only") is not True:
+            raise CodingAgentRouterError(
+                f"{identifier}: plan-mode route must be review_only"
+            )
+        writer_task_classes, review_task_classes = _route_task_partitions(
+            route, catalog
+        )
+        if route.get("writer_only") is True and (
+            not writer_task_classes or review_task_classes
+        ):
+            raise CodingAgentRouterError(
+                f"{identifier}: writer_only route must have writer tasks and no review tasks"
+            )
+        if route.get("review_only") is True and (
+            not review_task_classes or writer_task_classes
+        ):
+            raise CodingAgentRouterError(
+                f"{identifier}: review_only route must have review tasks and no writer tasks"
+            )
+        if (
+            route.get("enabled") is True
+            and route.get("controller") is not True
+            and not any(
+                _route_capabilities(route, catalog)[capability]
+                for capability in ("writer_capable", "review_capable")
+            )
+        ):
+            raise CodingAgentRouterError(
+                f"{identifier}: enabled external route has no actual capability"
+            )
         quality_class = route.get("quality_class")
         if quality_class not in QUALITY_CLASSES:
             raise CodingAgentRouterError(f"{identifier}: invalid quality class")
@@ -783,8 +878,11 @@ def _score_route(
             ["critical task requires an explicitly critical-eligible route"],
             False,
         )
-    if reviewer and route.get("writer_only"):
-        return None, 0.0, 0.0, reasons, ["writer-only route"], False
+    capabilities = _route_capabilities(route, catalog)
+    if reviewer and not capabilities["review_capable"]:
+        return None, 0.0, 0.0, reasons, ["route is not reviewer-capable"], False
+    if not reviewer and not capabilities["writer_capable"]:
+        return None, 0.0, 0.0, reasons, ["route is not writer-capable"], False
     if duration_minutes < int(route.get("min_duration_minutes", 0)):
         return None, 0.0, 0.0, reasons, ["delegation overhead exceeds task size"], False
     if latency_priority and route.get("remote"):
@@ -941,6 +1039,7 @@ def _recommendation(
         "reasons": reasons,
         "quality_evidence": model.get("evidence"),
         "execution_eligible_if_separately_authorized": execution_eligible,
+        **_route_capabilities(route, catalog),
     }
 
 
@@ -1065,6 +1164,7 @@ def grabowski_coding_agent_catalog(include_disabled: bool = False) -> dict[str, 
                 "tier": route.get("tier"),
                 "quota_pools": route["quota_pools"],
                 "disabled_reason": route.get("disabled_reason"),
+                **_route_capabilities(route, catalog),
             }
         )
     models = []
@@ -1182,11 +1282,13 @@ def grabowski_coding_agent_route(
         "risk_flags": flags,
         "latency_priority": latency_value,
     }
+    task = catalog["task_classes"][task_value]
+    primary_is_reviewer = task.get("independent_review") is True
     ranked, excluded = _rank_routes(
         task_value,
         catalog,
         state,
-        reviewer=False,
+        reviewer=primary_is_reviewer,
         previous_group=None,
         previous_provider=None,
         **common,
@@ -1210,7 +1312,6 @@ def grabowski_coding_agent_route(
         and candidate["quality_class"] == primary["quality_class"]
     ]
     reviewers: list[dict[str, Any]] = []
-    task = catalog["task_classes"][task_value]
     review_required = review_value or bool(task.get("critical"))
     if review_required:
         review_task = (
@@ -1238,6 +1339,7 @@ def grabowski_coding_agent_route(
         "decision": "route",
         "catalog_sha256": validation["catalog_sha256"],
         "task_class": task_value,
+        "primary_role": "reviewer" if primary_is_reviewer else "writer",
         "input": {
             "changed_files": changed_value,
             "duration_minutes": duration_value,
