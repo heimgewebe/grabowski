@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Mapping
 import hashlib
 import json
 import os
@@ -22,6 +23,27 @@ COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 class CatalogError(ValueError):
     pass
+
+
+JsonReadError = Literal[
+    "non_regular",
+    "hardlinked",
+    "too_large",
+    "missing",
+    "symlink",
+    "read_error",
+    "changed_during_read",
+    "invalid_json",
+    "root_not_object",
+]
+
+
+@dataclass(frozen=True)
+class JsonObjectRead:
+    value: dict[str, Any] | None
+    error: JsonReadError | None
+    digest: str | None
+    observed_bytes: int | None
 
 
 def _bounded(path: Path, root: Path) -> bool:
@@ -60,22 +82,26 @@ def _parse_created_at(value: object) -> tuple[str, float] | None:
     return value, utc.timestamp()
 
 
-def read_json_object(
-    path: Path, max_bytes: int
-) -> tuple[dict[str, Any] | None, str | None, str | None]:
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+def read_json_object(path: Path, max_bytes: int) -> JsonObjectRead:
     descriptor: int | None = None
     try:
+        path_before = os.lstat(path)
+        if stat.S_ISLNK(path_before.st_mode):
+            return JsonObjectRead(None, "symlink", None, None)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
         descriptor = os.open(path, flags)
         before = os.fstat(descriptor)
+        observed_bytes = before.st_size
+        if (path_before.st_dev, path_before.st_ino) != (before.st_dev, before.st_ino):
+            return JsonObjectRead(None, "changed_during_read", None, observed_bytes)
         if not stat.S_ISREG(before.st_mode):
-            return None, "non_regular", None
+            return JsonObjectRead(None, "non_regular", None, observed_bytes)
         if before.st_nlink != 1:
-            return None, "hardlinked", None
+            return JsonObjectRead(None, "hardlinked", None, observed_bytes)
         if before.st_size > max_bytes:
-            return None, "too_large", None
+            return JsonObjectRead(None, "too_large", None, observed_bytes)
         chunks: list[bytes] = []
         remaining = max_bytes + 1
         while remaining > 0:
@@ -86,32 +112,39 @@ def read_json_object(
             remaining -= len(chunk)
         data = b"".join(chunks)
         after = os.fstat(descriptor)
+        path_after = os.lstat(path)
     except FileNotFoundError:
-        return None, "missing", None
+        return JsonObjectRead(None, "missing", None, None)
     except OSError as exc:
         if exc.errno in {getattr(os, "ELOOP", 40), 40}:
-            return None, "symlink", None
-        return None, "read_error", None
+            return JsonObjectRead(None, "symlink", None, None)
+        return JsonObjectRead(None, "read_error", None, None)
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    if len(data) > max_bytes:
-        return None, "too_large", None
-    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-    ):
-        return None, "changed_during_read", None
+    observed_bytes = len(data)
+    if observed_bytes > max_bytes:
+        return JsonObjectRead(None, "too_large", None, observed_bytes)
+    if stat.S_ISLNK(path_after.st_mode):
+        return JsonObjectRead(None, "symlink", None, observed_bytes)
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    path_identity_after = (
+        path_after.st_dev,
+        path_after.st_ino,
+        path_after.st_size,
+        path_after.st_mtime_ns,
+    )
+    if identity_before != identity_after or identity_after != path_identity_after:
+        return JsonObjectRead(None, "changed_during_read", None, observed_bytes)
     digest = hashlib.sha256(data).hexdigest()
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return None, "invalid_json", digest
+        return JsonObjectRead(None, "invalid_json", digest, observed_bytes)
     if not isinstance(value, dict):
-        return None, "root_not_object", digest
-    return value, None, digest
+        return JsonObjectRead(None, "root_not_object", digest, observed_bytes)
+    return JsonObjectRead(value, None, digest, observed_bytes)
 
 
 def catalog_info(path: Path, canonical_root: Path, legacy_root: Path) -> dict[str, Any]:
@@ -301,10 +334,14 @@ def inspect_candidate(
     except (CatalogError, OSError, RuntimeError) as exc:
         return None, _base_rejection(path, None, str(exc))
 
-    document, error, manifest_sha = read_json_object(path, MAX_MANIFEST_BYTES)
+    manifest_read = read_json_object(path, MAX_MANIFEST_BYTES)
+    document = manifest_read.value
+    error = manifest_read.error
+    manifest_sha = manifest_read.digest
     if error or document is None:
         rejection = _base_rejection(path, info, f"manifest_{error or 'invalid'}")
         rejection["manifest_sha256"] = manifest_sha
+        rejection["manifest_bytes"] = manifest_read.observed_bytes
         return None, rejection
 
     expected_kind = (
@@ -350,9 +387,9 @@ def inspect_candidate(
     stem = str(info["stem"])
     bundle_health_path = path.parent / f"{stem}{BUNDLE_HEALTH_SUFFIX}"
     output_health_path = path.parent / f"{stem}{OUTPUT_HEALTH_SUFFIX}"
-    bundle_health, bundle_error, _bundle_sha = read_json_object(
-        bundle_health_path, MAX_HEALTH_BYTES
-    )
+    bundle_read = read_json_object(bundle_health_path, MAX_HEALTH_BYTES)
+    bundle_health = bundle_read.value
+    bundle_error = bundle_read.error
     if bundle_error or bundle_health is None:
         rejection = _base_rejection(
             path, info, f"bundle_health_{bundle_error or 'invalid'}"
@@ -364,9 +401,9 @@ def inspect_candidate(
         rejection["manifest_sha256"] = manifest_sha
         rejection["bundle_health_status"] = bundle_health.get("status")
         return None, rejection
-    output_health, output_error, _output_sha = read_json_object(
-        output_health_path, MAX_HEALTH_BYTES
-    )
+    output_read = read_json_object(output_health_path, MAX_HEALTH_BYTES)
+    output_health = output_read.value
+    output_error = output_read.error
     if output_error or output_health is None:
         rejection = _base_rejection(
             path, info, f"output_health_{output_error or 'invalid'}"
@@ -405,25 +442,170 @@ def inspect_candidate(
     return record, None
 
 
-def scan_catalog(canonical_root: Path, legacy_root: Path) -> dict[str, Any]:
+def _normalize_repo_query(repo: str | None) -> str | None:
+    if repo is None:
+        return None
+    if "__" in repo:
+        owner, repository = repo.split("__", 1)
+        if not _safe_segment(owner) or not _safe_segment(repository):
+            raise ValueError(
+                "repo must be a safe repository name or owner__repository identity"
+            )
+        return f"{owner}__{repository}"
+    safe = _safe_segment(repo)
+    if safe is None:
+        raise ValueError(
+            "repo must be a safe repository name or owner__repository identity"
+        )
+    return safe
+
+
+def _normalize_refs(
+    refs: list[str] | tuple[str, ...] | None,
+) -> frozenset[str] | None:
+    if refs is None:
+        return None
+    if not isinstance(refs, (list, tuple)):
+        raise ValueError("refs must be a list or tuple of safe ref names")
+    values: set[str] = set()
+    for ref in refs:
+        safe = _safe_segment(ref)
+        if safe is None:
+            raise ValueError("refs must contain only safe ref names")
+        values.add(safe)
+    return frozenset(values)
+
+
+def _canonical_repo_directories(
+    canonical_root: Path, repo: str | None
+) -> list[Path]:
+    if not canonical_root.is_dir() or canonical_root.is_symlink():
+        return []
+    if repo is None:
+        return sorted(
+            (
+                path
+                for path in canonical_root.iterdir()
+                if path.is_dir() and not path.is_symlink()
+            ),
+            key=str,
+        )
+    if "__" in repo:
+        candidate = canonical_root / repo
+        return (
+            [candidate]
+            if candidate.is_dir() and not candidate.is_symlink()
+            else []
+        )
+    return sorted(
+        (
+            path
+            for path in canonical_root.iterdir()
+            if path.is_dir()
+            and not path.is_symlink()
+            and (repo_id := _valid_repo_id(path)) is not None
+            and repo_id.split("__", 1)[1] == repo
+        ),
+        key=str,
+    )
+
+
+def _valid_repo_id(directory: Path) -> str | None:
+    if "__" not in directory.name:
+        return None
+    owner, repository = directory.name.split("__", 1)
+    if not _safe_segment(owner) or not _safe_segment(repository):
+        return None
+    return directory.name
+
+
+def _repository_directory_has_manifest(directory: Path) -> bool:
+    return next(directory.glob(f"*/*/*{MANIFEST_SUFFIX}"), None) is not None
+
+
+def _catalog_paths(
+    canonical_root: Path,
+    legacy_root: Path,
+    *,
+    repo: str | None,
+    stem: str | None,
+    refs: frozenset[str] | None,
+) -> tuple[list[Path], set[str]]:
     paths: list[Path] = []
-    if canonical_root.is_dir() and not canonical_root.is_symlink():
-        paths.extend(canonical_root.glob(f"*/*/*/*{MANIFEST_SUFFIX}"))
+    repo_directories = _canonical_repo_directories(canonical_root, repo)
+    identified_repo_ids = {
+        repo_id
+        for directory in repo_directories
+        if (repo_id := _valid_repo_id(directory)) is not None
+        and _repository_directory_has_manifest(directory)
+    }
+    for directory in repo_directories:
+        if refs is None:
+            candidates = directory.glob(f"*/*/*{MANIFEST_SUFFIX}")
+            paths.extend(candidates)
+        else:
+            for ref in sorted(refs):
+                ref_root = directory / ref
+                if ref_root.is_dir() and not ref_root.is_symlink():
+                    paths.extend(ref_root.glob(f"*/*{MANIFEST_SUFFIX}"))
+
     if legacy_root.is_dir() and not legacy_root.is_symlink():
         paths.extend(legacy_root.glob(f"*{MANIFEST_SUFFIX}"))
+
+    scoped: list[Path] = []
+    canonical = Path(os.path.abspath(canonical_root))
+    legacy = Path(os.path.abspath(legacy_root))
+    for path in sorted(set(paths), key=str):
+        try:
+            path_stem = _stem(path)
+        except CatalogError:
+            continue
+        if stem is not None and path_stem != stem:
+            continue
+        lexical = Path(os.path.abspath(path))
+        if lexical.parent == legacy:
+            if repo is not None:
+                if "__" in repo or _repo_from_stem(path_stem) != repo:
+                    continue
+        elif _bounded(lexical, canonical):
+            parts = lexical.relative_to(canonical).parts
+            if repo is not None and parts:
+                repo_id = parts[0]
+                if "__" in repo:
+                    if repo_id != repo:
+                        continue
+                elif "__" not in repo_id or repo_id.split("__", 1)[1] != repo:
+                    continue
+            if refs is not None and len(parts) >= 2 and parts[1] not in refs:
+                continue
+        else:
+            continue
+        scoped.append(path)
+    return scoped, identified_repo_ids
+
+
+def scan_catalog(
+    canonical_root: Path,
+    legacy_root: Path,
+    *,
+    repo: str | None = None,
+    stem: str | None = None,
+    refs: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    normalized_repo = _normalize_repo_query(repo)
+    normalized_refs = _normalize_refs(refs)
+    paths, identified_repo_ids = _catalog_paths(
+        canonical_root,
+        legacy_root,
+        repo=normalized_repo,
+        stem=stem,
+        refs=normalized_refs,
+    )
     healthy: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     rejected_total_count = 0
-    identified_repo_ids: set[str] = set()
-    for path in sorted(set(paths), key=str):
+    for path in paths:
         record, rejection = inspect_candidate(path, canonical_root, legacy_root)
-        value = record or rejection
-        if (
-            value
-            and value.get("authority") == "canonical_publication"
-            and value.get("repo_id")
-        ):
-            identified_repo_ids.add(str(value["repo_id"]))
         if record is not None:
             healthy.append(record)
         elif rejection is not None:
@@ -441,8 +623,8 @@ def scan_catalog(canonical_root: Path, legacy_root: Path) -> dict[str, Any]:
     )
     aliases: dict[str, list[str]] = {}
     for repo_id in sorted(identified_repo_ids):
-        repo = repo_id.split("__", 1)[1]
-        aliases.setdefault(repo, []).append(repo_id)
+        repository = repo_id.split("__", 1)[1]
+        aliases.setdefault(repository, []).append(repo_id)
     return {
         "healthy": healthy,
         "rejected": rejected,
@@ -473,18 +655,62 @@ def _choose_latest(
     return newest[0], None, []
 
 
-def _matching_rejections(
-    rejected: list[dict[str, Any]], *, repo: str | None, stem: str | None
-) -> list[dict[str, Any]]:
-    values = rejected
+def _rejection_projection(
+    scanned: Mapping[str, Any],
+    additional: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    extras = additional or []
+    stored = [*list(scanned["rejected"]), *extras]
+    total = int(scanned["rejected_total_count"]) + len(extras)
+    shown = stored[:MAX_REJECTIONS]
+    return {
+        "rejected": shown,
+        "rejected_total_count": total,
+        "rejected_truncated": total > len(shown),
+    }
+
+
+def _resolution_result(
+    scanned: Mapping[str, Any],
+    *,
+    available: bool,
+    reason: str | None,
+    repo: str | None,
+    selected: list[dict[str, Any]],
+    stem: str | None = None,
+    additional_rejections: list[dict[str, Any]] | None = None,
+    **values: Any,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "available": available,
+        "reason": reason,
+        "repo": repo,
+        "selected": selected,
+        "aliases": scanned["aliases"],
+        **_rejection_projection(scanned, additional_rejections),
+        **values,
+    }
     if stem is not None:
-        values = [item for item in values if item.get("stem") == stem]
-    if repo is not None:
-        if "__" in repo:
-            values = [item for item in values if item.get("repo_id") == repo]
-        else:
-            values = [item for item in values if item.get("repo") == repo]
-    return values[:MAX_REJECTIONS]
+        result["stem"] = stem
+    return result
+
+
+def selected_manifest_paths(
+    resolution: Mapping[str, Any],
+) -> list[tuple[str, Path]]:
+    selected = resolution.get("selected")
+    if not isinstance(selected, list):
+        raise CatalogError("resolution_selected_invalid")
+    candidates: list[tuple[str, Path]] = []
+    for item in selected:
+        if not isinstance(item, dict):
+            raise CatalogError("resolution_candidate_invalid")
+        ref = item.get("ref")
+        manifest_path = item.get("manifest_path")
+        if not isinstance(ref, str) or not isinstance(manifest_path, str):
+            raise CatalogError("resolution_candidate_identity_invalid")
+        candidates.append((ref, Path(manifest_path)))
+    return candidates
 
 
 def resolve_catalog(
@@ -495,44 +721,35 @@ def resolve_catalog(
     stem: str | None = None,
     refs: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    scanned = scan_catalog(canonical_root, legacy_root)
+    normalized_repo = _normalize_repo_query(repo)
+    normalized_refs = _normalize_refs(refs)
+    scanned = scan_catalog(
+        canonical_root,
+        legacy_root,
+        repo=normalized_repo,
+        stem=stem,
+        refs=sorted(normalized_refs) if normalized_refs is not None else None,
+    )
     healthy = list(scanned["healthy"])
-    normalized_refs: tuple[str, ...] | None = None
-    if refs is not None:
-        if not isinstance(refs, (list, tuple)):
-            raise ValueError("refs must be a list or tuple of safe ref names")
-        values: list[str] = []
-        for ref in refs:
-            safe = _safe_segment(ref)
-            if safe is None:
-                raise ValueError("refs must contain only safe ref names")
-            if safe not in values:
-                values.append(safe)
-        normalized_refs = tuple(values)
-        healthy = [item for item in healthy if item.get("ref") in normalized_refs]
-    rejected = list(scanned["rejected"])
     aliases = scanned["aliases"]
 
-    if repo is not None and "__" not in repo and len(aliases.get(repo, [])) > 1:
-        return {
-            "available": False,
-            "reason": "ambiguous_repository_alias",
-            "repo": repo,
-            "repo_ids": aliases[repo],
-            "selected": [],
-            "rejected": _matching_rejections(rejected, repo=repo, stem=stem),
-            "aliases": aliases,
-            "rejected_total_count": scanned["rejected_total_count"],
-            "rejected_truncated": scanned["rejected_truncated"],
-        }
+    if (
+        normalized_repo is not None
+        and "__" not in normalized_repo
+        and len(aliases.get(normalized_repo, [])) > 1
+    ):
+        return _resolution_result(
+            scanned,
+            available=False,
+            reason="ambiguous_repository_alias",
+            repo=normalized_repo,
+            stem=stem,
+            selected=[],
+            repo_ids=aliases[normalized_repo],
+        )
 
     if stem is not None:
         exact = [item for item in healthy if item["stem"] == stem]
-        if repo is not None:
-            if "__" in repo:
-                exact = [item for item in exact if item.get("repo_id") == repo]
-            else:
-                exact = [item for item in exact if item.get("repo") == repo]
         if exact:
             highest_authority = max(int(item["authority_rank"]) for item in exact)
             exact = [
@@ -541,49 +758,45 @@ def resolve_catalog(
                 if int(item["authority_rank"]) == highest_authority
             ]
             if len(exact) != 1:
-                return {
-                    "available": False,
-                    "reason": "ambiguous_stem",
-                    "repo": repo,
-                    "stem": stem,
-                    "selected": [],
-                    "ambiguous_candidates": [public_candidate(item) for item in exact],
-                    "rejected": _matching_rejections(rejected, repo=repo, stem=stem),
-                    "aliases": aliases,
-                }
+                return _resolution_result(
+                    scanned,
+                    available=False,
+                    reason="ambiguous_stem",
+                    repo=normalized_repo,
+                    stem=stem,
+                    selected=[],
+                    ambiguous_candidates=[public_candidate(item) for item in exact],
+                )
             selected = dict(exact[0])
             selected["selected"] = True
-            return {
-                "available": True,
-                "reason": None,
-                "repo": repo,
-                "stem": stem,
-                "selected": [selected],
-                "rejected": _matching_rejections(rejected, repo=repo, stem=stem),
-                "aliases": aliases,
-                "rejected_total_count": scanned["rejected_total_count"],
-                "rejected_truncated": scanned["rejected_truncated"],
-            }
-        return {
-            "available": False,
-            "reason": "publication_unavailable",
-            "repo": repo,
-            "stem": stem,
-            "selected": [],
-            "rejected": _matching_rejections(rejected, repo=repo, stem=stem),
-            "aliases": aliases,
-            "rejected_total_count": scanned["rejected_total_count"],
-            "rejected_truncated": scanned["rejected_truncated"],
-        }
+            return _resolution_result(
+                scanned,
+                available=True,
+                reason=None,
+                repo=normalized_repo,
+                stem=stem,
+                selected=[selected],
+            )
+        return _resolution_result(
+            scanned,
+            available=False,
+            reason="publication_unavailable",
+            repo=normalized_repo,
+            stem=stem,
+            selected=[],
+        )
 
-    if repo is not None:
-        canonical_identity_exists = False
-        if "__" in repo:
-            canonical_identity_exists = repo in scanned["identified_repo_ids"]
-            matching = [item for item in healthy if item.get("repo_id") == repo]
+    if normalized_repo is not None:
+        if "__" in normalized_repo:
+            canonical_identity_exists = normalized_repo in scanned["identified_repo_ids"]
+            matching = [
+                item for item in healthy if item.get("repo_id") == normalized_repo
+            ]
         else:
-            canonical_identity_exists = bool(aliases.get(repo))
-            matching = [item for item in healthy if item.get("repo") == repo]
+            canonical_identity_exists = bool(aliases.get(normalized_repo))
+            matching = [
+                item for item in healthy if item.get("repo") == normalized_repo
+            ]
         if canonical_identity_exists:
             matching = [
                 item
@@ -592,29 +805,23 @@ def resolve_catalog(
             ]
         selected, reason, ambiguous = _choose_latest(matching)
         if selected is None:
-            return {
-                "available": False,
-                "reason": reason,
-                "repo": repo,
-                "selected": [],
-                "ambiguous_candidates": [public_candidate(item) for item in ambiguous],
-                "rejected": _matching_rejections(rejected, repo=repo, stem=None),
-                "aliases": aliases,
-                "rejected_total_count": scanned["rejected_total_count"],
-                "rejected_truncated": scanned["rejected_truncated"],
-            }
+            return _resolution_result(
+                scanned,
+                available=False,
+                reason=reason,
+                repo=normalized_repo,
+                selected=[],
+                ambiguous_candidates=[public_candidate(item) for item in ambiguous],
+            )
         selected = dict(selected)
         selected["selected"] = True
-        return {
-            "available": True,
-            "reason": None,
-            "repo": repo,
-            "selected": [selected],
-            "rejected": _matching_rejections(rejected, repo=repo, stem=None),
-            "aliases": aliases,
-            "rejected_total_count": scanned["rejected_total_count"],
-            "rejected_truncated": scanned["rejected_truncated"],
-        }
+        return _resolution_result(
+            scanned,
+            available=True,
+            reason=None,
+            repo=normalized_repo,
+            selected=[selected],
+        )
 
     selected_records: list[dict[str, Any]] = []
     selection_rejections: list[dict[str, Any]] = []
@@ -677,22 +884,20 @@ def resolve_catalog(
         ),
         reverse=True,
     )
-    return {
-        "available": bool(selected_records),
-        "reason": None if selected_records else "publication_unavailable",
-        "repo": None,
-        "selected": selected_records,
-        "rejected": [*rejected, *selection_rejections][:MAX_REJECTIONS],
-        "aliases": aliases,
-        "rejected_total_count": scanned["rejected_total_count"],
-        "rejected_truncated": scanned["rejected_truncated"],
-    }
+    return _resolution_result(
+        scanned,
+        available=bool(selected_records),
+        reason=None if selected_records else "publication_unavailable",
+        repo=None,
+        selected=selected_records,
+        additional_rejections=selection_rejections,
+    )
 
 
 def inspect_stem(canonical_root: Path, legacy_root: Path, stem: str) -> dict[str, Any]:
-    scanned = scan_catalog(canonical_root, legacy_root)
-    healthy = [item for item in scanned["healthy"] if item.get("stem") == stem]
-    rejected = [item for item in scanned["rejected"] if item.get("stem") == stem]
+    scanned = scan_catalog(canonical_root, legacy_root, stem=stem)
+    healthy = list(scanned["healthy"])
+    rejected = list(scanned["rejected"])
     canonical = [
         item
         for item in [*healthy, *rejected]

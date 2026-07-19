@@ -388,7 +388,10 @@ class RepoGroundCatalogResolverTests(CatalogFixture):
                 if kind == "symlink":
                     manifest.symlink_to(target)
                 else:
-                    os.link(target, manifest)
+                    try:
+                        os.link(target, manifest)
+                    except OSError as exc:
+                        self.skipTest(f"hardlinks unavailable: {exc}")
 
                 scanned = catalog.scan_catalog(self.canonical, root)
 
@@ -412,6 +415,107 @@ class RepoGroundCatalogResolverTests(CatalogFixture):
         self.assertEqual(catalog.MAX_REJECTIONS, len(scanned["rejected"]))
         self.assertEqual(catalog.MAX_REJECTIONS + 5, scanned["rejected_total_count"])
         self.assertTrue(scanned["rejected_truncated"])
+
+    def test_repo_scoped_rejections_are_not_hidden_by_global_truncation(self) -> None:
+        for index in range(catalog.MAX_REJECTIONS + 5):
+            self.write_canonical(
+                repo="alpha",
+                run_dir=f"20260718T120000Z-alpha-{index}",
+                stem=f"heimgewebe__alpha__main-max-260718-{index:04d}",
+                created_at="2026-07-18T12:00:00Z",
+                malformed=True,
+            )
+        _manifest, target_stem = self.write_canonical(
+            repo="target",
+            run_dir="20260718T130000Z-target",
+            created_at="2026-07-18T13:00:00Z",
+            malformed=True,
+        )
+
+        resolved = catalog.resolve_catalog(
+            self.canonical, self.legacy, repo="target"
+        )
+
+        self.assertFalse(resolved["available"])
+        self.assertEqual(1, resolved["rejected_total_count"])
+        self.assertFalse(resolved["rejected_truncated"])
+        self.assertEqual([target_stem], [item["stem"] for item in resolved["rejected"]])
+
+    def test_repo_scoped_scan_does_not_parse_unrelated_manifests(self) -> None:
+        self.write_canonical(
+            repo="target",
+            run_dir="20260718T120000Z-target",
+            created_at="2026-07-18T12:00:00Z",
+        )
+        for index in range(10):
+            self.write_canonical(
+                repo=f"other-{index}",
+                run_dir=f"20260718T120000Z-other-{index}",
+                created_at="2026-07-18T12:00:00Z",
+            )
+
+        with patch.object(
+            catalog, "inspect_candidate", wraps=catalog.inspect_candidate
+        ) as inspect:
+            resolved = catalog.resolve_catalog(
+                self.canonical, self.legacy, repo="target"
+            )
+
+        self.assertTrue(resolved["available"])
+        self.assertEqual(1, inspect.call_count)
+
+    def test_short_repo_query_does_not_suffix_match_nested_name(self) -> None:
+        self.write_canonical(
+            repo="foo__bar",
+            run_dir="20260718T120000Z-nested",
+            created_at="2026-07-18T12:00:00Z",
+        )
+        self.write_canonical(
+            repo="bar",
+            run_dir="20260718T130000Z-exact",
+            created_at="2026-07-18T13:00:00Z",
+        )
+
+        with patch.object(
+            catalog, "inspect_candidate", wraps=catalog.inspect_candidate
+        ) as inspect:
+            resolved = catalog.resolve_catalog(
+                self.canonical, self.legacy, repo="bar"
+            )
+
+        self.assertTrue(resolved["available"])
+        self.assertEqual("bar", resolved["selected"][0]["repo"])
+        self.assertEqual("heimgewebe__bar", resolved["selected"][0]["repo_id"])
+        self.assertEqual(1, inspect.call_count)
+
+    def test_invalid_ref_names_fail_before_scanning(self) -> None:
+        with patch.object(
+            catalog, "scan_catalog", wraps=catalog.scan_catalog
+        ) as scan:
+            with self.assertRaisesRegex(ValueError, "safe ref names"):
+                catalog.resolve_catalog(
+                    self.canonical, self.legacy, repo="demo", refs=["../main"]
+                )
+        self.assertEqual(0, scan.call_count)
+
+    def test_legacy_fallback_remains_eligible_with_ref_filter(self) -> None:
+        _manifest, stem = self.write_legacy(repo="demo")
+
+        resolved = catalog.resolve_catalog(
+            self.canonical, self.legacy, repo="demo", refs=["main"]
+        )
+
+        self.assertTrue(resolved["available"])
+        self.assertEqual(stem, resolved["selected"][0]["stem"])
+        self.assertEqual(
+            "legacy_merges_fallback", resolved["selected"][0]["authority"]
+        )
+
+    def test_selected_manifest_paths_rejects_malformed_resolution(self) -> None:
+        with self.assertRaisesRegex(
+            catalog.CatalogError, "resolution_candidate_identity_invalid"
+        ):
+            catalog.selected_manifest_paths({"selected": [{"ref": "main"}]})
 
     def test_read_only_resolution_does_not_create_catalog_roots(self) -> None:
         missing_canonical = self.root / "missing-bundles"

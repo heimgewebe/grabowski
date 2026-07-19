@@ -241,7 +241,10 @@ class RBLookupTests(unittest.TestCase):
                     if kind == "symlink":
                         candidate.symlink_to(target)
                     else:
-                        os.link(target, candidate)
+                        try:
+                            os.link(target, candidate)
+                        except OSError as exc:
+                            self.skipTest(f"hardlinks unavailable: {exc}")
                     parsed, error = rb.read_manifest(candidate)
                     self.assertIsNone(parsed)
                     self.assertEqual("manifest_read_error", error["status"])
@@ -249,6 +252,43 @@ class RBLookupTests(unittest.TestCase):
                         "symlink" if kind == "symlink" else "hardlinked",
                         error["reason"],
                     )
+
+    def test_oversized_manifest_reports_observed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            path.write_bytes(b"x" * (rb.MAX_MANIFEST_BYTES + 17))
+
+            parsed, error = rb.read_manifest(path)
+
+        self.assertIsNone(parsed)
+        self.assertEqual("manifest_too_large", error["status"])
+        self.assertEqual(rb.MAX_MANIFEST_BYTES + 17, error["manifest_bytes"])
+        self.assertEqual(rb.MAX_MANIFEST_BYTES, error["max_manifest_bytes"])
+
+    def test_malformed_catalog_resolution_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "demo"
+            repo_path.mkdir()
+            publication_root = root / "pub"
+            publication_root.mkdir()
+            malformed = {
+                "available": True,
+                "selected": [{"ref": "main"}],
+                "aliases": {"demo": ["heimgewebe__demo"]},
+            }
+            with patch.object(
+                rb, "_canonical_manifest_resolution", return_value=malformed
+            ):
+                got = rb.context(
+                    repo_path,
+                    runner,
+                    {"root": str(repo_path), "branch": "main", "head": "a" * 40},
+                    {"repobrief_publication_root": str(publication_root)},
+                )
+
+        self.assertFalse(got["available"])
+        self.assertEqual("catalog_resolution_invalid", got["status"])
 
     def test_default_bundles_root_still_finds_legacy_repobrief_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

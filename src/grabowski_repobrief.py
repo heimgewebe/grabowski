@@ -171,9 +171,9 @@ def _legacy_manifest_path(publication_root: Path, repository: str, ref: str) -> 
 def read_manifest(
     manifest_path: Path,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    parsed, error, _digest = repoground_catalog.read_json_object(
-        manifest_path, MAX_MANIFEST_BYTES
-    )
+    read = repoground_catalog.read_json_object(manifest_path, MAX_MANIFEST_BYTES)
+    parsed = read.value
+    error = read.error
     if error is None and parsed is not None:
         return parsed, None
     if error == "missing":
@@ -182,6 +182,7 @@ def read_manifest(
         return None, unavailable(
             "manifest_too_large",
             manifest_path=str(manifest_path),
+            manifest_bytes=read.observed_bytes,
             max_manifest_bytes=MAX_MANIFEST_BYTES,
         )
     if error in {"invalid_json", "root_not_object"}:
@@ -254,12 +255,21 @@ def context(
     canonical_resolution = _canonical_manifest_resolution(
         canonical_root, repo_segment, refs
     )
+    try:
+        canonical_paths = repoground_catalog.selected_manifest_paths(
+            canonical_resolution
+        )
+    except repoground_catalog.CatalogError as exc:
+        return unavailable(
+            "catalog_resolution_invalid",
+            repository=repo_segment,
+            publication_root=str(canonical_root),
+            freshness_status="publication_unavailable",
+            reason=str(exc),
+        )
     candidates: list[tuple[str, Path, str]] = [
-        (str(item["ref"]), Path(str(item["manifest_path"])), "canonical_publication")
-        for item in canonical_resolution.get("selected", [])
-        if isinstance(item, dict)
-        and isinstance(item.get("ref"), str)
-        and isinstance(item.get("manifest_path"), str)
+        (ref, manifest_path, "canonical_publication")
+        for ref, manifest_path in canonical_paths
     ]
     canonical_identities = (canonical_resolution.get("aliases") or {}).get(
         repo_segment, []
