@@ -100,6 +100,8 @@ const allowedAddress = '192.168.1.10';
 const initialLoader = 'loader-before-reload';
 const reloadLoader = 'loader-after-reload';
 let frameTreeCalls = 0;
+let formContractCalls = 0;
+let clearFieldsCalls = 0;
 
 function message(target, payload) {
   if (target.onmessage) target.onmessage({data: JSON.stringify(payload)});
@@ -212,12 +214,20 @@ class FakeWebSocket {
       case 'Runtime.evaluate': {
         const expression = String(request.params.expression || '');
         if (expression.includes('identity_type: identityType')) {
+          formContractCalls += 1;
           if (scenario === 'verified-then-element-failure') {
-            reply({result: {value: {valid: false}}});
+            reply({result: {value: {
+              valid: false, origin: expectedOrigin, selector_error: true,
+            }}});
+          } else if (scenario === 'delayed-form-hydration' && formContractCalls < 3) {
+            reply({result: {value: {
+              valid: false, origin: expectedOrigin, selector_error: false,
+            }}});
           } else {
             reply({result: {value: {
               valid: true,
               origin: expectedOrigin,
+              selector_error: false,
               identity_type: 'text',
               protected_type: 'password',
               submit_type: 'submit',
@@ -229,6 +239,12 @@ class FakeWebSocket {
               submit_disabled: false,
             }}});
           }
+          return;
+        }
+        if (expression.includes('for (const selector of [s.identity, s.protected])')) {
+          clearFieldsCalls += 1;
+          const changed = scenario !== 'delayed-cleanup-hydration' || clearFieldsCalls >= 3;
+          reply({result: {value: changed}});
           return;
         }
         if (expression.includes('document.elementFromPoint')) {
@@ -1051,6 +1067,21 @@ globalThis.fetch = async () => ({
         self.assertIs(receipt["ok"], True)
         self.assertEqual(receipt["result_code"], "ready")
         self.assertIs(receipt["fill_confirmed"], True)
+        self.assertIs(receipt["cleaned"], True)
+
+    def test_stored_form_helper_polls_until_form_contract_is_hydrated(self) -> None:
+        execution, receipt = self._run_browser_form_node(
+            "delayed-form-hydration", cleanup_only=False, action_mode="readiness"
+        )
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertEqual(receipt["result_code"], "ready")
+        self.assertIs(receipt["fill_confirmed"], True)
+        self.assertIs(receipt["cleaned"], True)
+
+    def test_stored_form_helper_polls_cleanup_until_fields_are_hydrated(self) -> None:
+        execution, receipt = self._run_browser_form_node("delayed-cleanup-hydration")
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertEqual(receipt["result_code"], "cleanup")
         self.assertIs(receipt["cleaned"], True)
 
     def test_stored_form_helper_uses_topmost_pointer_and_guarded_enter(self) -> None:
