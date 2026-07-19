@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "config" / "runtime-entrypoint.json"
 POLICY_PATH = ROOT / "config" / "access.example.json"
 CAPABILITIES_PATH = ROOT / "src" / "grabowski_capabilities.py"
+OPERATOR_RELAY_PATH = ROOT / "src" / "grabowski_operator_relay.py"
 CATALOG_PATH = ROOT / "contracts" / "capability-catalog.v1.json"
 CONTEXT_JSON_PATH = ROOT / "docs" / "generated" / "operator-context.v1.json"
 CONTEXT_MD_PATH = ROOT / "docs" / "generated" / "operator-context.md"
@@ -40,6 +41,18 @@ def _load_capabilities_module() -> Any:
     )
     if spec is None or spec.loader is None:
         raise RuntimeError("Could not load capability definitions")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_operator_relay_module() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "grabowski_operator_relay_build",
+        OPERATOR_RELAY_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Could not load operator relay contract")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -119,6 +132,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
     policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
     capabilities = _load_capabilities_module()
+    operating_protocol = _load_operator_relay_module().operator_relay_protocol()
     profiles = policy.get("profiles", {})
     active_profile_name = policy.get("active_profile", policy.get("mode"))
     active_profile = (
@@ -199,92 +213,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
                 "sha256": _sha256(PROTOCOL_PATH),
             },
         },
-        "operating_protocol": {
-            "name": "Operator Relay v0",
-            "doc_path": "docs/blocked-action-protocol-v0.md",
-            "rule": (
-                "Keep ChatGPT as operator and execute bounded work first. "
-                "Delegate only when a helper adds useful scale or independent contrast."
-            ),
-            "control_loop": [
-                "typed_grabowski_tool",
-                "grabowski_micro_task",
-                "receipt_before_next_step",
-            ],
-            "execution_priority": [
-                "chatgpt_operator",
-                "claude",
-                "codex",
-                "agy",
-                "cline",
-            ],
-            "coding_agent_priority": [
-                "claude",
-                "codex",
-                "agy",
-                "cline",
-            ],
-            "workspace_execution_model": {
-                "default": "adaptive_operator_routing",
-                "lane_owner": "chatgpt_operator",
-                "operator_self_serves_lanes": ["captain", "writer", "tests", "review"],
-                "role_evidence_isolated": True,
-                "workspace_not_universal": True,
-                "direct_operator_for": [
-                    "small_low_risk_fix",
-                    "simple_document_change",
-                    "bounded_deterministic_edit",
-                ],
-                "full_workspace_for": [
-                    "runtime_or_security_change",
-                    "long_or_multi_file_implementation",
-                    "parallel_or_foreign_state",
-                    "connector_or_execution_state_uncertainty",
-                ],
-                "external_agent_delegation": "adaptive_opt_in",
-                "delegation_triggers": [
-                    "high_novelty_design_space",
-                    "independent_contrast",
-                    "multiple_plausible_implementations",
-                    "security_schema_or_concurrency_risk",
-                    "capacity_fallback",
-                ],
-                "external_programming_modes": ["competitor", "contrast"],
-                "max_external_candidates": 2,
-                "external_candidate_authority": "advisory_only",
-                "automatic_patch_apply": False,
-                "automatic_winner_selection": False,
-            },
-            "operator_first_for": [
-                "task_decomposition",
-                "bounded_code_change",
-                "integration",
-                "critical_self_review",
-                "recovery",
-            ],
-            "routing_roles": {
-                "complex_code_task": "chatgpt_operator_adaptive_workspace_external_competition_when_high_value",
-                "quick_light_reasoning": "chatgpt_operator_external_opt_in_agy_print",
-                "local_micro_reasoning": "ollama_api_qwen_coder",
-                "shell_or_git_grip": "grabowski_task",
-                "security_or_architecture_review": "chatgpt_operator_external_opt_in_claude",
-                "session_resume": "tmux_first_agy_when_useful",
-                "memory_prioritization": "bureau",
-                "patch_file_relay": "operator_patch_relay",
-                "patch_fallback": "aider_no_auto_commit",
-                "audit": "grabowski_git",
-                "repo_state_context": "steuerboard_operator_report",
-            },
-            "does_not_establish": [
-                "new_privileges",
-                "automatic_merge",
-                "automatic_push",
-                "automatic_deploy",
-                "free_shell_as_default_path",
-                "durable_agent_autonomy",
-                "steuerboard_report_action_approval",
-            ],
-        },
+        "operating_protocol": operating_protocol,
         "runtime_contract": {
             "module": contract["module"],
             "source": contract["source"],
@@ -320,16 +249,16 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
         "- Name: `Operator Relay v0`",
         "- Source: `docs/blocked-action-protocol-v0.md`",
         "- Control loop: typed Grabowski tool first; if blocked, one bounded Grabowski Micro-Task; then read a receipt before deciding the next step.",
-        "- Execution priority: ChatGPT operator first; delegated coding agents follow Claude, Codex, agy, then Cline.",
-        "- Workspace routing: use direct operator execution for small low-risk edits; use isolated role evidence for long, risky, parallel or state-uncertain work.",
-        "- External programming: at most two opt-in competitor/contrast candidates may challenge the primary approach; their patches remain advisory and are never applied or selected automatically.",
-        "- Operator-first work: task decomposition, bounded code changes, integration, critical self-review and recovery.",
-        "- Complex code task: the operator remains integrator; high-value design spaces may add bounded Claude/agy competition or contrast before the normal Writer, Tests and Review path.",
-        "- Quick light reasoning: operator first, then agy `--print` when delegation adds value.",
-        "- Local micro reasoning: Ollama API with qwen coder.",
+        "- Execution priority: ChatGPT/Grabowski performs authoritative work; external review or contrast selection follows Claude, Codex, agy, then Cline.",
+        "- Workspace routing: authoritative implementation stays with the direct ChatGPT/Grabowski operator for every task size.",
+        "- External programming: agents are limited to explicit advisory contrast or competition; their patches are never applied or selected automatically.",
+        "- Operator-first work: state inspection, planning, all code changes, tests, integration, merge, deployment and closeout.",
+        "- Complex code task: the operator remains the only authoritative writer; independent agents may review or compare an alternative after the operator plan or candidate exists.",
+        "- Quick light reasoning: ChatGPT operator directly.",
+        "- Local micro reasoning: ChatGPT operator directly.",
         "- Patch file relay: local patch files use `tools/operator_patch_relay.py` for check/apply receipts before user manual execution.",
-        "- Review: operator first; Claude provides independent architecture and safety contrast.",
-        "- Session: tmux first; agy only when available and better for resume.",
+        "- Review: operator verifies directly; Claude may provide independent architecture and safety findings.",
+        "- Session: direct operator context first; tmux or agy may preserve a bounded advisory session when useful.",
         "- Steuerboard: `operator report` is a lightweight read-only repo-state context signal; no separate trial/noise logging; never an approval gate.",
         "",
         "## Contract integrity",

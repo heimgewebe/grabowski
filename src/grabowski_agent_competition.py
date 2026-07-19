@@ -1529,7 +1529,7 @@ def grabowski_agent_execution_route(
     decision_fork: bool = False,
     architecture_hypotheses: int = 1,
 ) -> dict[str, Any]:
-    """Recommend a lean R0-R3 route without authorizing parallel writers."""
+    """Keep implementation direct and optionally recommend advisory contrast."""
     kind = workspace._required_string(task_kind, "task_kind", max_length=32)
     if kind not in TASK_KINDS:
         raise AgentCompetitionError(
@@ -1672,15 +1672,16 @@ def grabowski_agent_execution_route(
         "risk_tier": decision["risk_tier"],
         "score": score,
         "execution_mode": mode,
-        "full_workspace": mode.startswith("full_workspace")
-        or mode.startswith("workspace_with_"),
+        "full_workspace": False,
         "external_candidates": candidate_plan,
         "max_external_candidates": 2,
         "external_results_are_advisory": True,
         "automatic_patch_apply": False,
         "automatic_winner_selection": False,
         "operator_remains_integrator": True,
-        "roles_remain_isolated": mode != "direct_operator",
+        "direct_implementation_required": True,
+        "external_primary_writer_forbidden": True,
+        "roles_remain_isolated": bool(candidate_plan),
         "single_mutating_writer": True,
         "parallel_writer_pilot": decision["parallel_writer_pilot"],
         "input_facts": input_facts,
@@ -1706,15 +1707,14 @@ def grabowski_agent_execution_route(
             "bound commit or exported context becomes unavailable or mismatched",
             "candidate attempts mutation or returns unstructured output",
             "additional candidate would repeat an already represented approach",
-            "parallel writer assessment lacks a two-shard conflict-domain proof",
+            "external candidate attempts to become the authoritative writer",
         ],
         "does_not_establish": [
             "execution_authority",
             "candidate_correctness",
             "merge_readiness",
+            "permission_to_delegate_authoritative_implementation",
             "need_for_external_agents",
-            "parallel_writer_safety",
-            "workspace_group_availability",
         ],
     }
     recommendation_contract = {

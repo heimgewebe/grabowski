@@ -374,6 +374,10 @@
     {
       "module": "grabowski_juno_storage",
       "source": "src/grabowski_juno_storage.py"
+    },
+    {
+      "module": "grabowski_operator_relay",
+      "source": "src/grabowski_operator_relay.py"
     }
   ]
 }
