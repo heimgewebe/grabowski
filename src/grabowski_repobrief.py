@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import re
@@ -150,25 +149,17 @@ def _publication_roots(publication_root: Path) -> tuple[Path, Path]:
 
 
 def _canonical_manifest_resolution(
-    publication_root: Path, repository: str
+    publication_root: Path,
+    repository: str,
+    refs: list[str] | None = None,
 ) -> dict[str, Any]:
     disabled_legacy_root = publication_root / ".repoground-no-legacy-fallback"
     return repoground_catalog.resolve_catalog(
-        publication_root, disabled_legacy_root, repo=repository
+        publication_root,
+        disabled_legacy_root,
+        repo=repository,
+        refs=refs,
     )
-
-
-def _canonical_manifest_candidates(
-    publication_root: Path, repository: str, refs: list[str]
-) -> list[tuple[str, Path]]:
-    resolution = _canonical_manifest_resolution(publication_root, repository)
-    candidates: list[tuple[str, Path]] = []
-    for item in resolution.get("selected", []):
-        ref = item.get("ref")
-        manifest_path = item.get("manifest_path")
-        if ref in refs and isinstance(ref, str) and isinstance(manifest_path, str):
-            candidates.append((ref, Path(manifest_path)))
-    return candidates
 
 
 def _legacy_manifest_path(publication_root: Path, repository: str, ref: str) -> Path:
@@ -180,42 +171,31 @@ def _legacy_manifest_path(publication_root: Path, repository: str, ref: str) -> 
 def read_manifest(
     manifest_path: Path,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    try:
-        size = manifest_path.stat().st_size
-    except FileNotFoundError:
+    read = repoground_catalog.read_json_object(manifest_path, MAX_MANIFEST_BYTES)
+    parsed = read.value
+    error = read.error
+    if error is None and parsed is not None:
+        return parsed, None
+    if error == "missing":
         return None, unavailable("missing", manifest_path=str(manifest_path))
-    except OSError as exc:
-        return None, unavailable(
-            "manifest_read_error", manifest_path=str(manifest_path), reason=str(exc)
-        )
-    if size > MAX_MANIFEST_BYTES:
+    if error == "too_large":
         return None, unavailable(
             "manifest_too_large",
             manifest_path=str(manifest_path),
-            manifest_bytes=size,
+            manifest_bytes=read.observed_bytes,
             max_manifest_bytes=MAX_MANIFEST_BYTES,
         )
-    try:
-        parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None, unavailable("missing", manifest_path=str(manifest_path))
-    except json.JSONDecodeError:
+    if error in {"invalid_json", "root_not_object"}:
         return None, unavailable(
             "invalid_manifest",
             manifest_path=str(manifest_path),
-            reason="manifest is not valid JSON",
+            reason=error,
         )
-    except OSError as exc:
-        return None, unavailable(
-            "manifest_read_error", manifest_path=str(manifest_path), reason=str(exc)
-        )
-    if not isinstance(parsed, dict):
-        return None, unavailable(
-            "invalid_manifest",
-            manifest_path=str(manifest_path),
-            reason="manifest root must be an object",
-        )
-    return parsed, None
+    return None, unavailable(
+        "manifest_read_error",
+        manifest_path=str(manifest_path),
+        reason=error or "invalid",
+    )
 
 
 def _freshness_status(snapshot_commit: object, current_head: object) -> str:
@@ -272,11 +252,24 @@ def context(
 
     canonical_root, legacy_root = _publication_roots(publication_root)
     refs = ref_candidates(repo, runner, orientation)
-    canonical_resolution = _canonical_manifest_resolution(canonical_root, repo_segment)
-    canonical = _canonical_manifest_candidates(canonical_root, repo_segment, refs)
+    canonical_resolution = _canonical_manifest_resolution(
+        canonical_root, repo_segment, refs
+    )
+    try:
+        canonical_paths = repoground_catalog.selected_manifest_paths(
+            canonical_resolution
+        )
+    except repoground_catalog.CatalogError as exc:
+        return unavailable(
+            "catalog_resolution_invalid",
+            repository=repo_segment,
+            publication_root=str(canonical_root),
+            freshness_status="publication_unavailable",
+            reason=str(exc),
+        )
     candidates: list[tuple[str, Path, str]] = [
         (ref, manifest_path, "canonical_publication")
-        for ref, manifest_path in canonical
+        for ref, manifest_path in canonical_paths
     ]
     canonical_identities = (canonical_resolution.get("aliases") or {}).get(
         repo_segment, []
