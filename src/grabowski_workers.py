@@ -917,11 +917,13 @@ try {
   const documentResponsePromise = waitEvent('Network.responseReceived', (params) =>
     params.type === 'Document' && params.frameId === mainFrameId &&
       typeof params.loaderId === 'string' && params.loaderId.length > 0 &&
+      params.loaderId !== currentLoaderId &&
       params.response && typeof params.response.url === 'string',
   reloadEventFloor);
   const lifecycleLoadPromise = waitEvent('Page.lifecycleEvent', (params) =>
     params.name === 'load' && params.frameId === mainFrameId &&
-      typeof params.loaderId === 'string' && params.loaderId.length > 0,
+      typeof params.loaderId === 'string' && params.loaderId.length > 0 &&
+      params.loaderId !== currentLoaderId,
   reloadEventFloor);
   try {
     const [, documentResponse, lifecycleLoad] = await Promise.all([
@@ -952,6 +954,7 @@ try {
         verifiedOrigin !== request.expected_origin) {
       throw new Error('target-origin');
     }
+    // Public evidence is committed only after loader, frame, origin, and allowlist verification.
     remoteAddressSha256 = digest(remoteAddress);
   } catch (error) {
     rejectTransportOperations();
