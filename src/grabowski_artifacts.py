@@ -9,6 +9,7 @@ import shutil
 import stat
 import tempfile
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import grabowski_fleet as fleet
@@ -26,6 +27,81 @@ MUTATING = operator.MUTATING
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9._/+@=-]{1,4095}\Z")
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024 * 1024
+MAX_ERROR_INPUT_CHARS = 16 * 1024
+MAX_ERROR_DETAIL_CHARS = 2048
+_AUTHORIZATION_RE = re.compile(
+    r"(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)([^\s,;]+)"
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b((?:api[_-]?key|access[_-]?key|access[_-]?token|password|passwd|secret|token)"
+    r"\b[\"']?\s*[:=]\s*[\"']?)([^\"'\s,;]+)"
+)
+_URI_CREDENTIAL_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9+.-]*://)([^/\s:@]+):([^@/\s]+)@"
+)
+_TOKEN_PATTERNS = (
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
+
+
+class ArtifactTransferError(RuntimeError):
+    """Bounded operator-facing artifact transport failure."""
+
+
+def _redact_transfer_detail(
+    value: object,
+    *,
+    redactor: Callable[[str], str] | None = None,
+) -> str:
+    """Return one bounded diagnostic without relying on operator internals."""
+    try:
+        text = str(value)
+    except Exception:
+        text = "artifact transport failed"
+    text = text[:MAX_ERROR_INPUT_CHARS]
+    if redactor is not None:
+        try:
+            text = str(redactor(text))[:MAX_ERROR_INPUT_CHARS]
+        except Exception:
+            text = "artifact transport failed"
+    text = _AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\1[REDACTED]", text)
+    text = _URI_CREDENTIAL_RE.sub(r"\1[REDACTED]@", text)
+    for pattern in _TOKEN_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    home = str(Path.home())
+    if home and home != "/":
+        text = text.replace(home, "~")
+    text = " ".join(text.replace("\x00", " ").split())
+    if not text:
+        text = "artifact transport failed"
+    if len(text) > MAX_ERROR_DETAIL_CHARS:
+        text = f"{text[: MAX_ERROR_DETAIL_CHARS - 1]}…"
+    return text
+
+
+def _transfer_error(operation: str, error: BaseException) -> ArtifactTransferError:
+    if isinstance(error, ArtifactTransferError):
+        return ArtifactTransferError(_redact_transfer_detail(error))
+    if isinstance(error, FileExistsError):
+        detail = "destination already exists"
+    elif isinstance(error, FileNotFoundError):
+        detail = "file not found"
+    elif isinstance(error, TimeoutError):
+        detail = "operation timed out"
+    else:
+        detail = _redact_transfer_detail(error)
+    return ArtifactTransferError(f"Artifact {operation} failed: {detail}")
+
+
+def _command_error(label: str, result: object) -> ArtifactTransferError:
+    if isinstance(result, dict):
+        detail = result.get("stderr") or result.get("stdout") or "command failed"
+    else:
+        detail = "command returned an invalid result"
+    return ArtifactTransferError(f"{label} failed: {_redact_transfer_detail(detail)}")
 
 _REMOTE_STAT_SCRIPT = r'''import hashlib,json,os,stat,sys
 p=sys.argv[1]
@@ -187,15 +263,20 @@ def _local_stat(path: Path) -> dict[str, Any]:
 
 
 def _remote_run(host: str, argv: list[str], timeout_seconds: int = 60) -> dict[str, Any]:
-    result = fleet.run_fleet_host(
-        host,
-        argv,
-        timeout_seconds=timeout_seconds,
-        max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
-    )["result"]
-    if result["returncode"] != 0:
-        detail = result.get("stderr") or result.get("stdout") or "remote operation failed"
-        raise RuntimeError(operator._redact_text(detail.strip()))
+    try:
+        envelope = fleet.run_fleet_host(
+            host,
+            argv,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+        )
+    except Exception as exc:
+        raise _transfer_error("remote operation", exc) from None
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("result"), dict):
+        raise ArtifactTransferError("Remote artifact operation returned an invalid result")
+    result = envelope["result"]
+    if result.get("returncode") != 0:
+        raise _command_error("Remote artifact operation", result)
     return result
 
 
@@ -351,8 +432,8 @@ def artifact_push(
     temporary = f"{destination}.grabowski-{uuid.uuid4().hex}.tmp"
     try:
         scp_result = _scp(host, str(source), temporary, upload=True)
-        if scp_result["returncode"] != 0:
-            raise RuntimeError(operator._redact_text(scp_result.get("stderr", "scp failed")))
+        if not isinstance(scp_result, dict) or scp_result.get("returncode") != 0:
+            raise _command_error("SCP upload", scp_result)
         publish = _remote_run(
             host,
             [
@@ -367,7 +448,21 @@ def artifact_push(
             ],
             60,
         )
-        result = json.loads(publish["stdout"])
+        try:
+            result = json.loads(publish.get("stdout", ""))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ArtifactTransferError(
+                "Remote artifact publish returned invalid JSON"
+            ) from exc
+        if (
+            not isinstance(result, dict)
+            or result.get("sha256") != expected_source
+            or result.get("size") != size
+            or result.get("mode") != mode
+        ):
+            raise ArtifactTransferError(
+                "Remote artifact publish returned an invalid integrity receipt"
+            )
     except Exception:
         _remote_cleanup(host, temporary)
         raise
@@ -424,8 +519,8 @@ def artifact_pull(
     temporary.unlink()
     try:
         scp_result = _scp(host, source, str(temporary), upload=False)
-        if scp_result["returncode"] != 0:
-            raise RuntimeError(operator._redact_text(scp_result.get("stderr", "scp failed")))
+        if not isinstance(scp_result, dict) or scp_result.get("returncode") != 0:
+            raise _command_error("SCP download", scp_result)
         downloaded_hash, downloaded_size = _hash_file(temporary)
         if downloaded_hash != expected_source or downloaded_size != remote["size"]:
             raise RuntimeError("Downloaded artifact failed source verification")
@@ -468,7 +563,10 @@ def _audit_transfer(result: dict[str, Any]) -> dict[str, Any]:
 def grabowski_artifact_stat(host: str, path: str) -> dict[str, Any]:
     """Return regular-file metadata and SHA-256 for one local or fleet artifact."""
     operator._require_operator_capability("artifact_transfer")
-    return artifact_stat(host, path)
+    try:
+        return artifact_stat(host, path)
+    except Exception as exc:
+        raise _transfer_error("stat", exc) from None
 
 
 @mcp.tool(name="grabowski_artifact_push", annotations=MUTATING)
@@ -484,14 +582,17 @@ def grabowski_artifact_push(
     operator._require_operator_mutation(
         "artifact_transfer", path=destination_path, host=host
     )
-    result = artifact_push(
-        host,
-        source_path,
-        destination_path,
-        expected_source_sha256,
-        create_only=create_only,
-        expected_destination_sha256=expected_destination_sha256,
-    )
+    try:
+        result = artifact_push(
+            host,
+            source_path,
+            destination_path,
+            expected_source_sha256,
+            create_only=create_only,
+            expected_destination_sha256=expected_destination_sha256,
+        )
+    except Exception as exc:
+        raise _transfer_error("push", exc) from None
     base._append_audit(_audit_transfer(result))
     return result
 
@@ -509,13 +610,16 @@ def grabowski_artifact_pull(
     operator._require_operator_mutation(
         "artifact_transfer", path=destination_path, host=host
     )
-    result = artifact_pull(
-        host,
-        source_path,
-        destination_path,
-        expected_source_sha256,
-        create_only=create_only,
-        expected_destination_sha256=expected_destination_sha256,
-    )
+    try:
+        result = artifact_pull(
+            host,
+            source_path,
+            destination_path,
+            expected_source_sha256,
+            create_only=create_only,
+            expected_destination_sha256=expected_destination_sha256,
+        )
+    except Exception as exc:
+        raise _transfer_error("pull", exc) from None
     base._append_audit(_audit_transfer(result))
     return result
