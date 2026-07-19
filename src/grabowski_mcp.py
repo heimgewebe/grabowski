@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -154,8 +155,16 @@ REPOGROUND_PUBLICATION_ROOT = Path(
 ).expanduser()
 MERGES_ROOT = HOME / "repos" / "merges"
 AUDIT_SCHEMA_VERSION = 2
+AUDIT_SEGMENT_SCHEMA_VERSION = 1
 MAX_AUDIT_BYTES = 16 * 1024 * 1024
+MAX_AUDIT_RECORD_BYTES = 128 * 1024
+AUDIT_ROTATION_RESERVE_BYTES = 256 * 1024
+MAX_AUDIT_SEGMENTS = 4096
+MAX_AUDIT_EVIDENCE_BYTES = 1024 * 1024
+MAX_AUDIT_SEGMENT_CACHE_ENTRIES = 256
 AUDIT_APPEND_LOCK = threading.RLock()
+AUDIT_SEGMENT_CACHE_LOCK = threading.RLock()
+AUDIT_SEGMENT_VERIFICATION_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 AUDIT_LOCK_TIMEOUT_SECONDS = 5.0
 AUDIT_LOCK_POLL_SECONDS = 0.02
 BASE_CAPABILITIES = (
@@ -2590,6 +2599,7 @@ def _write_json_evidence(path: Path, payload: dict[str, Any]) -> None:
         os.close(descriptor)
 
 
+
 def _audit_record_hash(record: dict[str, Any]) -> str:
     material = {key: value for key, value in record.items() if key != "record_sha256"}
     encoded = json.dumps(
@@ -2682,23 +2692,105 @@ def _audit_parent(path: Path) -> Path:
     return parent
 
 
+def _audit_storage_paths(path: Path) -> dict[str, Path]:
+    parent = path.parent
+    return {
+        "segments": parent / "audit-segments",
+        "manifests": parent / "audit-segment-manifests",
+        "archive": parent / "audit-archive",
+        "legacy_receipts": parent / "audit-rotation-receipts",
+        "coordination_lock": parent / f"{path.name}.lock",
+    }
+
+
+def _ensure_private_audit_directory(path: Path) -> Path:
+    if path.is_symlink():
+        raise PermissionError("Audit evidence directory may not be a symlink")
+    try:
+        path.mkdir(mode=0o700)
+        _fsync_directory(path.parent)
+    except FileExistsError:
+        pass
+    metadata = os.stat(path, follow_symlinks=False)
+    if (
+        not statmod.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_gid != os.getgid()
+        or statmod.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise PermissionError("Audit evidence directory does not satisfy its contract")
+    return path
+
+
+def _acquire_flock(descriptor: int, *, exclusive: bool) -> None:
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    deadline = time.monotonic() + AUDIT_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Audit lock acquisition timed out") from exc
+            time.sleep(min(AUDIT_LOCK_POLL_SECONDS, remaining))
+
+
+@contextmanager
+def _audit_coordination_lock(path: Path, *, exclusive: bool):
+    parent = _audit_parent(path)
+    lock_path = _audit_storage_paths(path)["coordination_lock"]
+    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    try:
+        try:
+            descriptor = os.open(lock_path, flags)
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(
+                    lock_path,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                created = True
+            except FileExistsError:
+                descriptor = os.open(lock_path, flags)
+    except OSError as exc:
+        raise PermissionError("Audit coordination lock cannot be opened safely") from exc
+    try:
+        if created:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            _fsync_directory(parent)
+        opened = os.fstat(descriptor)
+        linked = os.stat(lock_path, follow_symlinks=False)
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or not statmod.S_ISREG(linked.st_mode)
+            or opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_uid != os.getuid()
+            or opened.st_gid != os.getgid()
+            or opened.st_nlink != 1
+            or statmod.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise PermissionError("Audit coordination lock violates its file contract")
+        _acquire_flock(descriptor, exclusive=exclusive)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def _acquire_audit_descriptor_lock(
     descriptor: int,
     path: Path,
     *,
     exclusive: bool,
 ) -> None:
-    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-    deadline = time.monotonic() + AUDIT_LOCK_TIMEOUT_SECONDS
-    while True:
-        try:
-            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
-            break
-        except BlockingIOError as exc:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError("Audit lock acquisition timed out") from exc
-            time.sleep(min(AUDIT_LOCK_POLL_SECONDS, remaining))
+    _acquire_flock(descriptor, exclusive=exclusive)
     try:
         opened = os.fstat(descriptor)
         linked = os.stat(path, follow_symlinks=False)
@@ -2748,6 +2840,7 @@ def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, A
             "legacy_records": 0,
             "v2_records": 0,
             "last_record_sha256": None,
+            "active_bytes": 0,
             "error": None,
         }
     lines = data.splitlines()
@@ -2766,6 +2859,7 @@ def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, A
                 "legacy_records": legacy_records,
                 "v2_records": v2_records,
                 "last_record_sha256": previous,
+                "active_bytes": len(data),
                 "error": f"blank-line-{index}",
             }
         records += 1
@@ -2780,6 +2874,7 @@ def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, A
                 "legacy_records": legacy_records,
                 "v2_records": v2_records,
                 "last_record_sha256": previous,
+                "active_bytes": len(data),
                 "error": f"line-{index}:{type(exc).__name__}",
             }
         if not isinstance(parsed, dict):
@@ -2791,6 +2886,7 @@ def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, A
                 "legacy_records": legacy_records,
                 "v2_records": v2_records,
                 "last_record_sha256": previous,
+                "active_bytes": len(data),
                 "error": f"line-{index}:not-object",
             }
         stored_hash = parsed.get("record_sha256")
@@ -2804,6 +2900,7 @@ def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, A
                     "legacy_records": legacy_records,
                     "v2_records": v2_records,
                     "last_record_sha256": previous,
+                    "active_bytes": len(data),
                     "error": f"line-{index}:legacy-record-after-v2",
                 }
             legacy_records += 1
@@ -2822,6 +2919,7 @@ def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, A
                 "legacy_records": legacy_records,
                 "v2_records": v2_records,
                 "last_record_sha256": previous,
+                "active_bytes": len(data),
                 "error": f"line-{index}:invalid-record-hash",
             }
         if parsed.get("previous_record_sha256") != previous:
@@ -2833,6 +2931,7 @@ def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, A
                 "legacy_records": legacy_records,
                 "v2_records": v2_records,
                 "last_record_sha256": previous,
+                "active_bytes": len(data),
                 "error": f"line-{index}:previous-hash-mismatch",
             }
         if parsed.get("sequence") != records:
@@ -2844,6 +2943,7 @@ def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, A
                 "legacy_records": legacy_records,
                 "v2_records": v2_records,
                 "last_record_sha256": previous,
+                "active_bytes": len(data),
                 "error": f"line-{index}:sequence-mismatch",
             }
         expected_hash = _audit_record_hash(parsed)
@@ -2856,6 +2956,7 @@ def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, A
                 "legacy_records": legacy_records,
                 "v2_records": v2_records,
                 "last_record_sha256": previous,
+                "active_bytes": len(data),
                 "error": f"line-{index}:record-hash-mismatch",
             }
         v2_records += 1
@@ -2870,6 +2971,7 @@ def _verify_audit_bytes(path: Path, data: bytes, *, exists: bool) -> dict[str, A
         "legacy_records": legacy_records,
         "v2_records": v2_records,
         "last_record_sha256": previous,
+        "active_bytes": len(data),
         "error": None,
     }
 
@@ -2886,20 +2988,468 @@ def _verify_audit_descriptor(path: Path, descriptor: int) -> dict[str, Any]:
             "legacy_records": 0,
             "v2_records": 0,
             "last_record_sha256": None,
+            "active_bytes": 0,
             "error": str(exc),
         }
     return _verify_audit_bytes(path, data, exists=True)
 
 
-def _verify_audit_log_unlocked(path: Path = AUDIT_LOG) -> dict[str, Any]:
-    descriptor: int | None = None
+def _read_audit_file(path: Path) -> tuple[bytes, dict[str, Any]]:
+    descriptor = _open_audit_read_target(path)
+    if descriptor is None:
+        return b"", _verify_audit_bytes(path, b"", exists=False)
     try:
-        descriptor = _open_audit_read_target(path)
-        if descriptor is None:
-            return _verify_audit_bytes(path, b"", exists=False)
-        return _verify_audit_descriptor(path, descriptor)
-    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        data = _read_audit_descriptor(descriptor, path)
+        return data, _verify_audit_bytes(path, data, exists=True)
+    finally:
+        _close_audit_descriptor(descriptor)
+
+
+def _first_audit_record(data: bytes) -> dict[str, Any] | None:
+    lines = data.splitlines()
+    if not lines:
+        return None
+    parsed = json.loads(lines[0].decode("utf-8"))
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _safe_audit_evidence_path(
+    active_path: Path,
+    value: Any,
+    *,
+    allowed_directory_names: tuple[str, ...],
+) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError("audit-chain-path-invalid")
+    candidate = Path(value)
+    if not candidate.is_absolute() or candidate.is_symlink():
+        raise ValueError("audit-chain-path-invalid")
+    parent = candidate.parent.resolve(strict=True)
+    allowed = {
+        (active_path.parent / name).resolve(strict=True)
+        for name in allowed_directory_names
+        if (active_path.parent / name).is_dir()
+    }
+    if parent not in allowed:
+        raise ValueError("audit-chain-path-outside-evidence-roots")
+    return candidate
+
+
+def _private_evidence_identity(path: Path, *, max_bytes: int) -> tuple[int, ...]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(path, follow_symlinks=False)
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or not statmod.S_ISREG(linked.st_mode)
+            or opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_uid != os.getuid()
+            or opened.st_gid != os.getgid()
+            or opened.st_nlink != 1
+            or statmod.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size > max_bytes
+        ):
+            raise PermissionError("Audit evidence file violates its contract")
+        return _audit_file_identity(opened)
+    finally:
+        os.close(descriptor)
+
+
+def _segment_cache_key(
+    path: Path,
+    expected: dict[str, Any],
+) -> tuple[Any, ...]:
+    segment_identity = _private_evidence_identity(path, max_bytes=MAX_AUDIT_BYTES)
+    manifest_path = expected.get("manifest_path")
+    manifest_identity = (
+        _private_evidence_identity(
+            manifest_path,
+            max_bytes=MAX_AUDIT_EVIDENCE_BYTES,
+        )
+        if isinstance(manifest_path, Path)
+        else None
+    )
+    binding = (
+        expected.get("sha256"),
+        expected.get("bytes"),
+        expected.get("records"),
+        expected.get("legacy_records"),
+        expected.get("v2_records"),
+        expected.get("last_record_sha256"),
+        str(manifest_path) if manifest_path is not None else None,
+        expected.get("manifest_sha256"),
+        bool(expected.get("compatibility")),
+    )
+    return (
+        str(path),
+        segment_identity,
+        manifest_identity,
+        binding,
+    )
+
+
+def _segment_cache_get(key: tuple[Any, ...]) -> dict[str, Any] | None:
+    with AUDIT_SEGMENT_CACHE_LOCK:
+        cached = AUDIT_SEGMENT_VERIFICATION_CACHE.get(key)
+        if cached is None:
+            return None
         return {
+            "status": dict(cached["status"]),
+            "sha256": cached["sha256"],
+            "first_record": (
+                dict(cached["first_record"])
+                if isinstance(cached.get("first_record"), dict)
+                else None
+            ),
+        }
+
+
+def _segment_cache_put(
+    key: tuple[Any, ...],
+    *,
+    status: dict[str, Any],
+    sha256: str,
+    first_record: dict[str, Any] | None,
+) -> None:
+    with AUDIT_SEGMENT_CACHE_LOCK:
+        if len(AUDIT_SEGMENT_VERIFICATION_CACHE) >= MAX_AUDIT_SEGMENT_CACHE_ENTRIES:
+            AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+        AUDIT_SEGMENT_VERIFICATION_CACHE[key] = {
+            "status": dict(status),
+            "sha256": sha256,
+            "first_record": dict(first_record) if first_record is not None else None,
+        }
+
+
+def _read_private_evidence(path: Path, *, max_bytes: int) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(path, follow_symlinks=False)
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or not statmod.S_ISREG(linked.st_mode)
+            or opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_uid != os.getuid()
+            or opened.st_gid != os.getgid()
+            or opened.st_nlink != 1
+            or statmod.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size > max_bytes
+        ):
+            raise PermissionError("Audit evidence file violates its contract")
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(descriptor)
+        linked_after = os.stat(path, follow_symlinks=False)
+        if (
+            len(data) != opened.st_size
+            or _audit_file_identity(opened) != _audit_file_identity(after)
+            or _audit_file_identity(opened) != _audit_file_identity(linked_after)
+        ):
+            raise RuntimeError("Audit evidence changed while being read")
+        return data
+    finally:
+        os.close(descriptor)
+
+
+def _audit_predecessor_binding(
+    active_path: Path,
+    record: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not record:
+        return None
+    operation = record.get("operation")
+    if operation == "audit-segment-genesis-v1":
+        return {
+            "path": _safe_audit_evidence_path(
+                active_path,
+                record.get("archived_audit_path"),
+                allowed_directory_names=("audit-segments", "audit-archive"),
+            ),
+            "sha256": record.get("archived_audit_sha256"),
+            "bytes": record.get("archived_audit_bytes"),
+            "records": record.get("archived_audit_records"),
+            "legacy_records": record.get("archived_audit_legacy_records"),
+            "v2_records": record.get("archived_audit_v2_records"),
+            "last_record_sha256": record.get("archived_last_record_sha256"),
+            "manifest_path": _safe_audit_evidence_path(
+                active_path,
+                record.get("segment_manifest_path"),
+                allowed_directory_names=("audit-segment-manifests",),
+            ),
+            "manifest_sha256": record.get("segment_manifest_sha256"),
+            "compatibility": False,
+        }
+    if operation == "audit-capacity-rotation-v1":
+        return {
+            "path": _safe_audit_evidence_path(
+                active_path,
+                record.get("archived_audit_path"),
+                allowed_directory_names=("audit-segments", "audit-archive"),
+            ),
+            "sha256": record.get("archived_audit_sha256"),
+            "bytes": record.get("archived_audit_bytes"),
+            "records": record.get("archived_audit_records"),
+            "legacy_records": None,
+            "v2_records": None,
+            "last_record_sha256": record.get("archived_last_record_sha256"),
+            "manifest_path": None,
+            "manifest_sha256": None,
+            "compatibility": True,
+        }
+    if operation == "audit-rotation-genesis":
+        return {
+            "path": _safe_audit_evidence_path(
+                active_path,
+                record.get("archived_audit_path"),
+                allowed_directory_names=("audit-segments", "audit-archive"),
+            ),
+            "sha256": record.get("archived_audit_sha256"),
+            "bytes": record.get("archived_audit_bytes"),
+            "records": record.get("archived_audit_records"),
+            "legacy_records": None,
+            "v2_records": None,
+            "last_record_sha256": record.get("archived_audit_last_record_sha256"),
+            "manifest_path": _safe_audit_evidence_path(
+                active_path,
+                record.get("rotation_manifest_path"),
+                allowed_directory_names=("audit-rotation-receipts",),
+            ),
+            "manifest_sha256": record.get("rotation_manifest_sha256"),
+            "compatibility": True,
+        }
+    return None
+
+
+def _validate_segment_manifest(
+    binding: dict[str, Any],
+    *,
+    segment_status: dict[str, Any],
+    segment_bytes: bytes,
+) -> None:
+    manifest_path = binding.get("manifest_path")
+    manifest_sha256 = binding.get("manifest_sha256")
+    if manifest_path is None:
+        return
+    manifest_data = _read_private_evidence(
+        manifest_path,
+        max_bytes=MAX_AUDIT_EVIDENCE_BYTES,
+    )
+    if hashlib.sha256(manifest_data).hexdigest() != manifest_sha256:
+        raise ValueError("audit-segment-manifest-sha256-mismatch")
+    try:
+        manifest = json.loads(manifest_data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("audit-segment-manifest-invalid") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("audit-segment-manifest-invalid")
+    if manifest.get("kind") == "grabowski_audit_segment_manifest":
+        expected = {
+            "schema_version": AUDIT_SEGMENT_SCHEMA_VERSION,
+            "kind": "grabowski_audit_segment_manifest",
+            "segment_path": str(binding["path"]),
+            "segment_sha256": binding["sha256"],
+            "segment_bytes": len(segment_bytes),
+            "records": segment_status["records"],
+            "legacy_records": segment_status["legacy_records"],
+            "v2_records": segment_status["v2_records"],
+            "last_record_sha256": segment_status["last_record_sha256"],
+            "created_at": manifest.get("created_at"),
+        }
+        if manifest != expected or not isinstance(manifest.get("created_at"), str):
+            raise ValueError("audit-segment-manifest-binding-mismatch")
+        return
+    if manifest.get("kind") == "grabowski_audit_rotation":
+        if (
+            manifest.get("archive_path") != str(binding["path"])
+            or manifest.get("archive_sha256") != binding["sha256"]
+            or manifest.get("source_records") != segment_status["records"]
+            or manifest.get("source_last_record_sha256")
+            != segment_status["last_record_sha256"]
+        ):
+            raise ValueError("audit-legacy-rotation-manifest-binding-mismatch")
+        return
+    raise ValueError("audit-segment-manifest-kind-invalid")
+
+
+def _read_audit_chain_unlocked(
+    path: Path,
+    *,
+    use_segment_cache: bool = True,
+) -> tuple[list[tuple[Path, bytes, dict[str, Any]]], bool]:
+    components: list[tuple[Path, bytes, dict[str, Any]]] = []
+    seen: set[Path] = set()
+    current = path
+    expected: dict[str, Any] | None = None
+    compatibility_evidence = False
+    for _ in range(MAX_AUDIT_SEGMENTS + 1):
+        resolved = current.resolve(strict=False)
+        if resolved in seen:
+            raise ValueError("audit-segment-cycle")
+        seen.add(resolved)
+        cached: dict[str, Any] | None = None
+        cache_key: tuple[Any, ...] | None = None
+        if expected is not None and use_segment_cache:
+            cache_key = _segment_cache_key(current, expected)
+            cached = _segment_cache_get(cache_key)
+        if cached is not None:
+            data = b""
+            status = cached["status"]
+            observed_sha = str(cached["sha256"])
+            first_record = cached.get("first_record")
+        else:
+            data, status = _read_audit_file(current)
+            if not status["valid"]:
+                if expected is None and current == path:
+                    raise ValueError(str(status["error"]))
+                raise ValueError(f"audit-segment-invalid:{status['error']}")
+            observed_sha = hashlib.sha256(data).hexdigest()
+            first_record = _first_audit_record(data)
+        if expected is not None:
+            if observed_sha != expected.get("sha256"):
+                raise ValueError("audit-segment-sha256-mismatch")
+            expected_bytes = expected.get("bytes")
+            observed_bytes = int(status.get("active_bytes") or 0)
+            if expected_bytes is not None and expected_bytes != observed_bytes:
+                raise ValueError("audit-segment-byte-count-mismatch")
+            if status["records"] != expected.get("records"):
+                raise ValueError("audit-segment-record-count-mismatch")
+            if status["last_record_sha256"] != expected.get("last_record_sha256"):
+                raise ValueError("audit-segment-last-hash-mismatch")
+            if (
+                expected.get("legacy_records") is not None
+                and status["legacy_records"] != expected.get("legacy_records")
+            ):
+                raise ValueError("audit-segment-legacy-count-mismatch")
+            if (
+                expected.get("v2_records") is not None
+                and status["v2_records"] != expected.get("v2_records")
+            ):
+                raise ValueError("audit-segment-v2-count-mismatch")
+            if cached is None:
+                _validate_segment_manifest(
+                    expected,
+                    segment_status=status,
+                    segment_bytes=data,
+                )
+                if use_segment_cache and cache_key is not None:
+                    _segment_cache_put(
+                        cache_key,
+                        status=status,
+                        sha256=observed_sha,
+                        first_record=first_record,
+                    )
+            compatibility_evidence = compatibility_evidence or bool(
+                expected.get("compatibility")
+            )
+        components.append((current, data, status))
+        binding = _audit_predecessor_binding(path, first_record)
+        if binding is None:
+            return components, compatibility_evidence
+        current = binding["path"]
+        expected = binding
+    raise ValueError("audit-segment-limit-exceeded")
+
+
+def _audit_capacity_status(
+    path: Path,
+    audit: dict[str, Any],
+) -> dict[str, Any]:
+    active_bytes = int(audit.get("active_bytes") or 0)
+    remaining = max(0, MAX_AUDIT_BYTES - active_bytes)
+    threshold = max(0, MAX_AUDIT_BYTES - AUDIT_ROTATION_RESERVE_BYTES)
+    rotation_required = bool(audit.get("exists")) and active_bytes >= threshold
+    configuration_valid = (
+        MAX_AUDIT_BYTES
+        > AUDIT_ROTATION_RESERVE_BYTES + MAX_AUDIT_RECORD_BYTES + 4096
+    )
+    try:
+        free_bytes = shutil.disk_usage(path.parent).free
+    except OSError:
+        free_bytes = 0
+    minimum_free_bytes = (
+        active_bytes
+        + AUDIT_ROTATION_RESERVE_BYTES
+        + MAX_AUDIT_RECORD_BYTES
+        + 4096
+    )
+    writable = (
+        bool(audit.get("valid"))
+        and configuration_valid
+        and free_bytes >= minimum_free_bytes
+    )
+    if not audit.get("valid"):
+        state = "invalid"
+    elif not configuration_valid:
+        state = "configuration_invalid"
+    elif free_bytes < minimum_free_bytes:
+        state = "storage_exhausted"
+    elif rotation_required:
+        state = "rotation_required"
+    else:
+        state = "ready"
+    return {
+        "audit_writable": writable,
+        "audit_state": state,
+        "active_bytes": active_bytes,
+        "max_bytes": MAX_AUDIT_BYTES,
+        "remaining_bytes": remaining,
+        "reserve_bytes": AUDIT_ROTATION_RESERVE_BYTES,
+        "max_record_bytes": MAX_AUDIT_RECORD_BYTES,
+        "rotation_threshold_bytes": threshold,
+        "rotation_required": rotation_required,
+        "filesystem_free_bytes": free_bytes,
+        "minimum_free_bytes": minimum_free_bytes,
+    }
+
+
+def _verify_audit_log_unlocked(path: Path = AUDIT_LOG) -> dict[str, Any]:
+    try:
+        components, compatibility_evidence = _read_audit_chain_unlocked(path)
+        if not components:
+            status = _verify_audit_bytes(path, b"", exists=False)
+            status.update(
+                {
+                    "total_records": 0,
+                    "total_legacy_records": 0,
+                    "total_v2_records": 0,
+                    "archived_segment_count": 0,
+                    "chain_valid": True,
+                    "legacy_rotation_compatibility": False,
+                }
+            )
+        else:
+            status = dict(components[0][2])
+            status.update(
+                {
+                    "total_records": sum(item[2]["records"] for item in components),
+                    "total_legacy_records": sum(
+                        item[2]["legacy_records"] for item in components
+                    ),
+                    "total_v2_records": sum(
+                        item[2]["v2_records"] for item in components
+                    ),
+                    "archived_segment_count": len(components) - 1,
+                    "chain_valid": True,
+                    "legacy_rotation_compatibility": compatibility_evidence,
+                }
+            )
+        status.update(_audit_capacity_status(path, status))
+        return status
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        status = {
             "valid": False,
             "path": str(path),
             "exists": path.exists(),
@@ -2907,15 +3457,46 @@ def _verify_audit_log_unlocked(path: Path = AUDIT_LOG) -> dict[str, Any]:
             "legacy_records": 0,
             "v2_records": 0,
             "last_record_sha256": None,
+            "active_bytes": 0,
+            "total_records": 0,
+            "total_legacy_records": 0,
+            "total_v2_records": 0,
+            "archived_segment_count": 0,
+            "chain_valid": False,
+            "legacy_rotation_compatibility": False,
             "error": str(exc),
         }
-    finally:
-        if descriptor is not None:
-            _close_audit_descriptor(descriptor)
+        status.update(_audit_capacity_status(path, status))
+        return status
 
 
 def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
-    return _verify_audit_log_unlocked(path)
+    try:
+        lock_path = _audit_storage_paths(path)["coordination_lock"]
+        if not path.exists() and not lock_path.exists():
+            return _verify_audit_log_unlocked(path)
+        with _audit_coordination_lock(path, exclusive=False):
+            return _verify_audit_log_unlocked(path)
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        status = {
+            "valid": False,
+            "path": str(path),
+            "exists": path.exists(),
+            "records": 0,
+            "legacy_records": 0,
+            "v2_records": 0,
+            "last_record_sha256": None,
+            "active_bytes": 0,
+            "total_records": 0,
+            "total_legacy_records": 0,
+            "total_v2_records": 0,
+            "archived_segment_count": 0,
+            "chain_valid": False,
+            "legacy_rotation_compatibility": False,
+            "error": str(exc),
+        }
+        status.update(_audit_capacity_status(path, status))
+        return status
 
 
 def _open_audit_append_target(path: Path) -> tuple[int, bool]:
@@ -2979,71 +3560,246 @@ def _rollback_audit_descriptor(descriptor: int, expected_size: int) -> None:
         raise RuntimeError("Audit append rollback size postflight mismatch")
 
 
+def _canonical_json_line(payload: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _enriched_audit_record(
+    record: dict[str, Any],
+    status: dict[str, Any],
+) -> tuple[dict[str, Any], bytes]:
+    enriched = {**record}
+    enriched.setdefault("timestamp", _utc_timestamp())
+    enriched["audit_schema_version"] = AUDIT_SCHEMA_VERSION
+    enriched["sequence"] = int(status["records"]) + 1
+    enriched["previous_record_sha256"] = status["last_record_sha256"]
+    enriched["record_sha256"] = _audit_record_hash(enriched)
+    payload = _canonical_json_line(enriched)
+    if len(payload) > MAX_AUDIT_RECORD_BYTES:
+        raise ValueError("Audit record would exceed its byte limit")
+    return enriched, payload
+
+
+def _write_private_create_only(path: Path, data: bytes) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, data)
+        os.fsync(descriptor)
+        if os.fstat(descriptor).st_size != len(data):
+            raise RuntimeError("Audit evidence write size mismatch")
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
+
+
+def _rotate_audit_segment(
+    path: Path,
+    descriptor: int,
+    status: dict[str, Any],
+    *,
+    next_record_bytes: int,
+) -> None:
+    _require_audit_descriptor_bound(descriptor, path)
+    data = _read_audit_descriptor(descriptor, path)
+    if not data or status["records"] <= 0:
+        raise ValueError("Audit log would exceed its byte limit")
+    segment_sha256 = hashlib.sha256(data).hexdigest()
+    paths = _audit_storage_paths(path)
+    segment_dir = _ensure_private_audit_directory(paths["segments"])
+    manifest_dir = _ensure_private_audit_directory(paths["manifests"])
+    timestamp = re.sub(r"[^0-9A-Za-z]+", "", _utc_timestamp())
+    unique = uuid.uuid4().hex[:12]
+    stem = f"{path.stem}-{timestamp}-{segment_sha256[:12]}-{unique}"
+    segment_path = segment_dir / f"{stem}.jsonl"
+    manifest_path = manifest_dir / f"{stem}.json"
+    manifest = {
+        "schema_version": AUDIT_SEGMENT_SCHEMA_VERSION,
+        "kind": "grabowski_audit_segment_manifest",
+        "segment_path": str(segment_path),
+        "segment_sha256": segment_sha256,
+        "segment_bytes": len(data),
+        "records": status["records"],
+        "legacy_records": status["legacy_records"],
+        "v2_records": status["v2_records"],
+        "last_record_sha256": status["last_record_sha256"],
+        "created_at": _utc_timestamp(),
+    }
+    manifest_data = (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    manifest_sha256 = hashlib.sha256(manifest_data).hexdigest()
+    genesis = {
+        "operation": "audit-segment-genesis-v1",
+        "reason": "capacity-threshold",
+        "segment_schema_version": AUDIT_SEGMENT_SCHEMA_VERSION,
+        "archived_audit_path": str(segment_path),
+        "archived_audit_sha256": segment_sha256,
+        "archived_audit_bytes": len(data),
+        "archived_audit_records": status["records"],
+        "archived_audit_legacy_records": status["legacy_records"],
+        "archived_audit_v2_records": status["v2_records"],
+        "archived_last_record_sha256": status["last_record_sha256"],
+        "segment_manifest_path": str(manifest_path),
+        "segment_manifest_sha256": manifest_sha256,
+        "timestamp": _utc_timestamp(),
+        "audit_schema_version": AUDIT_SCHEMA_VERSION,
+        "sequence": 1,
+        "previous_record_sha256": None,
+    }
+    genesis["record_sha256"] = _audit_record_hash(genesis)
+    genesis_data = _canonical_json_line(genesis)
+    if (
+        len(genesis_data)
+        + next_record_bytes
+        + AUDIT_ROTATION_RESERVE_BYTES
+        > MAX_AUDIT_BYTES
+    ):
+        raise ValueError("Audit log would exceed its byte limit")
+    _write_private_create_only(segment_path, data)
+    _write_private_create_only(manifest_path, manifest_data)
+    temporary_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.rotation-",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    replaced = False
+    try:
+        os.fchmod(temporary_descriptor, 0o600)
+        _write_all(temporary_descriptor, genesis_data)
+        os.fsync(temporary_descriptor)
+        if os.fstat(temporary_descriptor).st_size != len(genesis_data):
+            raise RuntimeError("Audit rotation genesis size mismatch")
+        _require_audit_descriptor_bound(descriptor, path)
+        os.replace(temporary_path, path)
+        replaced = True
+        _fsync_directory(path.parent)
+    finally:
+        os.close(temporary_descriptor)
+        if not replaced:
+            try:
+                temporary_path.unlink()
+                _fsync_directory(path.parent)
+            except FileNotFoundError:
+                pass
+
+
+def _append_payload(descriptor: int, path: Path, payload: bytes) -> None:
+    current_size = os.fstat(descriptor).st_size
+    if current_size + len(payload) > MAX_AUDIT_BYTES:
+        raise ValueError("Audit log would exceed its byte limit")
+    _require_audit_descriptor_bound(descriptor, path)
+    try:
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        _require_audit_descriptor_bound(descriptor, path)
+        appended = os.fstat(descriptor)
+        if appended.st_size != current_size + len(payload):
+            raise RuntimeError("Audit append size postflight mismatch")
+    except BaseException:
+        try:
+            _rollback_audit_descriptor(descriptor, current_size)
+        except BaseException as rollback_error:
+            raise RuntimeError(
+                "Audit append failed and rollback did not complete"
+            ) from rollback_error
+        raise
+
+
 def _append_audit(record: dict[str, Any]) -> None:
     with AUDIT_APPEND_LOCK:
         if AUDIT_LOG.is_symlink():
             raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
-        descriptor, _created = _open_audit_append_target(AUDIT_LOG)
-        try:
-            status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
-            if not status["valid"]:
-                raise RuntimeError(f"Audit log verification failed: {status['error']}")
-
-            enriched = {**record}
-            enriched.setdefault("timestamp", _utc_timestamp())
-            enriched["audit_schema_version"] = AUDIT_SCHEMA_VERSION
-            enriched["sequence"] = int(status["records"]) + 1
-            enriched["previous_record_sha256"] = status["last_record_sha256"]
-            enriched["record_sha256"] = _audit_record_hash(enriched)
-            payload = (
-                json.dumps(
-                    enriched,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-                + "\n"
-            ).encode("utf-8")
-            current_size = os.fstat(descriptor).st_size
-            if current_size + len(payload) > MAX_AUDIT_BYTES:
-                raise ValueError("Audit log would exceed its byte limit")
-            _require_audit_descriptor_bound(descriptor, AUDIT_LOG)
+        with _audit_coordination_lock(AUDIT_LOG, exclusive=True):
+            descriptor: int | None = None
             try:
-                _write_all(descriptor, payload)
-                os.fsync(descriptor)
-                _require_audit_descriptor_bound(descriptor, AUDIT_LOG)
-                appended = os.fstat(descriptor)
-                if appended.st_size != current_size + len(payload):
-                    raise RuntimeError("Audit append size postflight mismatch")
-            except BaseException:
-                try:
-                    _rollback_audit_descriptor(descriptor, current_size)
-                except BaseException as rollback_error:
+                chain_status = _verify_audit_log_unlocked(AUDIT_LOG)
+                if not chain_status["valid"]:
+                    chain_error = str(chain_status["error"])
+                    if (
+                        "file contract" in chain_error
+                        or "parent directory" in chain_error
+                        or "symlink" in chain_error
+                    ):
+                        raise PermissionError(chain_error)
                     raise RuntimeError(
-                        "Audit append failed and rollback did not complete"
-                    ) from rollback_error
-                raise
-        finally:
-            _close_audit_descriptor(descriptor)
+                        f"Audit log verification failed: {chain_error}"
+                    )
+                descriptor, _created = _open_audit_append_target(AUDIT_LOG)
+                status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
+                if not status["valid"]:
+                    raise RuntimeError(
+                        f"Audit log verification failed: {status['error']}"
+                    )
+                _enriched, payload = _enriched_audit_record(record, status)
+                current_size = os.fstat(descriptor).st_size
+                needs_rotation = (
+                    current_size > 0
+                    and current_size
+                    + len(payload)
+                    + AUDIT_ROTATION_RESERVE_BYTES
+                    > MAX_AUDIT_BYTES
+                )
+                if needs_rotation:
+                    if (
+                        MAX_AUDIT_BYTES
+                        <= AUDIT_ROTATION_RESERVE_BYTES
+                        + MAX_AUDIT_RECORD_BYTES
+                        + 4096
+                    ):
+                        raise ValueError("Audit log would exceed its byte limit")
+                    _rotate_audit_segment(
+                        AUDIT_LOG,
+                        descriptor,
+                        status,
+                        next_record_bytes=len(payload),
+                    )
+                    _close_audit_descriptor(descriptor)
+                    descriptor = None
+                    descriptor, _created = _open_audit_append_target(AUDIT_LOG)
+                    status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
+                    if not status["valid"]:
+                        raise RuntimeError(
+                            f"Audit rotation verification failed: {status['error']}"
+                        )
+                    _enriched, payload = _enriched_audit_record(record, status)
+                elif current_size + len(payload) > MAX_AUDIT_BYTES:
+                    raise ValueError("Audit log would exceed its byte limit")
+                _append_payload(descriptor, AUDIT_LOG, payload)
+            finally:
+                if descriptor is not None:
+                    _close_audit_descriptor(descriptor)
 
 
 def _audit_records() -> list[dict[str, Any]]:
-    descriptor = _open_audit_read_target(AUDIT_LOG)
-    if descriptor is None:
-        return []
-    try:
-        data = _read_audit_descriptor(descriptor, AUDIT_LOG)
-        status = _verify_audit_bytes(AUDIT_LOG, data, exists=True)
-        if not status["valid"]:
-            raise RuntimeError(f"Audit log verification failed: {status['error']}")
-        records = []
-        for line in data.splitlines():
-            parsed = json.loads(line.decode("utf-8"))
-            if isinstance(parsed, dict):
-                records.append(parsed)
+    with _audit_coordination_lock(AUDIT_LOG, exclusive=False):
+        components, _compatibility = _read_audit_chain_unlocked(
+            AUDIT_LOG,
+            use_segment_cache=False,
+        )
+        records: list[dict[str, Any]] = []
+        for _path, data, _status in reversed(components):
+            for line in data.splitlines():
+                parsed = json.loads(line.decode("utf-8"))
+                if isinstance(parsed, dict):
+                    records.append(parsed)
         return records
-    finally:
-        _close_audit_descriptor(descriptor)
 
 
 def _find_transaction_record(transaction_id: str) -> dict[str, Any]:
@@ -4096,6 +4852,7 @@ def grabowski_status(
     deployment = _deployment_metadata()
     tool_contract = _runtime_tool_contract_summary(deployment)
     audit = _verify_audit_log(AUDIT_LOG)
+    audit_writable = bool(audit.get("audit_writable", audit.get("valid")))
     kill_switch = _kill_switch_state()
     integrity_fields = (
         "manifest_parse_valid",
@@ -4120,6 +4877,22 @@ def grabowski_status(
         )
     if not bool(audit.get("valid")):
         warnings.append({"code": "audit_invalid", "error": audit.get("error")})
+    elif not audit_writable:
+        warnings.append(
+            {
+                "code": "audit_not_writable",
+                "state": audit.get("audit_state"),
+                "remaining_bytes": audit.get("remaining_bytes"),
+            }
+        )
+    if bool(audit.get("rotation_required")):
+        warnings.append(
+            {
+                "code": "audit_rotation_required",
+                "active_bytes": audit.get("active_bytes"),
+                "rotation_threshold_bytes": audit.get("rotation_threshold_bytes"),
+            }
+        )
     if bool(kill_switch.get("engaged")):
         warnings.append({"code": "kill_switch_engaged"})
     if not bool(tool_contract.get("runtime_matches_deployment_contract")):
@@ -4143,6 +4916,7 @@ def grabowski_status(
         deployment.get("completion_status") == "complete"
         and all(integrity.values())
         and bool(audit.get("valid"))
+        and audit_writable
         and not bool(kill_switch.get("engaged"))
         and bool(tool_contract.get("runtime_matches_deployment_contract"))
     )
@@ -4152,7 +4926,9 @@ def grabowski_status(
             runtime_healthy=healthy,
             client_snapshot=client_snapshot,
         )
-    if not healthy:
+    if bool(audit.get("valid")) and not audit_writable:
+        recommended_next_action = "restore audit writability before operator mutation"
+    elif not healthy:
         recommended_next_action = "repair runtime integrity before operator mutation"
     elif not bool(client_snapshot.get("observable")):
         recommended_next_action = str(
@@ -4238,7 +5014,16 @@ def grabowski_status(
                 "kill_switch": kill_switch,
                 "audit": {
                     "valid": audit.get("valid"),
+                    "writable": audit_writable,
+                    "state": audit.get("audit_state"),
                     "records": audit.get("records"),
+                    "total_records": audit.get("total_records"),
+                    "archived_segment_count": audit.get("archived_segment_count"),
+                    "active_bytes": audit.get("active_bytes"),
+                    "max_bytes": audit.get("max_bytes"),
+                    "remaining_bytes": audit.get("remaining_bytes"),
+                    "reserve_bytes": audit.get("reserve_bytes"),
+                    "rotation_required": audit.get("rotation_required"),
                     "last_record_sha256": audit.get("last_record_sha256"),
                     "error": audit.get("error"),
                 },

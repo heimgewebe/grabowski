@@ -331,6 +331,7 @@ def grabowski_runtime_health() -> dict[str, Any]:
         key: bool(deployment.get(key))
         for key in DEPLOYMENT_INTEGRITY_FIELDS
     }
+    audit_writable = bool(audit.get("audit_writable"))
     return {
         "service": runtime_extensions.LOGICAL_RUNTIME_SERVICE,
         "service_model": runtime_extensions.runtime_service_model(deployment),
@@ -338,11 +339,21 @@ def grabowski_runtime_health() -> dict[str, Any]:
             deployment.get("completion_status") == "complete"
             and all(integrity.values())
             and bool(audit.get("valid"))
+            and audit_writable
             and not bool(base._kill_switch_state().get("engaged"))
         ),
         "deployment_complete": deployment.get("completion_status") == "complete",
         "deployment_integrity_valid": all(integrity.values()),
         "audit_valid": bool(audit.get("valid")),
+        "audit_writable": audit_writable,
+        "audit_state": audit.get("audit_state"),
+        "audit_active_bytes": audit.get("active_bytes"),
+        "audit_max_bytes": audit.get("max_bytes"),
+        "audit_remaining_bytes": audit.get("remaining_bytes"),
+        "audit_reserve_bytes": audit.get("reserve_bytes"),
+        "audit_rotation_required": audit.get("rotation_required"),
+        "audit_archived_segment_count": audit.get("archived_segment_count"),
+        "audit_total_records": audit.get("total_records"),
         "kill_switch_engaged": bool(base._kill_switch_state().get("engaged")),
         "release_id": deployment.get("release_id"),
         "repo_head": deployment.get("repo_head"),

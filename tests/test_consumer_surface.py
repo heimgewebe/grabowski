@@ -298,6 +298,76 @@ class ConsumerSurfaceTests(unittest.TestCase):
             with mock.patch.object(grabowski_mcp, "_load_policy", return_value=policy):
                 grabowski_mcp._project_status_fields(minimal, ["missing"])
 
+    def test_status_refuses_valid_but_nonwritable_audit(self) -> None:
+        policy = {
+            "mode": "bounded-read-write",
+            "active_profile": "trusted-owner",
+            "profiles": {"trusted-owner": {}},
+            "forbidden_capabilities": [],
+        }
+        deployment = {
+            "release_id": "release-1",
+            "repo_head": "a" * 40,
+            "completion_status": "complete",
+            "manifest_parse_valid": True,
+            "manifest_schema_valid": True,
+            "repo_head_valid": True,
+            "agent_instructions_identity_valid": True,
+            "runtime_binding_valid": True,
+            "environment_compatibility_valid": True,
+            "provenance_valid": True,
+            "artifact_integrity_valid": True,
+        }
+        contract = {
+            "expected_tool_count": 152,
+            "registered_tool_count": 152,
+            "runtime_matches_deployment_contract": True,
+            "client_snapshot_observable": True,
+            "client_snapshot": {
+                "state": "matched",
+                "observable": True,
+                "fresh": True,
+                "matched": True,
+            },
+        }
+        audit = {
+            "valid": True,
+            "audit_writable": False,
+            "audit_state": "storage_exhausted",
+            "remaining_bytes": 0,
+            "rotation_required": True,
+            "active_bytes": 100,
+            "rotation_threshold_bytes": 90,
+            "last_record_sha256": "b" * 64,
+        }
+        with mock.patch.object(
+            grabowski_mcp, "_load_policy", return_value=policy
+        ), mock.patch.object(
+            grabowski_mcp,
+            "_active_profile",
+            return_value={"name": "trusted-owner"},
+        ), mock.patch.object(
+            grabowski_mcp, "_deployment_metadata", return_value=deployment
+        ), mock.patch.object(
+            grabowski_mcp,
+            "_runtime_tool_contract_summary",
+            return_value=contract,
+        ), mock.patch.object(
+            grabowski_mcp, "_verify_audit_log", return_value=audit
+        ), mock.patch.object(
+            grabowski_mcp, "_kill_switch_state", return_value={"engaged": False}
+        ):
+            result = grabowski_mcp.grabowski_status(view="minimal")
+
+        self.assertFalse(result["healthy"])
+        warning_codes = {item["code"] for item in result["warnings"]}
+        self.assertIn("audit_not_writable", warning_codes)
+        self.assertIn("audit_rotation_required", warning_codes)
+        self.assertEqual(
+            result["recommended_next_action"],
+            "restore audit writability before operator mutation",
+        )
+
     def test_minimal_status_does_not_query_consolidated_overview(self) -> None:
         policy = {
             "mode": "bounded-read-write",
