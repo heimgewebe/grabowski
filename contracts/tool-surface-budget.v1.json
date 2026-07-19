@@ -1,5 +1,32 @@
 {
   "accepted_additions": {
+    "grabowski_agent_workspace_writer_handoff": {
+      "evidence_refs": [
+        "bureau:issue-687",
+        "tests:test_agent_workspace.py",
+        "contract:agent-workspace-writer-attempts-v1"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns the distinct transition from a terminal failed writer to one operator-bound replacement writer while preserving the original task and receipt as immutable evidence.",
+        "evidence": "Exact workspace, branch, head, clean-state, scope, lifecycle and lease gates; one-attempt limit; append-only writer history; hash-bound task-start reconciliation; attempt-specific receipt collection; focused negative and end-to-end collection tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic terminal, task-start or tmux operation was rejected because none can atomically preserve original writer evidence, enforce the one-handoff state transition, reconcile an ambiguous start by exact task identity and bind collection to the replacement receipt.",
+      "rationale": "Writer handoff changes the authoritative Agent Workspace state machine rather than merely running a command. It must own a narrowly typed transition that cannot be represented by the broader terminal or durable-task surfaces without bypassing workspace evidence and lease invariants.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "agent-workspace",
+        "effects": [
+          "receipt-create",
+          "task-start",
+          "task-state-refresh"
+        ],
+        "read_only": false,
+        "reversibility": "preserved-worktree-and-receipts",
+        "risk_class": "high",
+        "tool": "grabowski_agent_workspace_writer_handoff"
+      }
+    },
     "grabowski_browser_worker_stored_form_action": {
       "evidence_refs": [
         "docs:browser-stored-form-action.md",

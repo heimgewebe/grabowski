@@ -1760,6 +1760,21 @@
     },
     {
       "category": "agent-workspace",
+      "description": "Start one operator-bound replacement writer after a proven terminal failure.",
+      "effects": [
+        "task-start",
+        "receipt-create",
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_writer_handoff",
+      "purpose": "Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence.",
+      "read_only": false,
+      "reversibility": "preserved-worktree-and-receipts",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_writer_handoff"
+    },
+    {
+      "category": "agent-workspace",
       "description": "Close one collected workspace without deleting its writer worktree or branch.",
       "effects": [
         "possible-task-stop",
@@ -2209,6 +2224,7 @@
       "grabowski_agent_workspace_attach",
       "grabowski_agent_workspace_collect",
       "grabowski_agent_workspace_role_retry",
+      "grabowski_agent_workspace_writer_handoff",
       "grabowski_agent_workspace_close",
       "grabowski_agent_workspace_observe",
       "grabowski_agent_workspace_optimize",
@@ -2449,7 +2465,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "0965cde817e8a53e759e250a40188677663d067f26c0751377e9ab2463f34cdd"
+      "sha256": "6f0e402bdf3c3f017e82be36d5f91d98f635e15cef45c9b1aeeeb7c2349179c0"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2457,16 +2473,16 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "2c47105e3c8ecbb2fa715edab91920c1911a6397c4fc90d6e621306d0c1806bc"
+      "sha256": "fdc92f471a9540d22426a7b6a3f0261cf53fed1ead52b1c1b5adce02493fa81c"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
       "src/grabowski_agent_competition.py": "a73185abdcd26b6bad07b1fc5511182b820fd0e7b6eee3fbb9b558f5df83f442",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "4807f736bb0432eda1424e074e5d9b595fcc91df1e792d2ea2051a03ad4137af",
+      "src/grabowski_agent_workspace.py": "8bf6d2f6906360715b1b87e2cc736ddb0f3d8ec5b8e531d867f886c4a117d5eb",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
-      "src/grabowski_agent_writer.py": "1ccf0168b78db145c36292397410eb8878b78ad004e1795cfe5a490763530b69",
+      "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "d9b18fbef0aa2bfae78030d9826b493e18f581d2a32915a50d34d2e0b843883c",
       "src/grabowski_blockade_authority.py": "f4f5d5260b8f88a01eb176b25427de4726c57a926982cb446b54ccb6e1dbadcd",
       "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
@@ -2474,7 +2490,7 @@
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_intake.py": "1a130619c17e4a4b7b06134cd71dac98b738dac1b5299ce082737b251a20891f",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "0965cde817e8a53e759e250a40188677663d067f26c0751377e9ab2463f34cdd",
+      "src/grabowski_capabilities.py": "6f0e402bdf3c3f017e82be36d5f91d98f635e15cef45c9b1aeeeb7c2349179c0",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "e44d25d955ab35efbfe3ec381f84395f070d37fcd8726a0488269a47137ade8f",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
@@ -2490,7 +2506,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "972c84d132e74222b4d3bd7309d06280938e4d1473feabd63c97ca5a57516783",
+      "src/grabowski_mcp.py": "80c501e6a9519522a1a8ad9cf6b138b6eefc56e29e387d5fc1e593355bf8a514",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",

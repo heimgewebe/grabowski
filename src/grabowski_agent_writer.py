@@ -13,6 +13,7 @@ from typing import Any
 from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
+LAUNCH_NONCE = __import__("re").compile(r"^[0-9a-f]{24}$")
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 
 
@@ -109,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-branch", required=True)
     parser.add_argument("--allowed-path", action="append", default=[])
     parser.add_argument("--output", required=True)
+    parser.add_argument("--launch-nonce")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = list(args.command)
@@ -116,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         command.pop(0)
     if not command or SHA40.fullmatch(args.expected_base_head) is None or not args.allowed_path:
         parser.error("invalid command, base binding or writable scope")
+    if args.launch_nonce is not None and LAUNCH_NONCE.fullmatch(args.launch_nonce) is None:
+        parser.error("invalid launch nonce")
     repo = Path(args.repository).resolve(strict=True)
     output = Path(args.output).resolve(strict=False)
     writable_paths = [_allowed_path(repo, item) for item in args.allowed_path]
@@ -154,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         "head_before": before_head,
         "branch_before": before_branch,
         "command_sha256": _digest(command),
+        "launch_nonce": args.launch_nonce,
         "returncode": completed.returncode,
         "stdout_bytes": completed.stdout_bytes,
         "stderr_bytes": completed.stderr_bytes,

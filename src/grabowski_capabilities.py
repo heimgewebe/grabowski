@@ -1003,6 +1003,13 @@ TOOL_PROFILES.update(
             "effects": ["task-start", "receipt-create", "task-state-refresh"],
             "reversibility": "preserved-worktree-and-receipts",
         },
+        "grabowski_agent_workspace_writer_handoff": {
+            "category": "agent-workspace",
+            "purpose": "Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence.",
+            "risk_class": "high",
+            "effects": ["task-start", "receipt-create", "task-state-refresh"],
+            "reversibility": "preserved-worktree-and-receipts",
+        },
         "grabowski_agent_workspace_close": {
             "category": "agent-workspace",
             "purpose": "Close one collected workspace while preserving its branch and writer worktree.",

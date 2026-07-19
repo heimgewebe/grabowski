@@ -269,6 +269,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_agent_workspace_attach": ("tmux_interaction",),
     "grabowski_agent_workspace_collect": ("durable_job", "git_cli"),
     "grabowski_agent_workspace_role_retry": ("durable_job", "git_cli"),
+    "grabowski_agent_workspace_writer_handoff": ("durable_job", "git_cli", "resource_lease"),
     "grabowski_agent_workspace_close": (
         "durable_job",
         "resource_lease",
@@ -402,6 +403,7 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_agent_workspace_attach",
     "grabowski_agent_workspace_collect",
     "grabowski_agent_workspace_role_retry",
+    "grabowski_agent_workspace_writer_handoff",
     "grabowski_agent_workspace_close",
     "grabowski_agent_workspace_observe",
     "grabowski_agent_workspace_optimize",

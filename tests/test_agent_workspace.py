@@ -282,6 +282,13 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         self.preflight_patch.start()
         self.addCleanup(self.preflight_patch.stop)
+        self.renew_patch = mock.patch.object(
+            workspace.resources,
+            "renew_resources",
+            return_value={"expires_at_unix": 4102444800, "leases": []},
+        )
+        self.renew_patch.start()
+        self.addCleanup(self.renew_patch.stop)
         self.addCleanup(self.temp.cleanup)
 
     def manifest(self, *, with_writer: bool = True) -> dict:
@@ -1539,6 +1546,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "task": {
                     "task_id": "writer-task",
                     "host": kwargs["host"],
+                    "attempt": 1,
+                    "resume_policy": "never",
                     "argv_sha256": workspace._sha256_json(kwargs["argv"]),
                     "cwd": kwargs["cwd"],
                 }
@@ -1580,6 +1589,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "task": {
                     "task_id": "writer-task",
                     "host": kwargs["host"],
+                    "attempt": 1,
+                    "resume_policy": "never",
                     "argv_sha256": workspace._sha256_json(kwargs["argv"]),
                     "cwd": kwargs["cwd"],
                 }
@@ -2014,6 +2025,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                     "task": {
                         "task_id": "writer-task",
                         "host": kwargs["host"],
+                        "attempt": 1,
+                        "resume_policy": "never",
                         "argv_sha256": workspace._sha256_json(kwargs["argv"]),
                         "cwd": kwargs["cwd"],
                     }
@@ -2435,6 +2448,8 @@ class AgentWorkspaceTests(unittest.TestCase):
             "host": workspace.AGENT_WORKSPACE_TASK_HOST,
             "argv_sha256": workspace._sha256_json(argv),
             "cwd": str(self.git.repo),
+            "attempt": 1,
+            "resume_policy": "never",
         }
         self.assertEqual(
             workspace._validate_started_task(
@@ -2450,6 +2465,8 @@ class AgentWorkspaceTests(unittest.TestCase):
             ("host", "other-host"),
             ("argv_sha256", "0" * 64),
             ("cwd", str(self.root / "other")),
+            ("attempt", 2),
+            ("resume_policy", "always"),
         ):
             with self.subTest(field=field):
                 with self.assertRaisesRegex(workspace.AgentWorkspaceActionError, "task binding mismatch"):
@@ -3422,6 +3439,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "task": {
                     "task_id": "tests-retry-task",
                     "host": kwargs["host"],
+                    "attempt": 1,
+                    "resume_policy": "never",
                     "argv_sha256": workspace._sha256_json(kwargs["argv"]),
                     "cwd": kwargs["cwd"],
                 }
@@ -3494,6 +3513,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "task": {
                     "task_id": "tests-retry-task",
                     "host": kwargs["host"],
+                    "attempt": 1,
+                    "resume_policy": "never",
                     "argv_sha256": workspace._sha256_json(kwargs["argv"]),
                     "cwd": kwargs["cwd"],
                 }
@@ -4067,6 +4088,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "task": {
                     "task_id": "tests-task-2",
                     "host": kwargs["host"],
+                    "attempt": 1,
+                    "resume_policy": "never",
                     "argv_sha256": workspace._sha256_json(kwargs["argv"]),
                     "cwd": kwargs["cwd"],
                 }
@@ -5742,6 +5765,964 @@ class AgentWorkspaceTests(unittest.TestCase):
             "receipt_sha256": workspace._sha256_json(incomplete_body),
         }
         self.assertFalse(workspace._legacy_absence_receipt_valid(manifest, incomplete))
+
+
+    def _handoff_ready_manifest(self) -> tuple[dict, list[dict]]:
+        manifest = self.manifest()
+        manifest["route_evidence"] = workspace._normalize_route_evidence(
+            complete_route_evidence()
+        )
+        manifest["checkout_lifecycle"] = workspace._bind_writer_checkout_lifecycle(
+            manifest
+        )
+        manifest["checkout_lifecycle"]["task"]["writer_task_id"] = manifest["tasks"]["writer"]
+        workspace._write_manifest(manifest)
+        leases = [
+            {"resource_key": key}
+            for key in manifest["resources"]["lease_keys"]
+        ]
+        return manifest, leases
+
+    def _handoff_writer_task(
+        self,
+        manifest: dict,
+        *,
+        state: str = "failed",
+        task_id: str | None = None,
+    ) -> dict:
+        attempt = workspace._writer_attempts(manifest)[0]
+        return {
+            "task_id": attempt["task_id"] if task_id is None else task_id,
+            "host": workspace.AGENT_WORKSPACE_TASK_HOST,
+            "state": state,
+            "terminal": state in workspace.TERMINAL_TASK_STATES,
+            "attempt": 1,
+            "resume_policy": "never",
+            "argv_sha256": attempt["task_argv_sha256"],
+            "cwd": str(manifest["writer_worktree"]),
+        }
+
+    def test_writer_attempts_legacy_manifest_synthesizes_redacted_attempt_one(self) -> None:
+        manifest = self.manifest()
+        attempts = workspace._writer_attempts(manifest)
+        refs = workspace._writer_attempt_refs(manifest)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["attempt"], 1)
+        self.assertEqual(attempts[0]["task_id"], "writer-task")
+        self.assertEqual(attempts[0]["command"], manifest["commands"]["writer"])
+        self.assertEqual(workspace._writer_final_attempt(manifest), 1)
+        self.assertNotIn("command", refs[0])
+        self.assertEqual(refs[0]["command_sha256"], attempts[0]["command_sha256"])
+
+    def test_writer_handoff_starts_attempt_two_preserves_original_and_is_idempotent(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        original_task = manifest["tasks"]["writer"]
+        original_command = list(manifest["commands"]["writer"])
+        original_receipt_path = workspace._role_receipt_path(manifest, "writer")
+        original_receipt = original_receipt_path.read_bytes()
+        replacement = ["python3", "replacement-writer.py"]
+
+        def task_status(task_id: str) -> dict:
+            current = workspace._manifest(manifest["workspace_id"])
+            attempt = next(
+                item
+                for item in workspace._writer_attempts(current)
+                if item["task_id"] == task_id
+            )
+            state = "failed" if task_id == "writer-task" else "running"
+            return {
+                "task_id": task_id,
+                "host": workspace.AGENT_WORKSPACE_TASK_HOST,
+                "state": state,
+                "attempt": 1,
+                "resume_policy": "never",
+                "argv_sha256": attempt["task_argv_sha256"],
+                "cwd": str(self.git.writer),
+            }
+
+        def task_start(**kwargs) -> dict:
+            return {
+                "task": {
+                    "task_id": "replacement-writer-task",
+                    "host": kwargs["host"],
+                    "state": "running",
+                    "attempt": 1,
+                    "resume_policy": "never",
+                    "argv_sha256": workspace._task_argv_sha256(kwargs["argv"]),
+                    "cwd": kwargs["cwd"],
+                }
+            }
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.tasks, "grabowski_task_status", side_effect=task_status),
+            mock.patch.object(workspace.tasks, "grabowski_task_start", side_effect=task_start) as start,
+            mock.patch.object(workspace.resources, "list_resources", return_value=leases),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            result = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+            same = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+            different = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], ["python3", "different.py"]
+            )
+
+        self.assertEqual(result["state"], "writer_handoff_started")
+        self.assertEqual(same["state"], "writer_handoff_already_started")
+        self.assertEqual(same["handoff_status"], "idempotent")
+        self.assertEqual(different["state"], "writer_handoff_limit_reached")
+        self.assertEqual(start.call_count, 1)
+        stored = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual(stored["tasks"]["writer"], original_task)
+        self.assertEqual(stored["commands"]["writer"], original_command)
+        self.assertEqual(original_receipt_path.read_bytes(), original_receipt)
+        self.assertEqual(stored["writer_final_attempt"], 2)
+        self.assertEqual(len(stored["writer_attempts"]), 2)
+        self.assertEqual(stored["writer_attempts"][1]["task_id"], "replacement-writer-task")
+        self.assertEqual(len(stored["writer_attempts"][1]["launch_nonce"]), 24)
+        self.assertEqual(
+            stored["writer_attempts"][1]["launch_nonce_sha256"],
+            hashlib.sha256(stored["writer_attempts"][1]["launch_nonce"].encode()).hexdigest(),
+        )
+        self.assertIn("--launch-nonce", start.call_args.kwargs["argv"])
+        self.assertEqual(
+            stored["checkout_lifecycle"]["task"]["writer_task_id"], original_task
+        )
+        self.assertEqual(
+            stored["checkout_lifecycle"]["task"]["effective_writer_task_id"],
+            "replacement-writer-task",
+        )
+        self.assertEqual(
+            stored["checkout_lifecycle"]["task"]["writer_attempt_task_ids"],
+            [original_task, "replacement-writer-task"],
+        )
+        self.assertEqual(
+            stored["writer_attempts"][1]["receipt_path"],
+            str(workspace._role_receipt_path(stored, "writer", attempt=2)),
+        )
+        self.assertNotIn("writer_handoff", stored["task_start_intents"])
+        self.assertNotIn("command", result["attempt_record"])
+
+    def test_writer_handoff_idempotent_readback_rejects_task_binding_drift(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        replacement = ["python3", "replacement-writer.py"]
+        drift = {"enabled": False}
+
+        def task_status(task_id: str) -> dict:
+            current = workspace._manifest(manifest["workspace_id"])
+            attempt = next(
+                item
+                for item in workspace._writer_attempts(current)
+                if item["task_id"] == task_id
+            )
+            argv_sha256 = attempt["task_argv_sha256"]
+            if task_id == "replacement-writer-task" and drift["enabled"]:
+                argv_sha256 = "f" * 64
+            return {
+                "task_id": task_id,
+                "host": workspace.AGENT_WORKSPACE_TASK_HOST,
+                "state": "failed" if task_id == "writer-task" else "running",
+                "attempt": 1,
+                "resume_policy": "never",
+                "argv_sha256": argv_sha256,
+                "cwd": str(self.git.writer),
+            }
+
+        def task_start(**kwargs) -> dict:
+            return {
+                "task": {
+                    "task_id": "replacement-writer-task",
+                    "host": kwargs["host"],
+                    "state": "running",
+                    "attempt": 1,
+                    "resume_policy": "never",
+                    "argv_sha256": workspace._task_argv_sha256(kwargs["argv"]),
+                    "cwd": kwargs["cwd"],
+                }
+            }
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_status", side_effect=task_status
+            ),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_start", side_effect=task_start
+            ) as start,
+            mock.patch.object(
+                workspace.resources, "list_resources", return_value=leases
+            ),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            started = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+            drift["enabled"] = True
+            repeated = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+
+        self.assertEqual(started["state"], "writer_handoff_started")
+        self.assertEqual(
+            repeated["state"], "writer_handoff_task_binding_mismatch"
+        )
+        self.assertEqual(repeated["handoff_status"], "blocked")
+        self.assertEqual(
+            repeated["binding_reasons"], ["writer_task_argv_mismatch"]
+        )
+        self.assertEqual(start.call_count, 1)
+
+
+    def test_writer_handoff_blocks_running_completed_and_unknown_writer_states(self) -> None:
+        expected_reason = {
+            "running": "writer_not_terminal",
+            "completed": "writer_not_failed",
+            "outcome_unknown": "writer_outcome_reconcile_required",
+            "interrupted": "writer_outcome_reconcile_required",
+        }
+        for state, reason in expected_reason.items():
+            with self.subTest(state=state):
+                manifest, leases = self._handoff_ready_manifest()
+                with (
+                    mock.patch.object(workspace.operator, "_require_operator_mutation"),
+                    mock.patch.object(
+                        workspace.tasks,
+                        "grabowski_task_status",
+                        return_value=self._handoff_writer_task(
+                            manifest, state=state
+                        ),
+                    ),
+                    mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+                    mock.patch.object(workspace.resources, "list_resources", return_value=leases),
+                ):
+                    result = workspace.grabowski_agent_workspace_writer_handoff(
+                        manifest["workspace_id"], ["python3", "replacement.py"]
+                    )
+                self.assertEqual(result["state"], "writer_handoff_blocked")
+                self.assertIn(reason, result["writer_handoff"]["reasons"])
+                start.assert_not_called()
+
+    def test_writer_handoff_start_failure_leaves_reconcile_intent_without_consuming_attempt(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start", side_effect=RuntimeError("launch unknown")) as start,
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_list",
+                return_value={"tasks": [], "pagination": {"has_more": False}},
+            ),
+            mock.patch.object(workspace.resources, "list_resources", return_value=leases),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "launch unknown"):
+                workspace.grabowski_agent_workspace_writer_handoff(
+                    manifest["workspace_id"], ["python3", "replacement.py"]
+                )
+            blocked = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], ["python3", "replacement.py"]
+            )
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(blocked["state"], "writer_handoff_start_unresolved")
+        self.assertTrue(blocked["reconcile_required"])
+        stored = workspace._manifest(manifest["workspace_id"])
+        self.assertIn("writer_handoff", stored["task_start_intents"])
+        self.assertNotIn("writer_attempts", stored)
+        self.assertNotIn("writer_final_attempt", stored)
+
+
+    def test_writer_handoff_reconciles_one_exact_started_task_without_retry(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        replacement = ["python3", "replacement.py"]
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start", side_effect=RuntimeError("response lost")) as start,
+            mock.patch.object(workspace.resources, "list_resources", return_value=leases),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "response lost"):
+                workspace.grabowski_agent_workspace_writer_handoff(
+                    manifest["workspace_id"], replacement
+                )
+        pending = workspace._manifest(manifest["workspace_id"])
+        intent = pending["task_start_intents"]["writer_handoff"]
+        candidate = {
+            "task_id": "reconciled-writer-task",
+            "host": workspace.AGENT_WORKSPACE_TASK_HOST,
+            "state": "running",
+            "attempt": 1,
+            "resume_policy": "never",
+            "argv_sha256": intent["task_argv_sha256"],
+            "cwd": str(self.git.writer),
+            "created_at_unix": intent["created_at_unix"],
+        }
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_list",
+                return_value={
+                    "tasks": [candidate],
+                    "pagination": {"has_more": False, "next_cursor": None},
+                },
+            ) as task_list,
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as second_start,
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            result = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+        self.assertEqual(start.call_count, 1)
+        second_start.assert_not_called()
+        task_list.assert_called_once()
+        self.assertEqual(result["state"], "writer_handoff_start_reconciled")
+        self.assertEqual(result["handoff_status"], "reconciled")
+        stored = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual(stored["writer_final_attempt"], 2)
+        self.assertEqual(stored["writer_attempts"][1]["task_id"], "reconciled-writer-task")
+        self.assertTrue(stored["writer_attempts"][1]["start_reconciled"])
+        self.assertEqual(
+            stored["writer_attempts"][1]["launch_nonce"], intent["launch_nonce"]
+        )
+        self.assertNotIn("launch_nonce", result["attempt_record"])
+        self.assertIn("launch_nonce_sha256", result["attempt_record"])
+        self.assertNotIn("writer_handoff", stored["task_start_intents"])
+
+
+
+    def test_writer_handoff_reconciliation_preserves_intent_previous_state(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        replacement = ["python3", "replacement.py"]
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_start",
+                side_effect=RuntimeError("response lost"),
+            ),
+            mock.patch.object(
+                workspace.resources, "list_resources", return_value=leases
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "response lost"):
+                workspace.grabowski_agent_workspace_writer_handoff(
+                    manifest["workspace_id"], replacement
+                )
+
+        pending = workspace._manifest(manifest["workspace_id"])
+        intent = pending["task_start_intents"]["writer_handoff"]
+        candidate = {
+            "task_id": "reconciled-writer-task",
+            "host": workspace.AGENT_WORKSPACE_TASK_HOST,
+            "state": "running",
+            "attempt": 1,
+            "resume_policy": "never",
+            "argv_sha256": intent["task_argv_sha256"],
+            "cwd": str(self.git.writer),
+            "created_at_unix": intent["created_at_unix"],
+        }
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(
+                    manifest, state="cancelled"
+                ),
+            ),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_list",
+                return_value={
+                    "tasks": [candidate],
+                    "pagination": {"has_more": False, "next_cursor": None},
+                },
+            ),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            result = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+
+        self.assertEqual(result["state"], "writer_handoff_start_reconciled")
+        self.assertEqual(result["attempt_record"]["previous_state"], "failed")
+        stored = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual(stored["writer_attempts"][1]["previous_state"], "failed")
+
+
+    def test_writer_handoff_preflight_failure_does_not_consume_attempt(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        replacement = ["missing-writer-tool", "--write"]
+        failed_preflight = {
+            "passed": False,
+            "command_sha256": workspace._sha256_json(replacement),
+            "failure_classification": "environment_toolchain_failure",
+            "missing_executable": True,
+        }
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(workspace, "_role_toolchain_preflight", return_value=failed_preflight),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+            mock.patch.object(workspace.resources, "list_resources", return_value=leases),
+        ):
+            result = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+        self.assertEqual(result["state"], "writer_toolchain_preflight_failed")
+        self.assertFalse(result["attempt_consumed"])
+        start.assert_not_called()
+        stored = workspace._manifest(manifest["workspace_id"])
+        self.assertNotIn("writer_attempts", stored)
+        self.assertNotIn("writer_final_attempt", stored)
+        self.assertEqual(
+            stored["writer_handoff_preflight_blocks"][-1]["proposed_attempt"], 2
+        )
+
+    def test_writer_handoff_preflight_history_is_bounded(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+            mock.patch.object(
+                workspace.resources, "list_resources", return_value=leases
+            ),
+        ):
+            for index in range(workspace.MAX_WRITER_HANDOFF_PREFLIGHT_BLOCKS + 5):
+                command = ["missing-writer-tool", f"--probe={index}"]
+                failed_preflight = {
+                    "passed": False,
+                    "command_sha256": workspace._sha256_json(command),
+                    "failure_classification": "environment_toolchain_failure",
+                    "missing_executable": True,
+                }
+                with mock.patch.object(
+                    workspace,
+                    "_role_toolchain_preflight",
+                    return_value=failed_preflight,
+                ):
+                    result = workspace.grabowski_agent_workspace_writer_handoff(
+                        manifest["workspace_id"], command
+                    )
+                self.assertEqual(result["state"], "writer_toolchain_preflight_failed")
+
+        start.assert_not_called()
+        stored = workspace._manifest(manifest["workspace_id"])
+        blocks = stored["writer_handoff_preflight_blocks"]
+        self.assertEqual(len(blocks), workspace.MAX_WRITER_HANDOFF_PREFLIGHT_BLOCKS)
+        self.assertEqual(
+            blocks[-1]["command_sha256"],
+            workspace._sha256_json(
+                [
+                    "missing-writer-tool",
+                    f"--probe={workspace.MAX_WRITER_HANDOFF_PREFLIGHT_BLOCKS + 4}",
+                ]
+            ),
+        )
+        self.assertNotIn("writer_attempts", stored)
+        self.assertNotIn("writer_final_attempt", stored)
+
+    def test_writer_handoff_rejects_malformed_preflight_history(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        manifest["writer_handoff_preflight_blocks"] = ["invalid"]
+        workspace._write_manifest(manifest)
+        failed_preflight = {
+            "passed": False,
+            "command_sha256": workspace._sha256_json(
+                ["missing-writer-tool", "--write"]
+            ),
+            "failure_classification": "environment_toolchain_failure",
+            "missing_executable": True,
+        }
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight", return_value=failed_preflight
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+            mock.patch.object(
+                workspace.resources, "list_resources", return_value=leases
+            ),
+        ):
+            result = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], ["missing-writer-tool", "--write"]
+            )
+
+        self.assertEqual(
+            result["state"], "writer_handoff_preflight_history_invalid"
+        )
+        self.assertFalse(result["attempt_consumed"])
+        start.assert_not_called()
+
+
+    def test_writer_handoff_proven_absent_start_clears_only_intent(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        replacement = ["python3", "replacement.py"]
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start", side_effect=RuntimeError("response lost")),
+            mock.patch.object(workspace.resources, "list_resources", return_value=leases),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "response lost"):
+                workspace.grabowski_agent_workspace_writer_handoff(
+                    manifest["workspace_id"], replacement
+                )
+        pending = workspace._manifest(manifest["workspace_id"])
+        pending["task_start_intents"]["writer_handoff"]["created_at_unix"] -= 20
+        workspace._write_manifest(pending)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_list",
+                return_value={"tasks": [], "pagination": {"has_more": False}},
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as second_start,
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            result = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+        second_start.assert_not_called()
+        self.assertEqual(
+            result["state"], "writer_handoff_start_absent_intent_cleared"
+        )
+        self.assertTrue(result["retry_allowed_on_new_call"])
+        stored = workspace._manifest(manifest["workspace_id"])
+        self.assertNotIn("writer_handoff", stored["task_start_intents"])
+        self.assertNotIn("writer_attempts", stored)
+        self.assertNotIn("writer_final_attempt", stored)
+
+
+
+    def test_writer_handoff_eligibility_reports_each_authority_blocker(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        writer = self._handoff_writer_task(manifest)
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        with mock.patch.object(workspace.resources, "list_resources", return_value=leases):
+            self.assertTrue(
+                workspace._writer_handoff_eligibility(manifest, writer, snapshot)["eligible"]
+            )
+
+        cases: list[tuple[str, dict, dict, str]] = []
+        route_manifest = dict(manifest)
+        route_manifest["route_evidence"] = None
+        cases.append(("route", route_manifest, dict(snapshot), "route_evidence_incomplete"))
+        collection_manifest = dict(manifest)
+        collection_manifest["collection"] = {"state": "observing"}
+        cases.append(("collection", collection_manifest, dict(snapshot), "collection_already_started"))
+        frozen_manifest = dict(manifest)
+        frozen_manifest["frozen_writer"] = {"writer_head": manifest["expected_base_head"]}
+        cases.append(("frozen", frozen_manifest, dict(snapshot), "writer_already_frozen"))
+        closed_manifest = dict(manifest)
+        closed_manifest["close_receipt"] = {"closed": True}
+        cases.append(("closed", closed_manifest, dict(snapshot), "workspace_closed"))
+        intent_manifest = dict(manifest)
+        intent_manifest["task_start_intents"] = {"other": {"nonce": "x"}}
+        cases.append(("intent", intent_manifest, dict(snapshot), "task_start_reconcile_required"))
+        lifecycle_manifest = dict(manifest)
+        lifecycle_manifest["checkout_lifecycle"] = None
+        cases.append(("lifecycle", lifecycle_manifest, dict(snapshot), "checkout_lifecycle_missing"))
+        dirty = dict(snapshot)
+        dirty["dirty"] = True
+        cases.append(("dirty", dict(manifest), dirty, "writer_worktree_not_clean"))
+        head = dict(snapshot)
+        head["writer_head"] = "f" * 40
+        cases.append(("head", dict(manifest), head, "writer_head_mismatch"))
+        branch = dict(snapshot)
+        branch["writer_branch_matches"] = False
+        cases.append(("branch", dict(manifest), branch, "writer_branch_mismatch"))
+        drift = dict(snapshot)
+        drift["base_drift"] = True
+        cases.append(("drift", dict(manifest), drift, "base_drift"))
+        scope = dict(snapshot)
+        scope["scope_passed"] = False
+        cases.append(("scope", dict(manifest), scope, "scope_violation"))
+
+        for label, candidate_manifest, candidate_snapshot, reason in cases:
+            with self.subTest(label=label), mock.patch.object(
+                workspace.resources, "list_resources", return_value=leases
+            ):
+                result = workspace._writer_handoff_eligibility(
+                    candidate_manifest, writer, candidate_snapshot
+                )
+                self.assertFalse(result["eligible"])
+                self.assertIn(reason, result["reasons"])
+
+        with mock.patch.object(workspace.resources, "list_resources", return_value=[]):
+            result = workspace._writer_handoff_eligibility(manifest, writer, snapshot)
+        self.assertIn("workspace_lease_missing", result["reasons"])
+
+        with (
+            mock.patch.object(workspace.resources, "list_resources", return_value=leases),
+            mock.patch.object(workspace.checkouts, "_lifecycle_bindings", return_value={}),
+        ):
+            result = workspace._writer_handoff_eligibility(manifest, writer, snapshot)
+        self.assertIn("checkout_lifecycle_unbound", result["reasons"])
+
+    def test_writer_handoff_eligibility_rejects_original_task_binding_drift(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        mutations = {
+            "host": "other-host",
+            "argv_sha256": "f" * 64,
+            "cwd": "/tmp/rebound-writer",
+            "attempt": 2,
+            "resume_policy": "always",
+        }
+        expected = {
+            "host": "writer_task_host_mismatch",
+            "argv_sha256": "writer_task_argv_mismatch",
+            "cwd": "writer_task_cwd_mismatch",
+            "attempt": "writer_task_attempt_mismatch",
+            "resume_policy": "writer_task_resume_policy_mismatch",
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field), mock.patch.object(
+                workspace.resources, "list_resources", return_value=leases
+            ):
+                writer = self._handoff_writer_task(manifest)
+                writer[field] = value
+                result = workspace._writer_handoff_eligibility(
+                    manifest, writer, snapshot
+                )
+                self.assertFalse(result["eligible"])
+                self.assertIn(expected[field], result["reasons"])
+
+    def test_writer_handoff_revalidates_git_and_leases_before_start(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        clean = workspace._git_snapshot(manifest, workspace._run)
+        changed = dict(clean)
+        changed["dirty"] = True
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(workspace, "_git_snapshot", side_effect=[clean, changed]),
+            mock.patch.object(workspace.resources, "list_resources", return_value=leases),
+            mock.patch.object(workspace.resources, "renew_resources") as renew,
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+        ):
+            result = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], ["python3", "replacement.py"]
+            )
+        self.assertEqual(result["state"], "writer_handoff_revalidation_blocked")
+        self.assertIn("writer_worktree_not_clean", result["writer_handoff"]["reasons"])
+        renew.assert_not_called()
+        start.assert_not_called()
+        stored = workspace._manifest(manifest["workspace_id"])
+        self.assertNotIn("writer_handoff", stored["task_start_intents"])
+        self.assertNotIn("writer_attempts", stored)
+
+    def test_writer_handoff_binds_revalidated_previous_state(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        replacement = ["python3", "replacement.py"]
+        observed_states = iter(("failed", "cancelled"))
+
+        def task_status(task_id: str) -> dict:
+            return self._handoff_writer_task(
+                manifest, state=next(observed_states), task_id=task_id
+            )
+
+        def task_start(**kwargs) -> dict:
+            return {
+                "task": {
+                    "task_id": "replacement-writer-task",
+                    "host": kwargs["host"],
+                    "state": "running",
+                    "attempt": 1,
+                    "resume_policy": "never",
+                    "argv_sha256": workspace._task_argv_sha256(kwargs["argv"]),
+                    "cwd": kwargs["cwd"],
+                }
+            }
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_status", side_effect=task_status
+            ),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_start", side_effect=task_start
+            ),
+            mock.patch.object(
+                workspace.resources, "list_resources", return_value=leases
+            ),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            result = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+
+        self.assertEqual(result["state"], "writer_handoff_started")
+        self.assertEqual(result["attempt_record"]["previous_state"], "cancelled")
+        stored = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual(stored["writer_attempts"][1]["previous_state"], "cancelled")
+
+
+    def test_writer_handoff_start_reconciliation_fails_closed_on_ambiguity(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        replacement = ["python3", "replacement.py"]
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start", side_effect=RuntimeError("response lost")),
+            mock.patch.object(workspace.resources, "list_resources", return_value=leases),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "response lost"):
+                workspace.grabowski_agent_workspace_writer_handoff(
+                    manifest["workspace_id"], replacement
+                )
+        pending = workspace._manifest(manifest["workspace_id"])
+        intent = pending["task_start_intents"]["writer_handoff"]
+        candidates = [
+            {
+                "task_id": task_id,
+                "host": workspace.AGENT_WORKSPACE_TASK_HOST,
+                "state": "running",
+                "argv_sha256": intent["task_argv_sha256"],
+                "cwd": str(self.git.writer),
+                "created_at_unix": intent["created_at_unix"],
+            }
+            for task_id in ("candidate-a", "candidate-b")
+        ]
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_list",
+                return_value={"tasks": candidates, "pagination": {"has_more": False}},
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as retry_start,
+        ):
+            result = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+        retry_start.assert_not_called()
+        self.assertEqual(result["state"], "writer_handoff_start_ambiguous")
+        self.assertEqual(result["candidate_task_ids"], ["candidate-a", "candidate-b"])
+        stored = workspace._manifest(manifest["workspace_id"])
+        self.assertIn("writer_handoff", stored["task_start_intents"])
+        self.assertNotIn("writer_attempts", stored)
+
+    def test_writer_attempt_history_rejects_extra_or_rebound_attempts(self) -> None:
+        manifest = self.manifest()
+        first = workspace._writer_attempts(manifest)[0]
+        second = {
+            "attempt": 2,
+            "actor": "operator_handoff",
+            "task_id": "replacement",
+            "command": ["python3", "replacement.py"],
+            "command_sha256": workspace._sha256_json(["python3", "replacement.py"]),
+            "task_argv_sha256": "a" * 64,
+            "receipt_path": str(workspace._role_receipt_path(manifest, "writer", attempt=2)),
+            "expected_base_head": manifest["expected_base_head"],
+            "expected_branch": manifest["writer_branch"],
+            "previous_task_id": "wrong-original",
+            "previous_state": "failed",
+        }
+        manifest["writer_attempts"] = [first, second]
+        manifest["writer_final_attempt"] = 2
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "previous task"):
+            workspace._writer_attempts(manifest)
+        second["previous_task_id"] = first["task_id"]
+        third = dict(second)
+        third["attempt"] = 3
+        manifest["writer_attempts"] = [first, second, third]
+        manifest["writer_final_attempt"] = 3
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "exceeds"):
+            workspace._writer_attempts(manifest)
+
+
+    def test_writer_attempt_history_rejects_mutated_original_binding(self) -> None:
+        mutations = {
+            "command": ["python3", "forged-writer.py"],
+            "expected_base_head": "f" * 40,
+            "expected_branch": "feat/forged-writer",
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                manifest = self.manifest()
+                first = workspace._writer_attempts(manifest)[0]
+                first[field] = value
+                manifest["writer_attempts"] = [first]
+                with self.assertRaisesRegex(
+                    workspace.AgentWorkspaceError,
+                    "does not match original binding",
+                ):
+                    workspace._writer_attempts(manifest)
+
+
+    def test_status_exposes_eligible_redacted_writer_handoff(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        with (
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                return_value=self._handoff_writer_task(manifest),
+            ),
+            mock.patch.object(workspace.resources, "list_resources", return_value=leases),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+        ):
+            status = workspace._status_data(manifest)
+        self.assertTrue(status["writer_handoff"]["eligible"])
+        self.assertEqual(status["recommended_next_action"], "writer_handoff")
+        self.assertEqual(status["writer_final_attempt"], 1)
+        self.assertEqual(status["tasks"]["writer"]["task_id"], "writer-task")
+        self.assertEqual(status["original_writer_task"]["task_id"], "writer-task")
+        self.assertNotIn("command", status["writer_attempts"][0])
+
+    def test_collect_uses_attempt_two_task_and_receipt(self) -> None:
+        manifest = self.manifest()
+        replacement = ["python3", "replacement-writer.py"]
+        attempt_one = workspace._writer_attempts(manifest)[0]
+        launch_nonce = "0123456789abcdef01234567"
+        attempt_two_argv = workspace._writer_task_argv(
+            manifest, command=replacement, attempt=2, launch_nonce=launch_nonce
+        )
+        attempt_two = {
+            "attempt": 2,
+            "actor": "operator_handoff",
+            "task_id": "replacement-writer-task",
+            "command": replacement,
+            "command_sha256": workspace._sha256_json(replacement),
+            "task_argv_sha256": workspace._task_argv_sha256(attempt_two_argv),
+            "receipt_path": str(workspace._role_receipt_path(manifest, "writer", attempt=2)),
+            "expected_base_head": manifest["expected_base_head"],
+            "expected_branch": manifest["writer_branch"],
+            "previous_task_id": "writer-task",
+            "previous_state": "failed",
+            "started_at": "2026-07-18T19:00:00+00:00",
+            "launch_nonce": launch_nonce,
+            "launch_nonce_sha256": hashlib.sha256(launch_nonce.encode()).hexdigest(),
+        }
+        manifest["writer_attempts"] = [attempt_one, attempt_two]
+        manifest["writer_final_attempt"] = 2
+        (self.git.writer / "src" / "app.py").write_text("value = 22\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        manifest["tasks"].update({"tests": "tests-task", "review": "review-task"})
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": workspace._materialize_writer_patch(manifest, snapshot, workspace._run),
+        }
+        workspace._write_manifest(manifest)
+        writer_receipt = signed_receipt(
+            {
+                "role": "writer",
+                "expected_base_head": self.git.base,
+                "expected_branch": "feat/writer",
+                "allowed_paths": ["src"],
+                "allowed_paths_sha256": workspace._sha256_json(["src"]),
+                "command_sha256": workspace._sha256_json(replacement),
+                "launch_nonce": launch_nonce,
+                "head_before": self.git.base,
+                "branch_before": "feat/writer",
+                "head_after": self.git.base,
+                "branch_after": "feat/writer",
+                "sandbox": "bubblewrap-minimal-root-bounded-writable-paths-v1",
+                "git_common_dir_mode": "read_only",
+                "returncode": 0,
+            }
+        )
+        workspace._atomic_json(
+            workspace._role_receipt_path(manifest, "writer", attempt=2), writer_receipt
+        )
+        workspace._atomic_json(
+            workspace._role_receipt_path(manifest, "tests"),
+            signed_role_receipt("tests", manifest, snapshot),
+        )
+        workspace._atomic_json(
+            workspace._role_receipt_path(manifest, "review"),
+            signed_role_receipt("review", manifest, snapshot),
+        )
+
+        def task_status(task_id: str) -> dict:
+            value = {"task_id": task_id, "state": "completed"}
+            if task_id == "replacement-writer-task":
+                value.update(
+                    {
+                        "host": workspace.AGENT_WORKSPACE_TASK_HOST,
+                        "argv_sha256": attempt_two["task_argv_sha256"],
+                        "cwd": str(self.git.writer),
+                    }
+                )
+            return value
+
+        with (
+            mock.patch.object(workspace.tasks, "grabowski_task_status", side_effect=task_status),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual(result["state"], "complete")
+        self.assertEqual(result["result"]["writer_final_attempt"], 2)
+        self.assertEqual(
+            result["result"]["effective_writer_task_id"], "replacement-writer-task"
+        )
+        self.assertEqual(result["result"]["original_writer_task_id"], "writer-task")
+        self.assertEqual(
+            result["result"]["writer_receipt_sha256"], writer_receipt["receipt_sha256"]
+        )
+        self.assertNotIn("command", result["result"]["writer_attempts"][1])
 
 
 if __name__ == "__main__":
