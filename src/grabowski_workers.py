@@ -661,7 +661,10 @@ import net from 'node:net';
 const request = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const digest = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
-const FORM_HYDRATION_GRACE_MS = 100;
+const FORM_READY_POLL_MS = 50;
+const FORM_READY_TIMEOUT_MS = 1000;
+const FORM_ALLOWED_IDENTITY_TYPES = new Set(['text', 'email', 'select']);
+const FORM_ALLOWED_SUBMIT_TYPES = new Set(['submit', 'button']);
 const RESULT_CODES = new Set([
   'ok', 'target-discovery', 'target-origin', 'transport', 'element-contract',
   'identity-choice', 'browser-fill', 'submit-target', 'submit-effect',
@@ -879,6 +882,85 @@ async function clearFields() {
   }
 }
 
+function formReadyDeadline() {
+  return Date.now() + Math.min(FORM_READY_TIMEOUT_MS, request.timeout_ms);
+}
+
+async function inspectFormContract() {
+  return await evaluate(expression(request.selectors, `
+    const visible = (element) => {
+      if (!element || !element.isConnected) return false;
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+    let identity, protectedField, submit;
+    try {
+      identity = document.querySelector(s.identity);
+      protectedField = document.querySelector(s.protected);
+      submit = document.querySelector(s.submit);
+    } catch {
+      return {valid: false, origin: location.origin, selector_error: true};
+    }
+    const identityTag = identity ? identity.tagName.toLowerCase() : '';
+    const identityType = identityTag === 'input' ? (identity.type || 'text').toLowerCase() : identityTag;
+    const protectedType = protectedField && protectedField.tagName.toLowerCase() === 'input'
+      ? (protectedField.type || 'text').toLowerCase() : '';
+    const submitTag = submit ? submit.tagName.toLowerCase() : '';
+    const submitType = submitTag === 'input' || submitTag === 'button'
+      ? (submit.type || 'submit').toLowerCase() : submitTag;
+    return {
+      valid: Boolean(identity && protectedField && submit),
+      origin: location.origin,
+      selector_error: false,
+      identity_type: identityType,
+      protected_type: protectedType,
+      submit_type: submitType,
+      identity_visible: visible(identity),
+      protected_visible: visible(protectedField),
+      submit_visible: visible(submit),
+      identity_disabled: Boolean(identity && identity.disabled),
+      protected_disabled: Boolean(protectedField && protectedField.disabled),
+      submit_disabled: Boolean(submit && submit.disabled),
+    };
+  `));
+}
+
+function formContractReady(inspected) {
+  return Boolean(inspected && inspected.valid && !inspected.selector_error &&
+    inspected.origin === request.expected_origin &&
+    FORM_ALLOWED_IDENTITY_TYPES.has(inspected.identity_type) &&
+    inspected.protected_type === 'password' &&
+    FORM_ALLOWED_SUBMIT_TYPES.has(inspected.submit_type) &&
+    inspected.identity_visible && inspected.protected_visible && inspected.submit_visible &&
+    !inspected.identity_disabled && !inspected.protected_disabled && !inspected.submit_disabled);
+}
+
+async function waitForFormContract() {
+  const deadline = formReadyDeadline();
+  while (true) {
+    const inspected = await inspectFormContract();
+    if (inspected && (inspected.selector_error ||
+        (typeof inspected.origin === 'string' && inspected.origin !== request.expected_origin))) {
+      throw new Error('element-contract');
+    }
+    if (formContractReady(inspected)) return inspected;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('element-contract');
+    await sleep(Math.min(FORM_READY_POLL_MS, remaining));
+  }
+}
+
+async function clearFieldsAfterHydration() {
+  const deadline = formReadyDeadline();
+  while (true) {
+    if (await clearFields()) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await sleep(Math.min(FORM_READY_POLL_MS, remaining));
+  }
+}
+
 try {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), request.timeout_ms);
@@ -961,11 +1043,8 @@ try {
     try { if (ws) ws.close(); } catch {}
     throw error;
   }
-  // Give client-side form hydration one bounded grace interval after verified load.
-  await sleep(FORM_HYDRATION_GRACE_MS);
-
   if (request.cleanup_only === true) {
-    cleaned = await clearFields();
+    cleaned = await clearFieldsAfterHydration();
     emit({
       schema_version: 1, ok: true, result_code: 'cleanup', fill_confirmed: false,
       submitted: false, action_effect_observed: false, navigation_observed: false,
@@ -974,51 +1053,7 @@ try {
     });
   } else {
   stage = 'element-contract';
-  const inspected = await evaluate(expression(request.selectors, `
-    const visible = (element) => {
-      if (!element || !element.isConnected) return false;
-      const rect = element.getBoundingClientRect();
-      const style = getComputedStyle(element);
-      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-    };
-    let identity, protectedField, submit;
-    try {
-      identity = document.querySelector(s.identity);
-      protectedField = document.querySelector(s.protected);
-      submit = document.querySelector(s.submit);
-    } catch {
-      return {valid: false};
-    }
-    const identityTag = identity ? identity.tagName.toLowerCase() : '';
-    const identityType = identityTag === 'input' ? (identity.type || 'text').toLowerCase() : identityTag;
-    const protectedType = protectedField && protectedField.tagName.toLowerCase() === 'input'
-      ? (protectedField.type || 'text').toLowerCase() : '';
-    const submitTag = submit ? submit.tagName.toLowerCase() : '';
-    const submitType = submitTag === 'input' || submitTag === 'button'
-      ? (submit.type || 'submit').toLowerCase() : submitTag;
-    return {
-      valid: Boolean(identity && protectedField && submit),
-      origin: location.origin,
-      identity_type: identityType,
-      protected_type: protectedType,
-      submit_type: submitType,
-      identity_visible: visible(identity),
-      protected_visible: visible(protectedField),
-      submit_visible: visible(submit),
-      identity_disabled: Boolean(identity && identity.disabled),
-      protected_disabled: Boolean(protectedField && protectedField.disabled),
-      submit_disabled: Boolean(submit && submit.disabled),
-    };
-  `));
-  const allowedIdentity = new Set(['text', 'email', 'select']);
-  const allowedSubmit = new Set(['submit', 'button']);
-  if (!inspected || !inspected.valid || inspected.origin !== request.expected_origin ||
-      !allowedIdentity.has(inspected.identity_type) || inspected.protected_type !== 'password' ||
-      !allowedSubmit.has(inspected.submit_type) || !inspected.identity_visible ||
-      !inspected.protected_visible || !inspected.submit_visible || inspected.identity_disabled ||
-      inspected.protected_disabled || inspected.submit_disabled) {
-    throw new Error('element-contract');
-  }
+  const inspected = await waitForFormContract();
 
   if (request.identity_choice !== null) {
     stage = 'identity-choice';
