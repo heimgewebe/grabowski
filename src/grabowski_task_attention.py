@@ -502,9 +502,16 @@ def _read_valid_outcome(
         expected_receipt_sha256 = authoritative_receipt_sha256
 
     _ensure_private_directory(tasks.TASK_OUTCOMES_DIR, create=False)
+    primary_path, lifecycle_path = _outcome_paths(binding["task_id"])
+    paths = (primary_path, lifecycle_path)
+    if authoritative_receipt_sha256 is not None:
+        # Prefer the dedicated lifecycle path, but keep the primary path as a
+        # compatibility location because current writers may have persisted the
+        # authoritative v2 receipt there before a legacy primary existed.
+        paths = (lifecycle_path, primary_path)
     first_missing: FileNotFoundError | None = None
     first_conflict: TaskAttentionConflictError | None = None
-    for path in _outcome_paths(binding["task_id"]):
+    for path in paths:
         try:
             value, file_sha256 = _read_private_json(
                 path,
@@ -513,6 +520,14 @@ def _read_valid_outcome(
         except FileNotFoundError as exc:
             if first_missing is None:
                 first_missing = exc
+            continue
+        if (
+            authoritative_receipt_sha256 is not None
+            and value.get("receipt_sha256") != authoritative_receipt_sha256
+        ):
+            # A historical or unrelated receipt at the alternate compatibility
+            # path has no authority once the task row binds an exact lifecycle
+            # digest. Do not let its older schema mask the bound receipt.
             continue
         try:
             receipt_sha256 = _validate_outcome_receipt(

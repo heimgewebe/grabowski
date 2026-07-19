@@ -129,6 +129,27 @@ class TaskAttentionTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    @staticmethod
+    def _to_legacy_unbound_outcome(
+        lifecycle: dict[str, object],
+    ) -> dict[str, object]:
+        legacy = {
+            key: value
+            for key, value in lifecycle.items()
+            if key
+            not in {
+                "kind",
+                "terminalization",
+                "receipt_sha256",
+                "authoritative_unit",
+                "execution_backend",
+                "systemd_scope",
+            }
+        }
+        legacy["schema_version"] = 1
+        legacy["receipt_sha256"] = attention._sha256_json(legacy)
+        return legacy
+
     def test_decision_is_private_create_only_and_idempotent(self) -> None:
         record = self._failed_task()
         parameters = self._parameters(record)
@@ -199,13 +220,7 @@ class TaskAttentionTests(unittest.TestCase):
         lifecycle = json.loads(primary_path.read_text(encoding="utf-8"))
         primary_path.replace(lifecycle_path)
 
-        legacy = {
-            key: value
-            for key, value in lifecycle.items()
-            if key not in {"kind", "terminalization", "receipt_sha256"}
-        }
-        legacy["schema_version"] = 1
-        legacy["receipt_sha256"] = attention._sha256_json(legacy)
+        legacy = self._to_legacy_unbound_outcome(lifecycle)
         primary_path.write_text(
             json.dumps(legacy, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
@@ -221,6 +236,80 @@ class TaskAttentionTests(unittest.TestCase):
         classified = attention._classify_record(tasks._row(task_id))
         self.assertEqual("decision_closed", classified["classification"])
         self.assertEqual(expected, classified["outcome_receipt_sha256"])
+
+    def test_authoritative_primary_survives_unrelated_lifecycle_path(self) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        primary_path = self.outcomes / f"{task_id}.json"
+        lifecycle_path = self.outcomes / f"{task_id}.lifecycle.json"
+        authoritative = json.loads(primary_path.read_text(encoding="utf-8"))
+        unrelated = self._to_legacy_unbound_outcome(authoritative)
+        lifecycle_path.write_text(
+            json.dumps(unrelated, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(lifecycle_path, 0o600)
+
+        expected = authoritative["receipt_sha256"]
+        result = attention.record_decision(
+            self._parameters(record, outcome_receipt_sha256=expected)
+        )
+
+        self.assertEqual(expected, result["outcome_receipt_sha256"])
+
+    def test_missing_authoritative_lifecycle_does_not_fall_back_to_legacy_primary(self) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        primary_path = self.outcomes / f"{task_id}.json"
+        lifecycle = json.loads(primary_path.read_text(encoding="utf-8"))
+
+        legacy = self._to_legacy_unbound_outcome(lifecycle)
+        primary_path.write_text(
+            json.dumps(legacy, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(primary_path, 0o600)
+
+        with self.assertRaises(FileNotFoundError):
+            attention.record_decision(
+                self._parameters(
+                    record,
+                    outcome_receipt_sha256=lifecycle["receipt_sha256"],
+                )
+            )
+
+    def test_tampered_authoritative_lifecycle_is_not_masked_by_legacy_primary(self) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        primary_path = self.outcomes / f"{task_id}.json"
+        lifecycle_path = self.outcomes / f"{task_id}.lifecycle.json"
+        lifecycle = json.loads(primary_path.read_text(encoding="utf-8"))
+        primary_path.replace(lifecycle_path)
+
+        legacy = self._to_legacy_unbound_outcome(lifecycle)
+        primary_path.write_text(
+            json.dumps(legacy, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(primary_path, 0o600)
+
+        lifecycle["terminalization"]["recovery_status"] = "recovered_after_revocation"
+        lifecycle["receipt_sha256"] = attention._sha256_json(
+            {key: value for key, value in lifecycle.items() if key != "receipt_sha256"}
+        )
+        lifecycle_path.write_text(
+            json.dumps(lifecycle, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(lifecycle_path, 0o600)
+        tampered_record = dict(record)
+        tampered_record["lifecycle_receipt_sha256"] = lifecycle["receipt_sha256"]
+
+        with self.assertRaisesRegex(attention.TaskAttentionIntegrityError, "transition hash"):
+            attention._read_valid_outcome(
+                tampered_record,
+                expected_receipt_sha256=lifecycle["receipt_sha256"],
+            )
 
     def test_lifecycle_transition_tampering_is_rejected_after_outer_rehash(self) -> None:
         record = self._failed_task()
