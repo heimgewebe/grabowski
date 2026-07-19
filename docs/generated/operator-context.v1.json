@@ -2512,7 +2512,7 @@
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
       "src/grabowski_tasks.py": "075fac25559a35e7590cf7e948bfd8ccdc3bdb262669655cb3dbb2e74bd65666",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
-      "src/grabowski_workers.py": "294f795b4d35c4d7b70757bd2a95d3f19381ce95aea2e049d4976e307e505f79",
+      "src/grabowski_workers.py": "e8f0abf27da4afc17d2d9607e38023ba48d97d50ec9d37bd63ddcddef34c7f73",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"
     }
   }

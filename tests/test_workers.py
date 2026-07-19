@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import shutil
 import socket
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -71,6 +75,133 @@ class WorkerTests(unittest.TestCase):
         for item in reversed(self.patches):
             item.stop()
         self.temporary.cleanup()
+
+    def _run_browser_form_node(
+        self, scenario: str
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is required for the browser helper runtime test")
+        helper_path = self.root / "stored-form-helper.mjs"
+        preload_path = self.root / "fake-cdp.mjs"
+        request_path = self.root / "request.json"
+        helper_path.write_text(workers.BROWSER_FORM_NODE_SOURCE, encoding="utf-8")
+        preload_path.write_text(
+            r"""
+const scenario = process.env.GRABOWSKI_TEST_SCENARIO;
+const expectedOrigin = 'http://device.home.arpa';
+const allowedAddress = '192.168.1.10';
+
+function message(target, payload) {
+  if (target.onmessage) target.onmessage({data: JSON.stringify(payload)});
+}
+
+class FakeWebSocket {
+  static OPEN = 1;
+
+  constructor() {
+    this.readyState = 0;
+    queueMicrotask(() => {
+      this.readyState = FakeWebSocket.OPEN;
+      if (this.onopen) this.onopen();
+    });
+  }
+
+  send(raw) {
+    const request = JSON.parse(raw);
+    const reply = (result = {}) => {
+      message(this, {id: request.id, result});
+    };
+    const emit = (method, params = {}) => {
+      message(this, {method, params});
+    };
+    switch (request.method) {
+      case 'Runtime.enable':
+      case 'Page.enable':
+      case 'Network.enable':
+      case 'Network.setCacheDisabled':
+        reply();
+        return;
+      case 'Page.getFrameTree':
+        reply({frameTree: {frame: {id: 'main'}}});
+        return;
+      case 'Page.reload': {
+        const remoteIPAddress = scenario === 'disallowed-address'
+          ? '203.0.113.7' : allowedAddress;
+        emit('Network.responseReceived', {
+          type: 'Document',
+          frameId: 'main',
+          response: {url: expectedOrigin + '/', remoteIPAddress},
+        });
+        if (scenario === 'response-then-close') {
+          this.readyState = 3;
+          if (this.onclose) this.onclose();
+          return;
+        }
+        emit('Page.loadEventFired');
+        reply();
+        return;
+      }
+      case 'Runtime.evaluate':
+        reply({result: {value: true}});
+        return;
+      default:
+        reply();
+    }
+  }
+
+  close() {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    queueMicrotask(() => {
+      if (this.onclose) this.onclose();
+    });
+  }
+}
+
+globalThis.WebSocket = FakeWebSocket;
+globalThis.fetch = async () => ({
+  ok: true,
+  json: async () => [{
+    type: 'page',
+    url: expectedOrigin + '/',
+    webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/1',
+  }],
+});
+""",
+            encoding="utf-8",
+        )
+        request_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "port": 9222,
+                    "expected_origin": "http://device.home.arpa",
+                    "allowed_addresses": ["192.168.1.10"],
+                    "cleanup_only": True,
+                    "selectors": {
+                        "identity": "#identity",
+                        "protected": "#protected",
+                        "submit": "button",
+                    },
+                    "identity_choice": None,
+                    "timeout_ms": 250,
+                }
+            ),
+            encoding="utf-8",
+        )
+        execution = subprocess.run(
+            [node, "--import", str(preload_path), str(helper_path), str(request_path)],
+            cwd=self.root,
+            env={**os.environ, "GRABOWSKI_TEST_SCENARIO": scenario},
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        lines = [line for line in execution.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines, execution.stderr)
+        return execution, json.loads(lines[-1])
 
     def test_browser_launch_is_loopback_only_and_leased(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
@@ -710,32 +841,32 @@ class WorkerTests(unittest.TestCase):
                 )
         action.assert_not_called()
 
-    def test_stored_form_helper_arms_reload_waiters_before_reload(self) -> None:
-        source = workers.BROWSER_FORM_NODE_SOURCE
-        document_waiter = source.index(
-            "const documentResponsePromise = waitEvent('Network.responseReceived'"
+    def test_stored_form_helper_handles_prearmed_reload_events_at_runtime(self) -> None:
+        execution, receipt = self._run_browser_form_node("reload-events-before-reply")
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertIs(receipt["ok"], True)
+        self.assertEqual(receipt["result_code"], "cleanup")
+        self.assertEqual(
+            receipt["remote_address_sha256"],
+            hashlib.sha256(b"192.168.1.10").hexdigest(),
         )
-        load_waiter = source.index(
-            "const loadEventPromise = waitEvent('Page.loadEventFired')"
-        )
-        reload_call = source.index("call('Page.reload', {ignoreCache: true})")
-        joined_wait = source.index("const reloadResults = await Promise.all([")
-        self.assertLess(document_waiter, reload_call)
-        self.assertLess(load_waiter, reload_call)
-        self.assertLess(joined_wait, reload_call)
-        self.assertIn("if (eventQueue.length > 128) eventQueue.shift();", source)
-        self.assertIn("function rejectTransportOperations()", source)
-        self.assertIn("ws.onclose = rejectTransportOperations;", source)
-        self.assertIn("rejectTransportOperations();", source)
-        self.assertIn("for (const waiter of eventWaiters.splice(0))", source)
-        self.assertIn("try { if (ws) ws.close(); } catch {}", source)
 
-    def test_stored_form_helper_preserves_verified_remote_digest_on_later_failure(self) -> None:
-        source = workers.BROWSER_FORM_NODE_SOURCE
-        self.assertIn("let remoteAddressSha256 = null;", source)
-        self.assertIn("remoteAddressSha256 = digest(remoteAddress);", source)
-        failure = source.rsplit("} catch (error) {", 1)[1]
-        self.assertIn("remote_address_sha256: remoteAddressSha256", failure)
+    def test_stored_form_helper_preserves_verified_digest_after_transport_failure(self) -> None:
+        execution, receipt = self._run_browser_form_node("response-then-close")
+        self.assertEqual(execution.returncode, 2, execution.stderr)
+        self.assertIs(receipt["ok"], False)
+        self.assertEqual(receipt["result_code"], "transport")
+        self.assertEqual(
+            receipt["remote_address_sha256"],
+            hashlib.sha256(b"192.168.1.10").hexdigest(),
+        )
+
+    def test_stored_form_helper_does_not_disclose_rejected_remote_address(self) -> None:
+        execution, receipt = self._run_browser_form_node("disallowed-address")
+        self.assertEqual(execution.returncode, 2, execution.stderr)
+        self.assertIs(receipt["ok"], False)
+        self.assertEqual(receipt["result_code"], "target-origin")
+        self.assertIsNone(receipt["remote_address_sha256"])
 
     def test_stored_form_helper_uses_topmost_pointer_and_guarded_enter(self) -> None:
         source = workers.BROWSER_FORM_NODE_SOURCE

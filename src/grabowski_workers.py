@@ -753,27 +753,28 @@ try {
         !params.response || typeof params.response.url !== 'string') return false;
     try { return new URL(params.response.url).origin === request.expected_origin; }
     catch { return false; }
+  }).then((documentResponse) => {
+    const remoteAddress = String(documentResponse.response.remoteIPAddress || '')
+      .split('%', 1)[0].replace(/^\[|\]$/g, '');
+    if (!remoteAddress || !request.allowed_addresses.includes(remoteAddress)) {
+      throw new Error('target-origin');
+    }
+    remoteAddressSha256 = digest(remoteAddress);
+    return documentResponse;
   });
   const loadEventPromise = waitEvent('Page.loadEventFired');
-  let documentResponse;
   try {
-    const reloadResults = await Promise.all([
+    await Promise.all([
       call('Page.reload', {ignoreCache: true}),
       documentResponsePromise,
       loadEventPromise,
     ]);
-    documentResponse = reloadResults[1];
   } catch (error) {
     rejectTransportOperations();
     try { if (ws) ws.close(); } catch {}
     throw error;
   }
-  const remoteAddress = String(documentResponse.response.remoteIPAddress || '')
-    .split('%', 1)[0].replace(/^\[|\]$/g, '');
-  if (!remoteAddress || !request.allowed_addresses.includes(remoteAddress)) {
-    throw new Error('target-origin');
-  }
-  remoteAddressSha256 = digest(remoteAddress);
+  // Let the reloaded document settle before querying its form contract.
   await sleep(100);
 
   if (request.cleanup_only === true) {
