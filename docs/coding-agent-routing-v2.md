@@ -31,6 +31,8 @@ Plan-Semantik gilt global: Jede Route mit plan als Permission- oder Approval-Mod
 
 `acceptEdits` ist gewählt, weil eine Writer-Route im separat autorisierten Arbeitsraum Änderungen anwenden können muss, ohne die Schutzgrenzen von `--safe-mode` zu umgehen. Ein `auto`-Modus würde die Freigabeentscheidung weiter delegieren; `bypassPermissions` beziehungsweise vergleichbare Permission-Bypässe würden die Sicherheitsgrenze aufheben. Beides ist hier ausdrücklich ausgeschlossen. `acceptEdits` erteilt weder automatische Ausführungsautorität noch Integrations-, Merge- oder Deployment-Rechte. Es bleibt bei höchstens einem mutierenden Writer; Katalog und Empfehlung starten keine Route automatisch.
 
+`argv_prefix` bleibt in dieser Version die kanonische Befehlsquelle. Permission- und Approval-Modi werden zentral, reihenfolgeunabhängig und für beide CLI-Schreibweisen (`--flag value` und `--flag=value`) validiert; der abgeleitete Wert erscheint als strukturiertes Feld `permission_mode` in Katalog- und Routingausgaben. Ein eigenständiges autoritatives Katalogfeld wäre eine separate Schemamigration und wird nicht neben dem bestehenden Befehlsvertrag als zweite Wahrheit eingeführt.
+
 ## Selbstlernen
 
 Lokale Ergebnisse überschreiben Hersteller- und Benchmark-Priors erst ab fünf vergleichbaren Läufen derselben Route und Aufgabenklasse. Verwendet werden First-Pass-, CI- und Merge-Erfolg, Nacharbeit, Rollbacks, falsche Behauptungen, Scope-Verstöße, Laufzeit und Kontingentverbrauch. Zugangstests werden getrennt gespeichert und nie als Qualitätserfolg gezählt. Bayesianische Schrumpfung und harte Kappen verhindern, dass wenige Läufe die Hierarchie umwerfen.

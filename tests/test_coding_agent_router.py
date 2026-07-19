@@ -199,34 +199,115 @@ class CodingAgentRouterTests(unittest.TestCase):
 
     def test_fable_writer_and_reviewer_have_separate_permission_modes(self) -> None:
         routes = {route["id"]: route for route in self.catalog["routes"]}
+        public = {
+            route["route"]: route
+            for model in router.grabowski_coding_agent_catalog(include_disabled=True)[
+                "models"
+            ]
+            for route in model["routes"]
+        }
         legacy = routes["claude-fable-5-high"]
         writer = routes["claude-fable-5-writer-high"]
         reviewer = routes["claude-fable-5-review-high"]
         self.assertFalse(legacy["enabled"])
-        self.assertEqual(legacy["argv_prefix"][4], "plan")
+        self.assertEqual(public[legacy["id"]]["permission_mode"], "plan")
         self.assertTrue(legacy["review_only"])
         self.assertIn("Compatibility alias", legacy["disabled_reason"])
-        self.assertEqual(
-            writer["argv_prefix"],
-            [
-                "claude",
-                "-p",
-                "--safe-mode",
-                "--permission-mode",
-                "acceptEdits",
-                "--model",
-                "claude-fable-5",
-                "--effort",
-                "high",
-            ],
-        )
+        self.assertIn("--safe-mode", writer["argv_prefix"])
+        self.assertIn("claude-fable-5", writer["argv_prefix"])
+        self.assertEqual(public[writer["id"]]["permission_mode"], "acceptEdits")
         self.assertTrue(writer["writer_only"])
-        self.assertEqual(reviewer["argv_prefix"][4], "plan")
+        self.assertEqual(public[reviewer["id"]]["permission_mode"], "plan")
         self.assertTrue(reviewer["review_only"])
         self.assertEqual(
             reviewer["task_classes"],
             ["independent-review", "critical-review", "security-review"],
         )
+
+    def test_permission_mode_projection_accepts_reordered_and_equals_forms(self) -> None:
+        catalog = json.loads(json.dumps(self.catalog))
+        routes = {route["id"]: route for route in catalog["routes"]}
+        routes["claude-fable-5-review-high"]["argv_prefix"] = [
+            "claude",
+            "--model",
+            "claude-fable-5",
+            "--permission-mode=plan",
+            "-p",
+            "--safe-mode",
+            "--effort",
+            "high",
+        ]
+        routes["claude-fable-5-writer-high"]["argv_prefix"] = [
+            "claude",
+            "--model",
+            "claude-fable-5",
+            "--effort",
+            "high",
+            "--permission-mode=acceptEdits",
+            "-p",
+            "--safe-mode",
+        ]
+        self.catalog_path.write_text(json.dumps(catalog))
+        public = {
+            route["route"]: route
+            for model in router.grabowski_coding_agent_catalog(include_disabled=True)[
+                "models"
+            ]
+            for route in model["routes"]
+        }
+        self.assertEqual(
+            public["claude-fable-5-review-high"]["permission_mode"], "plan"
+        )
+        self.assertEqual(
+            public["claude-fable-5-writer-high"]["permission_mode"], "acceptEdits"
+        )
+
+    def test_route_derivations_are_built_once_for_primary_and_review_ranking(
+        self,
+    ) -> None:
+        original = router._route_capabilities
+        calls: list[str] = []
+
+        def counted(route, catalog, review_task_classes=None):
+            calls.append(route["id"])
+            return original(route, catalog, review_task_classes)
+
+        with mock.patch.object(router, "_route_capabilities", side_effect=counted):
+            result = self._route("complex-patch", need_review=True)
+
+        self.assertEqual(result["decision"], "route")
+        self.assertEqual(len(calls), len(self.catalog["routes"]))
+        self.assertEqual(set(calls), {route["id"] for route in self.catalog["routes"]})
+
+    def test_permission_mode_validation_fails_closed_for_malformed_argv(self) -> None:
+        cases = [
+            (None, "invalid argv_prefix"),
+            (["claude", ""], "invalid argv_prefix"),
+            (["claude", "--permission-mode"], "missing a value"),
+            (["claude", "--permission-mode", "-p"], "missing a value"),
+            (["claude", "--permission-mode="], "empty value"),
+            (
+                [
+                    "claude",
+                    "--permission-mode",
+                    "plan",
+                    "--approval-mode=acceptEdits",
+                ],
+                "conflicting permission modes",
+            ),
+        ]
+        for argv_prefix, message in cases:
+            with self.subTest(argv_prefix=argv_prefix):
+                catalog = json.loads(json.dumps(self.catalog))
+                route = next(
+                    route
+                    for route in catalog["routes"]
+                    if route["id"] == "claude-fable-5-review-high"
+                )
+                route["argv_prefix"] = argv_prefix
+                self.catalog_path.write_text(json.dumps(catalog))
+                with self.assertRaisesRegex(router.CodingAgentRouterError, message):
+                    router.grabowski_coding_agent_catalog(include_disabled=True)
 
     def test_every_public_plan_route_is_review_only_and_non_writer(self) -> None:
         result = router.grabowski_coding_agent_catalog(include_disabled=True)
@@ -237,13 +318,12 @@ class CodingAgentRouterTests(unittest.TestCase):
         }
         plan_routes = [
             route
-            for route in self.catalog["routes"]
-            if router._route_uses_plan_mode(route)
+            for route in public_routes.values()
+            if route["permission_mode"] == "plan"
         ]
         self.assertTrue(plan_routes)
-        for route in plan_routes:
-            with self.subTest(route=route["id"]):
-                public = public_routes[route["id"]]
+        for public in plan_routes:
+            with self.subTest(route=public["route"]):
                 self.assertTrue(public["review_only"])
                 self.assertFalse(public["writer_capable"])
                 self.assertTrue(public["review_capable"])
@@ -266,7 +346,8 @@ class CodingAgentRouterTests(unittest.TestCase):
             for route in writer_in_plan_mode["routes"]
             if route["id"] == "claude-fable-5-writer-high"
         )
-        writer["argv_prefix"][4] = "plan"
+        mode_index = writer["argv_prefix"].index("--permission-mode")
+        writer["argv_prefix"][mode_index + 1] = "plan"
         with self.assertRaisesRegex(router.CodingAgentRouterError, "cannot use plan"):
             router._validate_catalog(writer_in_plan_mode)
 
