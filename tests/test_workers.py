@@ -77,7 +77,12 @@ class WorkerTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def _run_browser_form_node(
-        self, scenario: str
+        self,
+        scenario: str,
+        *,
+        cleanup_only: bool = True,
+        action_mode: str = "readiness",
+        allowed_addresses: list[str] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
         node = shutil.which("node")
         if node is None:
@@ -91,6 +96,9 @@ class WorkerTests(unittest.TestCase):
 const scenario = process.env.GRABOWSKI_TEST_SCENARIO;
 const expectedOrigin = 'http://device.home.arpa';
 const allowedAddress = '192.168.1.10';
+const initialLoader = 'loader-before-reload';
+const reloadLoader = 'loader-after-reload';
+let frameTreeCalls = 0;
 
 function message(target, payload) {
   if (target.onmessage) target.onmessage({data: JSON.stringify(payload)});
@@ -112,23 +120,67 @@ class FakeWebSocket {
     const reply = (result = {}) => {
       message(this, {id: request.id, result});
     };
+    const fail = () => {
+      message(this, {id: request.id, error: {message: 'protocol'}});
+    };
     const emit = (method, params = {}) => {
       message(this, {method, params});
     };
     switch (request.method) {
       case 'Runtime.enable':
       case 'Page.enable':
+      case 'Page.setLifecycleEventsEnabled':
       case 'Network.enable':
       case 'Network.setCacheDisabled':
+      case 'Input.dispatchMouseEvent':
+      case 'Input.dispatchKeyEvent':
         reply();
         return;
-      case 'Page.getFrameTree':
-        reply({frameTree: {frame: {id: 'main'}}});
+      case 'Page.getFrameTree': {
+        frameTreeCalls += 1;
+        const finalOrigin = scenario === 'wrong-final-origin'
+          ? 'http://other.home.arpa' : expectedOrigin;
+        reply({
+          frameTree: {
+            frame: {
+              id: 'main',
+              loaderId: frameTreeCalls === 1 ? initialLoader : reloadLoader,
+              url: (frameTreeCalls === 1 ? expectedOrigin : finalOrigin) + '/',
+            },
+          },
+        });
+        if (frameTreeCalls === 1 && scenario === 'stale-events') {
+          emit('Network.responseReceived', {
+            requestId: 'stale-document',
+            loaderId: initialLoader,
+            type: 'Document',
+            frameId: 'main',
+            response: {
+              url: expectedOrigin + '/',
+              remoteIPAddress: allowedAddress,
+            },
+          });
+          emit('Page.lifecycleEvent', {
+            name: 'load', frameId: 'main', loaderId: initialLoader,
+          });
+        }
         return;
+      }
       case 'Page.reload': {
+        if (request.params.loaderId !== initialLoader) {
+          fail();
+          return;
+        }
         const remoteIPAddress = scenario === 'disallowed-address'
-          ? '203.0.113.7' : allowedAddress;
+          ? '203.0.113.7'
+          : (scenario === 'invalid-address'
+            ? 'not-an-ip'
+            : (scenario === 'ipv6-zone-address' ? '[fd00:0:0::1%eth0]' : allowedAddress));
+        const responseLoader = scenario === 'loader-mismatch'
+          ? 'different-loader' : reloadLoader;
         emit('Network.responseReceived', {
+          requestId: 'reload-document',
+          loaderId: responseLoader,
           type: 'Document',
           frameId: 'main',
           response: {url: expectedOrigin + '/', remoteIPAddress},
@@ -138,13 +190,45 @@ class FakeWebSocket {
           if (this.onclose) this.onclose();
           return;
         }
-        emit('Page.loadEventFired');
+        emit('Page.lifecycleEvent', {
+          name: 'load', frameId: 'main', loaderId: reloadLoader,
+        });
         reply();
         return;
       }
-      case 'Runtime.evaluate':
+      case 'Runtime.evaluate': {
+        const expression = String(request.params.expression || '');
+        if (expression.includes('identity_type: identityType')) {
+          if (scenario === 'verified-then-element-failure') {
+            reply({result: {value: {valid: false}}});
+          } else {
+            reply({result: {value: {
+              valid: true,
+              origin: expectedOrigin,
+              identity_type: 'text',
+              protected_type: 'password',
+              submit_type: 'submit',
+              identity_visible: true,
+              protected_visible: true,
+              submit_visible: true,
+              identity_disabled: false,
+              protected_disabled: false,
+              submit_disabled: false,
+            }}});
+          }
+          return;
+        }
+        if (expression.includes('document.elementFromPoint')) {
+          reply({result: {value: {x: 10, y: 10}}});
+          return;
+        }
+        if (expression.includes('identity_filled')) {
+          reply({result: {value: {identity_filled: true, protected_filled: true}}});
+          return;
+        }
         reply({result: {value: true}});
         return;
+      }
       default:
         reply();
     }
@@ -177,8 +261,9 @@ globalThis.fetch = async () => ({
                     "schema_version": 1,
                     "port": 9222,
                     "expected_origin": "http://device.home.arpa",
-                    "allowed_addresses": ["192.168.1.10"],
-                    "cleanup_only": True,
+                    "allowed_addresses": allowed_addresses or ["192.168.1.10"],
+                    "cleanup_only": cleanup_only,
+                    "action_mode": action_mode,
                     "selectors": {
                         "identity": "#identity",
                         "protected": "#protected",
@@ -581,6 +666,27 @@ globalThis.fetch = async () => ({
             with self.assertRaisesRegex(PermissionError, "outside local"):
                 workers._canonical_local_origin("http://example.invalid")
 
+    def test_stored_form_action_canonicalizes_resolved_ipv6_addresses(self) -> None:
+        local_answers = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fd00:0:0:0:0:0:0:1", 80, 0, 3)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fd00::1", 80, 0, 0)),
+        ]
+        with patch.object(workers.socket, "getaddrinfo", return_value=local_answers):
+            origin, address_sha256, addresses = workers._canonical_local_origin(
+                "http://device.invalid"
+            )
+        self.assertEqual(origin, "http://device.invalid")
+        self.assertEqual(addresses, ["fd00::1"])
+        self.assertEqual(address_sha256, hashlib.sha256(b"fd00::1").hexdigest())
+
+    def test_stored_form_action_rejects_invalid_resolver_address(self) -> None:
+        invalid_answers = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("not-an-ip", 80))
+        ]
+        with patch.object(workers.socket, "getaddrinfo", return_value=invalid_answers):
+            with self.assertRaisesRegex(RuntimeError, "invalid address"):
+                workers._canonical_local_origin("http://device.invalid")
+
     def test_stored_form_action_rejects_multiline_selector(self) -> None:
         with self.assertRaisesRegex(ValueError, "bounded single-line"):
             workers._validate_form_selector("#field\nscript", "identity_selector")
@@ -851,11 +957,40 @@ globalThis.fetch = async () => ({
             hashlib.sha256(b"192.168.1.10").hexdigest(),
         )
 
-    def test_stored_form_helper_preserves_verified_digest_after_transport_failure(self) -> None:
+    def test_stored_form_helper_ignores_stale_pre_reload_events(self) -> None:
+        execution, receipt = self._run_browser_form_node("stale-events")
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertIs(receipt["ok"], True)
+        self.assertEqual(
+            receipt["remote_address_sha256"],
+            hashlib.sha256(b"192.168.1.10").hexdigest(),
+        )
+
+    def test_stored_form_helper_rejects_loader_mismatch(self) -> None:
+        execution, receipt = self._run_browser_form_node("loader-mismatch")
+        self.assertEqual(execution.returncode, 2, execution.stderr)
+        self.assertEqual(receipt["result_code"], "target-origin")
+        self.assertIsNone(receipt["remote_address_sha256"])
+
+    def test_stored_form_helper_rejects_final_frame_origin_drift(self) -> None:
+        execution, receipt = self._run_browser_form_node("wrong-final-origin")
+        self.assertEqual(execution.returncode, 2, execution.stderr)
+        self.assertEqual(receipt["result_code"], "target-origin")
+        self.assertIsNone(receipt["remote_address_sha256"])
+
+    def test_stored_form_helper_does_not_claim_incomplete_transport_evidence(self) -> None:
         execution, receipt = self._run_browser_form_node("response-then-close")
         self.assertEqual(execution.returncode, 2, execution.stderr)
         self.assertIs(receipt["ok"], False)
         self.assertEqual(receipt["result_code"], "transport")
+        self.assertIsNone(receipt["remote_address_sha256"])
+
+    def test_stored_form_helper_preserves_digest_after_verified_later_failure(self) -> None:
+        execution, receipt = self._run_browser_form_node(
+            "verified-then-element-failure", cleanup_only=False
+        )
+        self.assertEqual(execution.returncode, 2, execution.stderr)
+        self.assertEqual(receipt["result_code"], "element-contract")
         self.assertEqual(
             receipt["remote_address_sha256"],
             hashlib.sha256(b"192.168.1.10").hexdigest(),
@@ -867,6 +1002,32 @@ globalThis.fetch = async () => ({
         self.assertIs(receipt["ok"], False)
         self.assertEqual(receipt["result_code"], "target-origin")
         self.assertIsNone(receipt["remote_address_sha256"])
+
+    def test_stored_form_helper_rejects_invalid_remote_address(self) -> None:
+        execution, receipt = self._run_browser_form_node("invalid-address")
+        self.assertEqual(execution.returncode, 2, execution.stderr)
+        self.assertEqual(receipt["result_code"], "target-origin")
+        self.assertIsNone(receipt["remote_address_sha256"])
+
+    def test_stored_form_helper_normalizes_ipv6_zone_address(self) -> None:
+        execution, receipt = self._run_browser_form_node(
+            "ipv6-zone-address", allowed_addresses=["fd00::1"]
+        )
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertEqual(
+            receipt["remote_address_sha256"],
+            hashlib.sha256(b"fd00::1").hexdigest(),
+        )
+
+    def test_stored_form_helper_executes_non_cleanup_readiness_path(self) -> None:
+        execution, receipt = self._run_browser_form_node(
+            "readiness-success", cleanup_only=False, action_mode="readiness"
+        )
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertIs(receipt["ok"], True)
+        self.assertEqual(receipt["result_code"], "ready")
+        self.assertIs(receipt["fill_confirmed"], True)
+        self.assertIs(receipt["cleaned"], True)
 
     def test_stored_form_helper_uses_topmost_pointer_and_guarded_enter(self) -> None:
         source = workers.BROWSER_FORM_NODE_SOURCE
