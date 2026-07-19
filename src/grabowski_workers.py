@@ -539,6 +539,7 @@ let submitted = false;
 let actionEffectObserved = false;
 let navigationObserved = false;
 let formDisappeared = false;
+let remoteAddressSha256 = null;
 
 function emit(payload, status = 0) {
   process.stdout.write(JSON.stringify(payload) + '\n');
@@ -547,6 +548,18 @@ function emit(payload, status = 0) {
 
 function expression(selectors, body) {
   return `(() => { const s = ${JSON.stringify(selectors)}; ${body} })()`;
+}
+
+function rejectTransportOperations() {
+  for (const entry of pending.values()) {
+    clearTimeout(entry.timer);
+    entry.reject(new Error('transport'));
+  }
+  pending.clear();
+  for (const waiter of eventWaiters.splice(0)) {
+    clearTimeout(waiter.timer);
+    waiter.reject(new Error('transport'));
+  }
 }
 
 async function connect(url) {
@@ -578,13 +591,7 @@ async function connect(url) {
       eventQueue.push(message);
       if (eventQueue.length > 128) eventQueue.shift();
     };
-    ws.onclose = () => {
-      for (const entry of pending.values()) {
-        clearTimeout(entry.timer);
-        entry.reject(new Error('transport'));
-      }
-      pending.clear();
-    };
+    ws.onclose = rejectTransportOperations;
   });
 }
 
@@ -741,20 +748,32 @@ try {
   const mainFrameId = frameTree.frameTree && frameTree.frameTree.frame
     ? frameTree.frameTree.frame.id : null;
   if (!mainFrameId) throw new Error('protocol');
-  await call('Page.reload', {ignoreCache: true});
-  const documentResponse = await waitEvent('Network.responseReceived', (params) => {
+  const documentResponsePromise = waitEvent('Network.responseReceived', (params) => {
     if (params.type !== 'Document' || params.frameId !== mainFrameId ||
         !params.response || typeof params.response.url !== 'string') return false;
     try { return new URL(params.response.url).origin === request.expected_origin; }
     catch { return false; }
   });
-  await waitEvent('Page.loadEventFired');
+  const loadEventPromise = waitEvent('Page.loadEventFired');
+  let documentResponse;
+  try {
+    const reloadResults = await Promise.all([
+      call('Page.reload', {ignoreCache: true}),
+      documentResponsePromise,
+      loadEventPromise,
+    ]);
+    documentResponse = reloadResults[1];
+  } catch (error) {
+    rejectTransportOperations();
+    try { if (ws) ws.close(); } catch {}
+    throw error;
+  }
   const remoteAddress = String(documentResponse.response.remoteIPAddress || '')
     .split('%', 1)[0].replace(/^\[|\]$/g, '');
   if (!remoteAddress || !request.allowed_addresses.includes(remoteAddress)) {
     throw new Error('target-origin');
   }
-  const remoteAddressSha256 = digest(remoteAddress);
+  remoteAddressSha256 = digest(remoteAddress);
   await sleep(100);
 
   if (request.cleanup_only === true) {
@@ -949,7 +968,7 @@ try {
     form_disappeared: formDisappeared,
     post_origin: null,
     post_path_sha256: null,
-    remote_address_sha256: null,
+    remote_address_sha256: remoteAddressSha256,
     cleaned,
   }, 2);
 } finally {
