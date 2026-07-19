@@ -157,11 +157,11 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_browser_worker_stored_form_action` | browser-worker | no | high | Use browser-managed stored form data on one exact local-device origin without returning field contents. |
 | `grabowski_browser_worker_status` | browser-worker | yes | low | Observe one isolated browser worker and reconcile terminal leases. |
 | `grabowski_browser_worker_stop` | browser-worker | no | medium | Stop one isolated browser worker and clean ephemeral state. |
-| `grabowski_browser_worker_list` | browser-worker | yes | low | List isolated agent-owned browser workers. |
+| `grabowski_browser_worker_list` | browser-worker | yes | low | List current or historical browser workers with fresh read-only active observation. |
 | `grabowski_gui_worker_start` | gui-worker | no | high | Start an argv-only GUI worker on an isolated Xvfb display. |
 | `grabowski_gui_worker_status` | gui-worker | yes | low | Observe one isolated GUI worker and reconcile terminal leases. |
 | `grabowski_gui_worker_stop` | gui-worker | no | medium | Stop one isolated GUI worker and clean ephemeral XDG state. |
-| `grabowski_gui_worker_list` | gui-worker | yes | low | List isolated GUI workers. |
+| `grabowski_gui_worker_list` | gui-worker | yes | low | List current or historical GUI workers with fresh read-only active observation. |
 | `grabowski_agent_workspace_create` | agent-workspace | no | high | Create one task-bound four-pane tmux workspace with one isolated writer worktree. |
 | `grabowski_agent_workspace_status` | agent-workspace | yes | low | Derive workspace state from Grabowski tasks, Git and tmux without treating pane state as success. |
 | `grabowski_agent_workspace_attach` | agent-workspace | yes | low | Return the exact attach command for an existing non-authoritative tmux workspace UI. |
