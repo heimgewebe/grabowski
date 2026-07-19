@@ -815,7 +815,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_browser_worker_list": {
             "category": "browser-worker",
-            "purpose": "List isolated agent-owned browser workers.",
+            "purpose": "List current or historical browser workers with fresh read-only active observation.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",
@@ -843,7 +843,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_gui_worker_list": {
             "category": "gui-worker",
-            "purpose": "List isolated GUI workers.",
+            "purpose": "List current or historical GUI workers with fresh read-only active observation.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",

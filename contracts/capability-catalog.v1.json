@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "87b5463fcb58632b88f8ea0e2c49dd2c672731e324fc665e1022840156020fdd",
+  "capability_source_sha256": "0965cde817e8a53e759e250a40188677663d067f26c0751377e9ab2463f34cdd",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "2c47105e3c8ecbb2fa715edab91920c1911a6397c4fc90d6e621306d0c1806bc",
   "integrity": {
@@ -1635,10 +1635,10 @@
     },
     {
       "category": "browser-worker",
-      "description": "List isolated agent-owned browser workers.",
+      "description": "List current or historical browser workers with fresh read-only observation.",
       "effects": [],
       "id": "grabowski_browser_worker_list",
-      "purpose": "List isolated agent-owned browser workers.",
+      "purpose": "List current or historical browser workers with fresh read-only active observation.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -1690,10 +1690,10 @@
     },
     {
       "category": "gui-worker",
-      "description": "List isolated GUI workers.",
+      "description": "List current or historical GUI workers with fresh read-only observation.",
       "effects": [],
       "id": "grabowski_gui_worker_list",
-      "purpose": "List isolated GUI workers.",
+      "purpose": "List current or historical GUI workers with fresh read-only active observation.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
