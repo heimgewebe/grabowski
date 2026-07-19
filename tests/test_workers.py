@@ -171,6 +171,18 @@ class FakeWebSocket {
           fail();
           return;
         }
+        if (scenario === 'old-loader-events-during-reload') {
+          emit('Network.responseReceived', {
+            requestId: 'old-loader-document',
+            loaderId: initialLoader,
+            type: 'Document',
+            frameId: 'main',
+            response: {url: expectedOrigin + '/', remoteIPAddress: allowedAddress},
+          });
+          emit('Page.lifecycleEvent', {
+            name: 'load', frameId: 'main', loaderId: initialLoader,
+          });
+        }
         const remoteIPAddress = scenario === 'disallowed-address'
           ? '203.0.113.7'
           : (scenario === 'invalid-address'
@@ -959,6 +971,17 @@ globalThis.fetch = async () => ({
 
     def test_stored_form_helper_ignores_stale_pre_reload_events(self) -> None:
         execution, receipt = self._run_browser_form_node("stale-events")
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertIs(receipt["ok"], True)
+        self.assertEqual(
+            receipt["remote_address_sha256"],
+            hashlib.sha256(b"192.168.1.10").hexdigest(),
+        )
+
+    def test_stored_form_helper_ignores_old_loader_events_during_reload(self) -> None:
+        execution, receipt = self._run_browser_form_node(
+            "old-loader-events-during-reload"
+        )
         self.assertEqual(execution.returncode, 0, execution.stderr)
         self.assertIs(receipt["ok"], True)
         self.assertEqual(
