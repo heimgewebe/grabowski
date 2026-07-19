@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
-import fcntl
 import hashlib
 import json
 import os
@@ -18,6 +17,7 @@ from typing import Any, Iterable, Mapping
 import grabowski_mcp as base
 import grabowski_bureau_leases as bureau_leases
 import grabowski_nonconflict as nonconflict
+import grabowski_sqlite_store as sqlite_store
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 mcp = operator.mcp
 READ_ONLY = operator.READ_ONLY
 MUTATING = operator.MUTATING
+DEFAULT_RESOURCE_LIST_LIMIT = 200
 RESOURCE_DB = Path(
     os.environ.get(
         "GRABOWSKI_RESOURCE_DB",
@@ -181,203 +182,27 @@ RESOURCE_SCHEMA_ROLLING_UPGRADE = {
 }
 
 
-@contextmanager
-def _resource_schema_directory_lock(parent: Path) -> Iterator[None]:
-    flags = os.O_RDONLY | os.O_DIRECTORY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    descriptor = os.open(parent, flags)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
-
-
-@contextmanager
-def _resource_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(
-        path.absolute().as_uri() + "?mode=ro",
-        uri=True,
-        timeout=1,
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only=ON")
-    try:
-        yield connection
-    finally:
-        connection.close()
+_resource_schema_directory_lock = sqlite_store.schema_directory_lock
+_resource_readonly_sqlite = sqlite_store.readonly_sqlite
 
 
 class ResourceSchemaInventoryChanged(RuntimeError):
     pass
 
 
-def _inventory_file_identity(path: Path) -> tuple[int, int, int, int, int]:
-    status = path.stat()
-    return (
-        status.st_dev,
-        status.st_ino,
-        status.st_size,
-        status.st_mtime_ns,
-        status.st_ctime_ns,
-    )
-
-
-def _inventory_status_identity(
-    status: os.stat_result,
-) -> tuple[int, int, int, int, int]:
-    return (
-        status.st_dev,
-        status.st_ino,
-        status.st_size,
-        status.st_mtime_ns,
-        status.st_ctime_ns,
-    )
-
-
-def _inventory_assert_identity(
-    path: Path,
-    expected: tuple[int, int, int, int, int],
-) -> None:
-    try:
-        status = os.lstat(path)
-    except FileNotFoundError as exc:
-        raise ResourceSchemaInventoryChanged(
-            "Store changed while schema inventory was read; retry inventory"
-        ) from exc
-    if (
-        not stat.S_ISREG(status.st_mode)
-        or _inventory_status_identity(status) != expected
-    ):
-        raise ResourceSchemaInventoryChanged(
-            "Store changed while schema inventory was read; retry inventory"
-        )
-
-
-def _inventory_copy_regular_file(source: Path, target: Path) -> tuple[int, int, int, int, int]:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(source, flags)
-    except OSError as exc:
-        raise ResourceSchemaInventoryChanged(
-            "Store changed while schema inventory was read; retry inventory"
-        ) from exc
-    try:
-        before_status = os.fstat(descriptor)
-        if not stat.S_ISREG(before_status.st_mode):
-            raise ResourceSchemaInventoryChanged(
-                "Store changed while schema inventory was read; retry inventory"
-            )
-        before = _inventory_status_identity(before_status)
-        with os.fdopen(os.dup(descriptor), "rb") as source_handle:
-            with target.open("xb") as target_handle:
-                while True:
-                    chunk = source_handle.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    target_handle.write(chunk)
-        os.chmod(target, 0o600)
-        after = _inventory_status_identity(os.fstat(descriptor))
-        if after != before:
-            raise ResourceSchemaInventoryChanged(
-                "Store changed while schema inventory was read; retry inventory"
-            )
-        _inventory_assert_identity(source, before)
-        return before
-    finally:
-        os.close(descriptor)
-
-
 @contextmanager
 def _resource_inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
-    wal_path = Path(str(path) + "-wal")
-    wal_present = wal_path.exists() or wal_path.is_symlink()
-    if not wal_present:
-        before_identity = _inventory_file_identity(path)
-        connection = sqlite3.connect(
-            path.absolute().as_uri() + "?mode=ro&immutable=1",
-            uri=True,
-            timeout=1,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
-        try:
-            yield connection
-        finally:
-            connection.close()
-            _inventory_assert_identity(path, before_identity)
-            if wal_path.exists() or wal_path.is_symlink():
-                raise ResourceSchemaInventoryChanged(
-                    "Store changed while schema inventory was read; retry inventory"
-                )
-        return
-
-    with tempfile.TemporaryDirectory(
-        prefix="grabowski-resource-schema-inventory-",
-    ) as temporary_directory:
-        snapshot = Path(temporary_directory) / path.name
-        snapshot_wal = Path(str(snapshot) + "-wal")
-        database_identity = _inventory_copy_regular_file(path, snapshot)
-        wal_identity = _inventory_copy_regular_file(wal_path, snapshot_wal)
-        connection = sqlite3.connect(snapshot, timeout=1)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
-        try:
-            yield connection
-        finally:
-            connection.close()
-            _inventory_assert_identity(path, database_identity)
-            _inventory_assert_identity(wal_path, wal_identity)
+    with sqlite_store.inventory_readonly_sqlite(
+        path,
+        temporary_prefix="grabowski-resource-schema-inventory-",
+        error_type=ResourceSchemaInventoryChanged,
+    ) as connection:
+        yield connection
 
 
-def _resource_sqlite_integrity(
-    connection: sqlite3.Connection,
-    label: str,
-    *,
-    quick: bool = False,
-) -> None:
-    pragma = "quick_check" if quick else "integrity_check"
-    try:
-        rows = connection.execute(f"PRAGMA {pragma}").fetchall()
-    except sqlite3.DatabaseError as exc:
-        detail = str(exc).lower()
-        if "locked" in detail or "busy" in detail:
-            raise RuntimeError(
-                f"{label} is busy; retry after the active writer completes"
-            ) from exc
-        raise RuntimeError(
-            f"{label} is corrupt; restore a verified backup before retrying"
-        ) from exc
-    values = [str(row[0]).lower() for row in rows]
-    if values != ["ok"]:
-        detail = "; ".join(str(row[0]) for row in rows[:5])
-        raise RuntimeError(
-            f"{label} failed {pragma}: {detail or 'no result'}"
-        )
-
-
-def _resource_sqlite_fingerprint(connection: sqlite3.Connection) -> str:
-    digest = hashlib.sha256()
-    for statement in connection.iterdump():
-        digest.update(statement.encode("utf-8"))
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _resource_database_tables(connection: sqlite3.Connection) -> set[str]:
-    return {
-        str(row[0])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        )
-    }
+_resource_sqlite_integrity = sqlite_store.sqlite_integrity
+_resource_sqlite_fingerprint = sqlite_store.sqlite_fingerprint
+_resource_database_tables = sqlite_store.database_tables
 
 
 def _resource_table_shape(
@@ -3446,7 +3271,7 @@ def grabowski_resource_inspect(resource_key: str) -> dict[str, Any]:
 def grabowski_resource_list(
     owner_id: str | None = None,
     include_expired: bool = False,
-    limit: int = 200,
+    limit: int = DEFAULT_RESOURCE_LIST_LIMIT,
     schema_only: bool = False,
 ) -> dict[str, Any]:
     """List bounded leases or inspect store-schema compatibility read-only."""
@@ -3454,7 +3279,11 @@ def grabowski_resource_list(
     if not isinstance(schema_only, bool):
         raise ValueError("schema_only must be boolean")
     if schema_only:
-        if owner_id is not None or include_expired or limit != 200:
+        if (
+            owner_id is not None
+            or include_expired
+            or limit != DEFAULT_RESOURCE_LIST_LIMIT
+        ):
             raise ValueError(
                 "schema_only cannot be combined with resource-list filters"
             )

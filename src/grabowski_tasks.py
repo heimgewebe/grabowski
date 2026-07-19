@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -24,6 +23,7 @@ import grabowski_resources as resources
 import grabowski_nonconflict as nonconflict
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
+import grabowski_sqlite_store as sqlite_store
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -40,6 +40,7 @@ TASK_DB = Path(
     )
 ).expanduser()
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
+DEFAULT_TASK_LIST_LIMIT = 20
 
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
 EXTERNAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
@@ -354,203 +355,27 @@ TASK_SCHEMA_ROLLING_UPGRADE = {
 }
 
 
-@contextmanager
-def _schema_directory_lock(parent: Path) -> Iterator[None]:
-    flags = os.O_RDONLY | os.O_DIRECTORY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    descriptor = os.open(parent, flags)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
-
-
-@contextmanager
-def _readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(
-        path.absolute().as_uri() + "?mode=ro",
-        uri=True,
-        timeout=1,
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only=ON")
-    try:
-        yield connection
-    finally:
-        connection.close()
+_schema_directory_lock = sqlite_store.schema_directory_lock
+_readonly_sqlite = sqlite_store.readonly_sqlite
 
 
 class TaskSchemaInventoryChanged(RuntimeError):
     pass
 
 
-def _inventory_file_identity(path: Path) -> tuple[int, int, int, int, int]:
-    status = path.stat()
-    return (
-        status.st_dev,
-        status.st_ino,
-        status.st_size,
-        status.st_mtime_ns,
-        status.st_ctime_ns,
-    )
-
-
-def _inventory_status_identity(
-    status: os.stat_result,
-) -> tuple[int, int, int, int, int]:
-    return (
-        status.st_dev,
-        status.st_ino,
-        status.st_size,
-        status.st_mtime_ns,
-        status.st_ctime_ns,
-    )
-
-
-def _inventory_assert_identity(
-    path: Path,
-    expected: tuple[int, int, int, int, int],
-) -> None:
-    try:
-        status = os.lstat(path)
-    except FileNotFoundError as exc:
-        raise TaskSchemaInventoryChanged(
-            "Store changed while schema inventory was read; retry inventory"
-        ) from exc
-    if (
-        not stat.S_ISREG(status.st_mode)
-        or _inventory_status_identity(status) != expected
-    ):
-        raise TaskSchemaInventoryChanged(
-            "Store changed while schema inventory was read; retry inventory"
-        )
-
-
-def _inventory_copy_regular_file(source: Path, target: Path) -> tuple[int, int, int, int, int]:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(source, flags)
-    except OSError as exc:
-        raise TaskSchemaInventoryChanged(
-            "Store changed while schema inventory was read; retry inventory"
-        ) from exc
-    try:
-        before_status = os.fstat(descriptor)
-        if not stat.S_ISREG(before_status.st_mode):
-            raise TaskSchemaInventoryChanged(
-                "Store changed while schema inventory was read; retry inventory"
-            )
-        before = _inventory_status_identity(before_status)
-        with os.fdopen(os.dup(descriptor), "rb") as source_handle:
-            with target.open("xb") as target_handle:
-                while True:
-                    chunk = source_handle.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    target_handle.write(chunk)
-        os.chmod(target, 0o600)
-        after = _inventory_status_identity(os.fstat(descriptor))
-        if after != before:
-            raise TaskSchemaInventoryChanged(
-                "Store changed while schema inventory was read; retry inventory"
-            )
-        _inventory_assert_identity(source, before)
-        return before
-    finally:
-        os.close(descriptor)
-
-
 @contextmanager
 def _inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
-    wal_path = Path(str(path) + "-wal")
-    wal_present = wal_path.exists() or wal_path.is_symlink()
-    if not wal_present:
-        before_identity = _inventory_file_identity(path)
-        connection = sqlite3.connect(
-            path.absolute().as_uri() + "?mode=ro&immutable=1",
-            uri=True,
-            timeout=1,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
-        try:
-            yield connection
-        finally:
-            connection.close()
-            _inventory_assert_identity(path, before_identity)
-            if wal_path.exists() or wal_path.is_symlink():
-                raise TaskSchemaInventoryChanged(
-                    "Store changed while schema inventory was read; retry inventory"
-                )
-        return
-
-    with tempfile.TemporaryDirectory(
-        prefix="grabowski-task-schema-inventory-",
-    ) as temporary_directory:
-        snapshot = Path(temporary_directory) / path.name
-        snapshot_wal = Path(str(snapshot) + "-wal")
-        database_identity = _inventory_copy_regular_file(path, snapshot)
-        wal_identity = _inventory_copy_regular_file(wal_path, snapshot_wal)
-        connection = sqlite3.connect(snapshot, timeout=1)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
-        try:
-            yield connection
-        finally:
-            connection.close()
-            _inventory_assert_identity(path, database_identity)
-            _inventory_assert_identity(wal_path, wal_identity)
+    with sqlite_store.inventory_readonly_sqlite(
+        path,
+        temporary_prefix="grabowski-task-schema-inventory-",
+        error_type=TaskSchemaInventoryChanged,
+    ) as connection:
+        yield connection
 
 
-def _sqlite_integrity(
-    connection: sqlite3.Connection,
-    label: str,
-    *,
-    quick: bool = False,
-) -> None:
-    pragma = "quick_check" if quick else "integrity_check"
-    try:
-        rows = connection.execute(f"PRAGMA {pragma}").fetchall()
-    except sqlite3.DatabaseError as exc:
-        detail = str(exc).lower()
-        if "locked" in detail or "busy" in detail:
-            raise RuntimeError(
-                f"{label} is busy; retry after the active writer completes"
-            ) from exc
-        raise RuntimeError(
-            f"{label} is corrupt; restore a verified backup before retrying"
-        ) from exc
-    values = [str(row[0]).lower() for row in rows]
-    if values != ["ok"]:
-        detail = "; ".join(str(row[0]) for row in rows[:5])
-        raise RuntimeError(
-            f"{label} failed {pragma}: {detail or 'no result'}"
-        )
-
-
-def _sqlite_fingerprint(connection: sqlite3.Connection) -> str:
-    digest = hashlib.sha256()
-    for statement in connection.iterdump():
-        digest.update(statement.encode("utf-8"))
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _database_tables(connection: sqlite3.Connection) -> set[str]:
-    return {
-        str(row[0])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        )
-    }
+_sqlite_integrity = sqlite_store.sqlite_integrity
+_sqlite_fingerprint = sqlite_store.sqlite_fingerprint
+_database_tables = sqlite_store.database_tables
 
 
 def _metadata_shape(connection: sqlite3.Connection) -> tuple[tuple[str, str, int, int], ...]:
@@ -2931,7 +2756,7 @@ def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:
 
 @mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
 def grabowski_task_list(
-    limit: int = 20,
+    limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,
     view: str = "minimal",
     cursor: str | None = None,
@@ -2944,7 +2769,7 @@ def grabowski_task_list(
         raise ValueError("schema_only must be boolean")
     if schema_only:
         if (
-            limit != 20
+            limit != DEFAULT_TASK_LIST_LIMIT
             or state is not None
             or view != "minimal"
             or cursor is not None

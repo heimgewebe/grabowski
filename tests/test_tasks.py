@@ -2147,6 +2147,9 @@ class TaskTests(unittest.TestCase):
         keeper = sqlite3.connect(self.database)
         try:
             self.assertEqual("wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+            self.assertEqual(
+                0, keeper.execute("PRAGMA wal_autocheckpoint=0").fetchone()[0]
+            )
             keeper.execute(
                 "UPDATE metadata SET value='6' WHERE key='schema_version'"
             )
