@@ -1,0 +1,26 @@
+[Unit]
+Description=Grabowski safety and connector incident observer
+After=grabowski-operator.service tunnel-client-grabowski.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/libexec/grabowski-safety-observer.py collect
+TimeoutStartSec=60
+MemoryMax=512M
+TasksMax=50
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ReadWritePaths=%h/.local/state/grabowski/safety-observer
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+SystemCallArchitectures=native
+LockPersonality=true
+MemoryDenyWriteExecute=true
