@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -8,6 +11,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import tempfile
 import time
 from typing import Any, Iterable, Mapping
 
@@ -139,48 +143,540 @@ def _metadata(metadata: dict[str, Any] | None) -> tuple[str, str]:
     return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+RESOURCE_METADATA_SHAPE = (
+    ("key", "TEXT", 0, 1),
+    ("value", "TEXT", 1, 0),
+)
+RESOURCE_LEASE_SHAPE = (
+    ("resource_key", "TEXT", 0, 1),
+    ("owner_id", "TEXT", 1, 0),
+    ("purpose", "TEXT", 1, 0),
+    ("acquired_at_unix", "INTEGER", 1, 0),
+    ("updated_at_unix", "INTEGER", 1, 0),
+    ("expires_at_unix", "INTEGER", 1, 0),
+    ("metadata_sha256", "TEXT", 1, 0),
+    ("metadata_json", "TEXT", 1, 0),
+    ("reclaimed_from_owner", "TEXT", 0, 0),
+)
+RESOURCE_SCHEMA_V2_TABLES = frozenset({
+    "metadata", "leases", "task_terminalizations", "task_authority_adoptions",
+})
+RESOURCE_CURRENT_SCHEMA_VERSION = "2"
+RESOURCE_SUPPORTED_SCHEMA_VERSIONS = ("1", "2")
+RESOURCE_SCHEMA_MIGRATION_PATHS = {"1": ("1", RESOURCE_CURRENT_SCHEMA_VERSION)}
+RESOURCE_SCHEMA_RECOVERY_INSTRUCTION = (
+    "Keep the resource store unchanged; use a runtime that explicitly supports "
+    "the observed schema or restore a verified backup before retrying."
+)
+
+RESOURCE_SCHEMA_ROLLING_UPGRADE = {
+    "current_runtime_current_store": "supported",
+    "current_runtime_supported_older_store": (
+        "supported_with_exclusive_migration"
+    ),
+    "current_runtime_newer_store": "fail_closed_without_mutation",
+    "pre_t062_runtime_overlap_with_future_schema": (
+        "unsupported_require_full_runtime_drain"
+    ),
+}
+
+
+@contextmanager
+def _resource_schema_directory_lock(parent: Path) -> Iterator[None]:
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(parent, flags)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+@contextmanager
+def _resource_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
+    connection = sqlite3.connect(
+        path.absolute().as_uri() + "?mode=ro",
+        uri=True,
+        timeout=1,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+class ResourceSchemaInventoryChanged(RuntimeError):
+    pass
+
+
+def _inventory_file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    status = path.stat()
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _inventory_status_identity(
+    status: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _inventory_assert_identity(
+    path: Path,
+    expected: tuple[int, int, int, int, int],
+) -> None:
+    try:
+        status = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise ResourceSchemaInventoryChanged(
+            "Store changed while schema inventory was read; retry inventory"
+        ) from exc
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or _inventory_status_identity(status) != expected
+    ):
+        raise ResourceSchemaInventoryChanged(
+            "Store changed while schema inventory was read; retry inventory"
+        )
+
+
+def _inventory_copy_regular_file(source: Path, target: Path) -> tuple[int, int, int, int, int]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise ResourceSchemaInventoryChanged(
+            "Store changed while schema inventory was read; retry inventory"
+        ) from exc
+    try:
+        before_status = os.fstat(descriptor)
+        if not stat.S_ISREG(before_status.st_mode):
+            raise ResourceSchemaInventoryChanged(
+                "Store changed while schema inventory was read; retry inventory"
+            )
+        before = _inventory_status_identity(before_status)
+        with os.fdopen(os.dup(descriptor), "rb") as source_handle:
+            with target.open("xb") as target_handle:
+                while True:
+                    chunk = source_handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    target_handle.write(chunk)
+        os.chmod(target, 0o600)
+        after = _inventory_status_identity(os.fstat(descriptor))
+        if after != before:
+            raise ResourceSchemaInventoryChanged(
+                "Store changed while schema inventory was read; retry inventory"
+            )
+        _inventory_assert_identity(source, before)
+        return before
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _resource_inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
+    wal_path = Path(str(path) + "-wal")
+    wal_present = wal_path.exists() or wal_path.is_symlink()
+    if not wal_present:
+        before_identity = _inventory_file_identity(path)
+        connection = sqlite3.connect(
+            path.absolute().as_uri() + "?mode=ro&immutable=1",
+            uri=True,
+            timeout=1,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        try:
+            yield connection
+        finally:
+            connection.close()
+            _inventory_assert_identity(path, before_identity)
+            if wal_path.exists() or wal_path.is_symlink():
+                raise ResourceSchemaInventoryChanged(
+                    "Store changed while schema inventory was read; retry inventory"
+                )
+        return
+
+    with tempfile.TemporaryDirectory(
+        prefix="grabowski-resource-schema-inventory-",
+    ) as temporary_directory:
+        snapshot = Path(temporary_directory) / path.name
+        snapshot_wal = Path(str(snapshot) + "-wal")
+        database_identity = _inventory_copy_regular_file(path, snapshot)
+        wal_identity = _inventory_copy_regular_file(wal_path, snapshot_wal)
+        connection = sqlite3.connect(snapshot, timeout=1)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        try:
+            yield connection
+        finally:
+            connection.close()
+            _inventory_assert_identity(path, database_identity)
+            _inventory_assert_identity(wal_path, wal_identity)
+
+
+def _resource_sqlite_integrity(
+    connection: sqlite3.Connection,
+    label: str,
+    *,
+    quick: bool = False,
+) -> None:
+    pragma = "quick_check" if quick else "integrity_check"
+    try:
+        rows = connection.execute(f"PRAGMA {pragma}").fetchall()
+    except sqlite3.DatabaseError as exc:
+        detail = str(exc).lower()
+        if "locked" in detail or "busy" in detail:
+            raise RuntimeError(
+                f"{label} is busy; retry after the active writer completes"
+            ) from exc
+        raise RuntimeError(
+            f"{label} is corrupt; restore a verified backup before retrying"
+        ) from exc
+    values = [str(row[0]).lower() for row in rows]
+    if values != ["ok"]:
+        detail = "; ".join(str(row[0]) for row in rows[:5])
+        raise RuntimeError(
+            f"{label} failed {pragma}: {detail or 'no result'}"
+        )
+
+
+def _resource_sqlite_fingerprint(connection: sqlite3.Connection) -> str:
+    digest = hashlib.sha256()
+    for statement in connection.iterdump():
+        digest.update(statement.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _resource_database_tables(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+
+
+def _resource_table_shape(
+    connection: sqlite3.Connection,
+    table_name: str,
+) -> tuple[tuple[str, str, int, int], ...]:
+    return tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute(f'PRAGMA table_info("{table_name}")')
+    )
+
+
+def _resource_schema_version(connection: sqlite3.Connection) -> str | None:
+    tables = _resource_database_tables(connection)
+    if not tables:
+        return None
+    if "metadata" not in tables:
+        raise RuntimeError(
+            "Resource database schema metadata is missing; restore or inspect the store"
+        )
+    if _resource_table_shape(connection, "metadata") != RESOURCE_METADATA_SHAPE:
+        raise RuntimeError("Resource database metadata table is malformed")
+    rows = connection.execute(
+        "SELECT value FROM metadata WHERE key='schema_version'"
+    ).fetchall()
+    if len(rows) != 1:
+        raise RuntimeError(
+            "Resource database schema_version metadata is missing or ambiguous"
+        )
+    return str(rows[0][0])
+
+
+def _validate_resource_schema_legacy(connection: sqlite3.Connection) -> None:
+    if _resource_database_tables(connection) != {"metadata", "leases"}:
+        raise RuntimeError("Resource database schema 1 is incomplete or unsupported")
+    if _resource_table_shape(connection, "metadata") != RESOURCE_METADATA_SHAPE:
+        raise RuntimeError("Resource database schema 1 metadata is malformed")
+    if _resource_table_shape(connection, "leases") != RESOURCE_LEASE_SHAPE:
+        raise RuntimeError("Resource database schema 1 leases are malformed")
+
+
 def _validate_additive_schema_v2(connection: sqlite3.Connection) -> None:
     for table_name, expected_columns in RESOURCE_SCHEMA_V2_ADDITIVE_TABLES.items():
-        rows = connection.execute(
-            f'PRAGMA table_info("{table_name}")'
-        ).fetchall()
-        actual_columns = tuple(
-            (
-                str(row["name"]),
-                str(row["type"]).upper(),
-                int(row["notnull"]),
-                int(row["pk"]),
-            )
-            for row in rows
-        )
-        if actual_columns != expected_columns:
-            connection.close()
+        if _resource_table_shape(connection, table_name) != expected_columns:
             raise RuntimeError("Unsupported resource database schema")
 
 
-def _database() -> sqlite3.Connection:
-    parent = RESOURCE_DB.parent
-    if parent.is_symlink():
-        raise PermissionError(f"Resource state directory may not be a symlink: {parent}")
-    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if RESOURCE_DB.is_symlink():
-        raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
-    connection = sqlite3.connect(RESOURCE_DB, timeout=10, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=FULL")
-    connection.execute("PRAGMA foreign_keys=ON")
+def _validate_resource_schema_current(connection: sqlite3.Connection) -> None:
+    if _resource_database_tables(connection) != RESOURCE_SCHEMA_V2_TABLES:
+        raise RuntimeError("Unsupported resource database schema")
+    if _resource_table_shape(connection, "metadata") != RESOURCE_METADATA_SHAPE:
+        raise RuntimeError("Unsupported resource database schema")
+    if _resource_table_shape(connection, "leases") != RESOURCE_LEASE_SHAPE:
+        raise RuntimeError("Unsupported resource database schema")
+    _validate_additive_schema_v2(connection)
+
+
+def _resource_schema_inventory() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "store": "resources",
+        "database": str(RESOURCE_DB),
+        "observed_version": None,
+        "current_version": RESOURCE_CURRENT_SCHEMA_VERSION,
+        "supported_versions": list(RESOURCE_SUPPORTED_SCHEMA_VERSIONS),
+        "status": "uninitialized",
+        "migration_required": False,
+        "migration_path": [],
+        "write_compatible": False,
+        "mutation_performed": False,
+        "required_action": "initialize_on_first_write",
+        "recovery_instruction": None,
+        "rolling_upgrade": dict(RESOURCE_SCHEMA_ROLLING_UPGRADE),
+    }
+    if not RESOURCE_DB.exists():
+        return result
+    if RESOURCE_DB.is_symlink() or not RESOURCE_DB.is_file():
+        result.update(
+            status="blocked",
+            required_action="inspect_store_path",
+            recovery_instruction=RESOURCE_SCHEMA_RECOVERY_INSTRUCTION,
+            error="Resource database must be a regular non-symlink file",
+        )
+        return result
+    if RESOURCE_DB.stat().st_size == 0:
+        return result
+    try:
+        with _resource_inventory_readonly_sqlite(RESOURCE_DB) as connection:
+            _resource_sqlite_integrity(connection, "Resource database", quick=True)
+            observed = _resource_schema_version(connection)
+            result["observed_version"] = observed
+            if observed not in RESOURCE_SUPPORTED_SCHEMA_VERSIONS:
+                future = (
+                    observed is not None
+                    and observed.isdecimal()
+                    and int(observed) > int(RESOURCE_CURRENT_SCHEMA_VERSION)
+                )
+                result.update(
+                    status="unsupported_future" if future else "unsupported_schema",
+                    required_action="upgrade_runtime_or_restore_verified_backup",
+                    recovery_instruction=RESOURCE_SCHEMA_RECOVERY_INSTRUCTION,
+                )
+                return result
+            if observed == RESOURCE_CURRENT_SCHEMA_VERSION:
+                _validate_resource_schema_current(connection)
+            else:
+                _validate_resource_schema_legacy(connection)
+    except ResourceSchemaInventoryChanged as exc:
+        result.update(
+            status="blocked",
+            required_action="retry_schema_inventory",
+            recovery_instruction=(
+                "Retry after the concurrent writer completes; do not mutate the store "
+                "from this inventory result."
+            ),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return result
+    except (OSError, RuntimeError, sqlite3.DatabaseError) as exc:
+        result.update(
+            status="blocked",
+            required_action="restore_or_inspect_store",
+            recovery_instruction=RESOURCE_SCHEMA_RECOVERY_INSTRUCTION,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return result
+    if observed == RESOURCE_CURRENT_SCHEMA_VERSION:
+        result.update(status="current", write_compatible=True, required_action="none")
+        return result
+    path = RESOURCE_SCHEMA_MIGRATION_PATHS[observed]
+    result.update(
+        status="migration_required",
+        migration_required=True,
+        migration_path=[
+            {
+                "from": path[0],
+                "to": path[1],
+                "lock": "exclusive_store_directory",
+                "transaction": "immediate",
+                "verified_backup_required": True,
+            }
+        ],
+        required_action="open_with_current_runtime_to_migrate",
+    )
+    return result
+
+
+def _validate_resource_backup(
+    path: Path,
+    version: str,
+    fingerprint: str,
+) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"Resource migration backup may not be a symlink: {path}")
+    try:
+        status = path.stat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Resource migration backup disappeared: {path}") from exc
+    if not stat.S_ISREG(status.st_mode):
+        raise RuntimeError(f"Resource migration backup is not a regular file: {path}")
+    if stat.S_IMODE(status.st_mode) not in {0o400, 0o600}:
+        raise RuntimeError(f"Resource migration backup permissions are unsafe: {path}")
+    with _resource_readonly_sqlite(path) as backup:
+        _resource_sqlite_integrity(backup, "Resource migration backup")
+        if _resource_schema_version(backup) != version:
+            raise RuntimeError("Resource migration backup schema version does not match")
+        _validate_resource_schema_legacy(backup)
+        if _resource_sqlite_fingerprint(backup) != fingerprint:
+            raise RuntimeError("Resource migration backup fingerprint does not match")
+
+
+def _verified_resource_migration_backup(
+    version: str,
+    fingerprint: str,
+) -> Path:
+    with _resource_readonly_sqlite(RESOURCE_DB) as source:
+        source.execute("BEGIN")
+        _resource_sqlite_integrity(source, "Resource database")
+        if _resource_sqlite_fingerprint(source) != fingerprint:
+            raise RuntimeError(
+                "Resource database changed identity before backup; retry migration"
+            )
+        backup_path = RESOURCE_DB.parent / (
+            f"{RESOURCE_DB.name}.schema-{version}-{fingerprint}.backup"
+        )
+        if backup_path.exists() or backup_path.is_symlink():
+            _validate_resource_backup(backup_path, version, fingerprint)
+            return backup_path
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{RESOURCE_DB.name}.schema-{version}-",
+            suffix=".backup.tmp",
+            dir=RESOURCE_DB.parent,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            target = sqlite3.connect(temporary)
+            try:
+                source.backup(target)
+                target.commit()
+            finally:
+                target.close()
+            os.chmod(temporary, 0o400)
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            _validate_resource_backup(temporary, version, fingerprint)
+            try:
+                os.link(temporary, backup_path)
+            except FileExistsError:
+                pass
+            else:
+                temporary.unlink()
+            _validate_resource_backup(backup_path, version, fingerprint)
+            directory = os.open(RESOURCE_DB.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            return backup_path
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _preflight_resource_store() -> str | None:
+    if not RESOURCE_DB.exists():
+        return None
+    if RESOURCE_DB.is_symlink() or not RESOURCE_DB.is_file():
+        raise PermissionError(f"Resource database must be a regular file: {RESOURCE_DB}")
+    if RESOURCE_DB.stat().st_size == 0:
+        return None
+    with _resource_readonly_sqlite(RESOURCE_DB) as connection:
+        _resource_sqlite_integrity(connection, "Resource database", quick=True)
+        version = _resource_schema_version(connection)
+        if version not in {"1", "2"}:
+            raise RuntimeError(
+                "Unsupported resource database schema; use a compatible runtime"
+            )
+        if version == "1":
+            _validate_resource_schema_legacy(connection)
+        else:
+            _validate_resource_schema_current(connection)
+        return version
+
+
+def _create_resource_additive_tables(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
+        CREATE TABLE task_terminalizations (
+            task_id TEXT PRIMARY KEY,
+            attempt INTEGER NOT NULL,
+            lease_owner_id TEXT NOT NULL,
+            terminal_state TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            task_projection_json TEXT NOT NULL,
+            task_projection_sha256 TEXT NOT NULL,
+            requested_resource_keys_json TEXT NOT NULL,
+            requested_resource_keys_sha256 TEXT NOT NULL,
+            prior_leases_json TEXT NOT NULL,
+            prior_leases_sha256 TEXT NOT NULL,
+            revoked_resource_keys_json TEXT NOT NULL,
+            missing_resource_keys_json TEXT NOT NULL,
+            observation_sha256 TEXT NOT NULL,
+            prepared_at_unix INTEGER NOT NULL,
+            leases_revoked_at_unix INTEGER NOT NULL,
+            projected_at_unix INTEGER,
+            lifecycle_receipt_sha256 TEXT,
+            recovery_status TEXT NOT NULL,
+            transition_sha256 TEXT NOT NULL
         )
         """
     )
     connection.execute(
         """
-        CREATE TABLE IF NOT EXISTS leases (
+        CREATE TABLE task_authority_adoptions (
+            task_id TEXT PRIMARY KEY,
+            guard_owner_id TEXT NOT NULL,
+            lease_owner_id TEXT NOT NULL,
+            acquired_at_unix INTEGER NOT NULL,
+            expires_at_unix INTEGER NOT NULL,
+            binding_sha256 TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX task_authority_adoptions_expiry_idx "
+        "ON task_authority_adoptions(expires_at_unix)"
+    )
+
+
+def _create_resource_schema_v2(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE leases (
             resource_key TEXT PRIMARY KEY,
             owner_id TEXT NOT NULL,
             purpose TEXT NOT NULL,
@@ -193,84 +689,113 @@ def _database() -> sqlite3.Connection:
         )
         """
     )
-    current = connection.execute(
-        "SELECT value FROM metadata WHERE key='schema_version'"
-    ).fetchone()
-    version = None if current is None else str(current["value"])
-    if version not in {None, "1", "2"}:
+    _create_resource_additive_tables(connection)
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES('schema_version', '2')"
+    )
+
+
+def _migrate_resource_schema_v1(connection: sqlite3.Connection) -> None:
+    _create_resource_additive_tables(connection)
+    connection.execute(
+        "UPDATE metadata SET value='2' WHERE key='schema_version'"
+    )
+
+
+def _connect_existing_resource_database() -> sqlite3.Connection:
+    if RESOURCE_DB.is_symlink():
+        raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
+    connection = sqlite3.connect(
+        RESOURCE_DB.absolute().as_uri() + "?mode=rw",
+        uri=True,
+        timeout=10,
+        isolation_level=None,
+    )
+    if RESOURCE_DB.is_symlink():
         connection.close()
-        raise RuntimeError("Unsupported resource database schema")
-    if version != "2":
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            current = connection.execute(
-                "SELECT value FROM metadata WHERE key='schema_version'"
-            ).fetchone()
-            version = None if current is None else str(current["value"])
-            if version not in {None, "1", "2"}:
-                raise RuntimeError("Unsupported resource database schema")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS task_terminalizations (
-                    task_id TEXT PRIMARY KEY,
-                    attempt INTEGER NOT NULL,
-                    lease_owner_id TEXT NOT NULL,
-                    terminal_state TEXT NOT NULL,
-                    phase TEXT NOT NULL,
-                    task_projection_json TEXT NOT NULL,
-                    task_projection_sha256 TEXT NOT NULL,
-                    requested_resource_keys_json TEXT NOT NULL,
-                    requested_resource_keys_sha256 TEXT NOT NULL,
-                    prior_leases_json TEXT NOT NULL,
-                    prior_leases_sha256 TEXT NOT NULL,
-                    revoked_resource_keys_json TEXT NOT NULL,
-                    missing_resource_keys_json TEXT NOT NULL,
-                    observation_sha256 TEXT NOT NULL,
-                    prepared_at_unix INTEGER NOT NULL,
-                    leases_revoked_at_unix INTEGER NOT NULL,
-                    projected_at_unix INTEGER,
-                    lifecycle_receipt_sha256 TEXT,
-                    recovery_status TEXT NOT NULL,
-                    transition_sha256 TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS task_authority_adoptions (
-                    task_id TEXT PRIMARY KEY,
-                    guard_owner_id TEXT NOT NULL,
-                    lease_owner_id TEXT NOT NULL,
-                    acquired_at_unix INTEGER NOT NULL,
-                    expires_at_unix INTEGER NOT NULL,
-                    binding_sha256 TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS task_authority_adoptions_expiry_idx "
-                "ON task_authority_adoptions(expires_at_unix)"
-            )
-            if version is None:
-                connection.execute(
-                    "INSERT INTO metadata(key, value) VALUES('schema_version', '2')"
-                )
-            elif version == "1":
-                connection.execute(
-                    "UPDATE metadata SET value='2' WHERE key='schema_version'"
-                )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            connection.close()
-            raise
-    _validate_additive_schema_v2(connection)
+        raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
+    return connection
+
+
+def _open_current_resource_database() -> sqlite3.Connection:
+    connection = _connect_existing_resource_database()
+    connection.row_factory = sqlite3.Row
     try:
-        os.chmod(RESOURCE_DB, 0o600)
-    except FileNotFoundError:
+        if _resource_schema_version(connection) != "2":
+            raise RuntimeError(
+                "Resource database schema changed while opening; retry with a compatible runtime"
+            )
+        _validate_resource_schema_current(connection)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        if stat.S_IMODE(RESOURCE_DB.stat().st_mode) != 0o600:
+            os.chmod(RESOURCE_DB, 0o600)
+        return connection
+    except Exception:
         connection.close()
         raise
-    return connection
+
+
+def _database() -> sqlite3.Connection:
+    parent = RESOURCE_DB.parent
+    if parent.is_symlink():
+        raise PermissionError(f"Resource state directory may not be a symlink: {parent}")
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if RESOURCE_DB.is_symlink():
+        raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
+
+    observed = _preflight_resource_store()
+    if observed == "2":
+        return _open_current_resource_database()
+
+    with _resource_schema_directory_lock(parent):
+        observed = _preflight_resource_store()
+        if observed == "2":
+            return _open_current_resource_database()
+        connection = (
+            sqlite3.connect(RESOURCE_DB, timeout=10, isolation_level=None)
+            if observed is None
+            else _connect_existing_resource_database()
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            version = _resource_schema_version(connection)
+            if version not in {None, "1", "2"}:
+                raise RuntimeError(
+                    "Unsupported resource database schema; use a compatible runtime"
+                )
+            if version is None:
+                if _resource_database_tables(connection):
+                    raise RuntimeError(
+                        "Resource database schema metadata is missing from an existing database"
+                    )
+                _create_resource_schema_v2(connection)
+            elif version == "1":
+                _validate_resource_schema_legacy(connection)
+                _resource_sqlite_integrity(connection, "Resource database")
+                fingerprint = _resource_sqlite_fingerprint(connection)
+                _verified_resource_migration_backup(version, fingerprint)
+                _migrate_resource_schema_v1(connection)
+            else:
+                _validate_resource_schema_current(connection)
+            if _resource_schema_version(connection) != "2":
+                raise RuntimeError("Resource database migration did not reach schema 2")
+            _validate_resource_schema_current(connection)
+            _resource_sqlite_integrity(connection, "Migrated resource database")
+            connection.commit()
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            if stat.S_IMODE(RESOURCE_DB.stat().st_mode) != 0o600:
+                os.chmod(RESOURCE_DB, 0o600)
+            return connection
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
+            raise
 
 
 def _owner(value: str) -> str:
@@ -2922,9 +3447,18 @@ def grabowski_resource_list(
     owner_id: str | None = None,
     include_expired: bool = False,
     limit: int = 200,
+    schema_only: bool = False,
 ) -> dict[str, Any]:
-    """List bounded resource leases, optionally filtered by owner."""
+    """List bounded leases or inspect store-schema compatibility read-only."""
     operator._require_operator_capability("resource_lease")
+    if not isinstance(schema_only, bool):
+        raise ValueError("schema_only must be boolean")
+    if schema_only:
+        if owner_id is not None or include_expired or limit != 200:
+            raise ValueError(
+                "schema_only cannot be combined with resource-list filters"
+            )
+        return _resource_schema_inventory()
     leases = list_resources(
         owner_id=owner_id,
         include_expired=include_expired,
