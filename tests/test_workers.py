@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 from pathlib import Path
 import sys
@@ -914,6 +915,289 @@ globalThis.fetch = async () => ({
             started = workers.browser_start(str(self.binary), port=9224, runtime_seconds=60)
         self.assertEqual(started["worker"]["state"], "failed")
         self.assertIsNone(workers.resources.inspect_resource("port:9224"))
+
+
+    def test_current_list_observes_stale_running_without_mutation(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9320, runtime_seconds=60)
+        worker = started["worker"]
+        record = workers._row(worker["worker_id"])
+        config_path = Path(record["config_path"])
+        probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+                "Result=success\nExecMainStatus=0\n"
+            )
+        )
+        with patch.object(workers.operator, "_run", return_value=probe), patch.object(
+            workers, "_update", side_effect=AssertionError("list must not persist")
+        ), patch.object(
+            workers, "_release", side_effect=AssertionError("list must not release")
+        ), patch.object(
+            workers, "_cleanup", side_effect=AssertionError("list must not cleanup")
+        ):
+            current = workers.worker_list("browser", limit=10)
+        self.assertEqual(current["view"], "current")
+        self.assertEqual(current["count"], 0)
+        self.assertEqual(current["observed_count"], 1)
+        self.assertEqual(
+            workers.resources.inspect_resource("port:9320")["owner_id"],
+            f"worker:{worker['worker_id']}",
+        )
+        self.assertEqual(workers._row(worker["worker_id"])["state"], "running")
+        self.assertTrue(config_path.exists())
+
+        with patch.object(workers.operator, "_run", return_value=probe):
+            reconciled = workers.worker_status(worker["worker_id"], expected_kind="browser")
+        self.assertEqual(reconciled["state"], "completed")
+        self.assertIsNone(workers.resources.inspect_resource("port:9320"))
+        observation = reconciled["last_observation"]
+        self.assertEqual(observation["terminalization"]["release"]["status"], "released")
+        self.assertIn(
+            str(config_path.parent),
+            observation["terminalization"]["cleanup"]["preserved_evidence"],
+        )
+        with patch.object(workers, "_observe", side_effect=AssertionError("history must not probe")):
+            history = workers.worker_list("browser", limit=10, view="history")
+        self.assertEqual(history["count"], 1)
+        self.assertEqual(history["workers"][0]["state"], "completed")
+        self.assertFalse(history["workers"][0]["projection"]["fresh"])
+
+    def test_list_missing_registry_does_not_create_state(self) -> None:
+        self.assertFalse(workers.WORKER_STATE.exists())
+        current = workers.worker_list("browser", limit=10)
+        history = workers.worker_list("gui", limit=10, view="history")
+        self.assertEqual(current["count"], 0)
+        self.assertEqual(history["count"], 0)
+        self.assertFalse(workers.WORKER_STATE.exists())
+        self.assertFalse(workers.WORKER_DB.exists())
+
+    def test_current_list_does_not_migrate_worker_database(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            workers.browser_start(str(self.binary), port=9323, runtime_seconds=60)
+        with sqlite3.connect(workers.WORKER_DB) as connection:
+            before = connection.execute(
+                "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+        before_bytes = workers.WORKER_DB.read_bytes()
+        before_stat = workers.WORKER_DB.stat()
+        before_entries = sorted(path.name for path in workers.WORKER_STATE.iterdir())
+        observation = {
+            "state": "running",
+            "properties": {"LoadState": "loaded", "ActiveState": "active"},
+            "probe": result(),
+            "observed_at_unix": 223344,
+        }
+        with patch.object(workers, "_observe", return_value=observation):
+            current = workers.worker_list("browser", limit=10)
+        self.assertEqual(current["count"], 1)
+        with sqlite3.connect(workers.WORKER_DB) as connection:
+            after = connection.execute(
+                "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+        after_stat = workers.WORKER_DB.stat()
+        self.assertEqual(after, before)
+        self.assertEqual(workers.WORKER_DB.read_bytes(), before_bytes)
+        self.assertEqual(after_stat.st_mode, before_stat.st_mode)
+        self.assertEqual(after_stat.st_size, before_stat.st_size)
+        self.assertEqual(after_stat.st_mtime_ns, before_stat.st_mtime_ns)
+        self.assertEqual(
+            sorted(path.name for path in workers.WORKER_STATE.iterdir()),
+            before_entries,
+        )
+
+    def test_current_list_surfaces_ambiguous_missing_unit_without_persisting(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9321, runtime_seconds=60)
+        worker_id = started["worker"]["worker_id"]
+        probe = result(
+            stdout=(
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+                "Result=\nExecMainStatus=\n"
+            )
+        )
+        with patch.object(workers.operator, "_run", return_value=probe):
+            current = workers.worker_list("browser", limit=10)
+        self.assertEqual(current["count"], 1)
+        item = current["workers"][0]
+        self.assertEqual(item["state"], "interrupted")
+        self.assertEqual(item["projection"]["stored_state"], "running")
+        self.assertFalse(item["projection"]["persisted_by_list"])
+        self.assertEqual(item["projection"]["bucket"], "attention")
+        self.assertEqual(item["projection"]["reason"], "systemd-observation-ambiguous")
+        self.assertEqual(workers._row(worker_id)["state"], "running")
+        self.assertIsNotNone(workers.resources.inspect_resource("port:9321"))
+        with patch.object(workers.operator, "_run", return_value=probe):
+            reconciled = workers.worker_status(worker_id, expected_kind="browser")
+        self.assertEqual(reconciled["state"], "interrupted")
+        self.assertIsNone(workers.resources.inspect_resource("port:9321"))
+
+    def test_status_releases_only_exact_worker_owned_leases(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9322, runtime_seconds=60)
+        worker = started["worker"]
+        owner = f"worker:{worker['worker_id']}"
+        profile_key = f"browser-profile:{worker['profile_path']}"
+        workers.resources.release_resources(owner, ["port:9322"])
+        workers.resources.acquire_resources(
+            "foreign-owner",
+            ["port:9322"],
+            purpose="foreign replacement",
+            ttl_seconds=60,
+        )
+        probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+                "Result=success\nExecMainStatus=0\n"
+            )
+        )
+        with patch.object(workers.operator, "_run", return_value=probe):
+            reconciled = workers.worker_status(worker["worker_id"], expected_kind="browser")
+        release = reconciled["last_observation"]["terminalization"]["release"]
+        self.assertEqual(release["status"], "partial")
+        self.assertEqual(release["blocked"][0]["resource_key"], "port:9322")
+        self.assertEqual(
+            workers.resources.inspect_resource("port:9322")["owner_id"],
+            "foreign-owner",
+        )
+        self.assertIsNone(workers.resources.inspect_resource(profile_key))
+
+        current = workers.worker_list("browser", limit=10)
+        self.assertEqual(current["count"], 1)
+        self.assertEqual(current["observed_count"], 0)
+        self.assertEqual(
+            current["workers"][0]["projection"]["reason"],
+            "terminalization-incomplete",
+        )
+        self.assertFalse(current["workers"][0]["projection"]["fresh"])
+        workers.resources.release_resources("foreign-owner", ["port:9322"])
+        still_attention = workers.worker_list("browser", limit=10)
+        self.assertEqual(still_attention["count"], 1)
+        with patch.object(workers.operator, "_run", return_value=probe):
+            workers.worker_status(worker["worker_id"], expected_kind="browser")
+        final = workers.worker_list("browser", limit=10)
+        self.assertEqual(final["count"], 0)
+        self.assertIsNone(workers.resources.inspect_resource("port:9322"))
+
+    def test_history_cursor_is_stable_for_same_second_records(self) -> None:
+        created: list[str] = []
+        with patch.object(workers, "_now", return_value=123456), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            for port in (9330, 9331, 9332):
+                worker = workers.browser_start(
+                    str(self.binary), port=port, runtime_seconds=60
+                )["worker"]
+                created.append(worker["worker_id"])
+                workers._update(worker["worker_id"], "completed")
+        with patch.object(workers, "_observe", side_effect=AssertionError("history must not probe")):
+            first = workers.worker_list("browser", limit=2, view="history")
+            second = workers.worker_list(
+                "browser", limit=2, view="history", cursor=first["next_cursor"]
+            )
+        first_ids = [item["worker_id"] for item in first["workers"]]
+        second_ids = [item["worker_id"] for item in second["workers"]]
+        self.assertEqual(first["count"], 2)
+        self.assertTrue(first["has_more"])
+        self.assertEqual(second["count"], 1)
+        self.assertFalse(second["has_more"])
+        self.assertEqual(set(first_ids + second_ids), set(created))
+        self.assertEqual(len(first_ids + second_ids), len(set(first_ids + second_ids)))
+
+    def test_current_cursor_is_stable_and_reconciles_each_page(self) -> None:
+        created: list[str] = []
+        with patch.object(workers, "_now", return_value=222222), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            for port in (9340, 9341, 9342):
+                worker = workers.browser_start(
+                    str(self.binary), port=port, runtime_seconds=60
+                )["worker"]
+                created.append(worker["worker_id"])
+        observation = {
+            "state": "running",
+            "properties": {"LoadState": "loaded", "ActiveState": "active"},
+            "probe": result(),
+            "observed_at_unix": 222223,
+        }
+        with patch.object(workers, "_observe", return_value=observation) as observe, patch.object(
+            workers, "_update", side_effect=AssertionError("list must not persist")
+        ), patch.object(
+            workers, "_release", side_effect=AssertionError("list must not release")
+        ), patch.object(
+            workers, "_cleanup", side_effect=AssertionError("list must not cleanup")
+        ):
+            first = workers.worker_list("browser", limit=2)
+            second = workers.worker_list(
+                "browser", limit=2, cursor=first["next_cursor"]
+            )
+        ids = [item["worker_id"] for item in first["workers"] + second["workers"]]
+        self.assertEqual(set(ids), set(created))
+        self.assertEqual(first["observed_count"], 2)
+        self.assertEqual(second["observed_count"], 1)
+        self.assertEqual(observe.call_count, 3)
+        self.assertTrue(all(item["projection"]["bucket"] == "active" for item in first["workers"] + second["workers"]))
+
+    def test_gui_list_uses_shared_terminal_reconciliation(self) -> None:
+        xvfb = self.root / "Xvfb-list"
+        xvfb.write_text("#!/bin/sh\nexit 0\n")
+        xvfb.chmod(0o755)
+        with patch.object(workers.shutil, "which", return_value=str(xvfb)), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            started = workers.gui_start(
+                str(self.binary), display_number=31, runtime_seconds=60
+            )
+        config_path = Path(workers._row(started["worker"]["worker_id"])["config_path"])
+        probe = result(
+            stdout=(
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+                "Result=success\nExecMainStatus=0\n"
+            )
+        )
+        worker_id = started["worker"]["worker_id"]
+        with patch.object(workers.operator, "_run", return_value=probe):
+            current = workers.worker_list("gui", limit=10)
+        self.assertEqual(current["count"], 0)
+        self.assertIsNotNone(workers.resources.inspect_resource("display:31"))
+        self.assertEqual(workers._row(worker_id)["state"], "running")
+        with patch.object(workers.operator, "_run", return_value=probe):
+            reconciled = workers.worker_status(worker_id, expected_kind="gui")
+        self.assertEqual(reconciled["state"], "completed")
+        self.assertIsNone(workers.resources.inspect_resource("display:31"))
+        self.assertTrue(config_path.exists())
+
+    def test_stop_records_terminalization_and_preserves_manifest(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9350, runtime_seconds=60)
+        worker = started["worker"]
+        config_path = Path(workers._row(worker["worker_id"])["config_path"])
+        with patch.object(workers.operator, "_run", return_value=result()):
+            stopped = workers.worker_stop(worker["worker_id"], expected_kind="browser")
+        self.assertEqual(stopped["worker"]["state"], "stopped")
+        self.assertTrue(config_path.exists())
+        self.assertIsNone(workers.resources.inspect_resource("port:9350"))
+        terminalization = stopped["worker"]["last_observation"]["terminalization"]
+        self.assertEqual(terminalization["release"]["status"], "released")
+        self.assertEqual(terminalization["cleanup"]["status"], "completed")
+
+    def test_worker_list_cursor_is_bound_to_kind_and_view(self) -> None:
+        with self.assertRaisesRegex(ValueError, "bound to another worker view"):
+            workers.worker_list(
+                "gui",
+                view="history",
+                cursor="browser:history:1:" + "0" * 20,
+            )
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,13 @@ WORKER_STATE = Path(
 WORKER_DB = WORKER_STATE / "workers.sqlite3"
 WORKER_ID = re.compile(r"[0-9a-f]{20}\Z")
 WORKER_STATES = {"launching", "running", "completed", "failed", "stopped", "interrupted"}
+WORKER_ACTIVE_STATES = {"launching", "running"}
+WORKER_HISTORY_STATES = {"completed", "failed", "stopped", "interrupted"}
+WORKER_LIST_VIEWS = {"current", "history"}
+WORKER_LIST_MAX_SCAN = 500
+WORKER_LIST_CURSOR = re.compile(
+    r"(browser|gui):(current|history):([0-9]{1,20}):([0-9a-f]{20})\Z"
+)
 DEFAULT_BROWSER_EXECUTABLES = (
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
@@ -113,6 +120,34 @@ def _database() -> sqlite3.Connection:
         raise RuntimeError("Unsupported worker database schema")
     connection.commit()
     os.chmod(WORKER_DB, 0o600)
+    return connection
+
+
+def _read_database() -> sqlite3.Connection | None:
+    if WORKER_STATE.is_symlink():
+        raise PermissionError("Worker state directory may not be a symlink")
+    if not WORKER_DB.exists():
+        return None
+    if WORKER_DB.is_symlink():
+        raise PermissionError("Worker database may not be a symlink")
+    if not WORKER_DB.is_file():
+        raise PermissionError("Worker database must be a regular file")
+    connection = sqlite3.connect(
+        f"file:{WORKER_DB}?mode=ro",
+        uri=True,
+        timeout=10,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'"
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        connection.close()
+        raise
+    if row is None or row["value"] != "1":
+        connection.close()
+        raise RuntimeError("Unsupported worker database schema")
     return connection
 
 
@@ -344,24 +379,127 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _release(record: dict[str, Any]) -> None:
+def _release(record: dict[str, Any]) -> dict[str, Any]:
     keys = json.loads(record["lease_keys_json"])
-    if keys:
+    owner = f"worker:{record['worker_id']}"
+    released: list[str] = []
+    absent: list[str] = []
+    blocked: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = []
+    for key in keys:
         try:
-            resources.release_resources(f"worker:{record['worker_id']}", keys)
-        except (PermissionError, ValueError):
-            pass
+            current = resources.inspect_resource(key)
+        except (PermissionError, ValueError) as exc:
+            errors.append({"resource_key": key, "error": str(exc)})
+            continue
+        if current is None:
+            absent.append(key)
+            continue
+        current_owner = str(current.get("owner_id", ""))
+        if current_owner != owner:
+            blocked.append({"resource_key": key, "owner_id": current_owner})
+            continue
+        try:
+            result = resources.release_resources(owner, [key])
+        except (PermissionError, ValueError) as exc:
+            errors.append({"resource_key": key, "error": str(exc)})
+            continue
+        released.extend(
+            str(item["resource_key"]) for item in result.get("released", [])
+        )
+
+    remaining: list[dict[str, str]] = []
+    for key in keys:
+        try:
+            current = resources.inspect_resource(key)
+        except (PermissionError, ValueError) as exc:
+            errors.append({"resource_key": key, "error": str(exc)})
+            continue
+        if current is not None:
+            remaining.append(
+                {
+                    "resource_key": key,
+                    "owner_id": str(current.get("owner_id", "")),
+                }
+            )
+
+    if blocked or errors:
+        status = "partial" if released or absent else "blocked"
+    elif remaining:
+        status = "incomplete"
+    elif released:
+        status = "released"
+    else:
+        status = "already-absent"
+    return {
+        "status": status,
+        "owner_id": owner,
+        "requested": keys,
+        "released": released,
+        "already_absent": absent,
+        "blocked": blocked,
+        "errors": errors,
+        "remaining": remaining,
+    }
 
 
-def _cleanup(record: dict[str, Any]) -> None:
+def _cleanup(record: dict[str, Any]) -> dict[str, Any]:
+    removed: list[str] = []
+    absent: list[str] = []
+    preserved: list[str] = []
+    errors: list[dict[str, str]] = []
+    evidence_directory = WORKER_STATE / "instances" / record["worker_id"]
     for raw in json.loads(record["ephemeral_paths_json"]):
         path = Path(raw)
+        if path == evidence_directory:
+            preserved.append(str(path))
+            continue
+        if path == WORKER_STATE or WORKER_STATE not in path.parents:
+            preserved.append(str(path))
+            continue
         try:
-            if path == WORKER_STATE or WORKER_STATE not in path.parents:
-                continue
             shutil.rmtree(path)
+            removed.append(str(path))
         except FileNotFoundError:
-            pass
+            absent.append(str(path))
+        except OSError as exc:
+            errors.append({"path": str(path), "error": str(exc)})
+    return {
+        "status": "partial" if errors else "completed",
+        "removed": removed,
+        "already_absent": absent,
+        "preserved_evidence": preserved,
+        "errors": errors,
+    }
+
+
+def _terminalization_action_required(observation: dict[str, Any]) -> bool:
+    terminalization = observation.get("terminalization")
+    if not isinstance(terminalization, dict):
+        return False
+    release = terminalization.get("release")
+    cleanup = terminalization.get("cleanup")
+    return bool(
+        isinstance(release, dict)
+        and release.get("status") in {"blocked", "partial", "incomplete"}
+    ) or bool(isinstance(cleanup, dict) and cleanup.get("status") == "partial")
+
+
+def _reconcile_record(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    observation = _observe(record)
+    stored = _update(record["worker_id"], observation["state"], observation=observation)
+    if observation["state"] not in WORKER_ACTIVE_STATES:
+        observation = {
+            **observation,
+            "terminalization": {
+                "release": _release(stored),
+                "cleanup": _cleanup(stored),
+            },
+        }
+        stored = _update(
+            record["worker_id"], observation["state"], observation=observation
+        )
+    return stored, observation
 
 
 def _observe(record: dict[str, Any]) -> dict[str, Any]:
@@ -1555,11 +1693,7 @@ def worker_status(worker_id: str, *, expected_kind: str | None = None) -> dict[s
     record = _row(worker_id)
     if expected_kind is not None and record["kind"] != expected_kind:
         raise ValueError(f"Worker is not a {expected_kind} worker")
-    observation = _observe(record)
-    stored = _update(worker_id, observation["state"], observation=observation)
-    if observation["state"] not in {"launching", "running"}:
-        _release(stored)
-        _cleanup(stored)
+    stored, _observation = _reconcile_record(record)
     return _public(stored)
 
 
@@ -1574,24 +1708,260 @@ def worker_stop(worker_id: str, *, expected_kind: str | None = None) -> dict[str
         max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
     )
     state = "stopped" if result["returncode"] == 0 else record["state"]
-    stored = _update(worker_id, state, observation={"stop": result})
+    observation: dict[str, Any] = {
+        "state": state,
+        "stop": result,
+        "observed_at_unix": _now(),
+    }
+    stored = _update(worker_id, state, observation=observation)
     if result["returncode"] == 0:
-        _release(stored)
-        _cleanup(stored)
+        observation["terminalization"] = {
+            "release": _release(stored),
+            "cleanup": _cleanup(stored),
+        }
+        stored = _update(worker_id, state, observation=observation)
     return {"worker": _public(stored), "result": result}
 
 
-def worker_list(kind: str, limit: int = 100) -> dict[str, Any]:
+def _worker_cursor_encode(
+    kind: str, view: str, created_at_unix: int, worker_id: str
+) -> str:
+    return f"{kind}:{view}:{created_at_unix}:{worker_id}"
+
+
+def _worker_cursor_decode(
+    cursor: str | None, *, kind: str, view: str
+) -> tuple[int, str] | None:
+    if cursor in {None, ""}:
+        return None
+    if not isinstance(cursor, str):
+        raise ValueError("cursor must be text")
+    if len(cursor) > 128:
+        raise ValueError("cursor is too large")
+    match = WORKER_LIST_CURSOR.fullmatch(cursor)
+    if match is None or match.group(1) != kind or match.group(2) != view:
+        raise ValueError("cursor is invalid or bound to another worker view")
+    return int(match.group(3)), match.group(4)
+
+
+def _worker_rows(
+    kind: str,
+    view: str,
+    *,
+    cursor: tuple[int, str] | None,
+    row_limit: int,
+) -> list[dict[str, Any]]:
+    states = (
+        tuple(sorted(WORKER_STATES))
+        if view == "current"
+        else tuple(sorted(WORKER_HISTORY_STATES))
+    )
+    placeholders = ",".join("?" for _ in states)
+    query = (
+        f"SELECT * FROM workers WHERE kind=? AND state IN ({placeholders})"
+    )
+    parameters: list[Any] = [kind, *states]
+    if cursor is not None:
+        created_at_unix, worker_id = cursor
+        query += (
+            " AND (created_at_unix < ? OR "
+            "(created_at_unix = ? AND worker_id < ?))"
+        )
+        parameters.extend([created_at_unix, created_at_unix, worker_id])
+    query += " ORDER BY created_at_unix DESC, worker_id DESC LIMIT ?"
+    parameters.append(row_limit)
+    connection = _read_database()
+    if connection is None:
+        return []
+    try:
+        rows = connection.execute(query, parameters).fetchall()
+    finally:
+        connection.close()
+    return [dict(row) for row in rows]
+
+
+def _observed_projection_record(
+    record: dict[str, Any], observation: dict[str, Any]
+) -> dict[str, Any]:
+    projected = dict(record)
+    projected["state"] = observation["state"]
+    projected["updated_at_unix"] = max(
+        int(record["updated_at_unix"]), int(observation["observed_at_unix"])
+    )
+    projected["last_observation_json"] = _canonical_json(observation)
+    return projected
+
+
+def _current_worker_projection(
+    record: dict[str, Any],
+    observation: dict[str, Any],
+    *,
+    freshly_observed: bool,
+) -> dict[str, Any] | None:
+    state = record["state"]
+    if state in WORKER_ACTIVE_STATES:
+        return {
+            "bucket": "active",
+            "fresh": True,
+            "action_required": False,
+            "reason": None,
+        }
+    if _terminalization_action_required(observation):
+        return {
+            "bucket": "attention",
+            "fresh": False,
+            "action_required": True,
+            "reason": "terminalization-incomplete",
+        }
+    if freshly_observed and state == "failed":
+        return {
+            "bucket": "attention",
+            "fresh": True,
+            "action_required": True,
+            "reason": "worker-failed",
+        }
+    if freshly_observed and state == "interrupted":
+        return {
+            "bucket": "attention",
+            "fresh": True,
+            "action_required": True,
+            "reason": "systemd-observation-ambiguous",
+        }
+    return None
+
+
+def worker_list(
+    kind: str,
+    limit: int = 100,
+    *,
+    view: str = "current",
+    cursor: str | None = None,
+) -> dict[str, Any]:
     if kind not in {"browser", "gui"}:
         raise ValueError("kind must be browser or gui")
     if not isinstance(limit, int) or not 1 <= limit <= 500:
         raise ValueError("limit must be between 1 and 500")
-    with _database() as connection:
-        rows = connection.execute(
-            "SELECT * FROM workers WHERE kind=? ORDER BY created_at_unix DESC LIMIT ?",
-            (kind, limit),
-        ).fetchall()
-    return {"kind": kind, "count": len(rows), "workers": [_public(dict(row)) for row in rows]}
+    if view not in WORKER_LIST_VIEWS:
+        raise ValueError("view must be current or history")
+    decoded_cursor = _worker_cursor_decode(cursor, kind=kind, view=view)
+
+    if view == "history":
+        rows = _worker_rows(
+            kind, view, cursor=decoded_cursor, row_limit=limit + 1
+        )
+        selected = rows[:limit]
+        has_more = len(rows) > limit
+        next_cursor = (
+            _worker_cursor_encode(
+                kind,
+                view,
+                selected[-1]["created_at_unix"],
+                selected[-1]["worker_id"],
+            )
+            if has_more and selected
+            else None
+        )
+        public_workers: list[dict[str, Any]] = []
+        for record in selected:
+            item = _public(record)
+            item["projection"] = {
+                "bucket": "history",
+                "fresh": False,
+                "action_required": False,
+                "reason": None,
+            }
+            public_workers.append(item)
+        return {
+            "schema_version": 2,
+            "kind": kind,
+            "view": view,
+            "count": len(public_workers),
+            "workers": public_workers,
+            "scanned_count": len(selected),
+            "observed_count": 0,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+            "scan_truncated": False,
+            "does_not_establish": [
+                "fresh systemd state for historical records",
+                "permission to delete worker evidence",
+            ],
+        }
+
+    rows = _worker_rows(
+        kind,
+        view,
+        cursor=decoded_cursor,
+        row_limit=WORKER_LIST_MAX_SCAN + 1,
+    )
+    public_workers: list[dict[str, Any]] = []
+    processed = 0
+    observed = 0
+    next_cursor: str | None = None
+    has_more = False
+    for index, record in enumerate(rows[:WORKER_LIST_MAX_SCAN]):
+        processed += 1
+        freshly_observed = record["state"] in WORKER_ACTIVE_STATES
+        if freshly_observed:
+            observation = _observe(record)
+            projected = _observed_projection_record(record, observation)
+            observed += 1
+        else:
+            observation = (
+                json.loads(record["last_observation_json"])
+                if record["last_observation_json"]
+                else {}
+            )
+            projected = record
+        projection = _current_worker_projection(
+            projected, observation, freshly_observed=freshly_observed
+        )
+        if projection is not None:
+            item = _public(projected)
+            item["projection"] = {
+                **projection,
+                "stored_state": record["state"],
+                "persisted_by_list": False,
+            }
+            public_workers.append(item)
+        if len(public_workers) >= limit:
+            has_more = index + 1 < len(rows)
+            if has_more:
+                next_cursor = _worker_cursor_encode(
+                    kind, view, record["created_at_unix"], record["worker_id"]
+                )
+            break
+    else:
+        if len(rows) > WORKER_LIST_MAX_SCAN:
+            has_more = True
+            last = rows[WORKER_LIST_MAX_SCAN - 1]
+            next_cursor = _worker_cursor_encode(
+                kind, view, last["created_at_unix"], last["worker_id"]
+            )
+
+    return {
+        "schema_version": 2,
+        "kind": kind,
+        "view": view,
+        "count": len(public_workers),
+        "workers": public_workers,
+        "scanned_count": processed,
+        "observed_count": observed,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "scan_truncated": len(rows) > WORKER_LIST_MAX_SCAN,
+        "does_not_establish": [
+            "stored lifecycle convergence or lease release from list output",
+            "absence of older active records beyond a truncated scan",
+            "permission to release foreign leases",
+            "worker action success from registry state alone",
+        ],
+        "recommended_next_action": (
+            "call the exact worker status surface for persisted reconciliation"
+            if any(item["projection"]["action_required"] for item in public_workers)
+            else "none"
+        ),
+    }
 
 
 def _audit(operation: str, result: dict[str, Any]) -> None:
@@ -1681,10 +2051,14 @@ def grabowski_browser_worker_stop(worker_id: str) -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_browser_worker_list", annotations=READ_ONLY)
-def grabowski_browser_worker_list(limit: int = 100) -> dict[str, Any]:
-    """List isolated agent-owned browser workers."""
+def grabowski_browser_worker_list(
+    limit: int = 100,
+    view: str = "current",
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """List current or historical browser workers with fresh read-only observation."""
     operator._require_operator_capability("browser_worker")
-    return worker_list("browser", limit)
+    return worker_list("browser", limit, view=view, cursor=cursor)
 
 
 @mcp.tool(name="grabowski_gui_worker_start", annotations=MUTATING)
@@ -1723,7 +2097,11 @@ def grabowski_gui_worker_stop(worker_id: str) -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_gui_worker_list", annotations=READ_ONLY)
-def grabowski_gui_worker_list(limit: int = 100) -> dict[str, Any]:
-    """List isolated GUI workers."""
+def grabowski_gui_worker_list(
+    limit: int = 100,
+    view: str = "current",
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """List current or historical GUI workers with fresh read-only observation."""
     operator._require_operator_capability("gui_worker")
-    return worker_list("gui", limit)
+    return worker_list("gui", limit, view=view, cursor=cursor)
