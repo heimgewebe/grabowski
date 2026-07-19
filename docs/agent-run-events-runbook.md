@@ -136,3 +136,22 @@ Stop the experiment if any of these happen:
 ## Current decision
 
 Default state remains off. The writer is a diagnostic seam, not a dependency.
+
+## Explicit coding-memory import and history
+
+The task-local `chronik_context_json` remains the persisted context truth. It is derived by `grabowski_task_start` from canonical resource claims plus `chronik_operation`; callers do not provide a second context object or migration-only compatibility field.
+
+Two typed tools expose the optional local coding-memory seam:
+
+- `grabowski_chronik_outbox_import(path)` imports exactly one existing `grabowski_*.jsonl` directly below `chronik-outbox`. The source must contain only hash-valid, redacted `agent-run-event.v0` records from Grabowski. The adapter calls Chronik's existing positional `import INPUT` command, verifies that the source identity is unchanged afterwards, and returns a SHA-256-bound receipt. Re-import is delegated to Chronik's idempotent event-ID contract; the source is never deleted or compacted by this tool.
+- `grabowski_chronik_history(...)` calls Chronik's bounded `query` command for exactly one repository or host target. Every response is historical-only and explicitly does not establish current Git state, current CI state, current runtime state, or safe retry.
+
+The optional checkout and data directory are configured with:
+
+```text
+GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT=/home/alex/.local/state
+GRABOWSKI_CHRONIK_CODING_MEMORY_REPO=/home/alex/repos/chronik
+GRABOWSKI_CHRONIK_CODING_MEMORY_DATA_DIR=/home/alex/.local/state/chronik
+```
+
+A missing or stale checkout, missing `tools/coding_memory.py`, invalid CLI output, timeout, or non-zero exit is returned as a bounded unavailable result. These failures do not affect normal task creation, execution, reconciliation, or lifecycle event writing.

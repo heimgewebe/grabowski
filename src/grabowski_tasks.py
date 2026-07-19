@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 import uuid
@@ -3864,3 +3865,339 @@ def _managed_cargo_evidence_from_task_store(max_entries: int) -> dict[str, Any]:
         cache_root=MANAGED_CARGO_CACHE_ROOT,
         max_entries=max_entries,
     )
+CHRONIK_CLI_TIMEOUT_SECONDS = 30
+CHRONIK_CLI_MAX_OUTPUT_BYTES = 64 * 1024
+CHRONIK_HISTORY_MAX_LIMIT = 100
+
+
+def _chronik_bounded_text(value: str, *, label: str, maximum: int = 256) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be text")
+    normalized = value.strip()
+    if len(normalized) > maximum or any(
+        ord(character) < 32 for character in normalized
+    ):
+        raise ValueError(f"{label} is invalid")
+    return normalized
+
+
+def _chronik_cli_run(
+    arguments: list[str],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    configuration = chronik.coding_memory_configuration()
+    if not configuration["available"]:
+        return configuration, None
+    command = [
+        sys.executable,
+        configuration["cli"],
+        "--data-dir",
+        configuration["data_dir"],
+        *arguments,
+    ]
+    try:
+        result = operator._run(
+            command,
+            cwd=Path(configuration["repository"]),
+            timeout_seconds=CHRONIK_CLI_TIMEOUT_SECONDS,
+            max_output_bytes=CHRONIK_CLI_MAX_OUTPUT_BYTES,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return configuration, {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": _redact_reason(str(exc)),
+            "timed_out": False,
+            "launch_error": True,
+        }
+    return configuration, result
+
+
+def _chronik_cli_json(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("returncode") != 0 or result.get("timed_out") is True:
+        raise ValueError("Chronik coding-memory CLI did not complete successfully")
+    raw = result.get("stdout")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("Chronik coding-memory CLI returned no JSON")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Chronik coding-memory CLI returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Chronik coding-memory CLI result must be an object")
+    return payload
+
+
+def _chronik_receipt(payload: dict[str, Any], *, field: str) -> dict[str, Any]:
+    result = dict(payload)
+    result[field] = _sha256_json(result)
+    return result
+
+
+def _chronik_failure_details(result: dict[str, Any] | None) -> dict[str, Any]:
+    if result is None:
+        return {}
+    stderr = result.get("stderr")
+    return {
+        "returncode": result.get("returncode"),
+        "timed_out": result.get("timed_out") is True,
+        "error": _redact_reason(stderr) if isinstance(stderr, str) and stderr else None,
+    }
+
+
+def _chronik_unsigned_receipt_valid(payload: dict[str, Any]) -> bool:
+    claimed = payload.get("receipt_sha256")
+    if not isinstance(claimed, str):
+        return False
+    unsigned = dict(payload)
+    unsigned.pop("receipt_sha256", None)
+    return claimed == _sha256_json(unsigned)
+
+
+def _validate_chronik_import_result(
+    source: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    if payload.get("schema_version") != "chronik-import-receipt.v1":
+        raise ValueError("Chronik coding-memory import contract is stale")
+    if payload.get("domain") != "agent.ledger":
+        raise ValueError("Chronik coding-memory import domain is invalid")
+    if payload.get("event_ids") != sorted(source["event_ids"]):
+        raise ValueError("Chronik coding-memory import event_ids are unbound")
+    requested = payload.get("requested")
+    imported = payload.get("imported")
+    skipped = payload.get("skipped_existing")
+    if (
+        type(requested) is not int
+        or requested != source["event_count"]
+        or type(imported) is not int
+        or imported < 0
+        or type(skipped) is not int
+        or skipped < 0
+        or imported + skipped != requested
+    ):
+        raise ValueError("Chronik coding-memory import counts are invalid")
+    if payload.get("source_sha256") != source["chronik_source_sha256"]:
+        raise ValueError("Chronik coding-memory import source digest is unbound")
+    if payload.get("historical_only") is not True:
+        raise ValueError("Chronik coding-memory import is not historical-only")
+    claims = payload.get("does_not_establish")
+    if not isinstance(claims, list) or not set(
+        chronik.CODING_MEMORY_DOES_NOT_ESTABLISH
+    ).issubset(claims):
+        raise ValueError("Chronik coding-memory import truth exclusions are incomplete")
+    if not _chronik_unsigned_receipt_valid(payload):
+        raise ValueError("Chronik coding-memory import receipt digest is invalid")
+    return payload
+
+
+@mcp.tool(name="grabowski_chronik_outbox_import", annotations=MUTATING)
+def grabowski_chronik_outbox_import(path: str) -> dict[str, Any]:
+    """Import one redacted Grabowski outbox JSONL into optional local Chronik."""
+    operator._require_operator_mutation("durable_job")
+    source = chronik.inspect_coding_memory_source(path)
+    configuration, execution = _chronik_cli_run(["import", source["path"]])
+    base_payload: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_chronik_outbox_import_receipt",
+        "source": {
+            key: source[key]
+            for key in ("path", "sha256", "bytes", "event_count", "event_ids_sha256")
+        },
+        "cli_present": bool(configuration["available"]),
+        "available": False,
+        "imported": False,
+        "idempotent_import_contract": True,
+        "source_unchanged": True,
+        "outcome_unknown": False,
+        "does_not_establish": list(chronik.CODING_MEMORY_DOES_NOT_ESTABLISH),
+    }
+    if execution is None:
+        payload = {
+            **base_payload,
+            "failure": {
+                "code": configuration["reason"],
+                "returncode": None,
+                "timed_out": False,
+                "error": None,
+            },
+        }
+    else:
+        source_readback_error = None
+        try:
+            after = chronik.inspect_coding_memory_source(source["path"])
+        except ValueError as exc:
+            source_unchanged = False
+            source_readback_error = str(exc)
+        else:
+            source_unchanged = (
+                after["sha256"] == source["sha256"]
+                and after["bytes"] == source["bytes"]
+                and after["identity"] == source["identity"]
+            )
+        try:
+            cli_result = _validate_chronik_import_result(
+                source, _chronik_cli_json(execution)
+            )
+        except ValueError as exc:
+            payload = {
+                **base_payload,
+                "source_unchanged": source_unchanged,
+                "outcome_unknown": True,
+                "failure": {
+                    "code": "chronik_coding_memory_cli_failed",
+                    **_chronik_failure_details(execution),
+                    "contract_error": str(exc),
+                    "source_readback_error": source_readback_error,
+                },
+            }
+        else:
+            payload = {
+                **base_payload,
+                "available": source_unchanged,
+                "imported": source_unchanged,
+                "source_unchanged": source_unchanged,
+                "outcome_unknown": not source_unchanged,
+                "chronik_result": cli_result if source_unchanged else None,
+            }
+            if not source_unchanged:
+                payload["failure"] = {
+                    "code": "chronik_outbox_source_changed",
+                    "returncode": execution.get("returncode"),
+                    "timed_out": execution.get("timed_out") is True,
+                    "error": source_readback_error,
+                }
+    receipt = _chronik_receipt(payload, field="receipt_sha256")
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "chronik-outbox-import",
+            "source_sha256": source["sha256"],
+            "source_event_count": source["event_count"],
+            "available": receipt["available"],
+            "imported": receipt["imported"],
+            "outcome_unknown": receipt["outcome_unknown"],
+            "receipt_sha256": receipt["receipt_sha256"],
+        }
+    )
+    return receipt
+
+
+@mcp.tool(name="grabowski_chronik_history", annotations=READ_ONLY)
+def grabowski_chronik_history(
+    repo: str = "",
+    host: str = "",
+    component: str = "",
+    operation: str = "",
+    task_class: str = "",
+    outcome: str = "",
+    since: str = "",
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Read bounded historical coding events without asserting current truth."""
+    operator._require_operator_capability("durable_job")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= CHRONIK_HISTORY_MAX_LIMIT
+    ):
+        raise ValueError(f"limit must be between 1 and {CHRONIK_HISTORY_MAX_LIMIT}")
+    normalized = {
+        "repo": _chronik_bounded_text(repo, label="repo"),
+        "host": _chronik_bounded_text(host, label="host"),
+        "component": _chronik_bounded_text(component, label="component"),
+        "operation": _chronik_bounded_text(operation, label="operation"),
+        "task_class": _chronik_bounded_text(task_class, label="task_class"),
+        "outcome": _chronik_bounded_text(outcome, label="outcome"),
+        "since": _chronik_bounded_text(since, label="since"),
+    }
+    if bool(normalized["repo"]) == bool(normalized["host"]):
+        raise ValueError("exactly one of repo or host is required")
+    arguments = ["query"]
+    target_key = "repo" if normalized["repo"] else "host"
+    arguments.append(f"--{target_key}={normalized[target_key]}")
+    for key in ("component", "operation", "task_class", "outcome", "since"):
+        if normalized[key]:
+            option = key.replace("_", "-")
+            arguments.append(f"--{option}={normalized[key]}")
+    arguments.append(f"--limit={limit}")
+    configuration, execution = _chronik_cli_run(arguments)
+    query = {key: value for key, value in normalized.items() if value}
+    query["limit"] = limit
+    base_payload: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_chronik_history",
+        "query": query,
+        "cli_present": bool(configuration["available"]),
+        "available": False,
+        "historical_only": True,
+        "events": [],
+        "does_not_establish": list(chronik.CODING_MEMORY_DOES_NOT_ESTABLISH),
+    }
+    if execution is None:
+        payload = {
+            **base_payload,
+            "failure": {
+                "code": configuration["reason"],
+                "returncode": None,
+                "timed_out": False,
+                "error": None,
+            },
+        }
+    else:
+        try:
+            history = _chronik_cli_json(execution)
+            if history.get("schema_version") != "chronik-coding-history.v1":
+                raise ValueError("Chronik coding-memory history contract is stale")
+            if history.get("historical_only") is not True:
+                raise ValueError("Chronik coding-memory history is not historical-only")
+            raw_events = history.get("events", [])
+            raw_event_ids = history.get("event_ids", [])
+            raw_claims = history.get("does_not_establish", [])
+            if not isinstance(raw_events, list) or not all(
+                isinstance(event, dict) for event in raw_events
+            ):
+                raise ValueError(
+                    "Chronik coding-memory history events must be a list of objects"
+                )
+            if not isinstance(raw_event_ids, list) or not all(
+                isinstance(event_id, str) for event_id in raw_event_ids
+            ):
+                raise ValueError(
+                    "Chronik coding-memory history event_ids must be a list of text"
+                )
+            if raw_event_ids != [event.get("event_id") for event in raw_events]:
+                raise ValueError("Chronik coding-memory history event_ids are unbound")
+            if not isinstance(raw_claims, list) or not all(
+                isinstance(claim, str) for claim in raw_claims
+            ):
+                raise ValueError(
+                    "Chronik coding-memory history does_not_establish must be a list of text"
+                )
+            if not set(chronik.CODING_MEMORY_DOES_NOT_ESTABLISH).issubset(raw_claims):
+                raise ValueError(
+                    "Chronik coding-memory history truth exclusions are incomplete"
+                )
+        except ValueError as exc:
+            payload = {
+                **base_payload,
+                "failure": {
+                    "code": "chronik_coding_memory_cli_failed",
+                    **_chronik_failure_details(execution),
+                    "contract_error": str(exc),
+                },
+            }
+        else:
+            events = raw_events[:limit]
+            history = dict(history)
+            history["events"] = events
+            history["event_ids"] = raw_event_ids[:limit]
+            history["historical_only"] = True
+            history["does_not_establish"] = sorted(
+                set(raw_claims) | set(chronik.CODING_MEMORY_DOES_NOT_ESTABLISH)
+            )
+            payload = {
+                **base_payload,
+                "available": True,
+                "events": events,
+                "history": history,
+            }
+    return _chronik_receipt(payload, field="result_sha256")
