@@ -47,7 +47,12 @@ import grabowski_merge_guard
 import grabowski_repoground_catalog as repoground_catalog
 
 APP_NAME = "Grabowski"
-DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 5
+DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 6
+RESERVED_DEPLOYMENT_SNAPSHOT_INPUTS = frozenset({
+    "runtime-entrypoint.json",
+    "runtime.in",
+    "runtime.lock.txt",
+})
 AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
 AGENT_INSTRUCTIONS_VERSION = "grabowski-agent-facing-contract-v1"
 AGENT_INSTRUCTIONS_MAX_BYTES = 4_096
@@ -3920,6 +3925,8 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         "agent_instructions": dict,
         "source_sha256": str,
         "source_sha256s": dict,
+        "runtime_asset_sha256s": dict,
+        "runtime_asset_paths": dict,
         "runtime_input_sha256": str,
         "runtime_lock_sha256": str,
         "snapshot_paths": dict,
@@ -3963,9 +3970,11 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         return False
     schema_version = contract.get("schema_version")
     expected_keys = {"schema_version", "mode", "module", "source", "expected_tools"}
-    if schema_version == 2:
+    if schema_version in {2, 3}:
         expected_keys.add("supporting_sources")
-    if schema_version not in {1, 2} or set(contract) != expected_keys:
+    if schema_version == 3:
+        expected_keys.add("runtime_assets")
+    if schema_version not in {1, 2, 3} or set(contract) != expected_keys:
         return False
     module = contract.get("module")
     source = contract.get("source")
@@ -4006,12 +4015,60 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         modules.add(item_module)
         supporting_modules.add(item_module)
         sources.add(item_source)
+
+    runtime_asset_destinations: set[str] = set()
+    runtime_asset_sources: set[str] = set()
+    runtime_assets = contract.get("runtime_assets", [])
+    if not isinstance(runtime_assets, list):
+        return False
+    for item in runtime_assets:
+        if not isinstance(item, dict) or set(item) != {"source", "destination"}:
+            return False
+        asset_source = item.get("source")
+        destination = item.get("destination")
+        if (
+            not _safe_relative_path(asset_source)
+            or not _safe_relative_path(destination)
+            or asset_source in sources
+            or asset_source in runtime_asset_sources
+            or Path(asset_source).as_posix() in RESERVED_DEPLOYMENT_SNAPSHOT_INPUTS
+            or destination in runtime_asset_destinations
+        ):
+            return False
+        destination_path = Path(destination)
+        if (
+            destination_path.parts[0] in {".venv", "inputs"}
+            or destination in {"deployment-manifest.json", "deployment-incomplete.json"}
+            or any(
+                destination_path in Path(existing).parents
+                or Path(existing) in destination_path.parents
+                for existing in runtime_asset_destinations
+            )
+        ):
+            return False
+        runtime_asset_sources.add(asset_source)
+        runtime_asset_destinations.add(destination)
+
     hashes = raw.get("source_sha256s")
     if (
         not isinstance(hashes, dict)
         or set(hashes) != modules
         or not all(_is_lower_hex(value, 64) for value in hashes.values())
         or hashes.get(module) != raw.get("source_sha256")
+    ):
+        return False
+    asset_hashes = raw.get("runtime_asset_sha256s")
+    if (
+        not isinstance(asset_hashes, dict)
+        or set(asset_hashes) != runtime_asset_destinations
+        or not all(_is_lower_hex(value, 64) for value in asset_hashes.values())
+    ):
+        return False
+    asset_paths = raw.get("runtime_asset_paths")
+    if (
+        not isinstance(asset_paths, dict)
+        or set(asset_paths) != runtime_asset_destinations
+        or not all(isinstance(value, str) and value for value in asset_paths.values())
     ):
         return False
     module_paths = raw.get("module_paths")
@@ -4029,6 +4086,7 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         "runtime_lock",
         "source",
         "supporting_sources",
+        "runtime_assets",
     }:
         return False
     if not all(
@@ -4041,6 +4099,16 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         not isinstance(support_paths, dict)
         or set(support_paths) != supporting_modules
         or not all(isinstance(value, str) and value for value in support_paths.values())
+    ):
+        return False
+    runtime_asset_snapshot_paths = snapshot_paths.get("runtime_assets")
+    if (
+        not isinstance(runtime_asset_snapshot_paths, dict)
+        or set(runtime_asset_snapshot_paths) != runtime_asset_destinations
+        or not all(
+            isinstance(value, str) and value
+            for value in runtime_asset_snapshot_paths.values()
+        )
     ):
         return False
     created = raw.get("created_at_unix")
@@ -4219,6 +4287,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
     )
 
     contract_sources: list[tuple[str, str]] = []
+    contract_assets: list[tuple[str, str]] = []
     if contract_raw is not None:
         main_module = contract_raw.get("module")
         main_source = contract_raw.get("source")
@@ -4238,6 +4307,15 @@ def _deployment_metadata_impl() -> dict[str, Any]:
                     and _safe_relative_path(item.get("source"))
                 ):
                     contract_sources.append((item["module"], item["source"]))
+        runtime_assets = contract_raw.get("runtime_assets", [])
+        if isinstance(runtime_assets, list):
+            for item in runtime_assets:
+                if (
+                    isinstance(item, dict)
+                    and _safe_relative_path(item.get("source"))
+                    and _safe_relative_path(item.get("destination"))
+                ):
+                    contract_assets.append((item["source"], item["destination"]))
 
     source_hashes = raw.get("source_sha256s")
     module_paths = raw.get("module_paths")
@@ -4303,6 +4381,50 @@ def _deployment_metadata_impl() -> dict[str, Any]:
             and hashlib.sha256(module_data).hexdigest() == expected_hash
         )
 
+    runtime_asset_hashes = raw.get("runtime_asset_sha256s")
+    runtime_asset_paths = raw.get("runtime_asset_paths")
+    runtime_asset_snapshot_paths = snapshot_paths.get("runtime_assets")
+    runtime_asset_snapshot_identity_by_destination: dict[str, bool] = {}
+    runtime_asset_identity_by_destination: dict[str, bool] = {}
+    for asset_source, destination in contract_assets:
+        expected_hash = (
+            runtime_asset_hashes.get(destination)
+            if isinstance(runtime_asset_hashes, dict)
+            else None
+        )
+        snapshot_data = _read_bound_regular_file(
+            runtime_asset_snapshot_paths.get(destination)
+            if isinstance(runtime_asset_snapshot_paths, dict)
+            else None,
+            release_root / "inputs" / asset_source,
+            release_root,
+            max_bytes=MAX_SNAPSHOT_BYTES,
+        )
+        runtime_asset_snapshot_identity_by_destination[destination] = (
+            snapshot_data is not None
+            and hashlib.sha256(snapshot_data).hexdigest() == expected_hash
+        )
+        installed_data = _read_bound_regular_file(
+            runtime_asset_paths.get(destination)
+            if isinstance(runtime_asset_paths, dict)
+            else None,
+            release_root / destination,
+            release_root,
+            max_bytes=MAX_SNAPSHOT_BYTES,
+        )
+        runtime_asset_identity_by_destination[destination] = (
+            installed_data is not None
+            and hashlib.sha256(installed_data).hexdigest() == expected_hash
+        )
+
+    runtime_asset_snapshot_identity_valid = (
+        len(runtime_asset_snapshot_identity_by_destination) == len(contract_assets)
+        and all(runtime_asset_snapshot_identity_by_destination.values())
+    )
+    runtime_asset_identity_valid = (
+        len(runtime_asset_identity_by_destination) == len(contract_assets)
+        and all(runtime_asset_identity_by_destination.values())
+    )
     source_snapshot_identity_valid = (
         bool(contract_sources)
         and len(snapshot_identity_by_module) == len(contract_sources)
@@ -4368,6 +4490,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
             runtime_input_identity_valid,
             lock_identity_valid,
             source_snapshot_identity_valid,
+            runtime_asset_snapshot_identity_valid,
             embedded_contract_valid,
             entrypoint_contract_identity_valid,
             agent_instructions_identity_valid,
@@ -4381,6 +4504,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
             stable_runtime_manifest_valid,
             runtime_pointer_valid,
             source_identity_valid,
+            runtime_asset_identity_valid,
             entrypoint_path_valid,
             release_python_identity_valid,
             executable_identity_valid,
@@ -4411,6 +4535,7 @@ def _deployment_metadata_impl() -> dict[str, Any]:
             "agent_instructions",
             "source_sha256",
             "source_sha256s",
+            "runtime_asset_sha256s",
             "runtime_input_sha256",
             "runtime_lock_sha256",
             "mcp_protocol_version",
@@ -4436,8 +4561,14 @@ def _deployment_metadata_impl() -> dict[str, Any]:
         "lock_identity_valid": lock_identity_valid,
         "source_snapshot_identity_valid": source_snapshot_identity_valid,
         "source_snapshot_identity_by_module": snapshot_identity_by_module,
+        "runtime_asset_snapshot_identity_valid": runtime_asset_snapshot_identity_valid,
+        "runtime_asset_snapshot_identity_by_destination": (
+            runtime_asset_snapshot_identity_by_destination
+        ),
         "source_identity_valid": source_identity_valid,
         "source_identity_by_module": module_identity_by_module,
+        "runtime_asset_identity_valid": runtime_asset_identity_valid,
+        "runtime_asset_identity_by_destination": runtime_asset_identity_by_destination,
         "embedded_contract_valid": embedded_contract_valid,
         "entrypoint_contract_identity_valid": entrypoint_contract_identity_valid,
         "agent_instructions_identity_valid": agent_instructions_identity_valid,

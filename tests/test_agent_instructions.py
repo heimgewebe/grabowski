@@ -66,7 +66,7 @@ class AgentInstructionsTests(unittest.TestCase):
         encoded = grabowski_mcp.AGENT_INSTRUCTIONS.encode("utf-8")
         metadata = grabowski_mcp._agent_instructions_metadata()
         self.assertEqual(metadata["schema_version"], 1)
-        self.assertEqual(grabowski_mcp.DEPLOYMENT_MANIFEST_SCHEMA_VERSION, 5)
+        self.assertEqual(grabowski_mcp.DEPLOYMENT_MANIFEST_SCHEMA_VERSION, 6)
         self.assertEqual(
             metadata["version"],
             "grabowski-agent-facing-contract-v1",

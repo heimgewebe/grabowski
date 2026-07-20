@@ -118,6 +118,7 @@ class MultiSourceDeployTests(unittest.TestCase):
                 input_paths=input_paths,
                 entrypoint_path=operator_path,
                 module_paths=module_paths,
+                runtime_asset_paths={},
                 protocol_version="2025-06-18",
                 agent_instructions=deploy_runtime.agent_instructions_identity(
                     "Grabowski agent-facing contract "

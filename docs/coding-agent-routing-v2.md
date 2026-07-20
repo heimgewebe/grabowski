@@ -35,7 +35,7 @@ Plan-Semantik gilt global: Jede Route mit plan als Permission- oder Approval-Mod
 
 ## Katalogauflösung ohne stille zweite Wahrheit
 
-Ohne explizite Konfiguration liest der Router ausschließlich den zum deployten Quellstand gehörenden Katalog `config/coding-agent-catalog.json`. Eine vorhandene Datei unter `%h/.config/grabowski/coding-agent-catalog.json` überschreibt den versionierten Katalog nicht mehr still. Damit können alte lokale Kopien weder neue Validierungsregeln umgehen noch einen strukturell grünen Werkzeugvertrag bei semantisch ungültigem Routing vortäuschen.
+Ohne explizite Konfiguration liest der Router ausschließlich den zum deployten Quellstand gehörenden Katalog `config/coding-agent-catalog.json`. Im Quellcheckout ist das die versionierte Repository-Datei; im installierten Betrieb ist es das gleichnamige, vom Runtime-Vertrag deklarierte Asset innerhalb des immutable Release-Verzeichnisses. Snapshot, Release-ID, Deployment-Manifest und finaler Readback binden Pfad und SHA-256. Eine vorhandene Datei unter `%h/.config/grabowski/coding-agent-catalog.json` überschreibt den versionierten Katalog nicht mehr still. Damit können alte lokale Kopien weder neue Validierungsregeln umgehen noch einen strukturell grünen Werkzeugvertrag bei semantisch ungültigem Routing vortäuschen.
 
 Ein abweichender Katalog bleibt für kontrollierte Tests und ausdrücklich gebundene Sonderläufe über `GRABOWSKI_CODING_AGENT_CATALOG` möglich. Status und `grabowski_contract_drift` veröffentlichen den tatsächlich gewählten Ursprung sowie die semantische Katalogvalidierung. Ein ungültiger expliziter Katalog setzt die Routing-Readiness fail-closed, ohne die allgemeine Runtime-Integrität umzudeuten.
 

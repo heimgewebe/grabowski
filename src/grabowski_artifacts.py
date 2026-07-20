@@ -29,6 +29,7 @@ REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9._/+@=-]{1,4095}\Z")
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024 * 1024
 MAX_ERROR_INPUT_CHARS = 16 * 1024
 MAX_ERROR_DETAIL_CHARS = 2048
+_NO_DESTINATION_HASH = "-"
 _AUTHORIZATION_RE = re.compile(
     r"(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)([^\s,;]+)"
 )
@@ -39,6 +40,8 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 _URI_CREDENTIAL_RE = re.compile(
     r"([A-Za-z][A-Za-z0-9+.-]*://)([^/\s:@]+):([^@/\s]+)@"
 )
+_TRACEBACK_MARKER = "Traceback (most recent call last):"
+_TRACEBACK_EXCEPTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:\s*(?P<detail>.*)$")
 _TOKEN_PATTERNS = (
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
@@ -48,6 +51,18 @@ _TOKEN_PATTERNS = (
 
 class ArtifactTransferError(RuntimeError):
     """Bounded operator-facing artifact transport failure."""
+
+
+def _condense_python_traceback(text: str) -> str:
+    """Reduce remote Python tracebacks to their controlled final diagnostic."""
+    if _TRACEBACK_MARKER not in text:
+        return text
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        match = _TRACEBACK_EXCEPTION_RE.fullmatch(line)
+        if match is not None:
+            return match.group("detail") or "artifact transport failed"
+    return "artifact transport failed"
 
 
 def _redact_transfer_detail(
@@ -66,6 +81,7 @@ def _redact_transfer_detail(
             text = str(redactor(text))[:MAX_ERROR_INPUT_CHARS]
         except Exception:
             text = "artifact transport failed"
+    text = _condense_python_traceback(text)
     text = _AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
     text = _SECRET_ASSIGNMENT_RE.sub(r"\1[REDACTED]", text)
     text = _URI_CREDENTIAL_RE.sub(r"\1[REDACTED]@", text)
@@ -159,8 +175,10 @@ except FileNotFoundError:
  actual_destination=None
  destination_exists=False
 if mode=="create":
+ if expected_destination!="-": raise RuntimeError("invalid create destination precondition")
  if destination_exists: raise RuntimeError("destination already exists")
 elif mode=="replace":
+ if expected_destination=="-": raise RuntimeError("missing replacement destination precondition")
  if not destination_exists: raise RuntimeError("destination is missing")
  if actual_destination!=expected_destination: raise RuntimeError("destination hash precondition failed")
 else: raise RuntimeError("invalid publication mode")
@@ -195,7 +213,7 @@ def _validate_mode(
     if create_only:
         if expected_destination_sha256 is not None:
             raise ValueError("create-only publication may not include a destination hash")
-        return "create", ""
+        return "create", _NO_DESTINATION_HASH
     if expected_destination_sha256 is None:
         raise ValueError("replacement requires expected_destination_sha256")
     return "replace", _validate_sha256(

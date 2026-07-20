@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import stat
+import sys
 from typing import Any
 
 import grabowski_operator_core as operator
@@ -157,13 +158,24 @@ def _read_json_object(
     return value
 
 
+def _deployment_catalog_path() -> Path:
+    module_path = Path(__file__).resolve()
+    environment_prefix = Path(sys.prefix).resolve()
+    if environment_prefix.name == ".venv":
+        try:
+            module_path.relative_to(environment_prefix)
+        except ValueError:
+            pass
+        else:
+            return environment_prefix.parent / "config" / "coding-agent-catalog.json"
+    return module_path.parent.parent / "config" / "coding-agent-catalog.json"
+
+
 def _catalog_path() -> Path:
     configured = os.environ.get(CATALOG_ENV)
     if configured:
         return Path(configured).expanduser()
-    return (
-        Path(__file__).resolve().parent.parent / "config" / "coding-agent-catalog.json"
-    )
+    return _deployment_catalog_path()
 
 
 def _catalog_source() -> str:

@@ -56,6 +56,21 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         self.assertEqual(report["operation_count"], 3)
         self.assertEqual(report["retired_tool_count"], 8)
 
+    def test_runtime_tool_projection_accepts_schema_two_without_assets(self) -> None:
+        self.assertEqual(
+            budget._runtime_tools(
+                {"schema_version": 2, "expected_tools": ["grabowski_status"]}
+            ),
+            ["grabowski_status"],
+        )
+
+    def test_runtime_tool_projection_rejects_malformed_schema_three_assets(self) -> None:
+        runtime = copy.deepcopy(self.runtime)
+        runtime["runtime_assets"] = {"source": "catalog.json"}
+        report = self._validate(copy.deepcopy(self.contract), runtime=runtime)
+        self.assertFalse(report["valid"])
+        self.assertIn("runtime_assets must be a list", report["errors"][0])
+
     def test_unbudgeted_public_tool_is_rejected(self) -> None:
         runtime = copy.deepcopy(self.runtime)
         runtime["expected_tools"].append("grabowski_new_probe")

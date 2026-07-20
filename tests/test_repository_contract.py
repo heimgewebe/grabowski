@@ -126,11 +126,20 @@ class RepositoryContractTests(unittest.TestCase):
         contract = json.loads(
             (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(contract["schema_version"], 2)
+        self.assertEqual(contract["schema_version"], 3)
         self.assertEqual(contract["mode"], "module")
         self.assertEqual(contract["module"], "grabowski_operator")
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
+        self.assertEqual(
+            contract["runtime_assets"],
+            [
+                {
+                    "source": "config/coding-agent-catalog.json",
+                    "destination": "config/coding-agent-catalog.json",
+                }
+            ],
+        )
         tools = set(contract["expected_tools"])
         self.assertEqual(len(tools), 154)
         self.assertTrue(

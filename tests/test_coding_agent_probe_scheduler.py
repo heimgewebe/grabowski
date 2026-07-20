@@ -66,6 +66,35 @@ class CodingAgentProbeSchedulerTests(unittest.TestCase):
             return True
         return state not in {"X", "Z"}
 
+    def _wait_for_positive_pid(
+        self, path: Path, *, timeout_seconds: float
+    ) -> int:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                process_id = int(path.read_text(encoding="ascii").strip())
+            except (FileNotFoundError, ValueError):
+                time.sleep(0.02)
+                continue
+            if process_id > 0:
+                return process_id
+            time.sleep(0.02)
+        self.fail(
+            f"PID file did not contain a positive integer before timeout: {path}"
+        )
+
+    def test_wait_for_positive_pid_tolerates_empty_existing_file(self) -> None:
+        pid_path = self.root / "child.pid"
+        pid_path.touch()
+        with (
+            mock.patch.object(Path, "read_text", side_effect=["", "321\n"]) as read_text,
+            mock.patch.object(time, "sleep") as sleep,
+        ):
+            process_id = self._wait_for_positive_pid(pid_path, timeout_seconds=1)
+        self.assertEqual(321, process_id)
+        self.assertEqual(2, read_text.call_count)
+        sleep.assert_called_once_with(0.02)
+
     def write_router(
         self, *, mutate_history: bool = False, tamper_digest: bool = False
     ) -> None:
@@ -388,11 +417,10 @@ else:
         )
         child_pid = None
         try:
-            deadline = time.monotonic() + 5
-            while not child_pid_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertTrue(child_pid_path.exists())
-            child_pid = int(child_pid_path.read_text(encoding="ascii"))
+            child_pid = self._wait_for_positive_pid(
+                child_pid_path,
+                timeout_seconds=5,
+            )
             self.assertEqual(process.pid, os.getpgid(process.pid))
             with mock.patch.object(SCHEDULER, "PROCESS_TERMINATION_GRACE_SECONDS", 0.5):
                 SCHEDULER.terminate_process_group(process)
@@ -435,11 +463,10 @@ else:
                     environment=dict(os.environ),
                     timeout_seconds=2,
                 )
-            deadline = time.monotonic() + 3
-            while not child_pid_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertTrue(child_pid_path.exists())
-            child_pid = int(child_pid_path.read_text(encoding="ascii"))
+            child_pid = self._wait_for_positive_pid(
+                child_pid_path,
+                timeout_seconds=3,
+            )
             deadline = time.monotonic() + 5
             while self._process_is_live(child_pid) and time.monotonic() < deadline:
                 time.sleep(0.02)

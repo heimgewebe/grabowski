@@ -157,7 +157,7 @@
   ],
   "mode": "module",
   "module": "grabowski_operator",
-  "schema_version": 2,
+  "schema_version": 3,
   "source": "src/grabowski_runtime.py",
   "supporting_sources": [
     {
@@ -375,6 +375,12 @@
     {
       "module": "grabowski_juno_storage",
       "source": "src/grabowski_juno_storage.py"
+    }
+  ],
+  "runtime_assets": [
+    {
+      "source": "config/coding-agent-catalog.json",
+      "destination": "config/coding-agent-catalog.json"
     }
   ]
 }
