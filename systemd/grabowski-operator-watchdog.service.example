@@ -1,7 +1,7 @@
-# Productive semantic watchdog: verify both the live Streamable HTTP MCP
-# lifecycle and one isolated stdio lifecycle from the exact deployed runtime.
-# The live probe creates and deletes one disposable session and calls only
-# grabowski_runtime_health. Before recovery restart it requests a Python stack dump.
+# Productive semantic watchdog: verify the live event loop and FastMCP session-
+# creation lock without opening a competing session, plus one isolated stdio
+# lifecycle from the exact deployed runtime. Before recovery restart it requests
+# a bounded Python stack dump in the private Grabowski state directory.
 [Unit]
 Description=Grabowski operator semantic watchdog
 After=grabowski-operator.service

@@ -27,14 +27,15 @@ DEFAULT_PROFILE = "grabowski"
 DEFAULT_MODULE = "grabowski_operator"
 DEFAULT_OPERATOR_SERVICE = "grabowski-operator.service"
 DEFAULT_TUNNEL_SERVICE = "tunnel-client-grabowski.service"
-DEFAULT_MCP_URL = "http://127.0.0.1:18181/mcp"
+DEFAULT_MCP_URL = "http://127.0.0.1:18181/_grabowski/mcp-liveness"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:18080/healthz"
 DEFAULT_READY_URL = "http://127.0.0.1:18080/readyz"
 PROTOCOL_VERSION = "2025-06-18"
 MCP_HEALTH_TOOL = "grabowski_runtime_health"
 MCP_MAX_RESPONSE_BYTES = 65536
 MCP_STDIO_SHUTDOWN_TIMEOUT = 2.0
-MCP_HTTP_SESSION_HEADER = "mcp-session-id"
+STACK_DUMP_PATH = DEFAULT_STATE_DIR / "operator-stackdump.log"
+STACK_DUMP_MAX_BYTES = 1_048_576
 DEFAULT_BACKOFF_BASE = 60
 DEFAULT_BACKOFF_MAX = 900
 BACKOFF_MAX_LEVEL = 32
@@ -330,66 +331,20 @@ def tool_health_payload(result: dict) -> dict | None:
     return None
 
 
-def _mcp_http_message(body: bytes, content_type: str, expected_id: int) -> dict:
-    if len(body) > MCP_MAX_RESPONSE_BYTES:
-        raise McpProbeFailure("mcp-http-response-too-large")
-    try:
-        decoded = body.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise McpProbeFailure("mcp-http-json-invalid") from exc
-    candidates: list[str] = []
-    if content_type.split(";", 1)[0].strip().lower() == "text/event-stream":
-        candidates.extend(
-            line[5:].strip()
-            for line in decoded.splitlines()
-            if line.startswith("data:")
-        )
-    else:
-        candidates.append(decoded.strip())
-    for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            message = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if (
-            isinstance(message, dict)
-            and message.get("jsonrpc") == "2.0"
-            and message.get("id") == expected_id
-        ):
-            return message
-    raise McpProbeFailure("mcp-http-json-invalid")
-
-
 def _mcp_http_request(
     *,
     host: str,
     port: int,
     path: str,
-    method: str,
     timeout: float,
-    payload: dict | None = None,
-    session_id: str | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
     headers = {
-        "Accept": "application/json, text/event-stream",
+        "Accept": "application/json",
         "Connection": "close",
     }
-    body: bytes | None = None
-    if payload is not None:
-        body = json.dumps(
-            payload,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-        headers["Content-Length"] = str(len(body))
-    if session_id is not None:
-        headers["Mcp-Session-Id"] = session_id
     connection = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
-        connection.request(method, path, body=body, headers=headers)
+        connection.request("GET", path, headers=headers)
         response = connection.getresponse()
         response_body = response.read(MCP_MAX_RESPONSE_BYTES + 1)
         response_headers = {
@@ -403,127 +358,40 @@ def _mcp_http_request(
 
 
 def mcp_http_probe(url: str, timeout: float) -> str | None:
-    # Exercise a disposable lifecycle against the actual live HTTP listener.
+    # Probe the live event loop and session-creation lock without creating a session.
     if timeout <= 0:
         raise WatchdogError("invalid-mcp-timeout")
     host, port, path = loopback_http_url(url)
-    session_id: str | None = None
-    primary_failure: str | None = None
     try:
         status, headers, body = _mcp_http_request(
             host=host,
             port=port,
             path=path,
-            method="POST",
             timeout=timeout,
-            payload={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "grabowski-component-watchdog-http",
-                        "version": "1",
-                    },
-                },
-            },
         )
-        if status != 200:
-            raise McpProbeFailure("mcp-http-initialize-status")
-        session_id = headers.get(MCP_HTTP_SESSION_HEADER)
-        if (
-            not isinstance(session_id, str)
-            or not session_id
-            or len(session_id) > 256
-        ):
-            raise McpProbeFailure("mcp-http-session-missing")
-        initialize = _mcp_http_message(
-            body,
-            headers.get("content-type", ""),
-            expected_id=1,
-        )
-        if "error" in initialize:
-            raise McpProbeFailure("mcp-http-initialize-invalid")
-        result = initialize.get("result")
-        if (
-            not isinstance(result, dict)
-            or not isinstance(result.get("protocolVersion"), str)
-            or not isinstance(result.get("capabilities"), dict)
-            or not isinstance(result.get("serverInfo"), dict)
-        ):
-            raise McpProbeFailure("mcp-http-initialize-shape-invalid")
-        status, _, _ = _mcp_http_request(
-            host=host,
-            port=port,
-            path=path,
-            method="POST",
-            timeout=timeout,
-            payload={
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-            },
-            session_id=session_id,
-        )
-        if status not in {200, 202}:
-            raise McpProbeFailure("mcp-http-initialized-status")
-        status, headers, body = _mcp_http_request(
-            host=host,
-            port=port,
-            path=path,
-            method="POST",
-            timeout=timeout,
-            payload={
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": MCP_HEALTH_TOOL,
-                    "arguments": {},
-                },
-            },
-            session_id=session_id,
-        )
-        if status != 200:
-            raise McpProbeFailure("mcp-http-tool-status")
-        call = _mcp_http_message(
-            body,
-            headers.get("content-type", ""),
-            expected_id=2,
-        )
-        if "error" in call:
-            raise McpProbeFailure("mcp-http-tool-call-invalid")
-        result = call.get("result")
-        if not isinstance(result, dict):
-            raise McpProbeFailure("mcp-http-tool-shape-invalid")
-        is_error = result.get("isError", False)
-        if not isinstance(is_error, bool) or is_error:
-            raise McpProbeFailure("mcp-http-tool-error")
-        health = tool_health_payload(result)
-        if health is None or not isinstance(health.get("healthy"), bool):
-            raise McpProbeFailure("mcp-http-tool-shape-invalid")
-        if health["healthy"] is not True:
-            raise McpProbeFailure("mcp-runtime-unhealthy")
     except McpProbeFailure as failure:
-        primary_failure = failure.reason
-    finally:
-        if session_id is not None:
-            try:
-                cleanup_status, _, _ = _mcp_http_request(
-                    host=host,
-                    port=port,
-                    path=path,
-                    method="DELETE",
-                    timeout=timeout,
-                    session_id=session_id,
-                )
-                if cleanup_status not in {200, 202, 204} and primary_failure is None:
-                    primary_failure = "mcp-http-cleanup-status"
-            except McpProbeFailure:
-                if primary_failure is None:
-                    primary_failure = "mcp-http-cleanup-failed"
-    return primary_failure
+        return failure.reason
+    if status == 503:
+        return "mcp-session-creation-lock-busy"
+    if status != 200:
+        return "mcp-http-liveness-status"
+    if len(body) > MCP_MAX_RESPONSE_BYTES:
+        return "mcp-http-response-too-large"
+    content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        return "mcp-http-content-type-invalid"
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "mcp-http-json-invalid"
+    if not isinstance(payload, dict):
+        return "mcp-http-liveness-shape-invalid"
+    if (
+        payload.get("healthy") is not True
+        or payload.get("session_creation_lock_available") is not True
+    ):
+        return "mcp-session-creation-lock-busy"
+    return None
 
 
 def mcp_stdio_probe(
@@ -937,15 +805,59 @@ def decide(
     )
 
 
-def request_python_stack_dump(pid: int) -> bool:
-    if pid <= 0 or not hasattr(signal, "SIGUSR1"):
+def _prepare_stack_dump_target(path: Path) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            metadata = os.fstat(descriptor)
+            if not statmod.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                return False
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return False
+    return True
+
+
+def _cap_stack_dump_target(path: Path, max_bytes: int) -> bool:
+    flags = os.O_WRONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if not statmod.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                return False
+            if metadata.st_size > max_bytes:
+                os.ftruncate(descriptor, max_bytes)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return False
+    return True
+
+
+def request_python_stack_dump(
+    pid: int,
+    path: Path = STACK_DUMP_PATH,
+    max_bytes: int = STACK_DUMP_MAX_BYTES,
+) -> bool:
+    if pid <= 0 or max_bytes <= 0 or not hasattr(signal, "SIGUSR1"):
+        return False
+    if not _prepare_stack_dump_target(path):
         return False
     try:
         os.kill(pid, signal.SIGUSR1)
     except OSError:
         return False
     time.sleep(0.25)
-    return True
+    return _cap_stack_dump_target(path, max_bytes)
 
 
 def restart_service(service: str) -> None:
@@ -1082,6 +994,16 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 restart_generation=next_state.restart_generation,
             )
             restart_service(args.service)
+            if stack_dump_requested:
+                emit(
+                    "grabowski.component_watchdog.stack_dump_finalized",
+                    component=args.component,
+                    service=args.service,
+                    capped=_cap_stack_dump_target(
+                        STACK_DUMP_PATH, STACK_DUMP_MAX_BYTES
+                    ),
+                    max_bytes=STACK_DUMP_MAX_BYTES,
+                )
             deadline = time.monotonic() + args.recovery_timeout
             final_probe = probe
             while time.monotonic() < deadline:
@@ -1170,12 +1092,14 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     if args.host != "127.0.0.1" or not 1024 <= args.port <= 65535:
         raise WatchdogError("invalid-operator-listener")
     if args.mcp_url is None:
-        args.mcp_url = f"http://{args.host}:{args.port}/mcp"
+        args.mcp_url = (
+            f"http://{args.host}:{args.port}/_grabowski/mcp-liveness"
+        )
     mcp_host, mcp_port, mcp_path = loopback_http_url(args.mcp_url)
     if (
         mcp_host != args.host
         or mcp_port != args.port
-        or mcp_path != "/mcp"
+        or mcp_path != "/_grabowski/mcp-liveness"
     ):
         raise WatchdogError("mcp-url-listener-mismatch")
     return args

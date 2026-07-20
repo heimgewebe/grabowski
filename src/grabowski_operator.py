@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import errno
 import faulthandler
 from datetime import datetime, timezone
@@ -123,6 +124,10 @@ CONSUMER_VIEW_ALIASES = consumer_surface.CONSUMER_VIEW_ALIASES
 MAX_CONSUMER_FIELDS = consumer_surface.MAX_CONSUMER_FIELDS
 MAX_CONSUMER_CURSOR_BYTES = consumer_surface.MAX_CONSUMER_CURSOR_BYTES
 HTTP_SESSION_IDLE_TIMEOUT_SECONDS = 1_800
+MCP_SESSION_LOCK_PROBE_TIMEOUT_SECONDS = 1.0
+MCP_LIVENESS_PATH = "/_grabowski/mcp-liveness"
+STACK_DUMP_PATH = STATE_DIR / "operator-stackdump.log"
+_STACK_DUMP_FILE: Any | None = None
 
 _canonical_json_bytes = consumer_surface.canonical_json_bytes
 _normalize_consumer_view = consumer_surface.normalize_view
@@ -292,21 +297,94 @@ async def oauth_protected_resource_metadata(request: Any) -> Any:
     )
 
 
+async def _session_creation_lock_available(timeout_seconds: float) -> bool:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    try:
+        manager = mcp.session_manager
+    except RuntimeError:
+        return False
+    lock = getattr(manager, "_session_creation_lock", None)
+    if lock is None:
+        return False
+    async def acquire_and_release() -> bool:
+        async with lock:
+            return True
+
+    try:
+        return await asyncio.wait_for(
+            acquire_and_release(), timeout=timeout_seconds
+        )
+    except (asyncio.TimeoutError, RuntimeError):
+        return False
+
+
+@_mcp_custom_route(
+    MCP_LIVENESS_PATH,
+    methods=["GET"],
+    include_in_schema=False,
+)
+async def mcp_session_manager_liveness(_request: Any) -> Any:
+    from starlette.responses import JSONResponse
+
+    available = await _session_creation_lock_available(
+        MCP_SESSION_LOCK_PROBE_TIMEOUT_SECONDS
+    )
+    return JSONResponse(
+        {
+            "healthy": available,
+            "session_creation_lock_available": available,
+        },
+        status_code=200 if available else 503,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _configure_http_runtime() -> None:
+    if not callable(getattr(mcp, "custom_route", None)):
+        raise RuntimeError("FastMCP custom_route support is required")
     mcp.streamable_http_app()
-    mcp.session_manager.session_idle_timeout = HTTP_SESSION_IDLE_TIMEOUT_SECONDS
+    manager = mcp.session_manager
+    if getattr(manager, "_session_creation_lock", None) is None:
+        raise RuntimeError("FastMCP session creation lock is unavailable")
+    manager.session_idle_timeout = HTTP_SESSION_IDLE_TIMEOUT_SECONDS
+
+
+def _open_stack_dump_file() -> Any:
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(STACK_DUMP_PATH, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError("stack dump target must be one regular file")
+        os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        os.close(descriptor)
+        raise
 
 
 def _configure_faulthandler() -> None:
+    global _STACK_DUMP_FILE
+    stream: Any | None = None
     try:
-        faulthandler.enable(all_threads=True)
+        stream = _open_stack_dump_file()
+        faulthandler.enable(file=stream, all_threads=True)
         if hasattr(signal, "SIGUSR1"):
             faulthandler.register(
                 signal.SIGUSR1,
+                file=stream,
                 all_threads=True,
                 chain=False,
             )
+        _STACK_DUMP_FILE = stream
     except (OSError, RuntimeError, ValueError):
+        if stream is not None:
+            stream.close()
+        _STACK_DUMP_FILE = None
         # Stack capture is recovery evidence, not a startup dependency.
         return
 

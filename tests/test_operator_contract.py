@@ -11,16 +11,27 @@ import tempfile
 import time
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src" / "grabowski_operator.py"
 
 
+class _FakeAsyncLock:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
 class _FakeFastMCP:
     def __init__(self, *args, **kwargs):
-        self.session_manager = types.SimpleNamespace(session_idle_timeout=None)
+        self.session_manager = types.SimpleNamespace(
+            session_idle_timeout=None,
+            _session_creation_lock=_FakeAsyncLock(),
+        )
 
     def tool(self, *args, **kwargs):
         return lambda function: function
@@ -150,7 +161,7 @@ class OperatorContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "loopback HTTP"):
             operator._protected_resource_metadata("https://example.com/")
 
-    def test_http_sessions_are_idle_bounded(self) -> None:
+    def test_http_sessions_and_liveness_lock_are_bounded(self) -> None:
         operator = _load_operator_module()
         operator._configure_http_runtime()
         self.assertEqual(
@@ -158,20 +169,59 @@ class OperatorContractTests(unittest.TestCase):
             operator.mcp.session_manager.session_idle_timeout,
         )
         self.assertEqual(1_800, operator.HTTP_SESSION_IDLE_TIMEOUT_SECONDS)
+        self.assertTrue(
+            operator.asyncio.run(
+                operator._session_creation_lock_available(
+                    operator.MCP_SESSION_LOCK_PROBE_TIMEOUT_SECONDS
+                )
+            )
+        )
+        self.assertEqual("/_grabowski/mcp-liveness", operator.MCP_LIVENESS_PATH)
+
+    def test_liveness_probe_times_out_on_held_session_creation_lock(self) -> None:
+        operator = _load_operator_module()
+
+        class BusyLock:
+            async def __aenter__(self):
+                await operator.asyncio.sleep(60)
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        operator.mcp.session_manager._session_creation_lock = BusyLock()
+        self.assertFalse(
+            operator.asyncio.run(
+                operator._session_creation_lock_available(0.01)
+            )
+        )
+
+    def test_http_runtime_fails_closed_without_required_fastmcp_contract(self) -> None:
+        operator = _load_operator_module()
+        with patch.object(operator.mcp, "custom_route", None):
+            with self.assertRaisesRegex(RuntimeError, "custom_route"):
+                operator._configure_http_runtime()
+        operator.mcp.session_manager._session_creation_lock = None
+        with self.assertRaisesRegex(RuntimeError, "session creation lock"):
+            operator._configure_http_runtime()
 
     def test_operator_registers_recovery_stack_signal(self) -> None:
         operator = _load_operator_module()
+        stream = MagicMock()
         with (
+            patch.object(operator, "_open_stack_dump_file", return_value=stream),
             patch.object(operator.faulthandler, "enable") as enable,
             patch.object(operator.faulthandler, "register") as register,
         ):
             operator._configure_faulthandler()
-        enable.assert_called_once_with(all_threads=True)
+        enable.assert_called_once_with(file=stream, all_threads=True)
         register.assert_called_once_with(
             operator.signal.SIGUSR1,
+            file=stream,
             all_threads=True,
             chain=False,
         )
+        self.assertIs(operator._STACK_DUMP_FILE, stream)
 
     def test_runtime_deploy_runner_is_reserved_for_typed_scheduler(self) -> None:
         operator = _load_operator_module()

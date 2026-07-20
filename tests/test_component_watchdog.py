@@ -218,67 +218,36 @@ class McpLifecycleProbeTests(unittest.TestCase):
                 watchdog.mcp_stdio_probe_from_runtime(root, "../bad", 1)
 
 
-class McpHttpLifecycleProbeTests(unittest.TestCase):
-    @staticmethod
-    def sse(message: dict) -> bytes:
-        return (
-            "event: message\r\n"
-            f"data: {json.dumps(message, separators=(',', ':'))}\r\n\r\n"
+class McpHttpLivenessProbeTests(unittest.TestCase):
+    def test_live_http_probe_uses_one_session_free_get(self) -> None:
+        payload = json.dumps(
+            {
+                "healthy": True,
+                "session_creation_lock_available": True,
+            }
         ).encode("utf-8")
-
-    def test_live_http_lifecycle_calls_health_and_deletes_session(self) -> None:
-        initialize = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "protocolVersion": watchdog.PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "stub", "version": "1"},
-            },
-        }
-        tool_result = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "result": {
-                "content": [
-                    {"type": "text", "text": json.dumps(HEALTH_PAYLOAD)}
-                ],
-                "structuredContent": HEALTH_PAYLOAD,
-                "isError": False,
-            },
-        }
-        responses = [
-            (
-                200,
-                {
-                    "mcp-session-id": "session-1",
-                    "content-type": "text/event-stream",
-                },
-                self.sse(initialize),
-            ),
-            (202, {}, b""),
-            (
-                200,
-                {"content-type": "text/event-stream"},
-                self.sse(tool_result),
-            ),
-            (200, {}, b""),
-        ]
         with patch.object(
-            watchdog, "_mcp_http_request", side_effect=responses
+            watchdog,
+            "_mcp_http_request",
+            return_value=(
+                200,
+                {"content-type": "application/json"},
+                payload,
+            ),
         ) as request:
             self.assertIsNone(
-                watchdog.mcp_http_probe("http://127.0.0.1:18181/mcp", 2)
+                watchdog.mcp_http_probe(
+                    "http://127.0.0.1:18181/_grabowski/mcp-liveness", 2
+                )
             )
-        self.assertEqual(
-            ["POST", "POST", "POST", "DELETE"],
-            [call.kwargs["method"] for call in request.call_args_list],
-        )
-        self.assertEqual(
-            "session-1", request.call_args_list[-1].kwargs["session_id"]
+        request.assert_called_once_with(
+            host="127.0.0.1",
+            port=18181,
+            path="/_grabowski/mcp-liveness",
+            timeout=2,
         )
 
-    def test_live_http_failure_and_cleanup_failure_are_reported(self) -> None:
+    def test_live_http_failures_are_precise(self) -> None:
         with patch.object(
             watchdog,
             "_mcp_http_request",
@@ -286,51 +255,38 @@ class McpHttpLifecycleProbeTests(unittest.TestCase):
         ):
             self.assertEqual(
                 "mcp-http-request-failed",
-                watchdog.mcp_http_probe("http://127.0.0.1:18181/mcp", 2),
+                watchdog.mcp_http_probe(watchdog.DEFAULT_MCP_URL, 2),
             )
-
-        initialize = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "protocolVersion": watchdog.PROTOCOL_VERSION,
-                "capabilities": {},
-                "serverInfo": {"name": "stub", "version": "1"},
-            },
-        }
-        tool_result = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "result": {
-                "content": [
-                    {"type": "text", "text": json.dumps(HEALTH_PAYLOAD)}
-                ],
-                "isError": False,
-            },
-        }
-        responses = [
-            (
-                200,
-                {
-                    "mcp-session-id": "session-1",
-                    "content-type": "text/event-stream",
-                },
-                self.sse(initialize),
-            ),
-            (202, {}, b""),
-            (
-                200,
-                {"content-type": "text/event-stream"},
-                self.sse(tool_result),
-            ),
-            (404, {}, b""),
-        ]
         with patch.object(
-            watchdog, "_mcp_http_request", side_effect=responses
+            watchdog,
+            "_mcp_http_request",
+            return_value=(503, {"content-type": "application/json"}, b"{}"),
         ):
             self.assertEqual(
-                "mcp-http-cleanup-status",
-                watchdog.mcp_http_probe("http://127.0.0.1:18181/mcp", 2),
+                "mcp-session-creation-lock-busy",
+                watchdog.mcp_http_probe(watchdog.DEFAULT_MCP_URL, 2),
+            )
+        with patch.object(
+            watchdog,
+            "_mcp_http_request",
+            return_value=(200, {"content-type": "text/plain"}, b"ok"),
+        ):
+            self.assertEqual(
+                "mcp-http-content-type-invalid",
+                watchdog.mcp_http_probe(watchdog.DEFAULT_MCP_URL, 2),
+            )
+        with patch.object(
+            watchdog,
+            "_mcp_http_request",
+            return_value=(
+                200,
+                {"content-type": "application/json"},
+                b'{"healthy":true,"session_creation_lock_available":false}',
+            ),
+        ):
+            self.assertEqual(
+                "mcp-session-creation-lock-busy",
+                watchdog.mcp_http_probe(watchdog.DEFAULT_MCP_URL, 2),
             )
 
     def test_live_endpoint_failure_makes_operator_unhealthy(self) -> None:
@@ -350,7 +306,7 @@ class McpHttpLifecycleProbeTests(unittest.TestCase):
             patch.object(
                 watchdog,
                 "mcp_http_probe",
-                return_value="mcp-http-request-failed",
+                return_value="mcp-session-creation-lock-busy",
             ),
             patch.object(
                 watchdog, "mcp_stdio_probe_from_runtime", return_value=None
@@ -370,7 +326,7 @@ class McpHttpLifecycleProbeTests(unittest.TestCase):
                 http_timeout=2,
             )
         self.assertEqual("unhealthy", result.status)
-        self.assertEqual(("mcp-http-request-failed",), result.reasons)
+        self.assertEqual(("mcp-session-creation-lock-busy",), result.reasons)
 
     def test_concrete_failure_outranks_runtime_unhealthy(self) -> None:
         with (
@@ -413,14 +369,25 @@ class McpHttpLifecycleProbeTests(unittest.TestCase):
         self.assertEqual("unhealthy", result.status)
         self.assertEqual(("mcp-stdio-process-exited",), result.reasons)
 
-    def test_stack_dump_request_is_bounded(self) -> None:
-        with (
-            patch.object(watchdog.os, "kill") as kill,
-            patch.object(watchdog.time, "sleep") as sleep,
-        ):
-            self.assertTrue(watchdog.request_python_stack_dump(123))
-        kill.assert_called_once_with(123, watchdog.signal.SIGUSR1)
-        sleep.assert_called_once_with(0.25)
+    def test_stack_dump_target_is_replaced_and_capped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "stack.log"
+            path.write_bytes(b"old-data")
+            with (
+                patch.object(watchdog.os, "kill") as kill,
+                patch.object(watchdog.time, "sleep") as sleep,
+            ):
+                self.assertTrue(
+                    watchdog.request_python_stack_dump(123, path=path, max_bytes=16)
+                )
+            kill.assert_called_once_with(123, watchdog.signal.SIGUSR1)
+            sleep.assert_called_once_with(0.25)
+            self.assertEqual(b"", path.read_bytes())
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            path.write_bytes(b"x" * 32)
+            self.assertTrue(watchdog._cap_stack_dump_target(path, 16))
+            self.assertEqual(16, path.stat().st_size)
+
 
 
 class BackoffDecisionTests(unittest.TestCase):
