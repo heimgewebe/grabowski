@@ -165,6 +165,40 @@ class DeployRuntimeTests(unittest.TestCase):
             ["/release/.venv/bin/python", "-m", "grabowski_mcp"],
         )
 
+    def test_runtime_asset_contract_loads_and_rejects_traversal(self) -> None:
+        raw = json.dumps({
+            "schema_version": 3, "mode": "module", "module": "grabowski_mcp",
+            "source": "src/grabowski_mcp.py", "expected_tools": ["grabowski_status"],
+            "supporting_sources": [], "runtime_assets": [{
+                "source": "config/coding-agent-catalog.json",
+                "destination": "config/coding-agent-catalog.json",
+            }],
+        }).encode()
+        contract = deploy_runtime.load_contract_bytes(raw)
+        self.assertEqual(
+            contract.runtime_assets[0].destination,
+            Path("config/coding-agent-catalog.json"),
+        )
+        invalid = json.loads(raw)
+        invalid["runtime_assets"][0]["destination"] = "../catalog.json"
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "repository-relativer"):
+            deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+
+    def test_manifest_validation_handles_invalid_supporting_sources_fail_closed(self) -> None:
+        manifest = {
+            "entrypoint_contract": {
+                "schema_version": 3,
+                "mode": "module",
+                "module": "grabowski_mcp",
+                "source": "src/grabowski_mcp.py",
+                "expected_tools": ["grabowski_status"],
+                "supporting_sources": "invalid",
+                "runtime_assets": [],
+            }
+        }
+        errors = deploy_runtime.validate_manifest_schema(manifest)
+        self.assertIn("entrypoint_contract", errors)
+
     def test_script_entrypoint_contract_is_rejected(self) -> None:
         raw = json.dumps(
             {
@@ -544,10 +578,18 @@ class DeployRuntimeTests(unittest.TestCase):
                 "runtime_lock": str(release / "inputs/runtime.lock.txt"),
                 "source": str(release / "inputs/src/grabowski_mcp.py"),
                 "supporting_sources": {},
+                "runtime_assets": {
+                    item.destination.as_posix(): str(release / "inputs" / item.source)
+                    for item in snapshot.contract.runtime_assets
+                },
             },
             entrypoint_path=release / ".venv/lib/python3.10/site-packages/grabowski_mcp.py",
             module_paths={
                 snapshot.contract.module: release / ".venv/lib/python3.10/site-packages/grabowski_mcp.py"
+            },
+            runtime_asset_paths={
+                item.destination.as_posix(): release / item.destination
+                for item in snapshot.contract.runtime_assets
             },
             protocol_version="2025-06-18",
             agent_instructions=deploy_runtime.agent_instructions_identity(
@@ -561,6 +603,93 @@ class DeployRuntimeTests(unittest.TestCase):
                 "pip_version": "pip 25",
             },
         )
+
+    def test_runtime_asset_installation_is_exact_and_payload_mismatch_fails(self) -> None:
+        contract = deploy_runtime.RuntimeContract(
+            schema_version=3,
+            mode="module",
+            module="grabowski_mcp",
+            source=Path("src/grabowski_mcp.py"),
+            expected_tools=("grabowski_status",),
+            runtime_assets=(
+                deploy_runtime.RuntimeAsset(
+                    source=Path("config/coding-agent-catalog.json"),
+                    destination=Path("config/coding-agent-catalog.json"),
+                ),
+            ),
+        )
+        snapshot = deploy_runtime.Snapshot(
+            repo_head="a" * 40,
+            dirty=False,
+            contract=contract,
+            contract_bytes=json.dumps(contract.to_manifest()).encode(),
+            runtime_input_bytes=b"mcp==1.27.2\n",
+            runtime_lock_bytes=b"mcp==1.27.2\n",
+            source_bytes=b"print('snapshot')\n",
+            runtime_asset_bytes={
+                "config/coding-agent-catalog.json": b"{\"schema_version\": 2}\n"
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory) / "release"
+            release.mkdir()
+            installed = deploy_runtime.install_runtime_assets(snapshot, release)
+            target = release / "config/coding-agent-catalog.json"
+            self.assertEqual(installed, {"config/coding-agent-catalog.json": target})
+            self.assertEqual(
+                target.read_bytes(),
+                snapshot.runtime_asset_bytes["config/coding-agent-catalog.json"],
+            )
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        mismatch = deploy_runtime.Snapshot(
+            repo_head=snapshot.repo_head,
+            dirty=False,
+            contract=contract,
+            contract_bytes=snapshot.contract_bytes,
+            runtime_input_bytes=snapshot.runtime_input_bytes,
+            runtime_lock_bytes=snapshot.runtime_lock_bytes,
+            source_bytes=snapshot.source_bytes,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "stimmt nicht"):
+                deploy_runtime.write_snapshot_inputs(mismatch, Path(directory) / "release")
+
+    def test_runtime_asset_is_bound_to_release_identity_and_final_readback(self) -> None:
+        contract = deploy_runtime.RuntimeContract(
+            schema_version=3, mode="module", module="grabowski_mcp",
+            source=Path("src/grabowski_mcp.py"), expected_tools=("grabowski_status",),
+            runtime_assets=(deploy_runtime.RuntimeAsset(
+                source=Path("config/coding-agent-catalog.json"),
+                destination=Path("config/coding-agent-catalog.json"),
+            ),),
+        )
+        snapshot = deploy_runtime.Snapshot(
+            repo_head="a" * 40, dirty=False, contract=contract,
+            contract_bytes=json.dumps(contract.to_manifest()).encode(),
+            runtime_input_bytes=b"mcp==1.27.2\n",
+            runtime_lock_bytes=b"mcp==1.27.2\n",
+            source_bytes=b"print('snapshot')\n",
+            runtime_asset_bytes={"config/coding-agent-catalog.json": b"{\"schema_version\": 2}\n"},
+        )
+        changed = deploy_runtime.Snapshot(
+            repo_head=snapshot.repo_head, dirty=False, contract=contract,
+            contract_bytes=snapshot.contract_bytes,
+            runtime_input_bytes=snapshot.runtime_input_bytes,
+            runtime_lock_bytes=snapshot.runtime_lock_bytes, source_bytes=snapshot.source_bytes,
+            runtime_asset_bytes={"config/coding-agent-catalog.json": b"{}\n"},
+        )
+        self.assertNotEqual(
+            deploy_runtime.release_id_base(snapshot),
+            deploy_runtime.release_id_base(changed),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); release = root / "release"; release.mkdir()
+            runtime = root / "grabowski-mcp"; runtime.symlink_to(release)
+            module = self._write_complete_release(release, snapshot, runtime)
+            self._verify_complete_release(release, runtime, snapshot, module)
+            (release / "config/coding-agent-catalog.json").write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "driftete"):
+                self._verify_complete_release(release, runtime, snapshot, module)
 
     def test_write_manifest_is_private_and_umask_independent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -608,6 +737,15 @@ class DeployRuntimeTests(unittest.TestCase):
         (release / "inputs/runtime.in").write_bytes(snapshot.runtime_input_bytes)
         (release / "inputs/runtime.lock.txt").write_bytes(snapshot.runtime_lock_bytes)
         (release / "inputs/src/grabowski_mcp.py").write_bytes(snapshot.source_bytes)
+        for item in snapshot.contract.runtime_assets:
+            destination = item.destination.as_posix()
+            data = snapshot.runtime_asset_bytes[destination]
+            snapshot_target = release / "inputs" / item.source
+            snapshot_target.parent.mkdir(parents=True, exist_ok=True)
+            snapshot_target.write_bytes(data)
+            installed_target = release / item.destination
+            installed_target.parent.mkdir(parents=True, exist_ok=True)
+            installed_target.write_bytes(data)
         python = release / ".venv/bin/python"
         python.parent.mkdir(parents=True)
         python.write_text("", encoding="utf-8")

@@ -90,8 +90,14 @@ class DeploymentMetadataTests(unittest.TestCase):
         runtime_input.write_text("mcp==1.27.2\n", encoding="utf-8")
         runtime_lock = inputs / "runtime.lock.txt"
         runtime_lock.write_text("mcp==1.27.2\n", encoding="utf-8")
+        catalog_snapshot = inputs / "config/coding-agent-catalog.json"
+        catalog_snapshot.parent.mkdir(parents=True)
+        catalog_snapshot.write_text('{"schema_version": 2}\n', encoding="utf-8")
+        catalog_asset = release / "config/coding-agent-catalog.json"
+        catalog_asset.parent.mkdir(parents=True)
+        catalog_asset.write_bytes(catalog_snapshot.read_bytes())
         contract = {
-            "schema_version": 2,
+            "schema_version": 3,
             "mode": "module",
             "module": "grabowski_operator",
             "source": "src/grabowski_operator.py",
@@ -102,6 +108,12 @@ class DeploymentMetadataTests(unittest.TestCase):
                 }
             ],
             "expected_tools": ["grabowski_status"],
+            "runtime_assets": [
+                {
+                    "source": "config/coding-agent-catalog.json",
+                    "destination": "config/coding-agent-catalog.json",
+                }
+            ],
         }
         contract_path = inputs / "runtime-entrypoint.json"
         contract_path.write_text(
@@ -114,7 +126,7 @@ class DeploymentMetadataTests(unittest.TestCase):
             "grabowski_mcp": _sha256(base_snapshot),
         }
         manifest = {
-            "schema_version": 5,
+            "schema_version": 6,
             "release_id": release.name,
             "repo_head": "a" * 40,
             "entrypoint_contract": contract,
@@ -122,6 +134,12 @@ class DeploymentMetadataTests(unittest.TestCase):
             "agent_instructions": grabowski_mcp._agent_instructions_metadata(),
             "source_sha256": source_sha256s["grabowski_operator"],
             "source_sha256s": source_sha256s,
+            "runtime_asset_sha256s": {
+                "config/coding-agent-catalog.json": _sha256(catalog_snapshot),
+            },
+            "runtime_asset_paths": {
+                "config/coding-agent-catalog.json": str(catalog_asset),
+            },
             "runtime_input_sha256": _sha256(runtime_input),
             "runtime_lock_sha256": _sha256(runtime_lock),
             "snapshot_paths": {
@@ -131,6 +149,9 @@ class DeploymentMetadataTests(unittest.TestCase):
                 "source": str(operator_snapshot),
                 "supporting_sources": {
                     "grabowski_mcp": str(base_snapshot),
+                },
+                "runtime_assets": {
+                    "config/coding-agent-catalog.json": str(catalog_snapshot),
                 },
             },
             "immutable_release_path": str(release),
@@ -160,6 +181,8 @@ class DeploymentMetadataTests(unittest.TestCase):
             "manifest": manifest_path,
             "runtime_input": runtime_input,
             "runtime_lock": runtime_lock,
+            "catalog_snapshot": catalog_snapshot,
+            "catalog_asset": catalog_asset,
             "source_snapshot": operator_snapshot,
             "base_source_snapshot": base_snapshot,
             "module": operator_module,
@@ -193,6 +216,8 @@ class DeploymentMetadataTests(unittest.TestCase):
         self.assertTrue(metadata["entrypoint_path_valid"])
         self.assertTrue(metadata["repo_head_valid"])
         self.assertTrue(metadata["platform_identity_valid"])
+        self.assertTrue(metadata["runtime_asset_snapshot_identity_valid"])
+        self.assertTrue(metadata["runtime_asset_identity_valid"])
         self.assertTrue(metadata["provenance_valid"])
 
     def test_agent_instructions_manifest_drift_invalidates_provenance(self) -> None:
@@ -232,6 +257,23 @@ class DeploymentMetadataTests(unittest.TestCase):
             self.assertTrue(metadata["source_snapshot_identity_valid"])
             self.assertFalse(metadata["source_identity_valid"])
             self.assertFalse(metadata["provenance_valid"])
+
+    def test_runtime_asset_snapshot_and_install_tamper_are_distinguished(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self._release(Path(directory))
+            paths["catalog_snapshot"].write_text("{}\n", encoding="utf-8")
+            metadata = self._metadata(paths)
+            self.assertFalse(metadata["runtime_asset_snapshot_identity_valid"])
+            self.assertTrue(metadata["runtime_asset_identity_valid"])
+            self.assertFalse(metadata["artifact_integrity_valid"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self._release(Path(directory))
+            paths["catalog_asset"].write_text("{}\n", encoding="utf-8")
+            metadata = self._metadata(paths)
+            self.assertTrue(metadata["runtime_asset_snapshot_identity_valid"])
+            self.assertFalse(metadata["runtime_asset_identity_valid"])
+            self.assertFalse(metadata["runtime_binding_valid"])
 
     def test_embedded_contract_tamper_invalidates_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
