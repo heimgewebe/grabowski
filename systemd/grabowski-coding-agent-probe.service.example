@@ -1,9 +1,8 @@
 [Unit]
-Description=Refresh the advisory Grabowski coding-agent catalog
+Description=Refresh the advisory Grabowski coding-agent runtime state
 Documentation=file://%h/.local/share/grabowski/docs/coding-agent-routing-v2.md
 ConditionPathExists=%h/bin/agent-route
 ConditionPathExists=%h/.config/grabowski/coding-agent-probe-scheduler-router.sha256
-ConditionPathExists=%h/.config/grabowski/coding-agent-catalog.json
 
 [Service]
 Type=oneshot

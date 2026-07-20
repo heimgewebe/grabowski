@@ -408,7 +408,7 @@
     },
     {
       "category": "context",
-      "description": "Return bounded runtime-contract and capability-catalog drift.",
+      "description": "Return bounded structural and semantic runtime-contract drift.",
       "effects": [],
       "id": "grabowski_contract_drift",
       "purpose": "Read bounded runtime-contract and capability-catalog drift.",

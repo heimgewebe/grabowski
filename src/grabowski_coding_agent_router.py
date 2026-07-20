@@ -161,12 +161,13 @@ def _catalog_path() -> Path:
     configured = os.environ.get(CATALOG_ENV)
     if configured:
         return Path(configured).expanduser()
-    user_catalog = Path.home() / ".config" / "grabowski" / "coding-agent-catalog.json"
-    if user_catalog.exists():
-        return user_catalog
     return (
         Path(__file__).resolve().parent.parent / "config" / "coding-agent-catalog.json"
     )
+
+
+def _catalog_source() -> str:
+    return "explicit_environment" if os.environ.get(CATALOG_ENV) else "deployment_catalog"
 
 
 def _state_path() -> Path:
@@ -531,6 +532,28 @@ def _load_catalog() -> tuple[dict[str, Any], dict[str, Any]]:
         max_bytes=MAX_CATALOG_BYTES,
     )
     return catalog, _validate_catalog(catalog)
+
+
+def coding_agent_catalog_health() -> dict[str, Any]:
+    """Return bounded semantic health for the exact catalog selected by the router."""
+    path = _catalog_path()
+    source = _catalog_source()
+    try:
+        _catalog, validation = _load_catalog()
+    except (OSError, CodingAgentRouterError) as exc:
+        return {
+            "ready": False,
+            "source": source,
+            "path": str(path),
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:512],
+        }
+    return {
+        "ready": True,
+        "source": source,
+        "path": str(path),
+        **validation,
+    }
 
 
 def _load_state() -> dict[str, Any]:

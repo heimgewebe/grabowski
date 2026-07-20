@@ -382,7 +382,7 @@ def grabowski_deployment_identity() -> dict[str, Any]:
 
 @mcp.tool(name="grabowski_contract_drift", annotations=LOCAL_READ)
 def grabowski_contract_drift() -> dict[str, Any]:
-    """Return bounded runtime-contract and capability-catalog drift."""
+    """Return bounded structural and semantic runtime-contract drift."""
     snapshot = runtime_extensions._runtime_contract_snapshot()
     expected = snapshot["contract"].get("expected_tools", [])
     if not isinstance(expected, list):
@@ -392,11 +392,26 @@ def grabowski_contract_drift() -> dict[str, Any]:
         key: sorted(str(value) for value in values)[:200]
         for key, values in classification.items()
     }
+    structural_ready = not any(normalized.values())
+    try:
+        import grabowski_coding_agent_router as coding_agent_router
+
+        coding_agent_catalog = coding_agent_router.coding_agent_catalog_health()
+    except Exception as exc:  # pragma: no cover - defensive read boundary
+        coding_agent_catalog = {
+            "ready": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:512],
+        }
+    semantic_ready = coding_agent_catalog.get("ready") is True
     return {
         "contract_source": snapshot["source"],
         "expected_tool_count": len(expected),
-        "catalog_matches_contract": not any(normalized.values()),
+        "capability_catalog_matches_contract": structural_ready,
+        "semantic_catalog_ready": semantic_ready,
+        "catalog_matches_contract": structural_ready and semantic_ready,
         "drift": normalized,
+        "coding_agent_catalog": coding_agent_catalog,
         "connector_snapshot_observable": False,
     }
 
