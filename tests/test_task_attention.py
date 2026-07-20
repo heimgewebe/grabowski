@@ -319,6 +319,48 @@ class TaskAttentionTests(unittest.TestCase):
             attention.record_decision(self._parameters(record))
         self.assertEqual([], list(self.decisions.glob("*.json")))
 
+    def test_incomplete_lifecycle_binding_fails_closed(self) -> None:
+        record = self._failed_task()
+        incomplete = dict(record)
+        incomplete["lifecycle_receipt_sha256"] = None
+
+        with self.assertRaisesRegex(
+            attention.TaskAttentionConflictError,
+            "task lifecycle binding is incomplete",
+        ):
+            attention._read_valid_outcome(
+                incomplete,
+                expected_receipt_sha256=None,
+            )
+        classified = attention._classify_record(incomplete)
+        self.assertEqual("invalid_evidence", classified["classification"])
+        self.assertEqual(
+            "TaskAttentionConflictError",
+            classified["evidence_error"],
+        )
+
+    def test_lifecycle_binding_drift_before_publication_blocks_decision(self) -> None:
+        record = self._failed_task()
+        parameters = self._parameters(record)
+        outcome = attention._read_valid_outcome(
+            record,
+            expected_receipt_sha256=parameters["outcome_receipt_sha256"],
+        )
+        drifted = dict(record)
+        drifted["lifecycle_receipt_sha256"] = "a" * 64
+
+        with patch.object(tasks, "_row", side_effect=[record, drifted]), patch.object(
+            attention,
+            "_read_valid_outcome",
+            return_value=outcome,
+        ):
+            with self.assertRaisesRegex(
+                attention.TaskAttentionConflictError,
+                "binding changed before decision publication",
+            ):
+                attention.record_decision(parameters)
+        self.assertEqual([], list(self.decisions.glob("*.json")))
+
     def test_tampered_authoritative_lifecycle_is_not_masked_by_legacy_primary(self) -> None:
         record = self._failed_task()
         task_id = str(record["task_id"])
