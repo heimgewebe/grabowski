@@ -306,14 +306,14 @@ class SafetyObserverUnitTests(unittest.TestCase):
                 "systemctl",
                 "--user",
                 "start",
-                dual.SAFETY_OBSERVER_SERVICE,
+                target.name,
             ]:
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             if argv[:4] == [
                 "systemctl",
                 "--user",
                 "show",
-                dual.SAFETY_OBSERVER_SERVICE,
+                target.name,
             ]:
                 if "--property=Result" in argv:
                     return SimpleNamespace(
@@ -1160,7 +1160,183 @@ class SafetyObserverUnitTests(unittest.TestCase):
                 core.DeployError,
                 "nicht kanonisch erfolgreich",
             ):
-                dual._verify_safety_observer_executes()
+                dual._verify_safety_observer_executes(dual.SAFETY_OBSERVER_SERVICE)
+
+    def test_observer_execution_uses_requested_unit_and_query_timeout(self) -> None:
+        unit_name = "custom-safety-observer.service"
+        responses = [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "Result=success\n"
+                    "ActiveState=inactive\n"
+                    "SubState=dead\n"
+                ),
+                stderr="",
+            ),
+        ]
+        with mock.patch.object(core, "run", side_effect=responses) as run:
+            result = dual._verify_safety_observer_executes(unit_name)
+
+        self.assertEqual(
+            result,
+            {
+                "Result": "success",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+            },
+        )
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    ["systemctl", "--user", "start", unit_name],
+                    check=False,
+                    capture=True,
+                    timeout=core.TIMEOUTS["service_start"],
+                ),
+                mock.call(
+                    [
+                        "systemctl",
+                        "--user",
+                        "show",
+                        unit_name,
+                        "--property=Result",
+                        "--property=ActiveState",
+                        "--property=SubState",
+                    ],
+                    check=False,
+                    capture=True,
+                    timeout=core.TIMEOUTS["systemd_query"],
+                ),
+            ],
+        )
+
+    def test_observer_execution_start_failure_preserves_stderr(self) -> None:
+        with mock.patch.object(
+            core,
+            "run",
+            return_value=SimpleNamespace(
+                returncode=218,
+                stdout="",
+                stderr="Failed to drop capabilities\n",
+            ),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual._verify_safety_observer_executes(
+                    dual.SAFETY_OBSERVER_SERVICE,
+                )
+
+        self.assertEqual(raised.exception.phase, "observer-unit-execution")
+        self.assertEqual(
+            raised.exception.details,
+            {
+                "returncode": 218,
+                "stderr": "Failed to drop capabilities",
+            },
+        )
+
+    def test_observer_execution_status_failure_preserves_stderr(self) -> None:
+        responses = [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Failed to query unit state\n",
+            ),
+        ]
+        with mock.patch.object(core, "run", side_effect=responses):
+            with self.assertRaises(core.DeployError) as raised:
+                dual._verify_safety_observer_executes(
+                    dual.SAFETY_OBSERVER_SERVICE,
+                )
+
+        self.assertEqual(
+            raised.exception.phase,
+            "observer-unit-execution-readback",
+        )
+        self.assertEqual(
+            raised.exception.details,
+            {
+                "returncode": 1,
+                "stderr": "Failed to query unit state",
+            },
+        )
+
+    def test_observer_relation_readback_uses_requested_unit_and_query_timeout(self) -> None:
+        target = Path("/tmp/custom-safety-observer.service")
+        with mock.patch.object(
+            core,
+            "run",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout=self.show_output(target),
+                stderr="",
+            ),
+        ) as run:
+            dual._observer_unit_relations(target)
+
+        argv = run.call_args.args[0]
+        self.assertEqual(
+            argv[:4],
+            ["systemctl", "--user", "show", target.name],
+        )
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            core.TIMEOUTS["systemd_query"],
+        )
+
+    def test_observer_relation_readback_failure_preserves_stderr(self) -> None:
+        target = Path("/tmp/custom-safety-observer.service")
+        with mock.patch.object(
+            core,
+            "run",
+            return_value=SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Failed to read unit properties\n",
+            ),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual._observer_unit_relations(target)
+
+        self.assertEqual(raised.exception.phase, "observer-unit-readback")
+        self.assertEqual(
+            raised.exception.details,
+            {
+                "returncode": 1,
+                "stderr": "Failed to read unit properties",
+            },
+        )
+
+    def test_install_validates_requested_target_unit_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            target = root / "config/systemd/user/custom-safety-observer.service"
+            target.parent.mkdir(parents=True)
+
+            with (
+                mock.patch.object(core, "git_show", return_value=self.expected),
+                mock.patch.object(core, "run", side_effect=self.run_systemctl(target)),
+            ):
+                result = dual.install_safety_observer_unit(
+                    repo,
+                    self.snapshot,
+                    target=target,
+                )
+
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["path"], str(target))
+            self.assertEqual(
+                result["execution"],
+                {
+                    "Result": "success",
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                },
+            )
 
     def test_incomplete_effective_relation_readback_fails_closed(self) -> None:
         target = Path("/tmp/grabowski-safety-observer.service")
