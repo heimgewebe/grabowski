@@ -9,9 +9,9 @@ GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python
 RETENTION_MIN_AGE_SECONDS ?= 86400
 RETENTION_MAX_ARCHIVE_JOBS ?= 128
 
-.PHONY: validate syntax test policy tool-surface-budget context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply runtime-legacy-status
+.PHONY: validate syntax test policy tool-surface-budget catalog-data-refresh catalog-data-check context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply runtime-legacy-status routing-cli-check routing-cli-apply
 
-validate: syntax test policy tool-surface-budget context-check profiles-check runtime-lock deploy-tooling-check secrets
+validate: catalog-data-check syntax test policy tool-surface-budget context-check profiles-check runtime-lock deploy-tooling-check secrets
 
 syntax:
 >$(PYTHON) -m py_compile tools/operator_patch_relay.py
@@ -26,11 +26,17 @@ policy:
 tool-surface-budget:
 >PYTHONPATH=src $(PYTHON) -m grabowski_tool_surface_budget --check
 
-context-refresh:
+catalog-data-refresh:
+>$(PYTHON) tools/build_coding_agent_catalog_data.py --write
+
+catalog-data-check:
+>$(PYTHON) tools/build_coding_agent_catalog_data.py --check
+
+context-refresh: catalog-data-refresh
 >$(PYTHON) tools/build_operator_context.py --write
 >$(PYTHON) tools/build_publication_profiles.py --write
 
-context-check:
+context-check: catalog-data-check
 >$(PYTHON) tools/build_operator_context.py --check
 
 profiles-refresh:
@@ -88,3 +94,10 @@ runtime-retention-apply: context-check
 runtime-legacy-status: context-check
 >test -x "$(GRABOWSKI_RUNTIME_PYTHON)"
 >"$(GRABOWSKI_RUNTIME_PYTHON)" tools/maintain_runtime_state.py --legacy-archive-status
+
+
+routing-cli-check: catalog-data-check
+>$(PYTHON) tools/install_coding_agent_router_cli.py --check
+
+routing-cli-apply: catalog-data-check
+>$(PYTHON) tools/install_coding_agent_router_cli.py --apply

@@ -1881,7 +1881,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Keep authoritative implementation direct; rank agents only for review.",
+      "description": "Keep all authoritative work direct; rank agents only as advisory reviewers.",
       "effects": [],
       "id": "grabowski_coding_agent_route",
       "purpose": "Keep every authoritative implementation on grabowski-primary and rank external routes only for independent review.",
@@ -1967,6 +1967,7 @@
       "agy",
       "cline"
     ],
+    "coding_agent_priority_semantics": "legacy_name_review_and_contrast_only",
     "control_loop": [
       "typed_grabowski_tool",
       "grabowski_micro_task",
@@ -1989,6 +1990,7 @@
       "agy",
       "cline"
     ],
+    "execution_priority_semantics": "authoritative_operator_then_advisory_helpers",
     "name": "Operator Relay v0",
     "operator_first_for": [
       "task_decomposition",
@@ -2000,6 +2002,12 @@
       "deployment",
       "closeout",
       "recovery"
+    ],
+    "review_and_contrast_agent_priority": [
+      "claude",
+      "codex",
+      "agy",
+      "cline"
     ],
     "routing_roles": {
       "audit": "grabowski_git",
@@ -2028,6 +2036,7 @@
       ],
       "direct_operator_for": [
         "all_authoritative_implementation",
+        "all_reviews",
         "all_task_sizes",
         "runtime_or_security_change",
         "long_or_multi_file_implementation",
@@ -2036,6 +2045,7 @@
       ],
       "external_agent_delegation": "review_or_explicit_contrast_only",
       "external_candidate_authority": "advisory_only",
+      "external_primary_reviewer_forbidden": true,
       "external_primary_writer_forbidden": true,
       "external_programming_modes": [
         "competitor",
@@ -2469,6 +2479,14 @@
       {
         "module": "grabowski_operator_relay",
         "source": "src/grabowski_operator_relay.py"
+      },
+      {
+        "module": "grabowski_coding_agent_catalog_data",
+        "source": "src/grabowski_coding_agent_catalog_data.py"
+      },
+      {
+        "module": "grabowski_coding_agent_router_cli",
+        "source": "src/grabowski_coding_agent_router_cli.py"
       }
     ]
   },
@@ -2476,7 +2494,7 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "7eeab5c1947fd56f64b297bcd5ccab2bcb182feca5310328be89cfa7dc9e9497"
+      "sha256": "fa8cb43bc4e88ade3bcf91869966f7f0d7b5a988aef74ad3e156ccb1820bb20d"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
@@ -2488,14 +2506,14 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "db5c07d232cadf76644ef62f91a0f62136fc747f6e0fce781a4562944f6f9361"
+      "sha256": "5bb7246fa1faf7f40cfcfd8e56555ee2f053aae0eb661bdd94b594941bf8f4e5"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
       "src/grabowski_agent_competition.py": "d570ae640c971ff1487db9e28bce19f42caa69f414eb2cb91ffe3be3bfc60c5d",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "2515452d674a346d62aadf411af4dd85704ee5836fccfb61fce17b5e8f082789",
+      "src/grabowski_agent_workspace.py": "0e2c43ae21dc6fe0a1973d9b811ee74c649e3b81e195775f524b1ac9e59eef23",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "040e2272ff0345608f512ccc59b1bec6997d3b39da4e9caceaca967c03d6b85d",
@@ -2509,7 +2527,9 @@
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "e44d25d955ab35efbfe3ec381f84395f070d37fcd8726a0488269a47137ade8f",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
-      "src/grabowski_coding_agent_router.py": "d6f11515407697cec9f71be7c63f86e593161af5ab57a11bb0ec6b2c69fbbac0",
+      "src/grabowski_coding_agent_catalog_data.py": "90688161027ce9b061125499006b4db130473997fb9fd1d922118a89526a243e",
+      "src/grabowski_coding_agent_router.py": "e4b9eccf43c6c41e857226662615cde4e54e7e9e124febf7aed3f01aefdc4b03",
+      "src/grabowski_coding_agent_router_cli.py": "961b5894ed4b5fb3ced650c8f19e2db35ffc16e1f390c6e705a895895b2e49d1",
       "src/grabowski_command_identity.py": "03bf7193851846d1f5b4d1bfe71a787937e424804f875ba4e021233ddbc842c9",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_convergence.py": "03ea75eb190ac08f29c4ec6c5ab1a14a631ce7c0cce4956ed6f437c492a6a635",
@@ -2527,7 +2547,7 @@
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
       "src/grabowski_operator.py": "674c070df71d3538e6dd8edc6e373a57563650015a6d8bedae91133e4b486666",
       "src/grabowski_operator_obligation.py": "a18dd9e4c9b2915aecdf51897b38da08dc1b557541e823e9fb3bd7a0e470c085",
-      "src/grabowski_operator_relay.py": "278ca5a0618967a582e1a6da12a295e6618ee72ca19547fa34ac0931a6ff4fae",
+      "src/grabowski_operator_relay.py": "e0869b3297b473366963670a7105ece12afae308f4ceba80a300db49ddd666b7",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "ea0cd51630be7362a985ed0a56288d521c9d3b7341218d656306643e6c27a498",
       "src/grabowski_privileged_broker.py": "605e8f7b7946c5907c3844e47451b63497ad3948eac92804e28be44fb4c30ffa",

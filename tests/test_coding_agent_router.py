@@ -35,6 +35,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             os.environ,
             {
                 router.CATALOG_ENV: str(self.catalog_path),
+                router.CATALOG_OVERRIDE_ENV: "1",
                 router.STATE_ENV: str(self.state_path),
             },
             clear=False,
@@ -148,8 +149,12 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(direct["direct_implementation_required"])
         self.assertTrue(direct["applies_to_all_implementation_sizes"])
         self.assertTrue(direct["external_primary_writer_forbidden"])
+        self.assertTrue(direct["external_primary_reviewer_forbidden"])
         self.assertFalse(direct["capacity_fallback_to_external_writer"])
         self.assertEqual(direct["external_agent_roles"], ["review", "contrast"])
+        self.assertIn("review", direct["operator_owns"])
+        self.assertIn("upper_review_or_contrast_routes", policy)
+        self.assertNotIn("upper_work_routes", policy)
         self.assertFalse(result["provider_peer_balance"]["enabled"])
         self.assertEqual(result["provider_peer_balance"]["selection_effect"], 0)
         self.assertFalse(result["automatic_execution_authorized"])
@@ -208,6 +213,18 @@ class CodingAgentRouterTests(unittest.TestCase):
                     "external_agent_roles", ["writer", "review"]
                 ),
                 "external_agent_roles",
+            ),
+            (
+                lambda catalog: catalog["policy"]["direct_work_policy"].__setitem__(
+                    "external_primary_reviewer_forbidden", False
+                ),
+                "external_primary_reviewer_forbidden must be true",
+            ),
+            (
+                lambda catalog: catalog["policy"]["direct_work_policy"][
+                    "operator_owns"
+                ].remove("review"),
+                "operator_owns is incomplete",
             ),
             (
                 lambda catalog: next(
@@ -511,9 +528,10 @@ class CodingAgentRouterTests(unittest.TestCase):
         security = self._route(
             "security-review", duration_minutes=120, risk_flags=["security-sensitive"]
         )
-        self.assertEqual(security["decision"], "route")
-        self.assertEqual(security["primary_role"], "reviewer")
-        self.assertTrue(security["primary"]["review_capable"])
+        self.assertEqual(security["decision"], "controller")
+        self.assertEqual(security["primary_role"], "direct-reviewer")
+        self.assertTrue(security["direct_review_required"])
+        self.assertTrue(security["reviewers"][0]["review_capable"])
         self.assertTrue(security["authoritative_implementation_remains_direct"])
 
     def test_opus_plan_route_is_reserved_for_review_and_never_becomes_writer(
@@ -552,7 +570,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         }
         self._write_state()
         pending = self._route("independent-review")
-        candidates = [pending["primary"], *pending["fallbacks"]]
+        candidates = [*pending["reviewers"], *pending["review_fallbacks"]]
         fable = next(item for item in candidates if item["route"] == route_id)
         self.assertTrue(any("learning pending 4/5" in reason for reason in fable["reasons"]))
         pending_score = fable["adaptive_score"]
@@ -568,7 +586,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         }
         self._write_state()
         learned = self._route("independent-review")
-        candidates = [learned["primary"], *learned["fallbacks"]]
+        candidates = [*learned["reviewers"], *learned["review_fallbacks"]]
         fable_learned = next(item for item in candidates if item["route"] == route_id)
         self.assertLess(fable_learned["adaptive_score"], pending_score)
         self.assertTrue(
@@ -596,8 +614,9 @@ class CodingAgentRouterTests(unittest.TestCase):
         }
         self._write_state()
         review = self._route("independent-review")
-        self.assertEqual(review["decision"], "route")
-        self.assertNotEqual(review["primary"]["provider_family"], "anthropic")
+        self.assertEqual(review["decision"], "controller")
+        self.assertEqual(review["primary_role"], "direct-reviewer")
+        self.assertNotEqual(review["reviewers"][0]["provider_family"], "anthropic")
 
         cline = router._pool_gate("cline-account", self.catalog, self.state, critical=False)
         openrouter = router._pool_gate("openrouter-paid", self.catalog, self.state, critical=True)
@@ -756,15 +775,14 @@ class CodingAgentRouterTests(unittest.TestCase):
             )
         for task_class in ("critical-review", "security-review"):
             review = self._route(task_class)
-            self.assertEqual(review["primary_role"], "reviewer")
-            self.assertTrue(review["primary"]["review_capable"])
-            self.assertNotEqual(review["primary"]["provider_family"], "openai")
+            self.assertEqual(review["decision"], "controller")
+            self.assertEqual(review["primary_role"], "direct-reviewer")
+            self.assertTrue(review["direct_review_required"])
             self.assertEqual(review["review_gap"], 0)
+            self.assertEqual(review["review_quorum"]["direct_operator"], 1)
+            self.assertEqual(review["review_quorum"]["external_advisory_target"], 1)
             self.assertTrue(review["reviewers"][0]["review_capable"])
-            self.assertNotEqual(
-                review["primary"]["provider_family"],
-                review["reviewers"][0]["provider_family"],
-            )
+            self.assertNotEqual(review["reviewers"][0]["provider_family"], "openai")
 
     def test_fable_contrast_and_review_routes_never_become_primary_writer(self) -> None:
         coding = self._route("complex-patch", need_review=True)
@@ -793,7 +811,10 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(reviewer["writer_capable"])
 
         review = self._route("independent-review")
-        all_review_routes = {review["primary"]["route"], *(item["route"] for item in review["fallbacks"])}
+        all_review_routes = {
+            *(item["route"] for item in review["reviewers"]),
+            *(item["route"] for item in review["review_fallbacks"]),
+        }
         self.assertNotIn("claude-fable-5-contrast-high", all_review_routes)
         self.assertNotIn("claude-fable-5-writer-high", all_review_routes)
 
@@ -813,7 +834,10 @@ class CodingAgentRouterTests(unittest.TestCase):
         coding = self._route("complex-patch", need_review=True)
         self.assertEqual(coding["decision"], "controller")
         self.assertEqual(coding["review_status"], "router-state-unavailable")
-        self.assertEqual(self._route("independent-review")["decision"], "probe-required")
+        direct_review = self._route("independent-review")
+        self.assertEqual(direct_review["decision"], "controller")
+        self.assertEqual(direct_review["primary_role"], "direct-reviewer")
+        self.assertEqual(direct_review["review_status"], "router-state-unavailable")
 
         self.state = self._fresh_state()
         self.state["catalog"]["observed_at"] = (
@@ -826,7 +850,9 @@ class CodingAgentRouterTests(unittest.TestCase):
         coding = self._route("complex-patch", need_review=True)
         self.assertEqual(coding["decision"], "controller")
         self.assertEqual(coding["review_status"], "router-state-stale")
-        self.assertEqual(self._route("independent-review")["decision"], "probe-required")
+        direct_review = self._route("independent-review")
+        self.assertEqual(direct_review["decision"], "controller")
+        self.assertEqual(direct_review["review_status"], "router-state-stale")
 
         self.state = self._fresh_state()
         self.state["catalog_sha256"] = "0" * 64
@@ -834,7 +860,9 @@ class CodingAgentRouterTests(unittest.TestCase):
         coding = self._route("complex-patch", need_review=True)
         self.assertEqual(coding["decision"], "controller")
         self.assertEqual(coding["review_status"], "router-state-catalog-mismatch")
-        self.assertEqual(self._route("independent-review")["decision"], "probe-required")
+        direct_review = self._route("independent-review")
+        self.assertEqual(direct_review["decision"], "controller")
+        self.assertEqual(direct_review["review_status"], "router-state-catalog-mismatch")
 
     def test_controller_owned_work_never_routes_to_an_external_writer(self) -> None:
         result = self._route("deployment")

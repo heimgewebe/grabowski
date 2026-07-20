@@ -20,6 +20,7 @@ class CodingAgentProbeSystemdContractTests(unittest.TestCase):
             "ConditionPathExists=%h/.config/grabowski/coding-agent-probe-scheduler-router.sha256",
             unit,
         )
+        self.assertNotIn("coding-agent-catalog.json", unit)
         self.assertIn("NoNewPrivileges=yes", unit)
         self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("ProtectHome=read-only", unit)
