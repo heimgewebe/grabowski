@@ -454,9 +454,12 @@ def _audit_window_projection(
             failure_signal_count += 1
             failure_reason_counts.update(reasons)
 
-        bureau_code = record.get("bureau_code")
-        if isinstance(bureau_code, str) and bureau_code:
-            bureau_code_counts[_audit_label(bureau_code, fallback="unknown")] += 1
+        if "bureau_failure_status" in reasons:
+            bureau_code = record.get("bureau_code")
+            if isinstance(bureau_code, str) and bureau_code:
+                bureau_code_counts[
+                    _audit_label(bureau_code, fallback="unknown")
+                ] += 1
 
         resource_keys = record.get("resource_keys")
         if isinstance(resource_keys, list):

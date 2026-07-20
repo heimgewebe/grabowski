@@ -319,12 +319,22 @@ class ReadSurfaceTests(unittest.TestCase):
                 "effect_started": False,
             },
             {
+                "operation": "bureau-task-publish",
+                "timestamp": datetime.fromtimestamp(
+                    now - 270, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "e" * 64,
+                "bureau_status": "published",
+                "bureau_code": "publication-complete",
+                "effect_started": True,
+            },
+            {
                 "operation": "remove",
                 "timestamp": datetime.fromtimestamp(
                     now - 300, tz=timezone.utc
                 ).isoformat(),
-                "record_sha256": "e" * 64,
-                "before_sha256": "f" * 64,
+                "record_sha256": "f" * 64,
+                "before_sha256": "0" * 64,
                 "after_sha256": None,
                 "rollback": {"available": True},
             },
@@ -333,7 +343,7 @@ class ReadSurfaceTests(unittest.TestCase):
             "valid": True,
             "total_records": len(records),
             "total_legacy_records": 0,
-            "last_record_sha256": "e" * 64,
+            "last_record_sha256": "f" * 64,
             "archived_segment_count": 2,
             "audit_writable": True,
         }
@@ -351,7 +361,7 @@ class ReadSurfaceTests(unittest.TestCase):
             )
         self.assertEqual(result["projection_kind"], "audit_projection.v1")
         self.assertEqual(result["source_binding"]["record_count"], len(records))
-        self.assertEqual(result["source_binding"]["last_record_sha256"], "e" * 64)
+        self.assertEqual(result["source_binding"]["last_record_sha256"], "f" * 64)
         self.assertEqual(
             [item["label"] for item in result["windows"]], ["24h", "7d", "30d"]
         )
@@ -379,6 +389,10 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(
             result["candidate_patterns"][0]["top_codes"][0],
             {"code": "request-schema-unsupported", "count": 3},
+        )
+        self.assertNotIn(
+            "publication-complete",
+            json.dumps(result["windows"][0]["top_bureau_failure_codes"]),
         )
         self.assertEqual(result["candidate_patterns"][0]["authority"], "proposal_only")
         self.assertNotIn("owner_id", json.dumps(result))
