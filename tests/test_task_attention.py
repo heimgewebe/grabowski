@@ -278,6 +278,89 @@ class TaskAttentionTests(unittest.TestCase):
                 )
             )
 
+    def test_all_unrelated_outcome_paths_raise_file_not_found(self) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        primary_path = self.outcomes / f"{task_id}.json"
+        lifecycle_path = self.outcomes / f"{task_id}.lifecycle.json"
+        authoritative = json.loads(primary_path.read_text(encoding="utf-8"))
+        unrelated = self._to_legacy_unbound_outcome(authoritative)
+        encoded = (
+            json.dumps(unrelated, ensure_ascii=False, sort_keys=True, indent=2)
+            + "\n"
+        )
+        primary_path.write_text(encoded, encoding="utf-8")
+        lifecycle_path.write_text(encoded, encoding="utf-8")
+        os.chmod(primary_path, 0o600)
+        os.chmod(lifecycle_path, 0o600)
+
+        with self.assertRaisesRegex(
+            FileNotFoundError,
+            "No task outcome receipt",
+        ):
+            attention._read_valid_outcome(
+                record,
+                expected_receipt_sha256=authoritative["receipt_sha256"],
+            )
+
+    def test_corrupt_preferred_lifecycle_fails_closed_before_primary_fallback(
+        self,
+    ) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        lifecycle_path = self.outcomes / f"{task_id}.lifecycle.json"
+        lifecycle_path.write_text("{", encoding="utf-8")
+        os.chmod(lifecycle_path, 0o600)
+
+        with self.assertRaisesRegex(
+            attention.TaskAttentionIntegrityError,
+            "invalid task outcome receipt JSON",
+        ):
+            attention.record_decision(self._parameters(record))
+        self.assertEqual([], list(self.decisions.glob("*.json")))
+
+    def test_incomplete_lifecycle_binding_fails_closed(self) -> None:
+        record = self._failed_task()
+        incomplete = dict(record)
+        incomplete["lifecycle_receipt_sha256"] = None
+
+        with self.assertRaisesRegex(
+            attention.TaskAttentionConflictError,
+            "task lifecycle binding is incomplete",
+        ):
+            attention._read_valid_outcome(
+                incomplete,
+                expected_receipt_sha256=None,
+            )
+        classified = attention._classify_record(incomplete)
+        self.assertEqual("invalid_evidence", classified["classification"])
+        self.assertEqual(
+            "TaskAttentionConflictError",
+            classified["evidence_error"],
+        )
+
+    def test_lifecycle_binding_drift_before_publication_blocks_decision(self) -> None:
+        record = self._failed_task()
+        parameters = self._parameters(record)
+        outcome = attention._read_valid_outcome(
+            record,
+            expected_receipt_sha256=parameters["outcome_receipt_sha256"],
+        )
+        drifted = dict(record)
+        drifted["lifecycle_receipt_sha256"] = "a" * 64
+
+        with patch.object(tasks, "_row", side_effect=[record, drifted]), patch.object(
+            attention,
+            "_read_valid_outcome",
+            return_value=outcome,
+        ):
+            with self.assertRaisesRegex(
+                attention.TaskAttentionConflictError,
+                "binding changed before decision publication",
+            ):
+                attention.record_decision(parameters)
+        self.assertEqual([], list(self.decisions.glob("*.json")))
+
     def test_tampered_authoritative_lifecycle_is_not_masked_by_legacy_primary(self) -> None:
         record = self._failed_task()
         task_id = str(record["task_id"])
