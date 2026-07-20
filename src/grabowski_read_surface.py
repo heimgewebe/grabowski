@@ -44,6 +44,7 @@ MAX_GIT_COMMITS = 100
 MAX_WORKTREES = 100
 MAX_REVISION_LENGTH = 200
 MAX_AUDIT_PROJECTION_TOP = 25
+AUDIT_FUTURE_TOLERANCE_SECONDS = 300
 AUDIT_PROJECTION_WINDOWS = (("24h", 86_400), ("7d", 604_800), ("30d", 2_592_000))
 AUDIT_PROJECTION_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}")
 AUDIT_EFFECT_OPERATIONS = frozenset(
@@ -350,6 +351,15 @@ def _audit_timestamp_unix(value: Any) -> int | None:
         return None
 
 
+def _prepare_audit_records(
+    records: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], int | None]]:
+    return [
+        (record, _audit_timestamp_unix(record.get("timestamp")))
+        for record in records
+    ]
+
+
 def _audit_label(value: Any, *, fallback: str) -> str:
     if not isinstance(value, str) or not value:
         return fallback
@@ -396,7 +406,7 @@ def _audit_resource_type(value: Any) -> str:
 
 
 def _audit_window_projection(
-    records: list[dict[str, Any]],
+    records: list[tuple[dict[str, Any], int | None]],
     *,
     start_unix: int | None,
     end_unix: int,
@@ -420,13 +430,12 @@ def _audit_window_projection(
     resource_reclamation_event_count = 0
     selected_count = 0
 
-    for record in records:
-        timestamp_unix = _audit_timestamp_unix(record.get("timestamp"))
+    for record, timestamp_unix in records:
         if timestamp_unix is None:
             timestamp_quality["invalid_or_missing"] += 1
             if start_unix is not None:
                 continue
-        elif timestamp_unix > end_unix + 300:
+        elif timestamp_unix > end_unix + AUDIT_FUTURE_TOLERANCE_SECONDS:
             timestamp_quality["future_dated"] += 1
             if start_unix is not None:
                 continue
@@ -549,13 +558,14 @@ def _audit_projection_candidates(
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     bureau_codes: Counter[str] = seven_day["bureau_code_counts"]
-    repeated_codes = [
-        (code, count)
-        for code, count in sorted(
-            bureau_codes.items(), key=lambda item: (-item[1], item[0])
-        )
-        if count >= 3
-    ]
+    repeated_codes = sorted(
+        (
+            (code, count)
+            for code, count in bureau_codes.items()
+            if count >= 3
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )
     if repeated_codes:
         candidates.append(
             {
@@ -725,15 +735,24 @@ def grabowski_audit_projection(
 ) -> dict[str, Any]:
     """Project verified audit-chain records into bounded operational trends."""
     selected_view = consumer_surface.normalize_view(view)
-    if isinstance(top_limit, bool) or not 1 <= top_limit <= MAX_AUDIT_PROJECTION_TOP:
+    if (
+        isinstance(top_limit, bool)
+        or not isinstance(top_limit, int)
+        or not 1 <= top_limit <= MAX_AUDIT_PROJECTION_TOP
+    ):
         raise ValueError(f"top_limit must be between 1 and {MAX_AUDIT_PROJECTION_TOP}")
-    before = base._verify_audit_log(base.AUDIT_LOG)
-    if not before.get("valid"):
-        raise RuntimeError(
-            f"Audit log verification failed: {before.get('error') or 'unknown'}"
-        )
-    records = base._audit_records()
+    try:
+        records, snapshot_status = base._audit_records_snapshot()
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"Audit log verification failed: {exc}") from exc
     binding = _audit_snapshot_binding(records)
+    if (
+        snapshot_status.get("total_records") != binding["record_count"]
+        or snapshot_status.get("last_record_sha256")
+        != binding["last_record_sha256"]
+    ):
+        raise RuntimeError("Audit snapshot binding mismatch")
+    prepared_records = _prepare_audit_records(records)
     after = base._verify_audit_log(base.AUDIT_LOG)
     if not after.get("valid"):
         raise RuntimeError(
@@ -745,7 +764,7 @@ def grabowski_audit_projection(
     private_windows: dict[str, dict[str, Any]] = {}
     for label, seconds in AUDIT_PROJECTION_WINDOWS:
         public, private = _audit_window_projection(
-            records,
+            prepared_records,
             start_unix=as_of_unix - seconds,
             end_unix=as_of_unix,
             label=label,
@@ -755,7 +774,7 @@ def grabowski_audit_projection(
         windows.append(public)
         private_windows[label] = private
     all_time, all_time_private = _audit_window_projection(
-        records,
+        prepared_records,
         start_unix=None,
         end_unix=as_of_unix,
         label="all_time",
@@ -776,7 +795,7 @@ def grabowski_audit_projection(
                 "current_last_record_sha256": after.get("last_record_sha256"),
             }
         )
-    legacy_records = int(after.get("total_legacy_records") or 0)
+    legacy_records = int(snapshot_status.get("total_legacy_records") or 0)
     if legacy_records:
         warnings.append(
             {"code": "legacy_audit_records_present", "count": legacy_records}
@@ -807,8 +826,10 @@ def grabowski_audit_projection(
             "post_read_chain_valid": True,
             "post_read_total_records": after.get("total_records"),
             "post_read_last_record_sha256": after.get("last_record_sha256"),
-            "archived_segment_count": after.get("archived_segment_count"),
-            "audit_writable": after.get("audit_writable"),
+            "archived_segment_count": snapshot_status.get(
+                "archived_segment_count"
+            ),
+            "audit_writable": snapshot_status.get("audit_writable"),
             "advanced_during_projection": advanced,
         },
         "windows": windows,

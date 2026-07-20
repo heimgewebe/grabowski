@@ -3418,39 +3418,45 @@ def _audit_capacity_status(
     }
 
 
+def _audit_status_from_components(
+    path: Path,
+    components: list[tuple[Path, bytes, dict[str, Any]]],
+    compatibility_evidence: bool,
+) -> dict[str, Any]:
+    if not components:
+        status = _verify_audit_bytes(path, b"", exists=False)
+        status.update(
+            {
+                "total_records": 0,
+                "total_legacy_records": 0,
+                "total_v2_records": 0,
+                "archived_segment_count": 0,
+                "chain_valid": True,
+                "legacy_rotation_compatibility": False,
+            }
+        )
+    else:
+        status = dict(components[0][2])
+        status.update(
+            {
+                "total_records": sum(item[2]["records"] for item in components),
+                "total_legacy_records": sum(
+                    item[2]["legacy_records"] for item in components
+                ),
+                "total_v2_records": sum(item[2]["v2_records"] for item in components),
+                "archived_segment_count": len(components) - 1,
+                "chain_valid": True,
+                "legacy_rotation_compatibility": compatibility_evidence,
+            }
+        )
+    status.update(_audit_capacity_status(path, status))
+    return status
+
+
 def _verify_audit_log_unlocked(path: Path = AUDIT_LOG) -> dict[str, Any]:
     try:
         components, compatibility_evidence = _read_audit_chain_unlocked(path)
-        if not components:
-            status = _verify_audit_bytes(path, b"", exists=False)
-            status.update(
-                {
-                    "total_records": 0,
-                    "total_legacy_records": 0,
-                    "total_v2_records": 0,
-                    "archived_segment_count": 0,
-                    "chain_valid": True,
-                    "legacy_rotation_compatibility": False,
-                }
-            )
-        else:
-            status = dict(components[0][2])
-            status.update(
-                {
-                    "total_records": sum(item[2]["records"] for item in components),
-                    "total_legacy_records": sum(
-                        item[2]["legacy_records"] for item in components
-                    ),
-                    "total_v2_records": sum(
-                        item[2]["v2_records"] for item in components
-                    ),
-                    "archived_segment_count": len(components) - 1,
-                    "chain_valid": True,
-                    "legacy_rotation_compatibility": compatibility_evidence,
-                }
-            )
-        status.update(_audit_capacity_status(path, status))
-        return status
+        return _audit_status_from_components(path, components, compatibility_evidence)
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         status = {
             "valid": False,
@@ -3790,19 +3796,32 @@ def _append_audit(record: dict[str, Any]) -> None:
                     _close_audit_descriptor(descriptor)
 
 
-def _audit_records() -> list[dict[str, Any]]:
+def _audit_records_from_components(
+    components: list[tuple[Path, bytes, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for _path, data, _status in reversed(components):
+        for line in data.splitlines():
+            parsed = json.loads(line.decode("utf-8"))
+            if isinstance(parsed, dict):
+                records.append(parsed)
+    return records
+
+
+def _audit_records_snapshot() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     with _audit_coordination_lock(AUDIT_LOG, exclusive=False):
-        components, _compatibility = _read_audit_chain_unlocked(
+        components, compatibility = _read_audit_chain_unlocked(
             AUDIT_LOG,
             use_segment_cache=False,
         )
-        records: list[dict[str, Any]] = []
-        for _path, data, _status in reversed(components):
-            for line in data.splitlines():
-                parsed = json.loads(line.decode("utf-8"))
-                if isinstance(parsed, dict):
-                    records.append(parsed)
-        return records
+        status = _audit_status_from_components(AUDIT_LOG, components, compatibility)
+        records = _audit_records_from_components(components)
+        return records, status
+
+
+def _audit_records() -> list[dict[str, Any]]:
+    records, _status = _audit_records_snapshot()
+    return records
 
 
 def _find_transaction_record(transaction_id: str) -> dict[str, Any]:
