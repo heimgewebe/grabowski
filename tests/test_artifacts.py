@@ -279,6 +279,23 @@ class ArtifactTests(unittest.TestCase):
         self.assertNotIn("json-secret", json_redacted)
         self.assertIn("[REDACTED]", json_redacted)
 
+    def test_traceback_redaction_emits_only_the_controlled_final_diagnostic(self) -> None:
+        secret = "traceback-secret-value"
+        diagnostic = (
+            "Traceback (most recent call last):\n"
+            "  File \"<string>\", line 34, in <module>\n"
+            "    raise RuntimeError(\"destination already exists\")\n"
+            "RuntimeError: destination already exists token=" + secret
+        )
+
+        redacted = artifacts._redact_transfer_detail(diagnostic)
+
+        self.assertNotIn("Traceback", redacted)
+        self.assertNotIn("<string>", redacted)
+        self.assertNotIn("RuntimeError", redacted)
+        self.assertNotIn(secret, redacted)
+        self.assertEqual(redacted, "destination already exists token=[REDACTED]")
+
     def test_remote_failure_is_total_and_redacts_secret_output(self) -> None:
         secret = "remote-secret-value"
         failure = {

@@ -40,6 +40,8 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 _URI_CREDENTIAL_RE = re.compile(
     r"([A-Za-z][A-Za-z0-9+.-]*://)([^/\s:@]+):([^@/\s]+)@"
 )
+_TRACEBACK_MARKER = "Traceback (most recent call last):"
+_TRACEBACK_EXCEPTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:\s*(?P<detail>.*)$")
 _TOKEN_PATTERNS = (
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
@@ -49,6 +51,18 @@ _TOKEN_PATTERNS = (
 
 class ArtifactTransferError(RuntimeError):
     """Bounded operator-facing artifact transport failure."""
+
+
+def _condense_python_traceback(text: str) -> str:
+    """Reduce remote Python tracebacks to their controlled final diagnostic."""
+    if _TRACEBACK_MARKER not in text:
+        return text
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        match = _TRACEBACK_EXCEPTION_RE.fullmatch(line)
+        if match is not None:
+            return match.group("detail") or "artifact transport failed"
+    return "artifact transport failed"
 
 
 def _redact_transfer_detail(
@@ -67,6 +81,7 @@ def _redact_transfer_detail(
             text = str(redactor(text))[:MAX_ERROR_INPUT_CHARS]
         except Exception:
             text = "artifact transport failed"
+    text = _condense_python_traceback(text)
     text = _AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
     text = _SECRET_ASSIGNMENT_RE.sub(r"\1[REDACTED]", text)
     text = _URI_CREDENTIAL_RE.sub(r"\1[REDACTED]@", text)
