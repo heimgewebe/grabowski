@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -18,6 +19,7 @@ import grabowski_coding_agent_router as router
 
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
 COMMAND_TIMEOUT_SECONDS = 20
+PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v2"
 
 
 class CodingAgentRouterCliError(RuntimeError):
@@ -30,15 +32,14 @@ def _iso_now() -> str:
     )
 
 
-def _canonical_sha256(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()
+def _probe_digest(value: dict[str, Any]) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hmac.new(PROBE_DIGEST_DOMAIN, payload, hashlib.sha256).hexdigest()
 
 
 def _clean_environment(catalog: dict[str, Any]) -> dict[str, str]:
@@ -276,7 +277,7 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         "model_invocations": 0,
         "paid_api_requests_authorized": 0,
     }
-    return {**body, "catalog_probe_sha256": _canonical_sha256(body)}
+    return {**body, "catalog_probe_sha256": _probe_digest(body)}
 
 
 def _default_state(catalog_sha256: str) -> dict[str, Any]:

@@ -101,6 +101,7 @@ class CodingAgentProbeSchedulerTests(unittest.TestCase):
         program = f"""\
 #!/usr/bin/env python3
 import hashlib
+import hmac
 import json
 import os
 from datetime import datetime, timezone
@@ -118,7 +119,9 @@ if sys.argv[1] == "probe":
         "api_key_environment_scrubbed": [],
     }}
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    body["catalog_probe_sha256"] = hashlib.sha256(canonical).hexdigest()
+    body["catalog_probe_sha256"] = hmac.new(
+        b"grabowski-coding-agent-probe-v2", canonical, hashlib.sha256
+    ).hexdigest()
     if {tamper_digest!r}:
         body["catalog_probe_sha256"] = "0" * 64
     state["catalog"] = body
@@ -182,6 +185,27 @@ else:
         )
         self.assertFalse(self.failure.exists())
 
+    def test_probe_validation_rejects_plain_sha256_without_domain_binding(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": SCHEDULER.iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": [],
+            "api_key_environment_scrubbed": [],
+        }
+        canonical = json.dumps(
+            probe,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        probe["catalog_probe_sha256"] = hashlib.sha256(canonical).hexdigest()
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError, "digest does not match"
+        ):
+            SCHEDULER.validate_probe(probe)
+
     def test_probe_validation_rejects_invalid_verified_pool_claims(self) -> None:
         base = {
             "schema_version": 2,
@@ -197,7 +221,7 @@ else:
         ):
             with self.subTest(value=value):
                 probe = {**base, "verified_quota_pools": value}
-                probe["catalog_probe_sha256"] = SCHEDULER.value_sha256(probe)
+                probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
                 with self.assertRaisesRegex(
                     SCHEDULER.ProbeSchedulerError, "verified_quota_pools"
                 ):
@@ -212,7 +236,7 @@ else:
             "verified_quota_pools": ["grok-com"],
             "api_key_environment_scrubbed": [],
         }
-        probe["catalog_probe_sha256"] = SCHEDULER.value_sha256(probe)
+        probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
         before = {
             **self.initial,
             "pools": {
@@ -246,7 +270,7 @@ else:
             "verified_quota_pools": ["jules-account"],
             "api_key_environment_scrubbed": [],
         }
-        probe["catalog_probe_sha256"] = SCHEDULER.value_sha256(probe)
+        probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
         after = {
             "schema_version": 2,
             "updated_at": probe["observed_at"],
