@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+runtime_python="$HOME/.local/share/grabowski-mcp/.venv/bin/python"
+if [ ! -x "$runtime_python" ]; then
+  printf '%s\n' '{"schema_version":1,"status":"failed","error":"grabowski_runtime_python_unavailable","automatic_execution_authorized":false}' >&2
+  exit 1
+fi
+exec "$runtime_python" -m grabowski_coding_agent_router_cli "$@"

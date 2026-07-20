@@ -100,6 +100,18 @@ class OperatorContextTests(unittest.TestCase):
             ["claude", "codex", "agy", "cline"],
         )
         self.assertEqual(
+            protocol["review_and_contrast_agent_priority"],
+            ["claude", "codex", "agy", "cline"],
+        )
+        self.assertEqual(
+            protocol["coding_agent_priority_semantics"],
+            "legacy_name_review_and_contrast_only",
+        )
+        self.assertEqual(
+            protocol["execution_priority_semantics"],
+            "authoritative_operator_then_advisory_helpers",
+        )
+        self.assertEqual(
             protocol["workspace_execution_model"],
             {
                 "default": "direct_operator",
@@ -118,6 +130,7 @@ class OperatorContextTests(unittest.TestCase):
                 "workspace_not_universal": True,
                 "direct_operator_for": [
                     "all_authoritative_implementation",
+                    "all_reviews",
                     "all_task_sizes",
                     "runtime_or_security_change",
                     "long_or_multi_file_implementation",
@@ -136,6 +149,7 @@ class OperatorContextTests(unittest.TestCase):
                 "max_external_candidates": 2,
                 "external_candidate_authority": "advisory_only",
                 "external_primary_writer_forbidden": True,
+                "external_primary_reviewer_forbidden": True,
                 "capacity_fallback_to_external_writer": False,
                 "automatic_patch_apply": False,
                 "automatic_winner_selection": False,

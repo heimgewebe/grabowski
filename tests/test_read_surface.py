@@ -274,7 +274,7 @@ class ReadSurfaceTests(unittest.TestCase):
         healthy_router = types.ModuleType("grabowski_coding_agent_router")
         healthy_router.coding_agent_catalog_health = lambda: {
             "ready": True,
-            "source": "deployment_catalog",
+            "source": "embedded-runtime",
             "catalog_sha256": "a" * 64,
         }
         with patch.dict(
@@ -285,7 +285,7 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertTrue(result["semantic_catalog_ready"])
         self.assertTrue(result["catalog_matches_contract"])
         self.assertEqual(
-            result["coding_agent_catalog"]["source"], "deployment_catalog"
+            result["coding_agent_catalog"]["source"], "embedded-runtime"
         )
 
         invalid_router = types.ModuleType("grabowski_coding_agent_router")

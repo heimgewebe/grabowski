@@ -509,29 +509,32 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertFalse(decision["automatic_cleanup_authorized"])
         self.assertTrue(self.git.writer.exists())
 
-    def test_public_create_rejects_missing_advisory_route_before_effects(self) -> None:
-        with mock.patch.object(
-            workspace.operator, "_require_operator_mutation"
-        ) as mutation:
-            with self.assertRaisesRegex(
-                workspace.AgentWorkspaceError,
-                "schema-v2 advisory route evidence",
-            ):
-                workspace.grabowski_agent_workspace_create(
-                    binding_kind="thread_focus",
-                    binding_id="thread-direct-first-gate",
-                    repository=str(self.git.repo),
-                    expected_base_head=self.git.base,
-                    writer_branch="feat/direct-first-gate",
-                    writer_worktree=str(self.root / "direct-first-gate"),
-                    allowed_paths=["src"],
-                    writer_argv=["true"],
-                    test_argv=["true"],
-                    review_argv=["true"],
-                    runtime_seconds=600,
-                )
-        mutation.assert_not_called()
-        self.assertFalse((self.root / "direct-first-gate").exists())
+    def test_public_create_rejects_missing_or_invalid_advisory_route_before_effects(self) -> None:
+        for route_evidence in (None, [], "invalid"):
+            with self.subTest(route_evidence=route_evidence):
+                with mock.patch.object(
+                    workspace.operator, "_require_operator_mutation"
+                ) as mutation:
+                    with self.assertRaisesRegex(
+                        workspace.AgentWorkspaceError,
+                        "schema-v2 advisory route evidence",
+                    ):
+                        workspace.grabowski_agent_workspace_create(
+                            route_evidence=route_evidence,  # type: ignore[arg-type]
+                            binding_kind="thread_focus",
+                            binding_id="thread-direct-first-gate",
+                            repository=str(self.git.repo),
+                            expected_base_head=self.git.base,
+                            writer_branch="feat/direct-first-gate",
+                            writer_worktree=str(self.root / "direct-first-gate"),
+                            allowed_paths=["src"],
+                            writer_argv=["true"],
+                            test_argv=["true"],
+                            review_argv=["true"],
+                            runtime_seconds=600,
+                        )
+                mutation.assert_not_called()
+                self.assertFalse((self.root / "direct-first-gate").exists())
 
     def test_route_evidence_is_hash_bound_and_missing_evidence_fails_closed(self) -> None:
         normalized = workspace._normalize_route_evidence(complete_route_evidence())

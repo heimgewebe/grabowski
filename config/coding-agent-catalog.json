@@ -606,16 +606,16 @@
       "opus_role": "Upper-frontier independent review and judgment contrast; never an authoritative writer.",
       "principle": "Grabowski/ChatGPT performs every authoritative implementation directly, independent of size. External frontier models are ranked only for advisory review or explicitly requested isolated contrast work.",
       "same_task_peer_use": true,
-      "upper_work_routes": [
+      "top_contrast_routes": [
+        "codex-sol-high",
+        "claude-fable-5-contrast-high"
+      ],
+      "upper_review_or_contrast_routes": [
         "codex-sol-medium",
         "claude-opus-4.8-high",
         "codex-terra-high",
         "claude-sonnet-5-high",
         "grok-4.5-high"
-      ],
-      "top_contrast_routes": [
-        "codex-sol-high",
-        "claude-fable-5-contrast-high"
       ]
     },
     "model_quality_is_prior_not_truth": true,
@@ -717,11 +717,13 @@
         "planning",
         "implementation",
         "tests",
+        "review",
         "integration",
         "merge",
         "deployment",
         "closeout"
-      ]
+      ],
+      "external_primary_reviewer_forbidden": true
     }
   },
   "quota_pools": {
@@ -2045,7 +2047,7 @@
     }
   ],
   "schema_version": 2,
-  "source": "versioned-repository-default",
+  "source": "versioned-repository-embedded-runtime",
   "task_classes": {
     "architecture": {
       "critical": false,
