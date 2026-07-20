@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "dd5e77f1c836de87af896fcef0a24eaba15d03fb86346bdf322ea0ba632039e4",
+  "capability_source_sha256": "3ae4d9f1b8e5e8d5769e550abd7947596c93b5fbfdcf818dab668dab0a06423c",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "4ca920fde323408f931da8e870cd9568f28c5b3bf0e1cd91479d8c85b3a5b4c1",
+  "contract_sha256": "2ada01660eb35bd2cf8d607ff6aa88798d85161490467a1eca121804b77b7a82",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1412,6 +1412,19 @@
       "reversibility": "artifact-preserving",
       "risk_class": "medium",
       "tool": "grabowski_bureau_task_propose"
+    },
+    {
+      "category": "bureau",
+      "description": "Review one exact Bureau proposal digest without changing Registry, Queue or publication truth.",
+      "effects": [
+        "private_proposal_artifact"
+      ],
+      "id": "grabowski_bureau_task_review",
+      "purpose": "Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation.",
+      "read_only": false,
+      "reversibility": "artifact-preserving-idempotent-review",
+      "risk_class": "medium",
+      "tool": "grabowski_bureau_task_review"
     },
     {
       "category": "bureau",

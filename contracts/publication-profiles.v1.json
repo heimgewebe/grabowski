@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "4ca920fde323408f931da8e870cd9568f28c5b3bf0e1cd91479d8c85b3a5b4c1"
+    "sha256": "2ada01660eb35bd2cf8d607ff6aa88798d85161490467a1eca121804b77b7a82"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "e4482e855bda7c65470b6e29ae480f9d8130b1d60eb53db64fc68a11e33ff42a"
+    "sha256": "baecd6d99e394130d9c7c943f4919c88f5c245e18001912250000ff85b536eaa"
   },
   "counts": {
     "core": 22,
-    "full": 154,
-    "operator": 139
+    "full": 155,
+    "operator": 140
   },
   "profiles": {
     "core": [
@@ -150,6 +150,7 @@
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
+      "grabowski_bureau_task_review",
       "grabowski_bureau_task_publish_preview",
       "grabowski_bureau_task_publish",
       "grabowski_resource_nonconflict_assess",
@@ -291,6 +292,7 @@
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
+      "grabowski_bureau_task_review",
       "grabowski_bureau_task_publish_preview",
       "grabowski_bureau_task_publish",
       "grabowski_resource_nonconflict_assess",
