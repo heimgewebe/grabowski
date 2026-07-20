@@ -1128,6 +1128,9 @@ def _resolve_root_task_systemd_action(
         argv = [
             "/usr/bin/systemd-run",
             "--system",
+            # Preserve the validated command as literal argv. Without this,
+            # systemd-run expands $VAR and ${VAR} before the root task starts.
+            "--expand-environment=no",
             f"--description={description}",
             "--unit",
             unit,

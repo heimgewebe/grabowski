@@ -1390,6 +1390,11 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
     argv = [
         "systemd-run",
         "--user",
+        # systemd-run otherwise expands $VAR, ${VAR} and related forms in
+        # command arguments before the selected executable receives them.
+        # Durable task argv is opaque payload; only that executable may
+        # interpret shell or template syntax.
+        "--expand-environment=no",
         f"--description={operator._systemd_safe_description('task', unit, record['argv_sha256'])}",
         "--unit",
         unit,

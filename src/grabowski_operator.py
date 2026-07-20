@@ -2874,6 +2874,9 @@ def _start_job(
     systemd_argv = [
         "systemd-run",
         "--user",
+        # Preserve opaque job argv until the selected executable receives it.
+        # systemd-run otherwise expands $VAR and ${VAR} in command arguments.
+        "--expand-environment=no",
         f"--description={_systemd_safe_description('job', unit, metadata['argv_sha256'])}",
         "--unit",
         unit,
