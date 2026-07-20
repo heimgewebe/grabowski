@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from grabowski_blockade_authority import resolve_lifecycle
+import grabowski_command_identity as command_identity
 
 MAX_INPUT_BYTES = 64 * 1024
 MAX_CONFIG_BYTES = 512 * 1024
@@ -1128,9 +1129,6 @@ def _resolve_root_task_systemd_action(
         argv = [
             "/usr/bin/systemd-run",
             "--system",
-            # Preserve the validated command as literal argv. Without this,
-            # systemd-run expands $VAR and ${VAR} before the root task starts.
-            "--expand-environment=no",
             f"--description={description}",
             "--unit",
             unit,
@@ -1157,7 +1155,7 @@ def _resolve_root_task_systemd_action(
         ]
         if memory is not None:
             argv.append(f"--property=MemoryMax={memory}")
-        argv.extend(["--", *command])
+        argv.extend(["--", *command_identity.systemd_escape_argv(command)])
     execution: dict[str, Any] = {
         "mode": "root-task-systemd",
         "internal_action": f"root-task-{operation}",

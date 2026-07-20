@@ -137,7 +137,7 @@ class TaskTests(unittest.TestCase):
         self.assertIn(" argv=", descriptions[0])
         self.assertNotIn("\n", descriptions[0])
         self.assertIn("--slice=grabowski-tasks.slice", launch)
-        self.assertIn("--expand-environment=no", launch)
+        self.assertNotIn("--expand-environment=no", launch)
         self.assertEqual(launch.count("--property=LimitCORE=0"), 1)
         self.assertIn("--property=CPUWeight=50", launch)
         self.assertIn("--property=IOWeight=25", launch)
@@ -148,6 +148,32 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=UMask=0077", launch)
         self.assertEqual(launch[-3:], ["--", "/bin/echo", "ok"])
         return result
+
+    def test_systemd_escape_argv_doubles_only_dollars_without_mutating_input(self) -> None:
+        command = [
+            "$HOME",
+            "${cluster}",
+            "$(uname)",
+            "${{ github.sha }}",
+            "$$",
+            "plain",
+            "Grüße 🌍",
+        ]
+        original = list(command)
+
+        self.assertEqual(
+            command_identity.systemd_escape_argv(command),
+            [
+                "$$HOME",
+                "$${cluster}",
+                "$$(uname)",
+                "$${{ github.sha }}",
+                "$$$$",
+                "plain",
+                "Grüße 🌍",
+            ],
+        )
+        self.assertEqual(command, original)
 
     def test_task_start_preserves_literal_shell_and_template_argv_end_to_end(self) -> None:
         command = [
@@ -178,8 +204,8 @@ class TaskTests(unittest.TestCase):
         separator = launch.index("--")
         self.assertEqual(command, task["argv"])
         self.assertEqual(command_identity.argv_sha256(command), task["argv_sha256"])
-        self.assertEqual(command, launch[separator + 1 :])
-        self.assertIn("--expand-environment=no", launch[:separator])
+        self.assertEqual(command_identity.systemd_escape_argv(command), launch[separator + 1 :])
+        self.assertNotIn("--expand-environment=no", launch[:separator])
 
     def test_server_task_lease_delegation_requires_running_task_and_live_leases(self) -> None:
         result = self._start(resource_keys=["component:test-task-delegation"])
