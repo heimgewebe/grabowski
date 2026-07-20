@@ -1138,6 +1138,13 @@ TOOL_PROFILES.update(
             "effects": ["private_proposal_artifact"],
             "reversibility": "artifact-preserving",
         },
+        "grabowski_bureau_task_review": {
+            "category": "bureau",
+            "purpose": "Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation.",
+            "risk_class": "medium",
+            "effects": ["private_proposal_artifact"],
+            "reversibility": "artifact-preserving-idempotent-review",
+        },
         "grabowski_bureau_task_publish_preview": {
             "category": "bureau",
             "purpose": "Validate one Bureau task proposal and return exact publication resources without effects.",

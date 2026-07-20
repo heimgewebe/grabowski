@@ -112,6 +112,7 @@
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_candidate_assess",
     "grabowski_bureau_task_propose",
+    "grabowski_bureau_task_review",
     "grabowski_bureau_task_publish_preview",
     "grabowski_bureau_task_publish",
     "grabowski_resource_nonconflict_assess",

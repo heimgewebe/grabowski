@@ -391,6 +391,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_bureau_candidate_record": ("terminal_execute",),
     "grabowski_bureau_candidate_assess": (),
     "grabowski_bureau_task_propose": ("terminal_execute",),
+    "grabowski_bureau_task_review": ("terminal_execute",),
     "grabowski_bureau_task_publish_preview": (),
     "grabowski_bureau_task_publish": ("resource_lease", "terminal_execute"),
 }
@@ -398,6 +399,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_task_propose",
+    "grabowski_bureau_task_review",
     "grabowski_bureau_task_publish",
     "grabowski_github_pr_view",
     "grabowski_github_checks",

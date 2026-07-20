@@ -423,6 +423,59 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertFalse(first["idempotent_adapter_replay"])
         self.assertTrue(second["idempotent_adapter_replay"])
 
+    def test_task_review_binds_exact_digest_without_caller_timestamp(self) -> None:
+        proposal_id = "b" * 64
+        self._write_proposal(proposal_id)
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={
+                "kind": "bureau_task_review_result",
+                "status": "reviewed",
+                "proposal_sha256": "c" * 64,
+            },
+        ) as invoke:
+            result = intake.grabowski_bureau_task_review(
+                proposal_id,
+                "operator-reviewer",
+                "c" * 64,
+                registry_root=str(self.root),
+            )
+        arguments = invoke.call_args.args[0]
+        self.assertIn("operator-task-review", arguments)
+        self.assertEqual(arguments[arguments.index("--reviewer") + 1], "operator-reviewer")
+        self.assertEqual(arguments[arguments.index("--proposal-sha256") + 1], "c" * 64)
+        self.assertNotIn("--reviewed-at", arguments)
+        self.assertTrue(invoke.call_args.kwargs["mutation"])
+        self.assertEqual(invoke.call_args.kwargs["required_readback"], ["proposal_artifact"])
+        self.assertEqual(result["adapter_proposal_id"], proposal_id)
+
+    def test_task_review_rejects_invalid_public_inputs_before_bureau(self) -> None:
+        proposal_id = "b" * 64
+        self._write_proposal(proposal_id)
+        with mock.patch.object(intake, "_invoke_bureau") as invoke:
+            with self.assertRaises(ValueError):
+                intake.grabowski_bureau_task_review(
+                    proposal_id, "", "c" * 64, registry_root=str(self.root)
+                )
+            with self.assertRaises(ValueError):
+                intake.grabowski_bureau_task_review(
+                    proposal_id, "reviewer", "not-a-digest", registry_root=str(self.root)
+                )
+        invoke.assert_not_called()
+
+    def test_task_review_rejects_symlink_plan(self) -> None:
+        proposal_id = "a" * 64
+        directory = self.artifacts / "proposals" / proposal_id
+        directory.mkdir(parents=True)
+        target = directory / "target.json"
+        target.write_text("{}\n", encoding="utf-8")
+        (directory / "plan.json").symlink_to(target)
+        with self.assertRaises(FileNotFoundError):
+            intake.grabowski_bureau_task_review(
+                proposal_id, "reviewer", "c" * 64, registry_root=str(self.root)
+            )
+
     def _write_proposal(self, proposal_id: str = "b" * 64) -> Path:
         directory = self.artifacts / "proposals" / proposal_id
         directory.mkdir(parents=True)

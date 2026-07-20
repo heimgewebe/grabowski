@@ -11,6 +11,7 @@ Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale
 | `grabowski_bureau_candidate_record` | Hängt einen quellgebundenen Kandidaten idempotent an das Bureau Live Register an. |
 | `grabowski_bureau_candidate_assess` | Bewertet einen Kandidaten read-only gegen aktuelle Registry- und Live-Register-Wahrheit. |
 | `grabowski_bureau_task_propose` | Erzeugt ein digestgebundenes privates Proposal-Artefakt; Registry und Queue bleiben unverändert. |
+| `grabowski_bureau_task_review` | Prüft exakt den angegebenen Proposal-Digest und erzeugt `reviewed_plan`-Approval-Evidenz; Reviewzeitpunkt kommt ausschließlich aus Bureau. |
 | `grabowski_bureau_task_publish_preview` | Validiert ein Proposal und liefert die exakt benötigten Publikationsressourcen ohne Wirkung. |
 | `grabowski_bureau_task_publish` | Erwirbt zwei exakte Kurzleasen, publiziert Branch und Pull Request und gibt Leases nur nach eindeutigem Ausgang frei. |
 
@@ -25,7 +26,7 @@ Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale
 
 ## Idempotenz
 
-Kandidaten verwenden den Bureau-Idempotenzschlüssel. Proposal-Verzeichnisse werden aus dem kanonischen Request-Hash abgeleitet. Ein vorhandener Plan wird nicht blind wiederverwendet, sondern erneut gegen aktuelle Registry-Wahrheit geprüft. Ein vorhandenes Publikations-Receipt wird vor jeder neuen Lease-Akquise über Bureaus Receipt-Replay gelesen.
+Kandidaten verwenden den Bureau-Idempotenzschlüssel. Proposal-Verzeichnisse werden aus dem kanonischen Request-Hash abgeleitet. Ein vorhandener Plan wird nicht blind wiederverwendet, sondern erneut gegen aktuelle Registry-Wahrheit geprüft. Reviews binden Reviewer und exakten Proposal-Digest; der Adapter akzeptiert bewusst keinen aufrufergesteuerten Reviewzeitpunkt und überlässt dessen Erzeugung ausschließlich Bureau. Ein vorhandenes Publikations-Receipt wird vor jeder neuen Lease-Akquise über Bureaus Receipt-Replay gelesen.
 
 ## Publikationsvertrag
 
