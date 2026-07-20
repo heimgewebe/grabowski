@@ -4658,10 +4658,24 @@ def _project_status_fields(
     )
 
 
+def _coding_agent_catalog_health() -> dict[str, Any]:
+    try:
+        import grabowski_coding_agent_router
+
+        return grabowski_coding_agent_router.coding_agent_catalog_health()
+    except Exception as exc:  # pragma: no cover - defensive status boundary
+        return {
+            "ready": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:512],
+        }
+
+
 def _operator_system_overview(
     *,
     runtime_healthy: bool,
     client_snapshot: dict[str, Any],
+    coding_agent_catalog: dict[str, Any],
 ) -> dict[str, Any]:
     tasks: dict[str, Any] = {
         "available": False,
@@ -4732,6 +4746,7 @@ def _operator_system_overview(
         )
 
     snapshot_observable = bool(client_snapshot.get("observable"))
+    coding_agent_catalog_ready = coding_agent_catalog.get("ready") is True
     unknown_state_count = tasks.get("unknown_state_count")
     truth_model_ready = tasks.get("available") is True and unknown_state_count == 0
     components_observable = (
@@ -4743,12 +4758,15 @@ def _operator_system_overview(
     )
     operator_ready = (
         runtime_healthy
+        and coding_agent_catalog_ready
         and snapshot_observable
         and truth_model_ready
         and components_observable
     )
     if not runtime_healthy:
         next_action = "repair runtime integrity before operator mutation"
+    elif not coding_agent_catalog_ready:
+        next_action = "repair coding-agent catalog semantics before routed execution"
     elif not snapshot_observable:
         next_action = str(
             client_snapshot.get(
@@ -4835,11 +4853,13 @@ def _operator_system_overview(
         "operator_ready": operator_ready,
         "readiness": {
             "runtime_ready": runtime_healthy,
+            "coding_agent_catalog_ready": coding_agent_catalog_ready,
             "connector_snapshot_ready": snapshot_observable,
             "truth_model_ready": truth_model_ready,
             "components_observable": components_observable,
         },
         "runtime": {"healthy": runtime_healthy},
+        "coding_agent_catalog": coding_agent_catalog,
         "connector": {
             "state": client_snapshot.get("state"),
             "observable": snapshot_observable,
@@ -4873,6 +4893,7 @@ def grabowski_status(
     active_profile = _active_profile(policy)
     deployment = _deployment_metadata()
     tool_contract = _runtime_tool_contract_summary(deployment)
+    coding_agent_catalog = _coding_agent_catalog_health()
     audit = _verify_audit_log(AUDIT_LOG)
     audit_writable = bool(audit.get("audit_writable", audit.get("valid")))
     kill_switch = _kill_switch_state()
@@ -4919,6 +4940,14 @@ def grabowski_status(
         warnings.append({"code": "kill_switch_engaged"})
     if not bool(tool_contract.get("runtime_matches_deployment_contract")):
         warnings.append({"code": "runtime_tool_contract_drift"})
+    if coding_agent_catalog.get("ready") is not True:
+        warnings.append(
+            {
+                "code": "coding_agent_catalog_invalid",
+                "error_type": coding_agent_catalog.get("error_type"),
+                "detail": coding_agent_catalog.get("error"),
+            }
+        )
     if not bool(deployment.get("agent_instructions_identity_valid")):
         warnings.append({"code": "agent_instructions_drift"})
     client_snapshot = tool_contract.get("client_snapshot", {})
@@ -4947,11 +4976,16 @@ def grabowski_status(
         system_overview = _operator_system_overview(
             runtime_healthy=healthy,
             client_snapshot=client_snapshot,
+            coding_agent_catalog=coding_agent_catalog,
         )
     if bool(audit.get("valid")) and not audit_writable:
         recommended_next_action = "restore audit writability before operator mutation"
     elif not healthy:
         recommended_next_action = "repair runtime integrity before operator mutation"
+    elif coding_agent_catalog.get("ready") is not True:
+        recommended_next_action = (
+            "repair coding-agent catalog semantics before routed execution"
+        )
     elif not bool(client_snapshot.get("observable")):
         recommended_next_action = str(
             client_snapshot.get(
@@ -4996,6 +5030,7 @@ def grabowski_status(
                 "refresh_required_when_client_count_or_hash_differs"
             ),
         },
+        "coding_agent_catalog": coding_agent_catalog,
         "agent_instructions": {
             **_agent_instructions_metadata(),
             "runtime_matches_deployment_manifest": deployment.get(

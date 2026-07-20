@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 from contextlib import ExitStack
 import hashlib
-import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -466,6 +465,10 @@ class ConsumerSurfaceTests(unittest.TestCase):
         ):
             overview = grabowski_mcp._operator_system_overview(
                 runtime_healthy=True,
+                coding_agent_catalog={
+                    "ready": True,
+                    "source": "deployment_catalog",
+                },
                 client_snapshot={
                     "state": "missing",
                     "observable": False,
@@ -489,6 +492,53 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertEqual(
             "target_required",
             overview["source_registry"]["systemkatalog"]["observation_state"],
+        )
+
+    def test_operator_system_overview_prioritizes_invalid_coding_catalog(self) -> None:
+        fake_tasks = SimpleNamespace(
+            grabowski_task_list=lambda **_kwargs: {
+                "state_counts": {},
+                "projection_counts": {},
+                "projection_counts_overlap": False,
+                "unknown_state_count": 0,
+                "state_counts_complete": True,
+            }
+        )
+        fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _parameters: {
+                "record_count": 0,
+                "integrity_errors": [],
+                "scan_truncated": False,
+            }
+        )
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "grabowski_tasks": fake_tasks,
+                "grabowski_resources": fake_resources,
+                "grabowski_operator_obligation": fake_obligations,
+            },
+        ):
+            overview = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                coding_agent_catalog={
+                    "ready": False,
+                    "error": "invalid catalog",
+                },
+                client_snapshot={
+                    "state": "current",
+                    "observable": True,
+                    "fresh": True,
+                    "matched": True,
+                    "verification_model": "test",
+                },
+            )
+        self.assertFalse(overview["operator_ready"])
+        self.assertFalse(overview["readiness"]["coding_agent_catalog_ready"])
+        self.assertEqual(
+            "repair coding-agent catalog semantics before routed execution",
+            overview["recommended_next_action"],
         )
 
     def test_task_pagination_has_no_duplicates_and_cursor_is_view_filter_bound(self) -> None:

@@ -701,6 +701,37 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(first["windows"][0]["record_count"], 1)
         self.assertEqual(second["windows"][0]["record_count"], 0)
         self.assertNotEqual(first["findings_sha256"], second["findings_sha256"])
+    def test_contract_drift_combines_structural_and_semantic_health(self) -> None:
+        healthy_router = types.ModuleType("grabowski_coding_agent_router")
+        healthy_router.coding_agent_catalog_health = lambda: {
+            "ready": True,
+            "source": "deployment_catalog",
+            "catalog_sha256": "a" * 64,
+        }
+        with patch.dict(
+            sys.modules, {"grabowski_coding_agent_router": healthy_router}, clear=False
+        ):
+            result = read_surface.grabowski_contract_drift()
+        self.assertTrue(result["capability_catalog_matches_contract"])
+        self.assertTrue(result["semantic_catalog_ready"])
+        self.assertTrue(result["catalog_matches_contract"])
+        self.assertEqual(
+            result["coding_agent_catalog"]["source"], "deployment_catalog"
+        )
+
+        invalid_router = types.ModuleType("grabowski_coding_agent_router")
+        invalid_router.coding_agent_catalog_health = lambda: {
+            "ready": False,
+            "error_type": "CodingAgentRouterError",
+            "error": "invalid catalog",
+        }
+        with patch.dict(
+            sys.modules, {"grabowski_coding_agent_router": invalid_router}, clear=False
+        ):
+            invalid = read_surface.grabowski_contract_drift()
+        self.assertTrue(invalid["capability_catalog_matches_contract"])
+        self.assertFalse(invalid["semantic_catalog_ready"])
+        self.assertFalse(invalid["catalog_matches_contract"])
 
     def test_contract_contains_all_read_tools(self) -> None:
         contract = json.loads((ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8"))
