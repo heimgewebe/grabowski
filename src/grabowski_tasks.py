@@ -1390,11 +1390,6 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
     argv = [
         "systemd-run",
         "--user",
-        # systemd-run otherwise expands $VAR, ${VAR} and related forms in
-        # command arguments before the selected executable receives them.
-        # Durable task argv is opaque payload; only that executable may
-        # interpret shell or template syntax.
-        "--expand-environment=no",
         f"--description={operator._systemd_safe_description('task', unit, record['argv_sha256'])}",
         "--unit",
         unit,
@@ -1416,7 +1411,7 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
     ]
     if record["memory_max_bytes"] is not None:
         argv.append(f"--property=MemoryMax={record['memory_max_bytes']}")
-    return [*argv, "--", *command]
+    return [*argv, "--", *command_identity.systemd_escape_argv(command)]
 
 
 def _root_task_start_payload(record: dict[str, Any]) -> dict[str, Any]:

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Preserved literal argv across durable jobs and both user and root persistent-task launchers by disabling systemd-run environment expansion; shell variables, command substitutions, heredocs and foreign template syntax now reach only the intended runtime while stored argv and SHA-256 identity remain unchanged.
+- Preserved literal argv across durable jobs and both user and root persistent-task launchers with a reversible systemd dollar transport encoding compatible with systemd 249 and newer; shell variables, command substitutions, heredocs and foreign template syntax now reach only the intended runtime while stored argv and SHA-256 identity remain unchanged.
 - Juno Operator beendet interaktive Warnläufe ohne rote `SystemExit`-Ausnahme; echte Laufzeitfehler bleiben weiterhin sichtbar.
 - Extended the commit-bound Rootbroker cutover to install the reviewed root-task systemd action as an exact, recovery-gated catalog contract; absent actions are added, exact preexisting actions remain idempotent, drifted actions, broadened patterns or command prefixes, and incoherent publisher/lifecycle gates fail closed before backup or mutation.
 - Added Juno Operator, a standard-library-only read-only iPad dashboard with bounded storage/network collectors, local cache, self-contained HTML, notebook entry point, and hash-bound incident packages.

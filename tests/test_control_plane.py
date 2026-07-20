@@ -472,7 +472,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
         self.assertEqual(execution["internal_action"], "root-task-start")
         argv = execution["argv"]
         self.assertEqual(argv[:2], ["/usr/bin/systemd-run", "--system"])
-        self.assertIn("--expand-environment=no", argv)
+        self.assertNotIn("--expand-environment=no", argv)
         self.assertIn("--slice=grabowski-root-tasks.slice", argv)
         self.assertIn("--property=LogRateLimitIntervalSec=30s", argv)
         self.assertIn("--property=LogRateLimitBurst=1000", argv)
@@ -508,8 +508,8 @@ class PrivilegedBrokerTests(unittest.TestCase):
         execution = privileged_broker.resolve_execution(self._root_task_config(), parsed)
         argv = execution["argv"]
         separator = argv.index("--")
-        self.assertIn("--expand-environment=no", argv[:separator])
-        self.assertEqual(command, argv[separator + 1 :])
+        self.assertNotIn("--expand-environment=no", argv[:separator])
+        self.assertEqual(privileged_broker.command_identity.systemd_escape_argv(command), argv[separator + 1 :])
 
     def test_root_task_start_rejects_runtime_without_lease_grace(self) -> None:
         reference = self._root_task_reference({
