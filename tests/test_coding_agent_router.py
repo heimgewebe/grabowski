@@ -145,16 +145,41 @@ class CodingAgentRouterTests(unittest.TestCase):
         )
         route.pop("review_only", None)
         stale.write_text(json.dumps(stale_catalog), encoding="utf-8")
-        with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.object(Path, "home", return_value=home),
-        ):
+        with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 router._catalog_path(), ROOT / "config" / "coding-agent-catalog.json"
             )
             health = router.coding_agent_catalog_health()
         self.assertTrue(health["ready"])
         self.assertEqual(health["source"], "deployment_catalog")
+
+    def test_installed_module_resolves_release_scoped_catalog(self) -> None:
+        release = self.root / "release"
+        catalog = release / "config" / "coding-agent-catalog.json"
+        catalog.parent.mkdir(parents=True)
+        catalog.write_text(json.dumps(self.catalog), encoding="utf-8")
+        module = release / ".venv/lib/python3.10/site-packages/grabowski_coding_agent_router.py"
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(router, "__file__", str(module)),
+            mock.patch.object(router.sys, "prefix", str(release / ".venv")),
+        ):
+            health = router.coding_agent_catalog_health()
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["source"], "deployment_catalog")
+        self.assertEqual(health["path"], str(catalog))
+
+    def test_global_prefix_does_not_masquerade_as_release(self) -> None:
+        module = Path("/usr/local/lib/python3.10/site-packages/grabowski_coding_agent_router.py")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(router, "__file__", str(module)),
+            mock.patch.object(router.sys, "prefix", "/usr"),
+        ):
+            self.assertEqual(
+                router._catalog_path(),
+                Path("/usr/local/lib/python3.10/config/coding-agent-catalog.json"),
+            )
 
     def test_explicit_invalid_catalog_is_reported_by_health(self) -> None:
         invalid = json.loads(json.dumps(self.catalog))

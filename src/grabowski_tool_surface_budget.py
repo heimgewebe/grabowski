@@ -154,8 +154,31 @@ def capability_projection(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _runtime_tools(payload: Mapping[str, Any]) -> list[str]:
-    if payload.get("schema_version") != 2:
-        raise ToolSurfaceBudgetError("runtime entrypoint must use schema_version 2")
+    schema_version = payload.get("schema_version")
+    if schema_version not in {2, 3}:
+        raise ToolSurfaceBudgetError(
+            "runtime entrypoint must use schema_version 2 or 3"
+        )
+    runtime_assets = payload.get("runtime_assets", [])
+    if schema_version == 2 and runtime_assets:
+        raise ToolSurfaceBudgetError("runtime_assets requires schema_version 3")
+    if not isinstance(runtime_assets, list):
+        raise ToolSurfaceBudgetError("runtime_assets must be a list")
+    for index, item in enumerate(runtime_assets):
+        if not isinstance(item, dict) or set(item) != {"source", "destination"}:
+            raise ToolSurfaceBudgetError(
+                f"runtime_assets[{index}] must declare source and destination"
+            )
+        _text(
+            item.get("source"),
+            label=f"runtime_assets[{index}].source",
+            maximum=500,
+        )
+        _text(
+            item.get("destination"),
+            label=f"runtime_assets[{index}].destination",
+            maximum=500,
+        )
     raw = payload.get("expected_tools")
     if not isinstance(raw, list):
         raise ToolSurfaceBudgetError("runtime expected_tools must be a list")
