@@ -35,6 +35,7 @@ MCP_HEALTH_TOOL = "grabowski_runtime_health"
 MCP_MAX_RESPONSE_BYTES = 65536
 MCP_STDIO_SHUTDOWN_TIMEOUT = 2.0
 STACK_DUMP_PATH = DEFAULT_STATE_DIR / "operator-stackdump.log"
+STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
 STACK_DUMP_MAX_BYTES = 1_048_576
 DEFAULT_BACKOFF_BASE = 60
 DEFAULT_BACKOFF_MAX = 900
@@ -805,59 +806,219 @@ def decide(
     )
 
 
-def _prepare_stack_dump_target(path: Path) -> bool:
+def _stack_dump_memfd(
+    pid: int,
+    proc_root: Path = Path("/proc"),
+) -> int | None:
+    if pid <= 0:
+        return None
+    directory = proc_root / str(pid) / "fd"
+    try:
+        entries = sorted(directory.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return None
+    expected = f"memfd:{STACK_DUMP_MEMFD_NAME}"
+    matches: list[int] = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            target = os.readlink(entry).lstrip("/")
+        except OSError:
+            continue
+        if target in {expected, f"{expected} (deleted)"}:
+            matches.append(int(entry.name))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _stack_dump_memfd_position(
+    pid: int,
+    descriptor: int,
+    max_bytes: int,
+    proc_root: Path = Path("/proc"),
+) -> int | None:
+    if pid <= 0 or descriptor < 0 or max_bytes <= 0:
+        return None
+    path = proc_root / str(pid) / "fdinfo" / str(descriptor)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    if len(text.encode("utf-8")) > 4096:
+        return None
+    for line in text.splitlines():
+        if not line.startswith("pos:"):
+            continue
+        try:
+            position = int(line.split(":", 1)[1].strip(), 10)
+        except ValueError:
+            return None
+        if not 0 <= position <= max_bytes:
+            return None
+        return position
+    return None
+
+
+def _read_stack_dump_memfd(
+    pid: int,
+    descriptor: int,
+    start: int,
+    end: int,
+    max_bytes: int,
+    proc_root: Path = Path("/proc"),
+) -> bytes | None:
+    if (
+        pid <= 0
+        or descriptor < 0
+        or start < 0
+        or end <= start
+        or end > max_bytes
+    ):
+        return None
+    path = proc_root / str(pid) / "fd" / str(descriptor)
+    expected = f"memfd:{STACK_DUMP_MEMFD_NAME}"
+    try:
+        target = os.readlink(path).lstrip("/")
+    except OSError:
+        return None
+    if target not in {expected, f"{expected} (deleted)"}:
+        return None
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    try:
+        source = os.open(path, flags)
+        try:
+            metadata = os.fstat(source)
+            if (
+                not statmod.S_ISREG(metadata.st_mode)
+                or metadata.st_size != max_bytes
+            ):
+                return None
+            required_seals = fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK
+            seals = fcntl.fcntl(source, fcntl.F_GET_SEALS)
+            if seals & required_seals != required_seals:
+                return None
+            payload = os.pread(source, end - start, start)
+        finally:
+            os.close(source)
+    except OSError:
+        return None
+    return payload if len(payload) == end - start else None
+
+
+def _remove_stack_dump_target(path: Path) -> bool:
+    try:
+        parent_metadata = path.parent.lstat()
+        if not statmod.S_ISDIR(parent_metadata.st_mode):
+            return False
+        path.unlink(missing_ok=True)
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        directory_descriptor = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OSError:
+        return False
+    return True
+
+
+def _write_stack_dump_target(
+    path: Path,
+    payload: bytes,
+    max_bytes: int,
+) -> bool:
+    if not payload or max_bytes <= 0 or len(payload) > max_bytes:
+        return False
+    temporary_path: Path | None = None
+    descriptor = -1
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(path, flags, 0o600)
-        try:
-            metadata = os.fstat(descriptor)
-            if not statmod.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        parent_metadata = path.parent.lstat()
+        if not statmod.S_ISDIR(parent_metadata.st_mode):
+            return False
+        os.chmod(path.parent, 0o700)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        metadata = os.fstat(descriptor)
+        if not statmod.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return False
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
                 return False
-            os.fchmod(descriptor, 0o600)
+            written += count
+        os.fsync(descriptor)
+        os.replace(temporary_path, path)
+        temporary_path = None
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        directory_descriptor = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
         finally:
-            os.close(descriptor)
+            os.close(directory_descriptor)
     except OSError:
         return False
-    return True
-
-
-def _cap_stack_dump_target(path: Path, max_bytes: int) -> bool:
-    flags = os.O_WRONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
     try:
-        descriptor = os.open(path, flags)
-        try:
-            metadata = os.fstat(descriptor)
-            if not statmod.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                return False
-            if metadata.st_size > max_bytes:
-                os.ftruncate(descriptor, max_bytes)
-        finally:
-            os.close(descriptor)
+        metadata = path.lstat()
     except OSError:
         return False
-    return True
+    return (
+        statmod.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and statmod.S_IMODE(metadata.st_mode) == 0o600
+        and metadata.st_size == len(payload)
+    )
 
 
 def request_python_stack_dump(
     pid: int,
     path: Path = STACK_DUMP_PATH,
     max_bytes: int = STACK_DUMP_MAX_BYTES,
+    proc_root: Path = Path("/proc"),
 ) -> bool:
     if pid <= 0 or max_bytes <= 0 or not hasattr(signal, "SIGUSR1"):
         return False
-    if not _prepare_stack_dump_target(path):
+    descriptor = _stack_dump_memfd(pid, proc_root)
+    if descriptor is None:
+        return False
+    before = _stack_dump_memfd_position(
+        pid, descriptor, max_bytes, proc_root
+    )
+    if before is None or not _remove_stack_dump_target(path):
         return False
     try:
         os.kill(pid, signal.SIGUSR1)
     except OSError:
         return False
     time.sleep(0.25)
-    return _cap_stack_dump_target(path, max_bytes)
+    after = _stack_dump_memfd_position(pid, descriptor, max_bytes, proc_root)
+    if after is None or after <= before:
+        return False
+    payload = _read_stack_dump_memfd(
+        pid, descriptor, before, after, max_bytes, proc_root
+    )
+    return payload is not None and _write_stack_dump_target(
+        path, payload, max_bytes
+    )
 
 
 def restart_service(service: str) -> None:
@@ -983,7 +1144,10 @@ def run_watchdog(args: argparse.Namespace) -> int:
             stack_dump_requested = (
                 args.component == "operator"
                 and probe.pid is not None
-                and request_python_stack_dump(probe.pid)
+                and request_python_stack_dump(
+                    probe.pid,
+                    path=state_dir / "operator-stackdump.log",
+                )
             )
             emit(
                 "grabowski.component_watchdog.restarting",
@@ -999,9 +1163,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     "grabowski.component_watchdog.stack_dump_finalized",
                     component=args.component,
                     service=args.service,
-                    capped=_cap_stack_dump_target(
-                        STACK_DUMP_PATH, STACK_DUMP_MAX_BYTES
-                    ),
+                    persisted=True,
                     max_bytes=STACK_DUMP_MAX_BYTES,
                 )
             deadline = time.monotonic() + args.recovery_timeout

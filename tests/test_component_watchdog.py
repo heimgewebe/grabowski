@@ -369,24 +369,97 @@ class McpHttpLivenessProbeTests(unittest.TestCase):
         self.assertEqual("unhealthy", result.status)
         self.assertEqual(("mcp-stdio-process-exited",), result.reasons)
 
-    def test_stack_dump_target_is_replaced_and_capped(self) -> None:
+    def test_stack_dump_atomic_replace_preserves_hardlink_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            victim = root / "victim.log"
+            path = root / "stack.log"
+            victim.write_bytes(b"keep-me")
+            path.hardlink_to(victim)
+            old_inode = path.stat().st_ino
+            self.assertTrue(
+                watchdog._write_stack_dump_target(path, b"new-dump", 16)
+            )
+            self.assertEqual(b"keep-me", victim.read_bytes())
+            self.assertEqual(b"new-dump", path.read_bytes())
+            self.assertNotEqual(old_inode, path.stat().st_ino)
+            self.assertEqual(1, path.stat().st_nlink)
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+
+    def test_stack_dump_atomic_replace_preserves_symlink_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            victim = root / "victim.log"
+            path = root / "stack.log"
+            victim.write_bytes(b"keep-me")
+            path.symlink_to(victim)
+            self.assertTrue(
+                watchdog._write_stack_dump_target(path, b"new-dump", 16)
+            )
+            self.assertEqual(b"keep-me", victim.read_bytes())
+            self.assertFalse(path.is_symlink())
+            self.assertEqual(b"new-dump", path.read_bytes())
+
+    def test_stack_dump_request_extracts_only_new_memfd_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "stack.log"
-            path.write_bytes(b"old-data")
             with (
+                patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog,
+                    "_stack_dump_memfd_position",
+                    side_effect=[10, 18],
+                ) as position,
+                patch.object(
+                    watchdog,
+                    "_read_stack_dump_memfd",
+                    return_value=b"new-dump",
+                ) as read,
+                patch.object(
+                    watchdog,
+                    "_write_stack_dump_target",
+                    return_value=True,
+                ) as write,
                 patch.object(watchdog.os, "kill") as kill,
                 patch.object(watchdog.time, "sleep") as sleep,
             ):
                 self.assertTrue(
-                    watchdog.request_python_stack_dump(123, path=path, max_bytes=16)
+                    watchdog.request_python_stack_dump(
+                        123, path=path, max_bytes=16
+                    )
                 )
             kill.assert_called_once_with(123, watchdog.signal.SIGUSR1)
             sleep.assert_called_once_with(0.25)
-            self.assertEqual(b"", path.read_bytes())
-            self.assertEqual(0o600, path.stat().st_mode & 0o777)
-            path.write_bytes(b"x" * 32)
-            self.assertTrue(watchdog._cap_stack_dump_target(path, 16))
-            self.assertEqual(16, path.stat().st_size)
+            self.assertEqual(2, position.call_count)
+            read.assert_called_once_with(
+                123, 7, 10, 18, 16, Path("/proc")
+            )
+            write.assert_called_once_with(path, b"new-dump", 16)
+
+    def test_failed_fresh_dump_removes_stale_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "stack.log"
+            path.write_bytes(b"stale")
+            with (
+                patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog,
+                    "_stack_dump_memfd_position",
+                    side_effect=[0, 0],
+                ),
+                patch.object(watchdog.os, "kill"),
+                patch.object(watchdog.time, "sleep"),
+            ):
+                self.assertFalse(
+                    watchdog.request_python_stack_dump(
+                        123, path=path, max_bytes=16
+                    )
+                )
+            self.assertFalse(path.exists())
+
+    def test_stack_dump_request_fails_without_unique_memfd(self) -> None:
+        with patch.object(watchdog, "_stack_dump_memfd", return_value=None):
+            self.assertFalse(watchdog.request_python_stack_dump(123))
 
 
 

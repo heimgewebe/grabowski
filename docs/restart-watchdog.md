@@ -77,12 +77,21 @@ zu belasten. Der Live-Probe besteht aus genau einem begrenzten GET gegen
 Loopback; Antwortzeit und Antwortgröße sind auf zwei Sekunden und 64 KiB
 begrenzt.
 
-Vor einem automatischen Operator-Neustart leert der Watchdog die private Datei
-`~/.local/state/grabowski/operator-stackdump.log`, sendet `SIGUSR1` an die
-MainPID und begrenzt die dauerhaft gespeicherte Aufnahme anschließend auf
-1 MiB. Der Operator hält dafür einen nur für `faulthandler` geöffneten
-Dateideskriptor. Die Stackaufnahme ist Diagnoseevidenz und darf einen
-notwendigen Neustart nicht blockieren.
+Der Operator registriert `SIGUSR1` auf einem anonymen Linux-Memfd mit exakt
+1 MiB Kapazität. `F_SEAL_GROW` und `F_SEAL_SHRINK` verhindern, dass auch viele
+fremde Signale diesen Speicher vergrößern oder umformen. Vor einem
+automatischen Neustart ermittelt der Watchdog genau diesen Deskriptor über
+`/proc/<pid>/fd`, merkt sich seine aktuelle Schreibposition, sendet ein Signal
+und liest ausschließlich die neu geschriebenen Bytes aus.
+
+Die persistente Datei
+`~/.local/state/grabowski/operator-stackdump.log` entsteht erst danach aus
+einer neuen Exklusivdatei mit Modus 0600 und wird per atomarem Replace
+veröffentlicht. Bestehende Hardlinks oder Symlinks werden dadurch ersetzt,
+ohne ihr Ziel vor der Prüfung zu öffnen oder zu truncaten. Pro Recovery wird
+höchstens 1 MiB persistiert; weitere externe Signale verändern die persistente
+Datei nicht. Die Stackaufnahme ist Diagnoseevidenz und darf einen notwendigen
+Neustart nicht blockieren.
 
 Der HTTP-Sitzungsmanager beendet inaktive Sitzungen nach 1.800 Sekunden. Das
 begrenzt verwaiste Zustände, ohne normale Connector-Sitzungen aggressiv zu

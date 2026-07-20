@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import errno
 import faulthandler
+import fcntl
 from datetime import datetime, timezone
 
 import hashlib
@@ -126,7 +127,8 @@ MAX_CONSUMER_CURSOR_BYTES = consumer_surface.MAX_CONSUMER_CURSOR_BYTES
 HTTP_SESSION_IDLE_TIMEOUT_SECONDS = 1_800
 MCP_SESSION_LOCK_PROBE_TIMEOUT_SECONDS = 1.0
 MCP_LIVENESS_PATH = "/_grabowski/mcp-liveness"
-STACK_DUMP_PATH = STATE_DIR / "operator-stackdump.log"
+STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
+STACK_DUMP_MAX_BYTES = 1_048_576
 _STACK_DUMP_FILE: Any | None = None
 
 _canonical_json_bytes = consumer_surface.canonical_json_bytes
@@ -350,18 +352,33 @@ def _configure_http_runtime() -> None:
     manager.session_idle_timeout = HTTP_SESSION_IDLE_TIMEOUT_SECONDS
 
 
-def _open_stack_dump_file() -> Any:
-    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(STACK_DUMP_PATH, flags, 0o600)
+def _open_stack_dump_memfd(max_bytes: int = STACK_DUMP_MAX_BYTES) -> Any:
+    if max_bytes <= 0:
+        raise ValueError("stack dump capacity must be positive")
+    if not hasattr(os, "memfd_create"):
+        raise RuntimeError("memfd_create is unavailable")
+    required = (
+        "MFD_CLOEXEC",
+        "MFD_ALLOW_SEALING",
+    )
+    if any(not hasattr(os, name) for name in required):
+        raise RuntimeError("memfd sealing flags are unavailable")
+    seal_names = ("F_ADD_SEALS", "F_SEAL_GROW", "F_SEAL_SHRINK")
+    if any(not hasattr(fcntl, name) for name in seal_names):
+        raise RuntimeError("memfd seal operations are unavailable")
+    descriptor = os.memfd_create(
+        STACK_DUMP_MEMFD_NAME,
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise RuntimeError("stack dump target must be one regular file")
-        os.fchmod(descriptor, 0o600)
-        return os.fdopen(descriptor, "a", encoding="utf-8", buffering=1)
+        os.ftruncate(descriptor, max_bytes)
+        fcntl.fcntl(
+            descriptor,
+            fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK,
+        )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return os.fdopen(descriptor, "wb", buffering=0)
     except Exception:
         os.close(descriptor)
         raise
@@ -369,10 +386,13 @@ def _open_stack_dump_file() -> Any:
 
 def _configure_faulthandler() -> None:
     global _STACK_DUMP_FILE
+    try:
+        faulthandler.enable(all_threads=True)
+    except (OSError, RuntimeError, ValueError):
+        pass
     stream: Any | None = None
     try:
-        stream = _open_stack_dump_file()
-        faulthandler.enable(file=stream, all_threads=True)
+        stream = _open_stack_dump_memfd()
         if hasattr(signal, "SIGUSR1"):
             faulthandler.register(
                 signal.SIGUSR1,

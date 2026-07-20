@@ -205,16 +205,37 @@ class OperatorContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "session creation lock"):
             operator._configure_http_runtime()
 
+    def test_stack_dump_memfd_is_fixed_and_sealed(self) -> None:
+        operator = _load_operator_module()
+        stream = operator._open_stack_dump_memfd(4096)
+        try:
+            descriptor = stream.fileno()
+            self.assertEqual(4096, operator.os.fstat(descriptor).st_size)
+            seals = operator.fcntl.fcntl(
+                descriptor, operator.fcntl.F_GET_SEALS
+            )
+            self.assertTrue(seals & operator.fcntl.F_SEAL_GROW)
+            self.assertTrue(seals & operator.fcntl.F_SEAL_SHRINK)
+            stream.write(b"bounded")
+            self.assertEqual(
+                len(b"bounded"),
+                operator.os.lseek(descriptor, 0, operator.os.SEEK_CUR),
+            )
+            with self.assertRaises(OSError):
+                operator.os.ftruncate(descriptor, 8192)
+        finally:
+            stream.close()
+
     def test_operator_registers_recovery_stack_signal(self) -> None:
         operator = _load_operator_module()
         stream = MagicMock()
         with (
-            patch.object(operator, "_open_stack_dump_file", return_value=stream),
+            patch.object(operator, "_open_stack_dump_memfd", return_value=stream),
             patch.object(operator.faulthandler, "enable") as enable,
             patch.object(operator.faulthandler, "register") as register,
         ):
             operator._configure_faulthandler()
-        enable.assert_called_once_with(file=stream, all_threads=True)
+        enable.assert_called_once_with(all_threads=True)
         register.assert_called_once_with(
             operator.signal.SIGUSR1,
             file=stream,

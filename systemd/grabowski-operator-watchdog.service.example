@@ -1,7 +1,7 @@
 # Productive semantic watchdog: verify the live event loop and FastMCP session-
 # creation lock without opening a competing session, plus one isolated stdio
-# lifecycle from the exact deployed runtime. Before recovery restart it requests
-# a bounded Python stack dump in the private Grabowski state directory.
+# lifecycle from the exact deployed runtime. Before recovery restart it extracts
+# one bounded sealed-memfd stack dump through an atomic private-file replace.
 [Unit]
 Description=Grabowski operator semantic watchdog
 After=grabowski-operator.service
