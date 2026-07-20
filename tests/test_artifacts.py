@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import types
 import unittest
@@ -171,6 +172,67 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(len(cleaned), 1)
         self.assertTrue(cleaned[0].startswith("/remote/file.grabowski-"))
         self.assertEqual(artifacts.resources.list_resources(), [])
+
+    def test_remote_create_publish_accepts_nonempty_no_hash_sentinel(self) -> None:
+        payload = b"payload"
+        source = self.root / "temporary.bin"
+        destination = self.root / "published.bin"
+        source.write_bytes(payload)
+        expected = sha(payload)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                artifacts._REMOTE_PUBLISH_SCRIPT,
+                str(source),
+                str(destination),
+                expected,
+                "create",
+                artifacts._NO_DESTINATION_HASH,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(source.exists())
+        self.assertEqual(destination.read_bytes(), payload)
+        receipt = json.loads(result.stdout)
+        self.assertEqual(receipt["sha256"], expected)
+        self.assertEqual(receipt["mode"], "create")
+
+    def test_create_only_push_never_dispatches_empty_argv(self) -> None:
+        source = self.root / "source.bin"
+        source.write_bytes(b"payload")
+        expected = sha(source.read_bytes())
+        observed_argv: list[str] = []
+
+        def fake_remote_run(host: str, argv: list[str], timeout_seconds: int = 60):
+            self.assertEqual(host, "remote")
+            observed_argv.extend(argv)
+            return {
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {"size": source.stat().st_size, "sha256": expected, "mode": "create"}
+                ),
+                "stderr": "",
+            }
+
+        with patch.object(artifacts, "_local_source", return_value=source), patch.object(
+            artifacts.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            artifacts, "_scp", return_value={"returncode": 0, "stdout": "", "stderr": ""}
+        ), patch.object(artifacts, "_remote_run", side_effect=fake_remote_run):
+            result = artifacts.artifact_push(
+                "remote", str(source), "/remote/file", expected, create_only=True
+            )
+
+        self.assertEqual(result["sha256"], expected)
+        self.assertTrue(observed_argv)
+        self.assertTrue(all(isinstance(item, str) and item for item in observed_argv))
+        self.assertEqual(observed_argv[-1], artifacts._NO_DESTINATION_HASH)
 
     def test_push_returns_only_provenance_not_contents(self) -> None:
         source = self.root / "source.bin"

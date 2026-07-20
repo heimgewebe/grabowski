@@ -29,6 +29,7 @@ REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9._/+@=-]{1,4095}\Z")
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024 * 1024
 MAX_ERROR_INPUT_CHARS = 16 * 1024
 MAX_ERROR_DETAIL_CHARS = 2048
+_NO_DESTINATION_HASH = "-"
 _AUTHORIZATION_RE = re.compile(
     r"(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)([^\s,;]+)"
 )
@@ -159,8 +160,10 @@ except FileNotFoundError:
  actual_destination=None
  destination_exists=False
 if mode=="create":
+ if expected_destination!="-": raise RuntimeError("invalid create destination precondition")
  if destination_exists: raise RuntimeError("destination already exists")
 elif mode=="replace":
+ if expected_destination=="-": raise RuntimeError("missing replacement destination precondition")
  if not destination_exists: raise RuntimeError("destination is missing")
  if actual_destination!=expected_destination: raise RuntimeError("destination hash precondition failed")
 else: raise RuntimeError("invalid publication mode")
@@ -195,7 +198,7 @@ def _validate_mode(
     if create_only:
         if expected_destination_sha256 is not None:
             raise ValueError("create-only publication may not include a destination hash")
-        return "create", ""
+        return "create", _NO_DESTINATION_HASH
     if expected_destination_sha256 is None:
         raise ValueError("replacement requires expected_destination_sha256")
     return "replace", _validate_sha256(
