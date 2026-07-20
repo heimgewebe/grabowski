@@ -1514,6 +1514,10 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
             first["context_budget"]["effective_limit_bytes"], 1200
         )
         self.assertTrue(first["compactness"]["smaller_than_general_context_pack"])
+        self.assertLessEqual(
+            first["compactness"]["ratio"], first["compactness"]["target_max_ratio"]
+        )
+        self.assertEqual(first["sampling_policy"]["kind"], "deterministic_lane_caps_v1")
         self.assertIn("direct_changes", first["context"])
         self.assertIn("related_tests", first["context"])
         self.assertIn("authority_ordered_rules", first["context"])
@@ -1528,6 +1532,46 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertNotIn("raw_diff", first)
         self.assertIn("patch_correctness", first["does_not_establish"])
         self.assertIn("merge_readiness", first["does_not_establish"])
+
+    def test_context_compose_prioritizes_tests_and_gates_before_large_impact_lanes(self) -> None:
+        base, target = self._composer_fixture()
+        impact = self._composer_impact()
+        impact["target_symbols"] = [
+            {"name": f"symbol_{index}", "path": f"src/module_{index}.py"}
+            for index in range(40)
+        ]
+        impact["relations"] = [
+            {
+                "direction": "incoming",
+                "peer": {"path": f"src/peer_{index}.py"},
+                "edge_type": "import",
+                "evidence_level": "S1",
+            }
+            for index in range(40)
+        ]
+        impact["related_tests"] = [
+            {"path": f"tests/test_{index}.py", "evidence_type": "graph_edge"}
+            for index in range(12)
+        ]
+        with (
+            patch.object(mcp, "repoground_context_pack", return_value=self._composer_context_pack()),
+            patch.object(mcp, "_repoground_agent_impact_context", return_value=impact),
+        ):
+            result = mcp.repoground_context_compose(
+                "demo-repo", base, target, context_budget_bytes=1200
+            )
+
+        self.assertGreater(len(result["context"]["related_tests"]), 0)
+        self.assertGreater(len(result["context"]["gate_evidence"]), 0)
+        self.assertEqual(
+            result["context_budget"]["lane_counts"]["target_symbols"]["available"], 40
+        )
+        self.assertEqual(
+            result["context_budget"]["lane_counts"]["target_symbols"]["considered"], 8
+        )
+        self.assertLessEqual(
+            result["compactness"]["ratio"], result["compactness"]["target_max_ratio"]
+        )
 
     def test_context_compose_blocks_mismatched_diff_binding(self) -> None:
         base, target = self._composer_fixture()
