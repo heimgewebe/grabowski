@@ -304,7 +304,7 @@ def _observer_unit_relations(target: Path) -> dict[str, list[str]]:
     properties = sorted(OBSERVER_EFFECTIVE_RELATIONS)
     effective_properties = sorted(OBSERVER_EXPECTED_EFFECTIVE_PROPERTIES)
     effective_set_properties = sorted(OBSERVER_EXPECTED_EFFECTIVE_SETS)
-    argv = ["systemctl", "--user", "show", SAFETY_OBSERVER_SERVICE]
+    argv = ["systemctl", "--user", "show", target.name]
     argv.extend(f"--property={item}" for item in properties)
     argv.extend(f"--property={item}" for item in effective_properties)
     argv.extend(f"--property={item}" for item in effective_set_properties)
@@ -320,13 +320,16 @@ def _observer_unit_relations(target: Path) -> dict[str, list[str]]:
         argv,
         check=False,
         capture=True,
-        timeout=core.TIMEOUTS["service_start"],
+        timeout=core.TIMEOUTS["systemd_query"],
     )
     if result.returncode != 0:
         core.fail(
             "Safety-Observer-Unit konnte nach daemon-reload nicht gelesen werden",
             phase="observer-unit-readback",
-            details={"returncode": result.returncode},
+            details={
+                "returncode": result.returncode,
+                "stderr": result.stderr.strip(),
+            },
         )
     values: dict[str, list[str]] = {}
     fragment = ""
@@ -834,9 +837,9 @@ def _atomic_publish_observer_unit(
     }
 
 
-def _verify_safety_observer_executes() -> dict[str, str]:
+def _verify_safety_observer_executes(unit_name: str) -> dict[str, str]:
     start_result = core.run(
-        ["systemctl", "--user", "start", SAFETY_OBSERVER_SERVICE],
+        ["systemctl", "--user", "start", unit_name],
         check=False,
         capture=True,
         timeout=core.TIMEOUTS["service_start"],
@@ -845,27 +848,33 @@ def _verify_safety_observer_executes() -> dict[str, str]:
         core.fail(
             "Safety-Observer-Unit konnte nicht erfolgreich ausgeführt werden",
             phase="observer-unit-execution",
-            details={"returncode": start_result.returncode},
+            details={
+                "returncode": start_result.returncode,
+                "stderr": start_result.stderr.strip(),
+            },
         )
     status_result = core.run(
         [
             "systemctl",
             "--user",
             "show",
-            SAFETY_OBSERVER_SERVICE,
+            unit_name,
             "--property=Result",
             "--property=ActiveState",
             "--property=SubState",
         ],
         check=False,
         capture=True,
-        timeout=core.TIMEOUTS["service_start"],
+        timeout=core.TIMEOUTS["systemd_query"],
     )
     if status_result.returncode != 0:
         core.fail(
             "Safety-Observer-Ausführungszustand konnte nicht gelesen werden",
             phase="observer-unit-execution-readback",
-            details={"returncode": status_result.returncode},
+            details={
+                "returncode": status_result.returncode,
+                "stderr": status_result.stderr.strip(),
+            },
         )
     values: dict[str, str] = {}
     for line in status_result.stdout.splitlines():
@@ -976,7 +985,7 @@ def install_safety_observer_unit(
                 details={"returncode": reload_result.returncode},
             )
         relations = _observer_unit_relations(target)
-        execution = _verify_safety_observer_executes()
+        execution = _verify_safety_observer_executes(target.name)
         final_bytes, final_info = _read_observer_unit_at(
             directory_fd,
             target.name,
