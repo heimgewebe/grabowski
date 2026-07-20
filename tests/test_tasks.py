@@ -137,6 +137,7 @@ class TaskTests(unittest.TestCase):
         self.assertIn(" argv=", descriptions[0])
         self.assertNotIn("\n", descriptions[0])
         self.assertIn("--slice=grabowski-tasks.slice", launch)
+        self.assertIn("--expand-environment=no", launch)
         self.assertEqual(launch.count("--property=LimitCORE=0"), 1)
         self.assertIn("--property=CPUWeight=50", launch)
         self.assertIn("--property=IOWeight=25", launch)
@@ -147,6 +148,38 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=UMask=0077", launch)
         self.assertEqual(launch[-3:], ["--", "/bin/echo", "ok"])
         return result
+
+    def test_task_start_preserves_literal_shell_and_template_argv_end_to_end(self) -> None:
+        command = [
+            "/usr/bin/bash",
+            "-lc",
+            "cluster=alpha\nexpected=beta\nprintf '%s|%s\\n' \"${cluster}\" \"${expected}\"",
+            "$HOME",
+            "$(uname)",
+            "${{ github.sha }}",
+            "quote='\"'",
+            "heredoc=<<'EOF'\n${cluster}\nEOF",
+            "Grüße 🌍",
+        ]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ) as dispatch, patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                command,
+                cwd=str(self.root),
+                runtime_seconds=60,
+            )
+
+        task = result["task"]
+        launch = dispatch.call_args.args[1]
+        separator = launch.index("--")
+        self.assertEqual(command, task["argv"])
+        self.assertEqual(command_identity.argv_sha256(command), task["argv_sha256"])
+        self.assertEqual(command, launch[separator + 1 :])
+        self.assertIn("--expand-environment=no", launch[:separator])
 
     def test_server_task_lease_delegation_requires_running_task_and_live_leases(self) -> None:
         result = self._start(resource_keys=["component:test-task-delegation"])

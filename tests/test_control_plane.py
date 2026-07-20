@@ -472,11 +472,44 @@ class PrivilegedBrokerTests(unittest.TestCase):
         self.assertEqual(execution["internal_action"], "root-task-start")
         argv = execution["argv"]
         self.assertEqual(argv[:2], ["/usr/bin/systemd-run", "--system"])
+        self.assertIn("--expand-environment=no", argv)
         self.assertIn("--slice=grabowski-root-tasks.slice", argv)
         self.assertIn("--property=LogRateLimitIntervalSec=30s", argv)
         self.assertIn("--property=LogRateLimitBurst=1000", argv)
         self.assertNotIn("--user", argv)
         self.assertEqual(argv[-2:], ["--", "/usr/local/bin/sleep-heimserver"])
+
+    def test_root_task_start_preserves_literal_command_arguments(self) -> None:
+        unit = "grabowski-task-0123456789abcdef01234567-a1.service"
+        command = [
+            "/usr/local/bin/sleep-heimserver",
+            "${cluster}",
+            "$HOME",
+            "$(uname)",
+            "${{ github.sha }}",
+            "heredoc=<<EOF\n${expected}\nEOF",
+            "Grüße 🌍",
+        ]
+        reference = self._root_task_reference({
+            "operation": "start",
+            "unit": unit,
+            "argv": command,
+            "cwd": "/",
+            "runtime_seconds": 300,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+            "description": "Grabowski task root",
+        })
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+
+        execution = privileged_broker.resolve_execution(self._root_task_config(), parsed)
+        argv = execution["argv"]
+        separator = argv.index("--")
+        self.assertIn("--expand-environment=no", argv[:separator])
+        self.assertEqual(command, argv[separator + 1 :])
 
     def test_root_task_start_rejects_runtime_without_lease_grace(self) -> None:
         reference = self._root_task_reference({

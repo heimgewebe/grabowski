@@ -464,6 +464,12 @@ class OperatorContractTests(unittest.TestCase):
             cwd = root / "cwd"
             cwd.mkdir(parents=True)
             fake_uuid = types.SimpleNamespace(hex="deadbeefcafe1234")
+            command = [
+                "python3",
+                "-c",
+                "print(\"${cluster}|$HOME|$(uname)|${{ github.sha }}|Grüße 🌍\")",
+                "heredoc=<<EOF\n${expected}\nEOF",
+            ]
             launcher = {
                 "returncode": 0,
                 "stdout": "started",
@@ -482,7 +488,7 @@ class OperatorContractTests(unittest.TestCase):
             ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
                 operator, "_run", return_value=launcher
             ) as run:
-                job = operator.grabowski_job_start(["python3", "-c", "print(1)"], cwd=str(cwd), runtime_seconds=60)
+                job = operator.grabowski_job_start(command, cwd=str(cwd), runtime_seconds=60)
 
             self.assertEqual(job["job_id"], "deadbeefcafe")
             self.assertEqual(job["unit"], "grabowski-job-deadbeefcafe")
@@ -521,6 +527,11 @@ class OperatorContractTests(unittest.TestCase):
                 ),
             )
             invoked = run.call_args_list[0].args[0]
+            separator = invoked.index("--")
+            self.assertEqual(job["argv"], command)
+            self.assertEqual(job["argv_sha256"], operator._argv_hash(command))
+            self.assertEqual(invoked[separator + 1 :], command)
+            self.assertIn("--expand-environment=no", invoked[:separator])
             self.assertIn("systemd-run", invoked)
             self.assertEqual(invoked.count("--property=LimitCORE=0"), 1)
             self.assertNotIn("--property=LimitNOFILE=65536", invoked)
