@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,7 @@ PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 SPECIAL_PERMISSION_BITS = stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
 PROCESS_TERMINATION_GRACE_SECONDS = 2
+PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v2"
 FORBIDDEN_API_KEY_ENV = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -77,6 +79,16 @@ def canonical_bytes(value: Any) -> bytes:
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+
+
+def probe_digest(value: dict[str, Any]) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hmac.new(PROBE_DIGEST_DOMAIN, payload, hashlib.sha256).hexdigest()
 
 
 def value_sha256(value: Any) -> str:
@@ -516,7 +528,7 @@ def validate_probe(probe: dict[str, Any]) -> None:
         raise ProbeSchedulerError("probe digest is invalid")
     digest_input = dict(probe)
     digest_input.pop("catalog_probe_sha256", None)
-    if digest != value_sha256(digest_input):
+    if digest != probe_digest(digest_input):
         raise ProbeSchedulerError("probe digest does not match its payload")
     if not isinstance(probe.get("providers"), dict):
         raise ProbeSchedulerError("probe providers are missing")

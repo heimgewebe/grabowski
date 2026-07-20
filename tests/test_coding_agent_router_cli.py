@@ -96,7 +96,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             "model_invocations": 0,
             "paid_api_requests_authorized": 0,
         }
-        fake_probe["catalog_probe_sha256"] = cli._canonical_sha256(fake_probe)
+        fake_probe["catalog_probe_sha256"] = cli._probe_digest(fake_probe)
         with mock.patch.object(cli, "_probe", return_value=fake_probe):
             status, result = self._main(["probe"])
         self.assertEqual(status, 0)
@@ -171,7 +171,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(probe["verified_quota_pools"], [])
         digest_input = dict(probe)
         digest = digest_input.pop("catalog_probe_sha256")
-        self.assertEqual(digest, cli._canonical_sha256(digest_input))
+        self.assertEqual(digest, cli._probe_digest(digest_input))
 
     def test_state_target_symlink_is_rejected(self) -> None:
         real = self.root / "real-state.json"
@@ -337,7 +337,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             "model_invocations": 0,
             "paid_api_requests_authorized": 0,
         }
-        probe["catalog_probe_sha256"] = cli._canonical_sha256(probe)
+        probe["catalog_probe_sha256"] = cli._probe_digest(probe)
         cli._write_probe(probe, validation)
         stored = json.loads(self.state.read_text(encoding="utf-8"))
         self.assertEqual(stored["history"], initial["history"])
