@@ -158,6 +158,51 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(health["ready"])
         self.assertEqual(health["source"], "deployment_catalog")
 
+    def test_installed_module_resolves_release_scoped_catalog_from_named_venv(self) -> None:
+        release = self.root / "release"
+        environment = release / "runtime-env"
+        catalog = release / "config" / "coding-agent-catalog.json"
+        catalog.parent.mkdir(parents=True)
+        catalog.write_text(json.dumps(self.catalog), encoding="utf-8")
+        module = environment / "lib/python3.10/site-packages/grabowski_coding_agent_router.py"
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(router, "__file__", str(module)),
+            mock.patch.object(router.sys, "prefix", str(environment)),
+            mock.patch.object(router.sys, "base_prefix", "/usr"),
+        ):
+            health = router.coding_agent_catalog_health()
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["source"], "deployment_catalog")
+        self.assertEqual(health["path"], str(catalog))
+
+    def test_virtualenv_prefix_does_not_capture_module_outside_prefix(self) -> None:
+        environment = self.root / "runtime-env"
+        module = self.root / "source" / "src" / "grabowski_coding_agent_router.py"
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(router, "__file__", str(module)),
+            mock.patch.object(router.sys, "prefix", str(environment)),
+            mock.patch.object(router.sys, "base_prefix", "/usr"),
+        ):
+            self.assertEqual(
+                router._catalog_path(),
+                self.root / "source" / "config" / "coding-agent-catalog.json",
+            )
+
+    def test_global_prefix_does_not_masquerade_as_release(self) -> None:
+        module = Path("/usr/local/lib/python3.10/site-packages/grabowski_coding_agent_router.py")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(router, "__file__", str(module)),
+            mock.patch.object(router.sys, "prefix", "/usr"),
+            mock.patch.object(router.sys, "base_prefix", "/usr"),
+        ):
+            self.assertEqual(
+                router._catalog_path(),
+                Path("/usr/local/lib/python3.10/config/coding-agent-catalog.json"),
+            )
+
     def test_explicit_invalid_catalog_is_reported_by_health(self) -> None:
         invalid = json.loads(json.dumps(self.catalog))
         route = next(
