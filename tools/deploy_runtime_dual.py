@@ -2,10 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 from dataclasses import dataclass
+import errno
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import secrets
+import stat as statmod
 import shlex
 import socket
 import subprocess
@@ -19,6 +26,85 @@ import deploy_runtime as core
 
 TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 OPERATOR_SERVICE = "grabowski-operator.service"
+SAFETY_OBSERVER_SERVICE = "grabowski-safety-observer.service"
+SAFETY_OBSERVER_UNIT_RELATIVE = Path("systemd/grabowski-safety-observer.service.example")
+SAFETY_OBSERVER_UNIT_PATH = core.HOME / ".config/systemd/user/grabowski-safety-observer.service"
+OBSERVER_FORBIDDEN_RELATIONS = {
+    "Wants",
+    "Requires",
+    "Requisite",
+    "BindsTo",
+    "PartOf",
+    "Upholds",
+    "Conflicts",
+    "OnFailure",
+    "OnSuccess",
+    "PropagatesReloadTo",
+    "ReloadPropagatedFrom",
+    "PropagatesStopTo",
+    "StopPropagatedFrom",
+    "JoinsNamespaceOf",
+}
+OBSERVER_HIDDEN_RELATIONS = {"Upholds"}
+OBSERVER_EFFECTIVE_RELATIONS = OBSERVER_FORBIDDEN_RELATIONS - OBSERVER_HIDDEN_RELATIONS
+OBSERVER_EXPECTED_AFTER = (OPERATOR_SERVICE, TUNNEL_SERVICE)
+OBSERVER_EXPECTED_EXEC_START = (
+    "/usr/bin/python3 %h/.local/libexec/grabowski-safety-observer.py collect"
+)
+OBSERVER_EXPECTED_DIRECTIVES = {
+    "Unit": {
+        "Description": "Grabowski safety and connector incident observer",
+        "After": " ".join(OBSERVER_EXPECTED_AFTER),
+    },
+    "Service": {
+        "Type": "oneshot",
+        "ExecStart": OBSERVER_EXPECTED_EXEC_START,
+        "TimeoutStartSec": "60",
+        "MemoryMax": "512M",
+        "TasksMax": "50",
+        "UMask": "0077",
+        "NoNewPrivileges": "true",
+        "PrivateTmp": "true",
+        "ProtectSystem": "strict",
+        "ProtectHome": "read-only",
+        "ProtectKernelTunables": "true",
+        "ProtectControlGroups": "true",
+        "ReadWritePaths": "%h/.local/state/grabowski/safety-observer",
+        "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6",
+        "RestrictNamespaces": "true",
+        "SystemCallArchitectures": "native",
+        "LockPersonality": "true",
+        "MemoryDenyWriteExecute": "true",
+    },
+}
+OBSERVER_EXPECTED_EFFECTIVE_PROPERTIES = {
+    "Type": "oneshot",
+    "RemainAfterExit": "no",
+    "TimeoutStartUSec": "1min",
+    "MemoryMax": str(512 * 1024 * 1024),
+    "TasksMax": "50",
+    "UMask": "0077",
+    "NoNewPrivileges": "yes",
+    "PrivateTmp": "yes",
+    "ProtectSystem": "strict",
+    "ProtectHome": "read-only",
+    "ProtectKernelTunables": "yes",
+    "ProtectControlGroups": "yes",
+    "RestrictNamespaces": "yes",
+    "SystemCallArchitectures": "native",
+    "LockPersonality": "yes",
+    "MemoryDenyWriteExecute": "yes",
+}
+OBSERVER_EXPECTED_EFFECTIVE_SETS = {
+    "ReadWritePaths": {
+        str(core.HOME / ".local/state/grabowski/safety-observer"),
+    },
+    "RestrictAddressFamilies": {"AF_UNIX", "AF_INET", "AF_INET6"},
+}
+OBSERVER_USER_CAPABILITY_INCOMPATIBLE_DIRECTIVES = frozenset(
+    {"PrivateDevices", "ProtectKernelModules", "ProtectKernelLogs"}
+)
+OBSERVER_SAFETY_REPAIR_MARKER = "observer_safety_repair_retained_v1"
 OPERATOR_LISTENER_HOST = "127.0.0.1"
 OPERATOR_LISTENER_PORT = 18181
 OPERATOR_LISTENER_REQUIRED_SAMPLES = 2
@@ -57,6 +143,885 @@ class DualReadiness:
             "readiness": self.readiness,
             "journal": self.journal,
         }
+
+
+_OBSERVER_UNIT_HORIZONTAL_WHITESPACE = " \t"
+# LF (line separator) and HT (intentionally supported for indentation/trimming)
+# are the only C0 control bytes admitted into a unit-file input; everything
+# else -- including VT/FF/CR/NUL, which Python's generic str.strip() and
+# str.splitlines() would silently normalize away -- must fail closed instead
+# of being interpreted differently by us than by systemd's own byte parser.
+_OBSERVER_UNIT_ALLOWED_CONTROL_BYTES = frozenset({0x09, 0x0A})
+
+
+def _validate_observer_unit_control_bytes(data: bytes) -> None:
+    for byte in data:
+        if byte in _OBSERVER_UNIT_ALLOWED_CONTROL_BYTES:
+            continue
+        if byte < 0x20 or byte == 0x7F:
+            core.fail(
+                "Safety-Observer-Unit enthält ein nicht erlaubtes Steuerzeichen",
+                phase="observer-unit-contract",
+                details={"byte": f"0x{byte:02x}"},
+            )
+
+
+def _parse_observer_unit_directives(data: bytes) -> dict[tuple[str, str], str]:
+    _validate_observer_unit_control_bytes(data)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        core.fail(
+            "Safety-Observer-Unit ist kein gültiges UTF-8",
+            phase="observer-unit-source",
+            details={"error_type": type(exc).__name__},
+        )
+    directives: dict[tuple[str, str], str] = {}
+    sections_seen: set[str] = set()
+    section: str | None = None
+    for raw_line in text.split("\n"):
+        line = raw_line.strip(_OBSERVER_UNIT_HORIZONTAL_WHITESPACE)
+        # systemd resolves physical-line continuations before interpreting
+        # comments. Reject them before comment handling so a commented
+        # backslash cannot make our parser and systemd see different input.
+        if line.endswith("\\"):
+            core.fail(
+                "Safety-Observer-Unit darf keine Zeilenfortsetzungen enthalten",
+                phase="observer-unit-contract",
+            )
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("["):
+            if not line.endswith("]"):
+                core.fail(
+                    "Safety-Observer-Unit enthält einen ungültigen Abschnitt",
+                    phase="observer-unit-contract",
+                )
+            section = line[1:-1].strip(_OBSERVER_UNIT_HORIZONTAL_WHITESPACE)
+            if section not in OBSERVER_EXPECTED_DIRECTIVES:
+                core.fail(
+                    "Safety-Observer-Unit enthält einen nicht erlaubten Abschnitt",
+                    phase="observer-unit-contract",
+                    details={"section": section},
+                )
+            if section in sections_seen:
+                core.fail(
+                    "Safety-Observer-Unit enthält einen doppelten Abschnitt",
+                    phase="observer-unit-contract",
+                    details={"section": section},
+                )
+            sections_seen.add(section)
+            continue
+        key, separator, value = line.partition("=")
+        key = key.strip(_OBSERVER_UNIT_HORIZONTAL_WHITESPACE)
+        value = value.strip(_OBSERVER_UNIT_HORIZONTAL_WHITESPACE)
+        if section is None or not separator or not key:
+            core.fail(
+                "Safety-Observer-Unit enthält eine ungültige aktive Direktive",
+                phase="observer-unit-contract",
+            )
+        pair = (section, key)
+        if pair in directives:
+            core.fail(
+                "Safety-Observer-Unit enthält eine doppelte aktive Direktive",
+                phase="observer-unit-contract",
+                details={"section": section, "directive": key},
+            )
+        expected_value = OBSERVER_EXPECTED_DIRECTIVES[section].get(key)
+        if expected_value is None:
+            core.fail(
+                "Safety-Observer-Unit enthält eine nicht erlaubte aktive Direktive",
+                phase="observer-unit-contract",
+                details={"section": section, "directive": key},
+            )
+        if value != expected_value:
+            core.fail(
+                "Safety-Observer-Unit enthält einen unerwarteten Direktivenwert",
+                phase="observer-unit-contract",
+                details={"section": section, "directive": key},
+            )
+        directives[pair] = value
+    if sections_seen != set(OBSERVER_EXPECTED_DIRECTIVES):
+        core.fail(
+            "Safety-Observer-Unit enthält nicht exakt die erwarteten Abschnitte",
+            phase="observer-unit-contract",
+        )
+    return directives
+
+
+def _validate_observer_unit_bytes(data: bytes) -> bytes:
+    if not data.endswith(b"\n"):
+        core.fail("Safety-Observer-Unit benötigt einen abschließenden Zeilenumbruch")
+    directives = _parse_observer_unit_directives(data)
+    expected = {
+        (section, key): value
+        for section, section_directives in OBSERVER_EXPECTED_DIRECTIVES.items()
+        for key, value in section_directives.items()
+    }
+    if directives != expected:
+        core.fail(
+            "Safety-Observer-Unit enthält nicht exakt den erwarteten Direktivenvertrag",
+            phase="observer-unit-contract",
+        )
+    return data
+
+
+def _observer_unit_bytes(repo: Path, repo_head: str) -> bytes:
+    try:
+        data = core.git_show(repo, repo_head, SAFETY_OBSERVER_UNIT_RELATIVE)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        core.fail(
+            "Safety-Observer-Unit konnte nicht aus dem gebundenen Commit gelesen werden",
+            phase="observer-unit-source",
+            details={"error_type": type(exc).__name__, "repo_head": repo_head},
+        )
+    return _validate_observer_unit_bytes(data)
+
+
+def _parse_effective_exec_start(value: str) -> tuple[str, list[str]]:
+    if not value.startswith("{ ") or not value.endswith(" }"):
+        core.fail(
+            "Effektiver Safety-Observer ExecStart ist nicht eindeutig lesbar",
+            phase="observer-unit-readback",
+        )
+    fields: dict[str, str] = {}
+    for item in value[2:-2].split(" ; "):
+        key, separator, field_value = item.partition("=")
+        if separator:
+            fields[key] = field_value
+    try:
+        argv = shlex.split(fields["argv[]"])
+    except (KeyError, ValueError) as exc:
+        core.fail(
+            "Effektiver Safety-Observer ExecStart ist nicht eindeutig lesbar",
+            phase="observer-unit-readback",
+            details={"error_type": type(exc).__name__},
+        )
+    return fields.get("path", ""), argv
+
+
+def _observer_unit_relations(target: Path) -> dict[str, list[str]]:
+    properties = sorted(OBSERVER_EFFECTIVE_RELATIONS)
+    effective_properties = sorted(OBSERVER_EXPECTED_EFFECTIVE_PROPERTIES)
+    effective_set_properties = sorted(OBSERVER_EXPECTED_EFFECTIVE_SETS)
+    argv = ["systemctl", "--user", "show", target.name]
+    argv.extend(f"--property={item}" for item in properties)
+    argv.extend(f"--property={item}" for item in effective_properties)
+    argv.extend(f"--property={item}" for item in effective_set_properties)
+    argv.extend(
+        [
+            "--property=After",
+            "--property=ExecStart",
+            "--property=FragmentPath",
+            "--property=DropInPaths",
+        ]
+    )
+    result = core.run(
+        argv,
+        check=False,
+        capture=True,
+        timeout=core.TIMEOUTS["systemd_query"],
+    )
+    if result.returncode != 0:
+        core.fail(
+            "Safety-Observer-Unit konnte nach daemon-reload nicht gelesen werden",
+            phase="observer-unit-readback",
+            details={
+                "returncode": result.returncode,
+                "stderr": result.stderr.strip(),
+            },
+        )
+    values: dict[str, list[str]] = {}
+    fragment = ""
+    drop_ins: list[str] | None = None
+    after: list[str] | None = None
+    exec_start: str | None = None
+    effective: dict[str, str] = {}
+    effective_sets: dict[str, set[str]] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        if key == "FragmentPath":
+            fragment = value
+        elif key == "DropInPaths":
+            drop_ins = value.split()
+        elif key == "After":
+            after = value.split()
+        elif key == "ExecStart":
+            exec_start = value
+        elif key in OBSERVER_EFFECTIVE_RELATIONS:
+            values[key] = value.split()
+        elif key in OBSERVER_EXPECTED_EFFECTIVE_PROPERTIES:
+            effective[key] = value
+        elif key in OBSERVER_EXPECTED_EFFECTIVE_SETS:
+            try:
+                effective_sets[key] = set(shlex.split(value))
+            except ValueError as exc:
+                core.fail(
+                    "Effektive Safety-Observer-Set-Eigenschaft ist nicht lesbar",
+                    phase="observer-unit-readback",
+                    details={"property": key, "error_type": type(exc).__name__},
+                )
+    missing_properties = sorted(OBSERVER_EFFECTIVE_RELATIONS.difference(values))
+    missing_properties.extend(
+        sorted(set(OBSERVER_EXPECTED_EFFECTIVE_PROPERTIES).difference(effective))
+    )
+    missing_properties.extend(
+        sorted(set(OBSERVER_EXPECTED_EFFECTIVE_SETS).difference(effective_sets))
+    )
+    if after is None:
+        missing_properties.append("After")
+    if exec_start is None:
+        missing_properties.append("ExecStart")
+    if drop_ins is None:
+        missing_properties.append("DropInPaths")
+    if missing_properties:
+        core.fail(
+            "Safety-Observer-Relationen konnten nicht vollständig gelesen werden",
+            phase="observer-unit-readback",
+            details={"missing_properties": missing_properties},
+        )
+    if Path(fragment) != target:
+        core.fail(
+            "systemd verwendet nicht die kanonische Safety-Observer-Unit",
+            phase="observer-unit-readback",
+            details={"fragment_path": fragment},
+        )
+    if drop_ins:
+        core.fail(
+            "Safety-Observer-Drop-ins sind für den Order-only-Vertrag nicht zulässig",
+            phase="observer-unit-readback",
+            details={"drop_in_count": len(drop_ins)},
+        )
+    if not set(OBSERVER_EXPECTED_AFTER).issubset(after or []):
+        core.fail(
+            "Effektives Safety-Observer After enthält nicht beide Runtime-Dienste",
+            phase="observer-unit-readback",
+        )
+    exec_path, exec_argv = _parse_effective_exec_start(exec_start or "")
+    expected_argv = [
+        "/usr/bin/python3",
+        str(core.HOME / ".local/libexec/grabowski-safety-observer.py"),
+        "collect",
+    ]
+    if exec_path != expected_argv[0] or exec_argv != expected_argv:
+        core.fail(
+            "Effektiver Safety-Observer ExecStart weicht vom kanonischen Einstieg ab",
+            phase="observer-unit-readback",
+        )
+    for key, expected_value in OBSERVER_EXPECTED_EFFECTIVE_PROPERTIES.items():
+        if effective.get(key) != expected_value:
+            core.fail(
+                "Effektive Safety-Observer-Ausführungsgrenzen oder Härtung weichen ab",
+                phase="observer-unit-readback",
+                details={"property": key},
+            )
+    for key, expected_values in OBSERVER_EXPECTED_EFFECTIVE_SETS.items():
+        if effective_sets.get(key) != expected_values:
+            core.fail(
+                "Effektive Safety-Observer-Pfad- oder Adressgrenzen weichen ab",
+                phase="observer-unit-readback",
+                details={"property": key},
+            )
+    runtime_units = {OPERATOR_SERVICE, TUNNEL_SERVICE}
+    for key, units in values.items():
+        if runtime_units.intersection(units):
+            core.fail(
+                "Safety-Observer aktiviert oder koppelt weiterhin Runtime-Dienste",
+                phase="observer-unit-readback",
+                details={"directive": key},
+            )
+    return values
+
+@dataclass(frozen=True)
+class _ObserverDirectoryEdge:
+    parent_fd: int
+    name: str
+    child_fd: int
+
+
+def _require_parent_mapping(
+    parent: Path,
+    directory_fd: int,
+    edges: list[_ObserverDirectoryEdge] | None = None,
+) -> os.stat_result:
+    opened = os.fstat(directory_fd)
+    for edge in edges or []:
+        child = os.fstat(edge.child_fd)
+        try:
+            linked = os.stat(
+                edge.name,
+                dir_fd=edge.parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            core.fail(
+                "Safety-Observer-Unit-Verzeichnis driftete; Verzeichniskette driftete während der Installation",
+                phase="observer-unit-parent-drift",
+                details={"component": edge.name, "error_type": type(exc).__name__},
+            )
+        if (
+            not statmod.S_ISDIR(child.st_mode)
+            or not statmod.S_ISDIR(linked.st_mode)
+            or (linked.st_dev, linked.st_ino) != (child.st_dev, child.st_ino)
+        ):
+            core.fail(
+                "Safety-Observer-Unit-Verzeichnis driftete; Verzeichniskette driftete während der Installation",
+                phase="observer-unit-parent-drift",
+                details={"component": edge.name},
+            )
+    try:
+        mapped = os.stat(parent, follow_symlinks=False)
+    except OSError as exc:
+        core.fail(
+            "Safety-Observer-Unit-Verzeichnis driftete während der Installation",
+            phase="observer-unit-parent-drift",
+            details={"error_type": type(exc).__name__},
+        )
+    if (
+        not statmod.S_ISDIR(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or mapped.st_dev != opened.st_dev
+        or mapped.st_ino != opened.st_ino
+    ):
+        core.fail(
+            "Safety-Observer-Unit-Verzeichnis driftete während der Installation",
+            phase="observer-unit-parent-drift",
+        )
+    return opened
+
+
+def _open_observer_unit_directory(
+    parent: Path,
+) -> tuple[int, list[int], list[_ObserverDirectoryEdge]]:
+    if not parent.is_absolute():
+        core.fail(
+            "Safety-Observer-Unit-Verzeichnis muss absolut sein",
+            phase="observer-unit-parent",
+        )
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    edges: list[_ObserverDirectoryEdge] = []
+    try:
+        current_fd = os.open("/", flags)
+        descriptors.append(current_fd)
+        for component in parent.parts[1:]:
+            try:
+                child_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                try:
+                    child_fd = os.open(component, flags, dir_fd=current_fd)
+                except OSError as exc:
+                    core.fail(
+                        "Safety-Observer-Unit-Verzeichniskomponente konnte nicht sicher geöffnet werden",
+                        phase="observer-unit-parent",
+                        details={"component": component, "error_type": type(exc).__name__},
+                    )
+            except OSError as exc:
+                core.fail(
+                    "Safety-Observer-Unit-Verzeichniskomponente konnte nicht sicher geöffnet werden",
+                    phase="observer-unit-parent",
+                    details={"component": component, "error_type": type(exc).__name__},
+                )
+            child_info = os.fstat(child_fd)
+            if not statmod.S_ISDIR(child_info.st_mode):
+                os.close(child_fd)
+                core.fail(
+                    "Safety-Observer-Unit-Verzeichniskomponente ist kein Verzeichnis",
+                    phase="observer-unit-parent",
+                    details={"component": component},
+                )
+            descriptors.append(child_fd)
+            edges.append(_ObserverDirectoryEdge(current_fd, component, child_fd))
+            current_fd = child_fd
+        _require_parent_mapping(parent, current_fd, edges)
+        return current_fd, descriptors, edges
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+def _require_owned_regular(info: os.stat_result, message: str) -> None:
+    if (
+        not statmod.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+    ):
+        core.fail(message, phase="observer-unit-target")
+
+
+def _read_observer_unit_at(
+    directory_fd: int,
+    name: str,
+) -> tuple[bytes | None, os.stat_result | None]:
+    try:
+        linked = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None, None
+    _require_owned_regular(
+        linked,
+        "Safety-Observer-Unit ist keine eindeutige benutzereigene Datei",
+    )
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        core.fail(
+            "Safety-Observer-Unit konnte nicht sicher geöffnet werden",
+            phase="observer-unit-target",
+            details={"error_type": type(exc).__name__},
+        )
+    try:
+        opened = os.fstat(descriptor)
+        _require_owned_regular(
+            opened,
+            "Safety-Observer-Unit ist keine eindeutige benutzereigene Datei",
+        )
+        if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+            core.fail(
+                "Safety-Observer-Unit driftete während des Öffnens",
+                phase="observer-unit-target-drift",
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        verified = os.fstat(descriptor)
+        try:
+            remapped = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            core.fail(
+                "Safety-Observer-Unit driftete während des Lesens",
+                phase="observer-unit-target-drift",
+            )
+        if (
+            (verified.st_dev, verified.st_ino) != (opened.st_dev, opened.st_ino)
+            or (remapped.st_dev, remapped.st_ino) != (opened.st_dev, opened.st_ino)
+            or verified.st_nlink != 1
+        ):
+            core.fail(
+                "Safety-Observer-Unit driftete während des Lesens",
+                phase="observer-unit-target-drift",
+            )
+        return b"".join(chunks), verified
+    finally:
+        os.close(descriptor)
+
+
+RENAME_NOREPLACE = 1 << 0
+RENAME_EXCHANGE = 1 << 1
+
+
+def _load_renameat2():
+    library_name = ctypes.util.find_library("c")
+    if library_name is None:
+        return None
+    try:
+        libc = ctypes.CDLL(library_name, use_errno=True)
+        function = libc.renameat2
+    except (OSError, AttributeError):
+        return None
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    return function
+
+
+_RENAMEAT2 = _load_renameat2()
+
+
+def _renameat2(
+    old_dir_fd: int,
+    old_name: str,
+    new_dir_fd: int,
+    new_name: str,
+    flags: int,
+) -> None:
+    if _RENAMEAT2 is None:
+        core.fail(
+            "renameat2 ist für die atomare Safety-Observer-Veröffentlichung "
+            "nicht verfügbar",
+            phase="observer-unit-renameat2-unavailable",
+        )
+    ctypes.set_errno(0)
+    result = _RENAMEAT2(
+        ctypes.c_int(old_dir_fd),
+        os.fsencode(old_name),
+        ctypes.c_int(new_dir_fd),
+        os.fsencode(new_name),
+        ctypes.c_uint(flags),
+    )
+    if result == 0:
+        return
+    captured_errno = ctypes.get_errno()
+    if captured_errno == errno.ENOSYS:
+        core.fail(
+            "renameat2 wird vom Kernel nicht unterstützt",
+            phase="observer-unit-renameat2-unavailable",
+            details={"errno": captured_errno},
+        )
+    raise OSError(captured_errno, os.strerror(captured_errno), new_name)
+
+
+def _same_observer_entry(
+    before: os.stat_result | None,
+    after: os.stat_result | None,
+) -> bool:
+    if before is None or after is None:
+        return before is after
+    # renameat2 legitimately changes ctime. All identity-, ownership-, mode-
+    # and content-relevant metadata remains stable and is checked explicitly.
+    return (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_uid,
+        before.st_gid,
+        before.st_nlink,
+        before.st_size,
+        before.st_mtime_ns,
+    ) == (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_uid,
+        after.st_gid,
+        after.st_nlink,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+
+
+def _atomic_publish_observer_unit(
+    directory_fd: int,
+    incoming_name: str,
+    target_name: str,
+    target_info: os.stat_result | None,
+    target_content: bytes | None,
+    incoming_info: os.stat_result,
+    expected: bytes,
+) -> dict[str, str | None]:
+    if target_info is None:
+        try:
+            _renameat2(
+                directory_fd,
+                incoming_name,
+                directory_fd,
+                target_name,
+                RENAME_NOREPLACE,
+            )
+        except OSError as exc:
+            # The unique incoming artifact is deliberately retained. Deleting
+            # it by name here would reintroduce a cleanup TOCTOU race.
+            core.fail(
+                "Safety-Observer-Unit-Ziel wurde gleichzeitig angelegt",
+                phase="observer-unit-target-drift",
+                details={
+                    "error_type": type(exc).__name__,
+                    "errno": exc.errno,
+                    "retained_incoming_name": incoming_name,
+                },
+            )
+        os.fsync(directory_fd)
+        published, published_info = _read_observer_unit_at(
+            directory_fd,
+            target_name,
+        )
+        if (
+            published != expected
+            or not _same_observer_entry(incoming_info, published_info)
+        ):
+            core.fail(
+                "Safety-Observer-Unit-Ziel driftete nach atomarer Veröffentlichung",
+                phase="observer-unit-target-drift",
+            )
+        return {"retained_name": None, "retained_sha256": None}
+
+    if target_content is None:
+        core.fail(
+            "Safety-Observer-Unit-Zielinhalt fehlt vor atomarem Austausch",
+            phase="observer-unit-target-drift",
+        )
+
+    try:
+        _renameat2(
+            directory_fd,
+            incoming_name,
+            directory_fd,
+            target_name,
+            RENAME_EXCHANGE,
+        )
+    except OSError as exc:
+        core.fail(
+            "Safety-Observer-Unit-Austausch schlug fehl",
+            phase="observer-unit-target-drift",
+            details={
+                "error_type": type(exc).__name__,
+                "errno": exc.errno,
+                "retained_incoming_name": incoming_name,
+            },
+        )
+
+    # Never exchange back after drift. A second actor could replace the target
+    # between detection and rollback, causing the rollback to move or delete a
+    # third object. Instead, preserve the displaced entry under a hidden,
+    # unique name and verify both resulting mappings without further mutation.
+    retained_name = (
+        f".{target_name}.retained-{secrets.token_hex(12)}"
+    )
+    try:
+        _renameat2(
+            directory_fd,
+            incoming_name,
+            directory_fd,
+            retained_name,
+            RENAME_NOREPLACE,
+        )
+    except OSError as exc:
+        core.fail(
+            "Verdrängte Safety-Observer-Unit konnte nicht sicher bewahrt werden",
+            phase="observer-unit-retention",
+            details={
+                "error_type": type(exc).__name__,
+                "errno": exc.errno,
+                "retained_incoming_name": incoming_name,
+                "retained_candidate_name": retained_name,
+            },
+        )
+    os.fsync(directory_fd)
+
+    published, published_info = _read_observer_unit_at(
+        directory_fd,
+        target_name,
+    )
+    retained, retained_info = _read_observer_unit_at(
+        directory_fd,
+        retained_name,
+    )
+    if (
+        published != expected
+        or not _same_observer_entry(incoming_info, published_info)
+    ):
+        core.fail(
+            "Safety-Observer-Unit-Ziel driftete während der Retention",
+            phase="observer-unit-target-drift",
+            details={"retained_name": retained_name},
+        )
+    if (
+        retained != target_content
+        or not _same_observer_entry(target_info, retained_info)
+    ):
+        core.fail(
+            "Verdrängte Safety-Observer-Unit driftete während der Retention",
+            phase="observer-unit-target-drift",
+            details={"retained_name": retained_name},
+        )
+    return {
+        "retained_name": retained_name,
+        "retained_sha256": hashlib.sha256(target_content).hexdigest(),
+    }
+
+
+def _verify_safety_observer_executes(unit_name: str) -> dict[str, str]:
+    start_result = core.run(
+        ["systemctl", "--user", "start", unit_name],
+        check=False,
+        capture=True,
+        timeout=core.TIMEOUTS["service_start"],
+    )
+    if start_result.returncode != 0:
+        core.fail(
+            "Safety-Observer-Unit konnte nicht erfolgreich ausgeführt werden",
+            phase="observer-unit-execution",
+            details={
+                "returncode": start_result.returncode,
+                "stderr": start_result.stderr.strip(),
+            },
+        )
+    status_result = core.run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            unit_name,
+            "--property=Result",
+            "--property=ActiveState",
+            "--property=SubState",
+        ],
+        check=False,
+        capture=True,
+        timeout=core.TIMEOUTS["systemd_query"],
+    )
+    if status_result.returncode != 0:
+        core.fail(
+            "Safety-Observer-Ausführungszustand konnte nicht gelesen werden",
+            phase="observer-unit-execution-readback",
+            details={
+                "returncode": status_result.returncode,
+                "stderr": status_result.stderr.strip(),
+            },
+        )
+    values: dict[str, str] = {}
+    for line in status_result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    expected = {
+        "Result": "success",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+    }
+    if values != expected:
+        core.fail(
+            "Safety-Observer-Ausführung endete nicht kanonisch erfolgreich",
+            phase="observer-unit-execution-readback",
+            details={"properties": values},
+        )
+    return values
+
+
+def install_safety_observer_unit(
+    repo: Path,
+    snapshot: core.Snapshot,
+    *,
+    target: Path = SAFETY_OBSERVER_UNIT_PATH,
+) -> dict[str, Any]:
+    expected = _observer_unit_bytes(repo, snapshot.repo_head)
+    parent = target.parent
+    directory_fd, directory_fds, directory_edges = _open_observer_unit_directory(parent)
+    try:
+        _require_parent_mapping(parent, directory_fd, directory_edges)
+        current, target_info = _read_observer_unit_at(directory_fd, target.name)
+        changed = (
+            current != expected
+            or target_info is None
+            or statmod.S_IMODE(target_info.st_mode) != 0o644
+        )
+        publication: dict[str, str | None] = {
+            "retained_name": None,
+            "retained_sha256": None,
+        }
+        if changed:
+            incoming_name = (
+                f".{target.name}.incoming-{secrets.token_hex(12)}"
+            )
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW
+            )
+            descriptor = os.open(
+                incoming_name,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                view = memoryview(expected)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        core.fail(
+                            "Safety-Observer-Unit konnte nicht vollständig geschrieben werden"
+                        )
+                    view = view[written:]
+                os.fchmod(descriptor, 0o644)
+                os.fsync(descriptor)
+                incoming_info = os.fstat(descriptor)
+                _require_owned_regular(
+                    incoming_info,
+                    "Temporäre Safety-Observer-Unit ist nicht sicher",
+                )
+            finally:
+                os.close(descriptor)
+            _require_parent_mapping(parent, directory_fd, directory_edges)
+            publication = _atomic_publish_observer_unit(
+                directory_fd,
+                incoming_name,
+                target.name,
+                target_info,
+                current,
+                incoming_info,
+                expected,
+            )
+        installed, installed_info = _read_observer_unit_at(
+            directory_fd,
+            target.name,
+        )
+        if (
+            installed != expected
+            or installed_info is None
+            or statmod.S_IMODE(installed_info.st_mode) != 0o644
+        ):
+            core.fail("Safety-Observer-Unit stimmt nach Installation nicht exakt")
+        _require_parent_mapping(parent, directory_fd, directory_edges)
+        reload_result = core.run(
+            ["systemctl", "--user", "daemon-reload"],
+            check=False,
+            capture=True,
+            timeout=core.TIMEOUTS["service_start"],
+        )
+        if reload_result.returncode != 0:
+            core.fail(
+                "systemd daemon-reload für Safety-Observer fehlgeschlagen",
+                phase="observer-unit-daemon-reload",
+                details={"returncode": reload_result.returncode},
+            )
+        relations = _observer_unit_relations(target)
+        execution = _verify_safety_observer_executes(target.name)
+        final_bytes, final_info = _read_observer_unit_at(
+            directory_fd,
+            target.name,
+        )
+        if (
+            final_bytes != expected
+            or not _same_observer_entry(installed_info, final_info)
+            or final_info is None
+            or statmod.S_IMODE(final_info.st_mode) != 0o644
+        ):
+            core.fail(
+                "Safety-Observer-Unit driftete während des systemd-Readbacks",
+                phase="observer-unit-target-drift",
+            )
+        _require_parent_mapping(parent, directory_fd, directory_edges)
+        retained_name = publication["retained_name"]
+        return {
+            "changed": changed,
+            "path": str(target),
+            "repo_head": snapshot.repo_head,
+            "sha256": hashlib.sha256(expected).hexdigest(),
+            "retained_path": (
+                str(parent / retained_name)
+                if retained_name is not None
+                else None
+            ),
+            "retained_sha256": publication["retained_sha256"],
+            "relations": relations,
+            "execution": execution,
+        }
+    finally:
+        for descriptor in reversed(directory_fds):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _load_yaml(profile_path: Path) -> Any:
@@ -648,8 +1613,11 @@ def deploy_url(
         release_path=build.release_path,
         previous=core.capture_pointer(runtime),
     )
-    phase = "stop-tunnel"
+    observer_repair = install_safety_observer_unit(repo, snapshot)
+    phase = "post-observer-snapshot-revalidation"
     try:
+        core.verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
+        phase = "stop-tunnel"
         stop_service(TUNNEL_SERVICE)
         phase = "stop-operator"
         stop_service(OPERATOR_SERVICE)
@@ -715,6 +1683,21 @@ def deploy_url(
         primary_error = _error_summary(original)
         primary_error.setdefault("phase", phase)
         primary_error["deploy_phase"] = phase
+        observer_repair_evidence = {
+            "marker": OBSERVER_SAFETY_REPAIR_MARKER,
+            "retained": True,
+            "repo_head": observer_repair["repo_head"],
+            "sha256": observer_repair["sha256"],
+            "changed": bool(observer_repair["changed"]),
+        }
+        if observer_repair.get("retained_path") is not None:
+            observer_repair_evidence["retained_path"] = observer_repair[
+                "retained_path"
+            ]
+            observer_repair_evidence["retained_sha256"] = observer_repair[
+                "retained_sha256"
+            ]
+        primary_error["observer_safety_repair"] = observer_repair_evidence
         print(
             "PRIMARY-DEPLOY-ERROR: "
             + json.dumps(primary_error, sort_keys=True),

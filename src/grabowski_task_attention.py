@@ -477,21 +477,33 @@ def _validate_outcome_receipt(
             raise TaskAttentionIntegrityError("task lifecycle task-row receipt binding is invalid")
     return receipt_sha256
 
+
+def _lifecycle_binding(record: dict[str, Any]) -> tuple[str | None, str | None]:
+    terminalization_sha256 = record.get("terminalization_sha256")
+    lifecycle_receipt_sha256 = record.get("lifecycle_receipt_sha256")
+    for label, value in (
+        ("terminalization", terminalization_sha256),
+        ("lifecycle receipt", lifecycle_receipt_sha256),
+    ):
+        if value is not None and (
+            not isinstance(value, str) or SHA256_RE.fullmatch(value) is None
+        ):
+            raise TaskAttentionIntegrityError(
+                f"task lifecycle {label} binding is invalid"
+            )
+    if (terminalization_sha256 is None) != (lifecycle_receipt_sha256 is None):
+        raise TaskAttentionConflictError("task lifecycle binding is incomplete")
+    return terminalization_sha256, lifecycle_receipt_sha256
+
+
 def _read_valid_outcome(
     record: dict[str, Any],
     *,
     expected_receipt_sha256: str | None,
 ) -> tuple[dict[str, Any], str, str]:
     binding = _task_binding(record)
-    authoritative_receipt_sha256 = record.get("lifecycle_receipt_sha256")
+    _terminalization_sha256, authoritative_receipt_sha256 = _lifecycle_binding(record)
     if authoritative_receipt_sha256 is not None:
-        if (
-            not isinstance(authoritative_receipt_sha256, str)
-            or SHA256_RE.fullmatch(authoritative_receipt_sha256) is None
-        ):
-            raise TaskAttentionIntegrityError(
-                "task lifecycle task-row receipt binding is invalid"
-            )
         if (
             expected_receipt_sha256 is not None
             and expected_receipt_sha256 != authoritative_receipt_sha256
@@ -502,9 +514,16 @@ def _read_valid_outcome(
         expected_receipt_sha256 = authoritative_receipt_sha256
 
     _ensure_private_directory(tasks.TASK_OUTCOMES_DIR, create=False)
+    primary_path, lifecycle_path = _outcome_paths(binding["task_id"])
+    paths = (primary_path, lifecycle_path)
+    if authoritative_receipt_sha256 is not None:
+        # Prefer the dedicated lifecycle path, but keep the primary path as a
+        # compatibility location because current writers may have persisted the
+        # authoritative v2 receipt there before a legacy primary existed.
+        paths = (lifecycle_path, primary_path)
     first_missing: FileNotFoundError | None = None
     first_conflict: TaskAttentionConflictError | None = None
-    for path in _outcome_paths(binding["task_id"]):
+    for path in paths:
         try:
             value, file_sha256 = _read_private_json(
                 path,
@@ -513,6 +532,14 @@ def _read_valid_outcome(
         except FileNotFoundError as exc:
             if first_missing is None:
                 first_missing = exc
+            continue
+        if (
+            authoritative_receipt_sha256 is not None
+            and value.get("receipt_sha256") != authoritative_receipt_sha256
+        ):
+            # A historical or unrelated receipt at the alternate compatibility
+            # path has no authority once the task row binds an exact lifecycle
+            # digest. Do not let its older schema mask the bound receipt.
             continue
         try:
             receipt_sha256 = _validate_outcome_receipt(
@@ -628,6 +655,7 @@ def record_decision(parameters: dict[str, Any]) -> dict[str, Any]:
     with _state_lock():
         record = tasks._row(task_id)
         binding = _task_binding(record)
+        lifecycle_binding = _lifecycle_binding(record)
         _validate_expected_binding(parameters, binding)
         if record["state"] not in TERMINAL_ATTENTION_STATES:
             raise TaskAttentionConflictError(
@@ -655,7 +683,12 @@ def record_decision(parameters: dict[str, Any]) -> dict[str, Any]:
         payload["receipt_sha256"] = _sha256_json(payload)
 
         current = tasks._row(task_id)
-        if _task_binding(current) != binding or current["state"] != record["state"]:
+        current_lifecycle_binding = _lifecycle_binding(current)
+        if (
+            _task_binding(current) != binding
+            or current["state"] != record["state"]
+            or current_lifecycle_binding != lifecycle_binding
+        ):
             raise TaskAttentionConflictError("task binding changed before decision publication")
         root = _state_root()
         target = _decision_path(binding)

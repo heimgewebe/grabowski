@@ -28,6 +28,7 @@
     "repoground_query_existing_index",
     "repoground_range_get",
     "repoground_context_pack",
+    "repoground_context_compose",
     "repoground_find_symbol",
     "repoground_get_callers",
     "repoground_get_callees",
@@ -111,6 +112,7 @@
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_candidate_assess",
     "grabowski_bureau_task_propose",
+    "grabowski_bureau_task_review",
     "grabowski_bureau_task_publish_preview",
     "grabowski_bureau_task_publish",
     "grabowski_resource_nonconflict_assess",
@@ -138,6 +140,7 @@
     "grabowski_agent_workspace_attach",
     "grabowski_agent_workspace_collect",
     "grabowski_agent_workspace_role_retry",
+    "grabowski_agent_workspace_writer_handoff",
     "grabowski_agent_workspace_close",
     "grabowski_agent_workspace_observe",
     "grabowski_agent_workspace_optimize",
@@ -155,7 +158,7 @@
   ],
   "mode": "module",
   "module": "grabowski_operator",
-  "schema_version": 2,
+  "schema_version": 3,
   "source": "src/grabowski_runtime.py",
   "supporting_sources": [
     {
@@ -257,6 +260,10 @@
     {
       "module": "grabowski_command_identity",
       "source": "src/grabowski_command_identity.py"
+    },
+    {
+      "module": "grabowski_sqlite_store",
+      "source": "src/grabowski_sqlite_store.py"
     },
     {
       "module": "grabowski_tasks",
@@ -369,6 +376,12 @@
     {
       "module": "grabowski_juno_storage",
       "source": "src/grabowski_juno_storage.py"
+    }
+  ],
+  "runtime_assets": [
+    {
+      "source": "config/coding-agent-catalog.json",
+      "destination": "config/coding-agent-catalog.json"
     }
   ]
 }

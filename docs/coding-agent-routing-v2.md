@@ -17,6 +17,28 @@ Jules ist ein verwalteter Remote-Harness. Die interne Platzhalteridentität beha
 
 Sol high und Fable teilen denselben Startprior. Für denselben Aufgabentyp können beide als Co-Primärroute erscheinen. Das ist keine Erlaubnis für zwei parallele Writer. Die konkrete Einzelroute ergibt sich aus Aufgabenprofil, Effort, Harness, belastbaren lokalen Ergebnissen, Nacharbeit und Kontingent. Reine Run-Zahlen oder Anbieteranteile haben keinen Einfluss.
 
+## Getrennte Writer- und Review-Routen
+
+Die bisherige ID `claude-fable-5-high` wird nicht still von Planung auf Mutation umgedeutet. Sie bleibt als deaktivierter, plan-only Kompatibilitätsalias mit explizitem `disabled_reason` sichtbar. Fest codierte Inspektion sieht deshalb weiterhin eine nicht mutierende Route; jede Rangfolge verwirft sie fail-closed.
+
+Die neue aktive Writer-ID ist `claude-fable-5-writer-high`. Sie verwendet `claude -p --safe-mode --permission-mode acceptEdits --model claude-fable-5 --effort high` und `writer_only=true`. Top-Class-Policy und Co-Primär-Rangfolge referenzieren ausschließlich diese ID. Die neue ID ist absichtlich eine brechende Änderung für Aufrufer, die eine aktive Fable-Writer-ID fest codiert haben; Aufrufer müssen auf die neue ID wechseln. Die Fable-Routenhistorie ist leer, deshalb ist keine Ergebnis- oder Lernhistorienmigration erforderlich.
+
+Unabhängige Fable-Reviews laufen über die weiterhin aktive ID `claude-fable-5-review-high` mit `--permission-mode plan` und `review_only=true`. Plan-Modus ist für unabhängige, kritische und Security-Reviews passend, weil die Route analysiert, ohne den geprüften Stand zu verändern. Die Opus-Route `claude-opus-4.8-high` ist ebenfalls eine plan-only Review-Route und deshalb bewusst aus der Writer-Rangfolge entfernt; ihre Qualitätsprior bleibt für Review und Urteil erhalten, ohne eine mutierende Primärroute zu behaupten.
+
+Plan-Semantik gilt global: Jede Route mit plan als Permission- oder Approval-Modus muss `review_only=true` sein, mindestens eine als `independent_review=true` klassifizierte Review-Aufgabe anbieten und darf keine Writer-Aufgabe anbieten. Das gilt auch für deaktivierte und lokale Routen. Writer-only-Routen brauchen umgekehrt mindestens eine Writer-Aufgabe und dürfen keine Review-Aufgabe enthalten. Eine aktivierte externe Route ohne tatsächliche Writer- oder Review-Fähigkeit macht den gesamten Katalog ungültig.
+
+`route_role`, `writer_capable` und `review_capable` werden aus der tatsächlichen Partition der Task-Klassen plus den einschränkenden Rollenflags abgeleitet, nicht aus den Flags allein. Writer-Ranking verlangt `writer_capable`; Reviewer-Ranking verlangt `review_capable`. Explizite Review-Aufgaben wählen daher eine reviewer-fähige Primärroute und melden `primary_role=reviewer`; normale Coding-Aufgaben melden `primary_role=writer`. Ein kritischer Review darf weiterhin einen zweiten, provider- und lineage-unabhängigen Reviewer verlangen.
+
+`acceptEdits` ist gewählt, weil eine Writer-Route im separat autorisierten Arbeitsraum Änderungen anwenden können muss, ohne die Schutzgrenzen von `--safe-mode` zu umgehen. Ein `auto`-Modus würde die Freigabeentscheidung weiter delegieren; `bypassPermissions` beziehungsweise vergleichbare Permission-Bypässe würden die Sicherheitsgrenze aufheben. Beides ist hier ausdrücklich ausgeschlossen. `acceptEdits` erteilt weder automatische Ausführungsautorität noch Integrations-, Merge- oder Deployment-Rechte. Es bleibt bei höchstens einem mutierenden Writer; Katalog und Empfehlung starten keine Route automatisch.
+
+`argv_prefix` bleibt in dieser Version die kanonische Befehlsquelle. Permission- und Approval-Modi werden zentral, reihenfolgeunabhängig und für beide CLI-Schreibweisen (`--flag value` und `--flag=value`) validiert; der abgeleitete Wert erscheint als strukturiertes Feld `permission_mode` in Katalog- und Routingausgaben. Ein eigenständiges autoritatives Katalogfeld wäre eine separate Schemamigration und wird nicht neben dem bestehenden Befehlsvertrag als zweite Wahrheit eingeführt.
+
+## Katalogauflösung ohne stille zweite Wahrheit
+
+Ohne explizite Konfiguration liest der Router ausschließlich den zum deployten Quellstand gehörenden Katalog `config/coding-agent-catalog.json`. Im Quellcheckout ist das die versionierte Repository-Datei; im installierten Betrieb ist es das gleichnamige, vom Runtime-Vertrag deklarierte Asset innerhalb des immutable Release-Verzeichnisses. Snapshot, Release-ID, Deployment-Manifest und finaler Readback binden Pfad und SHA-256. Eine vorhandene Datei unter `%h/.config/grabowski/coding-agent-catalog.json` überschreibt den versionierten Katalog nicht mehr still. Damit können alte lokale Kopien weder neue Validierungsregeln umgehen noch einen strukturell grünen Werkzeugvertrag bei semantisch ungültigem Routing vortäuschen.
+
+Ein abweichender Katalog bleibt für kontrollierte Tests und ausdrücklich gebundene Sonderläufe über `GRABOWSKI_CODING_AGENT_CATALOG` möglich. Status und `grabowski_contract_drift` veröffentlichen den tatsächlich gewählten Ursprung sowie die semantische Katalogvalidierung. Ein ungültiger expliziter Katalog setzt die Routing-Readiness fail-closed, ohne die allgemeine Runtime-Integrität umzudeuten.
+
 ## Selbstlernen
 
 Lokale Ergebnisse überschreiben Hersteller- und Benchmark-Priors erst ab fünf vergleichbaren Läufen derselben Route und Aufgabenklasse. Verwendet werden First-Pass-, CI- und Merge-Erfolg, Nacharbeit, Rollbacks, falsche Behauptungen, Scope-Verstöße, Laufzeit und Kontingentverbrauch. Zugangstests werden getrennt gespeichert und nie als Qualitätserfolg gezählt. Bayesianische Schrumpfung und harte Kappen verhindern, dass wenige Läufe die Hierarchie umwerfen.
@@ -29,11 +51,13 @@ Statische Kosten-, PAYG-, Reserve- und Parallelitätspolitik stammt ausschließl
 
 Kontingentpools bilden eine Elternkette. Der Router erweitert jeden an einer Route genannten Pool automatisch um alle Elternpools und prüft jeden Pool genau einmal. Sperre, Erschöpfung, Cooldown, Reservegrenze, Parallelitätsgrenze oder Kostenunsicherheit eines Elternpools sperrt damit auch jede Kindroute, selbst wenn der Elternpool in der Route nicht zusätzlich ausgeschrieben ist.
 
-## Automatische Katalogaktualisierung
+## Automatische Laufzeitstatus-Aktualisierung
 
-Der Live-Katalog verfällt nach 3.600 Sekunden fail-closed. `grabowski-coding-agent-probe.timer` erneuert ihn deshalb alle 45 Minuten mit höchstens drei Minuten Jitter. Der Timer startet ausschließlich den bestehenden Metadatenpfad `agent-route probe`; er ruft keine Empfehlungs-, Beobachtungs- oder Ausführungsfunktion auf.
+Der dynamische Verfügbarkeits- und Quotenstatus verfällt nach 3.600 Sekunden fail-closed. `grabowski-coding-agent-probe.timer` erneuert ihn deshalb alle 45 Minuten mit höchstens drei Minuten Jitter. Der Timer startet ausschließlich den bestehenden Metadatenpfad `agent-route probe`; er ruft keine Empfehlungs-, Beobachtungs- oder Ausführungsfunktion auf.
 
 `coding_agent_probe_scheduler.py` verlangt zusätzlich einen privaten SHA-256-Pin für die konkrete `agent-route`-Datei, öffnet diese ohne Symlink-Folge und führt beide Unterbefehle über denselben offenen Dateideskriptor aus. Danach entfernt es bekannte API-Key-Variablen aus der Kindprozessumgebung, hält eine nichtblockierende exklusive Sperre, begrenzt Laufzeit und Ausgabemenge bereits beim parallelen Lesen der Kindprozess-Pipes und verlangt anschließend einen separaten `agent-route status`-Readback. Vorherige `history`-Daten müssen bytewertgleich in der JSON-Struktur erhalten bleiben. Der Router schreibt den eigentlichen State atomar; der Scheduler publiziert zusätzlich einen privaten atomaren Erfolgs- oder Fehlerbeleg. Ein gescheiterter Probe-Lauf autorisiert keine Ausführung und lässt den Router nach Ablauf der Freshness weiterhin fail-closed.
+
+Die Probe-Unit hängt nicht von einer Benutzerkopie des Katalogs ab. Ihre Startbedingungen prüfen ausschließlich den ausführbaren Metadatenpfad und dessen privaten SHA-256-Pin; der Router selbst liest den versionierten Deployment-Katalog.
 
 Die versionierten Installationsquellen sind:
 

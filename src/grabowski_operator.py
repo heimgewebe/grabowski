@@ -27,6 +27,7 @@ from mcp.types import ToolAnnotations
 
 import grabowski_mcp as base
 import grabowski_consumer_surface as consumer_surface
+import grabowski_command_identity as command_identity
 import grabowski_job_origin as job_origin
 import grabowski_private_io as private_io
 
@@ -2902,7 +2903,7 @@ def _start_job(
     if "expected_head" in finalization_contract:
         environment["GRABOWSKI_JOB_EXPECTED_HEAD"] = finalization_contract["expected_head"]
     systemd_argv.extend(f"--setenv={key}={value}" for key, value in environment.items())
-    systemd_argv.extend(["--", *command])
+    systemd_argv.extend(["--", *command_identity.systemd_escape_argv(command)])
     result = _run(
         systemd_argv,
         cwd=HOME,

@@ -1,5 +1,32 @@
 {
   "accepted_additions": {
+    "grabowski_agent_workspace_writer_handoff": {
+      "evidence_refs": [
+        "bureau:issue-687",
+        "tests:test_agent_workspace.py",
+        "contract:agent-workspace-writer-attempts-v1"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns the distinct transition from a terminal failed writer to one operator-bound replacement writer while preserving the original task and receipt as immutable evidence.",
+        "evidence": "Exact workspace, branch, head, clean-state, scope, lifecycle and lease gates; one-attempt limit; append-only writer history; hash-bound task-start reconciliation; attempt-specific receipt collection; focused negative and end-to-end collection tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic terminal, task-start or tmux operation was rejected because none can atomically preserve original writer evidence, enforce the one-handoff state transition, reconcile an ambiguous start by exact task identity and bind collection to the replacement receipt.",
+      "rationale": "Writer handoff changes the authoritative Agent Workspace state machine rather than merely running a command. It must own a narrowly typed transition that cannot be represented by the broader terminal or durable-task surfaces without bypassing workspace evidence and lease invariants.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "agent-workspace",
+        "effects": [
+          "receipt-create",
+          "task-start",
+          "task-state-refresh"
+        ],
+        "read_only": false,
+        "reversibility": "preserved-worktree-and-receipts",
+        "risk_class": "high",
+        "tool": "grabowski_agent_workspace_writer_handoff"
+      }
+    },
     "grabowski_browser_worker_stored_form_action": {
       "evidence_refs": [
         "docs:browser-stored-form-action.md",
@@ -150,6 +177,31 @@
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "grabowski_bureau_task_publish_preview"
+      }
+    },
+    "grabowski_bureau_task_review": {
+      "evidence_refs": [
+        "bureau:OPERATOR-MACHINE-READABILITY-V1-T017",
+        "docs:bureau-operator-intake-adapter-v1.md",
+        "tests:test_bureau_intake_adapter.py"
+      ],
+      "exception_detail": {
+        "claim": "grabowski_bureau_task_review owns only the exact hash-bound Bureau proposal-review authority boundary.",
+        "evidence": "Caller supplies proposal id, reviewer and exact proposal digest; no caller-controlled review timestamp exists; Bureau remains the source of review semantics and timestamp; Registry, Queue and publication truth are not mutated; focused input, symlink and call-shape tests cover the adapter boundary."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic terminal or operation call was rejected because it would expose broader command authority and would not preserve typed proposal identity, exact digest binding, Bureau domain errors, ambiguity readback and machine discoverability of the review transition.",
+      "rationale": "Proposal review is the distinct approval transition between immutable proposal creation and publication preview. A narrow typed tool exposes exactly that boundary while delegating timestamp and domain truth to Bureau.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "bureau",
+        "effects": [
+          "private_proposal_artifact"
+        ],
+        "read_only": false,
+        "reversibility": "artifact-preserving-idempotent-review",
+        "risk_class": "medium",
+        "tool": "grabowski_bureau_task_review"
       }
     },
     "grabowski_coding_agent_catalog": {
@@ -645,6 +697,28 @@
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "repoground_bundle_status"
+      }
+    },
+    "repoground_context_compose": {
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#684",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "exception_detail": {
+        "claim": "This tool adds one bounded read-only composition call shape without expanding mutation authority.",
+        "evidence": "Tests bind base and target commits plus the Git tree delta, enforce a hard context budget, separate dirty overlay state, and expose used and skipped retrieval lanes."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Client-side composition over context_pack, impact, symbol, call-graph, citation, entry and delta reads was rejected because it would duplicate budget and diff-binding policy across agents and could produce unbounded or inconsistent context.",
+      "rationale": "Change-oriented agents need one deterministic, diff-bound and budgeted composition surface; the general context pack has materially different inputs and does not bind base/target revisions or report retrieval-lane decisions.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "knowledge",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "repoground_context_compose"
       }
     },
     "repoground_context_pack": {

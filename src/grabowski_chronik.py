@@ -738,14 +738,15 @@ def _context(record: dict[str, Any]) -> dict[str, Any]:
 def _subject(context: dict[str, Any]) -> dict[str, Any]:
     scope = context.get("subject_scope")
     if scope == "repository":
-        subject = {"scope": "repository", "repo": context["repo"]}
-        for key in ("branch", "head"):
-            if context.get(key):
-                subject[key] = context[key]
-        return subject
-    if scope == "host":
-        return {"scope": "host", "host": context["host"]}
-    raise ValueError("stored Chronik context has invalid subject scope")
+        subject: dict[str, Any] = {"scope": "repository", "repo": context["repo"]}
+    elif scope == "host":
+        subject = {"scope": "host", "host": context["host"]}
+    else:
+        raise ValueError("stored Chronik context has invalid subject scope")
+    for key in ("branch", "head", "component", "bureau_task_id", "pr_number"):
+        if context.get(key) is not None and context.get(key) != "":
+            subject[key] = context[key]
+    return subject
 
 
 def build_event(record: dict[str, Any], state: str) -> dict[str, Any] | None:

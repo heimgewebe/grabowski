@@ -656,10 +656,15 @@ BROWSER_FORM_LOCAL_V6 = ipaddress.ip_network("fc00::/7")
 BROWSER_FORM_NODE_SOURCE = r"""
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import net from 'node:net';
 
 const request = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const digest = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+const FORM_READY_POLL_MS = 50;
+const FORM_READY_TIMEOUT_MS = 1000;
+const FORM_ALLOWED_IDENTITY_TYPES = new Set(['text', 'email', 'select']);
+const FORM_ALLOWED_SUBMIT_TYPES = new Set(['submit', 'button']);
 const RESULT_CODES = new Set([
   'ok', 'target-discovery', 'target-origin', 'transport', 'element-contract',
   'identity-choice', 'browser-fill', 'submit-target', 'submit-effect',
@@ -670,6 +675,7 @@ let nextId = 1;
 const pending = new Map();
 const eventQueue = [];
 const eventWaiters = [];
+let eventSequence = 0;
 let stage = 'target-discovery';
 let cleaned = false;
 let fillConfirmed = false;
@@ -718,15 +724,17 @@ async function connect(url) {
         return;
       }
       if (typeof message.method !== 'string') return;
+      const sequence = ++eventSequence;
       for (let index = 0; index < eventWaiters.length; index += 1) {
         const waiter = eventWaiters[index];
-        if (waiter.method !== message.method || !waiter.predicate(message.params || {})) continue;
+        if (sequence <= waiter.afterSequence || waiter.method !== message.method ||
+            !waiter.predicate(message.params || {})) continue;
         eventWaiters.splice(index, 1);
         clearTimeout(waiter.timer);
         waiter.resolve(message.params || {});
         return;
       }
-      eventQueue.push(message);
+      eventQueue.push({message, sequence});
       if (eventQueue.length > 128) eventQueue.shift();
     };
     ws.onclose = rejectTransportOperations;
@@ -746,16 +754,17 @@ async function call(method, params = {}) {
   });
 }
 
-async function waitEvent(method, predicate = () => true) {
-  const existing = eventQueue.findIndex((message) =>
-    message.method === method && predicate(message.params || {})
+async function waitEvent(method, predicate = () => true, afterSequence = 0) {
+  const existing = eventQueue.findIndex((entry) =>
+    entry.sequence > afterSequence && entry.message.method === method &&
+      predicate(entry.message.params || {})
   );
   if (existing >= 0) {
-    const [message] = eventQueue.splice(existing, 1);
-    return message.params || {};
+    const [entry] = eventQueue.splice(existing, 1);
+    return entry.message.params || {};
   }
   return await new Promise((resolve, reject) => {
-    const waiter = {method, predicate, resolve, reject, timer: null};
+    const waiter = {method, predicate, afterSequence, resolve, reject, timer: null};
     waiter.timer = setTimeout(() => {
       const index = eventWaiters.indexOf(waiter);
       if (index >= 0) eventWaiters.splice(index, 1);
@@ -763,6 +772,22 @@ async function waitEvent(method, predicate = () => true) {
     }, request.timeout_ms);
     eventWaiters.push(waiter);
   });
+}
+
+function normalizeRemoteAddress(raw) {
+  let value = String(raw || '').trim();
+  if (value.startsWith('[') && value.endsWith(']')) value = value.slice(1, -1);
+  const zoneIndex = value.indexOf('%');
+  if (zoneIndex >= 0) value = value.slice(0, zoneIndex);
+  const version = net.isIP(value);
+  if (version === 4) return value;
+  if (version !== 6) return null;
+  try {
+    const hostname = new URL('http://[' + value + ']/').hostname;
+    return hostname.slice(1, -1).toLowerCase();
+  } catch {
+    return null;
+  }
 }
 
 async function evaluate(source) {
@@ -857,6 +882,85 @@ async function clearFields() {
   }
 }
 
+function formReadyDeadline() {
+  return Date.now() + Math.min(FORM_READY_TIMEOUT_MS, request.timeout_ms);
+}
+
+async function inspectFormContract() {
+  return await evaluate(expression(request.selectors, `
+    const visible = (element) => {
+      if (!element || !element.isConnected) return false;
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+    let identity, protectedField, submit;
+    try {
+      identity = document.querySelector(s.identity);
+      protectedField = document.querySelector(s.protected);
+      submit = document.querySelector(s.submit);
+    } catch {
+      return {valid: false, origin: location.origin, selector_error: true};
+    }
+    const identityTag = identity ? identity.tagName.toLowerCase() : '';
+    const identityType = identityTag === 'input' ? (identity.type || 'text').toLowerCase() : identityTag;
+    const protectedType = protectedField && protectedField.tagName.toLowerCase() === 'input'
+      ? (protectedField.type || 'text').toLowerCase() : '';
+    const submitTag = submit ? submit.tagName.toLowerCase() : '';
+    const submitType = submitTag === 'input' || submitTag === 'button'
+      ? (submit.type || 'submit').toLowerCase() : submitTag;
+    return {
+      valid: Boolean(identity && protectedField && submit),
+      origin: location.origin,
+      selector_error: false,
+      identity_type: identityType,
+      protected_type: protectedType,
+      submit_type: submitType,
+      identity_visible: visible(identity),
+      protected_visible: visible(protectedField),
+      submit_visible: visible(submit),
+      identity_disabled: Boolean(identity && identity.disabled),
+      protected_disabled: Boolean(protectedField && protectedField.disabled),
+      submit_disabled: Boolean(submit && submit.disabled),
+    };
+  `));
+}
+
+function formContractReady(inspected) {
+  return Boolean(inspected && inspected.valid && !inspected.selector_error &&
+    inspected.origin === request.expected_origin &&
+    FORM_ALLOWED_IDENTITY_TYPES.has(inspected.identity_type) &&
+    inspected.protected_type === 'password' &&
+    FORM_ALLOWED_SUBMIT_TYPES.has(inspected.submit_type) &&
+    inspected.identity_visible && inspected.protected_visible && inspected.submit_visible &&
+    !inspected.identity_disabled && !inspected.protected_disabled && !inspected.submit_disabled);
+}
+
+async function waitForFormContract() {
+  const deadline = formReadyDeadline();
+  while (true) {
+    const inspected = await inspectFormContract();
+    if (inspected && (inspected.selector_error ||
+        (typeof inspected.origin === 'string' && inspected.origin !== request.expected_origin))) {
+      throw new Error('element-contract');
+    }
+    if (formContractReady(inspected)) return inspected;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('element-contract');
+    await sleep(Math.min(FORM_READY_POLL_MS, remaining));
+  }
+}
+
+async function clearFieldsAfterHydration() {
+  const deadline = formReadyDeadline();
+  while (true) {
+    if (await clearFields()) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await sleep(Math.min(FORM_READY_POLL_MS, remaining));
+  }
+}
+
 try {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), request.timeout_ms);
@@ -880,43 +984,67 @@ try {
   await connect(matches[0].webSocketDebuggerUrl);
   await call('Runtime.enable');
   await call('Page.enable');
+  await call('Page.setLifecycleEventsEnabled', {enabled: true});
   await call('Network.enable');
   await call('Network.setCacheDisabled', {cacheDisabled: true});
   const frameTree = await call('Page.getFrameTree');
-  const mainFrameId = frameTree.frameTree && frameTree.frameTree.frame
-    ? frameTree.frameTree.frame.id : null;
-  if (!mainFrameId) throw new Error('protocol');
-  const documentResponsePromise = waitEvent('Network.responseReceived', (params) => {
-    if (params.type !== 'Document' || params.frameId !== mainFrameId ||
-        !params.response || typeof params.response.url !== 'string') return false;
-    try { return new URL(params.response.url).origin === request.expected_origin; }
-    catch { return false; }
-  }).then((documentResponse) => {
-    const remoteAddress = String(documentResponse.response.remoteIPAddress || '')
-      .split('%', 1)[0].replace(/^\[|\]$/g, '');
-    if (!remoteAddress || !request.allowed_addresses.includes(remoteAddress)) {
+  const mainFrame = frameTree.frameTree && frameTree.frameTree.frame
+    ? frameTree.frameTree.frame : null;
+  const mainFrameId = mainFrame && typeof mainFrame.id === 'string' ? mainFrame.id : null;
+  const currentLoaderId = mainFrame && typeof mainFrame.loaderId === 'string'
+    ? mainFrame.loaderId : null;
+  if (!mainFrameId || !currentLoaderId) throw new Error('protocol');
+
+  const reloadEventFloor = eventSequence;
+  const documentResponsePromise = waitEvent('Network.responseReceived', (params) =>
+    params.type === 'Document' && params.frameId === mainFrameId &&
+      typeof params.loaderId === 'string' && params.loaderId.length > 0 &&
+      params.loaderId !== currentLoaderId &&
+      params.response && typeof params.response.url === 'string',
+  reloadEventFloor);
+  const lifecycleLoadPromise = waitEvent('Page.lifecycleEvent', (params) =>
+    params.name === 'load' && params.frameId === mainFrameId &&
+      typeof params.loaderId === 'string' && params.loaderId.length > 0 &&
+      params.loaderId !== currentLoaderId,
+  reloadEventFloor);
+  try {
+    const [, documentResponse, lifecycleLoad] = await Promise.all([
+      call('Page.reload', {ignoreCache: true, loaderId: currentLoaderId}),
+      documentResponsePromise,
+      lifecycleLoadPromise,
+    ]);
+    if (documentResponse.loaderId !== lifecycleLoad.loaderId) {
       throw new Error('target-origin');
     }
+    let responseOrigin;
+    try { responseOrigin = new URL(documentResponse.response.url).origin; }
+    catch { throw new Error('target-origin'); }
+    const remoteAddress = normalizeRemoteAddress(documentResponse.response.remoteIPAddress);
+    if (responseOrigin !== request.expected_origin || !remoteAddress ||
+        !request.allowed_addresses.includes(remoteAddress)) {
+      throw new Error('target-origin');
+    }
+
+    const verifiedFrameTree = await call('Page.getFrameTree');
+    const verifiedFrame = verifiedFrameTree.frameTree && verifiedFrameTree.frameTree.frame
+      ? verifiedFrameTree.frameTree.frame : null;
+    let verifiedOrigin = null;
+    try { verifiedOrigin = verifiedFrame ? new URL(verifiedFrame.url).origin : null; }
+    catch {}
+    if (!verifiedFrame || verifiedFrame.id !== mainFrameId ||
+        verifiedFrame.loaderId !== documentResponse.loaderId ||
+        verifiedOrigin !== request.expected_origin) {
+      throw new Error('target-origin');
+    }
+    // Public evidence is committed only after loader, frame, origin, and allowlist verification.
     remoteAddressSha256 = digest(remoteAddress);
-    return documentResponse;
-  });
-  const loadEventPromise = waitEvent('Page.loadEventFired');
-  try {
-    await Promise.all([
-      call('Page.reload', {ignoreCache: true}),
-      documentResponsePromise,
-      loadEventPromise,
-    ]);
   } catch (error) {
     rejectTransportOperations();
     try { if (ws) ws.close(); } catch {}
     throw error;
   }
-  // Let the reloaded document settle before querying its form contract.
-  await sleep(100);
-
   if (request.cleanup_only === true) {
-    cleaned = await clearFields();
+    cleaned = await clearFieldsAfterHydration();
     emit({
       schema_version: 1, ok: true, result_code: 'cleanup', fill_confirmed: false,
       submitted: false, action_effect_observed: false, navigation_observed: false,
@@ -925,51 +1053,7 @@ try {
     });
   } else {
   stage = 'element-contract';
-  const inspected = await evaluate(expression(request.selectors, `
-    const visible = (element) => {
-      if (!element || !element.isConnected) return false;
-      const rect = element.getBoundingClientRect();
-      const style = getComputedStyle(element);
-      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-    };
-    let identity, protectedField, submit;
-    try {
-      identity = document.querySelector(s.identity);
-      protectedField = document.querySelector(s.protected);
-      submit = document.querySelector(s.submit);
-    } catch {
-      return {valid: false};
-    }
-    const identityTag = identity ? identity.tagName.toLowerCase() : '';
-    const identityType = identityTag === 'input' ? (identity.type || 'text').toLowerCase() : identityTag;
-    const protectedType = protectedField && protectedField.tagName.toLowerCase() === 'input'
-      ? (protectedField.type || 'text').toLowerCase() : '';
-    const submitTag = submit ? submit.tagName.toLowerCase() : '';
-    const submitType = submitTag === 'input' || submitTag === 'button'
-      ? (submit.type || 'submit').toLowerCase() : submitTag;
-    return {
-      valid: Boolean(identity && protectedField && submit),
-      origin: location.origin,
-      identity_type: identityType,
-      protected_type: protectedType,
-      submit_type: submitType,
-      identity_visible: visible(identity),
-      protected_visible: visible(protectedField),
-      submit_visible: visible(submit),
-      identity_disabled: Boolean(identity && identity.disabled),
-      protected_disabled: Boolean(protectedField && protectedField.disabled),
-      submit_disabled: Boolean(submit && submit.disabled),
-    };
-  `));
-  const allowedIdentity = new Set(['text', 'email', 'select']);
-  const allowedSubmit = new Set(['submit', 'button']);
-  if (!inspected || !inspected.valid || inspected.origin !== request.expected_origin ||
-      !allowedIdentity.has(inspected.identity_type) || inspected.protected_type !== 'password' ||
-      !allowedSubmit.has(inspected.submit_type) || !inspected.identity_visible ||
-      !inspected.protected_visible || !inspected.submit_visible || inspected.identity_disabled ||
-      inspected.protected_disabled || inspected.submit_disabled) {
-    throw new Error('element-contract');
-  }
+  const inspected = await waitForFormContract();
 
   if (request.identity_choice !== null) {
     stage = 'identity-choice';
@@ -1171,7 +1255,15 @@ def _canonical_local_origin(value: str) -> tuple[str, str, list[str]]:
         answers = socket.getaddrinfo(hostname, service_port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise RuntimeError("expected_origin hostname did not resolve") from exc
-    addresses = sorted({answer[4][0].split("%", 1)[0] for answer in answers})
+    try:
+        addresses = sorted(
+            {
+                str(ipaddress.ip_address(answer[4][0].split("%", 1)[0]))
+                for answer in answers
+            }
+        )
+    except ValueError as exc:
+        raise RuntimeError("expected_origin resolved to an invalid address") from exc
     if not addresses:
         raise RuntimeError("expected_origin hostname has no addresses")
     for raw in addresses:

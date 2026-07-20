@@ -135,19 +135,80 @@ class CodingAgentRouterTests(unittest.TestCase):
         defaults.update(kwargs)
         return router.grabowski_coding_agent_route(task_class, **defaults)
 
+    def test_implicit_user_catalog_does_not_override_deployment_catalog(self) -> None:
+        home = self.root / "home"
+        stale = home / ".config" / "grabowski" / "coding-agent-catalog.json"
+        stale.parent.mkdir(parents=True)
+        stale_catalog = json.loads(json.dumps(self.catalog))
+        route = next(
+            item for item in stale_catalog["routes"] if item["id"] == "claude-fable-5-high"
+        )
+        route.pop("review_only", None)
+        stale.write_text(json.dumps(stale_catalog), encoding="utf-8")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                router._catalog_path(), ROOT / "config" / "coding-agent-catalog.json"
+            )
+            health = router.coding_agent_catalog_health()
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["source"], "deployment_catalog")
+
+    def test_installed_module_resolves_release_scoped_catalog(self) -> None:
+        release = self.root / "release"
+        catalog = release / "config" / "coding-agent-catalog.json"
+        catalog.parent.mkdir(parents=True)
+        catalog.write_text(json.dumps(self.catalog), encoding="utf-8")
+        module = release / ".venv/lib/python3.10/site-packages/grabowski_coding_agent_router.py"
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(router, "__file__", str(module)),
+            mock.patch.object(router.sys, "prefix", str(release / ".venv")),
+        ):
+            health = router.coding_agent_catalog_health()
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["source"], "deployment_catalog")
+        self.assertEqual(health["path"], str(catalog))
+
+    def test_global_prefix_does_not_masquerade_as_release(self) -> None:
+        module = Path("/usr/local/lib/python3.10/site-packages/grabowski_coding_agent_router.py")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(router, "__file__", str(module)),
+            mock.patch.object(router.sys, "prefix", "/usr"),
+        ):
+            self.assertEqual(
+                router._catalog_path(),
+                Path("/usr/local/lib/python3.10/config/coding-agent-catalog.json"),
+            )
+
+    def test_explicit_invalid_catalog_is_reported_by_health(self) -> None:
+        invalid = json.loads(json.dumps(self.catalog))
+        route = next(
+            item for item in invalid["routes"] if item["id"] == "claude-fable-5-high"
+        )
+        route.pop("review_only", None)
+        self.catalog_path.write_text(json.dumps(invalid), encoding="utf-8")
+        health = router.coding_agent_catalog_health()
+        self.assertFalse(health["ready"])
+        self.assertEqual(health["source"], "explicit_environment")
+        self.assertIn("plan-mode route must be review_only", health["error"])
+
     def test_catalog_declares_correct_quality_and_effort_hierarchy(self) -> None:
         result = router.grabowski_coding_agent_catalog(include_disabled=True)
         self.assertTrue(result["validation"]["valid"])
         policy = result["frontier_model_policy"]
         self.assertEqual(
-            policy["top_class_routes"], ["codex-sol-high", "claude-fable-5-high"]
+            policy["top_class_routes"],
+            ["codex-sol-high", "claude-fable-5-writer-high"],
         )
         self.assertEqual(policy["escalation_route"], "codex-sol-xhigh")
         self.assertFalse(result["provider_peer_balance"]["enabled"])
         self.assertEqual(result["provider_peer_balance"]["selection_effect"], 0)
         routes = {route["id"]: route for route in self.catalog["routes"]}
         self.assertEqual(routes["codex-sol-high"]["quality_class"], "S")
-        self.assertEqual(routes["claude-fable-5-high"]["quality_class"], "S")
+        self.assertEqual(
+            routes["claude-fable-5-writer-high"]["quality_class"], "S"
+        )
         self.assertEqual(routes["claude-opus-4.8-high"]["quality_class"], "A")
         self.assertEqual(routes["codex-sol-medium"]["quality_class"], "A")
         self.assertGreater(
@@ -159,10 +220,255 @@ class CodingAgentRouterTests(unittest.TestCase):
             routes["codex-sol-medium"]["burn_weight"],
         )
         self.assertNotEqual(
-            routes["claude-fable-5-high"]["burn_weight"],
+            routes["claude-fable-5-writer-high"]["burn_weight"],
             routes["claude-opus-4.8-high"]["burn_weight"],
         )
         self.assertFalse(result["automatic_execution_authorized"])
+
+        fable_routes = {
+            route["route"]: route
+            for model in result["models"]
+            if model["id"] == "claude-fable-5"
+            for route in model["routes"]
+        }
+        legacy = fable_routes["claude-fable-5-high"]
+        self.assertFalse(legacy["enabled"])
+        self.assertTrue(legacy["disabled_reason"])
+        self.assertEqual(legacy["route_role"], "reviewer")
+        self.assertFalse(legacy["writer_capable"])
+        self.assertTrue(legacy["review_only"])
+
+        writer = fable_routes["claude-fable-5-writer-high"]
+        self.assertEqual(writer["route_role"], "writer")
+        self.assertTrue(writer["writer_only"])
+        self.assertFalse(writer["review_only"])
+        self.assertTrue(writer["writer_capable"])
+        self.assertFalse(writer["review_capable"])
+        self.assertEqual(
+            fable_routes["claude-fable-5-review-high"]["route_role"], "reviewer"
+        )
+        self.assertFalse(
+            fable_routes["claude-fable-5-review-high"]["writer_capable"]
+        )
+        self.assertTrue(fable_routes["claude-fable-5-review-high"]["review_capable"])
+        for model in result["models"]:
+            for public_route in model["routes"]:
+                self.assertNotIn("role", public_route)
+
+    def test_fable_writer_and_reviewer_have_separate_permission_modes(self) -> None:
+        routes = {route["id"]: route for route in self.catalog["routes"]}
+        public = {
+            route["route"]: route
+            for model in router.grabowski_coding_agent_catalog(include_disabled=True)[
+                "models"
+            ]
+            for route in model["routes"]
+        }
+        legacy = routes["claude-fable-5-high"]
+        writer = routes["claude-fable-5-writer-high"]
+        reviewer = routes["claude-fable-5-review-high"]
+        self.assertFalse(legacy["enabled"])
+        self.assertEqual(public[legacy["id"]]["permission_mode"], "plan")
+        self.assertTrue(legacy["review_only"])
+        self.assertIn("Compatibility alias", legacy["disabled_reason"])
+        self.assertIn("--safe-mode", writer["argv_prefix"])
+        self.assertIn("claude-fable-5", writer["argv_prefix"])
+        self.assertEqual(public[writer["id"]]["permission_mode"], "acceptEdits")
+        self.assertTrue(writer["writer_only"])
+        self.assertEqual(public[reviewer["id"]]["permission_mode"], "plan")
+        self.assertTrue(reviewer["review_only"])
+        self.assertEqual(
+            reviewer["task_classes"],
+            ["independent-review", "critical-review", "security-review"],
+        )
+
+    def test_permission_mode_projection_accepts_reordered_and_equals_forms(self) -> None:
+        catalog = json.loads(json.dumps(self.catalog))
+        routes = {route["id"]: route for route in catalog["routes"]}
+        routes["claude-fable-5-review-high"]["argv_prefix"] = [
+            "claude",
+            "--model",
+            "claude-fable-5",
+            "--permission-mode=plan",
+            "-p",
+            "--safe-mode",
+            "--effort",
+            "high",
+        ]
+        routes["claude-fable-5-writer-high"]["argv_prefix"] = [
+            "claude",
+            "--model",
+            "claude-fable-5",
+            "--effort",
+            "high",
+            "--permission-mode=acceptEdits",
+            "-p",
+            "--safe-mode",
+        ]
+        self.catalog_path.write_text(json.dumps(catalog))
+        public = {
+            route["route"]: route
+            for model in router.grabowski_coding_agent_catalog(include_disabled=True)[
+                "models"
+            ]
+            for route in model["routes"]
+        }
+        self.assertEqual(
+            public["claude-fable-5-review-high"]["permission_mode"], "plan"
+        )
+        self.assertEqual(
+            public["claude-fable-5-writer-high"]["permission_mode"], "acceptEdits"
+        )
+
+    def test_route_derivations_are_built_once_for_primary_and_review_ranking(
+        self,
+    ) -> None:
+        original = router._route_capabilities
+        calls: list[str] = []
+
+        def counted(route, catalog, review_task_classes=None):
+            calls.append(route["id"])
+            return original(route, catalog, review_task_classes)
+
+        with mock.patch.object(router, "_route_capabilities", side_effect=counted):
+            result = self._route("complex-patch", need_review=True)
+
+        self.assertEqual(result["decision"], "route")
+        self.assertEqual(len(calls), len(self.catalog["routes"]))
+        self.assertEqual(set(calls), {route["id"] for route in self.catalog["routes"]})
+
+    def test_permission_mode_validation_fails_closed_for_malformed_argv(self) -> None:
+        cases = [
+            (None, "invalid argv_prefix"),
+            (["claude", ""], "invalid argv_prefix"),
+            (["claude", "--permission-mode"], "missing a value"),
+            (["claude", "--permission-mode", "-p"], "missing a value"),
+            (["claude", "--permission-mode="], "empty value"),
+            (
+                [
+                    "claude",
+                    "--permission-mode",
+                    "plan",
+                    "--approval-mode=acceptEdits",
+                ],
+                "conflicting permission modes",
+            ),
+        ]
+        for argv_prefix, message in cases:
+            with self.subTest(argv_prefix=argv_prefix):
+                catalog = json.loads(json.dumps(self.catalog))
+                route = next(
+                    route
+                    for route in catalog["routes"]
+                    if route["id"] == "claude-fable-5-review-high"
+                )
+                route["argv_prefix"] = argv_prefix
+                self.catalog_path.write_text(json.dumps(catalog))
+                with self.assertRaisesRegex(router.CodingAgentRouterError, message):
+                    router.grabowski_coding_agent_catalog(include_disabled=True)
+
+    def test_every_public_plan_route_is_review_only_and_non_writer(self) -> None:
+        result = router.grabowski_coding_agent_catalog(include_disabled=True)
+        public_routes = {
+            route["route"]: route
+            for model in result["models"]
+            for route in model["routes"]
+        }
+        plan_routes = [
+            route
+            for route in public_routes.values()
+            if route["permission_mode"] == "plan"
+        ]
+        self.assertTrue(plan_routes)
+        for public in plan_routes:
+            with self.subTest(route=public["route"]):
+                self.assertTrue(public["review_only"])
+                self.assertFalse(public["writer_capable"])
+                self.assertTrue(public["review_capable"])
+
+    def test_route_role_contract_rejects_ambiguous_or_mutating_plan_routes(self) -> None:
+        invalid_boolean = json.loads(json.dumps(self.catalog))
+        invalid_boolean["routes"][0]["writer_only"] = "true"
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "boolean"):
+            router._validate_catalog(invalid_boolean)
+
+        ambiguous = json.loads(json.dumps(self.catalog))
+        ambiguous["routes"][0]["writer_only"] = True
+        ambiguous["routes"][0]["review_only"] = True
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "mutually exclusive"):
+            router._validate_catalog(ambiguous)
+
+        writer_in_plan_mode = json.loads(json.dumps(self.catalog))
+        writer = next(
+            route
+            for route in writer_in_plan_mode["routes"]
+            if route["id"] == "claude-fable-5-writer-high"
+        )
+        mode_index = writer["argv_prefix"].index("--permission-mode")
+        writer["argv_prefix"][mode_index + 1] = "plan"
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "cannot use plan"):
+            router._validate_catalog(writer_in_plan_mode)
+
+        unmarked_plan_route = json.loads(json.dumps(self.catalog))
+        review_route = next(
+            route
+            for route in unmarked_plan_route["routes"]
+            if route["id"] == "claude-fable-5-review-high"
+        )
+        del review_route["review_only"]
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "must be review_only"):
+            router._validate_catalog(unmarked_plan_route)
+
+        writer_with_review_task = json.loads(json.dumps(self.catalog))
+        writer = next(
+            route
+            for route in writer_with_review_task["routes"]
+            if route["id"] == "claude-fable-5-writer-high"
+        )
+        writer["task_classes"].append("independent-review")
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "no review tasks"):
+            router._validate_catalog(writer_with_review_task)
+
+        writer_without_writer_task = json.loads(json.dumps(self.catalog))
+        writer = next(
+            route
+            for route in writer_without_writer_task["routes"]
+            if route["id"] == "claude-fable-5-writer-high"
+        )
+        writer["task_classes"] = []
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "must have writer"):
+            router._validate_catalog(writer_without_writer_task)
+
+        reviewer_with_writer_task = json.loads(json.dumps(self.catalog))
+        reviewer = next(
+            route
+            for route in reviewer_with_writer_task["routes"]
+            if route["id"] == "claude-fable-5-review-high"
+        )
+        reviewer["task_classes"].append("complex-patch")
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "no writer tasks"):
+            router._validate_catalog(reviewer_with_writer_task)
+
+        reviewer_without_review_task = json.loads(json.dumps(self.catalog))
+        reviewer = next(
+            route
+            for route in reviewer_without_review_task["routes"]
+            if route["id"] == "claude-fable-5-review-high"
+        )
+        reviewer["task_classes"] = []
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "must have review"):
+            router._validate_catalog(reviewer_without_review_task)
+
+        enabled_without_capability = json.loads(json.dumps(self.catalog))
+        route = next(
+            route
+            for route in enabled_without_capability["routes"]
+            if route["id"] == "aider-local-14b"
+        )
+        route["enabled"] = True
+        route["task_classes"] = []
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "no actual capability"):
+            router._validate_catalog(enabled_without_capability)
 
     def test_sonnet_alias_is_resolved_without_claiming_an_unknown_current_model(
         self,
@@ -181,7 +487,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         result = self._route("complex-patch")
         co_routes = {item["route"] for item in result["co_primaries"]}
         self.assertIn("codex-sol-high", co_routes)
-        self.assertIn("claude-fable-5-high", co_routes)
+        self.assertIn("claude-fable-5-writer-high", co_routes)
         self.assertEqual(
             {item["quality_class"] for item in result["co_primaries"]}, {"S"}
         )
@@ -204,12 +510,17 @@ class CodingAgentRouterTests(unittest.TestCase):
     def test_task_specific_defaults_match_the_corrected_baseline(self) -> None:
         complex_patch = self._route("complex-patch")
         self.assertIn(
-            complex_patch["primary"]["route"], {"codex-sol-high", "claude-fable-5-high"}
+            complex_patch["primary"]["route"],
+            {"codex-sol-high", "claude-fable-5-writer-high"},
         )
         migration = self._route("migration", duration_minutes=300)
-        self.assertEqual(migration["primary"]["route"], "claude-fable-5-high")
+        self.assertEqual(
+            migration["primary"]["route"], "claude-fable-5-writer-high"
+        )
         architecture = self._route("architecture")
-        self.assertEqual(architecture["primary"]["route"], "claude-fable-5-high")
+        self.assertEqual(
+            architecture["primary"]["route"], "claude-fable-5-writer-high"
+        )
         security = self._route(
             "security-review", duration_minutes=120, risk_flags=["security-sensitive"]
         )
@@ -242,19 +553,16 @@ class CodingAgentRouterTests(unittest.TestCase):
             {"codex-luna-high", "codex-luna-low", "agy-gemini-flash-low"},
         )
 
-    def test_opus_can_overtake_for_judgment_heavy_debugging_but_not_as_general_top_writer(
+    def test_opus_plan_route_is_reserved_for_review_and_never_ranks_as_writer(
         self,
     ) -> None:
         normal = self._route("deep-debug")
-        self.assertIn(
-            normal["primary"]["route"],
-            {"codex-sol-high", "claude-fable-5-high", "claude-opus-4.8-high"},
-        )
+        self.assertNotEqual(normal["primary"]["route"], "claude-opus-4.8-high")
         judgment = self._route(
             "deep-debug",
             risk_flags=["judgment-critical", "uncertainty-heavy", "root-cause"],
         )
-        self.assertEqual(judgment["primary"]["route"], "claude-opus-4.8-high")
+        self.assertNotEqual(judgment["primary"]["route"], "claude-opus-4.8-high")
         complex_patch = self._route("complex-patch")
         self.assertNotEqual(complex_patch["primary"]["route"], "claude-opus-4.8-high")
 
@@ -496,8 +804,73 @@ class CodingAgentRouterTests(unittest.TestCase):
                 result["reviewers"][0]["provider_family"],
             )
         fable_primary = self._route("migration")
-        self.assertEqual(fable_primary["primary"]["provider_family"], "anthropic")
+        self.assertEqual(
+            fable_primary["primary"]["route"], "claude-fable-5-writer-high"
+        )
         self.assertEqual(fable_primary["reviewers"][0]["provider_family"], "openai")
+        self.assertNotIn(
+            "anthropic-fable",
+            {
+                reviewer["independence_group"]
+                for reviewer in fable_primary["reviewers"]
+            },
+        )
+        for task_class in ("critical-review", "security-review"):
+            review = self._route(task_class)
+            self.assertEqual(review["primary_role"], "reviewer")
+            self.assertTrue(review["primary"]["review_capable"])
+            self.assertTrue(review["reviewers"][0]["review_capable"])
+
+    def test_fable_writer_and_review_routes_rank_only_for_actual_capability(self) -> None:
+        coding = self._route("complex-patch")
+        coding_routes = {
+            coding["primary"]["route"],
+            *(candidate["route"] for candidate in coding["co_primaries"]),
+            *(candidate["route"] for candidate in coding["fallbacks"]),
+        }
+        self.assertEqual(coding["primary_role"], "writer")
+        self.assertIn("claude-fable-5-writer-high", coding_routes)
+        self.assertNotIn("claude-fable-5-review-high", coding_routes)
+        self.assertEqual(coding["primary"]["route"], "codex-sol-high")
+        self.assertEqual(
+            coding["reviewers"][0]["route"], "claude-fable-5-review-high"
+        )
+        self.assertNotIn(
+            "claude-fable-5-writer-high",
+            {reviewer["route"] for reviewer in coding["reviewers"]},
+        )
+
+        fable_primary = self._route("migration")
+        self.assertEqual(
+            fable_primary["primary"]["route"], "claude-fable-5-writer-high"
+        )
+        self.assertNotIn(
+            "anthropic-fable",
+            {
+                reviewer["independence_group"]
+                for reviewer in fable_primary["reviewers"]
+            },
+        )
+
+        for task_class in (
+            "bounded-patch",
+            "complex-patch",
+            "deep-debug",
+            "architecture",
+            "migration",
+        ):
+            with self.subTest(task_class=task_class):
+                result = self._route(task_class)
+                self.assertNotEqual(
+                    result["primary"]["route"], "claude-fable-5-review-high"
+                )
+                self.assertTrue(result["primary"]["writer_capable"])
+                self.assertFalse(
+                    any(
+                        reviewer["route"] == "claude-fable-5-writer-high"
+                        for reviewer in result["reviewers"]
+                    )
+                )
 
     def test_jules_is_a_managed_harness_not_a_ranked_model_claim(self) -> None:
         model = self.catalog["models"]["jules-managed-latest"]

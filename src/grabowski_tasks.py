@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -23,6 +24,7 @@ import grabowski_resources as resources
 import grabowski_nonconflict as nonconflict
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
+import grabowski_sqlite_store as sqlite_store
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -39,6 +41,7 @@ TASK_DB = Path(
     )
 ).expanduser()
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
+DEFAULT_TASK_LIST_LIMIT = 20
 
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
 EXTERNAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
@@ -273,6 +276,525 @@ def _classify_observation(result: dict[str, Any], properties: dict[str, str]) ->
     return "outcome_unknown"
 
 
+TASK_SCHEMA_V5_COLUMN_SHAPES = {
+    "task_id": ("TEXT", 0, 1),
+    "host": ("TEXT", 1, 0),
+    "unit": ("TEXT", 1, 0),
+    "attempt": ("INTEGER", 1, 0),
+    "state": ("TEXT", 1, 0),
+    "resume_policy": ("TEXT", 1, 0),
+    "argv_json": ("TEXT", 1, 0),
+    "argv_sha256": ("TEXT", 1, 0),
+    "cwd": ("TEXT", 1, 0),
+    "runtime_seconds": ("INTEGER", 1, 0),
+    "cpu_weight": ("INTEGER", 1, 0),
+    "io_weight": ("INTEGER", 1, 0),
+    "memory_max_bytes": ("INTEGER", 0, 0),
+    "created_at_unix": ("INTEGER", 1, 0),
+    "updated_at_unix": ("INTEGER", 1, 0),
+    "launcher_json": ("TEXT", 1, 0),
+    "last_observation_json": ("TEXT", 0, 0),
+    "resource_keys_json": ("TEXT", 1, 0),
+    "lease_owner_id": ("TEXT", 0, 0),
+    "request_id": ("TEXT", 0, 0),
+    "origin_ref": ("TEXT", 0, 0),
+    "external_run_id": ("TEXT", 0, 0),
+    "execution_envelope_sha256": ("TEXT", 0, 0),
+    "acceptance_json": ("TEXT", 1, 0),
+    "request_sha256": ("TEXT", 0, 0),
+    "execution_backend": ("TEXT", 1, 0),
+    "systemd_scope": ("TEXT", 1, 0),
+    "authoritative_unit": ("TEXT", 0, 0),
+    "chronik_outbox_enabled": ("INTEGER", 1, 0),
+    "chronik_outbox_state_root": ("TEXT", 0, 0),
+    "chronik_context_json": ("TEXT", 0, 0),
+    "terminalization_sha256": ("TEXT", 0, 0),
+    "terminalized_at_unix": ("INTEGER", 0, 0),
+    "lifecycle_receipt_sha256": ("TEXT", 0, 0),
+    "repository_scope_manifest_json": ("TEXT", 0, 0),
+}
+TASK_SCHEMA_V1_COLUMNS = frozenset({
+    "task_id", "host", "unit", "attempt", "state", "resume_policy",
+    "argv_json", "argv_sha256", "cwd", "runtime_seconds", "cpu_weight",
+    "io_weight", "memory_max_bytes", "created_at_unix", "updated_at_unix",
+    "launcher_json", "last_observation_json",
+})
+TASK_SCHEMA_V2_COLUMNS = TASK_SCHEMA_V1_COLUMNS | {
+    "resource_keys_json", "lease_owner_id",
+}
+TASK_SCHEMA_V3_COLUMNS = frozenset(TASK_SCHEMA_V5_COLUMN_SHAPES) - {
+    "terminalization_sha256", "terminalized_at_unix",
+    "lifecycle_receipt_sha256", "repository_scope_manifest_json",
+}
+TASK_SCHEMA_V4_COLUMNS = frozenset(TASK_SCHEMA_V5_COLUMN_SHAPES) - {
+    "repository_scope_manifest_json",
+}
+TASK_SCHEMA_REQUIRED_INDEXES = frozenset({
+    "tasks_state_created_task_idx", "tasks_created_task_idx",
+})
+TASK_CURRENT_SCHEMA_VERSION = "5"
+TASK_SUPPORTED_SCHEMA_VERSIONS = ("1", "2", "3", "4", "5")
+TASK_SCHEMA_MIGRATION_PATHS = {
+    version: (version, TASK_CURRENT_SCHEMA_VERSION)
+    for version in TASK_SUPPORTED_SCHEMA_VERSIONS
+    if version != TASK_CURRENT_SCHEMA_VERSION
+}
+TASK_SCHEMA_RECOVERY_INSTRUCTION = (
+    "Keep the task store unchanged; use a runtime that explicitly supports the "
+    "observed schema or restore a verified backup before retrying."
+)
+
+TASK_SCHEMA_ROLLING_UPGRADE = {
+    "current_runtime_current_store": "supported",
+    "current_runtime_supported_older_store": (
+        "supported_with_exclusive_migration"
+    ),
+    "current_runtime_newer_store": "fail_closed_without_mutation",
+    "pre_t062_runtime_overlap_with_future_schema": (
+        "unsupported_require_full_runtime_drain"
+    ),
+}
+
+
+_schema_directory_lock = sqlite_store.schema_directory_lock
+_readonly_sqlite = sqlite_store.readonly_sqlite
+
+
+class TaskSchemaInventoryChanged(RuntimeError):
+    pass
+
+
+@contextmanager
+def _inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
+    with sqlite_store.inventory_readonly_sqlite(
+        path,
+        temporary_prefix="grabowski-task-schema-inventory-",
+        error_type=TaskSchemaInventoryChanged,
+    ) as connection:
+        yield connection
+
+
+_sqlite_integrity = sqlite_store.sqlite_integrity
+_sqlite_fingerprint = sqlite_store.sqlite_fingerprint
+_database_tables = sqlite_store.database_tables
+
+
+def _metadata_shape(connection: sqlite3.Connection) -> tuple[tuple[str, str, int, int], ...]:
+    return tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(metadata)")
+    )
+
+
+def _task_schema_version(connection: sqlite3.Connection) -> str | None:
+    tables = _database_tables(connection)
+    if not tables:
+        return None
+    if "metadata" not in tables:
+        raise RuntimeError(
+            "Task database schema metadata is missing; restore or inspect the store"
+        )
+    if _metadata_shape(connection) != (
+        ("key", "TEXT", 0, 1),
+        ("value", "TEXT", 1, 0),
+    ):
+        raise RuntimeError("Task database metadata table is malformed")
+    rows = connection.execute(
+        "SELECT value FROM metadata WHERE key='schema_version'"
+    ).fetchall()
+    if len(rows) != 1:
+        raise RuntimeError(
+            "Task database schema_version metadata is missing or ambiguous"
+        )
+    return str(rows[0][0])
+
+
+def _task_column_shapes(connection: sqlite3.Connection) -> dict[str, tuple[str, int, int]]:
+    return {
+        str(row[1]): (str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(tasks)")
+    }
+
+
+def _task_indexes(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[1])
+        for row in connection.execute("PRAGMA index_list(tasks)")
+    }
+
+
+def _validate_task_schema_legacy(
+    connection: sqlite3.Connection,
+    version: str,
+) -> None:
+    if _database_tables(connection) != {"metadata", "tasks"}:
+        raise RuntimeError(
+            f"Task database schema {version} has unsupported tables"
+        )
+    shapes = _task_column_shapes(connection)
+    expected = {
+        "1": TASK_SCHEMA_V1_COLUMNS,
+        "2": TASK_SCHEMA_V2_COLUMNS,
+        "3": TASK_SCHEMA_V3_COLUMNS,
+        "4": TASK_SCHEMA_V4_COLUMNS,
+    }[version]
+    names = set(shapes)
+    if names != expected:
+        raise RuntimeError(
+            f"Task database schema {version} is incomplete or unsupported"
+        )
+    mismatched = sorted(
+        name for name, shape in shapes.items()
+        if TASK_SCHEMA_V5_COLUMN_SHAPES.get(name) != shape
+    )
+    if mismatched:
+        raise RuntimeError(
+            f"Task database schema {version} has incompatible columns: "
+            + ", ".join(mismatched)
+        )
+    if version in {"3", "4"}:
+        missing_indexes = TASK_SCHEMA_REQUIRED_INDEXES - _task_indexes(connection)
+        if missing_indexes:
+            raise RuntimeError(
+                f"Task database schema {version} indexes are incomplete: "
+                + ", ".join(sorted(missing_indexes))
+            )
+
+
+def _validate_task_schema_current(connection: sqlite3.Connection) -> None:
+    if _database_tables(connection) != {"metadata", "tasks"}:
+        raise RuntimeError("Task database schema 5 has unsupported tables")
+    shapes = _task_column_shapes(connection)
+    if shapes != TASK_SCHEMA_V5_COLUMN_SHAPES:
+        raise RuntimeError("Task database schema 5 is incomplete or unsupported")
+    missing_indexes = TASK_SCHEMA_REQUIRED_INDEXES - _task_indexes(connection)
+    if missing_indexes:
+        raise RuntimeError(
+            "Task database schema 5 indexes are incomplete: "
+            + ", ".join(sorted(missing_indexes))
+        )
+
+
+def _task_schema_inventory() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "store": "tasks",
+        "database": str(TASK_DB),
+        "observed_version": None,
+        "current_version": TASK_CURRENT_SCHEMA_VERSION,
+        "supported_versions": list(TASK_SUPPORTED_SCHEMA_VERSIONS),
+        "status": "uninitialized",
+        "migration_required": False,
+        "migration_path": [],
+        "write_compatible": False,
+        "mutation_performed": False,
+        "required_action": "initialize_on_first_write",
+        "recovery_instruction": None,
+        "rolling_upgrade": dict(TASK_SCHEMA_ROLLING_UPGRADE),
+    }
+    if not TASK_DB.exists():
+        return result
+    if TASK_DB.is_symlink() or not TASK_DB.is_file():
+        result.update(
+            status="blocked",
+            required_action="inspect_store_path",
+            recovery_instruction=TASK_SCHEMA_RECOVERY_INSTRUCTION,
+            error="Task database must be a regular non-symlink file",
+        )
+        return result
+    if TASK_DB.stat().st_size == 0:
+        return result
+    try:
+        with _inventory_readonly_sqlite(TASK_DB) as connection:
+            _sqlite_integrity(connection, "Task database", quick=True)
+            observed = _task_schema_version(connection)
+            result["observed_version"] = observed
+            if observed not in TASK_SUPPORTED_SCHEMA_VERSIONS:
+                future = (
+                    observed is not None
+                    and observed.isdecimal()
+                    and int(observed) > int(TASK_CURRENT_SCHEMA_VERSION)
+                )
+                result.update(
+                    status="unsupported_future" if future else "unsupported_schema",
+                    required_action="upgrade_runtime_or_restore_verified_backup",
+                    recovery_instruction=TASK_SCHEMA_RECOVERY_INSTRUCTION,
+                )
+                return result
+            if observed == TASK_CURRENT_SCHEMA_VERSION:
+                _validate_task_schema_current(connection)
+            else:
+                _validate_task_schema_legacy(connection, observed)
+    except TaskSchemaInventoryChanged as exc:
+        result.update(
+            status="blocked",
+            required_action="retry_schema_inventory",
+            recovery_instruction=(
+                "Retry after the concurrent writer completes; do not mutate the store "
+                "from this inventory result."
+            ),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return result
+    except (OSError, RuntimeError, sqlite3.DatabaseError) as exc:
+        result.update(
+            status="blocked",
+            required_action="restore_or_inspect_store",
+            recovery_instruction=TASK_SCHEMA_RECOVERY_INSTRUCTION,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return result
+    if observed == TASK_CURRENT_SCHEMA_VERSION:
+        result.update(status="current", write_compatible=True, required_action="none")
+        return result
+    path = TASK_SCHEMA_MIGRATION_PATHS[observed]
+    result.update(
+        status="migration_required",
+        migration_required=True,
+        migration_path=[
+            {
+                "from": path[0],
+                "to": path[1],
+                "lock": "exclusive_store_directory",
+                "transaction": "immediate",
+                "verified_backup_required": True,
+            }
+        ],
+        required_action="open_with_current_runtime_to_migrate",
+    )
+    return result
+
+
+def _validate_task_backup(
+    path: Path,
+    version: str,
+    fingerprint: str,
+) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"Task migration backup may not be a symlink: {path}")
+    try:
+        status = path.stat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Task migration backup disappeared: {path}") from exc
+    if not stat.S_ISREG(status.st_mode):
+        raise RuntimeError(f"Task migration backup is not a regular file: {path}")
+    mode = stat.S_IMODE(status.st_mode)
+    if mode not in {0o400, 0o600}:
+        raise RuntimeError(f"Task migration backup permissions are unsafe: {path}")
+    with _readonly_sqlite(path) as backup:
+        _sqlite_integrity(backup, "Task migration backup")
+        if _task_schema_version(backup) != version:
+            raise RuntimeError("Task migration backup schema version does not match")
+        _validate_task_schema_legacy(backup, version)
+        if _sqlite_fingerprint(backup) != fingerprint:
+            raise RuntimeError("Task migration backup fingerprint does not match")
+
+
+def _verified_task_migration_backup(
+    version: str,
+    fingerprint: str,
+) -> Path:
+    with _readonly_sqlite(TASK_DB) as source:
+        source.execute("BEGIN")
+        _sqlite_integrity(source, "Task database")
+        if _sqlite_fingerprint(source) != fingerprint:
+            raise RuntimeError(
+                "Task database changed identity before backup; retry migration"
+            )
+        backup_path = TASK_DB.parent / (
+            f"{TASK_DB.name}.schema-{version}-{fingerprint}.backup"
+        )
+        if backup_path.exists() or backup_path.is_symlink():
+            _validate_task_backup(backup_path, version, fingerprint)
+            return backup_path
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{TASK_DB.name}.schema-{version}-",
+            suffix=".backup.tmp",
+            dir=TASK_DB.parent,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            target = sqlite3.connect(temporary)
+            try:
+                source.backup(target)
+                target.commit()
+            finally:
+                target.close()
+            os.chmod(temporary, 0o400)
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            _validate_task_backup(temporary, version, fingerprint)
+            try:
+                os.link(temporary, backup_path)
+            except FileExistsError:
+                pass
+            else:
+                temporary.unlink()
+            _validate_task_backup(backup_path, version, fingerprint)
+            flags = os.O_RDONLY | os.O_DIRECTORY
+            directory = os.open(TASK_DB.parent, flags)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            return backup_path
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _preflight_task_store() -> str | None:
+    if not TASK_DB.exists():
+        return None
+    if TASK_DB.is_symlink() or not TASK_DB.is_file():
+        raise PermissionError(f"Task database must be a regular file: {TASK_DB}")
+    if TASK_DB.stat().st_size == 0:
+        return None
+    with _readonly_sqlite(TASK_DB) as connection:
+        _sqlite_integrity(connection, "Task database", quick=True)
+        version = _task_schema_version(connection)
+        if version not in {"1", "2", "3", "4", "5"}:
+            raise RuntimeError(
+                "Unsupported task database schema; use a runtime that explicitly supports it"
+            )
+        if version == "5":
+            _validate_task_schema_current(connection)
+        else:
+            _validate_task_schema_legacy(connection, version)
+        return version
+
+
+def _create_task_schema_v5(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY,
+            host TEXT NOT NULL,
+            unit TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            resume_policy TEXT NOT NULL,
+            argv_json TEXT NOT NULL,
+            argv_sha256 TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            runtime_seconds INTEGER NOT NULL,
+            cpu_weight INTEGER NOT NULL,
+            io_weight INTEGER NOT NULL,
+            memory_max_bytes INTEGER,
+            created_at_unix INTEGER NOT NULL,
+            updated_at_unix INTEGER NOT NULL,
+            launcher_json TEXT NOT NULL,
+            last_observation_json TEXT,
+            resource_keys_json TEXT NOT NULL DEFAULT '[]',
+            lease_owner_id TEXT,
+            request_id TEXT,
+            origin_ref TEXT,
+            external_run_id TEXT,
+            execution_envelope_sha256 TEXT,
+            acceptance_json TEXT NOT NULL DEFAULT '[]',
+            request_sha256 TEXT,
+            execution_backend TEXT NOT NULL DEFAULT 'systemd-user',
+            systemd_scope TEXT NOT NULL DEFAULT 'user',
+            authoritative_unit TEXT,
+            chronik_outbox_enabled INTEGER NOT NULL DEFAULT 0,
+            chronik_outbox_state_root TEXT,
+            chronik_context_json TEXT,
+            terminalization_sha256 TEXT,
+            terminalized_at_unix INTEGER,
+            lifecycle_receipt_sha256 TEXT,
+            repository_scope_manifest_json TEXT
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES('schema_version', '5')"
+    )
+
+
+def _migrate_task_schema(connection: sqlite3.Connection, version: str) -> None:
+    columns = set(_task_column_shapes(connection))
+    additions = (
+        ("resource_keys_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("lease_owner_id", "TEXT"),
+        ("request_id", "TEXT"),
+        ("origin_ref", "TEXT"),
+        ("external_run_id", "TEXT"),
+        ("execution_envelope_sha256", "TEXT"),
+        ("acceptance_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("request_sha256", "TEXT"),
+        ("chronik_outbox_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("chronik_outbox_state_root", "TEXT"),
+        ("chronik_context_json", "TEXT"),
+        ("execution_backend", "TEXT NOT NULL DEFAULT 'systemd-user'"),
+        ("systemd_scope", "TEXT NOT NULL DEFAULT 'user'"),
+        ("authoritative_unit", "TEXT"),
+        ("terminalization_sha256", "TEXT"),
+        ("terminalized_at_unix", "INTEGER"),
+        ("lifecycle_receipt_sha256", "TEXT"),
+        ("repository_scope_manifest_json", "TEXT"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
+    if "execution_backend" in columns:
+        connection.execute(
+            "UPDATE tasks SET execution_backend='systemd-user' "
+            "WHERE execution_backend IS NULL OR execution_backend=''"
+        )
+    if "systemd_scope" in columns:
+        connection.execute(
+            "UPDATE tasks SET systemd_scope='user' "
+            "WHERE systemd_scope IS NULL OR systemd_scope=''"
+        )
+    connection.execute(
+        "UPDATE tasks SET authoritative_unit=unit "
+        "WHERE authoritative_unit IS NULL OR authoritative_unit=''"
+    )
+    connection.execute(
+        "UPDATE metadata SET value='5' WHERE key='schema_version'"
+    )
+
+
+def _connect_existing_task_database() -> sqlite3.Connection:
+    if TASK_DB.is_symlink():
+        raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
+    connection = sqlite3.connect(
+        TASK_DB.absolute().as_uri() + "?mode=rw",
+        uri=True,
+        timeout=10,
+    )
+    if TASK_DB.is_symlink():
+        connection.close()
+        raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
+    return connection
+
+
+def _open_current_task_database() -> sqlite3.Connection:
+    connection = _connect_existing_task_database()
+    connection.row_factory = sqlite3.Row
+    try:
+        if _task_schema_version(connection) != "5":
+            raise RuntimeError(
+                "Task database schema changed while opening; retry with a compatible runtime"
+            )
+        _validate_task_schema_current(connection)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        if stat.S_IMODE(TASK_DB.stat().st_mode) != 0o600:
+            os.chmod(TASK_DB, 0o600)
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
 def _database() -> sqlite3.Connection:
     parent = TASK_DB.parent
     if parent.is_symlink():
@@ -280,227 +802,42 @@ def _database() -> sqlite3.Connection:
     parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if TASK_DB.is_symlink():
         raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
-    connection = sqlite3.connect(TASK_DB, timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=FULL")
-    connection.execute("PRAGMA foreign_keys=ON")
 
-    def table_exists(name: str) -> bool:
-        return connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-            (name,),
-        ).fetchone() is not None
+    observed = _preflight_task_store()
+    if observed == "5":
+        return _open_current_task_database()
 
-    def schema_version() -> str | None:
-        if not table_exists("metadata"):
-            return None
-        row = connection.execute(
-            "SELECT value FROM metadata WHERE key='schema_version'"
-        ).fetchone()
-        return str(row["value"]) if row is not None else None
-
-    def task_columns() -> set[str]:
-        if not table_exists("tasks"):
-            return set()
-        return {
-            str(row["name"])
-            for row in connection.execute("PRAGMA table_info(tasks)")
-        }
-
-    def task_indexes() -> set[str]:
-        if not table_exists("tasks"):
-            return set()
-        return {
-            str(row["name"])
-            for row in connection.execute("PRAGMA index_list(tasks)")
-        }
-
-    required_columns = {
-        "task_id", "host", "unit", "attempt", "state", "resume_policy",
-        "argv_json", "argv_sha256", "cwd", "runtime_seconds",
-        "cpu_weight", "io_weight", "memory_max_bytes",
-        "created_at_unix", "updated_at_unix", "launcher_json",
-        "last_observation_json", "resource_keys_json", "lease_owner_id",
-        "request_id", "origin_ref", "external_run_id",
-        "execution_envelope_sha256", "acceptance_json", "request_sha256",
-        "execution_backend", "systemd_scope", "authoritative_unit",
-        "chronik_outbox_enabled", "chronik_outbox_state_root",
-        "chronik_context_json",
-        "terminalization_sha256", "terminalized_at_unix",
-        "lifecycle_receipt_sha256",
-        "repository_scope_manifest_json",
-    }
-    required_indexes = {
-        "tasks_state_created_task_idx",
-        "tasks_created_task_idx",
-    }
-    schema4_required_columns = required_columns - {
-        "repository_scope_manifest_json",
-    }
-    schema3_required_columns = schema4_required_columns - {
-        "terminalization_sha256",
-        "terminalized_at_unix",
-        "lifecycle_receipt_sha256",
-    }
-
-    version = schema_version()
-    if version not in {None, "1", "2", "3", "4", "5"}:
-        connection.close()
-        raise RuntimeError("Unsupported task database schema")
-
-    # Established schema-5 databases stay read-only here. Legacy migrations,
-    # backfills, index validation and the version flip are serialized together.
-    if version != "5":
-        connection.execute("BEGIN IMMEDIATE")
+    with _schema_directory_lock(parent):
+        observed = _preflight_task_store()
+        if observed == "5":
+            return _open_current_task_database()
+        connection = (
+            sqlite3.connect(TASK_DB, timeout=10)
+            if observed is None
+            else _connect_existing_task_database()
+        )
+        connection.row_factory = sqlite3.Row
         try:
-            # Re-read after acquiring the writer lock because another process
-            # may have completed the migration while this connection waited.
-            version = schema_version()
+            connection.execute("BEGIN IMMEDIATE")
+            version = _task_schema_version(connection)
             if version not in {None, "1", "2", "3", "4", "5"}:
-                raise RuntimeError("Unsupported task database schema")
+                raise RuntimeError(
+                    "Unsupported task database schema; use a compatible runtime"
+                )
             if version is None:
-                if table_exists("metadata") or table_exists("tasks"):
+                if _database_tables(connection):
                     raise RuntimeError(
                         "Task database schema metadata is missing from an existing database"
                     )
-                connection.execute(
-                    """
-                    CREATE TABLE metadata (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL
-                    )
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE tasks (
-                        task_id TEXT PRIMARY KEY,
-                        host TEXT NOT NULL,
-                        unit TEXT NOT NULL,
-                        attempt INTEGER NOT NULL,
-                        state TEXT NOT NULL,
-                        resume_policy TEXT NOT NULL,
-                        argv_json TEXT NOT NULL,
-                        argv_sha256 TEXT NOT NULL,
-                        cwd TEXT NOT NULL,
-                        runtime_seconds INTEGER NOT NULL,
-                        cpu_weight INTEGER NOT NULL,
-                        io_weight INTEGER NOT NULL,
-                        memory_max_bytes INTEGER,
-                        created_at_unix INTEGER NOT NULL,
-                        updated_at_unix INTEGER NOT NULL,
-                        launcher_json TEXT NOT NULL,
-                        last_observation_json TEXT,
-                        resource_keys_json TEXT NOT NULL DEFAULT '[]',
-                        lease_owner_id TEXT,
-                        request_id TEXT,
-                        origin_ref TEXT,
-                        external_run_id TEXT,
-                        execution_envelope_sha256 TEXT,
-                        acceptance_json TEXT NOT NULL DEFAULT '[]',
-                        request_sha256 TEXT,
-                        execution_backend TEXT NOT NULL DEFAULT 'systemd-user',
-                        systemd_scope TEXT NOT NULL DEFAULT 'user',
-                        authoritative_unit TEXT,
-                        chronik_outbox_enabled INTEGER NOT NULL DEFAULT 0,
-                        chronik_outbox_state_root TEXT,
-                        chronik_context_json TEXT,
-                        terminalization_sha256 TEXT,
-                        terminalized_at_unix INTEGER,
-                        lifecycle_receipt_sha256 TEXT,
-                        repository_scope_manifest_json TEXT
-                    )
-                    """
-                )
-                connection.execute(
-                    "INSERT INTO metadata(key, value) VALUES('schema_version', '5')"
-                )
-            elif version in {"1", "2", "3", "4"}:
-                if not table_exists("metadata") or not table_exists("tasks"):
-                    raise RuntimeError("Legacy task database is structurally incomplete")
-                columns = task_columns()
-                if version == "4":
-                    schema4_shapes = {
-                        str(row["name"]): (
-                            str(row["type"]).upper(),
-                            int(row["notnull"]),
-                            int(row["pk"]),
-                        )
-                        for row in connection.execute("PRAGMA table_info(tasks)")
-                    }
-                    if set(schema4_shapes) != schema4_required_columns or any(
-                        schema4_shapes.get(name) != expected
-                        for name, expected in TASK_SCHEMA_V4_ADDITIVE_COLUMNS.items()
-                    ):
-                        raise RuntimeError(
-                            "Task database schema 4 is incomplete or unsupported"
-                        )
-                    missing_schema4_indexes = required_indexes - task_indexes()
-                    if missing_schema4_indexes:
-                        raise RuntimeError(
-                            "Task database schema 4 indexes are incomplete: "
-                            + ", ".join(sorted(missing_schema4_indexes))
-                        )
-                elif version == "3":
-                    missing_schema3_columns = schema3_required_columns - columns
-                    if missing_schema3_columns:
-                        raise RuntimeError(
-                            "Task database schema 3 is incomplete: "
-                            + ", ".join(sorted(missing_schema3_columns))
-                        )
-                    missing_schema3_indexes = required_indexes - task_indexes()
-                    if missing_schema3_indexes:
-                        raise RuntimeError(
-                            "Task database schema 3 indexes are incomplete: "
-                            + ", ".join(sorted(missing_schema3_indexes))
-                        )
-                additions = (
-                    ("resource_keys_json", "TEXT NOT NULL DEFAULT '[]'"),
-                    ("lease_owner_id", "TEXT"),
-                    ("request_id", "TEXT"),
-                    ("origin_ref", "TEXT"),
-                    ("external_run_id", "TEXT"),
-                    ("execution_envelope_sha256", "TEXT"),
-                    ("acceptance_json", "TEXT NOT NULL DEFAULT '[]'"),
-                    ("request_sha256", "TEXT"),
-                    ("chronik_outbox_enabled", "INTEGER NOT NULL DEFAULT 0"),
-                    ("chronik_outbox_state_root", "TEXT"),
-                    ("chronik_context_json", "TEXT"),
-                    ("execution_backend", "TEXT NOT NULL DEFAULT 'systemd-user'"),
-                    ("systemd_scope", "TEXT NOT NULL DEFAULT 'user'"),
-                    ("authoritative_unit", "TEXT"),
-                    ("terminalization_sha256", "TEXT"),
-                    ("terminalized_at_unix", "INTEGER"),
-                    ("lifecycle_receipt_sha256", "TEXT"),
-                    ("repository_scope_manifest_json", "TEXT"),
-                )
-                for name, definition in additions:
-                    if name not in columns:
-                        connection.execute(
-                            f"ALTER TABLE tasks ADD COLUMN {name} {definition}"
-                        )
-                # Newly added NOT NULL columns already expose their SQLite
-                # defaults for every legacy row. Only repair these fields when
-                # they pre-existed, which preserves recovery from a partial
-                # migration without forcing two avoidable full-table writes.
-                if "execution_backend" in columns:
-                    connection.execute(
-                        "UPDATE tasks SET execution_backend='systemd-user' "
-                        "WHERE execution_backend IS NULL OR execution_backend=''"
-                    )
-                if "systemd_scope" in columns:
-                    connection.execute(
-                        "UPDATE tasks SET systemd_scope='user' "
-                        "WHERE systemd_scope IS NULL OR systemd_scope=''"
-                    )
-                connection.execute(
-                    "UPDATE tasks SET authoritative_unit=unit "
-                    "WHERE authoritative_unit IS NULL OR authoritative_unit=''"
-                )
-                connection.execute(
-                    "UPDATE metadata SET value='5' WHERE key='schema_version'"
-                )
+                _create_task_schema_v5(connection)
+            elif version == "5":
+                _validate_task_schema_current(connection)
+            else:
+                _validate_task_schema_legacy(connection, version)
+                _sqlite_integrity(connection, "Task database")
+                fingerprint = _sqlite_fingerprint(connection)
+                _verified_task_migration_backup(version, fingerprint)
+                _migrate_task_schema(connection, version)
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS tasks_state_created_task_idx "
                 "ON tasks(state, created_at_unix DESC, task_id DESC)"
@@ -509,47 +846,23 @@ def _database() -> sqlite3.Connection:
                 "CREATE INDEX IF NOT EXISTS tasks_created_task_idx "
                 "ON tasks(created_at_unix DESC, task_id DESC)"
             )
+            if _task_schema_version(connection) != "5":
+                raise RuntimeError("Task database migration did not reach schema 5")
+            _validate_task_schema_current(connection)
+            _sqlite_integrity(connection, "Migrated task database")
             connection.commit()
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            if stat.S_IMODE(TASK_DB.stat().st_mode) != 0o600:
+                os.chmod(TASK_DB, 0o600)
+            return connection
         except Exception:
-            connection.rollback()
+            if connection.in_transaction:
+                connection.rollback()
             connection.close()
             raise
 
-    missing_columns = required_columns - task_columns()
-    if missing_columns:
-        connection.close()
-        raise RuntimeError(
-            "Task database schema 5 is incomplete: "
-            + ", ".join(sorted(missing_columns))
-        )
-    missing_indexes = required_indexes - task_indexes()
-    if missing_indexes:
-        connection.close()
-        raise RuntimeError(
-            "Task database schema 5 indexes are incomplete: "
-            + ", ".join(sorted(missing_indexes))
-        )
-    effective_version = schema_version()
-    if effective_version == "5":
-        columns = {
-            str(row["name"]): (
-                str(row["type"]).upper(), int(row["notnull"]), int(row["pk"])
-            )
-            for row in connection.execute("PRAGMA table_info(tasks)")
-        }
-        expected_names = required_columns | set(TASK_SCHEMA_V5_ADDITIVE_COLUMNS)
-        if set(columns) != expected_names or any(
-            columns.get(name) != expected
-            for name, expected in TASK_SCHEMA_V5_ADDITIVE_COLUMNS.items()
-        ):
-            connection.close()
-            raise RuntimeError("Task database schema 5 is incomplete or unsupported")
-    try:
-        os.chmod(TASK_DB, 0o600)
-    except FileNotFoundError:
-        connection.close()
-        raise
-    return connection
 
 def _command_requires_recovery(argv: list[str]) -> bool:
     names = [Path(item).name.lower() for item in argv if isinstance(item, str)]
@@ -686,6 +999,44 @@ def _validate_chronik_operation(value: str, *, enabled: bool) -> str:
     if value != "other" and not enabled:
         raise ValueError("chronik_operation requires chronik_outbox")
     return value
+
+
+def _validate_chronik_context_metadata(
+    component: str,
+    bureau_task_id: str,
+    pr_number: int | None,
+    *,
+    enabled: bool,
+) -> tuple[str, str, int | None]:
+    values = {
+        "chronik_component": (component, 160),
+        "chronik_bureau_task_id": (bureau_task_id, 160),
+    }
+    normalized: dict[str, str] = {}
+    for label, (value, maximum) in values.items():
+        if not isinstance(value, str):
+            raise ValueError(f"{label} must be text")
+        candidate = value.strip()
+        if len(candidate) > maximum or any(ord(character) < 32 for character in candidate):
+            raise ValueError(f"{label} is invalid")
+        normalized[label] = candidate
+    if pr_number is not None and (
+        isinstance(pr_number, bool)
+        or not isinstance(pr_number, int)
+        or not 1 <= pr_number <= 2_147_483_647
+    ):
+        raise ValueError("chronik_pr_number must be a positive bounded integer")
+    if not enabled and (
+        normalized["chronik_component"]
+        or normalized["chronik_bureau_task_id"]
+        or pr_number is not None
+    ):
+        raise ValueError("Chronik context metadata requires chronik_outbox")
+    return (
+        normalized["chronik_component"],
+        normalized["chronik_bureau_task_id"],
+        pr_number,
+    )
 
 
 def _validate_resume_policy(value: str) -> str:
@@ -915,13 +1266,27 @@ def _task_lease_metadata(
     return metadata
 
 
-def _chronik_context(host: str, resource_keys: list[str], operation: str) -> str:
-    context: dict[str, str] = {
+def _chronik_context(
+    host: str,
+    resource_keys: list[str],
+    operation: str,
+    *,
+    component: str = "",
+    bureau_task_id: str = "",
+    pr_number: int | None = None,
+) -> str:
+    context: dict[str, Any] = {
         "subject_scope": "host",
         "host": host,
         "operation": operation,
         "task_class": CHRONIK_OPERATION_TASK_CLASS[operation],
     }
+    if component:
+        context["component"] = component
+    if bureau_task_id:
+        context["bureau_task_id"] = bureau_task_id
+    if pr_number is not None:
+        context["pr_number"] = pr_number
     if fleet.fleet_host(host)["transport"] != "local":
         return _canonical_json(context)
     repositories = [key.removeprefix("repo:") for key in resource_keys if key.startswith("repo:")]
@@ -937,12 +1302,10 @@ def _chronik_context(host: str, resource_keys: list[str], operation: str) -> str
     match = re.search(r"(?:github\.com[:/])(?P<slug>[^/\s]+/[^/\s]+?)(?:\.git)?$", remote)
     if match is None or not match.group("slug").startswith("heimgewebe/"):
         return _canonical_json(context)
-    return _canonical_json({
-        "subject_scope": "repository",
-        "repo": match.group("slug"),
-        "operation": operation,
-        "task_class": CHRONIK_OPERATION_TASK_CLASS[operation],
-    })
+    context.pop("host", None)
+    context["subject_scope"] = "repository"
+    context["repo"] = match.group("slug")
+    return _canonical_json(context)
 
 
 def _lease_owner(task_id: str) -> str:
@@ -1099,7 +1462,7 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
     ]
     if record["memory_max_bytes"] is not None:
         argv.append(f"--property=MemoryMax={record['memory_max_bytes']}")
-    return [*argv, "--", *command]
+    return [*argv, "--", *command_identity.systemd_escape_argv(command)]
 
 
 def _root_task_start_payload(record: dict[str, Any]) -> dict[str, Any]:
@@ -1729,6 +2092,9 @@ def grabowski_task_start(
     chronik_outbox: bool = False,
     chronik_outbox_state_root: str | None = None,
     chronik_operation: str = "other",
+    chronik_component: str = "",
+    chronik_bureau_task_id: str = "",
+    chronik_pr_number: int | None = None,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -1751,6 +2117,14 @@ def grabowski_task_start(
     chronik_operation = _validate_chronik_operation(
         chronik_operation, enabled=bool(chronik_enabled)
     )
+    chronik_component, chronik_bureau_task_id, chronik_pr_number = (
+        _validate_chronik_context_metadata(
+            chronik_component,
+            chronik_bureau_task_id,
+            chronik_pr_number,
+            enabled=bool(chronik_enabled),
+        )
+    )
     requested_resources = _resource_keys(resource_keys)
     task_resources, implicit_workspace_resource = _task_resource_keys(
         host,
@@ -1759,7 +2133,14 @@ def grabowski_task_start(
         requested=requested_resources,
     )
     chronik_context_json = (
-        _chronik_context(host, task_resources, chronik_operation)
+        _chronik_context(
+            host,
+            task_resources,
+            chronik_operation,
+            component=chronik_component,
+            bureau_task_id=chronik_bureau_task_id,
+            pr_number=chronik_pr_number,
+        )
         if chronik_enabled
         else None
     )
@@ -2444,14 +2825,29 @@ def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:
 
 @mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
 def grabowski_task_list(
-    limit: int = 20,
+    limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,
     view: str = "minimal",
     cursor: str | None = None,
     fields: list[str] | None = None,
+    schema_only: bool = False,
 ) -> dict[str, Any]:
-    """List persistent tasks with keyset pagination and compact default records."""
+    """List persistent tasks or inspect store-schema compatibility read-only."""
     operator._require_operator_capability("durable_job")
+    if not isinstance(schema_only, bool):
+        raise ValueError("schema_only must be boolean")
+    if schema_only:
+        if (
+            limit != DEFAULT_TASK_LIST_LIMIT
+            or state is not None
+            or view != "minimal"
+            or cursor is not None
+            or fields is not None
+        ):
+            raise ValueError(
+                "schema_only cannot be combined with task-list filters or projections"
+            )
+        return _task_schema_inventory()
     selected_view = consumer_surface.normalize_view(view)
     _recover_pending_task_terminalizations()
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
@@ -2864,6 +3260,18 @@ def grabowski_chronik_history(
                 raise ValueError("Chronik coding-memory history contract is stale")
             if history.get("historical_only") is not True:
                 raise ValueError("Chronik coding-memory history is not historical-only")
+            expected_history_query = {
+                "repo": normalized["repo"] or None,
+                "host": normalized["host"] or None,
+                "component": normalized["component"] or None,
+                "operation": normalized["operation"] or None,
+                "task_class": normalized["task_class"] or None,
+                "outcome": normalized["outcome"] or None,
+                "since": normalized["since"] or None,
+                "limit": limit,
+            }
+            if history.get("query") != expected_history_query:
+                raise ValueError("Chronik coding-memory history query is unbound")
             raw_events = history.get("events", [])
             raw_event_ids = history.get("event_ids", [])
             raw_claims = history.get("does_not_establish", [])

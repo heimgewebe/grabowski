@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "0965cde817e8a53e759e250a40188677663d067f26c0751377e9ab2463f34cdd",
+  "capability_source_sha256": "3ae4d9f1b8e5e8d5769e550abd7947596c93b5fbfdcf818dab668dab0a06423c",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "2c47105e3c8ecbb2fa715edab91920c1911a6397c4fc90d6e621306d0c1806bc",
+  "contract_sha256": "2ada01660eb35bd2cf8d607ff6aa88798d85161490467a1eca121804b77b7a82",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -353,6 +353,17 @@
     },
     {
       "category": "knowledge",
+      "description": "Compose deterministic, diff-bound RepoGround change context under a hard payload budget.",
+      "effects": [],
+      "id": "repoground_context_compose",
+      "purpose": "Compose deterministic diff-bound RepoGround change context under a hard context budget.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_context_compose"
+    },
+    {
+      "category": "knowledge",
       "description": "Find bounded Python symbol definitions in an existing RepoGround bundle.",
       "effects": [],
       "id": "repoground_find_symbol",
@@ -408,7 +419,7 @@
     },
     {
       "category": "context",
-      "description": "Return bounded runtime-contract and capability-catalog drift.",
+      "description": "Return bounded structural and semantic runtime-contract drift.",
       "effects": [],
       "id": "grabowski_contract_drift",
       "purpose": "Read bounded runtime-contract and capability-catalog drift.",
@@ -1140,7 +1151,7 @@
     },
     {
       "category": "task",
-      "description": "List persistent tasks with keyset pagination and compact default records.",
+      "description": "List persistent tasks or inspect store-schema compatibility read-only.",
       "effects": [],
       "id": "grabowski_task_list",
       "purpose": "List recent persistent task records with optional state filtering.",
@@ -1404,6 +1415,19 @@
     },
     {
       "category": "bureau",
+      "description": "Review one exact Bureau proposal digest without changing Registry, Queue or publication truth.",
+      "effects": [
+        "private_proposal_artifact"
+      ],
+      "id": "grabowski_bureau_task_review",
+      "purpose": "Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation.",
+      "read_only": false,
+      "reversibility": "artifact-preserving-idempotent-review",
+      "risk_class": "medium",
+      "tool": "grabowski_bureau_task_review"
+    },
+    {
+      "category": "bureau",
       "description": "Validate one immutable Bureau proposal and report its exact publication resources without effects.",
       "effects": [],
       "id": "grabowski_bureau_task_publish_preview",
@@ -1512,7 +1536,7 @@
     },
     {
       "category": "resource",
-      "description": "List bounded resource leases, optionally filtered by owner.",
+      "description": "List bounded leases or inspect store-schema compatibility read-only.",
       "effects": [],
       "id": "grabowski_resource_list",
       "purpose": "List bounded typed resource leases with optional owner filtering.",
@@ -1769,6 +1793,21 @@
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_role_retry"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Start one operator-bound replacement writer after a proven terminal failure.",
+      "effects": [
+        "task-start",
+        "receipt-create",
+        "task-state-refresh"
+      ],
+      "id": "grabowski_agent_workspace_writer_handoff",
+      "purpose": "Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence.",
+      "read_only": false,
+      "reversibility": "preserved-worktree-and-receipts",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_writer_handoff"
     },
     {
       "category": "agent-workspace",

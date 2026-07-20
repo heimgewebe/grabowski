@@ -57,6 +57,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `repoground_query_existing_index` | knowledge | yes | low | Query a prebuilt RepoGround index without refreshing or mutating the bundle. |
 | `repoground_range_get` | knowledge | yes | low | Resolve one bounded RepoGround range reference without refreshing source artifacts. |
 | `repoground_context_pack` | knowledge | yes | low | Build a bounded RepoGround context pack for agent handoff and Bureau receipts. |
+| `repoground_context_compose` | knowledge | yes | low | Compose deterministic diff-bound RepoGround change context under a hard context budget. |
 | `repoground_find_symbol` | knowledge | yes | low | Find bounded Python symbol definitions in an existing RepoGround bundle. |
 | `repoground_get_callers` | knowledge | yes | low | Read S1 callers while preserving unresolved references separately. |
 | `repoground_get_callees` | knowledge | yes | low | Read S1 callees while preserving S0 call sites separately. |
@@ -140,6 +141,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
 | `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one Bureau candidate read-only against current Registry and Live Register truth. |
 | `grabowski_bureau_task_propose` | bureau | no | medium | Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation. |
+| `grabowski_bureau_task_review` | bureau | no | medium | Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation. |
 | `grabowski_bureau_task_publish_preview` | bureau | yes | low | Validate one Bureau task proposal and return exact publication resources without effects. |
 | `grabowski_bureau_task_publish` | bureau | no | high | Acquire exact short Bureau leases and publish one reviewed task branch and pull request with bounded readback. |
 | `grabowski_resource_nonconflict_assess` | resource | no | medium | Assess and audit complete, attested same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint. |
@@ -167,6 +169,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_workspace_attach` | agent-workspace | yes | low | Return the exact attach command for an existing non-authoritative tmux workspace UI. |
 | `grabowski_agent_workspace_collect` | agent-workspace | no | high | Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt. |
 | `grabowski_agent_workspace_role_retry` | agent-workspace | no | high | Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot. |
+| `grabowski_agent_workspace_writer_handoff` | agent-workspace | no | high | Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence. |
 | `grabowski_agent_workspace_close` | agent-workspace | no | high | Close one collected workspace while preserving its branch and writer worktree. |
 | `grabowski_agent_workspace_observe` | agent-workspace | yes | low | Read one bounded immutable workspace event timeline and emit a facts/inferences/proposals process report. |
 | `grabowski_agent_workspace_optimize` | agent-workspace | yes | low | Derive advisory cross-workspace optimization proposals from at least two immutable reports. |

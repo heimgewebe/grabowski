@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 import io
 import json
@@ -9,6 +9,7 @@ import sqlite3
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest.mock import patch
@@ -137,6 +138,7 @@ class TaskTests(unittest.TestCase):
         self.assertIn(" argv=", descriptions[0])
         self.assertNotIn("\n", descriptions[0])
         self.assertIn("--slice=grabowski-tasks.slice", launch)
+        self.assertNotIn("--expand-environment=no", launch)
         self.assertEqual(launch.count("--property=LimitCORE=0"), 1)
         self.assertIn("--property=CPUWeight=50", launch)
         self.assertIn("--property=IOWeight=25", launch)
@@ -147,6 +149,64 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=UMask=0077", launch)
         self.assertEqual(launch[-3:], ["--", "/bin/echo", "ok"])
         return result
+
+    def test_systemd_escape_argv_doubles_only_dollars_without_mutating_input(self) -> None:
+        command = [
+            "$HOME",
+            "${cluster}",
+            "$(uname)",
+            "${{ github.sha }}",
+            "$$",
+            "plain",
+            "Grüße 🌍",
+        ]
+        original = list(command)
+
+        self.assertEqual(
+            command_identity.systemd_escape_argv(command),
+            [
+                "$$HOME",
+                "$${cluster}",
+                "$$(uname)",
+                "$${{ github.sha }}",
+                "$$$$",
+                "plain",
+                "Grüße 🌍",
+            ],
+        )
+        self.assertEqual(command, original)
+
+    def test_task_start_preserves_literal_shell_and_template_argv_end_to_end(self) -> None:
+        command = [
+            "/usr/bin/bash",
+            "-lc",
+            "cluster=alpha\nexpected=beta\nprintf '%s|%s\\n' \"${cluster}\" \"${expected}\"",
+            "$HOME",
+            "$(uname)",
+            "${{ github.sha }}",
+            "quote='\"'",
+            "heredoc=<<'EOF'\n${cluster}\nEOF",
+            "Grüße 🌍",
+        ]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ) as dispatch, patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                command,
+                cwd=str(self.root),
+                runtime_seconds=60,
+            )
+
+        task = result["task"]
+        launch = dispatch.call_args.args[1]
+        separator = launch.index("--")
+        self.assertEqual(command, task["argv"])
+        self.assertEqual(command_identity.argv_sha256(command), task["argv_sha256"])
+        self.assertEqual(command_identity.systemd_escape_argv(command), launch[separator + 1 :])
+        self.assertNotIn("--expand-environment=no", launch[:separator])
 
     def test_server_task_lease_delegation_requires_running_task_and_live_leases(self) -> None:
         result = self._start(resource_keys=["component:test-task-delegation"])
@@ -578,6 +638,93 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(event["kind"], "agent.run.started")
         self.assertEqual(event["data"]["operation"], "review")
         self.assertEqual(event["data"]["task_class"], "review")
+
+    def test_start_chronik_context_persists_target_component_bureau_and_pr_refs(self) -> None:
+        outbox_root = self.root / "chronik-context-state"
+        remote = {
+            "returncode": 0,
+            "stdout": "git@github.com:heimgewebe/grabowski.git\n",
+            "stderr": "",
+            "timed_out": False,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 140}
+            ),
+            patch.object(tasks.operator, "_run", return_value=remote),
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resource_keys=[f"repo:{self.root}"],
+                chronik_outbox=True,
+                chronik_outbox_state_root=str(outbox_root),
+                chronik_operation="implement",
+                chronik_component="task-runner",
+                chronik_bureau_task_id="CCM-V1-T002",
+                chronik_pr_number=306,
+            )
+        context = result["task"]["chronik_context"]
+        self.assertEqual(
+            {
+                "subject_scope": "repository",
+                "repo": "heimgewebe/grabowski",
+                "component": "task-runner",
+                "operation": "implement",
+                "task_class": "coding",
+                "bureau_task_id": "CCM-V1-T002",
+                "pr_number": 306,
+            },
+            context,
+        )
+        files = sorted(outbox_root.rglob("*.jsonl"))
+        self.assertEqual(1, len(files))
+        event = json.loads(files[0].read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(
+            {
+                "scope": "repository",
+                "repo": "heimgewebe/grabowski",
+                "component": "task-runner",
+                "bureau_task_id": "CCM-V1-T002",
+                "pr_number": 306,
+            },
+            event["subject"],
+        )
+
+    def test_start_rejects_chronik_context_metadata_without_outbox(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 141}
+        ):
+            with self.assertRaisesRegex(ValueError, "requires chronik_outbox"):
+                tasks.grabowski_task_start(
+                    "local",
+                    ["/bin/true"],
+                    cwd=str(self.root),
+                    runtime_seconds=60,
+                    chronik_component="task-runner",
+                )
+
+    def test_start_rejects_invalid_chronik_pr_reference(self) -> None:
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 141}
+        ):
+            for value in (True, 0):
+                with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "chronik_pr_number"
+                ):
+                    tasks.grabowski_task_start(
+                        "local",
+                        ["/bin/true"],
+                        cwd=str(self.root),
+                        runtime_seconds=60,
+                        chronik_outbox=True,
+                        chronik_pr_number=value,
+                    )
 
     def test_chronik_context_derives_repository_from_canonical_repo_claim(self) -> None:
         result = {"returncode": 0, "stdout": "git@github.com:heimgewebe/chronik.git\n", "stderr": "", "timed_out": False}
@@ -1826,6 +1973,92 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["blocked"][0]["task_id"], started["task"]["task_id"])
         self.assertIn("completed", result["blocked"][0]["reason"])
 
+    def _task_migration_backups(self) -> list[Path]:
+        return sorted(
+            self.database.parent.glob(
+                f"{self.database.name}.schema-*.backup"
+            )
+        )
+
+    def _create_task_schema_version(
+        self,
+        version: str,
+    ) -> tuple[str, dict[str, object]]:
+        keep_by_version = {
+            "1": tasks.TASK_SCHEMA_V1_COLUMNS,
+            "2": tasks.TASK_SCHEMA_V2_COLUMNS,
+            "3": tasks.TASK_SCHEMA_V3_COLUMNS,
+            "4": tasks.TASK_SCHEMA_V4_COLUMNS,
+        }
+        keep = keep_by_version[version]
+        task_id = version * 24
+        unit = f"grabowski-task-{task_id}-a7.service"
+        values: dict[str, object] = {
+            "task_id": task_id,
+            "host": "local",
+            "unit": unit,
+            "attempt": 7,
+            "state": "outcome_unknown",
+            "resume_policy": "manual",
+            "argv_json": '["/bin/true", "schema"]',
+            "argv_sha256": "a" * 64,
+            "cwd": str(self.root),
+            "runtime_seconds": 91,
+            "cpu_weight": 321,
+            "io_weight": 654,
+            "memory_max_bytes": 123456,
+            "created_at_unix": 11,
+            "updated_at_unix": 22,
+            "launcher_json": '{"returncode":0}',
+            "last_observation_json": '{"state":"outcome_unknown"}',
+            "resource_keys_json": '["component:schema-migration"]',
+            "lease_owner_id": f"task:{task_id}",
+            "request_id": "request-schema",
+            "origin_ref": "origin-schema",
+            "external_run_id": "external-schema",
+            "execution_envelope_sha256": "b" * 64,
+            "acceptance_json": '[{"criterion":"preserve"}]',
+            "request_sha256": "c" * 64,
+            "execution_backend": "systemd-root-broker",
+            "systemd_scope": "system",
+            "authoritative_unit": unit,
+            "chronik_outbox_enabled": 1,
+            "chronik_outbox_state_root": "/tmp/chronik",
+            "chronik_context_json": '{"operation":"migration"}',
+            "terminalization_sha256": "d" * 64,
+            "terminalized_at_unix": 33,
+            "lifecycle_receipt_sha256": "e" * 64,
+            "repository_scope_manifest_json": '{"schema_version":1}',
+        }
+        with tasks._database():
+            pass
+        with closing(sqlite3.connect(self.database)) as connection:
+            columns = [
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(tasks)")
+            ]
+            connection.execute(
+                "INSERT INTO tasks(" + ", ".join(columns) + ") VALUES(" +
+                ", ".join("?" for _ in columns) + ")",
+                tuple(values[name] for name in columns),
+            )
+            for name in reversed(columns):
+                if name not in keep:
+                    connection.execute(f'ALTER TABLE tasks DROP COLUMN "{name}"')
+            connection.execute(
+                "UPDATE metadata SET value=? WHERE key='schema_version'",
+                (version,),
+            )
+            connection.row_factory = sqlite3.Row
+            original = dict(
+                connection.execute(
+                    "SELECT * FROM tasks WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+            )
+            connection.commit()
+        return task_id, original
+
     def test_schema_v1_database_migrates_without_losing_records(self) -> None:
         self.database.parent.mkdir(parents=True)
         connection = sqlite3.connect(self.database)
@@ -1888,11 +2121,382 @@ class TaskTests(unittest.TestCase):
         self.assertIn("tasks_state_created_task_idx", indexes)
         self.assertIn("tasks_created_task_idx", indexes)
         self.assertEqual(journal_mode, "wal")
+        backups = self._task_migration_backups()
+        self.assertEqual(1, len(backups))
+        self.assertEqual(0o400, backups[0].stat().st_mode & 0o777)
+        with sqlite3.connect(backups[0]) as backup:
+            self.assertEqual(
+                "1",
+                backup.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                "ok", backup.execute("PRAGMA integrity_check").fetchone()[0]
+            )
+            self.assertEqual(
+                "a" * 24,
+                backup.execute("SELECT task_id FROM tasks").fetchone()[0],
+            )
         with tasks._database() as reopened:
             self.assertEqual(
                 reopened.total_changes,
                 0,
                 "schema-5 fast path must not repeat migration writes",
+            )
+        self.assertEqual(backups, self._task_migration_backups())
+
+    def test_schema_v2_and_v3_migrations_preserve_all_existing_fields(self) -> None:
+        for version in ("2", "3"):
+            with self.subTest(version=version):
+                database = self.root / f"state-v{version}" / "tasks.sqlite3"
+                with patch.object(tasks, "TASK_DB", database):
+                    previous = self.database
+                    self.database = database
+                    try:
+                        task_id, original = self._create_task_schema_version(version)
+                        listed = tasks.grabowski_task_list(limit=10)
+                        self.assertTrue(
+                            any(item["task_id"] == task_id for item in listed["tasks"])
+                        )
+                        with sqlite3.connect(database) as migrated:
+                            migrated.row_factory = sqlite3.Row
+                            self.assertEqual(
+                                "5",
+                                migrated.execute(
+                                    "SELECT value FROM metadata WHERE key='schema_version'"
+                                ).fetchone()[0],
+                            )
+                            after = dict(
+                                migrated.execute(
+                                    "SELECT * FROM tasks WHERE task_id=?",
+                                    (task_id,),
+                                ).fetchone()
+                            )
+                        for name, value in original.items():
+                            self.assertEqual(value, after[name], name)
+                        backups = self._task_migration_backups()
+                        self.assertEqual(1, len(backups))
+                        with sqlite3.connect(backups[0]) as backup:
+                            self.assertEqual(
+                                version,
+                                backup.execute(
+                                    "SELECT value FROM metadata WHERE key='schema_version'"
+                                ).fetchone()[0],
+                            )
+                            self.assertEqual(
+                                "ok",
+                                backup.execute("PRAGMA integrity_check").fetchone()[0],
+                            )
+                    finally:
+                        self.database = previous
+
+    def test_task_schema_only_inventory_reports_migration_without_mutation(self) -> None:
+        self._create_task_schema_version("2")
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_names = sorted(item.name for item in self.database.parent.iterdir())
+        inventory = tasks.grabowski_task_list(schema_only=True)
+        self.assertEqual("tasks", inventory["store"])
+        self.assertEqual("2", inventory["observed_version"])
+        self.assertEqual("5", inventory["current_version"])
+        self.assertEqual(["1", "2", "3", "4", "5"], inventory["supported_versions"])
+        self.assertEqual("migration_required", inventory["status"])
+        self.assertTrue(inventory["migration_required"])
+        self.assertFalse(inventory["write_compatible"])
+        self.assertFalse(inventory["mutation_performed"])
+        self.assertEqual(
+            "supported_with_exclusive_migration",
+            inventory["rolling_upgrade"][
+                "current_runtime_supported_older_store"
+            ],
+        )
+        self.assertEqual(
+            "unsupported_require_full_runtime_drain",
+            inventory["rolling_upgrade"][
+                "pre_t062_runtime_overlap_with_future_schema"
+            ],
+        )
+        self.assertEqual(
+            [{
+                "from": "2",
+                "to": "5",
+                "lock": "exclusive_store_directory",
+                "transaction": "immediate",
+                "verified_backup_required": True,
+            }],
+            inventory["migration_path"],
+        )
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(before_names, sorted(item.name for item in self.database.parent.iterdir()))
+        self.assertEqual([], self._task_migration_backups())
+        with self.assertRaisesRegex(ValueError, "schema_only must be boolean"):
+            tasks.grabowski_task_list(schema_only=1)
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            tasks.grabowski_task_list(schema_only=True, limit=1)
+
+    def test_current_task_schema_inventory_is_byte_stable(self) -> None:
+        connection = tasks._database()
+        connection.close()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_names = sorted(item.name for item in self.database.parent.iterdir())
+        original_integrity = tasks._sqlite_integrity
+        with patch.object(
+            tasks,
+            "_sqlite_integrity",
+            wraps=original_integrity,
+        ) as integrity:
+            connection = tasks._database()
+            connection.close()
+        self.assertEqual(1, integrity.call_count)
+        inventory = tasks.grabowski_task_list(schema_only=True)
+        self.assertEqual("5", inventory["observed_version"])
+        self.assertEqual("current", inventory["status"])
+        self.assertTrue(inventory["write_compatible"])
+        self.assertFalse(inventory["migration_required"])
+        self.assertEqual("none", inventory["required_action"])
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(before_names, sorted(item.name for item in self.database.parent.iterdir()))
+
+    def test_task_schema_inventory_blocks_if_wal_appears_during_immutable_read(self) -> None:
+        connection = tasks._database()
+        connection.close()
+        wal = Path(str(self.database) + "-wal")
+        self.assertFalse(wal.exists())
+        original = tasks._task_schema_version
+
+        def create_wal_during_read(connection: sqlite3.Connection) -> str | None:
+            version = original(connection)
+            wal.write_bytes(b"concurrent-writer-marker")
+            return version
+
+        try:
+            with patch.object(
+                tasks,
+                "_task_schema_version",
+                side_effect=create_wal_during_read,
+            ):
+                inventory = tasks.grabowski_task_list(schema_only=True)
+            self.assertEqual("blocked", inventory["status"])
+            self.assertEqual("retry_schema_inventory", inventory["required_action"])
+            self.assertFalse(inventory["write_compatible"])
+            self.assertFalse(inventory["mutation_performed"])
+            self.assertIn("changed while schema inventory", inventory["error"])
+        finally:
+            wal.unlink(missing_ok=True)
+
+    def test_task_schema_inventory_reads_uncheckpointed_future_wal(self) -> None:
+        connection = tasks._database()
+        connection.close()
+        keeper = sqlite3.connect(self.database)
+        try:
+            self.assertEqual("wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+            self.assertEqual(
+                0, keeper.execute("PRAGMA wal_autocheckpoint=0").fetchone()[0]
+            )
+            keeper.execute(
+                "UPDATE metadata SET value='6' WHERE key='schema_version'"
+            )
+            keeper.commit()
+            wal = Path(str(self.database) + "-wal")
+            self.assertTrue(wal.exists())
+            before_database = self.database.read_bytes()
+            before_wal = wal.read_bytes()
+            before_names = sorted(item.name for item in self.database.parent.iterdir())
+            original_connect = sqlite3.connect
+            source_uri = self.database.absolute().as_uri()
+
+            def reject_source_sqlite_open(
+                database: object,
+                *args: object,
+                **kwargs: object,
+            ) -> sqlite3.Connection:
+                database_text = str(database)
+                if (
+                    database_text == str(self.database)
+                    or database_text.startswith(source_uri)
+                ):
+                    raise AssertionError(
+                        "Task schema inventory must not open the source database when WAL is present"
+                    )
+                return original_connect(database, *args, **kwargs)
+
+            with patch.object(
+                tasks.sqlite3,
+                "connect",
+                side_effect=reject_source_sqlite_open,
+            ):
+                inventory = tasks.grabowski_task_list(schema_only=True)
+            self.assertEqual("6", inventory["observed_version"])
+            self.assertEqual("unsupported_future", inventory["status"])
+            self.assertFalse(inventory["write_compatible"])
+            self.assertFalse(inventory["mutation_performed"])
+            self.assertEqual(
+                "fail_closed_without_mutation",
+                inventory["rolling_upgrade"][
+                    "current_runtime_newer_store"
+                ],
+            )
+            self.assertEqual(
+                "unsupported_require_full_runtime_drain",
+                inventory["rolling_upgrade"][
+                    "pre_t062_runtime_overlap_with_future_schema"
+                ],
+            )
+            self.assertIsNotNone(inventory["recovery_instruction"])
+            self.assertEqual(before_database, self.database.read_bytes())
+            self.assertEqual(before_wal, wal.read_bytes())
+            self.assertEqual(
+                before_names,
+                sorted(item.name for item in self.database.parent.iterdir()),
+            )
+            self.assertEqual([], self._task_migration_backups())
+        finally:
+            keeper.close()
+
+    def test_task_backup_includes_committed_uncheckpointed_wal_data(self) -> None:
+        task_id, _ = self._create_task_schema_version("2")
+        keeper = sqlite3.connect(self.database)
+        try:
+            self.assertEqual(
+                "wal",
+                keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+            )
+            keeper.execute(
+                "UPDATE tasks SET updated_at_unix=999 WHERE task_id=?",
+                (task_id,),
+            )
+            keeper.commit()
+            self.assertTrue(Path(str(self.database) + "-wal").exists())
+            tasks.grabowski_task_list()
+            backup = self._task_migration_backups()[0]
+            with sqlite3.connect(backup) as connection:
+                self.assertEqual(
+                    999,
+                    connection.execute(
+                        "SELECT updated_at_unix FROM tasks WHERE task_id=?",
+                        (task_id,),
+                    ).fetchone()[0],
+                )
+        finally:
+            keeper.close()
+
+    def test_task_backup_failure_rolls_back_without_partial_schema(self) -> None:
+        task_id, original = self._create_task_schema_version("2")
+        with patch.object(
+            tasks.os,
+            "link",
+            side_effect=OSError("simulated backup publish failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "backup publish failure"):
+                tasks.grabowski_task_list()
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            self.assertEqual(
+                "2",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+            after = dict(
+                connection.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+                ).fetchone()
+            )
+        self.assertEqual(original, after)
+        self.assertEqual([], self._task_migration_backups())
+        self.assertEqual([], list(self.database.parent.glob("*.backup.tmp")))
+        tasks.grabowski_task_list()
+        self.assertEqual(1, len(self._task_migration_backups()))
+
+    def test_interrupted_task_migration_rolls_back_and_reuses_backup(self) -> None:
+        task_id, original = self._create_task_schema_version("3")
+        original_validator = tasks._validate_task_schema_current
+
+        def fail_after_migration(connection: sqlite3.Connection) -> None:
+            if tasks._task_schema_version(connection) == "5":
+                raise RuntimeError("simulated post-migration validation failure")
+            original_validator(connection)
+
+        with patch.object(
+            tasks,
+            "_validate_task_schema_current",
+            side_effect=fail_after_migration,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "post-migration"):
+                tasks.grabowski_task_list()
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            self.assertEqual(
+                "3",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                original,
+                dict(connection.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+                ).fetchone()),
+            )
+        backups = self._task_migration_backups()
+        self.assertEqual(1, len(backups))
+        tasks.grabowski_task_list()
+        self.assertEqual(backups, self._task_migration_backups())
+
+    def test_tampered_task_backup_blocks_retry(self) -> None:
+        self._create_task_schema_version("4")
+        with patch.object(
+            tasks,
+            "_validate_task_schema_current",
+            side_effect=RuntimeError("stop after backup"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after backup"):
+                tasks.grabowski_task_list()
+        backup = self._task_migration_backups()[0]
+        backup.chmod(0o600)
+        backup.write_bytes(b"not a sqlite database")
+        with self.assertRaisesRegex(RuntimeError, "corrupt"):
+            tasks.grabowski_task_list()
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                "4",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+
+    def test_concurrent_task_openers_create_one_verified_backup(self) -> None:
+        self._create_task_schema_version("2")
+        barrier = threading.Barrier(3)
+        errors: list[BaseException] = []
+
+        def open_store() -> None:
+            try:
+                barrier.wait(timeout=2)
+                with tasks._database():
+                    pass
+            except BaseException as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=open_store) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait(timeout=2)
+        for worker in workers:
+            worker.join(timeout=5)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(self._task_migration_backups()))
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                "5",
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
             )
 
     def _promote_to_additive_schema_v4(self, *, incomplete: bool = False) -> str:
@@ -1978,12 +2582,94 @@ class TaskTests(unittest.TestCase):
                 ).fetchone()[0],
             )
 
+    def test_task_integrity_check_reports_busy_separately_from_corruption(self) -> None:
+        class BusyConnection:
+            def execute(self, statement: str) -> object:
+                raise sqlite3.OperationalError("database is locked")
+
+        with self.assertRaisesRegex(RuntimeError, "busy; retry"):
+            tasks._sqlite_integrity(BusyConnection(), "Task database")
+
+    def test_current_task_store_reopen_is_byte_stable(self) -> None:
+        connection = tasks._database()
+        connection.close()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_names = sorted(item.name for item in self.database.parent.iterdir())
+        reopened = tasks._database()
+        self.assertEqual(0, reopened.total_changes)
+        reopened.close()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(
+            before_names,
+            sorted(item.name for item in self.database.parent.iterdir()),
+        )
+        self.assertEqual([], self._task_migration_backups())
+
+    def test_raced_away_current_task_store_is_not_recreated(self) -> None:
+        with tasks._database():
+            pass
+        self.database.unlink()
+        with patch.object(tasks, "_preflight_task_store", return_value="5"):
+            with self.assertRaises(sqlite3.OperationalError):
+                tasks._database()
+        self.assertFalse(self.database.exists())
+
+    def test_corrupt_task_store_fails_without_side_effects(self) -> None:
+        self.database.parent.mkdir(parents=True, exist_ok=True)
+        payload = b"not-a-sqlite-task-store\x00corrupt"
+        self.database.write_bytes(payload)
+        before_stat = self.database.stat()
+        with self.assertRaisesRegex(RuntimeError, "corrupt"):
+            tasks.grabowski_task_list()
+        self.assertEqual(payload, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(
+            [], list(self.database.parent.glob(self.database.name + "-*"))
+        )
+        self.assertEqual([], self._task_migration_backups())
+
+    def test_malformed_task_metadata_fails_without_side_effects(self) -> None:
+        self.database.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.database) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT, value TEXT NOT NULL);
+                INSERT INTO metadata VALUES('schema_version', '4');
+                INSERT INTO metadata VALUES('schema_version', '5');
+                CREATE TABLE tasks (task_id TEXT PRIMARY KEY);
+                """
+            )
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        with self.assertRaisesRegex(RuntimeError, "metadata table is malformed"):
+            tasks.grabowski_task_list()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(
+            [], list(self.database.parent.glob(self.database.name + "-*"))
+        )
+        self.assertEqual([], self._task_migration_backups())
+
     def test_unknown_task_schema_still_fails_closed(self) -> None:
         with tasks._database() as connection:
             connection.execute("UPDATE metadata SET value='6' WHERE key='schema_version'")
             connection.commit()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_sidecars = {
+            item.name for item in self.database.parent.glob(self.database.name + "-*")
+        }
         with self.assertRaisesRegex(RuntimeError, "Unsupported task database schema"):
             tasks.grabowski_task_list()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(
+            before_sidecars,
+            {item.name for item in self.database.parent.glob(self.database.name + "-*")},
+        )
+        self.assertEqual([], self._task_migration_backups())
 
     def test_schema_v3_missing_root_contract_column_fails_closed(self) -> None:
         self.database.parent.mkdir(parents=True)
@@ -2149,7 +2835,8 @@ else:
         {'event_id': 'sha256:' + 'a' * 64, 'target': target_value, 'operation': args.operation or 'other'},
         {'event_id': 'sha256:' + 'b' * 64, 'target': target_value, 'operation': args.operation or 'other'},
     ]
-    print(json.dumps({'schema_version': 'chronik-coding-history.v1', 'events': events, 'event_ids': [event['event_id'] for event in events], 'historical_only': True, 'does_not_establish': ['current_git_state', 'current_ci_state', 'current_runtime_state', 'safe_retry', 'writer_authority']}))
+    query = {'repo': args.repo, 'host': args.host, 'component': args.component, 'operation': args.operation, 'task_class': args.task_class, 'outcome': args.outcome, 'since': args.since, 'limit': args.limit}
+    print(json.dumps({'schema_version': 'chronik-coding-history.v1', 'query': query, 'events': events, 'event_ids': [event['event_id'] for event in events], 'historical_only': True, 'does_not_establish': ['current_git_state', 'current_ci_state', 'current_runtime_state', 'safe_retry', 'writer_authority']}))
 """,
             encoding="utf-8",
         )
@@ -2241,6 +2928,20 @@ else:
             self.assertIn(claim, result["does_not_establish"])
             self.assertIn(claim, result["history"]["does_not_establish"])
         self.assertRegex(result["result_sha256"], r"[0-9a-f]{64}\Z")
+
+    def test_history_rejects_cli_result_bound_to_different_query(self) -> None:
+        source = self.cli.read_text(encoding="utf-8")
+        self.cli.write_text(
+            source.replace("'repo': args.repo", "'repo': 'heimgewebe/other'"),
+            encoding="utf-8",
+        )
+        with patch.object(tasks.operator, "_require_operator_capability"):
+            result = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski", operation="implement", limit=1
+            )
+        self.assertFalse(result["available"])
+        self.assertEqual([], result["events"])
+        self.assertIn("unbound", result["failure"]["contract_error"])
 
     def test_stale_cli_contract_is_visible_without_success_claim(self) -> None:
         self.cli.write_text(

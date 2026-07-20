@@ -373,9 +373,26 @@ def sanitized_environment() -> dict[str, str]:
 
 
 def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    # run_json_command starts the child with start_new_session=True. After Popen
+    # returns, the child PID is therefore also the stable session and process
+    # group ID. Do not call poll() or wait() before the final group signal:
+    # reaping the leader could release that numeric ID for reuse.
     process_group_id = process.pid
     try:
         os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        return
+
+    # Preserve the unreaped group leader for the complete grace period. This
+    # both pins the numeric process-group ID and gives descendants their full
+    # opportunity to handle SIGTERM even when the leader exits immediately.
+    time.sleep(PROCESS_TERMINATION_GRACE_SECONDS)
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
     except ProcessLookupError:
         pass
     try:
@@ -383,21 +400,9 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         pass
 
-    # The group leader may exit on SIGTERM while a descendant ignores it.
-    # Escalate the original process group regardless of the leader state.
-    try:
-        os.killpg(process_group_id, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    if process.returncode is None:
-        try:
-            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            pass
-
 
 def bounded_output_read_size(buffered_bytes: int) -> int:
-    remaining_capacity = MAX_COMMAND_OUTPUT_BYTES - buffered_bytes
+    remaining_capacity = max(0, MAX_COMMAND_OUTPUT_BYTES - buffered_bytes)
     return min(IO_CHUNK_BYTES, remaining_capacity + 1)
 
 

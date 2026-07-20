@@ -8,6 +8,7 @@ import os
 import signal
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -57,8 +58,42 @@ class CodingAgentProbeSchedulerTests(unittest.TestCase):
             stat_payload = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
         except FileNotFoundError:
             return False
-        state = stat_payload.rsplit(")", 1)[1].strip().split(maxsplit=1)[0]
-        return state != "Z"
+        except PermissionError:
+            return True
+        try:
+            state = stat_payload.rsplit(")", 1)[1].strip().split(maxsplit=1)[0]
+        except IndexError:
+            return True
+        return state not in {"X", "Z"}
+
+    def _wait_for_positive_pid(
+        self, path: Path, *, timeout_seconds: float
+    ) -> int:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                process_id = int(path.read_text(encoding="ascii").strip())
+            except (FileNotFoundError, ValueError):
+                time.sleep(0.02)
+                continue
+            if process_id > 0:
+                return process_id
+            time.sleep(0.02)
+        self.fail(
+            f"PID file did not contain a positive integer before timeout: {path}"
+        )
+
+    def test_wait_for_positive_pid_tolerates_empty_existing_file(self) -> None:
+        pid_path = self.root / "child.pid"
+        pid_path.touch()
+        with (
+            mock.patch.object(Path, "read_text", side_effect=["", "321\n"]) as read_text,
+            mock.patch.object(time, "sleep") as sleep,
+        ):
+            process_id = self._wait_for_positive_pid(pid_path, timeout_seconds=1)
+        self.assertEqual(321, process_id)
+        self.assertEqual(2, read_text.call_count)
+        sleep.assert_called_once_with(0.02)
 
     def write_router(
         self, *, mutate_history: bool = False, tamper_digest: bool = False
@@ -294,20 +329,126 @@ else:
             )
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_termination_does_not_reap_leader_before_final_group_kill(self) -> None:
+        process = mock.Mock()
+        process.pid = 12345
+        events: list[tuple[str, object]] = []
+        process.wait.side_effect = lambda timeout: events.append(("wait", timeout))
+
+        with (
+            mock.patch.object(
+                SCHEDULER.os,
+                "killpg",
+                side_effect=lambda process_group_id, sent_signal: events.append(
+                    ("killpg", (process_group_id, sent_signal))
+                ),
+            ),
+            mock.patch.object(
+                SCHEDULER.time,
+                "sleep",
+                side_effect=lambda seconds: events.append(("sleep", seconds)),
+            ),
+        ):
+            SCHEDULER.terminate_process_group(process)
+
+        self.assertEqual(
+            [
+                ("killpg", (12345, signal.SIGTERM)),
+                ("sleep", SCHEDULER.PROCESS_TERMINATION_GRACE_SECONDS),
+                ("killpg", (12345, signal.SIGKILL)),
+                ("wait", SCHEDULER.PROCESS_TERMINATION_GRACE_SECONDS),
+            ],
+            events,
+        )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux /proc")
+    def test_termination_preserves_descendant_grace_after_leader_exit(self) -> None:
+        child_pid_path = self.root / "graceful-child.pid"
+        child_ready_path = self.root / "graceful-child.ready"
+        cleanup_started_path = self.root / "cleanup.started"
+        cleanup_completed_path = self.root / "cleanup.completed"
+        child_program = "\n".join(
+            (
+                "from pathlib import Path",
+                "import signal, sys, time",
+                "ready, started, completed = map(Path, sys.argv[1:4])",
+                "def handle(signum, frame):",
+                "    started.write_text('1', encoding='ascii')",
+                "    time.sleep(0.15)",
+                "    completed.write_text('1', encoding='ascii')",
+                "    raise SystemExit(0)",
+                "signal.signal(signal.SIGTERM, handle)",
+                "ready.write_text('1', encoding='ascii')",
+                "time.sleep(30)",
+            )
+        )
+        parent_program = "\n".join(
+            (
+                "from pathlib import Path",
+                "import subprocess, sys, time",
+                "pid_path, ready, started, completed = map(Path, sys.argv[1:5])",
+                "child = subprocess.Popen(",
+                "    [sys.executable, '-c', sys.argv[5], str(ready), str(started), str(completed)],",
+                "    stdout=subprocess.DEVNULL,",
+                "    stderr=subprocess.DEVNULL,",
+                ")",
+                "deadline = time.monotonic() + 5",
+                "while not ready.exists():",
+                "    if time.monotonic() >= deadline: raise SystemExit(3)",
+                "    time.sleep(0.01)",
+                "pid_path.write_text(str(child.pid), encoding='ascii')",
+                "time.sleep(30)",
+            )
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                parent_program,
+                str(child_pid_path),
+                str(child_ready_path),
+                str(cleanup_started_path),
+                str(cleanup_completed_path),
+                child_program,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        child_pid = None
+        try:
+            child_pid = self._wait_for_positive_pid(
+                child_pid_path,
+                timeout_seconds=5,
+            )
+            self.assertEqual(process.pid, os.getpgid(process.pid))
+            with mock.patch.object(SCHEDULER, "PROCESS_TERMINATION_GRACE_SECONDS", 0.5):
+                SCHEDULER.terminate_process_group(process)
+            self.assertTrue(cleanup_started_path.exists())
+            self.assertTrue(cleanup_completed_path.exists())
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2)
+            if child_pid is not None and self._process_is_live(child_pid):
+                os.kill(child_pid, signal.SIGKILL)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux /proc")
     def test_timeout_kills_term_resistant_descendant_after_leader_exit(self) -> None:
         child_pid_path = self.root / "term-resistant-child.pid"
         program = "\n".join(
             (
+                "from pathlib import Path",
                 "import signal, subprocess, sys, time",
                 "child = subprocess.Popen(",
                 "    [sys.executable, '-c',",
-                "     'import os, signal, sys, time; '",
+                "     'import signal, time; '",
                 "     'signal.signal(signal.SIGTERM, signal.SIG_IGN); '",
-                "     'open(sys.argv[1], \"w\").write(str(os.getpid())); '",
-                "     'time.sleep(30)', sys.argv[1]],",
+                "     'time.sleep(30)'],",
                 "    stdout=subprocess.DEVNULL,",
                 "    stderr=subprocess.DEVNULL,",
                 ")",
+                "Path(sys.argv[1]).write_text(str(child.pid), encoding='ascii')",
                 "time.sleep(30)",
             )
         )
@@ -320,10 +461,13 @@ else:
                 SCHEDULER.run_json_command(
                     [sys.executable, "-c", program, str(child_pid_path)],
                     environment=dict(os.environ),
-                    timeout_seconds=1,
+                    timeout_seconds=2,
                 )
-            child_pid = int(child_pid_path.read_text(encoding="ascii"))
-            deadline = time.monotonic() + 2
+            child_pid = self._wait_for_positive_pid(
+                child_pid_path,
+                timeout_seconds=3,
+            )
+            deadline = time.monotonic() + 5
             while self._process_is_live(child_pid) and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertFalse(self._process_is_live(child_pid))
@@ -336,6 +480,7 @@ else:
             self.assertEqual(1025, SCHEDULER.bounded_output_read_size(0))
             self.assertEqual(25, SCHEDULER.bounded_output_read_size(1000))
             self.assertEqual(1, SCHEDULER.bounded_output_read_size(1024))
+            self.assertEqual(1, SCHEDULER.bounded_output_read_size(2048))
 
     def test_invalid_command_json_fails_closed(self) -> None:
         with self.assertRaisesRegex(

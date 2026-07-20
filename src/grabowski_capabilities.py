@@ -205,6 +205,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "repoground_context_compose": {
+        "category": "knowledge",
+        "purpose": "Compose deterministic diff-bound RepoGround change context under a hard context budget.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "repoground_find_symbol": {
         "category": "knowledge",
         "purpose": "Find bounded Python symbol definitions in an existing RepoGround bundle.",
@@ -1003,6 +1010,13 @@ TOOL_PROFILES.update(
             "effects": ["task-start", "receipt-create", "task-state-refresh"],
             "reversibility": "preserved-worktree-and-receipts",
         },
+        "grabowski_agent_workspace_writer_handoff": {
+            "category": "agent-workspace",
+            "purpose": "Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence.",
+            "risk_class": "high",
+            "effects": ["task-start", "receipt-create", "task-state-refresh"],
+            "reversibility": "preserved-worktree-and-receipts",
+        },
         "grabowski_agent_workspace_close": {
             "category": "agent-workspace",
             "purpose": "Close one collected workspace while preserving its branch and writer worktree.",
@@ -1123,6 +1137,13 @@ TOOL_PROFILES.update(
             "risk_class": "medium",
             "effects": ["private_proposal_artifact"],
             "reversibility": "artifact-preserving",
+        },
+        "grabowski_bureau_task_review": {
+            "category": "bureau",
+            "purpose": "Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation.",
+            "risk_class": "medium",
+            "effects": ["private_proposal_artifact"],
+            "reversibility": "artifact-preserving-idempotent-review",
         },
         "grabowski_bureau_task_publish_preview": {
             "category": "bureau",
