@@ -522,6 +522,47 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(first["findings_sha256"], second["findings_sha256"])
         self.assertNotEqual(first["projection_sha256"], second["projection_sha256"])
 
+    def test_audit_projection_findings_hash_is_presentation_independent(self) -> None:
+        now = 1_800_000_000
+        records = [
+            {
+                "operation": operation,
+                "timestamp": datetime.fromtimestamp(
+                    now - offset, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": f"{index:064x}",
+            }
+            for index, (operation, offset) in enumerate(
+                (("task-start", 60), ("resource-acquire", 120), ("friction-record", 180)),
+                start=1,
+            )
+        ]
+        status = {
+            "valid": True,
+            "total_records": len(records),
+            "total_legacy_records": 0,
+            "last_record_sha256": records[-1]["record_sha256"],
+            "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=(records, status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            minimal = read_surface.grabowski_audit_projection(
+                view="minimal", top_limit=1
+            )
+            evidence = read_surface.grabowski_audit_projection(
+                view="evidence", top_limit=25
+            )
+        self.assertEqual(minimal["findings_sha256"], evidence["findings_sha256"])
+        self.assertNotEqual(minimal["projection_sha256"], evidence["projection_sha256"])
+
     def test_audit_projection_fails_closed_for_invalid_chain(self) -> None:
         with patch.object(
             read_surface.base,
@@ -623,9 +664,15 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertIn("operation_counts", evidence["windows"][0])
         self.assertIn("timestamp_quality", evidence["all_time"])
         self.assertIn("findings_sha256", projected)
+        self.assertIn("projection_sha256", projected)
+        self.assertEqual(projected["findings_sha256"], minimal["findings_sha256"])
+        self.assertEqual(projected["projection_sha256"], minimal["projection_sha256"])
         self.assertNotIn("windows", projected)
         self.assertIn("source_binding", projected)
         self.assertIn("windows", projected["projection"]["omitted_fields"])
+        self.assertIn(
+            "projection_sha256", projected["projection"]["required_fields_preserved"]
+        )
 
     def test_audit_projection_parses_each_timestamp_once(self) -> None:
         now = 1_800_000_000

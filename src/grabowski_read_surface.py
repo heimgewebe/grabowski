@@ -544,8 +544,18 @@ def _audit_window_projection(
             }
         )
     private = {
+        "label": label,
+        "record_count": selected_count,
+        "operation_counts": operation_counts,
         "failure_reason_counts": failure_reason_counts,
         "bureau_code_counts": bureau_code_counts,
+        "resource_type_counts": resource_type_counts,
+        "friction_kind_counts": friction_kind_counts,
+        "friction_surface_counts": friction_surface_counts,
+        "task_activity": task_activity,
+        "resource_activity": resource_activity,
+        "bureau_activity": bureau_activity,
+        "mutation_evidence": mutation_evidence,
         "resource_reclamation_event_count": resource_reclamation_event_count,
         "reclaimed_resource_count": reclaimed_resource_count,
         "failure_signal_count": failure_signal_count,
@@ -620,9 +630,8 @@ def _audit_findings_sha256(
 ) -> str:
     def semantic_window(value: dict[str, Any]) -> dict[str, Any]:
         return {
-            key: item
-            for key, item in value.items()
-            if key not in {"start_unix", "end_unix"}
+            key: dict(sorted(item.items())) if isinstance(item, Counter) else item
+            for key, item in sorted(value.items())
         }
 
     payload = {
@@ -864,7 +873,13 @@ def grabowski_audit_projection(
         ],
     }
     payload["findings_sha256"] = _audit_findings_sha256(
-        windows, all_time, candidates, warnings
+        [
+            private_windows[label]
+            for label, _seconds in AUDIT_PROJECTION_WINDOWS
+        ],
+        all_time_private,
+        candidates,
+        warnings,
     )
     payload["projection_sha256"] = hashlib.sha256(
         consumer_surface.canonical_json_bytes(payload)
@@ -881,6 +896,8 @@ def grabowski_audit_projection(
             "warnings",
             "recommended_next_action",
             "does_not_establish",
+            "findings_sha256",
+            "projection_sha256",
         ),
     )
 
