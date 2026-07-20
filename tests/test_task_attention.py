@@ -278,6 +278,47 @@ class TaskAttentionTests(unittest.TestCase):
                 )
             )
 
+    def test_all_unrelated_outcome_paths_raise_file_not_found(self) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        primary_path = self.outcomes / f"{task_id}.json"
+        lifecycle_path = self.outcomes / f"{task_id}.lifecycle.json"
+        authoritative = json.loads(primary_path.read_text(encoding="utf-8"))
+        unrelated = self._to_legacy_unbound_outcome(authoritative)
+        encoded = (
+            json.dumps(unrelated, ensure_ascii=False, sort_keys=True, indent=2)
+            + "\n"
+        )
+        primary_path.write_text(encoded, encoding="utf-8")
+        lifecycle_path.write_text(encoded, encoding="utf-8")
+        os.chmod(primary_path, 0o600)
+        os.chmod(lifecycle_path, 0o600)
+
+        with self.assertRaisesRegex(
+            FileNotFoundError,
+            "No task outcome receipt",
+        ):
+            attention._read_valid_outcome(
+                record,
+                expected_receipt_sha256=authoritative["receipt_sha256"],
+            )
+
+    def test_corrupt_preferred_lifecycle_fails_closed_before_primary_fallback(
+        self,
+    ) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        lifecycle_path = self.outcomes / f"{task_id}.lifecycle.json"
+        lifecycle_path.write_text("{", encoding="utf-8")
+        os.chmod(lifecycle_path, 0o600)
+
+        with self.assertRaisesRegex(
+            attention.TaskAttentionIntegrityError,
+            "invalid task outcome receipt JSON",
+        ):
+            attention.record_decision(self._parameters(record))
+        self.assertEqual([], list(self.decisions.glob("*.json")))
+
     def test_tampered_authoritative_lifecycle_is_not_masked_by_legacy_primary(self) -> None:
         record = self._failed_task()
         task_id = str(record["task_id"])
