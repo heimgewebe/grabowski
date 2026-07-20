@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "6f0e402bdf3c3f017e82be36d5f91d98f635e15cef45c9b1aeeeb7c2349179c0",
+  "capability_source_sha256": "dd5e77f1c836de87af896fcef0a24eaba15d03fb86346bdf322ea0ba632039e4",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "6b8559033d08c16a296f4842439e49a8c6ded2f7753039f6f82da48a35706c1b",
+  "contract_sha256": "4ca920fde323408f931da8e870cd9568f28c5b3bf0e1cd91479d8c85b3a5b4c1",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -350,6 +350,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "repoground_context_pack"
+    },
+    {
+      "category": "knowledge",
+      "description": "Compose deterministic, diff-bound RepoGround change context under a hard payload budget.",
+      "effects": [],
+      "id": "repoground_context_compose",
+      "purpose": "Compose deterministic diff-bound RepoGround change context under a hard context budget.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_context_compose"
     },
     {
       "category": "knowledge",

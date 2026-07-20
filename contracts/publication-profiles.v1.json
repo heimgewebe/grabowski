@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "6b8559033d08c16a296f4842439e49a8c6ded2f7753039f6f82da48a35706c1b"
+    "sha256": "4ca920fde323408f931da8e870cd9568f28c5b3bf0e1cd91479d8c85b3a5b4c1"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "40401651c258d1c06cb4c038b7f4957bd2cc446338df9283dc58e624acb87349"
+    "sha256": "e4482e855bda7c65470b6e29ae480f9d8130b1d60eb53db64fc68a11e33ff42a"
   },
   "counts": {
-    "core": 21,
-    "full": 153,
-    "operator": 138
+    "core": 22,
+    "full": 154,
+    "operator": 139
   },
   "profiles": {
     "core": [
@@ -19,6 +19,7 @@
       "repoground_bundle_status",
       "repoground_freshness_check",
       "repoground_context_pack",
+      "repoground_context_compose",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -65,6 +66,7 @@
       "repoground_query_existing_index",
       "repoground_range_get",
       "repoground_context_pack",
+      "repoground_context_compose",
       "repoground_find_symbol",
       "repoground_get_callers",
       "repoground_get_callees",
@@ -219,6 +221,7 @@
       "repoground_query_existing_index",
       "repoground_range_get",
       "repoground_context_pack",
+      "repoground_context_compose",
       "repoground_find_symbol",
       "repoground_get_callers",
       "repoground_get_callees",
@@ -361,6 +364,7 @@
         "grabowski_verify_audit",
         "repoground_bundle_discover",
         "repoground_bundle_status",
+        "repoground_context_compose",
         "repoground_context_pack",
         "repoground_freshness_check"
       ],
@@ -379,6 +383,7 @@
         "grabowski_runtime_health",
         "repoground_bundle_discover",
         "repoground_bundle_status",
+        "repoground_context_compose",
         "repoground_context_pack",
         "repoground_freshness_check"
       ],

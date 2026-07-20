@@ -248,6 +248,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "repoground_query_existing_index": ("bundle_registry",),
     "repoground_range_get": ("bundle_registry",),
     "repoground_context_pack": ("bundle_registry",),
+    "repoground_context_compose": ("bundle_registry",),
     "repoground_find_symbol": ("bundle_registry",),
     "repoground_get_callers": ("bundle_registry",),
     "repoground_get_callees": ("bundle_registry",),
@@ -7296,6 +7297,25 @@ elif operation == "get_callees":
         path=payload.get("path"),
         k=payload.get("k", 25),
     )
+elif operation == "agent_impact_context":
+    from pathlib import Path
+    from merger.repoground.core.agent_impact_adapter import RepoGroundAgentImpactAdapter
+    from merger.repoground.core.readonly_adapter import SnapshotRegistration
+    manifest_path = Path(manifest).resolve()
+    adapter = RepoGroundAgentImpactAdapter(
+        config_path=manifest_path,
+        allowed_roots=(manifest_path.parent,),
+        snapshots=(SnapshotRegistration("selected", manifest_path),),
+    )
+    result = adapter.agent_impact_context(
+        "selected",
+        target_path=payload.get("target_path"),
+        target_symbol=payload.get("target_symbol"),
+        changed_paths=payload.get("changed_paths"),
+        mode=payload.get("mode", "impact"),
+        max_items=payload.get("max_items", 25),
+        include_query_context=payload.get("include_query_context", True),
+    )
 else:
     raise SystemExit(f"unknown operation: {operation}")
 
@@ -8298,6 +8318,423 @@ def repoground_context_pack(
             "test_sufficiency",
             "review_complete",
             "runtime_correctness",
+        ],
+    }
+
+
+_REPOGROUND_REVISION_RE = re.compile(r"[A-Za-z0-9_./@{}^~:+-]{1,200}\Z")
+_REPOGROUND_SHA256_RE = re.compile(r"[a-f0-9]{64}\Z")
+
+
+def _repoground_validate_revision(value: str, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith("-")
+        or not _REPOGROUND_REVISION_RE.fullmatch(value)
+    ):
+        raise ValueError(f"{label} must be a bounded Git revision")
+    return value
+
+
+def _repoground_working_repo(repo: str) -> Path:
+    root = (HOME / "repos").resolve(strict=False)
+    candidate = root / repo
+    resolved = candidate.resolve(strict=False)
+    if (
+        resolved == root
+        or root not in resolved.parents
+        or not candidate.is_dir()
+        or candidate.is_symlink()
+    ):
+        raise ValueError("repository checkout is missing or invalid")
+    return candidate
+
+
+def _repoground_resolve_commit(repo_path: Path, revision: str) -> str:
+    rc, out, _err = _repoground_git(repo_path, ["rev-parse", "--verify", f"{revision}^{{commit}}"])
+    if rc != 0 or not re.fullmatch(r"[a-f0-9]{40}", out):
+        raise ValueError(f"Git revision could not be resolved: {revision}")
+    return out
+
+
+def _repoground_revision_changes(
+    repo_path: Path, base_commit: str, target_commit: str
+) -> tuple[list[dict[str, Any]], str]:
+    rc, names, err = _repoground_git(
+        repo_path,
+        ["diff", "--name-status", "--find-renames", "--no-ext-diff", base_commit, target_commit, "--"],
+    )
+    if rc != 0:
+        raise ValueError(f"Git diff name-status failed: {err or rc}")
+    changes: list[dict[str, Any]] = []
+    for raw in names.splitlines():
+        parts = raw.split("\t")
+        if len(parts) < 2:
+            continue
+        status = parts[0]
+        if status.startswith(("R", "C")) and len(parts) >= 3:
+            changes.append({"status": status, "previous_path": parts[1], "path": parts[2]})
+        else:
+            changes.append({"status": status, "path": parts[1]})
+    changes.sort(key=lambda item: (str(item.get("path")), str(item.get("previous_path", ""))))
+    rc, raw_delta, err = _repoground_git(
+        repo_path,
+        ["diff", "--raw", "--full-index", "--no-abbrev", "--no-ext-diff", base_commit, target_commit, "--"],
+    )
+    if rc != 0:
+        raise ValueError(f"Git diff identity failed: {err or rc}")
+    identity = json.dumps(
+        {
+            "schema_version": 1,
+            "base_commit": base_commit,
+            "target_commit": target_commit,
+            "name_status": names,
+            "raw_tree_delta": raw_delta,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return changes, hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _repoground_dirty_overlay(repo_path: Path) -> dict[str, Any]:
+    rc, status, err = _repoground_git(repo_path, ["status", "--porcelain=v1", "--untracked-files=normal"])
+    entries = [line for line in status.splitlines() if line]
+    return {
+        "available": rc == 0,
+        "dirty": bool(entries) if rc == 0 else None,
+        "entry_count": len(entries) if rc == 0 else None,
+        "status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest() if rc == 0 else None,
+        "included_in_revision_diff": False,
+        "error": err or None if rc != 0 else None,
+    }
+
+
+def _repoground_agent_impact_context(
+    manifest_path: Path, *, changed_paths: list[str], max_items: int
+) -> dict[str, Any]:
+    return _repoground_core_json(
+        "agent_impact_context",
+        manifest_path,
+        {
+            "changed_paths": changed_paths,
+            "mode": "impact",
+            "max_items": max_items,
+            "include_query_context": True,
+        },
+    )
+
+
+def _repoground_manifest_surface_metadata(manifest_path: Path) -> dict[str, dict[str, Any]]:
+    manifest = _repoground_json(manifest_path)
+    roles = {
+        "agent_entry_manifest",
+        "pr_delta_cards_jsonl",
+        "citation_map_jsonl",
+        "python_symbol_index_json",
+        "python_call_graph_json",
+        "architecture_graph_json",
+        "relation_cards_jsonl",
+    }
+    result: dict[str, dict[str, Any]] = {}
+    for artifact in manifest.get("artifacts", []):
+        if not isinstance(artifact, dict) or artifact.get("role") not in roles:
+            continue
+        role = str(artifact["role"])
+        result[role] = {
+            key: artifact.get(key)
+            for key in ("role", "path", "bytes", "sha256", "contract", "authority", "risk_class")
+            if artifact.get(key) is not None
+        }
+    return dict(sorted(result.items()))
+
+
+def _repoground_authority_rules(preflight: dict[str, Any]) -> list[dict[str, Any]]:
+    required_reading = preflight.get("required_reading")
+    if isinstance(required_reading, list):
+        return [item for item in required_reading if isinstance(item, dict)]
+    if not isinstance(required_reading, dict):
+        return []
+    rules: list[dict[str, Any]] = []
+    for group, priority in (
+        ("missing_required", 400),
+        ("required", 300),
+        ("missing_recommended", 200),
+        ("recommended", 100),
+    ):
+        roles = required_reading.get(group)
+        if not isinstance(roles, list):
+            continue
+        for role in roles:
+            if isinstance(role, str) and role:
+                rules.append(
+                    {
+                        "artifact_role": role,
+                        "requirement": group,
+                        "authority": "required_reading_protocol",
+                        "priority": priority,
+                    }
+                )
+    rules.sort(key=lambda item: (-int(item["priority"]), str(item["artifact_role"])))
+    return rules
+
+
+def _repoground_gate_evidence(
+    preflight: dict[str, Any], bundle_status: dict[str, Any]
+) -> list[dict[str, Any]]:
+    gates = [
+        {
+            "gate": "agent_consumption_preflight",
+            "status": preflight.get("status", "unknown"),
+            "authority": "repoground_preflight",
+        }
+    ]
+    for key in ("post_emit_health", "bundle_surface_validation", "output_health"):
+        value = bundle_status.get(key)
+        if isinstance(value, dict):
+            gates.append(
+                {
+                    "gate": key,
+                    "status": value.get("status", value.get("verdict", "unknown")),
+                    "authority": "bundle_status",
+                }
+            )
+    return gates
+
+
+def _repoground_json_bytes(value: Any) -> int:
+    return len(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def _repoground_budget_context(
+    lanes: list[tuple[str, list[Any]]], limit: int
+) -> tuple[dict[str, list[Any]], dict[str, dict[str, int]], int]:
+    context: dict[str, list[Any]] = {}
+    counts: dict[str, dict[str, int]] = {}
+    for name, items in lanes:
+        accepted: list[Any] = []
+        for item in items:
+            candidate = dict(context)
+            candidate[name] = [*accepted, item]
+            if _repoground_json_bytes(candidate) > limit:
+                break
+            accepted.append(item)
+        candidate = dict(context)
+        candidate[name] = accepted
+        if _repoground_json_bytes(candidate) <= limit:
+            context[name] = accepted
+        counts[name] = {"available": len(items), "included": len(accepted)}
+    return context, counts, _repoground_json_bytes(context)
+
+
+@mcp.tool(name="repoground_context_compose", annotations=READ_ANNOTATIONS)
+def repoground_context_compose(
+    repo: str,
+    base_revision: str,
+    target_revision: str,
+    task_profile: str = "change_impact",
+    context_budget_bytes: int = 12000,
+    expected_diff_sha256: str | None = None,
+    stem: str | None = None,
+    query: str | None = None,
+) -> dict[str, Any]:
+    """Compose deterministic, diff-bound RepoGround change context under a hard payload budget."""
+    _require_capability("bundle_registry")
+    repo = _repoground_validate_repo(repo) or ""
+    task_profile = _repoground_validate_task_profile(task_profile)
+    base_revision = _repoground_validate_revision(base_revision, label="base_revision")
+    target_revision = _repoground_validate_revision(target_revision, label="target_revision")
+    if not isinstance(context_budget_bytes, int) or isinstance(context_budget_bytes, bool) or not 512 <= context_budget_bytes <= 100_000:
+        raise ValueError("context_budget_bytes must be an integer between 512 and 100000")
+    if expected_diff_sha256 is not None and (
+        not isinstance(expected_diff_sha256, str)
+        or not _REPOGROUND_SHA256_RE.fullmatch(expected_diff_sha256)
+    ):
+        raise ValueError("expected_diff_sha256 must be a lowercase SHA-256 hex digest")
+    if query is not None and (not isinstance(query, str) or not query.strip() or len(query) > 500):
+        raise ValueError("query must be a non-empty string up to 500 characters when provided")
+
+    repo_path = _repoground_working_repo(repo)
+    base_commit = _repoground_resolve_commit(repo_path, base_revision)
+    target_commit = _repoground_resolve_commit(repo_path, target_revision)
+    changes, diff_sha256 = _repoground_revision_changes(repo_path, base_commit, target_commit)
+    dirty_overlay = _repoground_dirty_overlay(repo_path)
+    change_identity = {
+        "repo": repo,
+        "base_revision": base_revision,
+        "target_revision": target_revision,
+        "base_commit": base_commit,
+        "target_commit": target_commit,
+        "diff_sha256": diff_sha256,
+        "diff_binding_kind": "git_tree_delta_v1",
+        "expected_diff_sha256": expected_diff_sha256,
+        "diff_binding_verified": expected_diff_sha256 is None or expected_diff_sha256 == diff_sha256,
+        "changed_path_count": len(changes),
+    }
+    blocked_context, blocked_lane_counts, blocked_used_bytes = _repoground_budget_context(
+        [("direct_changes", changes)], context_budget_bytes
+    )
+    if expected_diff_sha256 is not None and expected_diff_sha256 != diff_sha256:
+        return {
+            "kind": "grabowski.repoground_context_compose",
+            "schema_version": 1,
+            "available": False,
+            "status": "blocked",
+            "reason": "diff_sha256_mismatch",
+            "change_identity": change_identity,
+            "dirty_overlay": dirty_overlay,
+            "context": blocked_context,
+            "context_budget": {
+                "requested_bytes": context_budget_bytes,
+                "effective_limit_bytes": context_budget_bytes,
+                "used_bytes": blocked_used_bytes,
+                "remaining_bytes": max(0, context_budget_bytes - blocked_used_bytes),
+                "hard_limit_applies_to": "context",
+                "lane_counts": blocked_lane_counts,
+            },
+            "retrieval_lanes": {"used": ["direct_changes"], "skipped": ["agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "symbol_navigation", "call_graph", "citation", "live_evidence"]},
+            "stop_criteria": {"triggered": ["diff_sha256_mismatch"], "available": ["publication_unavailable", "impact_context_blocked", "budget_exhausted"]},
+            "does_not_establish": ["truth", "completeness", "patch_correctness", "test_sufficiency", "merge_readiness", "runtime_behavior"],
+        }
+
+    freshness, selected_stem, manifest_path, selection_error = _repoground_selected_manifest_for_repo(repo, stem)
+    if selection_error is not None or manifest_path is None:
+        return {
+            "kind": "grabowski.repoground_context_compose",
+            "schema_version": 1,
+            "available": False,
+            "status": "unavailable",
+            "reason": (selection_error or {}).get("reason", "publication_unavailable"),
+            "change_identity": change_identity,
+            "dirty_overlay": dirty_overlay,
+            "context": blocked_context,
+            "context_budget": {
+                "requested_bytes": context_budget_bytes,
+                "effective_limit_bytes": context_budget_bytes,
+                "used_bytes": blocked_used_bytes,
+                "remaining_bytes": max(0, context_budget_bytes - blocked_used_bytes),
+                "hard_limit_applies_to": "context",
+                "lane_counts": blocked_lane_counts,
+            },
+            "retrieval_lanes": {"used": ["direct_changes"], "skipped": ["agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "symbol_navigation", "call_graph", "citation", "live_evidence"]},
+            "stop_criteria": {"triggered": ["publication_unavailable"], "available": ["diff_sha256_mismatch", "impact_context_blocked", "budget_exhausted"]},
+            "does_not_establish": ["truth", "completeness", "patch_correctness", "test_sufficiency", "merge_readiness", "runtime_behavior"],
+        }
+
+    changed_paths = [str(item["path"]) for item in changes]
+    effective_query = query.strip() if isinstance(query, str) else " ".join(changed_paths[:8]) or None
+    baseline = repoground_context_pack(
+        repo,
+        task_profile=task_profile,
+        stem=selected_stem,
+        query=effective_query,
+        k=min(max(len(changed_paths), 1), 10),
+        max_snippets=5,
+    )
+    baseline_bytes = _repoground_json_bytes(baseline)
+    effective_limit = min(context_budget_bytes, max(2, baseline_bytes - 1))
+    impact = _repoground_agent_impact_context(
+        manifest_path,
+        changed_paths=changed_paths,
+        max_items=min(max(len(changed_paths) * 4, 8), 50),
+    ) if changed_paths else {"status": "skipped", "gaps": []}
+    surfaces = _repoground_manifest_surface_metadata(manifest_path)
+    preflight = baseline.get("preflight") if isinstance(baseline.get("preflight"), dict) else {}
+    bundle_status = baseline.get("bundle_status") if isinstance(baseline.get("bundle_status"), dict) else {}
+    evidence = baseline.get("bounded_evidence") if isinstance(baseline.get("bounded_evidence"), dict) else {}
+    authority_rules = _repoground_authority_rules(preflight)
+    gate_evidence = _repoground_gate_evidence(preflight, bundle_status)
+    impact_status = str(impact.get("status", "unknown"))
+    source_statuses = [item for item in impact.get("source_statuses", []) if isinstance(item, dict)] if isinstance(impact, dict) else []
+    symbol_available = any(item.get("source") == "python_symbol_index_json" and item.get("status") == "available" for item in source_statuses)
+    call_graph_available = bool(impact.get("relations")) if isinstance(impact, dict) else False
+
+    lanes = [
+        ("direct_changes", changes),
+        ("target_symbols", [item for item in impact.get("target_symbols", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
+        ("related_tests", [item for item in impact.get("related_tests", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
+        ("causal_relations", [item for item in impact.get("relations", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
+        ("supporting_context", [item for item in impact.get("supporting_context", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
+        ("entrypoints", [item for item in impact.get("entrypoints", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
+        ("recommended_first_reads", [item for item in (impact.get("edit_context") or {}).get("recommended_first_reads", []) if isinstance(item, dict)] if isinstance(impact, dict) and isinstance(impact.get("edit_context"), dict) else []),
+        ("authority_ordered_rules", authority_rules),
+        ("gate_evidence", gate_evidence),
+        ("query_snippets", [item for item in evidence.get("snippets", []) if isinstance(item, dict)] if isinstance(evidence.get("snippets"), list) else []),
+        ("live_ranges", [item for item in evidence.get("ranges", []) if isinstance(item, dict)] if isinstance(evidence.get("ranges"), list) else []),
+        ("citations", [{"citation_id": item} for item in evidence.get("citation_ids", []) if isinstance(item, str)] if isinstance(evidence.get("citation_ids"), list) else []),
+        ("entry_manifest", [surfaces["agent_entry_manifest"]] if "agent_entry_manifest" in surfaces else []),
+        ("pr_delta_cards", [surfaces["pr_delta_cards_jsonl"]] if "pr_delta_cards_jsonl" in surfaces else []),
+        ("source_ranges", [item for item in impact.get("source_ranges", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
+        ("gaps", [item for item in impact.get("gaps", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
+    ]
+    context, lane_counts, used_bytes = _repoground_budget_context(lanes, effective_limit)
+    used = ["direct_changes"]
+    if impact_status not in {"skipped", "unavailable", "unknown"}:
+        used.append("agent_impact")
+    if effective_query and baseline.get("available"):
+        used.append("query_context")
+    if symbol_available:
+        used.append("symbol_navigation")
+    if call_graph_available:
+        used.append("call_graph")
+    if "citation_map_jsonl" in surfaces or context.get("citations"):
+        used.append("citation")
+    if context.get("live_ranges"):
+        used.append("live_evidence")
+    if "agent_entry_manifest" in surfaces:
+        used.append("entry_manifest")
+    if "pr_delta_cards_jsonl" in surfaces:
+        used.append("pr_delta_cards")
+    all_lanes = ["direct_changes", "agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "symbol_navigation", "call_graph", "citation", "live_evidence"]
+    skipped = [name for name in all_lanes if name not in used]
+    triggered: list[str] = []
+    if impact_status == "blocked":
+        triggered.append("impact_context_blocked")
+    if any(value["included"] < value["available"] for value in lane_counts.values()):
+        triggered.append("budget_exhausted")
+    return {
+        "kind": "grabowski.repoground_context_compose",
+        "schema_version": 1,
+        "available": True,
+        "status": "available" if not triggered else "degraded",
+        "repo": repo,
+        "task_profile": task_profile,
+        "stem": selected_stem,
+        "change_identity": change_identity,
+        "dirty_overlay": dirty_overlay,
+        "freshness": freshness,
+        "context_budget": {
+            "requested_bytes": context_budget_bytes,
+            "effective_limit_bytes": effective_limit,
+            "used_bytes": used_bytes,
+            "remaining_bytes": max(0, effective_limit - used_bytes),
+            "hard_limit_applies_to": "context",
+            "lane_counts": lane_counts,
+        },
+        "compactness": {
+            "general_context_pack_bytes": baseline_bytes,
+            "composed_context_bytes": used_bytes,
+            "smaller_than_general_context_pack": used_bytes < baseline_bytes,
+            "ratio": round(used_bytes / baseline_bytes, 6) if baseline_bytes else None,
+        },
+        "context": context,
+        "retrieval_lanes": {"used": used, "skipped": skipped},
+        "source_surfaces": surfaces,
+        "stop_criteria": {
+            "triggered": triggered,
+            "available": ["diff_sha256_mismatch", "publication_unavailable", "impact_context_blocked", "budget_exhausted"],
+        },
+        "does_not_establish": [
+            "truth",
+            "completeness",
+            "patch_correctness",
+            "test_sufficiency",
+            "test_coverage",
+            "review_completeness",
+            "merge_readiness",
+            "runtime_behavior",
+            "regression_absence",
         ],
     }
 

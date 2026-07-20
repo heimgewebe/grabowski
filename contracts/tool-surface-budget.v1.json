@@ -674,6 +674,28 @@
         "tool": "repoground_bundle_status"
       }
     },
+    "repoground_context_compose": {
+      "evidence_refs": [
+        "bureau:heimgewebe/bureau#684",
+        "tests:tests/test_repoground_bundles.py"
+      ],
+      "exception_detail": {
+        "claim": "This tool adds one bounded read-only composition call shape without expanding mutation authority.",
+        "evidence": "Tests bind base and target commits plus the Git tree delta, enforce a hard context budget, separate dirty overlay state, and expose used and skipped retrieval lanes."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Client-side composition over context_pack, impact, symbol, call-graph, citation, entry and delta reads was rejected because it would duplicate budget and diff-binding policy across agents and could produce unbounded or inconsistent context.",
+      "rationale": "Change-oriented agents need one deterministic, diff-bound and budgeted composition surface; the general context pack has materially different inputs and does not bind base/target revisions or report retrieval-lane decisions.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "knowledge",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "repoground_context_compose"
+      }
+    },
     "repoground_context_pack": {
       "evidence_refs": [
         "bureau:heimgewebe/bureau#673",
