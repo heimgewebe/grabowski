@@ -161,13 +161,11 @@ def _read_json_object(
 def _deployment_catalog_path() -> Path:
     module_path = Path(__file__).resolve()
     environment_prefix = Path(sys.prefix).resolve()
-    if environment_prefix.name == ".venv":
-        try:
-            module_path.relative_to(environment_prefix)
-        except ValueError:
-            pass
-        else:
-            return environment_prefix.parent / "config" / "coding-agent-catalog.json"
+    if (
+        sys.prefix != sys.base_prefix
+        and module_path.is_relative_to(environment_prefix)
+    ):
+        return environment_prefix.parent / "config" / "coding-agent-catalog.json"
     return module_path.parent.parent / "config" / "coding-agent-catalog.json"
 
 

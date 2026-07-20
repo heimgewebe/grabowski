@@ -2524,7 +2524,7 @@
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "e44d25d955ab35efbfe3ec381f84395f070d37fcd8726a0488269a47137ade8f",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
-      "src/grabowski_coding_agent_router.py": "56f71abd6cfe2da8c3c130b7985539a72cc58524ffd1ed80d63ee4fb6a5f9c0f",
+      "src/grabowski_coding_agent_router.py": "430165f8f3a6f388abb6beea23d7247a483ff136d3635552e12d460b47687148",
       "src/grabowski_command_identity.py": "8a45a7161aa992c41be86f0b9301077917e47b67034674ea16845e2622e7ffee",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_convergence.py": "03ea75eb190ac08f29c4ec6c5ab1a14a631ce7c0cce4956ed6f437c492a6a635",
