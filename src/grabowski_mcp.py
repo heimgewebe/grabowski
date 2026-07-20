@@ -247,6 +247,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "repoground_get_callers": ("bundle_registry",),
     "repoground_get_callees": ("bundle_registry",),
     "grabowski_runtime_health": (),
+    "grabowski_audit_projection": (),
     "grabowski_deployment_identity": (),
     "grabowski_contract_drift": (),
     "grabowski_checkout_summary": (),

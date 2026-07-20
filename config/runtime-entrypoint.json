@@ -32,6 +32,7 @@
     "repoground_get_callers",
     "repoground_get_callees",
     "grabowski_runtime_health",
+    "grabowski_audit_projection",
     "grabowski_deployment_identity",
     "grabowski_contract_drift",
     "grabowski_checkout_summary",

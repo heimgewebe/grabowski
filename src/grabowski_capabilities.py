@@ -861,6 +861,13 @@ TOOL_PROFILES.update(
             "effects": [],
             "reversibility": "not-applicable",
         },
+        "grabowski_audit_projection": {
+            "category": "operations-observability",
+            "purpose": "Derive bounded source-bound operational trends from the verified audit chain.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
         "grabowski_deployment_identity": {
             "category": "context",
             "purpose": "Read bounded runtime identity and integrity flags without local paths.",

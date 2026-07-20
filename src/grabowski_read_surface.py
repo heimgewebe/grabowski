@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections import Counter
+from datetime import datetime
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -42,6 +43,29 @@ MAX_LOG_LINES = 2_000
 MAX_GIT_COMMITS = 100
 MAX_WORKTREES = 100
 MAX_REVISION_LENGTH = 200
+MAX_AUDIT_PROJECTION_TOP = 25
+AUDIT_PROJECTION_WINDOWS = (("24h", 86_400), ("7d", 604_800), ("30d", 2_592_000))
+AUDIT_PROJECTION_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}")
+AUDIT_EFFECT_OPERATIONS = frozenset(
+    {
+        "create",
+        "replace",
+        "remove",
+        "destroy",
+        "git-branch",
+        "checkout-archive",
+        "checkout-cleanup-apply",
+        "bureau-task-publish",
+        "runtime-deploy-scheduled",
+    }
+)
+AUDIT_BUREAU_FAILURE_STATUSES = frozenset(
+    {
+        "failed",
+        "stale-runtime-blocked",
+        "publication-unclear",
+    }
+)
 REVISION_RE = re.compile(r"[A-Za-z0-9_./@{}^~:+-]+")
 OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
 DEPLOYMENT_IDENTITY_FIELDS = (
@@ -164,6 +188,7 @@ GitCommitCount = Annotated[int, Field(ge=1, le=MAX_GIT_COMMITS)]
 PullRequestNumber = Annotated[int, Field(ge=1, le=2_147_483_647)]
 SystemdUnit = Annotated[str, Field(min_length=1, max_length=255)]
 LogLineCount = Annotated[int, Field(ge=1, le=MAX_LOG_LINES)]
+AuditProjectionTopLimit = Annotated[int, Field(ge=1, le=MAX_AUDIT_PROJECTION_TOP)]
 
 
 def _run_read(
@@ -309,6 +334,338 @@ def _validate_pr(pr: int) -> int:
     return pr
 
 
+def _audit_timestamp_unix(value: Any) -> int | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    try:
+        return int(parsed.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _audit_label(value: Any, *, fallback: str) -> str:
+    if not isinstance(value, str) or not value:
+        return fallback
+    if AUDIT_PROJECTION_LABEL_RE.fullmatch(value) is None:
+        return "<redacted>"
+    return value
+
+
+def _audit_top(counter: Counter[str], limit: int) -> list[dict[str, Any]]:
+    return [
+        {"key": key, "count": count}
+        for key, count in sorted(counter.items(), key=lambda item: (-item[1], item[0]))[
+            :limit
+        ]
+    ]
+
+
+def _audit_failure_reasons(record: dict[str, Any]) -> set[str]:
+    reasons: set[str] = set()
+    returncode = record.get("returncode")
+    if (
+        isinstance(returncode, int)
+        and not isinstance(returncode, bool)
+        and returncode != 0
+    ):
+        reasons.add("nonzero_returncode")
+    if record.get("outcome_unknown") is True:
+        reasons.add("outcome_unknown")
+    if record.get("launcher_outcome_unknown") is True:
+        reasons.add("launcher_outcome_unknown")
+    if record.get("effect_started") is False:
+        reasons.add("effect_not_started")
+    if record.get("bureau_status") in AUDIT_BUREAU_FAILURE_STATUSES:
+        reasons.add("bureau_failure_status")
+    if record.get("error") not in (None, ""):
+        reasons.add("recorded_error")
+    return reasons
+
+
+def _audit_resource_type(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return "invalid"
+    return _audit_label(value.split(":", 1)[0], fallback="invalid")
+
+
+def _audit_window_projection(
+    records: list[dict[str, Any]],
+    *,
+    start_unix: int | None,
+    end_unix: int,
+    label: str,
+    top_limit: int,
+    view: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    operation_counts: Counter[str] = Counter()
+    failure_reason_counts: Counter[str] = Counter()
+    bureau_code_counts: Counter[str] = Counter()
+    resource_type_counts: Counter[str] = Counter()
+    friction_kind_counts: Counter[str] = Counter()
+    friction_surface_counts: Counter[str] = Counter()
+    task_activity: Counter[str] = Counter()
+    resource_activity: Counter[str] = Counter()
+    bureau_activity: Counter[str] = Counter()
+    mutation_evidence: Counter[str] = Counter()
+    timestamp_quality: Counter[str] = Counter()
+    failure_signal_count = 0
+    reclaimed_resource_count = 0
+    resource_reclamation_event_count = 0
+    selected_count = 0
+
+    for record in records:
+        timestamp_unix = _audit_timestamp_unix(record.get("timestamp"))
+        if timestamp_unix is None:
+            timestamp_quality["invalid_or_missing"] += 1
+            if start_unix is not None:
+                continue
+        elif timestamp_unix > end_unix + 300:
+            timestamp_quality["future_dated"] += 1
+            if start_unix is not None:
+                continue
+        elif start_unix is not None and timestamp_unix < start_unix:
+            continue
+        else:
+            timestamp_quality["valid"] += 1
+
+        selected_count += 1
+        operation = record.get("operation")
+        operation_key = _audit_label(operation, fallback="<missing>")
+        operation_counts[operation_key] += 1
+
+        reasons = _audit_failure_reasons(record)
+        if reasons:
+            failure_signal_count += 1
+            failure_reason_counts.update(reasons)
+
+        bureau_code = record.get("bureau_code")
+        if isinstance(bureau_code, str) and bureau_code:
+            bureau_code_counts[_audit_label(bureau_code, fallback="unknown")] += 1
+
+        resource_keys = record.get("resource_keys")
+        if isinstance(resource_keys, list):
+            resource_type_counts.update(
+                _audit_resource_type(item) for item in resource_keys
+            )
+
+        reclaimed = record.get("reclaimed_count")
+        if (
+            isinstance(reclaimed, int)
+            and not isinstance(reclaimed, bool)
+            and reclaimed > 0
+        ):
+            reclaimed_resource_count += reclaimed
+            resource_reclamation_event_count += 1
+
+        if operation_key.startswith("task-"):
+            task_activity[operation_key] += 1
+        if operation_key.startswith("resource-"):
+            resource_activity[operation_key] += 1
+        if operation_key.startswith("bureau-"):
+            bureau_activity[operation_key] += 1
+
+        if operation_key == "friction-record":
+            kind = record.get("kind")
+            surface = record.get("surface")
+            friction_kind_counts[_audit_label(kind, fallback="unknown")] += 1
+            friction_surface_counts[_audit_label(surface, fallback="unknown")] += 1
+
+        if operation_key in AUDIT_EFFECT_OPERATIONS:
+            mutation_evidence["selected_operation_receipts"] += 1
+            if "before_sha256" in record or "after_sha256" in record:
+                mutation_evidence["state_hash_receipts"] += 1
+            rollback = record.get("rollback")
+            if isinstance(rollback, dict):
+                mutation_evidence["rollback_declared"] += 1
+                if rollback.get("available") is True:
+                    mutation_evidence["rollback_available"] += 1
+                elif rollback.get("available") is False:
+                    mutation_evidence["rollback_unavailable"] += 1
+            recovery_refs = record.get("recovery_refs")
+            if isinstance(recovery_refs, list) and recovery_refs:
+                mutation_evidence["recovery_reference_receipts"] += 1
+
+    public: dict[str, Any] = {
+        "label": label,
+        "start_unix": start_unix,
+        "end_unix": end_unix,
+        "record_count": selected_count,
+        "failure_signal_count": failure_signal_count,
+        "top_operations": _audit_top(operation_counts, top_limit),
+        "task_activity": dict(sorted(task_activity.items())),
+        "resource_activity": {
+            **dict(sorted(resource_activity.items())),
+            "resource_reclamation_event_count": resource_reclamation_event_count,
+            "reclaimed_resource_count": reclaimed_resource_count,
+        },
+        "bureau_activity": dict(sorted(bureau_activity.items())),
+        "mutation_evidence": dict(sorted(mutation_evidence.items())),
+    }
+    if view in {"standard", "evidence"}:
+        public.update(
+            {
+                "top_failure_reasons": _audit_top(failure_reason_counts, top_limit),
+                "top_bureau_failure_codes": _audit_top(bureau_code_counts, top_limit),
+                "top_resource_types": _audit_top(resource_type_counts, top_limit),
+                "friction_activity": {
+                    "by_kind": dict(sorted(friction_kind_counts.items())),
+                    "by_surface": dict(sorted(friction_surface_counts.items())),
+                    "current_resolution_requires_friction_summary": True,
+                },
+            }
+        )
+    if view == "evidence":
+        public.update(
+            {
+                "operation_counts": dict(sorted(operation_counts.items())),
+                "failure_reason_counts": dict(sorted(failure_reason_counts.items())),
+                "bureau_failure_code_counts": dict(sorted(bureau_code_counts.items())),
+                "resource_type_counts": dict(sorted(resource_type_counts.items())),
+                "timestamp_quality": dict(sorted(timestamp_quality.items())),
+            }
+        )
+    private = {
+        "failure_reason_counts": failure_reason_counts,
+        "bureau_code_counts": bureau_code_counts,
+        "resource_reclamation_event_count": resource_reclamation_event_count,
+        "reclaimed_resource_count": reclaimed_resource_count,
+        "failure_signal_count": failure_signal_count,
+        "timestamp_quality": timestamp_quality,
+    }
+    return public, private
+
+
+def _audit_projection_candidates(
+    seven_day: dict[str, Any],
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    bureau_codes: Counter[str] = seven_day["bureau_code_counts"]
+    repeated_codes = [
+        (code, count)
+        for code, count in sorted(
+            bureau_codes.items(), key=lambda item: (-item[1], item[0])
+        )
+        if count >= 3
+    ]
+    if repeated_codes:
+        candidates.append(
+            {
+                "pattern": "repeated_bureau_contract_failures",
+                "count_7d": sum(count for _code, count in repeated_codes),
+                "top_codes": [
+                    {"code": code, "count": count} for code, count in repeated_codes[:5]
+                ],
+                "recommendation": "Inspect caller/runtime schema compatibility and group only evidence with the same contract identity.",
+                "authority": "proposal_only",
+                "does_not_establish": ["shared_root_cause", "bureau_task_readiness"],
+            }
+        )
+    failure_reasons: Counter[str] = seven_day["failure_reason_counts"]
+    unknown_count = (
+        failure_reasons["outcome_unknown"] + failure_reasons["launcher_outcome_unknown"]
+    )
+    if unknown_count:
+        candidates.append(
+            {
+                "pattern": "ambiguous_execution_outcome",
+                "count_7d": unknown_count,
+                "recommendation": "Read the exact target state before any unchanged mutation retry.",
+                "authority": "proposal_only",
+                "does_not_establish": ["mutation_failed", "safe_retry"],
+            }
+        )
+    reclamation_events = int(seven_day["resource_reclamation_event_count"])
+    reclaimed_resources = int(seven_day["reclaimed_resource_count"])
+    if reclamation_events >= 3:
+        candidates.append(
+            {
+                "pattern": "repeated_resource_reclamation",
+                "event_count_7d": reclamation_events,
+                "reclaimed_resource_count_7d": reclaimed_resources,
+                "recommendation": "Compare lease lifetime, terminalization and release timing before changing lease policy.",
+                "authority": "proposal_only",
+                "does_not_establish": ["lease_bug", "owner_failure"],
+            }
+        )
+    return candidates[:limit]
+
+
+def _audit_findings_sha256(
+    windows: list[dict[str, Any]],
+    all_time: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+) -> str:
+    def semantic_window(value: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: item
+            for key, item in value.items()
+            if key not in {"start_unix", "end_unix"}
+        }
+
+    payload = {
+        "windows": [semantic_window(item) for item in windows],
+        "all_time": semantic_window(all_time),
+        "candidate_patterns": candidates,
+        "warnings": [
+            item
+            for item in warnings
+            if item.get("code") != "audit_advanced_during_projection"
+        ],
+    }
+    return hashlib.sha256(
+        consumer_surface.canonical_json_bytes(payload)
+    ).hexdigest()
+
+
+def _audit_snapshot_binding(records: list[dict[str, Any]]) -> dict[str, Any]:
+    first_timestamp = next(
+        (
+            record.get("timestamp")
+            for record in records
+            if isinstance(record.get("timestamp"), str)
+        ),
+        None,
+    )
+    last_timestamp = next(
+        (
+            record.get("timestamp")
+            for record in reversed(records)
+            if isinstance(record.get("timestamp"), str)
+        ),
+        None,
+    )
+    last_record_sha256 = next(
+        (
+            record.get("record_sha256")
+            for record in reversed(records)
+            if isinstance(record.get("record_sha256"), str)
+        ),
+        None,
+    )
+    identity = {
+        "record_count": len(records),
+        "last_record_sha256": last_record_sha256,
+        "first_timestamp": first_timestamp,
+        "last_timestamp": last_timestamp,
+    }
+    return {
+        **identity,
+        "snapshot_sha256": hashlib.sha256(
+            consumer_surface.canonical_json_bytes(identity)
+        ).hexdigest(),
+    }
+
+
 def _parse_json_result(result: dict[str, Any]) -> dict[str, Any]:
     stdout = result.get("stdout")
     if not isinstance(stdout, str) or not stdout.strip():
@@ -358,6 +715,150 @@ def grabowski_runtime_health() -> dict[str, Any]:
         "release_id": deployment.get("release_id"),
         "repo_head": deployment.get("repo_head"),
     }
+
+
+@mcp.tool(name="grabowski_audit_projection", annotations=LOCAL_READ)
+def grabowski_audit_projection(
+    view: str = "minimal",
+    top_limit: AuditProjectionTopLimit = 10,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Project verified audit-chain records into bounded operational trends."""
+    selected_view = consumer_surface.normalize_view(view)
+    if isinstance(top_limit, bool) or not 1 <= top_limit <= MAX_AUDIT_PROJECTION_TOP:
+        raise ValueError(f"top_limit must be between 1 and {MAX_AUDIT_PROJECTION_TOP}")
+    before = base._verify_audit_log(base.AUDIT_LOG)
+    if not before.get("valid"):
+        raise RuntimeError(
+            f"Audit log verification failed: {before.get('error') or 'unknown'}"
+        )
+    records = base._audit_records()
+    binding = _audit_snapshot_binding(records)
+    after = base._verify_audit_log(base.AUDIT_LOG)
+    if not after.get("valid"):
+        raise RuntimeError(
+            f"Audit log verification failed after projection: {after.get('error') or 'unknown'}"
+        )
+
+    as_of_unix = int(time.time())
+    windows: list[dict[str, Any]] = []
+    private_windows: dict[str, dict[str, Any]] = {}
+    for label, seconds in AUDIT_PROJECTION_WINDOWS:
+        public, private = _audit_window_projection(
+            records,
+            start_unix=as_of_unix - seconds,
+            end_unix=as_of_unix,
+            label=label,
+            top_limit=top_limit,
+            view=selected_view,
+        )
+        windows.append(public)
+        private_windows[label] = private
+    all_time, all_time_private = _audit_window_projection(
+        records,
+        start_unix=None,
+        end_unix=as_of_unix,
+        label="all_time",
+        top_limit=top_limit,
+        view=selected_view,
+    )
+    candidates = _audit_projection_candidates(private_windows["7d"])
+    advanced = (
+        after.get("last_record_sha256") != binding["last_record_sha256"]
+        or after.get("total_records") != binding["record_count"]
+    )
+    warnings: list[dict[str, Any]] = []
+    if advanced:
+        warnings.append(
+            {
+                "code": "audit_advanced_during_projection",
+                "snapshot_last_record_sha256": binding["last_record_sha256"],
+                "current_last_record_sha256": after.get("last_record_sha256"),
+            }
+        )
+    legacy_records = int(after.get("total_legacy_records") or 0)
+    if legacy_records:
+        warnings.append(
+            {"code": "legacy_audit_records_present", "count": legacy_records}
+        )
+    invalid_timestamps = int(
+        all_time_private["timestamp_quality"]["invalid_or_missing"]
+    )
+    if invalid_timestamps:
+        warnings.append(
+            {
+                "code": "audit_records_without_valid_timestamp",
+                "count": invalid_timestamps,
+            }
+        )
+    future_dated = int(all_time_private["timestamp_quality"]["future_dated"])
+    if future_dated:
+        warnings.append({"code": "future_dated_audit_records", "count": future_dated})
+
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "projection_kind": "audit_projection.v1",
+        "authority": "derived_read_only_projection",
+        "view": selected_view,
+        "as_of_unix": as_of_unix,
+        "source_binding": {
+            **binding,
+            "snapshot_chain_valid": True,
+            "post_read_chain_valid": True,
+            "post_read_total_records": after.get("total_records"),
+            "post_read_last_record_sha256": after.get("last_record_sha256"),
+            "archived_segment_count": after.get("archived_segment_count"),
+            "audit_writable": after.get("audit_writable"),
+            "advanced_during_projection": advanced,
+        },
+        "windows": windows,
+        "all_time": all_time,
+        "candidate_patterns": candidates,
+        "warnings": warnings,
+        "recommended_next_action": (
+            "inspect ambiguous execution outcomes before retries"
+            if any(
+                item.get("pattern") == "ambiguous_execution_outcome"
+                for item in candidates
+            )
+            else (
+                "inspect the highest repeated proposal-only pattern"
+                if candidates
+                else "none"
+            )
+        ),
+        "does_not_establish": [
+            "causality",
+            "task_success_rate",
+            "operator_productivity",
+            "current_lease_truth",
+            "current_friction_resolution",
+            "safe_mutation_retry",
+            "bureau_task_readiness",
+            "automatic_task_creation_authority",
+            "live_routing_promotion",
+        ],
+    }
+    payload["findings_sha256"] = _audit_findings_sha256(
+        windows, all_time, candidates, warnings
+    )
+    payload["projection_sha256"] = hashlib.sha256(
+        consumer_surface.canonical_json_bytes(payload)
+    ).hexdigest()
+    return consumer_surface.project_fields(
+        payload,
+        fields=fields,
+        required=(
+            "schema_version",
+            "projection_kind",
+            "authority",
+            "view",
+            "source_binding",
+            "warnings",
+            "recommended_next_action",
+            "does_not_establish",
+        ),
+    )
 
 
 @mcp.tool(name="grabowski_deployment_identity", annotations=LOCAL_READ)
