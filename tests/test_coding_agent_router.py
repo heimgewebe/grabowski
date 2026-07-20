@@ -135,6 +135,39 @@ class CodingAgentRouterTests(unittest.TestCase):
         defaults.update(kwargs)
         return router.grabowski_coding_agent_route(task_class, **defaults)
 
+    def test_implicit_user_catalog_does_not_override_deployment_catalog(self) -> None:
+        home = self.root / "home"
+        stale = home / ".config" / "grabowski" / "coding-agent-catalog.json"
+        stale.parent.mkdir(parents=True)
+        stale_catalog = json.loads(json.dumps(self.catalog))
+        route = next(
+            item for item in stale_catalog["routes"] if item["id"] == "claude-fable-5-high"
+        )
+        route.pop("review_only", None)
+        stale.write_text(json.dumps(stale_catalog), encoding="utf-8")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(Path, "home", return_value=home),
+        ):
+            self.assertEqual(
+                router._catalog_path(), ROOT / "config" / "coding-agent-catalog.json"
+            )
+            health = router.coding_agent_catalog_health()
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["source"], "deployment_catalog")
+
+    def test_explicit_invalid_catalog_is_reported_by_health(self) -> None:
+        invalid = json.loads(json.dumps(self.catalog))
+        route = next(
+            item for item in invalid["routes"] if item["id"] == "claude-fable-5-high"
+        )
+        route.pop("review_only", None)
+        self.catalog_path.write_text(json.dumps(invalid), encoding="utf-8")
+        health = router.coding_agent_catalog_health()
+        self.assertFalse(health["ready"])
+        self.assertEqual(health["source"], "explicit_environment")
+        self.assertIn("plan-mode route must be review_only", health["error"])
+
     def test_catalog_declares_correct_quality_and_effort_hierarchy(self) -> None:
         result = router.grabowski_coding_agent_catalog(include_disabled=True)
         self.assertTrue(result["validation"]["valid"])

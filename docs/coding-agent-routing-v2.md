@@ -33,6 +33,12 @@ Plan-Semantik gilt global: Jede Route mit plan als Permission- oder Approval-Mod
 
 `argv_prefix` bleibt in dieser Version die kanonische Befehlsquelle. Permission- und Approval-Modi werden zentral, reihenfolgeunabhängig und für beide CLI-Schreibweisen (`--flag value` und `--flag=value`) validiert; der abgeleitete Wert erscheint als strukturiertes Feld `permission_mode` in Katalog- und Routingausgaben. Ein eigenständiges autoritatives Katalogfeld wäre eine separate Schemamigration und wird nicht neben dem bestehenden Befehlsvertrag als zweite Wahrheit eingeführt.
 
+## Katalogauflösung ohne stille zweite Wahrheit
+
+Ohne explizite Konfiguration liest der Router ausschließlich den zum deployten Quellstand gehörenden Katalog `config/coding-agent-catalog.json`. Eine vorhandene Datei unter `%h/.config/grabowski/coding-agent-catalog.json` überschreibt den versionierten Katalog nicht mehr still. Damit können alte lokale Kopien weder neue Validierungsregeln umgehen noch einen strukturell grünen Werkzeugvertrag bei semantisch ungültigem Routing vortäuschen.
+
+Ein abweichender Katalog bleibt für kontrollierte Tests und ausdrücklich gebundene Sonderläufe über `GRABOWSKI_CODING_AGENT_CATALOG` möglich. Status und `grabowski_contract_drift` veröffentlichen den tatsächlich gewählten Ursprung sowie die semantische Katalogvalidierung. Ein ungültiger expliziter Katalog setzt die Routing-Readiness fail-closed, ohne die allgemeine Runtime-Integrität umzudeuten.
+
 ## Selbstlernen
 
 Lokale Ergebnisse überschreiben Hersteller- und Benchmark-Priors erst ab fünf vergleichbaren Läufen derselben Route und Aufgabenklasse. Verwendet werden First-Pass-, CI- und Merge-Erfolg, Nacharbeit, Rollbacks, falsche Behauptungen, Scope-Verstöße, Laufzeit und Kontingentverbrauch. Zugangstests werden getrennt gespeichert und nie als Qualitätserfolg gezählt. Bayesianische Schrumpfung und harte Kappen verhindern, dass wenige Läufe die Hierarchie umwerfen.
@@ -45,11 +51,13 @@ Statische Kosten-, PAYG-, Reserve- und Parallelitätspolitik stammt ausschließl
 
 Kontingentpools bilden eine Elternkette. Der Router erweitert jeden an einer Route genannten Pool automatisch um alle Elternpools und prüft jeden Pool genau einmal. Sperre, Erschöpfung, Cooldown, Reservegrenze, Parallelitätsgrenze oder Kostenunsicherheit eines Elternpools sperrt damit auch jede Kindroute, selbst wenn der Elternpool in der Route nicht zusätzlich ausgeschrieben ist.
 
-## Automatische Katalogaktualisierung
+## Automatische Laufzeitstatus-Aktualisierung
 
-Der Live-Katalog verfällt nach 3.600 Sekunden fail-closed. `grabowski-coding-agent-probe.timer` erneuert ihn deshalb alle 45 Minuten mit höchstens drei Minuten Jitter. Der Timer startet ausschließlich den bestehenden Metadatenpfad `agent-route probe`; er ruft keine Empfehlungs-, Beobachtungs- oder Ausführungsfunktion auf.
+Der dynamische Verfügbarkeits- und Quotenstatus verfällt nach 3.600 Sekunden fail-closed. `grabowski-coding-agent-probe.timer` erneuert ihn deshalb alle 45 Minuten mit höchstens drei Minuten Jitter. Der Timer startet ausschließlich den bestehenden Metadatenpfad `agent-route probe`; er ruft keine Empfehlungs-, Beobachtungs- oder Ausführungsfunktion auf.
 
 `coding_agent_probe_scheduler.py` verlangt zusätzlich einen privaten SHA-256-Pin für die konkrete `agent-route`-Datei, öffnet diese ohne Symlink-Folge und führt beide Unterbefehle über denselben offenen Dateideskriptor aus. Danach entfernt es bekannte API-Key-Variablen aus der Kindprozessumgebung, hält eine nichtblockierende exklusive Sperre, begrenzt Laufzeit und Ausgabemenge bereits beim parallelen Lesen der Kindprozess-Pipes und verlangt anschließend einen separaten `agent-route status`-Readback. Vorherige `history`-Daten müssen bytewertgleich in der JSON-Struktur erhalten bleiben. Der Router schreibt den eigentlichen State atomar; der Scheduler publiziert zusätzlich einen privaten atomaren Erfolgs- oder Fehlerbeleg. Ein gescheiterter Probe-Lauf autorisiert keine Ausführung und lässt den Router nach Ablauf der Freshness weiterhin fail-closed.
+
+Die Probe-Unit hängt nicht von einer Benutzerkopie des Katalogs ab. Ihre Startbedingungen prüfen ausschließlich den ausführbaren Metadatenpfad und dessen privaten SHA-256-Pin; der Router selbst liest den versionierten Deployment-Katalog.
 
 Die versionierten Installationsquellen sind:
 
