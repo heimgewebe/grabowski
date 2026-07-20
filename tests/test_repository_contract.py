@@ -65,29 +65,38 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('"system_overview": system_overview', source)
 
     def test_status_surfaces_operator_relay_protocol(self) -> None:
-        source = (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
-        self.assertIn("def _operator_relay_protocol()", source)
-        self.assertIn('"operating_protocol": _operator_relay_protocol()', source)
-        self.assertIn('"Operator Relay v0"', source)
-        self.assertIn('"typed_grabowski_tool"', source)
-        self.assertIn('"grabowski_micro_task"', source)
-        self.assertIn('"routing_roles"', source)
-        self.assertIn('"execution_priority"', source)
-        self.assertIn(
-            '"chatgpt_operator_adaptive_workspace_external_competition_when_high_value"',
-            source,
+        server_source = (ROOT / "src" / "grabowski_mcp.py").read_text(
+            encoding="utf-8"
         )
-        self.assertIn(
-            '"external_programming_modes": ["competitor", "contrast"]', source
+        relay_source = (ROOT / "src" / "grabowski_operator_relay.py").read_text(
+            encoding="utf-8"
         )
-        self.assertIn('"automatic_winner_selection": False', source)
-        self.assertIn('"chatgpt_operator_external_opt_in_agy_print"', source)
-        self.assertIn('"cline"', source)
-        self.assertIn('"ollama_api_qwen_coder"', source)
-        self.assertIn('"operator_patch_relay"', source)
-        self.assertIn('"automatic_merge"', source)
-        self.assertIn('"automatic_push"', source)
-        self.assertIn('"automatic_deploy"', source)
+        self.assertIn("import grabowski_operator_relay", server_source)
+        self.assertIn("def _operator_relay_protocol()", server_source)
+        self.assertIn(
+            "return grabowski_operator_relay.operator_relay_protocol()",
+            server_source,
+        )
+        self.assertIn('"operating_protocol": _operator_relay_protocol()', server_source)
+        for phrase in (
+            '"Operator Relay v0"',
+            '"typed_grabowski_tool"',
+            '"grabowski_micro_task"',
+            '"routing_roles"',
+            '"execution_priority"',
+            '"chatgpt_operator"',
+            '"external_programming_modes": ["competitor", "contrast"]',
+            '"external_primary_writer_forbidden": True',
+            '"external_primary_reviewer_forbidden": True',
+            '"capacity_fallback_to_external_writer": False',
+            '"automatic_winner_selection": False',
+            '"cline"',
+            '"operator_patch_relay"',
+            '"automatic_merge"',
+            '"automatic_push"',
+            '"automatic_deploy"',
+        ):
+            self.assertIn(phrase, relay_source)
 
     def test_operator_patch_relay_is_syntax_checked(self) -> None:
         self.assertTrue((ROOT / "tools" / "operator_patch_relay.py").is_file())

@@ -380,6 +380,14 @@
     {
       "module": "grabowski_operator_relay",
       "source": "src/grabowski_operator_relay.py"
+    },
+    {
+      "module": "grabowski_coding_agent_catalog_data",
+      "source": "src/grabowski_coding_agent_catalog_data.py"
+    },
+    {
+      "module": "grabowski_coding_agent_router_cli",
+      "source": "src/grabowski_coding_agent_router_cli.py"
     }
   ],
   "runtime_assets": [

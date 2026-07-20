@@ -182,6 +182,98 @@ else:
         )
         self.assertFalse(self.failure.exists())
 
+    def test_probe_validation_rejects_invalid_verified_pool_claims(self) -> None:
+        base = {
+            "schema_version": 2,
+            "observed_at": SCHEDULER.iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "api_key_environment_scrubbed": [],
+        }
+        for value in (
+            ["grok-com", "grok-com"],
+            ["unknown"],
+            [{"pool": "grok-com"}],
+        ):
+            with self.subTest(value=value):
+                probe = {**base, "verified_quota_pools": value}
+                probe["catalog_probe_sha256"] = SCHEDULER.value_sha256(probe)
+                with self.assertRaisesRegex(
+                    SCHEDULER.ProbeSchedulerError, "verified_quota_pools"
+                ):
+                    SCHEDULER.validate_probe(probe)
+
+    def test_state_validation_preserves_same_catalog_and_adds_only_verified_time(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": "2026-07-20T11:00:00Z",
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": ["grok-com"],
+            "api_key_environment_scrubbed": [],
+        }
+        probe["catalog_probe_sha256"] = SCHEDULER.value_sha256(probe)
+        before = {
+            **self.initial,
+            "pools": {
+                "pool": {"status": "available"},
+                "grok-com": {"status": "unknown"},
+                "jules-account": {
+                    "status": "unknown",
+                    "verified_at": "2026-07-19T00:00:00Z",
+                },
+            },
+        }
+        after = json.loads(json.dumps(before))
+        after["catalog"] = probe
+        after["pools"]["grok-com"]["verified_at"] = probe["observed_at"]
+        after["pools"]["jules-account"].pop("verified_at")
+        SCHEDULER.validate_state_after_probe(before, after, probe)
+
+        tampered = json.loads(json.dumps(after))
+        tampered["pools"]["pool"]["status"] = "blocked"
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError, "beyond verified timestamps"
+        ):
+            SCHEDULER.validate_state_after_probe(before, tampered, probe)
+
+    def test_state_validation_requires_exact_reset_after_catalog_change(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": "2026-07-20T11:00:00Z",
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": ["jules-account"],
+            "api_key_environment_scrubbed": [],
+        }
+        probe["catalog_probe_sha256"] = SCHEDULER.value_sha256(probe)
+        after = {
+            "schema_version": 2,
+            "updated_at": probe["observed_at"],
+            "catalog_sha256": "new-catalog",
+            "catalog": probe,
+            "pools": {
+                "jules-account": {"verified_at": probe["observed_at"]}
+            },
+            "routes": {},
+            "history": self.initial["history"],
+        }
+        SCHEDULER.validate_state_after_probe(self.initial, after, probe)
+
+        stale_routes = json.loads(json.dumps(after))
+        stale_routes["routes"] = self.initial["routes"]
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError, "reset route history"
+        ):
+            SCHEDULER.validate_state_after_probe(self.initial, stale_routes, probe)
+
+        stale_pools = json.loads(json.dumps(after))
+        stale_pools["pools"]["pool"] = self.initial["pools"]["pool"]
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError, "reset pool state"
+        ):
+            SCHEDULER.validate_state_after_probe(self.initial, stale_pools, probe)
+
     def test_history_mutation_fails_closed_and_records_bounded_failure(self) -> None:
         self.write_router(mutate_history=True)
         result = SCHEDULER.main(self.arguments())
