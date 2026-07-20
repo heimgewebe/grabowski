@@ -310,6 +310,19 @@ class DeploymentMetadataTests(unittest.TestCase):
         self.assertFalse(metadata["manifest_schema_valid"])
         self.assertFalse(metadata["provenance_valid"])
 
+    def test_reserved_runtime_asset_snapshot_source_invalidates_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self._release(Path(directory))
+            manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+            manifest["entrypoint_contract"]["runtime_assets"][0]["source"] = (
+                "./runtime-entrypoint.json"
+            )
+            paths["manifest"].write_text(
+                json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            metadata = self._metadata(paths)
+        self.assertFalse(metadata["manifest_schema_valid"])
+        self.assertFalse(metadata["provenance_valid"])
 
     def test_runtime_lock_tamper_invalidates_artifact_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

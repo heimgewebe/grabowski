@@ -48,6 +48,11 @@ import grabowski_repoground_catalog as repoground_catalog
 
 APP_NAME = "Grabowski"
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 6
+RESERVED_DEPLOYMENT_SNAPSHOT_INPUTS = frozenset({
+    "runtime-entrypoint.json",
+    "runtime.in",
+    "runtime.lock.txt",
+})
 AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
 AGENT_INSTRUCTIONS_VERSION = "grabowski-agent-facing-contract-v1"
 AGENT_INSTRUCTIONS_MAX_BYTES = 4_096
@@ -4006,6 +4011,7 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
             or not _safe_relative_path(destination)
             or asset_source in sources
             or asset_source in runtime_asset_sources
+            or Path(asset_source).as_posix() in RESERVED_DEPLOYMENT_SNAPSHOT_INPUTS
             or destination in runtime_asset_destinations
         ):
             return False

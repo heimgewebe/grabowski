@@ -33,6 +33,11 @@ DEFAULT_LOCK_FILE = DEFAULT_STATE_ROOT / "deploy.lock"
 RUNTIME_INPUT_RELATIVE = Path("requirements/runtime.in")
 RUNTIME_LOCK_RELATIVE = Path("requirements/runtime.lock.txt")
 ENTRYPOINT_CONTRACT_RELATIVE = Path("config/runtime-entrypoint.json")
+RESERVED_SNAPSHOT_INPUT_PATHS = frozenset({
+    ENTRYPOINT_CONTRACT_RELATIVE.name,
+    RUNTIME_INPUT_RELATIVE.name,
+    RUNTIME_LOCK_RELATIVE.name,
+})
 RELEASES_DIR_NAME = "grabowski-mcp-releases"
 MANIFEST_NAME = "deployment-manifest.json"
 INCOMPLETE_MARKER = "deployment-incomplete.json"
@@ -535,6 +540,8 @@ def load_contract_bytes(data: bytes) -> RuntimeContract:
         )
         if asset_source.as_posix() == "." or asset_destination.as_posix() == ".":
             fail(f"runtime_assets[{index}] benötigt source und destination")
+        if asset_source.as_posix() in RESERVED_SNAPSHOT_INPUT_PATHS:
+            fail(f"runtime_assets[{index}] verwendet einen reservierten Snapshot-Quellpfad")
         if asset_source in seen_paths or asset_source in seen_asset_sources:
             fail("Doppelter Runtime-Quellpfad")
         if asset_destination in seen_asset_destinations:
@@ -1780,9 +1787,10 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
                     or destination_path.as_posix() == "."
                     or asset_source in seen_paths
                     or asset_source in seen_asset_sources
+                    or source_path.as_posix() in RESERVED_SNAPSHOT_INPUT_PATHS
                     or destination in runtime_asset_destinations
                     or destination_path.parts[0] in {".venv", "inputs"}
-                    or destination in {MANIFEST_NAME, INCOMPLETE_MARKER}
+                    or destination_path.as_posix() in {MANIFEST_NAME, INCOMPLETE_MARKER}
                 ):
                     errors.append("entrypoint_contract")
                     continue

@@ -183,6 +183,12 @@ class DeployRuntimeTests(unittest.TestCase):
         invalid["runtime_assets"][0]["destination"] = "../catalog.json"
         with self.assertRaisesRegex(deploy_runtime.DeployError, "repository-relativer"):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+        invalid = json.loads(raw)
+        invalid["runtime_assets"][0]["source"] = "./runtime-entrypoint.json"
+        with self.assertRaisesRegex(
+            deploy_runtime.DeployError, "reservierten Snapshot-Quellpfad"
+        ):
+            deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
 
     def test_manifest_validation_handles_invalid_supporting_sources_fail_closed(self) -> None:
         manifest = {
