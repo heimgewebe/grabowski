@@ -65,12 +65,9 @@ OBSERVER_EXPECTED_DIRECTIVES = {
         "UMask": "0077",
         "NoNewPrivileges": "true",
         "PrivateTmp": "true",
-        "PrivateDevices": "true",
         "ProtectSystem": "strict",
         "ProtectHome": "read-only",
         "ProtectKernelTunables": "true",
-        "ProtectKernelModules": "true",
-        "ProtectKernelLogs": "true",
         "ProtectControlGroups": "true",
         "ReadWritePaths": "%h/.local/state/grabowski/safety-observer",
         "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6",
@@ -89,12 +86,9 @@ OBSERVER_EXPECTED_EFFECTIVE_PROPERTIES = {
     "UMask": "0077",
     "NoNewPrivileges": "yes",
     "PrivateTmp": "yes",
-    "PrivateDevices": "yes",
     "ProtectSystem": "strict",
     "ProtectHome": "read-only",
     "ProtectKernelTunables": "yes",
-    "ProtectKernelModules": "yes",
-    "ProtectKernelLogs": "yes",
     "ProtectControlGroups": "yes",
     "RestrictNamespaces": "yes",
     "SystemCallArchitectures": "native",
@@ -107,6 +101,9 @@ OBSERVER_EXPECTED_EFFECTIVE_SETS = {
     },
     "RestrictAddressFamilies": {"AF_UNIX", "AF_INET", "AF_INET6"},
 }
+OBSERVER_USER_CAPABILITY_INCOMPATIBLE_DIRECTIVES = frozenset(
+    {"PrivateDevices", "ProtectKernelModules", "ProtectKernelLogs"}
+)
 OBSERVER_SAFETY_REPAIR_MARKER = "observer_safety_repair_retained_v1"
 OPERATOR_LISTENER_HOST = "127.0.0.1"
 OPERATOR_LISTENER_PORT = 18181
@@ -837,6 +834,58 @@ def _atomic_publish_observer_unit(
     }
 
 
+def _verify_safety_observer_executes() -> dict[str, str]:
+    start_result = core.run(
+        ["systemctl", "--user", "start", SAFETY_OBSERVER_SERVICE],
+        check=False,
+        capture=True,
+        timeout=core.TIMEOUTS["service_start"],
+    )
+    if start_result.returncode != 0:
+        core.fail(
+            "Safety-Observer-Unit konnte nicht erfolgreich ausgeführt werden",
+            phase="observer-unit-execution",
+            details={"returncode": start_result.returncode},
+        )
+    status_result = core.run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            SAFETY_OBSERVER_SERVICE,
+            "--property=Result",
+            "--property=ActiveState",
+            "--property=SubState",
+        ],
+        check=False,
+        capture=True,
+        timeout=core.TIMEOUTS["service_start"],
+    )
+    if status_result.returncode != 0:
+        core.fail(
+            "Safety-Observer-Ausführungszustand konnte nicht gelesen werden",
+            phase="observer-unit-execution-readback",
+            details={"returncode": status_result.returncode},
+        )
+    values: dict[str, str] = {}
+    for line in status_result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    expected = {
+        "Result": "success",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+    }
+    if values != expected:
+        core.fail(
+            "Safety-Observer-Ausführung endete nicht kanonisch erfolgreich",
+            phase="observer-unit-execution-readback",
+            details={"properties": values},
+        )
+    return values
+
+
 def install_safety_observer_unit(
     repo: Path,
     snapshot: core.Snapshot,
@@ -927,6 +976,7 @@ def install_safety_observer_unit(
                 details={"returncode": reload_result.returncode},
             )
         relations = _observer_unit_relations(target)
+        execution = _verify_safety_observer_executes()
         final_bytes, final_info = _read_observer_unit_at(
             directory_fd,
             target.name,
@@ -955,6 +1005,7 @@ def install_safety_observer_unit(
             ),
             "retained_sha256": publication["retained_sha256"],
             "relations": relations,
+            "execution": execution,
         }
     finally:
         for descriptor in reversed(directory_fds):

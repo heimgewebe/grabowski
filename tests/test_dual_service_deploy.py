@@ -305,9 +305,26 @@ class SafetyObserverUnitTests(unittest.TestCase):
             if argv[:4] == [
                 "systemctl",
                 "--user",
+                "start",
+                dual.SAFETY_OBSERVER_SERVICE,
+            ]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[:4] == [
+                "systemctl",
+                "--user",
                 "show",
                 dual.SAFETY_OBSERVER_SERVICE,
             ]:
+                if "--property=Result" in argv:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=(
+                            "Result=success\n"
+                            "ActiveState=inactive\n"
+                            "SubState=dead\n"
+                        ),
+                        stderr="",
+                    )
                 return SimpleNamespace(
                     returncode=0,
                     stdout=self.show_output(target, **show_kwargs),
@@ -325,7 +342,7 @@ class SafetyObserverUnitTests(unittest.TestCase):
         self.assertNotIn(b"PrivateUsers", self.expected)
         self.assertNotIn(b"SystemCallFilter", self.expected)
 
-    def test_repository_unit_has_exact_bounds_and_requested_hardening(self) -> None:
+    def test_repository_unit_has_exact_bounds_and_compatible_hardening(self) -> None:
         expected_service = dual.OBSERVER_EXPECTED_DIRECTIVES["Service"]
         self.assertEqual(expected_service["TimeoutStartSec"], "60")
         self.assertEqual(expected_service["MemoryMax"], "512M")
@@ -335,24 +352,22 @@ class SafetyObserverUnitTests(unittest.TestCase):
                 name: expected_service[name]
                 for name in (
                     "ProtectKernelTunables",
-                    "ProtectKernelModules",
-                    "ProtectKernelLogs",
                     "ProtectControlGroups",
-                    "PrivateDevices",
                     "RestrictNamespaces",
                     "SystemCallArchitectures",
                 )
             },
             {
                 "ProtectKernelTunables": "true",
-                "ProtectKernelModules": "true",
-                "ProtectKernelLogs": "true",
                 "ProtectControlGroups": "true",
-                "PrivateDevices": "true",
                 "RestrictNamespaces": "true",
                 "SystemCallArchitectures": "native",
             },
         )
+        for directive in dual.OBSERVER_USER_CAPABILITY_INCOMPATIBLE_DIRECTIVES:
+            self.assertNotIn(directive, expected_service)
+            self.assertNotIn(directive, dual.OBSERVER_EXPECTED_EFFECTIVE_PROPERTIES)
+            self.assertNotIn(f"{directive}=".encode(), self.expected)
 
     def test_comments_cannot_spoof_after_or_exec_start(self) -> None:
         cases = {
@@ -495,10 +510,7 @@ class SafetyObserverUnitTests(unittest.TestCase):
             "TasksMax",
             "UMask",
             "ProtectKernelTunables",
-            "ProtectKernelModules",
-            "ProtectKernelLogs",
             "ProtectControlGroups",
-            "PrivateDevices",
             "RestrictNamespaces",
             "SystemCallArchitectures",
         )
@@ -1066,6 +1078,15 @@ class SafetyObserverUnitTests(unittest.TestCase):
                     "_observer_unit_relations",
                     side_effect=relations,
                 ),
+                mock.patch.object(
+                    dual,
+                    "_verify_safety_observer_executes",
+                    return_value={
+                        "Result": "success",
+                        "ActiveState": "inactive",
+                        "SubState": "dead",
+                    },
+                ),
             ):
                 with self.assertRaisesRegex(
                     core.DeployError,
@@ -1081,6 +1102,65 @@ class SafetyObserverUnitTests(unittest.TestCase):
             retained = self.retained_paths(target)
             self.assertEqual(len(retained), 1)
             self.assertEqual(retained[0].read_bytes(), b"old\n")
+
+    def test_install_fails_closed_when_observer_cannot_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            target = root / "config/systemd/user/grabowski-safety-observer.service"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"old\n")
+            base_run = self.run_systemctl(target)
+
+            def run(argv, **kwargs):
+                if argv[:4] == [
+                    "systemctl",
+                    "--user",
+                    "start",
+                    dual.SAFETY_OBSERVER_SERVICE,
+                ]:
+                    return SimpleNamespace(
+                        returncode=218,
+                        stdout="",
+                        stderr="CAPABILITIES",
+                    )
+                return base_run(argv, **kwargs)
+
+            with (
+                mock.patch.object(core, "git_show", return_value=self.expected),
+                mock.patch.object(core, "run", side_effect=run),
+            ):
+                with self.assertRaisesRegex(
+                    core.DeployError,
+                    "nicht erfolgreich ausgeführt",
+                ):
+                    dual.install_safety_observer_unit(
+                        repo,
+                        self.snapshot,
+                        target=target,
+                    )
+
+            self.assertEqual(target.read_bytes(), self.expected)
+
+    def test_observer_execution_readback_must_be_inactive_success(self) -> None:
+        responses = [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "Result=exit-code\n"
+                    "ActiveState=failed\n"
+                    "SubState=failed\n"
+                ),
+                stderr="",
+            ),
+        ]
+        with mock.patch.object(core, "run", side_effect=responses):
+            with self.assertRaisesRegex(
+                core.DeployError,
+                "nicht kanonisch erfolgreich",
+            ):
+                dual._verify_safety_observer_executes()
 
     def test_incomplete_effective_relation_readback_fails_closed(self) -> None:
         target = Path("/tmp/grabowski-safety-observer.service")
