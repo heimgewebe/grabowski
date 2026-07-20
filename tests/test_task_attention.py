@@ -319,6 +319,32 @@ class TaskAttentionTests(unittest.TestCase):
             attention.record_decision(self._parameters(record))
         self.assertEqual([], list(self.decisions.glob("*.json")))
 
+    def test_unreadable_preferred_lifecycle_fails_closed_before_primary_fallback(
+        self,
+    ) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        lifecycle_path = self.outcomes / f"{task_id}.lifecycle.json"
+        original_read = attention._read_private_json
+        attempted_paths: list[Path] = []
+
+        def read_with_denied_lifecycle(path: Path, *, label: str):
+            attempted_paths.append(path)
+            if path == lifecycle_path:
+                raise PermissionError("lifecycle receipt is unreadable")
+            return original_read(path, label=label)
+
+        with patch.object(
+            attention,
+            "_read_private_json",
+            side_effect=read_with_denied_lifecycle,
+        ):
+            with self.assertRaisesRegex(PermissionError, "unreadable"):
+                attention.record_decision(self._parameters(record))
+
+        self.assertEqual([lifecycle_path], attempted_paths)
+        self.assertEqual([], list(self.decisions.glob("*.json")))
+
     def test_incomplete_lifecycle_binding_fails_closed(self) -> None:
         record = self._failed_task()
         incomplete = dict(record)
@@ -367,7 +393,6 @@ class TaskAttentionTests(unittest.TestCase):
         primary_path = self.outcomes / f"{task_id}.json"
         lifecycle_path = self.outcomes / f"{task_id}.lifecycle.json"
         lifecycle = json.loads(primary_path.read_text(encoding="utf-8"))
-        primary_path.replace(lifecycle_path)
 
         legacy = self._to_legacy_unbound_outcome(lifecycle)
         primary_path.write_text(
