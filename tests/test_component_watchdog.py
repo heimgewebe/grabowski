@@ -181,6 +181,7 @@ class McpLifecycleProbeTests(unittest.TestCase):
             ),
             patch.object(watchdog, "process_age_seconds", return_value=120.0),
             patch.object(watchdog, "operator_identity_ok", return_value=True),
+            patch.object(watchdog, "mcp_http_probe", return_value=None),
             patch.object(
                 watchdog,
                 "mcp_stdio_probe_from_runtime",
@@ -215,6 +216,211 @@ class McpLifecycleProbeTests(unittest.TestCase):
             executable.symlink_to(sys.executable)
             with self.assertRaisesRegex(watchdog.WatchdogError, "invalid-mcp-module"):
                 watchdog.mcp_stdio_probe_from_runtime(root, "../bad", 1)
+
+
+class McpHttpLifecycleProbeTests(unittest.TestCase):
+    @staticmethod
+    def sse(message: dict) -> bytes:
+        return (
+            "event: message\r\n"
+            f"data: {json.dumps(message, separators=(',', ':'))}\r\n\r\n"
+        ).encode("utf-8")
+
+    def test_live_http_lifecycle_calls_health_and_deletes_session(self) -> None:
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": watchdog.PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "stub", "version": "1"},
+            },
+        }
+        tool_result = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "content": [
+                    {"type": "text", "text": json.dumps(HEALTH_PAYLOAD)}
+                ],
+                "structuredContent": HEALTH_PAYLOAD,
+                "isError": False,
+            },
+        }
+        responses = [
+            (
+                200,
+                {
+                    "mcp-session-id": "session-1",
+                    "content-type": "text/event-stream",
+                },
+                self.sse(initialize),
+            ),
+            (202, {}, b""),
+            (
+                200,
+                {"content-type": "text/event-stream"},
+                self.sse(tool_result),
+            ),
+            (200, {}, b""),
+        ]
+        with patch.object(
+            watchdog, "_mcp_http_request", side_effect=responses
+        ) as request:
+            self.assertIsNone(
+                watchdog.mcp_http_probe("http://127.0.0.1:18181/mcp", 2)
+            )
+        self.assertEqual(
+            ["POST", "POST", "POST", "DELETE"],
+            [call.kwargs["method"] for call in request.call_args_list],
+        )
+        self.assertEqual(
+            "session-1", request.call_args_list[-1].kwargs["session_id"]
+        )
+
+    def test_live_http_failure_and_cleanup_failure_are_reported(self) -> None:
+        with patch.object(
+            watchdog,
+            "_mcp_http_request",
+            side_effect=watchdog.McpProbeFailure("mcp-http-request-failed"),
+        ):
+            self.assertEqual(
+                "mcp-http-request-failed",
+                watchdog.mcp_http_probe("http://127.0.0.1:18181/mcp", 2),
+            )
+
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": watchdog.PROTOCOL_VERSION,
+                "capabilities": {},
+                "serverInfo": {"name": "stub", "version": "1"},
+            },
+        }
+        tool_result = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "content": [
+                    {"type": "text", "text": json.dumps(HEALTH_PAYLOAD)}
+                ],
+                "isError": False,
+            },
+        }
+        responses = [
+            (
+                200,
+                {
+                    "mcp-session-id": "session-1",
+                    "content-type": "text/event-stream",
+                },
+                self.sse(initialize),
+            ),
+            (202, {}, b""),
+            (
+                200,
+                {"content-type": "text/event-stream"},
+                self.sse(tool_result),
+            ),
+            (404, {}, b""),
+        ]
+        with patch.object(
+            watchdog, "_mcp_http_request", side_effect=responses
+        ):
+            self.assertEqual(
+                "mcp-http-cleanup-status",
+                watchdog.mcp_http_probe("http://127.0.0.1:18181/mcp", 2),
+            )
+
+    def test_live_endpoint_failure_makes_operator_unhealthy(self) -> None:
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                return_value={
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": "123",
+                },
+            ),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "operator_identity_ok", return_value=True),
+            patch.object(
+                watchdog,
+                "mcp_http_probe",
+                return_value="mcp-http-request-failed",
+            ),
+            patch.object(
+                watchdog, "mcp_stdio_probe_from_runtime", return_value=None
+            ),
+        ):
+            result = watchdog.probe_component(
+                component="operator",
+                service="grabowski-operator.service",
+                runtime_root=Path("/runtime"),
+                module="grabowski_operator",
+                profile="grabowski",
+                host="127.0.0.1",
+                port=18181,
+                health_url="http://127.0.0.1:18080/healthz",
+                ready_url="http://127.0.0.1:18080/readyz",
+                startup_grace=20,
+                http_timeout=2,
+            )
+        self.assertEqual("unhealthy", result.status)
+        self.assertEqual(("mcp-http-request-failed",), result.reasons)
+
+    def test_concrete_failure_outranks_runtime_unhealthy(self) -> None:
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                return_value={
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": "123",
+                },
+            ),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "operator_identity_ok", return_value=True),
+            patch.object(
+                watchdog,
+                "mcp_http_probe",
+                return_value="mcp-runtime-unhealthy",
+            ),
+            patch.object(
+                watchdog,
+                "mcp_stdio_probe_from_runtime",
+                return_value="mcp-stdio-process-exited",
+            ),
+        ):
+            result = watchdog.probe_component(
+                component="operator",
+                service="grabowski-operator.service",
+                runtime_root=Path("/runtime"),
+                module="grabowski_operator",
+                profile="grabowski",
+                host="127.0.0.1",
+                port=18181,
+                health_url="http://127.0.0.1:18080/healthz",
+                ready_url="http://127.0.0.1:18080/readyz",
+                startup_grace=20,
+                http_timeout=2,
+            )
+        self.assertEqual("unhealthy", result.status)
+        self.assertEqual(("mcp-stdio-process-exited",), result.reasons)
+
+    def test_stack_dump_request_is_bounded(self) -> None:
+        with (
+            patch.object(watchdog.os, "kill") as kill,
+            patch.object(watchdog.time, "sleep") as sleep,
+        ):
+            self.assertTrue(watchdog.request_python_stack_dump(123))
+        kill.assert_called_once_with(123, watchdog.signal.SIGUSR1)
+        sleep.assert_called_once_with(0.25)
 
 
 class BackoffDecisionTests(unittest.TestCase):

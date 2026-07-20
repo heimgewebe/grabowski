@@ -63,7 +63,6 @@ class DurableSystemdContractTests(unittest.TestCase):
             self.assertNotIn("--check-only", text)
             self.assertIn("SuccessExitStatus=1", text)
             self.assertIn("TimeoutStartSec=90", text)
-            self.assertIn("--failure-threshold 3", text)
             self.assertIn("--max-restarts 3", text)
             self.assertIn("--restart-window 900", text)
             self.assertIn("--backoff-base 60", text)
@@ -72,7 +71,12 @@ class DurableSystemdContractTests(unittest.TestCase):
             ROOT / "systemd" / "grabowski-operator-watchdog.service.example"
         ).read_text(encoding="utf-8")
         self.assertIn("PYTHONDONTWRITEBYTECODE=1", operator)
+        self.assertIn("--failure-threshold 2", operator)
         self.assertNotIn("--mcp-url", operator)
+        tunnel = (
+            ROOT / "systemd" / "grabowski-tunnel-watchdog.service.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--failure-threshold 3", tunnel)
 
     def test_timers_keep_decorrelation_while_watchdog_owns_backoff(self) -> None:
         for name in (

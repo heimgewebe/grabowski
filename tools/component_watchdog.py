@@ -34,6 +34,7 @@ PROTOCOL_VERSION = "2025-06-18"
 MCP_HEALTH_TOOL = "grabowski_runtime_health"
 MCP_MAX_RESPONSE_BYTES = 65536
 MCP_STDIO_SHUTDOWN_TIMEOUT = 2.0
+MCP_HTTP_SESSION_HEADER = "mcp-session-id"
 DEFAULT_BACKOFF_BASE = 60
 DEFAULT_BACKOFF_MAX = 900
 BACKOFF_MAX_LEVEL = 32
@@ -329,6 +330,202 @@ def tool_health_payload(result: dict) -> dict | None:
     return None
 
 
+def _mcp_http_message(body: bytes, content_type: str, expected_id: int) -> dict:
+    if len(body) > MCP_MAX_RESPONSE_BYTES:
+        raise McpProbeFailure("mcp-http-response-too-large")
+    try:
+        decoded = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise McpProbeFailure("mcp-http-json-invalid") from exc
+    candidates: list[str] = []
+    if content_type.split(";", 1)[0].strip().lower() == "text/event-stream":
+        candidates.extend(
+            line[5:].strip()
+            for line in decoded.splitlines()
+            if line.startswith("data:")
+        )
+    else:
+        candidates.append(decoded.strip())
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            message = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(message, dict)
+            and message.get("jsonrpc") == "2.0"
+            and message.get("id") == expected_id
+        ):
+            return message
+    raise McpProbeFailure("mcp-http-json-invalid")
+
+
+def _mcp_http_request(
+    *,
+    host: str,
+    port: int,
+    path: str,
+    method: str,
+    timeout: float,
+    payload: dict | None = None,
+    session_id: str | None = None,
+) -> tuple[int, dict[str, str], bytes]:
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Connection": "close",
+    }
+    body: bytes | None = None
+    if payload is not None:
+        body = json.dumps(
+            payload,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(body))
+    if session_id is not None:
+        headers["Mcp-Session-Id"] = session_id
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read(MCP_MAX_RESPONSE_BYTES + 1)
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        return response.status, response_headers, response_body
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        raise McpProbeFailure("mcp-http-request-failed") from exc
+    finally:
+        connection.close()
+
+
+def mcp_http_probe(url: str, timeout: float) -> str | None:
+    # Exercise a disposable lifecycle against the actual live HTTP listener.
+    if timeout <= 0:
+        raise WatchdogError("invalid-mcp-timeout")
+    host, port, path = loopback_http_url(url)
+    session_id: str | None = None
+    primary_failure: str | None = None
+    try:
+        status, headers, body = _mcp_http_request(
+            host=host,
+            port=port,
+            path=path,
+            method="POST",
+            timeout=timeout,
+            payload={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "grabowski-component-watchdog-http",
+                        "version": "1",
+                    },
+                },
+            },
+        )
+        if status != 200:
+            raise McpProbeFailure("mcp-http-initialize-status")
+        session_id = headers.get(MCP_HTTP_SESSION_HEADER)
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or len(session_id) > 256
+        ):
+            raise McpProbeFailure("mcp-http-session-missing")
+        initialize = _mcp_http_message(
+            body,
+            headers.get("content-type", ""),
+            expected_id=1,
+        )
+        if "error" in initialize:
+            raise McpProbeFailure("mcp-http-initialize-invalid")
+        result = initialize.get("result")
+        if (
+            not isinstance(result, dict)
+            or not isinstance(result.get("protocolVersion"), str)
+            or not isinstance(result.get("capabilities"), dict)
+            or not isinstance(result.get("serverInfo"), dict)
+        ):
+            raise McpProbeFailure("mcp-http-initialize-shape-invalid")
+        status, _, _ = _mcp_http_request(
+            host=host,
+            port=port,
+            path=path,
+            method="POST",
+            timeout=timeout,
+            payload={
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            },
+            session_id=session_id,
+        )
+        if status not in {200, 202}:
+            raise McpProbeFailure("mcp-http-initialized-status")
+        status, headers, body = _mcp_http_request(
+            host=host,
+            port=port,
+            path=path,
+            method="POST",
+            timeout=timeout,
+            payload={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": MCP_HEALTH_TOOL,
+                    "arguments": {},
+                },
+            },
+            session_id=session_id,
+        )
+        if status != 200:
+            raise McpProbeFailure("mcp-http-tool-status")
+        call = _mcp_http_message(
+            body,
+            headers.get("content-type", ""),
+            expected_id=2,
+        )
+        if "error" in call:
+            raise McpProbeFailure("mcp-http-tool-call-invalid")
+        result = call.get("result")
+        if not isinstance(result, dict):
+            raise McpProbeFailure("mcp-http-tool-shape-invalid")
+        is_error = result.get("isError", False)
+        if not isinstance(is_error, bool) or is_error:
+            raise McpProbeFailure("mcp-http-tool-error")
+        health = tool_health_payload(result)
+        if health is None or not isinstance(health.get("healthy"), bool):
+            raise McpProbeFailure("mcp-http-tool-shape-invalid")
+        if health["healthy"] is not True:
+            raise McpProbeFailure("mcp-runtime-unhealthy")
+    except McpProbeFailure as failure:
+        primary_failure = failure.reason
+    finally:
+        if session_id is not None:
+            try:
+                cleanup_status, _, _ = _mcp_http_request(
+                    host=host,
+                    port=port,
+                    path=path,
+                    method="DELETE",
+                    timeout=timeout,
+                    session_id=session_id,
+                )
+                if cleanup_status not in {200, 202, 204} and primary_failure is None:
+                    primary_failure = "mcp-http-cleanup-status"
+            except McpProbeFailure:
+                if primary_failure is None:
+                    primary_failure = "mcp-http-cleanup-failed"
+    return primary_failure
+
+
 def mcp_stdio_probe(
     command: str,
     arguments: list[str],
@@ -471,6 +668,7 @@ def probe_component(
     ready_url: str,
     startup_grace: float,
     http_timeout: float,
+    mcp_url: str = DEFAULT_MCP_URL,
     proc_root: Path = Path("/proc"),
 ) -> ProbeResult:
     try:
@@ -499,15 +697,30 @@ def probe_component(
         if not operator_identity_ok(proc_root, pid, runtime_root, module, host, port):
             reasons.append("operator-identity-mismatch")
         try:
-            mcp_failure = mcp_stdio_probe_from_runtime(
+            live_failure = mcp_http_probe(mcp_url, http_timeout)
+            isolated_failure = mcp_stdio_probe_from_runtime(
                 runtime_root, module, http_timeout
             )
         except WatchdogError as exc:
             return ProbeResult("indeterminate", (str(exc),), pid, age)
-        if mcp_failure == "mcp-runtime-unhealthy" and not reasons:
-            return ProbeResult("indeterminate", (mcp_failure,), pid, age)
-        if mcp_failure is not None:
-            reasons.append(mcp_failure)
+        failures = tuple(
+            failure
+            for failure in (live_failure, isolated_failure)
+            if failure is not None
+        )
+        concrete_failures = tuple(
+            failure
+            for failure in failures
+            if failure != "mcp-runtime-unhealthy"
+        )
+        if concrete_failures:
+            reasons.extend(concrete_failures)
+        elif "mcp-runtime-unhealthy" in failures:
+            if not reasons:
+                return ProbeResult(
+                    "indeterminate", ("mcp-runtime-unhealthy",), pid, age
+                )
+            reasons.append("mcp-runtime-unhealthy")
     elif component == "tunnel":
         if not tunnel_identity_ok(proc_root, pid, profile):
             reasons.append("tunnel-identity-mismatch")
@@ -724,6 +937,17 @@ def decide(
     )
 
 
+def request_python_stack_dump(pid: int) -> bool:
+    if pid <= 0 or not hasattr(signal, "SIGUSR1"):
+        return False
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except OSError:
+        return False
+    time.sleep(0.25)
+    return True
+
+
 def restart_service(service: str) -> None:
     try:
         subprocess.run(
@@ -774,6 +998,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 ready_url=args.ready_url,
                 startup_grace=args.startup_grace,
                 http_timeout=args.http_timeout,
+                mcp_url=args.mcp_url,
             )
             state = load_state(state_path)
             common = {
@@ -843,9 +1068,15 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 )
                 return 1
 
+            stack_dump_requested = (
+                args.component == "operator"
+                and probe.pid is not None
+                and request_python_stack_dump(probe.pid)
+            )
             emit(
                 "grabowski.component_watchdog.restarting",
                 **common,
+                stack_dump_requested=stack_dump_requested,
                 backoff_level=next_state.backoff_level,
                 next_restart_not_before=next_state.next_restart_not_before,
                 restart_generation=next_state.restart_generation,
@@ -867,6 +1098,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     ready_url=args.ready_url,
                     startup_grace=0,
                     http_timeout=args.http_timeout,
+                    mcp_url=args.mcp_url,
                 )
                 if final_probe.status == "healthy":
                     recovered_state = reset_after_healthy(
@@ -911,9 +1143,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--host", default="127.0.0.1")
     result.add_argument("--port", type=int, default=18181)
     # Retained as a hidden compatibility argument for older installed units.
-    # The safe probe uses an isolated stdio MCP subprocess, never a competing
-    # session against the stateful live HTTP endpoint.
-    result.add_argument("--mcp-url", default=DEFAULT_MCP_URL, help=argparse.SUPPRESS)
+    # When omitted, normalize_args binds it to the exact loopback listener.
+    result.add_argument("--mcp-url", default=None, help=argparse.SUPPRESS)
     result.add_argument("--health-url", default=DEFAULT_HEALTH_URL)
     result.add_argument("--ready-url", default=DEFAULT_READY_URL)
     result.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
@@ -938,6 +1169,15 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         )
     if args.host != "127.0.0.1" or not 1024 <= args.port <= 65535:
         raise WatchdogError("invalid-operator-listener")
+    if args.mcp_url is None:
+        args.mcp_url = f"http://{args.host}:{args.port}/mcp"
+    mcp_host, mcp_port, mcp_path = loopback_http_url(args.mcp_url)
+    if (
+        mcp_host != args.host
+        or mcp_port != args.port
+        or mcp_path != "/mcp"
+    ):
+        raise WatchdogError("mcp-url-listener-mismatch")
     return args
 
 

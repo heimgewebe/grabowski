@@ -55,43 +55,39 @@ ausschließlich seinen eigenen Dienst neu.
 
 ### Vollständiger read-only MCP-Lebenszyklus (Operator)
 
-Der Operator-Probe erzeugt **keine zweite Sitzung am stateful Live-HTTP-Port**.
-Eine solche konkurrierende Initialisierung kann am Sitzungs-Erzeugungslock des
-MCP-Servers blockieren und den zu prüfenden Pfad selbst verschlechtern.
-Stattdessen kombiniert der Watchdog zwei getrennte Belege:
+Der Operator-Watchdog kombiniert zwei voneinander unabhängige Belege:
 
-1. Der laufende `grabowski-operator.service`, seine MainPID, sein Listener und
-   die Bindung an die erwartete deployte Runtime werden geprüft.
-2. Aus genau dieser Runtime wird ein isolierter, kurzlebiger
-   `grabowski_operator --transport stdio`-Prozess gestartet.
-3. Über newline-gerahmtes JSON-RPC läuft der vollständige MCP-Lebenszyklus:
-   `initialize`, `notifications/initialized`, danach `tools/call` mit exakt
-   `grabowski_runtime_health` und leeren Argumenten. `tools/list` findet nicht
-   statt und ist kein Ersatz für den echten Toolaufruf.
-4. Akzeptiert werden nur eine formgültige Initialize-Antwort, ein boolesches
-   `isError` ungleich `true` und ein Tool-Payload mit `healthy: true`.
-   `healthy: false` wird als `mcp-runtime-unhealthy` sichtbar, führt aber als
-   `indeterminate` nicht zu einer Operator-Restart-Schleife.
-5. stdin wird anschließend geschlossen; der Kindprozess muss innerhalb des
-   begrenzten Shutdown-Fensters sauber enden. Andernfalls wird er zuerst mit
-   TERM, danach nötigenfalls mit KILL beendet und der Probe bleibt fehlgeschlagen.
+1. Er prüft MainPID, Listener und Bindung an die erwartete deployte Runtime.
+2. Gegen den **tatsächlich laufenden** Streamable-HTTP-Endpunkt erzeugt er eine
+   ausschließlich für die Probe bestimmte Sitzung, führt `initialize`,
+   `notifications/initialized` und `tools/call` mit exakt
+   `grabowski_runtime_health` aus und beendet diese Sitzung mit `DELETE`.
+3. Zusätzlich startet er aus derselben Runtime einen isolierten kurzlebigen
+   stdio-Prozess und wiederholt dort denselben MCP-Toolaufruf. Damit bleiben
+   Live-Listener und importierbarer Runtime-Stand getrennt beobachtbar.
+4. Ein fachliches `healthy: false` bleibt `indeterminate` und löst keine
+   Restart-Schleife aus. Timeout, ungültiges Protokoll, fehlende Sitzung oder
+   nicht beendbare Probesitzung gelten dagegen als Live-Pfad-Fehler.
 
-Grenzen: ein gemeinsamer Lebenszyklus-Timeout (`--http-timeout`, historischer
-Kompatibilitätsname; Standard 2 s), maximal 64 KiB stdout-Protokollantwort,
-kein Netzwerkzugriff des Probes und keine Zielmutation. stderr des isolierten
-Kindprozesses wird verworfen, damit es weder den JSON-RPC-Kanal beschädigt noch
-einen Pipe-Stau erzeugt. `PYTHONDONTWRITEBYTECODE=1` verhindert Schreibnebenwirkungen
-im deployten Runtime-Baum.
+Der Live-Probe ist auf Loopback, zwei Sekunden je Anfrage, 64 KiB Antwort und
+vier deterministische Requests begrenzt. Er nutzt keine fremde Sitzung und
+löscht seine eigene Sitzung auch auf Fehlerpfaden bestmöglich.
 
-Der Probe belegt damit Live-Prozessidentität sowie die Start-, Protokoll- und
-Toolfähigkeit derselben deployten Runtime. Er belegt ausdrücklich **nicht**,
-dass eine neue HTTP-MCP-Sitzung parallel zum produktiven Connector eröffnet
-werden kann. Genau diese Nichtstörung erlaubt eine produktive Watchdog-Unit;
-`--check-only` bleibt für manuelle Diagnose verfügbar.
+Vor einem automatischen Operator-Neustart sendet der Watchdog `SIGUSR1` an die
+MainPID. Der Operator registriert dafür `faulthandler` und schreibt begrenzte
+Stacks aller Python-Threads in das User-Journal. Die Stackaufnahme ist nur
+Diagnoseevidenz und darf einen notwendigen Neustart nicht blockieren.
+
+Der HTTP-Sitzungsmanager beendet inaktive Sitzungen nach 1.800 Sekunden. Das
+begrenzt verwaiste Zustände, ohne normale Connector-Sitzungen aggressiv zu
+unterbrechen. Die vom Tunnel abgefragten Pfade
+`/.well-known/oauth-protected-resource` und
+`/.well-known/oauth-protected-resource/mcp` liefern deterministisches JSON für
+den auth-freien Loopback-Betrieb statt einer nicht parsebaren 404-Antwort.
 
 ### Backoff mit Jitter und persistenter Sperrzeit
 
-Failure-Threshold (3 aufeinanderfolgende Fehlmessungen) und Restart-Budget
+Failure-Threshold (2 aufeinanderfolgende Fehlmessungen) und Restart-Budget
 (3 Neustarts pro 15 Minuten) bleiben unverändert fail-closed und werden vor
 dem Backoff geprüft. Zusätzlich trägt der State einen begrenzten
 exponentiellen Restart-Backoff:
@@ -131,7 +127,7 @@ nicht deklariert werden. Die Aufteilung ist deshalb:
   Unit (eine Budget-Wahrheit).
 - `RandomizedDelaySec=3s` in den Timern bleibt reine äußere Entkopplung der
   Timerläufe; der semantische Watchdog trägt den eigentlichen Backoff. Der
-  leichte Tunnelcheck läuft alle 30 s, der rund 0,8 s teure stdio-Operatorcheck
+  leichte Tunnelcheck läuft alle 30 s, der begrenzte Live-HTTP- plus stdio-Operatorcheck
   alle 60 s, um unnötige Prozess- und Importlast zu halbieren.
 - `SuccessExitStatus=1` wertet Routine-Evidenz (Fehlmessung, aufgeschobener
   Neustart) nicht als Unit-Fehler; Exit 2/3/4 (indeterminate, Budget
@@ -143,11 +139,10 @@ nicht deklariert werden. Die Aufteilung ist deshalb:
 
 Die beiden Komponentenprüfungen liefern getrennte lokale Belege:
 Der Tunnel-Watchdog prüft dessen `/healthz` und `/readyz`; der
-Operator-Watchdog prüft Live-Prozess/Listener und ruft das Read-Tool
-`grabowski_runtime_health` in einem isolierten stdio-MCP-Prozess aus derselben
-deployten Runtime auf. Das beweist weder den produktiven HTTP-Sitzungspfad noch
-einen durchgängigen Pfad Tunnel → Operator oder den
-ChatGPT-Control-Plane-Roundtrip.
+Operator-Watchdog prüft Live-Prozess/Listener, den produktiven lokalen
+HTTP-Sitzungspfad und einen isolierten stdio-Pfad aus derselben deployten
+Runtime. Nicht belegt bleiben der vollständige Roundtrip durch die OpenAI-
+Control-Plane und die korrekte Zuordnung einer konkreten ChatGPT-Sitzung.
 
 Connection-Generation, das Verwerfen veralteter Antworten und die
 Neuerkennung des Tool-Katalogs durch den Client liegen außerhalb dieses

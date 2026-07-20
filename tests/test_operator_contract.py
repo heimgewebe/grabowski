@@ -20,10 +20,16 @@ SOURCE = ROOT / "src" / "grabowski_operator.py"
 
 class _FakeFastMCP:
     def __init__(self, *args, **kwargs):
-        pass
+        self.session_manager = types.SimpleNamespace(session_idle_timeout=None)
 
     def tool(self, *args, **kwargs):
         return lambda function: function
+
+    def custom_route(self, *args, **kwargs):
+        return lambda function: function
+
+    def streamable_http_app(self):
+        return object()
 
 
 class _FakeToolAnnotations:
@@ -132,6 +138,40 @@ class OperatorContractTests(unittest.TestCase):
             filename=str(SOURCE),
         )
         self.assertIsInstance(tree, ast.Module)
+
+    def test_http_recovery_contract_is_loopback_bound(self) -> None:
+        operator = _load_operator_module()
+        metadata = operator._protected_resource_metadata(
+            "http://127.0.0.1:18181/"
+        )
+        self.assertEqual("http://127.0.0.1:18181/mcp", metadata["resource"])
+        self.assertEqual([], metadata["authorization_servers"])
+        self.assertEqual([], metadata["bearer_methods_supported"])
+        with self.assertRaisesRegex(RuntimeError, "loopback HTTP"):
+            operator._protected_resource_metadata("https://example.com/")
+
+    def test_http_sessions_are_idle_bounded(self) -> None:
+        operator = _load_operator_module()
+        operator._configure_http_runtime()
+        self.assertEqual(
+            operator.HTTP_SESSION_IDLE_TIMEOUT_SECONDS,
+            operator.mcp.session_manager.session_idle_timeout,
+        )
+        self.assertEqual(1_800, operator.HTTP_SESSION_IDLE_TIMEOUT_SECONDS)
+
+    def test_operator_registers_recovery_stack_signal(self) -> None:
+        operator = _load_operator_module()
+        with (
+            patch.object(operator.faulthandler, "enable") as enable,
+            patch.object(operator.faulthandler, "register") as register,
+        ):
+            operator._configure_faulthandler()
+        enable.assert_called_once_with(all_threads=True)
+        register.assert_called_once_with(
+            operator.signal.SIGUSR1,
+            all_threads=True,
+            chain=False,
+        )
 
     def test_runtime_deploy_runner_is_reserved_for_typed_scheduler(self) -> None:
         operator = _load_operator_module()

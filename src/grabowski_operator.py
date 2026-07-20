@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import faulthandler
 from datetime import datetime, timezone
 
 import hashlib
@@ -121,6 +122,7 @@ CONSUMER_VIEWS = consumer_surface.CONSUMER_VIEWS
 CONSUMER_VIEW_ALIASES = consumer_surface.CONSUMER_VIEW_ALIASES
 MAX_CONSUMER_FIELDS = consumer_surface.MAX_CONSUMER_FIELDS
 MAX_CONSUMER_CURSOR_BYTES = consumer_surface.MAX_CONSUMER_CURSOR_BYTES
+HTTP_SESSION_IDLE_TIMEOUT_SECONDS = 1_800
 
 _canonical_json_bytes = consumer_surface.canonical_json_bytes
 _normalize_consumer_view = consumer_surface.normalize_view
@@ -239,6 +241,74 @@ def _find_server() -> FastMCP:
 
 
 mcp = _find_server()
+
+
+def _mcp_custom_route(path: str, **kwargs: Any) -> Any:
+    custom_route = getattr(mcp, "custom_route", None)
+    if callable(custom_route):
+        return custom_route(path, **kwargs)
+
+    def undecorated(function: Any) -> Any:
+        return function
+
+    return undecorated
+
+
+def _protected_resource_metadata(base_url: str) -> dict[str, Any]:
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.netloc
+    ):
+        raise RuntimeError("protected resource metadata requires loopback HTTP")
+    return {
+        "resource": f"{parsed.scheme}://{parsed.netloc}/mcp",
+        "resource_name": "Grabowski MCP",
+        "authorization_servers": [],
+        "bearer_methods_supported": [],
+    }
+
+
+@_mcp_custom_route(
+    "/.well-known/oauth-protected-resource",
+    methods=["GET"],
+    include_in_schema=False,
+)
+@_mcp_custom_route(
+    "/.well-known/oauth-protected-resource/mcp",
+    methods=["GET"],
+    include_in_schema=False,
+)
+async def oauth_protected_resource_metadata(request: Any) -> Any:
+    # Keep source-only contract tests independent of optional runtime packages.
+    from starlette.responses import JSONResponse
+
+    return JSONResponse(
+        _protected_resource_metadata(str(request.base_url)),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _configure_http_runtime() -> None:
+    mcp.streamable_http_app()
+    mcp.session_manager.session_idle_timeout = HTTP_SESSION_IDLE_TIMEOUT_SECONDS
+
+
+def _configure_faulthandler() -> None:
+    try:
+        faulthandler.enable(all_threads=True)
+        if hasattr(signal, "SIGUSR1"):
+            faulthandler.register(
+                signal.SIGUSR1,
+                all_threads=True,
+                chain=False,
+            )
+    except (OSError, RuntimeError, ValueError):
+        # Stack capture is recovery evidence, not a startup dependency.
+        return
 
 
 def _redact_dynamic_secret(text: str, secret: str) -> str:
@@ -3578,6 +3648,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    _configure_faulthandler()
     if args.transport == "streamable-http":
         if args.host != "127.0.0.1":
             raise SystemExit(
@@ -3587,6 +3658,7 @@ def main() -> None:
             raise SystemExit("port must be between 1024 and 65535")
         mcp.settings.host = args.host
         mcp.settings.port = args.port
+        _configure_http_runtime()
     mcp.run(transport=args.transport)
 
 
