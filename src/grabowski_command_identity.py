@@ -18,3 +18,15 @@ def canonical_argv_json(argv: Any) -> str:
 
 def argv_sha256(argv: Any) -> str:
     return hashlib.sha256(canonical_argv_json(argv).encode("utf-8")).hexdigest()
+
+
+def systemd_escape_argv(argv: Any) -> list[str]:
+    """Encode opaque argv for systemd's environment-expanding ExecStart parser.
+
+    systemd releases before ``--expand-environment=no`` still decode ``$$``
+    to one literal dollar sign. Doubling every dollar therefore preserves the
+    validated payload across old and new managers without changing its stored
+    identity.
+    """
+    canonical_argv_json(argv)
+    return [item.replace("$", "$$") for item in argv]

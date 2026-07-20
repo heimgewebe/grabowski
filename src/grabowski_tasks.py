@@ -1411,7 +1411,7 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
     ]
     if record["memory_max_bytes"] is not None:
         argv.append(f"--property=MemoryMax={record['memory_max_bytes']}")
-    return [*argv, "--", *command]
+    return [*argv, "--", *command_identity.systemd_escape_argv(command)]
 
 
 def _root_task_start_payload(record: dict[str, Any]) -> dict[str, Any]:
