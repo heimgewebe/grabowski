@@ -468,7 +468,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 runtime_healthy=True,
                 coding_agent_catalog={
                     "ready": True,
-                    "source": "deployment_catalog",
+                    "source": "embedded-runtime",
                 },
                 client_snapshot={
                     "state": "missing",

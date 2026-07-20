@@ -30,7 +30,7 @@ Die Operatorverantwortung umfasst Livezustand, Planung, Implementierung, Tests, 
 
 ## Externe Review-Routen
 
-Explizite Review-Aufgaben wie `independent-review`, `critical-review` und `security-review` dürfen externe Primärrouten wählen. Kritische Reviews können einen zweiten provider- und lineage-unabhängigen Reviewer verlangen. Jeder Befund bleibt bis zur direkten Reproduktion oder anderweitigen Prüfung durch den Operator beratend.
+Auch explizite Review-Aufgaben wie `independent-review`, `critical-review` und `security-review` beginnen beim direkten ChatGPT/Grabowski-Review. Der Router kann danach einen provider- und lineage-unabhängigen externen Zusatzreviewer empfehlen. Ein fehlender oder gesperrter Agentenstatus blockiert den direkten Review nicht. Jeder externe Befund bleibt bis zur direkten Reproduktion oder anderweitigen Prüfung durch den Operator beratend.
 
 Plan-Modus gilt global als Review-Modus: Jede Route mit `plan` als Permission- oder Approval-Modus muss `review_only=true` sein, mindestens eine als unabhängiger Review klassifizierte Aufgabe anbieten und darf keine Kontrastaufgabe enthalten.
 
@@ -86,9 +86,9 @@ Jules ist ein verwalteter Remote-Harness; die Platzhalteridentität behauptet ke
 
 ## Katalogauflösung ohne stille zweite Wahrheit
 
-Ohne explizite Konfiguration liest der Router ausschließlich den zum deployten Quellstand gehörenden Katalog `config/coding-agent-catalog.json`. Eine vorhandene Datei unter `%h/.config/grabowski/coding-agent-catalog.json` überschreibt den versionierten Katalog nicht mehr still. Damit können alte lokale Kopien weder neue Validierungsregeln umgehen noch einen strukturell grünen Werkzeugvertrag bei semantisch ungültigem Routing vortäuschen.
+`config/coding-agent-catalog.json` ist die redaktionelle Quellwahrheit. `tools/build_coding_agent_catalog_data.py` kanonisiert sie deterministisch zu `src/grabowski_coding_agent_catalog_data.py`; dieses Modul wird gemeinsam mit Router und CLI im selben unveränderlichen Runtime-Release installiert. Die Laufzeit liest standardmäßig ausschließlich diesen eingebetteten Katalog. Dadurch wechseln Routercode, Validierungsregeln und Katalog atomar mit demselben Release-Symlink.
 
-Ein abweichender Katalog bleibt für kontrollierte Tests und ausdrücklich gebundene Sonderläufe über `GRABOWSKI_CODING_AGENT_CATALOG` möglich. Status und `grabowski_contract_drift` veröffentlichen den tatsächlich gewählten Ursprung sowie die semantische Katalogvalidierung. Ein ungültiger expliziter Katalog setzt die Routing-Readiness fail-closed, ohne die allgemeine Runtime-Integrität umzudeuten.
+Eine alte Datei unter `%h/.config/grabowski/coding-agent-catalog.json` besitzt keine Routingautorität. Ein abweichender Katalog ist nur für kontrollierte Tests oder Diagnose zulässig, wenn **beide** Variablen gesetzt sind: `GRABOWSKI_CODING_AGENT_CATALOG=<pfad>` und `GRABOWSKI_CODING_AGENT_CATALOG_OVERRIDE=1`. Ein einzelner geerbter Pfadwert wird ignoriert. Status und `grabowski_contract_drift` veröffentlichen den tatsächlich gewählten Ursprung sowie die semantische Validierung; ein ungültiger ausdrücklicher Override setzt nur die Routing-Readiness fail-closed.
 
 ## Selbstlernen
 
@@ -106,16 +106,16 @@ Kontingentpools bilden eine Elternkette. Sperre, Erschöpfung, Cooldown, Reserve
 
 ## Automatische Laufzeitstatus-Aktualisierung
 
-Der dynamische Verfügbarkeits- und Quotenstatus verfällt nach 3.600 Sekunden fail-closed für die Auswahl externer Zusatzreviewer und Kontrastkandidaten. `grabowski-coding-agent-probe.timer` erneuert ihn alle 45 Minuten mit höchstens drei Minuten Jitter. Der Timer startet ausschließlich den Metadatenpfad `agent-route probe`; er führt keine Coding-, Review- oder Kontrastarbeit aus und blockiert die direkte Operatorarbeit nicht.
+Der dynamische Metadatenstand verfällt nach 3.600 Sekunden fail-closed nur für die Auswahl externer Zusatzreviewer und Kontrastkandidaten. `grabowski-coding-agent-probe.timer` erneuert ihn alle 45 Minuten mit höchstens drei Minuten Jitter. Der Timer startet ausschließlich `agent-route probe`; dieser Pfad liest Versions-, Auth- und Modellinventarmetadaten, führt aber keine Coding-, Review- oder Kontrastarbeit aus. Direkte Implementierung und direkter Review bleiben auch bei fehlender oder veralteter Probe verfügbar.
 
-`coding_agent_probe_scheduler.py` verlangt einen privaten SHA-256-Pin für die konkrete `agent-route`-Datei, öffnet sie ohne Symlink-Folge, entfernt bekannte API-Key-Variablen, begrenzt Laufzeit und Ausgabe und verlangt einen getrennten Status-Readback. Vorherige Historie muss strukturell erhalten bleiben. Ein fehlgeschlagener Probe-Lauf autorisiert nichts und kann die direkte Operatorarbeit nicht blockieren.
+`agent-route` ist ein dünner, versionierter Wrapper auf das aktuelle Runtime-Modul `grabowski_coding_agent_router_cli`. `tools/install_coding_agent_router_cli.py` serialisiert den Cutover unter einem privaten exklusiven Installationslock, ersetzt Wrapper und SHA-256-Pin jeweils atomar, verlangt zuvor den eingebetteten Runtime-Katalog und nimmt beide Dateien bei fehlerhaftem Direct-first-Readback zurück. `coding_agent_probe_scheduler.py` öffnet den Wrapper ohne Symlink-Folge, prüft den Pin, entfernt bekannte API-Key-Variablen, begrenzt Laufzeit und Ausgabe und verlangt einen getrennten Status-Readback. Vorherige Historie muss strukturell erhalten bleiben. Ein fehlgeschlagener Probe-Lauf autorisiert nichts.
 
-Die Probe-Unit hängt nicht von einer Benutzerkopie des Katalogs ab. Ihre Startbedingungen prüfen ausschließlich den ausführbaren Metadatenpfad und dessen privaten SHA-256-Pin; der Router selbst liest den versionierten Deployment-Katalog.
+Die Probe-Unit hängt nicht von einer Benutzerkopie des Katalogs ab. Ihre Startbedingungen prüfen ausschließlich den ausführbaren Metadatenpfad und dessen privaten SHA-256-Pin. Die versionierten Installationsquellen sind:
 
-Die versionierten Installationsquellen sind:
-
+- `tools/agent-route`
+- `tools/install_coding_agent_router_cli.py`
 - `tools/coding_agent_probe_scheduler.py`
 - `systemd/grabowski-coding-agent-probe.service.example`
 - `systemd/grabowski-coding-agent-probe.timer.example`
 
-Die Live-Ziele liegen unter `%h/.local/libexec/grabowski/` und `%h/.config/systemd/user/`; der Router-Pin liegt privat unter `%h/.config/grabowski/coding-agent-probe-scheduler-router.sha256`. Nur `%h/.local/state/grabowski/coding-agent-router` ist für den Dienst schreibbar. `MemoryMax=512M` und `TasksMax=50` begrenzen einen fehlerhaften Kindprozess. Die Probe-Unterbefehle bleiben auf Versions-, Auth- und Modellinventar-Metadaten beschränkt.
+Die Live-Ziele sind `%h/bin/agent-route`, `%h/.local/libexec/grabowski/coding_agent_probe_scheduler.py` und die Unit unter `%h/.config/systemd/user/`; der Wrapper-Pin liegt privat unter `%h/.config/grabowski/coding-agent-probe-scheduler-router.sha256`. Nur `%h/.local/state/grabowski/coding-agent-router` ist für den Dienst schreibbar. `MemoryMax=512M` und `TasksMax=50` begrenzen einen fehlerhaften Kindprozess. Der sichere Cutover lautet: geprüftes Runtime-Release aktivieren, Wrapper samt Pin installieren, Probe ausführen und Status sowie Direct-first-Empfehlung zurücklesen.

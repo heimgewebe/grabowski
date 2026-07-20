@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh the advisory Grabowski coding-agent catalog before it expires
+Description=Refresh the advisory Grabowski coding-agent runtime state before it expires
 
 [Timer]
 OnBootSec=5min

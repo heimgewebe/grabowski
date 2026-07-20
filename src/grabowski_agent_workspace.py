@@ -4836,7 +4836,7 @@ def grabowski_agent_workspace_create(
     memory_max_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Create one explicit advisory contrast workspace; direct work stays authoritative."""
-    if route_evidence is None or route_evidence.get("schema_version") != 2:
+    if not isinstance(route_evidence, dict) or route_evidence.get("schema_version") != 2:
         raise AgentWorkspaceError(
             "direct-first workspace creation requires schema-v2 advisory route evidence"
         )

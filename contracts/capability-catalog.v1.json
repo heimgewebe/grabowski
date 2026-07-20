@@ -2,7 +2,7 @@
   "capability_source": "src/grabowski_capabilities.py",
   "capability_source_sha256": "78b0f12335f5ca124ade07c69d2be1256432a8df0ec16dbea94f576fee66635c",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "db5c07d232cadf76644ef62f91a0f62136fc747f6e0fce781a4562944f6f9361",
+  "contract_sha256": "5bb7246fa1faf7f40cfcfd8e56555ee2f053aae0eb661bdd94b594941bf8f4e5",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1893,7 +1893,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Keep authoritative implementation direct; rank agents only for review.",
+      "description": "Keep all authoritative work direct; rank agents only as advisory reviewers.",
       "effects": [],
       "id": "grabowski_coding_agent_route",
       "purpose": "Keep every authoritative implementation on grabowski-primary and rank external routes only for independent review.",

@@ -68,7 +68,8 @@ Danach wird nach Aufgabenklasse geroutet.
    - Der Operator bleibt fuer Livezustand, Scope, Planung, Aenderung, Receipts, Tests und jede Wirkung verantwortlich.
 
 5. **Externe Review- und Kontrastagenten**
-   - Externe Modelle besitzen keine autoritative Writer-Rolle und keinen Kapazitaets-Fallback.
+   - Externe Modelle sind standardmaessig aus und besitzen keine autoritative Writer-Rolle und keinen Kapazitaets-Fallback.
+   - Auch bei expliziter Aktivierung erhalten sie keine Kopien dieses ChatGPT-Kontexts, sondern nur einen begrenzten, zweckgebundenen Review- oder Kontrastauftrag.
    - Zulassige Rollen sind unabhaengiger Review sowie ausdruecklich angeforderte isolierte Kontrast- oder Wettbewerbsprogrammierung.
    - Auswahlprioritaet innerhalb dieser beratenden Rollen: **Claude -> Codex -> agy -> Cline**.
    - Ergebnisse bleiben advisory-only: keine automatische Patchuebernahme, kein Commit, kein Push, kein Merge und kein Deploy.
