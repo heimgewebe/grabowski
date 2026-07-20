@@ -1373,5 +1373,196 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertEqual(result["context_ref"]["resolved_evidence_status"], "degraded")
 
 
+    def _composer_fixture(self) -> tuple[str, str]:
+        _manifest, base = self._write_bundle_and_repo()
+        repo = self.home / "repos" / "demo-repo"
+        (repo / "src").mkdir()
+        (repo / "tests").mkdir()
+        (repo / "src" / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+        (repo / "tests" / "test_app.py").write_text("def test_run():\n    assert True\n", encoding="utf-8")
+        subprocess.run(["git", "add", "src/app.py", "tests/test_app.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "change app"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+        return base, target
+
+    @staticmethod
+    def _composer_context_pack() -> dict:
+        return {
+            "kind": "grabowski.repoground_context_pack",
+            "schema_version": 1,
+            "available": True,
+            "preflight": {
+                "available": True,
+                "status": "pass",
+                "required_reading": {
+                    "required": ["canonical_md", "bundle_manifest"],
+                    "recommended": ["agent_entry_manifest"],
+                    "missing_required": [],
+                    "missing_recommended": ["pr_delta_cards_jsonl"],
+                },
+            },
+            "bounded_evidence": {
+                "citation_ids": ["cit_0123456789abcdef"],
+                "snippets": [
+                    {
+                        "path": "src/app.py",
+                        "text_excerpt": "x" * 700,
+                        "citation_id": "cit_0123456789abcdef",
+                    }
+                ],
+                "ranges": [
+                    {"file_path": "src/app.py", "start_line": 1, "end_line": 2}
+                ],
+            },
+            "snippets": [
+                {
+                    "path": "src/app.py",
+                    "text_excerpt": "x" * 700,
+                    "citation_id": "cit_0123456789abcdef",
+                }
+            ],
+            "ranges": [
+                {"file_path": "src/app.py", "start_line": 1, "end_line": 2}
+            ],
+            "does_not_establish": ["claims_true"],
+        }
+
+    @staticmethod
+    def _composer_impact() -> dict:
+        return {
+            "status": "available",
+            "relations": [
+                {
+                    "direction": "incoming",
+                    "peer": {"path": "tests/test_app.py"},
+                    "edge_type": "import",
+                    "evidence_level": "S1",
+                }
+            ],
+            "supporting_context": [
+                {
+                    "path": "config/app.json",
+                    "path_class": "config",
+                    "evidence_type": "graph_edge",
+                }
+            ],
+            "related_tests": [
+                {"path": "tests/test_app.py", "evidence_type": "graph_edge"}
+            ],
+            "entrypoints": [{"path": "src/app.py"}],
+            "edit_context": {
+                "recommended_first_reads": [
+                    {"path": "src/app.py", "reason": "changed_path"}
+                ]
+            },
+            "gaps": [],
+            "source_statuses": [
+                {"source": "python_symbol_index_json", "status": "available"}
+            ],
+            "does_not_establish": ["test_sufficiency", "runtime_behavior"],
+        }
+
+    def test_context_compose_is_deterministic_diff_bound_and_budgeted(self) -> None:
+        base, target = self._composer_fixture()
+        with (
+            patch.object(mcp, "repoground_context_pack", return_value=self._composer_context_pack()),
+            patch.object(mcp, "_repoground_agent_impact_context", return_value=self._composer_impact()),
+        ):
+            unbound = mcp.repoground_context_compose(
+                "demo-repo",
+                base,
+                target,
+                task_profile="change_impact",
+                context_budget_bytes=1200,
+            )
+            expected_diff = unbound["change_identity"]["diff_sha256"]
+            first = mcp.repoground_context_compose(
+                "demo-repo",
+                base,
+                target,
+                task_profile="change_impact",
+                context_budget_bytes=1200,
+                expected_diff_sha256=expected_diff,
+            )
+            second = mcp.repoground_context_compose(
+                "demo-repo",
+                base,
+                target,
+                task_profile="change_impact",
+                context_budget_bytes=1200,
+                expected_diff_sha256=expected_diff,
+            )
+
+        self.assertEqual(first, second)
+        self.assertTrue(first["available"])
+        self.assertEqual(first["change_identity"]["base_commit"], base)
+        self.assertEqual(first["change_identity"]["target_commit"], target)
+        self.assertTrue(first["change_identity"]["diff_binding_verified"])
+        self.assertLessEqual(
+            first["context_budget"]["used_bytes"],
+            first["context_budget"]["effective_limit_bytes"],
+        )
+        self.assertLessEqual(
+            first["context_budget"]["effective_limit_bytes"], 1200
+        )
+        self.assertTrue(first["compactness"]["smaller_than_general_context_pack"])
+        self.assertIn("direct_changes", first["context"])
+        self.assertIn("related_tests", first["context"])
+        self.assertIn("authority_ordered_rules", first["context"])
+        self.assertIn("gate_evidence", first["context"])
+        self.assertEqual(
+            first["context"]["authority_ordered_rules"][0]["authority"],
+            "required_reading_protocol",
+        )
+        self.assertIn("agent_impact", first["retrieval_lanes"]["used"])
+        self.assertIn("query_context", first["retrieval_lanes"]["used"])
+        self.assertFalse(first["dirty_overlay"]["included_in_revision_diff"])
+        self.assertNotIn("raw_diff", first)
+        self.assertIn("patch_correctness", first["does_not_establish"])
+        self.assertIn("merge_readiness", first["does_not_establish"])
+
+    def test_context_compose_blocks_mismatched_diff_binding(self) -> None:
+        base, target = self._composer_fixture()
+        result = mcp.repoground_context_compose(
+            "demo-repo",
+            base,
+            target,
+            context_budget_bytes=1200,
+            expected_diff_sha256="0" * 64,
+        )
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "diff_sha256_mismatch")
+        self.assertIn("diff_sha256_mismatch", result["stop_criteria"]["triggered"])
+        self.assertEqual(result["retrieval_lanes"]["used"], ["direct_changes"])
+
+    def test_context_compose_keeps_dirty_overlay_separate_from_revision_diff(self) -> None:
+        base, target = self._composer_fixture()
+        repo = self.home / "repos" / "demo-repo"
+        (repo / "src" / "app.py").write_text("dirty overlay\n", encoding="utf-8")
+        with (
+            patch.object(mcp, "repoground_context_pack", return_value=self._composer_context_pack()),
+            patch.object(mcp, "_repoground_agent_impact_context", return_value=self._composer_impact()),
+        ):
+            result = mcp.repoground_context_compose(
+                "demo-repo", base, target, context_budget_bytes=1200
+            )
+
+        self.assertTrue(result["dirty_overlay"]["dirty"])
+        self.assertFalse(result["dirty_overlay"]["included_in_revision_diff"])
+        self.assertEqual(result["change_identity"]["changed_path_count"], 2)
+        paths = [item["path"] for item in result["context"]["direct_changes"]]
+        self.assertEqual(paths, ["src/app.py", "tests/test_app.py"])
+
+
 if __name__ == "__main__":
     unittest.main()

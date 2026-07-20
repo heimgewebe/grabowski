@@ -205,6 +205,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "repoground_context_compose": {
+        "category": "knowledge",
+        "purpose": "Compose deterministic diff-bound RepoGround change context under a hard context budget.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "repoground_find_symbol": {
         "category": "knowledge",
         "purpose": "Find bounded Python symbol definitions in an existing RepoGround bundle.",

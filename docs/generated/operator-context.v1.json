@@ -341,6 +341,17 @@
     },
     {
       "category": "knowledge",
+      "description": "Compose deterministic, diff-bound RepoGround change context under a hard payload budget.",
+      "effects": [],
+      "id": "repoground_context_compose",
+      "purpose": "Compose deterministic diff-bound RepoGround change context under a hard context budget.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_context_compose"
+    },
+    {
+      "category": "knowledge",
       "description": "Find bounded Python symbol definitions in an existing RepoGround bundle.",
       "effects": [],
       "id": "repoground_find_symbol",
@@ -2114,6 +2125,7 @@
       "repoground_query_existing_index",
       "repoground_range_get",
       "repoground_context_pack",
+      "repoground_context_compose",
       "repoground_find_symbol",
       "repoground_get_callers",
       "repoground_get_callees",
@@ -2469,7 +2481,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "6f0e402bdf3c3f017e82be36d5f91d98f635e15cef45c9b1aeeeb7c2349179c0"
+      "sha256": "dd5e77f1c836de87af896fcef0a24eaba15d03fb86346bdf322ea0ba632039e4"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2477,7 +2489,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "6b8559033d08c16a296f4842439e49a8c6ded2f7753039f6f82da48a35706c1b"
+      "sha256": "4ca920fde323408f931da8e870cd9568f28c5b3bf0e1cd91479d8c85b3a5b4c1"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2494,7 +2506,7 @@
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_intake.py": "1a130619c17e4a4b7b06134cd71dac98b738dac1b5299ce082737b251a20891f",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "6f0e402bdf3c3f017e82be36d5f91d98f635e15cef45c9b1aeeeb7c2349179c0",
+      "src/grabowski_capabilities.py": "dd5e77f1c836de87af896fcef0a24eaba15d03fb86346bdf322ea0ba632039e4",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "e44d25d955ab35efbfe3ec381f84395f070d37fcd8726a0488269a47137ade8f",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
@@ -2510,7 +2522,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "5e0d262dc7ae89e8a006e58a762789f22cb69e331f2a2462031d7aed25c004ac",
+      "src/grabowski_mcp.py": "4b2277cf51eec46cb0dfaae9878936f4640813f208c2b16cadfe604adab21af9",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
