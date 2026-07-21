@@ -73,3 +73,13 @@ It does not establish:
 - correctness of individual tool behavior.
 
 A future platform-attested connector identity can strengthen this boundary without changing the receipt's server-side count, hash, release, and instruction bindings.
+
+## Automatic renewal
+
+The tunnel semantic watchdog runs every 30 seconds. When the tunnel is healthy, it asks the release-bound `grabowski_client_snapshot` module to decide whether renewal is due. Renewal is triggered when the local tunnel process lifetime changes, the bound runtime release changes, the snapshot is missing or invalid, or the receipt enters a 15-minute pre-expiry window.
+
+Renewal does not copy server contract values into a fresh receipt. A real loopback MCP client session performs `tools/list`, computes the canonical tool-name hash from the returned names, reads `grabowski_status` through the same MCP session, and submits that client-observed declaration through the existing `connector-snapshot-bind` grip. The grip performs the independent server-side comparison and persists only its receipt. A mismatch remains fail-closed.
+
+A fresh externally supplied connector snapshot is preserved until it needs renewal because it may represent stronger evidence than the local observer. A separate private scheduling marker remembers the last observed local tunnel process lifetime, so a later tunnel restart still triggers renewal without immediately replacing stronger external evidence. The automatic observer identifies its own evidence as `grabowski-tunnel-watchdog-observer-v1` and binds its session identifier to the concrete `tunnel-client` process lifetime (PID plus process start ticks, hashed into a bounded identifier).
+
+The automatic observer still does not establish platform-enforced ChatGPT connector identity, an individual remote conversation/session identity, or that the remote platform exposed every locally observed tool. Those non-claims remain part of `client-declared-server-compared-v1`; automatic renewal removes stale local evidence without upgrading it into stronger evidence than the system can actually observe.
