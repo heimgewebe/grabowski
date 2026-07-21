@@ -85,3 +85,11 @@ Die Aggregation bildet zusätzliche Safety-Fälle explizit ab:
 - unbekannte Prozess- oder systemd-nahe Beobachtungen bleiben fail-closed.
 
 Der normalisierte Snapshot erhält einen eigenen `evidence_sha256`. Er ist read-only und begründet weder einen Effekt noch eine Aussage darüber, dass die Quellzustände nach der Beobachtung unverändert geblieben sind. Die spätere Effektplanung muss den Snapshot deshalb erneut gegen aktuelle Quellen und exakte Leases binden.
+
+## Typisierte Archiv-Leseoberflächen
+
+`grabowski_task_archive_list` stellt einen bounded, paginierten Katalog der unveränderlichen Task-Archivsegmente bereit. Der Katalog akzeptiert ausschließlich kanonische `segment-<sha-prefix>`-Verzeichnisse, blockiert Symlinks und unerwartete Root-Einträge und verifiziert für den gesamten bounded Katalog die Manifest-Selbsthashes, Segmentidentitäten und Record-Hashsequenz-Metadaten. Der Cursor bindet die verifizierten Manifestidentitäten des gesamten Katalogs; Änderungen am Katalog invalidieren bestehende Cursor. Die Katalogoberfläche kennzeichnet ausdrücklich, dass die eigentlichen `records.jsonl`-Payloads zu diesem Zeitpunkt noch nicht vollständig verifiziert wurden.
+
+`grabowski_task_archive_read` liest genau ein kanonisch identifiziertes Segment. Vor Ausgabe eines Records wird das komplette Segment innerhalb einer serverseitigen Byte-Obergrenze mit `verify_task_archive_segment` geprüft. Erst danach werden die Records paginiert ausgegeben. Der Cursor ist an Segment-ID, View und Manifest-SHA gebunden.
+
+Beide Oberflächen sind reine Read-Tools mit `file_read`-Capability. Sie nehmen keinen frei wählbaren Dateipfad entgegen, ändern weder Archive noch Taskstore und begründen insbesondere keine Löschautorität oder aktuelle Projektionsmitgliedschaft. Physisches Pruning historischer Evidenz bleibt weiterhin außerhalb von T071.

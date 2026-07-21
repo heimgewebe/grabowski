@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "2ada01660eb35bd2cf8d607ff6aa88798d85161490467a1eca121804b77b7a82"
+    "sha256": "d3c6d40516eebc0f04b7e55de5e5f887c3cbff8436d6f5c3548b12a7689f9e8e"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "baecd6d99e394130d9c7c943f4919c88f5c245e18001912250000ff85b536eaa"
+    "sha256": "50853d546630b29c2ee0cd344d0ecdbe614832986f0587842b9bc5eebb9c0ff3"
   },
   "counts": {
     "core": 22,
-    "full": 155,
-    "operator": 140
+    "full": 157,
+    "operator": 142
   },
   "profiles": {
     "core": [
@@ -192,7 +192,9 @@
       "grabowski_agent_competition_status",
       "grabowski_agent_competition_compare",
       "grabowski_agent_bootstrap",
-      "grabowski_call_shape_check"
+      "grabowski_call_shape_check",
+      "grabowski_task_archive_list",
+      "grabowski_task_archive_read"
     ],
     "operator": [
       "grabowski_status",
@@ -334,7 +336,9 @@
       "grabowski_agent_competition_status",
       "grabowski_agent_competition_compare",
       "grabowski_agent_bootstrap",
-      "grabowski_call_shape_check"
+      "grabowski_call_shape_check",
+      "grabowski_task_archive_list",
+      "grabowski_task_archive_read"
     ]
   },
   "registration": {

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -410,25 +411,136 @@ def write_task_archive_segment(
     return {**verified, "idempotent_replay": False}
 
 
-def verify_task_archive_segment(segment_dir: Path) -> dict[str, Any]:
+def _read_regular_bytes(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+) -> bytes:
+    if max_bytes is not None and (
+        isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0
+    ):
+        raise ValueError("max_bytes must be a non-negative integer or None")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise LifecycleArchiveIntegrityError(
+            f"archive file is missing or unsafe: {path.name}"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise LifecycleArchiveIntegrityError(
+                f"archive file is missing or unsafe: {path.name}"
+            )
+        if max_bytes is not None and metadata.st_size > max_bytes:
+            raise LifecycleArchiveIntegrityError(
+                f"archive file exceeds server-owned read bound: {path.name}"
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            payload = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
+        if max_bytes is not None and len(payload) > max_bytes:
+            raise LifecycleArchiveIntegrityError(
+                f"archive file exceeds server-owned read bound: {path.name}"
+            )
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _validate_task_archive_manifest(
+    segment_dir: Path,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_manifest_sha256 = manifest.get("manifest_sha256")
+    if (
+        not isinstance(expected_manifest_sha256, str)
+        or SHA256.fullmatch(expected_manifest_sha256) is None
+    ):
+        raise LifecycleArchiveIntegrityError("archive manifest digest is missing or invalid")
+    body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    if sha256_json(body) != expected_manifest_sha256:
+        raise LifecycleArchiveIntegrityError("archive manifest digest mismatch")
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise LifecycleArchiveIntegrityError("unsupported archive manifest schema")
+    if manifest.get("kind") != "grabowski_task_archive_segment":
+        raise LifecycleArchiveIntegrityError("archive manifest kind mismatch")
+    if manifest.get("segment_id") != segment_dir.name:
+        raise LifecycleArchiveIntegrityError("archive segment identity mismatch")
+
+    for key in (
+        "source_store_sha256",
+        "plan_sha256",
+        "segment_sha256",
+        "segment_identity_sha256",
+    ):
+        value = manifest.get(key)
+        if not isinstance(value, str) or SHA256.fullmatch(value) is None:
+            raise LifecycleArchiveIntegrityError(f"archive manifest {key} is invalid")
+    identity_body = {
+        "source_store_sha256": manifest["source_store_sha256"],
+        "source_schema_version": manifest.get("source_schema_version"),
+        "plan_sha256": manifest["plan_sha256"],
+        "segment_sha256": manifest["segment_sha256"],
+    }
+    if sha256_json(identity_body) != manifest["segment_identity_sha256"]:
+        raise LifecycleArchiveIntegrityError("archive segment identity digest mismatch")
+    if segment_dir.name != f"segment-{manifest['segment_identity_sha256'][:24]}":
+        raise LifecycleArchiveIntegrityError("archive segment directory name mismatch")
+
+    record_count = manifest.get("record_count")
+    record_sha256s = manifest.get("record_sha256s")
+    if isinstance(record_count, bool) or not isinstance(record_count, int) or record_count < 1:
+        raise LifecycleArchiveIntegrityError("archive record count is invalid")
+    if not isinstance(record_sha256s, list) or len(record_sha256s) != record_count:
+        raise LifecycleArchiveIntegrityError("archive record hash sequence is invalid")
+    if any(
+        not isinstance(value, str) or SHA256.fullmatch(value) is None
+        for value in record_sha256s
+    ):
+        raise LifecycleArchiveIntegrityError(
+            "archive record hash sequence contains invalid digest"
+        )
+    if manifest.get("first_record_sha256") != record_sha256s[0]:
+        raise LifecycleArchiveIntegrityError("archive first record digest mismatch")
+    if manifest.get("last_record_sha256") != record_sha256s[-1]:
+        raise LifecycleArchiveIntegrityError("archive last record digest mismatch")
+
+    return {
+        "manifest_sha256": expected_manifest_sha256,
+        "record_hash_sequence_sha256": sha256_json(record_sha256s),
+    }
+
+
+def verify_task_archive_segment(
+    segment_dir: Path,
+    *,
+    max_manifest_bytes: int | None = None,
+    max_records_bytes: int | None = None,
+) -> dict[str, Any]:
     if segment_dir.is_symlink() or not segment_dir.is_dir():
         raise LifecycleArchiveIntegrityError("archive segment must be a regular directory")
     manifest_path = segment_dir / "manifest.json"
     records_path = segment_dir / "records.jsonl"
-    for path in (manifest_path, records_path):
-        if path.is_symlink() or not path.is_file():
-            raise LifecycleArchiveIntegrityError(f"archive file is missing or unsafe: {path.name}")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        manifest_payload = _read_regular_bytes(
+            manifest_path,
+            max_bytes=max_manifest_bytes,
+        )
+        manifest = json.loads(manifest_payload.decode("utf-8"))
+    except LifecycleArchiveIntegrityError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise LifecycleArchiveIntegrityError("archive manifest is invalid") from exc
-    expected_manifest_sha256 = manifest.get("manifest_sha256")
-    if not isinstance(expected_manifest_sha256, str):
-        raise LifecycleArchiveIntegrityError("archive manifest digest is missing")
-    body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
-    if sha256_json(body) != expected_manifest_sha256:
-        raise LifecycleArchiveIntegrityError("archive manifest digest mismatch")
-    payload = records_path.read_bytes()
+    if not isinstance(manifest, dict):
+        raise LifecycleArchiveIntegrityError("archive manifest must be an object")
+    manifest_evidence = _validate_task_archive_manifest(segment_dir, manifest)
+    payload = _read_regular_bytes(
+        records_path,
+        max_bytes=max_records_bytes,
+    )
     if hashlib.sha256(payload).hexdigest() != manifest.get("segment_sha256"):
         raise LifecycleArchiveIntegrityError("archive segment digest mismatch")
     raw_lines = payload.splitlines()
@@ -462,4 +574,8 @@ def verify_task_archive_segment(segment_dir: Path) -> dict[str, Any]:
         "segment_dir": str(segment_dir),
         "manifest": manifest,
         "records": records,
+        "records_bytes": len(payload),
+        "record_hash_sequence_sha256": manifest_evidence[
+            "record_hash_sequence_sha256"
+        ],
     }
