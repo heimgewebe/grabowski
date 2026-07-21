@@ -61,6 +61,35 @@ class LifecycleEffectPlanTests(unittest.TestCase):
     def valid_leases(self):
         return [self.lease(key) for key in RESOURCE_KEYS]
 
+    def ready_revalidation(self, plan=None, classification=None):
+        current = classification or self.classification()
+        value = plan or self.build_plan([current])
+        return effect_plan.revalidate_effect_plan(
+            value,
+            {current["identity"]: current},
+            self.valid_leases(),
+            now_unix=1500,
+        )
+
+    def build_receipt(self, plan=None, revalidation=None, **overrides):
+        value = plan or self.build_plan()
+        current_revalidation = revalidation or self.ready_revalidation(plan=value)
+        arguments = {
+            "execution_id": "exec-task-a-001",
+            "started_at_unix": 1501,
+            "completed_at_unix": 1502,
+            "transport_outcome": "confirmed_success",
+            "mutation_state": "performed",
+            "post_state_status": "verified",
+            "post_state_sha256s": {"task_store": "b" * 64},
+        }
+        arguments.update(overrides)
+        return effect_plan.build_effect_execution_receipt(
+            value,
+            current_revalidation,
+            **arguments,
+        )
+
     def test_build_plan_binds_evidence_sources_and_resources(self) -> None:
         classification = self.classification()
         plan = self.build_plan([classification])
@@ -280,6 +309,215 @@ class LifecycleEffectPlanTests(unittest.TestCase):
         self.assertFalse(result["ready_for_effect"])
         self.assertIn(
             f"duplicate_lease_observation:{RESOURCE_KEYS[0]}", result["errors"]
+        )
+
+    def test_effect_receipt_binds_plan_revalidation_sources_leases_and_post_state(self) -> None:
+        plan = self.build_plan()
+        revalidation = self.ready_revalidation(plan=plan)
+        receipt = self.build_receipt(plan=plan, revalidation=revalidation)
+        self.assertEqual(receipt["effect_kind"], plan["effect_kind"])
+        self.assertEqual(receipt["plan_sha256"], plan["plan_sha256"])
+        self.assertEqual(
+            receipt["revalidation_sha256"],
+            revalidation["revalidation_sha256"],
+        )
+        self.assertEqual(
+            receipt["source_bindings_sha256"],
+            effect_plan._source_bindings_sha256(plan),
+        )
+        self.assertEqual(
+            receipt["lease_bindings_sha256"],
+            effect_plan.sha256_json(revalidation["lease_bindings"]),
+        )
+        self.assertEqual(receipt["post_state_status"], "verified")
+        self.assertEqual(receipt["status"], "succeeded")
+        self.assertFalse(receipt["blind_retry_allowed"])
+
+    def test_effect_receipt_rejects_not_ready_revalidation(self) -> None:
+        classification = self.classification()
+        plan = self.build_plan([classification])
+        revalidation = effect_plan.revalidate_effect_plan(
+            plan,
+            {"task-a": classification},
+            [self.lease(RESOURCE_KEYS[0])],
+            now_unix=1500,
+        )
+        self.assertFalse(revalidation["ready_for_effect"])
+        with self.assertRaises(effect_plan.LifecycleEffectPlanError):
+            self.build_receipt(plan=plan, revalidation=revalidation)
+
+    def test_unknown_transport_forces_recovery_and_forbids_blind_retry(self) -> None:
+        receipt = self.build_receipt(
+            transport_outcome="unknown",
+            mutation_state="unknown",
+            post_state_status="unavailable",
+            post_state_sha256s=None,
+            recovery_refs=["recovery:effect:exec-task-a-001"],
+        )
+        self.assertEqual(receipt["status"], "recovery_required")
+        self.assertFalse(receipt["blind_retry_allowed"])
+        self.assertEqual(receipt["post_state_sha256s"], {})
+
+    def test_confirmed_failure_after_mutation_requires_recovery(self) -> None:
+        receipt = self.build_receipt(
+            transport_outcome="confirmed_failure",
+            mutation_state="performed",
+            recovery_refs=["recovery:effect:exec-task-a-001"],
+        )
+        self.assertEqual(receipt["status"], "recovery_required")
+
+    def test_recovery_required_receipt_requires_recovery_reference(self) -> None:
+        with self.assertRaises(ValueError):
+            self.build_receipt(
+                transport_outcome="unknown",
+                mutation_state="unknown",
+                post_state_status="unavailable",
+                post_state_sha256s=None,
+            )
+
+    def test_confirmed_failure_without_mutation_is_failed(self) -> None:
+        receipt = self.build_receipt(
+            transport_outcome="confirmed_failure",
+            mutation_state="not_performed",
+        )
+        self.assertEqual(receipt["status"], "failed")
+
+    def test_confirmed_outcome_requires_verified_post_state(self) -> None:
+        with self.assertRaises(ValueError):
+            self.build_receipt(
+                post_state_status="unavailable",
+                post_state_sha256s=None,
+            )
+
+    def test_effect_receipt_write_verify_and_idempotent_replay(self) -> None:
+        plan = self.build_plan()
+        revalidation = self.ready_revalidation(plan=plan)
+        receipt = self.build_receipt(plan=plan, revalidation=revalidation)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "effect-receipts"
+            first = effect_plan.write_effect_execution_receipt(
+                receipt, receipt_root=root, plan=plan, revalidation=revalidation
+            )
+            self.assertFalse(first["idempotent_replay"])
+            second = effect_plan.write_effect_execution_receipt(
+                receipt, receipt_root=root, plan=plan, revalidation=revalidation
+            )
+            self.assertTrue(second["idempotent_replay"])
+            self.assertEqual(first["receipt"], second["receipt"])
+
+    def test_effect_receipt_execution_identity_conflict_fails_closed(self) -> None:
+        plan = self.build_plan()
+        revalidation = self.ready_revalidation(plan=plan)
+        first_receipt = self.build_receipt(plan=plan, revalidation=revalidation)
+        second_receipt = self.build_receipt(
+            plan=plan, revalidation=revalidation, completed_at_unix=1503
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "effect-receipts"
+            effect_plan.write_effect_execution_receipt(
+                first_receipt, receipt_root=root, plan=plan, revalidation=revalidation
+            )
+            with self.assertRaises(effect_plan.LifecycleEffectPlanIntegrityError):
+                effect_plan.write_effect_execution_receipt(
+                    second_receipt,
+                    receipt_root=root,
+                    plan=plan,
+                    revalidation=revalidation,
+                )
+
+    def test_tampered_effect_receipt_fails_verification(self) -> None:
+        plan = self.build_plan()
+        revalidation = self.ready_revalidation(plan=plan)
+        receipt = self.build_receipt(plan=plan, revalidation=revalidation)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "effect-receipts"
+            result = effect_plan.write_effect_execution_receipt(
+                receipt, receipt_root=root, plan=plan, revalidation=revalidation
+            )
+            path = Path(result["receipt_path"])
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["status"] = "failed"
+            path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            with self.assertRaises(effect_plan.LifecycleEffectPlanIntegrityError):
+                effect_plan.verify_effect_execution_receipt(
+                    path, plan=plan, revalidation=revalidation
+                )
+
+    def test_effect_receipt_symlink_fails_closed(self) -> None:
+        plan = self.build_plan()
+        revalidation = self.ready_revalidation(plan=plan)
+        receipt = self.build_receipt(plan=plan, revalidation=revalidation)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "effect-receipts"
+            result = effect_plan.write_effect_execution_receipt(
+                receipt, receipt_root=root, plan=plan, revalidation=revalidation
+            )
+            path = Path(result["receipt_path"])
+            outside = Path(directory) / "outside-receipt.json"
+            outside.write_bytes(path.read_bytes())
+            path.unlink()
+            path.symlink_to(outside)
+            with self.assertRaises(effect_plan.LifecycleEffectPlanIntegrityError):
+                effect_plan.verify_effect_execution_receipt(
+                    path, plan=plan, revalidation=revalidation
+                )
+
+    def test_effect_receipt_writer_rejects_different_plan_binding(self) -> None:
+        first_plan = self.build_plan()
+        first_revalidation = self.ready_revalidation(plan=first_plan)
+        receipt = self.build_receipt(
+            plan=first_plan, revalidation=first_revalidation
+        )
+        bindings = dict(SOURCE_SHA256S)
+        bindings["process"] = "f" * 64
+        classification = self.classification(source_sha256s=bindings)
+        second_plan = self.build_plan([classification])
+        second_revalidation = self.ready_revalidation(
+            plan=second_plan, classification=classification
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(effect_plan.LifecycleEffectPlanIntegrityError):
+                effect_plan.write_effect_execution_receipt(
+                    receipt,
+                    receipt_root=Path(directory) / "effect-receipts",
+                    plan=second_plan,
+                    revalidation=second_revalidation,
+                )
+
+    def test_ready_revalidation_cannot_forge_source_binding(self) -> None:
+        plan = self.build_plan()
+        revalidation = self.ready_revalidation(plan=plan)
+        forged = dict(revalidation)
+        forged_bindings = [dict(item) for item in revalidation["current_bindings"]]
+        forged_bindings[0]["evidence_sha256"] = "f" * 64
+        forged["current_bindings"] = forged_bindings
+        body = {
+            key: value
+            for key, value in forged.items()
+            if key != "revalidation_sha256"
+        }
+        forged["revalidation_sha256"] = effect_plan.sha256_json(body)
+        with self.assertRaises(effect_plan.LifecycleEffectPlanIntegrityError):
+            self.build_receipt(plan=plan, revalidation=forged)
+
+    def test_effect_receipt_source_binding_changes_with_plan_sources(self) -> None:
+        first = self.build_receipt()
+        bindings = dict(SOURCE_SHA256S)
+        bindings["process"] = "f" * 64
+        classification = self.classification(source_sha256s=bindings)
+        plan = self.build_plan([classification])
+        revalidation = self.ready_revalidation(
+            plan=plan,
+            classification=classification,
+        )
+        second = self.build_receipt(
+            plan=plan,
+            revalidation=revalidation,
+            execution_id="exec-task-a-002",
+        )
+        self.assertNotEqual(
+            first["source_bindings_sha256"],
+            second["source_bindings_sha256"],
         )
 
     def test_plan_and_revalidation_never_claim_effect_or_deletion(self) -> None:

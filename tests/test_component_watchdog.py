@@ -220,6 +220,135 @@ class McpLifecycleProbeTests(unittest.TestCase):
                 watchdog.mcp_stdio_probe_from_runtime(root, "../bad", 1)
 
 
+class ControlPlanePollProbeTests(unittest.TestCase):
+    def test_recent_control_plane_poll_is_healthy(self) -> None:
+        metrics = (
+            "# TYPE commands_poll_last_successful_timestamp_seconds gauge\n"
+            "commands_poll_last_successful_timestamp_seconds{otel_scope_name=\"controlplane\"} 1000\n"
+        )
+        with patch.object(watchdog, "get_bounded_text", return_value=metrics):
+            self.assertIsNone(
+                watchdog.control_plane_poll_probe(
+                    watchdog.DEFAULT_METRICS_URL, 2, 90, now=1050
+                )
+            )
+
+    def test_stale_missing_and_unavailable_control_plane_poll_fail(self) -> None:
+        stale = "commands_poll_last_successful_timestamp_seconds 1000\n"
+        with patch.object(watchdog, "get_bounded_text", return_value=stale):
+            self.assertEqual(
+                "control-plane-poll-stale",
+                watchdog.control_plane_poll_probe(
+                    watchdog.DEFAULT_METRICS_URL, 2, 90, now=1091
+                ),
+            )
+        with patch.object(watchdog, "get_bounded_text", return_value="# no sample\n"):
+            self.assertEqual(
+                "control-plane-poll-missing",
+                watchdog.control_plane_poll_probe(
+                    watchdog.DEFAULT_METRICS_URL, 2, 90, now=1091
+                ),
+            )
+        with patch.object(watchdog, "get_bounded_text", return_value=None):
+            self.assertEqual(
+                "control-plane-metrics-unavailable",
+                watchdog.control_plane_poll_probe(
+                    watchdog.DEFAULT_METRICS_URL, 2, 90, now=1091
+                ),
+            )
+
+    def test_metric_parser_ignores_nonfinite_and_other_series(self) -> None:
+        metrics = (
+            "other_metric 4\n"
+            "commands_poll_last_successful_timestamp_seconds NaN\n"
+            "commands_poll_last_successful_timestamp_seconds{scope=\"a\"} 42.5 123\n"
+        )
+        self.assertEqual(
+            (42.5,),
+            watchdog.prometheus_metric_samples(
+                metrics, watchdog.CONTROL_PLANE_POLL_METRIC
+            ),
+        )
+
+    def test_missing_poll_evidence_is_indeterminate_not_restartable(self) -> None:
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                return_value={
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": "321",
+                },
+            ),
+            patch.object(watchdog, "process_start_ticks", return_value=77),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "tunnel_identity_ok", return_value=True),
+            patch.object(watchdog, "get_probe", return_value=True),
+            patch.object(
+                watchdog,
+                "control_plane_poll_probe",
+                return_value="control-plane-metrics-unavailable",
+            ),
+        ):
+            result = watchdog.probe_component(
+                component="tunnel",
+                service="tunnel-client-grabowski.service",
+                runtime_root=Path("/runtime"),
+                module="grabowski_operator",
+                profile="grabowski",
+                host="127.0.0.1",
+                port=18181,
+                health_url=watchdog.DEFAULT_HEALTH_URL,
+                ready_url=watchdog.DEFAULT_READY_URL,
+                startup_grace=20,
+                http_timeout=2,
+            )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(
+            ("control-plane-metrics-unavailable",), result.reasons
+        )
+
+    def test_stale_poll_is_indeterminate_not_restartable(self) -> None:
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                return_value={
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": "321",
+                },
+            ),
+            patch.object(watchdog, "process_start_ticks", return_value=77),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "tunnel_identity_ok", return_value=True),
+            patch.object(watchdog, "get_probe", return_value=True),
+            patch.object(
+                watchdog,
+                "control_plane_poll_probe",
+                return_value="control-plane-poll-stale",
+            ),
+        ):
+            result = watchdog.probe_component(
+                component="tunnel",
+                service="tunnel-client-grabowski.service",
+                runtime_root=Path("/runtime"),
+                module="grabowski_operator",
+                profile="grabowski",
+                host="127.0.0.1",
+                port=18181,
+                health_url=watchdog.DEFAULT_HEALTH_URL,
+                ready_url=watchdog.DEFAULT_READY_URL,
+                startup_grace=20,
+                http_timeout=2,
+            )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(("control-plane-poll-stale",), result.reasons)
+
+
 class McpHttpLivenessProbeTests(unittest.TestCase):
     def test_live_http_probe_uses_one_session_free_get(self) -> None:
         payload = json.dumps(
