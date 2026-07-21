@@ -1,7 +1,7 @@
-# Productive semantic watchdog: after checking the live operator process and
-# listener identity, the probe starts one bounded stdio MCP subprocess from the
-# exact deployed runtime and calls only grabowski_runtime_health. It never
-# opens a competing session against the stateful live HTTP endpoint.
+# Productive semantic watchdog: verify the live event loop and FastMCP session-
+# creation lock without opening a competing session, plus one isolated stdio
+# lifecycle from the exact deployed runtime. Before recovery restart it extracts
+# one pidfd-bound sealed-memfd stack dump into a generation-bound eight-slot evidence ring.
 [Unit]
 Description=Grabowski operator semantic watchdog
 After=grabowski-operator.service
@@ -10,7 +10,7 @@ ConditionPathExists=%h/.local/libexec/grabowski/component_watchdog.py
 [Service]
 Type=oneshot
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/usr/bin/python3 %h/.local/libexec/grabowski/component_watchdog.py --component operator --service grabowski-operator.service --runtime-root %h/.local/share/grabowski-mcp --module grabowski_operator --host 127.0.0.1 --port 18181 --failure-threshold 3 --max-restarts 3 --restart-window 900 --backoff-base 60 --backoff-max 900
+ExecStart=/usr/bin/python3 %h/.local/libexec/grabowski/component_watchdog.py --component operator --service grabowski-operator.service --runtime-root %h/.local/share/grabowski-mcp --module grabowski_operator --host 127.0.0.1 --port 18181 --failure-threshold 2 --max-restarts 3 --restart-window 900 --backoff-base 60 --backoff-max 900
 # Exit 1 (failure observed / restart deferred) is routine evidence, not a unit
 # failure. Exits 2 (indeterminate), 3 (budget exhausted) and 4 (restart did not
 # recover) keep marking the unit failed.
