@@ -8529,35 +8529,159 @@ def _repoground_json_bytes(value: Any) -> int:
     return len(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
+_REPOGROUND_CONTEXT_LANE_CONFIG: dict[str, dict[str, int]] = {
+    "direct_changes": {"priority": 100, "max_items": 16, "min_items": 1},
+    "related_tests": {"priority": 95, "max_items": 8, "min_items": 1},
+    "gate_evidence": {"priority": 90, "max_items": 6, "min_items": 1},
+    "authority_ordered_rules": {"priority": 85, "max_items": 8, "min_items": 1},
+    "target_symbols": {"priority": 80, "max_items": 8, "min_items": 1},
+    "causal_relations": {"priority": 75, "max_items": 8, "min_items": 1},
+    "recommended_first_reads": {"priority": 70, "max_items": 5, "min_items": 1},
+    "supporting_context": {"priority": 65, "max_items": 5, "min_items": 1},
+    "entrypoints": {"priority": 60, "max_items": 5, "min_items": 0},
+    "live_ranges": {"priority": 55, "max_items": 5, "min_items": 1},
+    "source_ranges": {"priority": 50, "max_items": 5, "min_items": 0},
+    "citations": {"priority": 45, "max_items": 5, "min_items": 0},
+    "entry_manifest": {"priority": 40, "max_items": 1, "min_items": 0},
+    "pr_delta_cards": {"priority": 35, "max_items": 1, "min_items": 0},
+    "gaps": {"priority": 30, "max_items": 8, "min_items": 1},
+    "query_snippets": {"priority": 20, "max_items": 5, "min_items": 0},
+}
+
+
+def _repoground_dict_items(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _repoground_context_lane_policy(
+    lane_values: dict[str, list[Any]],
+) -> tuple[
+    list[tuple[str, list[Any]]],
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+]:
+    configured = set(_REPOGROUND_CONTEXT_LANE_CONFIG)
+    supplied = set(lane_values)
+    if supplied != configured:
+        missing = sorted(configured - supplied)
+        unknown = sorted(supplied - configured)
+        raise RuntimeError(
+            "RepoGround context lane configuration mismatch: "
+            f"missing={missing}, unknown={unknown}"
+        )
+    lane_order = sorted(
+        _REPOGROUND_CONTEXT_LANE_CONFIG,
+        key=lambda name: (-_REPOGROUND_CONTEXT_LANE_CONFIG[name]["priority"], name),
+    )
+    lanes = [(name, lane_values[name]) for name in lane_order]
+    limits = {
+        name: _REPOGROUND_CONTEXT_LANE_CONFIG[name]["max_items"] for name in lane_order
+    }
+    minimums = {
+        name: _REPOGROUND_CONTEXT_LANE_CONFIG[name]["min_items"] for name in lane_order
+    }
+    priorities = {
+        name: _REPOGROUND_CONTEXT_LANE_CONFIG[name]["priority"] for name in lane_order
+    }
+    return lanes, limits, minimums, priorities
+
+
 def _repoground_budget_context(
     lanes: list[tuple[str, list[Any]]],
     limit: int,
     *,
     lane_item_limits: dict[str, int] | None = None,
+    lane_min_items: dict[str, int] | None = None,
 ) -> tuple[dict[str, list[Any]], dict[str, dict[str, int]], int]:
     context: dict[str, list[Any]] = {}
     counts: dict[str, dict[str, int]] = {}
     limits = lane_item_limits or {}
+    minimums = lane_min_items or {}
+    considered_by_lane: dict[str, list[Any]] = {}
     for name, items in lanes:
         item_limit = limits.get(name)
+        minimum = minimums.get(name, 0)
+        if isinstance(item_limit, bool) or (
+            isinstance(item_limit, int) and item_limit < 0
+        ):
+            raise ValueError(
+                f"lane item limit for {name!r} must be a non-negative integer"
+            )
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 0:
+            raise ValueError(
+                f"lane minimum for {name!r} must be a non-negative integer"
+            )
         considered = items[:item_limit] if isinstance(item_limit, int) else items
-        accepted: list[Any] = []
-        for item in considered:
-            candidate = dict(context)
-            candidate[name] = [*accepted, item]
-            if _repoground_json_bytes(candidate) > limit:
-                break
-            accepted.append(item)
-        candidate = dict(context)
-        candidate[name] = accepted
-        if _repoground_json_bytes(candidate) <= limit:
-            context[name] = accepted
+        considered_by_lane[name] = considered
         counts[name] = {
             "available": len(items),
             "considered": len(considered),
-            "included": len(accepted),
+            "included": 0,
+            "policy_omitted": len(items) - len(considered),
+            "budget_omitted": len(considered),
         }
-    return context, counts, _repoground_json_bytes(context)
+
+    used_bytes = _repoground_json_bytes(context)
+
+    def append_if_fits(name: str, item: Any) -> bool:
+        nonlocal used_bytes
+        item_bytes = _repoground_json_bytes(item)
+        if name in context:
+            delta = item_bytes + (1 if context[name] else 0)
+        else:
+            delta = (
+                (1 if context else 0)
+                + _repoground_json_bytes(name)
+                + 3
+                + item_bytes
+            )
+        if used_bytes + delta > limit:
+            return False
+        context.setdefault(name, []).append(item)
+        used_bytes += delta
+        counts[name]["included"] += 1
+        counts[name]["budget_omitted"] -= 1
+        return True
+
+    # Only lanes with an explicit minimum receive guaranteed coverage attempts. This
+    # protects semantic essentials without letting low-priority metadata invert the
+    # priority order merely because it happens to be non-empty.
+    for name, _items in lanes:
+        considered = considered_by_lane[name]
+        minimum = min(minimums.get(name, 0), len(considered))
+        for item in considered[:minimum]:
+            if not append_if_fits(name, item):
+                break
+
+    # Spend the remaining budget in deterministic priority order. Within each lane we
+    # retain prefix semantics: once the next item does not fit, later items are skipped.
+    for name, _items in lanes:
+        considered = considered_by_lane[name]
+        included = counts[name]["included"]
+        for item in considered[included:]:
+            if not append_if_fits(name, item):
+                break
+
+    # Preserve the previous best-effort output shape for empty or excluded lanes, but
+    # only after useful evidence has had a chance to consume the budget.
+    for name, _items in lanes:
+        if name in context:
+            continue
+        delta = (1 if context else 0) + _repoground_json_bytes(name) + 3
+        if used_bytes + delta <= limit:
+            context[name] = []
+            used_bytes += delta
+
+    exact_used_bytes = _repoground_json_bytes(context)
+    if exact_used_bytes != used_bytes:
+        raise RuntimeError(
+            "RepoGround context byte accounting mismatch: "
+            f"incremental={used_bytes}, exact={exact_used_bytes}"
+        )
+    return context, counts, exact_used_bytes
 
 
 @mcp.tool(name="repoground_context_compose", annotations=READ_ANNOTATIONS)
@@ -8662,15 +8786,11 @@ def repoground_context_compose(
         stem=selected_stem,
         query=effective_query,
         k=min(max(len(changed_paths), 1), 10),
-        max_snippets=5,
+        max_snippets=_REPOGROUND_CONTEXT_LANE_CONFIG["query_snippets"]["max_items"],
     )
     baseline_bytes = _repoground_json_bytes(baseline)
     compact_target_bytes = max(1, (baseline_bytes * 2) // 3)
-    effective_limit = min(
-        context_budget_bytes,
-        max(1, baseline_bytes - 1),
-        compact_target_bytes,
-    )
+    effective_limit = min(context_budget_bytes, compact_target_bytes)
     impact = _repoground_agent_impact_context(
         manifest_path,
         changed_paths=changed_paths,
@@ -8683,50 +8803,35 @@ def repoground_context_compose(
     authority_rules = _repoground_authority_rules(preflight)
     gate_evidence = _repoground_gate_evidence(preflight, bundle_status)
     impact_status = str(impact.get("status", "unknown"))
-    source_statuses = [item for item in impact.get("source_statuses", []) if isinstance(item, dict)] if isinstance(impact, dict) else []
+    source_statuses = _repoground_dict_items(impact.get("source_statuses")) if isinstance(impact, dict) else []
     symbol_available = any(item.get("source") == "python_symbol_index_json" and item.get("status") == "available" for item in source_statuses)
     call_graph_available = bool(impact.get("relations")) if isinstance(impact, dict) else False
 
-    lanes = [
-        ("direct_changes", changes),
-        ("related_tests", [item for item in impact.get("related_tests", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
-        ("gate_evidence", gate_evidence),
-        ("authority_ordered_rules", authority_rules),
-        ("entry_manifest", [surfaces["agent_entry_manifest"]] if "agent_entry_manifest" in surfaces else []),
-        ("pr_delta_cards", [surfaces["pr_delta_cards_jsonl"]] if "pr_delta_cards_jsonl" in surfaces else []),
-        ("target_symbols", [item for item in impact.get("target_symbols", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
-        ("causal_relations", [item for item in impact.get("relations", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
-        ("live_ranges", [item for item in evidence.get("ranges", []) if isinstance(item, dict)] if isinstance(evidence.get("ranges"), list) else []),
-        ("citations", [{"citation_id": item} for item in evidence.get("citation_ids", []) if isinstance(item, str)] if isinstance(evidence.get("citation_ids"), list) else []),
-        ("gaps", [item for item in impact.get("gaps", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
-        ("entrypoints", [item for item in impact.get("entrypoints", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
-        ("recommended_first_reads", [item for item in (impact.get("edit_context") or {}).get("recommended_first_reads", []) if isinstance(item, dict)] if isinstance(impact, dict) and isinstance(impact.get("edit_context"), dict) else []),
-        ("supporting_context", [item for item in impact.get("supporting_context", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
-        ("source_ranges", [item for item in impact.get("source_ranges", []) if isinstance(item, dict)] if isinstance(impact, dict) else []),
-        ("query_snippets", [item for item in evidence.get("snippets", []) if isinstance(item, dict)] if isinstance(evidence.get("snippets"), list) else []),
-    ]
-    lane_item_limits = {
-        "direct_changes": 16,
-        "related_tests": 8,
-        "gate_evidence": 6,
-        "authority_ordered_rules": 8,
-        "entry_manifest": 1,
-        "pr_delta_cards": 1,
-        "target_symbols": 8,
-        "causal_relations": 8,
-        "live_ranges": 5,
-        "citations": 5,
-        "gaps": 8,
-        "entrypoints": 5,
-        "recommended_first_reads": 5,
-        "supporting_context": 5,
-        "source_ranges": 5,
-        "query_snippets": 2,
+    edit_context = impact.get("edit_context") if isinstance(impact, dict) and isinstance(impact.get("edit_context"), dict) else {}
+    lane_values: dict[str, list[Any]] = {
+        "direct_changes": changes,
+        "related_tests": _repoground_dict_items(impact.get("related_tests")) if isinstance(impact, dict) else [],
+        "gate_evidence": gate_evidence,
+        "authority_ordered_rules": authority_rules,
+        "entry_manifest": [surfaces["agent_entry_manifest"]] if "agent_entry_manifest" in surfaces else [],
+        "pr_delta_cards": [surfaces["pr_delta_cards_jsonl"]] if "pr_delta_cards_jsonl" in surfaces else [],
+        "target_symbols": _repoground_dict_items(impact.get("target_symbols")) if isinstance(impact, dict) else [],
+        "causal_relations": _repoground_dict_items(impact.get("relations")) if isinstance(impact, dict) else [],
+        "live_ranges": _repoground_dict_items(evidence.get("ranges")),
+        "citations": [{"citation_id": item} for item in evidence.get("citation_ids", []) if isinstance(item, str)] if isinstance(evidence.get("citation_ids"), list) else [],
+        "gaps": _repoground_dict_items(impact.get("gaps")) if isinstance(impact, dict) else [],
+        "entrypoints": _repoground_dict_items(impact.get("entrypoints")) if isinstance(impact, dict) else [],
+        "recommended_first_reads": _repoground_dict_items(edit_context.get("recommended_first_reads")),
+        "supporting_context": _repoground_dict_items(impact.get("supporting_context")) if isinstance(impact, dict) else [],
+        "source_ranges": _repoground_dict_items(impact.get("source_ranges")) if isinstance(impact, dict) else [],
+        "query_snippets": _repoground_dict_items(evidence.get("snippets")),
     }
+    lanes, lane_item_limits, lane_min_items, lane_priorities = _repoground_context_lane_policy(lane_values)
     context, lane_counts, used_bytes = _repoground_budget_context(
         lanes,
         effective_limit,
         lane_item_limits=lane_item_limits,
+        lane_min_items=lane_min_items,
     )
     used = ["direct_changes"]
     if impact_status not in {"skipped", "unavailable", "unknown"}:
@@ -8750,7 +8855,13 @@ def repoground_context_compose(
     triggered: list[str] = []
     if impact_status == "blocked":
         triggered.append("impact_context_blocked")
-    if any(value["included"] < value["considered"] for value in lane_counts.values()):
+    budget_exhausted_lanes = [
+        name for name, value in lane_counts.items() if value["budget_omitted"] > 0
+    ]
+    policy_limited_lanes = [
+        name for name, value in lane_counts.items() if value["policy_omitted"] > 0
+    ]
+    if budget_exhausted_lanes:
         triggered.append("budget_exhausted")
     return {
         "kind": "grabowski.repoground_context_compose",
@@ -8780,8 +8891,14 @@ def repoground_context_compose(
             "ratio": round(used_bytes / baseline_bytes, 6) if baseline_bytes else None,
         },
         "sampling_policy": {
-            "kind": "deterministic_lane_caps_v1",
+            "kind": "deterministic_priority_lane_caps_v2",
+            "allocation_strategy": "minimum_coverage_then_priority_fill_v1",
             "lane_item_limits": lane_item_limits,
+            "lane_min_items": lane_min_items,
+            "lane_order_used": [name for name, _items in lanes],
+            "effective_priorities": lane_priorities,
+            "policy_limited_lanes": policy_limited_lanes,
+            "budget_exhausted_lanes": budget_exhausted_lanes,
             "does_not_establish": ["complete_lane_coverage", "all_relevant_context_used"],
         },
         "context": context,
