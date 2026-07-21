@@ -154,6 +154,21 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             },
         )
 
+    def test_probe_digest_safety_guard_rejects_sensitive_fields(self) -> None:
+        with self.assertRaisesRegex(
+            cli.CodingAgentRouterCliError,
+            r"sensitive field: providers\.claude\.auth\.password",
+        ):
+            cli._assert_probe_digest_safe(
+                {"providers": {"claude": {"auth": {"password": "redacted"}}}}
+            )
+        cli._assert_probe_digest_safe(
+            {
+                "api_key_environment_scrubbed": ["OPENAI_API_KEY"],
+                "context_token_count": 4096,
+            }
+        )
+
     def test_probe_output_declares_no_model_or_paid_invocation(self) -> None:
         catalog, _ = router._load_catalog()
         with (

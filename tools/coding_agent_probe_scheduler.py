@@ -45,6 +45,16 @@ PRIVATE_FILE_MODE = 0o600
 SPECIAL_PERMISSION_BITS = stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
 PROCESS_TERMINATION_GRACE_SECONDS = 2
 PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v2"
+SENSITIVE_PROBE_FIELD_TOKENS = (
+    "password",
+    "passwd",
+    "token",
+    "secret",
+    "credential",
+    "api_key",
+    "apikey",
+)
+ALLOWED_SENSITIVE_METADATA_FIELDS = frozenset({"api_key_environment_scrubbed"})
 FORBIDDEN_API_KEY_ENV = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -81,7 +91,31 @@ def canonical_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def assert_probe_digest_safe(value: Any, *, path: tuple[str, ...] = ()) -> None:
+    if isinstance(value, dict):
+        for raw_key, nested in value.items():
+            key = str(raw_key)
+            normalized = key.casefold().replace("-", "_")
+            if (
+                key not in ALLOWED_SENSITIVE_METADATA_FIELDS
+                and any(
+                    normalized == token or normalized.endswith(token)
+                    for token in SENSITIVE_PROBE_FIELD_TOKENS
+                )
+            ):
+                location = ".".join((*path, key))
+                raise ProbeSchedulerError(
+                    f"probe digest payload contains sensitive field: {location}"
+                )
+            assert_probe_digest_safe(nested, path=(*path, key))
+        return
+    if isinstance(value, list):
+        for index, nested in enumerate(value):
+            assert_probe_digest_safe(nested, path=(*path, str(index)))
+
+
 def probe_digest(value: dict[str, Any]) -> str:
+    assert_probe_digest_safe(value)
     payload = json.dumps(
         value,
         sort_keys=True,

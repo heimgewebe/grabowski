@@ -329,6 +329,21 @@ else:
         self.assertEqual("probe_scheduler_failed_closed", failure["error"])
         self.assertFalse(self.receipt.exists())
 
+    def test_probe_digest_safety_guard_rejects_sensitive_fields(self) -> None:
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError,
+            r"sensitive field: providers\.claude\.auth\.password",
+        ):
+            SCHEDULER.assert_probe_digest_safe(
+                {"providers": {"claude": {"auth": {"password": "redacted"}}}}
+            )
+        SCHEDULER.assert_probe_digest_safe(
+            {
+                "api_key_environment_scrubbed": ["OPENAI_API_KEY"],
+                "context_token_count": 4096,
+            }
+        )
+
     def test_lock_contention_is_a_clean_noop(self) -> None:
         self.write_router()
         descriptor = os.open(self.lock, os.O_RDWR | os.O_CREAT, 0o600)

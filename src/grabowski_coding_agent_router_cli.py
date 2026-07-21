@@ -20,6 +20,23 @@ import grabowski_coding_agent_router as router
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
 COMMAND_TIMEOUT_SECONDS = 20
 PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v2"
+SENSITIVE_PROBE_FIELD_TOKENS = (
+    "password",
+    "passwd",
+    "token",
+    "secret",
+    "credential",
+    "api_key",
+    "apikey",
+)
+ALLOWED_SENSITIVE_METADATA_FIELDS = frozenset({"api_key_environment_scrubbed"})
+CLAUDE_AUTH_METHOD_BY_CODE = {1: "claude.ai"}
+CLAUDE_SUBSCRIPTION_BY_CODE = {
+    1: "pro",
+    2: "max",
+    3: "team",
+    4: "enterprise",
+}
 
 
 class CodingAgentRouterCliError(RuntimeError):
@@ -32,7 +49,31 @@ def _iso_now() -> str:
     )
 
 
+def _assert_probe_digest_safe(value: Any, *, path: tuple[str, ...] = ()) -> None:
+    if isinstance(value, dict):
+        for raw_key, nested in value.items():
+            key = str(raw_key)
+            normalized = key.casefold().replace("-", "_")
+            if (
+                key not in ALLOWED_SENSITIVE_METADATA_FIELDS
+                and any(
+                    normalized == token or normalized.endswith(token)
+                    for token in SENSITIVE_PROBE_FIELD_TOKENS
+                )
+            ):
+                location = ".".join((*path, key))
+                raise CodingAgentRouterCliError(
+                    f"probe digest payload contains sensitive field: {location}"
+                )
+            _assert_probe_digest_safe(nested, path=(*path, key))
+        return
+    if isinstance(value, list):
+        for index, nested in enumerate(value):
+            _assert_probe_digest_safe(nested, path=(*path, str(index)))
+
+
 def _probe_digest(value: dict[str, Any]) -> str:
+    _assert_probe_digest_safe(value)
     payload = json.dumps(
         value,
         sort_keys=True,
@@ -135,27 +176,38 @@ def _binary_versions(catalog: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _claude_auth_status_codes(value: Any) -> tuple[bool, int, int]:
+    if not isinstance(value, dict):
+        return False, 0, 0
+    logged_in = value.get("loggedIn") is True
+    auth_method_code = 1 if value.get("authMethod") == "claude.ai" else 0
+    raw_subscription = value.get("subscriptionType")
+    subscription_code = 0
+    if raw_subscription == "pro":
+        subscription_code = 1
+    elif raw_subscription == "max":
+        subscription_code = 2
+    elif raw_subscription == "team":
+        subscription_code = 3
+    elif raw_subscription == "enterprise":
+        subscription_code = 4
+    return logged_in, auth_method_code, subscription_code
+
+
+def _claude_auth_summary_from_codes(
+    logged_in: bool, auth_method_code: int, subscription_code: int
+) -> dict[str, Any]:
+    return {
+        "logged_in": logged_in is True,
+        "auth_method": CLAUDE_AUTH_METHOD_BY_CODE.get(auth_method_code),
+        "subscription_type": CLAUDE_SUBSCRIPTION_BY_CODE.get(subscription_code),
+    }
+
+
 def _claude_auth_summary(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
-    auth_method: str | None = None
-    if value.get("authMethod") == "claude.ai":
-        auth_method = "claude.ai"
-    subscription_type: str | None = None
-    raw_subscription = value.get("subscriptionType")
-    if raw_subscription == "pro":
-        subscription_type = "pro"
-    elif raw_subscription == "max":
-        subscription_type = "max"
-    elif raw_subscription == "team":
-        subscription_type = "team"
-    elif raw_subscription == "enterprise":
-        subscription_type = "enterprise"
-    return {
-        "logged_in": value.get("loggedIn") is True,
-        "auth_method": auth_method,
-        "subscription_type": subscription_type,
-    }
+    return _claude_auth_summary_from_codes(*_claude_auth_status_codes(value))
 
 
 def _configured_models(catalog: dict[str, Any], harness: str) -> list[str]:
@@ -186,7 +238,9 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
             value = json.loads(str(claude_status.get("stdout", "")))
         except json.JSONDecodeError:
             value = None
-        claude_auth = _claude_auth_summary(value)
+        claude_auth = _claude_auth_summary_from_codes(
+            *_claude_auth_status_codes(value)
+        )
     providers["claude"] = {
         "available": harnesses.get("claude", {}).get("available") is True,
         "auth": claude_auth,
