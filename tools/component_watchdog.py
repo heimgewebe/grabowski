@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -31,6 +32,10 @@ DEFAULT_TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 DEFAULT_MCP_URL = "http://127.0.0.1:18181/_grabowski/mcp-liveness"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:18080/healthz"
 DEFAULT_READY_URL = "http://127.0.0.1:18080/readyz"
+DEFAULT_METRICS_URL = "http://127.0.0.1:18080/metrics"
+DEFAULT_CONTROL_PLANE_POLL_MAX_AGE = 90.0
+TUNNEL_METRICS_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+CONTROL_PLANE_POLL_METRIC = "commands_poll_last_successful_timestamp_seconds"
 PROTOCOL_VERSION = "2025-06-18"
 MCP_HEALTH_TOOL = "grabowski_runtime_health"
 MCP_MAX_RESPONSE_BYTES = 65536
@@ -230,6 +235,74 @@ def get_probe(url: str, expected_body: str, timeout: float) -> bool:
         return False
     finally:
         connection.close()
+
+
+def get_bounded_text(url: str, timeout: float, max_bytes: int) -> str | None:
+    if max_bytes < 1:
+        raise WatchdogError("invalid-http-response-limit")
+    host, port, path = loopback_http_url(url)
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        connection.request("GET", path, headers={"Connection": "close"})
+        response = connection.getresponse()
+        body = response.read(max_bytes + 1)
+        if response.status != 200 or len(body) > max_bytes:
+            return None
+        return body.decode("utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError, http.client.HTTPException):
+        return None
+    finally:
+        connection.close()
+
+
+def prometheus_metric_samples(text: str, metric_name: str) -> tuple[float, ...]:
+    if not metric_name or any(char.isspace() for char in metric_name):
+        raise WatchdogError("invalid-prometheus-metric-name")
+    values: list[float] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        token = parts[0]
+        if token != metric_name and not token.startswith(metric_name + "{"):
+            continue
+        try:
+            value = float(parts[1])
+        except ValueError:
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return tuple(values)
+
+
+def control_plane_poll_probe(
+    metrics_url: str,
+    timeout: float,
+    max_age_seconds: float,
+    *,
+    now: float | None = None,
+) -> str | None:
+    if max_age_seconds <= 0:
+        raise WatchdogError("invalid-control-plane-poll-max-age")
+    text = get_bounded_text(
+        metrics_url, timeout, TUNNEL_METRICS_MAX_RESPONSE_BYTES
+    )
+    if text is None:
+        return "control-plane-metrics-unavailable"
+    samples = prometheus_metric_samples(text, CONTROL_PLANE_POLL_METRIC)
+    if not samples:
+        return "control-plane-poll-missing"
+    observed = max(samples)
+    current = time.time() if now is None else now
+    age = current - observed
+    if age < -max_age_seconds:
+        return "control-plane-poll-timestamp-invalid"
+    if age > max_age_seconds:
+        return "control-plane-poll-stale"
+    return None
 
 
 class McpProbeFailure(Exception):
@@ -559,6 +632,8 @@ def probe_component(
     startup_grace: float,
     http_timeout: float,
     mcp_url: str = DEFAULT_MCP_URL,
+    metrics_url: str = DEFAULT_METRICS_URL,
+    control_plane_poll_max_age: float = DEFAULT_CONTROL_PLANE_POLL_MAX_AGE,
     proc_root: Path = Path("/proc"),
 ) -> ProbeResult:
     try:
@@ -620,6 +695,19 @@ def probe_component(
                 reasons.append("health-failed")
             if not get_probe(ready_url, "ready", http_timeout):
                 reasons.append("readiness-failed")
+            poll_failure = control_plane_poll_probe(
+                metrics_url, http_timeout, control_plane_poll_max_age
+            )
+            if poll_failure in {
+                "control-plane-metrics-unavailable",
+                "control-plane-poll-missing",
+                "control-plane-poll-timestamp-invalid",
+            } and not reasons:
+                return ProbeResult(
+                    "indeterminate", (poll_failure,), pid, age, start_ticks
+                )
+            if poll_failure is not None:
+                reasons.append(poll_failure)
         except WatchdogError as exc:
             return ProbeResult("indeterminate", (str(exc),), pid, age, start_ticks)
     else:
@@ -1368,6 +1456,8 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 startup_grace=args.startup_grace,
                 http_timeout=args.http_timeout,
                 mcp_url=args.mcp_url,
+                metrics_url=args.metrics_url,
+                control_plane_poll_max_age=args.control_plane_poll_max_age,
             )
             state = load_state(state_path)
             common = {
@@ -1485,6 +1575,8 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     startup_grace=0,
                     http_timeout=args.http_timeout,
                     mcp_url=args.mcp_url,
+                    metrics_url=args.metrics_url,
+                    control_plane_poll_max_age=args.control_plane_poll_max_age,
                 )
                 if final_probe.status == "healthy":
                     _emit_connector_snapshot_refresh(args, final_probe)
@@ -1534,6 +1626,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--mcp-url", default=None, help=argparse.SUPPRESS)
     result.add_argument("--health-url", default=DEFAULT_HEALTH_URL)
     result.add_argument("--ready-url", default=DEFAULT_READY_URL)
+    result.add_argument("--metrics-url", default=DEFAULT_METRICS_URL)
+    result.add_argument(
+        "--control-plane-poll-max-age",
+        type=float,
+        default=DEFAULT_CONTROL_PLANE_POLL_MAX_AGE,
+    )
     result.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     result.add_argument("--failure-threshold", type=int, default=3)
     result.add_argument("--max-restarts", type=int, default=3)
@@ -1556,6 +1654,9 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         )
     if args.host != "127.0.0.1" or not 1024 <= args.port <= 65535:
         raise WatchdogError("invalid-operator-listener")
+    if args.control_plane_poll_max_age <= 0:
+        raise WatchdogError("invalid-control-plane-poll-max-age")
+    loopback_http_url(args.metrics_url)
     if args.mcp_url is None:
         args.mcp_url = (
             f"http://{args.host}:{args.port}/_grabowski/mcp-liveness"
