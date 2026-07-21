@@ -426,6 +426,50 @@
         "tool": "grabowski_operator_blockade_status"
       }
     },
+    "grabowski_task_archive_list": {
+      "evidence_refs": [
+        "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T071",
+        "tests:tests/test_lifecycle_read_surface.py"
+      ],
+      "exception_detail": {
+        "claim": "This tool adds only bounded read authority over immutable task archive catalog metadata and does not expand mutation or deletion authority.",
+        "evidence": "The implementation exposes only manifest-verified segment summaries, uses file_read capability, and regression tests prove no mutation effect."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "A generic operation was rejected because archive discovery is a recurring read-only consumer surface whose cursor and integrity state must remain typed and directly inspectable.",
+      "rationale": "Archive discovery requires a stable bounded paginated catalog shape with explicit manifest-only integrity semantics distinct from reading record payloads.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "task-archive",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_task_archive_list"
+      }
+    },
+    "grabowski_task_archive_read": {
+      "evidence_refs": [
+        "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T071",
+        "tests:tests/test_lifecycle_read_surface.py"
+      ],
+      "exception_detail": {
+        "claim": "This tool adds only bounded read authority over fully verified immutable task archive segments and does not expand mutation or deletion authority.",
+        "evidence": "The implementation verifies the entire bounded segment before returning records, uses file_read capability, and exposes explicit non-claims."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "A generic operation was rejected because segment-bound full verification and view-bound pagination need a stable typed read contract separate from catalog listing.",
+      "rationale": "Archive record drill-down requires a segment identifier, full integrity verification, and record pagination that are materially different from catalog discovery.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "task-archive",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_task_archive_read"
+      }
+    },
     "ipad_capability_manifest": {
       "evidence_refs": [
         "docs:juno-ipad-storage.md",

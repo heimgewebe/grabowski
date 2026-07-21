@@ -39,6 +39,7 @@ from mcp.types import ToolAnnotations
 
 import grabowski_consumer_surface as consumer_surface
 import grabowski_client_snapshot
+import grabowski_lifecycle_read_surface as lifecycle_read_surface
 import grabowski_blockades as blockade_policy
 import grabowski_blockade_store as blockade_store
 
@@ -349,6 +350,8 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_task_cancel": ("durable_job",),
     "grabowski_task_resume": ("durable_job",),
     "grabowski_task_list": ("durable_job",),
+    "grabowski_task_archive_list": ("file_read",),
+    "grabowski_task_archive_read": ("file_read",),
     "grabowski_task_reconcile_check": ("durable_job",),
     "grabowski_task_reconcile_refresh": ("durable_job",),
     "grabowski_task_reconcile_resume": ("durable_job",),
@@ -9238,6 +9241,42 @@ def grip_run(
         dispatch_parameters,
         profile=profile,
         allow_mutation=allow_mutation,
+    )
+
+
+@mcp.tool(name="grabowski_task_archive_list", annotations=READ_ANNOTATIONS)
+def grabowski_task_archive_list(
+    limit: int = 20,
+    cursor: str | None = None,
+    view: str = "minimal",
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """List immutable task archive segments through a bounded verified catalog."""
+    _require_capability("file_read")
+    return lifecycle_read_surface.task_archive_list(
+        limit=limit,
+        cursor=cursor,
+        view=view,
+        fields=fields,
+    )
+
+
+@mcp.tool(name="grabowski_task_archive_read", annotations=READ_ANNOTATIONS)
+def grabowski_task_archive_read(
+    segment_id: str,
+    limit: int = 20,
+    cursor: str | None = None,
+    view: str = "standard",
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Read one fully verified immutable task archive segment with pagination."""
+    _require_capability("file_read")
+    return lifecycle_read_surface.task_archive_read(
+        segment_id,
+        limit=limit,
+        cursor=cursor,
+        view=view,
+        fields=fields,
     )
 
 

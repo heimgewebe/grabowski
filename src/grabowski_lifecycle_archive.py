@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -410,7 +411,51 @@ def write_task_archive_segment(
     return {**verified, "idempotent_replay": False}
 
 
-def verify_task_archive_segment(segment_dir: Path) -> dict[str, Any]:
+def _read_regular_bytes(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+) -> bytes:
+    if max_bytes is not None and (
+        isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0
+    ):
+        raise ValueError("max_bytes must be a non-negative integer or None")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise LifecycleArchiveIntegrityError(
+            f"archive file is missing or unsafe: {path.name}"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise LifecycleArchiveIntegrityError(
+                f"archive file is missing or unsafe: {path.name}"
+            )
+        if max_bytes is not None and metadata.st_size > max_bytes:
+            raise LifecycleArchiveIntegrityError(
+                f"archive file exceeds server-owned read bound: {path.name}"
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            payload = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
+        if max_bytes is not None and len(payload) > max_bytes:
+            raise LifecycleArchiveIntegrityError(
+                f"archive file exceeds server-owned read bound: {path.name}"
+            )
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def verify_task_archive_segment(
+    segment_dir: Path,
+    *,
+    max_manifest_bytes: int | None = None,
+    max_records_bytes: int | None = None,
+) -> dict[str, Any]:
     if segment_dir.is_symlink() or not segment_dir.is_dir():
         raise LifecycleArchiveIntegrityError("archive segment must be a regular directory")
     manifest_path = segment_dir / "manifest.json"
@@ -419,8 +464,14 @@ def verify_task_archive_segment(segment_dir: Path) -> dict[str, Any]:
         if path.is_symlink() or not path.is_file():
             raise LifecycleArchiveIntegrityError(f"archive file is missing or unsafe: {path.name}")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        manifest_payload = _read_regular_bytes(
+            manifest_path,
+            max_bytes=max_manifest_bytes,
+        )
+        manifest = json.loads(manifest_payload.decode("utf-8"))
+    except LifecycleArchiveIntegrityError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise LifecycleArchiveIntegrityError("archive manifest is invalid") from exc
     expected_manifest_sha256 = manifest.get("manifest_sha256")
     if not isinstance(expected_manifest_sha256, str):
@@ -428,7 +479,10 @@ def verify_task_archive_segment(segment_dir: Path) -> dict[str, Any]:
     body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
     if sha256_json(body) != expected_manifest_sha256:
         raise LifecycleArchiveIntegrityError("archive manifest digest mismatch")
-    payload = records_path.read_bytes()
+    payload = _read_regular_bytes(
+        records_path,
+        max_bytes=max_records_bytes,
+    )
     if hashlib.sha256(payload).hexdigest() != manifest.get("segment_sha256"):
         raise LifecycleArchiveIntegrityError("archive segment digest mismatch")
     raw_lines = payload.splitlines()

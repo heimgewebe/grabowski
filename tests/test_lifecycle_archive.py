@@ -287,5 +287,54 @@ class TaskArchiveSegmentTests(unittest.TestCase):
                 )
 
 
+    def test_segment_verification_respects_explicit_records_read_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "archives"
+            result = lifecycle.write_task_archive_segment(
+                [self.task("task-a", 10)],
+                archive_root=root,
+                source_store_sha256="c" * 64,
+                source_schema_version="5",
+                plan_sha256="d" * 64,
+            )
+            with self.assertRaises(lifecycle.LifecycleArchiveIntegrityError):
+                lifecycle.verify_task_archive_segment(
+                    Path(result["segment_dir"]),
+                    max_records_bytes=1,
+                )
+
+    def test_segment_verification_respects_explicit_manifest_read_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "archives"
+            result = lifecycle.write_task_archive_segment(
+                [self.task("task-a", 10)],
+                archive_root=root,
+                source_store_sha256="c" * 64,
+                source_schema_version="5",
+                plan_sha256="d" * 64,
+            )
+            with self.assertRaises(lifecycle.LifecycleArchiveIntegrityError):
+                lifecycle.verify_task_archive_segment(
+                    Path(result["segment_dir"]),
+                    max_manifest_bytes=1,
+                )
+
+    def test_segment_verification_rejects_invalid_records_read_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "archives"
+            result = lifecycle.write_task_archive_segment(
+                [self.task("task-a", 10)],
+                archive_root=root,
+                source_store_sha256="c" * 64,
+                source_schema_version="5",
+                plan_sha256="d" * 64,
+            )
+            with self.assertRaises(ValueError):
+                lifecycle.verify_task_archive_segment(
+                    Path(result["segment_dir"]),
+                    max_records_bytes=-1,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
