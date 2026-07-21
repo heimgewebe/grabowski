@@ -26,16 +26,17 @@ assert SPEC is not None and SPEC.loader is not None
 SCHEDULER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SCHEDULER)
 
+TEST_SCRUBBED_ENV = ("ROUTER_AUTH_ENV_A", "ROUTER_AUTH_ENV_B")
+
 
 class CodingAgentProbeSchedulerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.original_expected_router_scrubbed_env = (
-            SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
+        self.expected_scrub_patch = mock.patch.object(
+            SCHEDULER,
+            "EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV",
+            TEST_SCRUBBED_ENV,
         )
-        SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV = (
-            "ROUTER_AUTH_ENV_A",
-            "ROUTER_AUTH_ENV_B",
-        )
+        self.expected_scrub_patch.start()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.state = self.root / "state.json"
@@ -57,9 +58,7 @@ class CodingAgentProbeSchedulerTests(unittest.TestCase):
         os.chmod(self.state, 0o600)
 
     def tearDown(self) -> None:
-        SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV = (
-            self.original_expected_router_scrubbed_env
-        )
+        self.expected_scrub_patch.stop()
         self.temporary.cleanup()
 
     @staticmethod
@@ -127,7 +126,7 @@ if sys.argv[1] == "probe":
         "harnesses": {{}},
         "providers": {{"codex": {{"available": True}}}},
         "verified_quota_pools": [],
-        "api_key_environment_scrubbed": {list(SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV)!r},
+        "api_key_environment_scrubbed": {list(TEST_SCRUBBED_ENV)!r},
         "model_invocations": 0,
         "paid_api_requests_authorized": 0,
     }}
@@ -219,9 +218,7 @@ else:
             "harnesses": {},
             "providers": {},
             "verified_quota_pools": [],
-            "api_key_environment_scrubbed": list(
-                SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
-            ),
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
             "model_invocations": 0,
             "paid_api_requests_authorized": 0,
         }
@@ -244,15 +241,13 @@ else:
             "harnesses": {},
             "providers": {},
             "verified_quota_pools": [],
-            "api_key_environment_scrubbed": list(
-                SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
-            ),
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
             "model_invocations": 0,
             "paid_api_requests_authorized": 0,
         }
         digest = SCHEDULER.probe_digest(probe)
         probe["catalog_probe_sha256"] = digest
-        probe["api_key_environment_scrubbed"] = ["OPENAI_API_KEY"]
+        probe["api_key_environment_scrubbed"] = ["ROUTER_AUTH_ENV_A"]
         self.assertEqual(digest, SCHEDULER.probe_digest(probe))
         with self.assertRaisesRegex(
             SCHEDULER.ProbeSchedulerError,
@@ -266,9 +261,7 @@ else:
             "observed_at": SCHEDULER.iso_now(),
             "harnesses": {},
             "providers": {},
-            "api_key_environment_scrubbed": list(
-                SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
-            ),
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
             "model_invocations": 0,
             "paid_api_requests_authorized": 0,
         }
@@ -292,9 +285,7 @@ else:
             "harnesses": {},
             "providers": {},
             "verified_quota_pools": ["grok-com"],
-            "api_key_environment_scrubbed": list(
-                SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
-            ),
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
             "model_invocations": 0,
             "paid_api_requests_authorized": 0,
         }
@@ -330,9 +321,7 @@ else:
             "harnesses": {},
             "providers": {},
             "verified_quota_pools": ["jules-account"],
-            "api_key_environment_scrubbed": list(
-                SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
-            ),
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
             "model_invocations": 0,
             "paid_api_requests_authorized": 0,
         }
@@ -405,7 +394,7 @@ else:
             )
         SCHEDULER.assert_probe_digest_safe(
             {
-                "api_key_environment_scrubbed": ["OPENAI_API_KEY"],
+                "api_key_environment_scrubbed": ["ROUTER_AUTH_ENV_A"],
                 "context_token_count": 4096,
             }
         )
