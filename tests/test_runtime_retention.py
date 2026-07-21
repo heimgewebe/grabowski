@@ -939,6 +939,34 @@ class RuntimeRetentionTests(unittest.TestCase):
                         unit_states={},
                     )
 
+    def test_job_registry_discovery_stops_at_bounded_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            consumed: list[int] = []
+
+            class FakeJobsRoot:
+                def iterdir(self):
+                    for index in range(4):
+                        consumed.append(index)
+                        if index == 3:
+                            raise AssertionError("discovery consumed beyond limit + 1")
+                        yield root / f"grabowski-job-{index + 1:012x}"
+
+            with (
+                patch.object(RETENTION, "MAX_JOB_REGISTRY_ENTRIES", 2),
+                patch.object(RETENTION, "_private_directory", return_value=FakeJobsRoot()),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "bounded discovery limit"):
+                    RETENTION.build_plan(
+                        jobs_root=root / "jobs",
+                        archive_root=root / "archive",
+                        receipt_root=root / "receipts",
+                        task_db=root / "missing.sqlite3",
+                        failed_units=[],
+                        unit_states={},
+                    )
+            self.assertEqual(consumed, [0, 1, 2])
+
     def test_failed_job_keeps_failed_state_while_archive_is_deferred(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

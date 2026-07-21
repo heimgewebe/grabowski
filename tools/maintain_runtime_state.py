@@ -939,13 +939,12 @@ def build_plan(
     if len(failed) > MAX_FAILED_UNITS:
         raise RuntimeError("failed-unit inventory exceeds the bounded scan")
 
-    registry_entries = [
-        entry
-        for entry in jobs_root.iterdir()
-        if entry.name.startswith("grabowski-job-")
-    ]
-    if len(registry_entries) > MAX_JOB_REGISTRY_ENTRIES:
-        raise RuntimeError("job registry exceeds the bounded discovery limit")
+    registry_entries: list[Path] = []
+    for discovered_count, entry in enumerate(jobs_root.iterdir(), start=1):
+        if discovered_count > MAX_JOB_REGISTRY_ENTRIES:
+            raise RuntimeError("job registry exceeds the bounded discovery limit")
+        if entry.name.startswith("grabowski-job-"):
+            registry_entries.append(entry)
     registry_entries.sort(key=lambda entry: entry.name)
     primary_entries = registry_entries[:MAX_JOB_SCAN_ENTRIES]
     failed_job_names = {
