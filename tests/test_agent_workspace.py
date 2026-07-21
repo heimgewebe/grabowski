@@ -5191,6 +5191,177 @@ class AgentWorkspaceTests(unittest.TestCase):
         }
         self.assertIn("workspace_idle_tmux_cleanup_required", blocker_codes)
         self.assertNotIn("workspace_tmux_session_live", blocker_codes)
+        transition = plan["stale_reconciliation"]["idle_tmux_transition"]
+        self.assertFalse(transition["eligible"])
+        self.assertEqual(transition["session_name"], manifest["session_name"])
+
+    def test_idle_tmux_transition_removes_exact_session_and_reconciles_stale(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        session_live = True
+
+        def has_session(session: str) -> bool:
+            self.assertEqual(session, manifest["session_name"])
+            return session_live
+
+        def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
+            nonlocal session_live
+            self.assertEqual(argv, ["kill-session", "-t", manifest["session_name"]])
+            self.assertEqual(timeout, 30)
+            session_live = False
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
+            mock.patch.object(workspace, "_tmux_result", side_effect=tmux_result) as tmux,
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            transition = plan["stale_reconciliation"]["idle_tmux_transition"]
+            self.assertTrue(transition["eligible"])
+            self.assertFalse(plan["stale_reconciliation"]["eligible"])
+            result = workspace.grabowski_agent_workspace_reconcile_stale(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+                remove_idle_tmux_session=True,
+            )
+
+        tmux.assert_called_once()
+        self.assertEqual(result["state"], "stale_workspace_reconciled")
+        self.assertTrue(result["tmux_removed"])
+        self.assertTrue(result["tmux_mutation_performed"])
+        receipt = result["close_receipt"]
+        self.assertEqual(receipt["closure_outcome"], "abandoned_stale_workspace")
+        self.assertTrue(receipt["tmux_removed"])
+        self.assertTrue(receipt["tmux_mutation_performed"])
+        self.assertTrue(self.git.writer.exists())
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertTrue(
+            workspace._close_integrity_status(
+                persisted, persisted["close_receipt"]
+            )["valid"]
+        )
+
+    def test_idle_tmux_transition_refuses_other_stale_blockers_without_kill(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.resources,
+                "list_resources",
+                return_value=[{"resource_key": "path:/live"}],
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_result") as tmux,
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertFalse(
+                plan["stale_reconciliation"]["idle_tmux_transition"]["eligible"]
+            )
+            result = workspace.grabowski_agent_workspace_reconcile_stale(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+                remove_idle_tmux_session=True,
+            )
+        self.assertEqual(result["state"], "stale_reconciliation_blocked")
+        tmux.assert_not_called()
+
+    def test_idle_tmux_transition_rechecks_full_plan_after_session_removal(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        session_live = True
+        resource_observations = iter(
+            [
+                [],
+                [],
+                [{"resource_key": "path:/new-live-resource"}],
+            ]
+        )
+
+        def has_session(session: str) -> bool:
+            self.assertEqual(session, manifest["session_name"])
+            return session_live
+
+        def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
+            nonlocal session_live
+            self.assertEqual(argv, ["kill-session", "-t", manifest["session_name"]])
+            self.assertEqual(timeout, 30)
+            session_live = False
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.resources,
+                "list_resources",
+                side_effect=lambda **kwargs: next(resource_observations),
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
+            mock.patch.object(workspace, "_tmux_result", side_effect=tmux_result),
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertTrue(
+                plan["stale_reconciliation"]["idle_tmux_transition"]["eligible"]
+            )
+            result = workspace.grabowski_agent_workspace_reconcile_stale(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+                remove_idle_tmux_session=True,
+            )
+
+        self.assertEqual(
+            result["state"], "idle_tmux_removed_stale_reconciliation_blocked"
+        )
+        self.assertTrue(result["tmux_removed"])
+        self.assertIn(
+            "workspace_resources_live",
+            {
+                blocker["code"]
+                for blocker in result["plan"]["stale_reconciliation"]["blockers"]
+            },
+        )
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertIsNone(persisted.get("close_receipt"))
+
+    def test_idle_tmux_transition_requires_distinct_typed_confirmation(self) -> None:
+        manifest = self.manifest()
+        workspace._write_manifest(manifest)
+        with mock.patch.object(workspace.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+            ):
+                workspace.grabowski_agent_workspace_reconcile_stale(
+                    manifest["workspace_id"],
+                    "a" * 64,
+                    "mark-stale-workspace-abandoned",
+                    remove_idle_tmux_session=True,
+                )
 
     def test_interrupted_task_requires_reconciliation_without_claiming_liveness(self) -> None:
         manifest = self.manifest(with_writer=False)
