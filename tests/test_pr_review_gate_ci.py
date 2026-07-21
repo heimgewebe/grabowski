@@ -27,6 +27,8 @@ def _audit(**overrides) -> dict:
         "repo": "heimgewebe/grabowski",
         "pr": 42,
         "head_sha": "a" * 40,
+        "base_sha": "c" * 40,
+        "review_policy_version": ci.evidence_schemas.REVIEW_POLICY_VERSION,
         "diff_sha256": "b" * 64,
         "review_tier": "standard",
         "minimum_review_iterations": 2,

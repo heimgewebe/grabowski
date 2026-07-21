@@ -7,6 +7,16 @@ from typing import Any
 
 _MISSING = object()
 
+# Bump when review-gate policy semantics change in a way that invalidates prior audits.
+REVIEW_POLICY_VERSION = 2
+REVIEW_TIER_RANK = {
+    "documentation": 1,
+    "very_small": 1,
+    "standard": 2,
+    "important_repo": 3,
+    "high_critical": 4,
+}
+
 
 @dataclass(frozen=True)
 class FieldRule:
@@ -299,8 +309,95 @@ CLAUDE_EVIDENCE_SCHEMA = EvidenceSchema(
 )
 
 
+SELF_REVIEW_AUDIT_SCHEMA = EvidenceSchema(
+    name="Grabowski self-review audit v1",
+    fields={
+        "schema_version": FieldRule(("integer",), const=1),
+        "kind": FieldRule(("string",), const="grabowski_self_review_audit"),
+        "generated_at": STRING,
+        "repo": STRING,
+        "pr": POSITIVE_INTEGER,
+        "head_sha": STRING,
+        "base_sha": STRING,
+        "diff_sha256": STRING,
+        "review_policy_version": FieldRule(("integer",), const=REVIEW_POLICY_VERSION),
+        "review_tier": FieldRule(
+            ("string",),
+            enum=("documentation", "very_small", "standard", "important_repo", "high_critical"),
+        ),
+        "minimum_review_iterations": NON_NEGATIVE_INTEGER,
+        "actual_review_iterations": NON_NEGATIVE_INTEGER,
+        "all_findings_triaged": BOOLEAN,
+        "finding_count": FieldRule(("integer", "null"), minimum=0),
+        "material_findings_after_first_review": FieldRule(("integer", "null"), minimum=0),
+        "material_findings_remaining": FieldRule(("integer", "null"), minimum=0),
+        "uncertainty": FieldRule(("number", "null"), minimum=0, maximum=1),
+        "residual_risk_accepted": BOOLEAN,
+        "residual_risk_reason": FieldRule(("string",)),
+        "gate_verdict": FieldRule(("string",), enum=("PASS", "BLOCK")),
+        "self_review_gate_valid": BOOLEAN,
+        "tuning_signal": FieldRule(
+            ("string",), enum=("observe", "increase_depth", "repair_evidence")
+        ),
+    },
+    required=frozenset(
+        {
+            "schema_version", "kind", "repo", "pr", "head_sha", "base_sha",
+            "diff_sha256", "review_policy_version", "review_tier",
+            "minimum_review_iterations", "actual_review_iterations",
+            "all_findings_triaged", "material_findings_remaining", "gate_verdict",
+            "self_review_gate_valid", "tuning_signal",
+        }
+    ),
+    # The private audit may gain additional operator-only fields without widening
+    # the public projection. The projection schema below remains strict.
+    additional_properties=True,
+)
+
+
+REVIEW_GATE_STATUS_SCHEMA = EvidenceSchema(
+    name="Grabowski review-gate status projection v1",
+    fields={
+        "schema_version": FieldRule(("integer",), const=1),
+        "kind": FieldRule(("string",), const="grabowski_review_gate_status"),
+        "repo": STRING,
+        "pr": POSITIVE_INTEGER,
+        "head_sha": STRING,
+        "base_sha": STRING,
+        "diff_sha256": STRING,
+        "audit_sha256": STRING,
+        "review_policy_version": FieldRule(("integer",), const=REVIEW_POLICY_VERSION),
+        "gate_verdict": FieldRule(("string",), enum=("PASS", "BLOCK")),
+        "self_review_gate_valid": BOOLEAN,
+        "all_findings_triaged": BOOLEAN,
+        "material_findings_remaining": NON_NEGATIVE_INTEGER,
+        "minimum_review_iterations": NON_NEGATIVE_INTEGER,
+        "actual_review_iterations": NON_NEGATIVE_INTEGER,
+        "review_tier": FieldRule(
+            ("string",),
+            enum=("documentation", "very_small", "standard", "important_repo", "high_critical"),
+        ),
+        "tuning_signal": FieldRule(
+            ("string",), enum=("observe", "increase_depth", "repair_evidence")
+        ),
+    },
+    required=frozenset(
+        {
+            "schema_version", "kind", "repo", "pr", "head_sha", "base_sha",
+            "diff_sha256", "audit_sha256", "review_policy_version", "gate_verdict",
+            "self_review_gate_valid", "all_findings_triaged", "material_findings_remaining",
+            "minimum_review_iterations", "actual_review_iterations", "review_tier",
+            "tuning_signal",
+        }
+    ),
+    additional_properties=False,
+)
+
+
 SCHEMAS = {
     "self-review": SELF_REVIEW_SCHEMA,
+    "self-review audit": SELF_REVIEW_AUDIT_SCHEMA,
+    "review gate status": REVIEW_GATE_STATUS_SCHEMA,
     "external review evidence": EXTERNAL_REVIEW_SCHEMA,
     "Claude evidence": CLAUDE_EVIDENCE_SCHEMA,
 }
