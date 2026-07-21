@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "3ae4d9f1b8e5e8d5769e550abd7947596c93b5fbfdcf818dab668dab0a06423c",
+  "capability_source_sha256": "3a5d5b816ad4b781584f4f469ceedf752853ddf1145397ac27a329f459b347a1",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "2ada01660eb35bd2cf8d607ff6aa88798d85161490467a1eca121804b77b7a82",
+  "contract_sha256": "b7757445e200ed2d845a9cc4fe13987fc6f7787f1e0b1e7662a4d31e072b7311",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1725,7 +1725,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Create one four-role tmux workspace with one isolated durable writer task.",
+      "description": "Create one explicit advisory contrast workspace; direct work stays authoritative.",
       "effects": [
         "worktree-create",
         "branch-create",
@@ -1734,7 +1734,7 @@
         "lease-create"
       ],
       "id": "grabowski_agent_workspace_create",
-      "purpose": "Create one task-bound four-pane tmux workspace with one isolated writer worktree.",
+      "purpose": "Create one explicitly requested advisory contrast workspace while ChatGPT/Grabowski remains the authoritative writer.",
       "read_only": false,
       "reversibility": "close-and-preserved-worktree",
       "risk_class": "high",
@@ -1773,7 +1773,7 @@
         "task-state-refresh"
       ],
       "id": "grabowski_agent_workspace_collect",
-      "purpose": "Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt.",
+      "purpose": "Freeze advisory contrast evidence, run read-only tests and review, and write a head- and diff-bound receipt.",
       "read_only": false,
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
@@ -1803,7 +1803,7 @@
         "task-state-refresh"
       ],
       "id": "grabowski_agent_workspace_writer_handoff",
-      "purpose": "Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence.",
+      "purpose": "Start one operator-bound replacement contrast writer after a proven terminal failure without granting authoritative writer status.",
       "read_only": false,
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
@@ -1895,10 +1895,10 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Recommend a lean R0-R3 route without authorizing parallel writers.",
+      "description": "Keep implementation direct and optionally recommend advisory contrast.",
       "effects": [],
       "id": "grabowski_agent_execution_route",
-      "purpose": "Recommend a lean R0-R3 direct, isolated, full-workspace, contrast or explicitly fork-gated competition route while keeping parallel writers advisory-only.",
+      "purpose": "Return direct_operator for every authoritative task and optionally describe explicitly requested advisory contrast or competition candidates.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -1917,10 +1917,10 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Recommend one zero-marginal-cost coding route without authorizing execution.",
+      "description": "Keep all authoritative work direct; rank agents only as advisory reviewers.",
       "effects": [],
       "id": "grabowski_coding_agent_route",
-      "purpose": "Recommend one zero-marginal-cost, quota-aware coding route and provider-independent reviewer without granting dispatch or execution authority.",
+      "purpose": "Keep every authoritative implementation on grabowski-primary and rank external routes only for independent review.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
