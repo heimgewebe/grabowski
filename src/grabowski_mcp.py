@@ -8664,6 +8664,21 @@ def _repoground_budget_context(
     return context, counts, exact_used_bytes
 
 
+def _repoground_evidence_uses_coherent_source(value: Any, source: str) -> bool:
+    if isinstance(value, dict):
+        if value.get("source") == source and value.get("status") == "coherent":
+            return True
+        return any(
+            _repoground_evidence_uses_coherent_source(item, source)
+            for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _repoground_evidence_uses_coherent_source(item, source) for item in value
+        )
+    return False
+
+
 @mcp.tool(name="repoground_context_compose", annotations=READ_ANNOTATIONS)
 def repoground_context_compose(
     repo: str,
@@ -8785,7 +8800,7 @@ def repoground_context_compose(
     impact_status = str(impact.get("status", "unknown"))
     source_statuses = _repoground_dict_items(impact.get("source_statuses")) if isinstance(impact, dict) else []
     symbol_available = any(item.get("source") == "python_symbol_index_json" and item.get("status") == "available" for item in source_statuses)
-    call_graph_available = bool(impact.get("relations")) if isinstance(impact, dict) else False
+    causal_relations = _repoground_dict_items(impact.get("relations")) if isinstance(impact, dict) else []
 
     edit_context = impact.get("edit_context") if isinstance(impact, dict) and isinstance(impact.get("edit_context"), dict) else {}
     lane_values: dict[str, list[Any]] = {
@@ -8796,7 +8811,7 @@ def repoground_context_compose(
         "entry_manifest": [surfaces["agent_entry_manifest"]] if "agent_entry_manifest" in surfaces else [],
         "pr_delta_cards": [surfaces["pr_delta_cards_jsonl"]] if "pr_delta_cards_jsonl" in surfaces else [],
         "target_symbols": _repoground_dict_items(impact.get("target_symbols")) if isinstance(impact, dict) else [],
-        "causal_relations": _repoground_dict_items(impact.get("relations")) if isinstance(impact, dict) else [],
+        "causal_relations": causal_relations,
         "live_ranges": _repoground_dict_items(evidence.get("ranges")),
         "citations": [{"citation_id": item} for item in evidence.get("citation_ids", []) if isinstance(item, str)] if isinstance(evidence.get("citation_ids"), list) else [],
         "gaps": _repoground_dict_items(impact.get("gaps")) if isinstance(impact, dict) else [],
@@ -8820,7 +8835,10 @@ def repoground_context_compose(
         used.append("query_context")
     if symbol_available:
         used.append("symbol_navigation")
-    if call_graph_available:
+    call_graph_used = _repoground_evidence_uses_coherent_source(
+        context.get("causal_relations", []), "python_call_graph_json"
+    )
+    if call_graph_used:
         used.append("call_graph")
     if "citation_map_jsonl" in surfaces or context.get("citations"):
         used.append("citation")
