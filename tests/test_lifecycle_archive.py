@@ -221,6 +221,12 @@ class TaskArchiveSegmentTests(unittest.TestCase):
             self.assertEqual(manifest["record_count"], 2)
             self.assertEqual(manifest["first_task_id"], "task-a")
             self.assertEqual(manifest["last_task_id"], "task-b")
+            records_path = Path(first["segment_dir"]) / "records.jsonl"
+            self.assertEqual(first["records_bytes"], records_path.stat().st_size)
+            self.assertEqual(
+                first["record_hash_sequence_sha256"],
+                lifecycle.sha256_json(manifest["record_sha256s"]),
+            )
             second = lifecycle.write_task_archive_segment(
                 records,
                 archive_root=root,
@@ -273,6 +279,33 @@ class TaskArchiveSegmentTests(unittest.TestCase):
             with self.assertRaises(lifecycle.LifecycleArchiveIntegrityError):
                 lifecycle.verify_task_archive_segment(segment_dir)
 
+    def test_segment_verification_rejects_rehashed_manifest_semantic_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "archives"
+            result = lifecycle.write_task_archive_segment(
+                [self.task("task-a", 10)],
+                archive_root=root,
+                source_store_sha256="c" * 64,
+                source_schema_version="5",
+                plan_sha256="d" * 64,
+            )
+            segment_dir = Path(result["segment_dir"])
+            manifest_path = segment_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["kind"] = "tampered_archive_kind"
+            body = {
+                key: value
+                for key, value in manifest.items()
+                if key != "manifest_sha256"
+            }
+            manifest["manifest_sha256"] = lifecycle.sha256_json(body)
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(lifecycle.LifecycleArchiveIntegrityError):
+                lifecycle.verify_task_archive_segment(segment_dir)
+
     def test_segment_rejects_record_without_lifecycle_receipt(self) -> None:
         record = self.task("task-a", 10)
         record["lifecycle_receipt_sha256"] = None
@@ -284,6 +317,55 @@ class TaskArchiveSegmentTests(unittest.TestCase):
                     source_store_sha256="c" * 64,
                     source_schema_version="5",
                     plan_sha256="d" * 64,
+                )
+
+
+    def test_segment_verification_respects_explicit_records_read_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "archives"
+            result = lifecycle.write_task_archive_segment(
+                [self.task("task-a", 10)],
+                archive_root=root,
+                source_store_sha256="c" * 64,
+                source_schema_version="5",
+                plan_sha256="d" * 64,
+            )
+            with self.assertRaises(lifecycle.LifecycleArchiveIntegrityError):
+                lifecycle.verify_task_archive_segment(
+                    Path(result["segment_dir"]),
+                    max_records_bytes=1,
+                )
+
+    def test_segment_verification_respects_explicit_manifest_read_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "archives"
+            result = lifecycle.write_task_archive_segment(
+                [self.task("task-a", 10)],
+                archive_root=root,
+                source_store_sha256="c" * 64,
+                source_schema_version="5",
+                plan_sha256="d" * 64,
+            )
+            with self.assertRaises(lifecycle.LifecycleArchiveIntegrityError):
+                lifecycle.verify_task_archive_segment(
+                    Path(result["segment_dir"]),
+                    max_manifest_bytes=1,
+                )
+
+    def test_segment_verification_rejects_invalid_records_read_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "archives"
+            result = lifecycle.write_task_archive_segment(
+                [self.task("task-a", 10)],
+                archive_root=root,
+                source_store_sha256="c" * 64,
+                source_schema_version="5",
+                plan_sha256="d" * 64,
+            )
+            with self.assertRaises(ValueError):
+                lifecycle.verify_task_archive_segment(
+                    Path(result["segment_dir"]),
+                    max_records_bytes=-1,
                 )
 
 

@@ -184,6 +184,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_competition_compare` | agent-workspace | yes | low | Generate a deterministic contrast matrix, consensus signals and validation opportunities from exactly two bound external candidates. |
 | `grabowski_agent_bootstrap` | operations-observability | yes | low | Return a release-evidence-bound adaptive agent entry capsule without authorizing execution. |
 | `grabowski_call_shape_check` | operations-observability | yes | low | Deterministically lint one proposed tool-call shape before execution. |
+| `grabowski_task_archive_list` | task-archive | yes | low | List immutable task archive segments through a bounded manifest-verified catalog. |
+| `grabowski_task_archive_read` | task-archive | yes | low | Read one fully integrity-verified immutable task archive segment with bounded pagination. |
 
 ## Policy contract
 

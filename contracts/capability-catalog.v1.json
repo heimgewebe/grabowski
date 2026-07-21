@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "3ae4d9f1b8e5e8d5769e550abd7947596c93b5fbfdcf818dab668dab0a06423c",
+  "capability_source_sha256": "72fd9208be2aa3f5482864b46202d4754daad14fa8850dd525c66424802434a5",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "2ada01660eb35bd2cf8d607ff6aa88798d85161490467a1eca121804b77b7a82",
+  "contract_sha256": "d3c6d40516eebc0f04b7e55de5e5f887c3cbff8436d6f5c3548b12a7689f9e8e",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1986,6 +1986,28 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_call_shape_check"
+    },
+    {
+      "category": "task-archive",
+      "description": "List immutable task archive segments through a bounded verified catalog.",
+      "effects": [],
+      "id": "grabowski_task_archive_list",
+      "purpose": "List immutable task archive segments through a bounded manifest-verified catalog.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_archive_list"
+    },
+    {
+      "category": "task-archive",
+      "description": "Read one fully verified immutable task archive segment with pagination.",
+      "effects": [],
+      "id": "grabowski_task_archive_read",
+      "purpose": "Read one fully integrity-verified immutable task archive segment with bounded pagination.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_archive_read"
     }
   ]
 }
