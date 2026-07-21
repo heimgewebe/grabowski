@@ -1611,6 +1611,114 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertIn("patch_correctness", first["does_not_establish"])
         self.assertIn("merge_readiness", first["does_not_establish"])
 
+    def test_context_compose_does_not_claim_call_graph_lane_for_architecture_relations(self) -> None:
+        base, target = self._composer_fixture()
+        impact = self._composer_impact()
+        impact["source_statuses"].append(
+            {
+                "source": "python_call_graph_json",
+                "status": "blocked",
+                "error_code": "artifact_too_large",
+            }
+        )
+        impact["gaps"].append(
+            {
+                "kind": "call_graph_coverage_gap",
+                "source": "python_call_graph_json",
+                "reason": "artifact_too_large",
+            }
+        )
+        with (
+            patch.object(
+                mcp,
+                "repoground_context_pack",
+                return_value=self._composer_context_pack(),
+            ),
+            patch.object(
+                mcp, "_repoground_agent_impact_context", return_value=impact
+            ),
+        ):
+            result = mcp.repoground_context_compose(
+                "demo-repo", base, target, context_budget_bytes=4000
+            )
+
+        self.assertIn("causal_relations", result["context"])
+        self.assertNotIn("call_graph", result["retrieval_lanes"]["used"])
+        self.assertIn("call_graph", result["retrieval_lanes"]["skipped"])
+        self.assertEqual(
+            result["context_budget"]["lane_counts"]["gaps"]["available"], 1
+        )
+
+    def test_context_compose_does_not_claim_call_graph_lane_for_untrusted_call_graph_evidence(self) -> None:
+        base, target = self._composer_fixture()
+        impact = self._composer_impact()
+        impact["relations"] = [
+            {
+                "direction": "incoming",
+                "peer": {"path": "src/caller.py"},
+                "edge_type": "calls",
+                "evidence_level": "S1",
+                "freshness": {
+                    "source": "python_call_graph_json",
+                    "status": "stale_or_mismatched",
+                },
+            }
+        ]
+        impact["source_statuses"].append(
+            {"source": "python_call_graph_json", "status": "available"}
+        )
+        with (
+            patch.object(
+                mcp,
+                "repoground_context_pack",
+                return_value=self._composer_context_pack(),
+            ),
+            patch.object(
+                mcp, "_repoground_agent_impact_context", return_value=impact
+            ),
+        ):
+            result = mcp.repoground_context_compose(
+                "demo-repo", base, target, context_budget_bytes=4000
+            )
+
+        self.assertNotIn("call_graph", result["retrieval_lanes"]["used"])
+        self.assertIn("call_graph", result["retrieval_lanes"]["skipped"])
+
+    def test_context_compose_claims_call_graph_lane_only_for_consumed_call_graph_evidence(self) -> None:
+        base, target = self._composer_fixture()
+        impact = self._composer_impact()
+        impact["relations"] = [
+            {
+                "direction": "incoming",
+                "peer": {"path": "src/caller.py"},
+                "edge_type": "calls",
+                "evidence_level": "S1",
+                "freshness": {
+                    "source": "python_call_graph_json",
+                    "status": "coherent",
+                },
+            }
+        ]
+        impact["source_statuses"].append(
+            {"source": "python_call_graph_json", "status": "available"}
+        )
+        with (
+            patch.object(
+                mcp,
+                "repoground_context_pack",
+                return_value=self._composer_context_pack(),
+            ),
+            patch.object(
+                mcp, "_repoground_agent_impact_context", return_value=impact
+            ),
+        ):
+            result = mcp.repoground_context_compose(
+                "demo-repo", base, target, context_budget_bytes=4000
+            )
+
+        self.assertIn("call_graph", result["retrieval_lanes"]["used"])
+        self.assertNotIn("call_graph", result["retrieval_lanes"]["skipped"])
+
     def test_context_compose_prioritizes_tests_and_gates_before_large_impact_lanes(self) -> None:
         base, target = self._composer_fixture()
         impact = self._composer_impact()
