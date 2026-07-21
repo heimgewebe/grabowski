@@ -205,6 +205,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "repoground_context_compose": {
+        "category": "knowledge",
+        "purpose": "Compose deterministic diff-bound RepoGround change context under a hard context budget.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "repoground_find_symbol": {
         "category": "knowledge",
         "purpose": "Find bounded Python symbol definitions in an existing RepoGround bundle.",
@@ -1137,6 +1144,13 @@ TOOL_PROFILES.update(
             "risk_class": "medium",
             "effects": ["private_proposal_artifact"],
             "reversibility": "artifact-preserving",
+        },
+        "grabowski_bureau_task_review": {
+            "category": "bureau",
+            "purpose": "Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation.",
+            "risk_class": "medium",
+            "effects": ["private_proposal_artifact"],
+            "reversibility": "artifact-preserving-idempotent-review",
         },
         "grabowski_bureau_task_publish_preview": {
             "category": "bureau",

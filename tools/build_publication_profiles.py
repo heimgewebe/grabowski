@@ -36,6 +36,7 @@ CORE_TOOLS = {
     "repoground_bundle_status",
     "repoground_freshness_check",
     "repoground_context_pack",
+    "repoground_context_compose",
 }
 OPERATOR_ORIENTATION_TOOLS = {
     "grabowski_runtime_health",
@@ -45,6 +46,7 @@ OPERATOR_ORIENTATION_TOOLS = {
     "repoground_bundle_status",
     "repoground_freshness_check",
     "repoground_context_pack",
+    "repoground_context_compose",
 }
 
 

@@ -341,6 +341,17 @@
     },
     {
       "category": "knowledge",
+      "description": "Compose deterministic, diff-bound RepoGround change context under a hard payload budget.",
+      "effects": [],
+      "id": "repoground_context_compose",
+      "purpose": "Compose deterministic diff-bound RepoGround change context under a hard context budget.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_context_compose"
+    },
+    {
+      "category": "knowledge",
       "description": "Find bounded Python symbol definitions in an existing RepoGround bundle.",
       "effects": [],
       "id": "repoground_find_symbol",
@@ -1403,6 +1414,19 @@
     },
     {
       "category": "bureau",
+      "description": "Review one exact Bureau proposal digest without changing Registry, Queue or publication truth.",
+      "effects": [
+        "private_proposal_artifact"
+      ],
+      "id": "grabowski_bureau_task_review",
+      "purpose": "Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation.",
+      "read_only": false,
+      "reversibility": "artifact-preserving-idempotent-review",
+      "risk_class": "medium",
+      "tool": "grabowski_bureau_task_review"
+    },
+    {
+      "category": "bureau",
       "description": "Validate one immutable Bureau proposal and report its exact publication resources without effects.",
       "effects": [],
       "id": "grabowski_bureau_task_publish_preview",
@@ -2125,6 +2149,7 @@
       "repoground_query_existing_index",
       "repoground_range_get",
       "repoground_context_pack",
+      "repoground_context_compose",
       "repoground_find_symbol",
       "repoground_get_callers",
       "repoground_get_callees",
@@ -2209,6 +2234,7 @@
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
+      "grabowski_bureau_task_review",
       "grabowski_bureau_task_publish_preview",
       "grabowski_bureau_task_publish",
       "grabowski_resource_nonconflict_assess",
@@ -2481,7 +2507,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "56a19484b9c58070d03ecbd66e51812dd6966f0d9a2dfdc11daa0dcb59c2cc32"
+      "sha256": "30d57b3c64a63ee0b2d46f08549b76d7f52b5bacbcc2ac908fabe4acf9d8888b"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2489,7 +2515,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "886b616a4e17eebd0b28d2aaf8b7a0f8bcd884658b98b40f7f460d503fdf581a"
+      "sha256": "c6934dbd9d4ee12f9a9409a5d144893cd45a231a0e3b1995d9510a4b04f1a173"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2504,9 +2530,9 @@
       "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
-      "src/grabowski_bureau_intake.py": "1a130619c17e4a4b7b06134cd71dac98b738dac1b5299ce082737b251a20891f",
+      "src/grabowski_bureau_intake.py": "4eab97232ddee6fcebc83232209f37b2babb90d22d9fc809e71111e6d67a4c8b",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "56a19484b9c58070d03ecbd66e51812dd6966f0d9a2dfdc11daa0dcb59c2cc32",
+      "src/grabowski_capabilities.py": "30d57b3c64a63ee0b2d46f08549b76d7f52b5bacbcc2ac908fabe4acf9d8888b",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "e44d25d955ab35efbfe3ec381f84395f070d37fcd8726a0488269a47137ade8f",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
@@ -2522,7 +2548,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "a6831b96338b1dbc55d2b3a7a7b3e97a273ee398040e9e8024e09a7c2b38df79",
+      "src/grabowski_mcp.py": "de9d8a0c3930df26b029f44ce557ddb3443e92d3b27ea5809817e5a7974fa192",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",

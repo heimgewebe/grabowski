@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "56a19484b9c58070d03ecbd66e51812dd6966f0d9a2dfdc11daa0dcb59c2cc32",
+  "capability_source_sha256": "30d57b3c64a63ee0b2d46f08549b76d7f52b5bacbcc2ac908fabe4acf9d8888b",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "886b616a4e17eebd0b28d2aaf8b7a0f8bcd884658b98b40f7f460d503fdf581a",
+  "contract_sha256": "c6934dbd9d4ee12f9a9409a5d144893cd45a231a0e3b1995d9510a4b04f1a173",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -350,6 +350,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "repoground_context_pack"
+    },
+    {
+      "category": "knowledge",
+      "description": "Compose deterministic, diff-bound RepoGround change context under a hard payload budget.",
+      "effects": [],
+      "id": "repoground_context_compose",
+      "purpose": "Compose deterministic diff-bound RepoGround change context under a hard context budget.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_context_compose"
     },
     {
       "category": "knowledge",
@@ -1412,6 +1423,19 @@
       "reversibility": "artifact-preserving",
       "risk_class": "medium",
       "tool": "grabowski_bureau_task_propose"
+    },
+    {
+      "category": "bureau",
+      "description": "Review one exact Bureau proposal digest without changing Registry, Queue or publication truth.",
+      "effects": [
+        "private_proposal_artifact"
+      ],
+      "id": "grabowski_bureau_task_review",
+      "purpose": "Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation.",
+      "read_only": false,
+      "reversibility": "artifact-preserving-idempotent-review",
+      "risk_class": "medium",
+      "tool": "grabowski_bureau_task_review"
     },
     {
       "category": "bureau",
