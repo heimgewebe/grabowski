@@ -13,6 +13,11 @@ import shutil
 import subprocess
 from typing import Any
 
+try:
+    from review_evidence_schemas import validate_evidence
+except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
+    from tools.review_evidence_schemas import validate_evidence
+
 TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reason", "not_applicable"}
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
 STRONG_SEVERITIES = {"p0", "p1", "high", "critical"}
@@ -627,7 +632,13 @@ def classify_complexity(
     }
 
 
-def _load_json_file(path: Path | None, *, label: str) -> dict[str, Any] | None:
+def _load_json_file(
+    path: Path | None,
+    *,
+    label: str,
+    validate_schema: bool = False,
+    schema_failures_fatal: bool = True,
+) -> dict[str, Any] | None:
     if path is None:
         return None
     if not path.is_file():
@@ -641,19 +652,35 @@ def _load_json_file(path: Path | None, *, label: str) -> dict[str, Any] | None:
         raise GateInputError(f"{label} file is not valid JSON: {path}") from exc
     if not isinstance(payload, dict):
         raise GateInputError(f"{label} must be a JSON object")
+    if validate_schema:
+        schema_failures = validate_evidence(payload, label=label)
+        if schema_failures and schema_failures_fatal:
+            raise GateInputError(
+                f"{label} schema validation failed: " + "; ".join(schema_failures)
+            )
     return payload
 
 
 def load_self_review(path: Path | None) -> dict[str, Any] | None:
-    return _load_json_file(path, label="self-review")
+    return _load_json_file(path, label="self-review", validate_schema=True)
 
 
 def load_claude_evidence(path: Path | None) -> dict[str, Any] | None:
-    return _load_json_file(path, label="Claude evidence")
+    return _load_json_file(
+        path,
+        label="Claude evidence",
+        validate_schema=True,
+        schema_failures_fatal=False,
+    )
 
 
 def load_external_review_evidence(path: Path | None) -> dict[str, Any] | None:
-    return _load_json_file(path, label="external review evidence")
+    return _load_json_file(
+        path,
+        label="external review evidence",
+        validate_schema=True,
+        schema_failures_fatal=False,
+    )
 
 
 def load_policy_waiver(path: Path | None) -> dict[str, Any] | None:
@@ -853,7 +880,10 @@ def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any, *, repo_nam
         return []
     if not isinstance(evidence, dict):
         return ["evidence is not a JSON object"]
-    failures: list[str] = []
+    failures: list[str] = [
+        f"schema validation failed: {failure}"
+        for failure in validate_evidence(evidence, label="Claude evidence")
+    ]
     head = pr.get("headRefOid")
     pr_number = pr.get("number")
     schema_version = evidence.get("schema_version")
@@ -1198,7 +1228,12 @@ def _external_review_failures(
     if not isinstance(external_review, dict):
         return ["external review evidence is not a JSON object"]
 
-    failures: list[str] = []
+    failures: list[str] = [
+        f"schema validation failed: {failure}"
+        for failure in validate_evidence(
+            external_review, label="external review evidence"
+        )
+    ]
     head = pr.get("headRefOid")
     pr_number = pr.get("number")
 
