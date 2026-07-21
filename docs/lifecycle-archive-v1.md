@@ -58,15 +58,21 @@ Dateien und Verzeichnisse werden fsync-sicher persistiert. Ein identisches Segme
 
 Die Segmentarchivierung begründet ausdrücklich keine Erlaubnis, Records aus der Taskdatenbank zu löschen. Die spätere aktive Projektion darf erst nach erfolgreicher Segmentverifikation umgestellt werden.
 
+## Effect Plan, Revalidation und create-only Execution Receipts
+
+`build_effect_plan()` bindet einen geplanten Lifecycle-Effekt an die exakten Evidence- und Quell-SHA-256-Digests der betroffenen Identitäten sowie an die erforderlichen typisierten Ressourcen. `revalidate_effect_plan()` prüft diese Bindungen unmittelbar vor einem Effekt erneut gegen aktuelle Klassifikation und exakte Lease-Beobachtungen. Weder Plan noch Revalidation führen selbst eine Mutation aus.
+
+`build_effect_execution_receipt()` erzeugt anschließend ausschließlich den unveränderlichen Beleg für einen bereits beobachteten Effektversuch. Das Receipt bindet Plan, Revalidation, Source-Bindings, Lease-Bindings und Post-State-Digests. Ein bestätigter Erfolg ist nur mit verifiziertem Post-State zulässig. Ein unbekannter Transportausgang oder ein bestätigter Fehler nach möglicher beziehungsweise erfolgter Mutation wird zwingend als `recovery_required` klassifiziert und benötigt mindestens eine konkrete Recovery-Referenz; `blind_retry_allowed` bleibt immer `false`.
+
+`write_effect_execution_receipt()` persistiert create-only unter einer aus der Execution-ID abgeleiteten Identität und ist nur für exakt denselben Plan-/Revalidation-/Receipt-Inhalt idempotent wiederholbar. Ein gleichnamiger widersprüchlicher Beleg schlägt fail-closed fehl. Writer und Verifier verlangen die Ursprungsbelege erneut, sodass ein selbstkonsistent neu gehashter Receipt-Body keine fremde Plan- oder Source-Bindung vortäuschen kann. Das Receipt selbst führt keinen Effekt aus und begründet weder Löschautorität noch abgeschlossene Recovery.
+
 ## Noch getrennte Integrationsarbeit
 
 Für den vollständigen T071-Abschluss fehlen nach diesem Core noch:
 
-- Live-Aggregation von Task-, Workspace-, Lease-, Checkout-, Prozess- und tmux-Evidenz in dieselbe Klassifikation;
+- Ausführungsadapter, die den bereits belegten Plan/Revalidation/Receipt-Vertrag tatsächlich umsetzen, ohne Blind-Retry zu erlauben;
 - persistente Workspace-Archive und Retention-Konvergenz;
 - atomare beziehungsweise recovery-sichere Umstellung der aktiven Taskprojektion nach Segmentverifikation;
-- typisierte paginierte Archiv-Read-Oberflächen;
-- MCP- und Capability-Katalog-Registrierung;
 - Deployment und isolierter Livebeweis.
 
 Diese Schritte dürfen die bestehenden Safety-Grenzen nicht lockern: dirty, fremd geschützt, gemeinsam referenziert oder uneindeutig bleibt unberührbar.
