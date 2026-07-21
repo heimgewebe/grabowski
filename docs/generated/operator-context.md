@@ -57,6 +57,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `repoground_query_existing_index` | knowledge | yes | low | Query a prebuilt RepoGround index without refreshing or mutating the bundle. |
 | `repoground_range_get` | knowledge | yes | low | Resolve one bounded RepoGround range reference without refreshing source artifacts. |
 | `repoground_context_pack` | knowledge | yes | low | Build a bounded RepoGround context pack for agent handoff and Bureau receipts. |
+| `repoground_context_compose` | knowledge | yes | low | Compose deterministic diff-bound RepoGround change context under a hard context budget. |
 | `repoground_find_symbol` | knowledge | yes | low | Find bounded Python symbol definitions in an existing RepoGround bundle. |
 | `repoground_get_callers` | knowledge | yes | low | Read S1 callers while preserving unresolved references separately. |
 | `repoground_get_callees` | knowledge | yes | low | Read S1 callees while preserving S0 call sites separately. |
@@ -140,6 +141,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
 | `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one Bureau candidate read-only against current Registry and Live Register truth. |
 | `grabowski_bureau_task_propose` | bureau | no | medium | Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation. |
+| `grabowski_bureau_task_review` | bureau | no | medium | Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation. |
 | `grabowski_bureau_task_publish_preview` | bureau | yes | low | Validate one Bureau task proposal and return exact publication resources without effects. |
 | `grabowski_bureau_task_publish` | bureau | no | high | Acquire exact short Bureau leases and publish one reviewed task branch and pull request with bounded readback. |
 | `grabowski_resource_nonconflict_assess` | resource | no | medium | Assess and audit complete, attested same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint. |

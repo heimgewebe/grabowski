@@ -86,10 +86,13 @@ The deployment tool reads the exact instructions returned by a real MCP
 - actual byte length;
 - maximum byte length.
 
-That identity is stored in deployment-manifest schema 5. Deployment validation,
-pre-activation probing, post-activation probing, deploy-check and runtime status
-compare the exact identity. Any mismatch blocks or marks the deployment as
-invalid rather than accepting instruction drift.
+That identity is stored in deployment-manifest schema 6. The same manifest also
+binds declared non-Python runtime assets, including the canonical coding-agent
+catalog, to their release-relative paths and SHA-256 values. Deployment
+validation, pre-activation probing, post-activation probing, deploy-check and
+runtime status compare the exact identities. Any mismatch blocks or marks the
+deployment as invalid rather than accepting instruction, source or runtime-asset
+drift.
 
 The MCP `InitializeResult.instructions` field is optional at protocol level.
 Grabowski deliberately makes a valid, exact value mandatory for its own runtime.

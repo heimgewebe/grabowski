@@ -341,6 +341,17 @@
     },
     {
       "category": "knowledge",
+      "description": "Compose deterministic, diff-bound RepoGround change context under a hard payload budget.",
+      "effects": [],
+      "id": "repoground_context_compose",
+      "purpose": "Compose deterministic diff-bound RepoGround change context under a hard context budget.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_context_compose"
+    },
+    {
+      "category": "knowledge",
       "description": "Find bounded Python symbol definitions in an existing RepoGround bundle.",
       "effects": [],
       "id": "repoground_find_symbol",
@@ -1392,6 +1403,19 @@
     },
     {
       "category": "bureau",
+      "description": "Review one exact Bureau proposal digest without changing Registry, Queue or publication truth.",
+      "effects": [
+        "private_proposal_artifact"
+      ],
+      "id": "grabowski_bureau_task_review",
+      "purpose": "Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation.",
+      "read_only": false,
+      "reversibility": "artifact-preserving-idempotent-review",
+      "risk_class": "medium",
+      "tool": "grabowski_bureau_task_review"
+    },
+    {
+      "category": "bureau",
       "description": "Validate one immutable Bureau proposal and report its exact publication resources without effects.",
       "effects": [],
       "id": "grabowski_bureau_task_publish_preview",
@@ -2114,6 +2138,7 @@
       "repoground_query_existing_index",
       "repoground_range_get",
       "repoground_context_pack",
+      "repoground_context_compose",
       "repoground_find_symbol",
       "repoground_get_callers",
       "repoground_get_callees",
@@ -2197,6 +2222,7 @@
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
+      "grabowski_bureau_task_review",
       "grabowski_bureau_task_publish_preview",
       "grabowski_bureau_task_publish",
       "grabowski_resource_nonconflict_assess",
@@ -2469,7 +2495,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "6f0e402bdf3c3f017e82be36d5f91d98f635e15cef45c9b1aeeeb7c2349179c0"
+      "sha256": "3ae4d9f1b8e5e8d5769e550abd7947596c93b5fbfdcf818dab668dab0a06423c"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2477,7 +2503,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "1add9fdbb62bceb194a539c647d84ff6ebe738fb3de46a54df2b3e768e2de47c"
+      "sha256": "2ada01660eb35bd2cf8d607ff6aa88798d85161490467a1eca121804b77b7a82"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2487,18 +2513,18 @@
       "src/grabowski_agent_workspace.py": "8bf6d2f6906360715b1b87e2cc736ddb0f3d8ec5b8e531d867f886c4a117d5eb",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
-      "src/grabowski_artifacts.py": "040e2272ff0345608f512ccc59b1bec6997d3b39da4e9caceaca967c03d6b85d",
+      "src/grabowski_artifacts.py": "4ea793a295ca5d4dc73489795984fe8ffd27d623377d058c6fe5d71ee477fec8",
       "src/grabowski_blockade_authority.py": "f4f5d5260b8f88a01eb176b25427de4726c57a926982cb446b54ccb6e1dbadcd",
       "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
-      "src/grabowski_bureau_intake.py": "1a130619c17e4a4b7b06134cd71dac98b738dac1b5299ce082737b251a20891f",
+      "src/grabowski_bureau_intake.py": "4eab97232ddee6fcebc83232209f37b2babb90d22d9fc809e71111e6d67a4c8b",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "6f0e402bdf3c3f017e82be36d5f91d98f635e15cef45c9b1aeeeb7c2349179c0",
+      "src/grabowski_capabilities.py": "3ae4d9f1b8e5e8d5769e550abd7947596c93b5fbfdcf818dab668dab0a06423c",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "e44d25d955ab35efbfe3ec381f84395f070d37fcd8726a0488269a47137ade8f",
       "src/grabowski_client_snapshot.py": "6ef77ce7f23eb3ed686831ffeae175fef3877fef971ed83fa163a3c4f690d57e",
-      "src/grabowski_coding_agent_router.py": "06813362469d6739e67fc5707dc7bcfb81884f06b50fc6e0dfd3e78197bb64a5",
+      "src/grabowski_coding_agent_router.py": "56f71abd6cfe2da8c3c130b7985539a72cc58524ffd1ed80d63ee4fb6a5f9c0f",
       "src/grabowski_command_identity.py": "8a45a7161aa992c41be86f0b9301077917e47b67034674ea16845e2622e7ffee",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_convergence.py": "03ea75eb190ac08f29c4ec6c5ab1a14a631ce7c0cce4956ed6f437c492a6a635",
@@ -2510,7 +2536,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_mcp.py": "a107a06dc9b73925fd71c774b5532a6bcfece0565bc82740e3d1121f3eff9448",
+      "src/grabowski_mcp.py": "3b0f05d6af13e273b249b763f02f001eddf6843209a0aa9d8ffabe193ad9b407",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",

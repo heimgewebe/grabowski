@@ -827,6 +827,50 @@ def grabowski_bureau_task_propose(
     }
 
 
+@mcp.tool(name="grabowski_bureau_task_review", annotations=MUTATING)
+def grabowski_bureau_task_review(
+    proposal_id: str,
+    reviewer: str,
+    proposal_sha256: str,
+    registry_root: str = str(BUREAU_ROOT),
+) -> dict[str, Any]:
+    """Review one exact Bureau proposal digest without changing Registry, Queue or publication truth."""
+    resolved_root = str(Path(registry_root).expanduser().resolve())
+    operator._require_operator_mutation("terminal_execute", path=resolved_root)
+    if not reviewer.strip():
+        raise ValueError("reviewer must not be empty")
+    if not SHA256_RE.fullmatch(proposal_sha256):
+        raise ValueError("proposal_sha256 must be a lowercase SHA-256 digest")
+    plan_path = _proposal_directory(proposal_id) / "plan.json"
+    if not plan_path.is_file() or plan_path.is_symlink():
+        raise FileNotFoundError(f"unknown proposal: {proposal_id}")
+    payload = _invoke_bureau(
+        [
+            "--root",
+            resolved_root,
+            "--json",
+            "--json-envelope",
+            "operator-task-review",
+            "--plan",
+            str(plan_path),
+            "--reviewer",
+            reviewer,
+            "--proposal-sha256",
+            proposal_sha256,
+        ],
+        mutation=True,
+        required_readback=["proposal_artifact"],
+    )
+    _audit(
+        "bureau-task-review",
+        payload,
+        proposal_id=proposal_id,
+        proposal_sha256=proposal_sha256,
+        reviewer=reviewer,
+    )
+    return {**payload, "adapter_proposal_id": proposal_id}
+
+
 @mcp.tool(name="grabowski_bureau_task_publish_preview", annotations=READ_ONLY)
 def grabowski_bureau_task_publish_preview(
     proposal_id: str,

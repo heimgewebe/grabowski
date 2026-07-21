@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "1add9fdbb62bceb194a539c647d84ff6ebe738fb3de46a54df2b3e768e2de47c"
+    "sha256": "2ada01660eb35bd2cf8d607ff6aa88798d85161490467a1eca121804b77b7a82"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "16a03956866e9484789c3c2d0b32a51244cb12a678d31e6e44a72e5620b0f1bb"
+    "sha256": "baecd6d99e394130d9c7c943f4919c88f5c245e18001912250000ff85b536eaa"
   },
   "counts": {
-    "core": 21,
-    "full": 153,
-    "operator": 138
+    "core": 22,
+    "full": 155,
+    "operator": 140
   },
   "profiles": {
     "core": [
@@ -19,6 +19,7 @@
       "repoground_bundle_status",
       "repoground_freshness_check",
       "repoground_context_pack",
+      "repoground_context_compose",
       "grabowski_runtime_health",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -65,6 +66,7 @@
       "repoground_query_existing_index",
       "repoground_range_get",
       "repoground_context_pack",
+      "repoground_context_compose",
       "repoground_find_symbol",
       "repoground_get_callers",
       "repoground_get_callees",
@@ -148,6 +150,7 @@
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
+      "grabowski_bureau_task_review",
       "grabowski_bureau_task_publish_preview",
       "grabowski_bureau_task_publish",
       "grabowski_resource_nonconflict_assess",
@@ -219,6 +222,7 @@
       "repoground_query_existing_index",
       "repoground_range_get",
       "repoground_context_pack",
+      "repoground_context_compose",
       "repoground_find_symbol",
       "repoground_get_callers",
       "repoground_get_callees",
@@ -288,6 +292,7 @@
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
+      "grabowski_bureau_task_review",
       "grabowski_bureau_task_publish_preview",
       "grabowski_bureau_task_publish",
       "grabowski_resource_nonconflict_assess",
@@ -361,6 +366,7 @@
         "grabowski_verify_audit",
         "repoground_bundle_discover",
         "repoground_bundle_status",
+        "repoground_context_compose",
         "repoground_context_pack",
         "repoground_freshness_check"
       ],
@@ -379,6 +385,7 @@
         "grabowski_runtime_health",
         "repoground_bundle_discover",
         "repoground_bundle_status",
+        "repoground_context_compose",
         "repoground_context_pack",
         "repoground_freshness_check"
       ],
