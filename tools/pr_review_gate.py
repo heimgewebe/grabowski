@@ -14,9 +14,9 @@ import subprocess
 from typing import Any
 
 try:
-    from review_evidence_schemas import validate_evidence
+    from review_evidence_schemas import REVIEW_POLICY_VERSION, validate_evidence
 except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
-    from tools.review_evidence_schemas import validate_evidence
+    from tools.review_evidence_schemas import REVIEW_POLICY_VERSION, validate_evidence
 
 TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reason", "not_applicable"}
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
@@ -1573,6 +1573,8 @@ def build_self_review_audit(
         "repo": _canonical_repo_slug(state.get("repoName")),
         "pr": pr.get("number"),
         "head_sha": pr.get("headRefOid"),
+        "base_sha": pr.get("baseRefOid"),
+        "review_policy_version": REVIEW_POLICY_VERSION,
         "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
         "review_tier": complexity.get("review_tier"),
         "minimum_review_iterations": complexity.get("minimum_self_review_iterations"),
@@ -1679,6 +1681,11 @@ def _required_check_names_from_catalog(text: str) -> tuple[str, ...]:
             raise GateInputError(
                 f"target required-check catalog entry {index} exceeds "
                 f"{MAX_REQUIRED_CHECK_NAME_LENGTH} characters"
+            )
+        if name in DERIVED_REVIEW_STATUS_NAMES:
+            raise GateInputError(
+                "target required-check catalog must not include derived review status "
+                f"{name!r}"
             )
         normalized.append(name)
     if len(normalized) != len(set(normalized)):
