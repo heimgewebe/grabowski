@@ -30,6 +30,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
 MAX_REQUIRED_CHECK_NAMES = 64
 MAX_REQUIRED_CHECK_NAME_LENGTH = 200
 PASS_CHECK_BUCKETS = {"pass"}
+DERIVED_REVIEW_STATUS_NAMES = {"Review evidence gate"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
@@ -2071,6 +2072,8 @@ def evaluate_review_gate(
             continue
         name = check.get("name")
         bucket = check.get("bucket")
+        if name in DERIVED_REVIEW_STATUS_NAMES:
+            continue
         if name in expected_check_names:
             expected_check_buckets_by_name[name].append(bucket)
             if bucket not in PASS_CHECK_BUCKETS:
