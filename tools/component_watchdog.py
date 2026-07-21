@@ -701,6 +701,7 @@ def probe_component(
             if poll_failure in {
                 "control-plane-metrics-unavailable",
                 "control-plane-poll-missing",
+                "control-plane-poll-stale",
                 "control-plane-poll-timestamp-invalid",
             } and not reasons:
                 return ProbeResult(

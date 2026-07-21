@@ -310,7 +310,7 @@ class ControlPlanePollProbeTests(unittest.TestCase):
             ("control-plane-metrics-unavailable",), result.reasons
         )
 
-    def test_tunnel_false_green_becomes_unhealthy_when_poll_is_stale(self) -> None:
+    def test_stale_poll_is_indeterminate_not_restartable(self) -> None:
         with (
             patch.object(
                 watchdog,
@@ -345,7 +345,7 @@ class ControlPlanePollProbeTests(unittest.TestCase):
                 startup_grace=20,
                 http_timeout=2,
             )
-        self.assertEqual("unhealthy", result.status)
+        self.assertEqual("indeterminate", result.status)
         self.assertEqual(("control-plane-poll-stale",), result.reasons)
 
 
