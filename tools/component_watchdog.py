@@ -35,6 +35,8 @@ PROTOCOL_VERSION = "2025-06-18"
 MCP_HEALTH_TOOL = "grabowski_runtime_health"
 MCP_MAX_RESPONSE_BYTES = 65536
 MCP_STDIO_SHUTDOWN_TIMEOUT = 2.0
+CONNECTOR_SNAPSHOT_REFRESH_MAX_OUTPUT_BYTES = 64 * 1024
+CONNECTOR_SNAPSHOT_REFRESH_TIMEOUT_SECONDS = 8.0
 STACK_DUMP_DIRECTORY_NAME = "operator-stackdumps-v1"
 STACK_DUMP_SLOT_COUNT = 8
 STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
@@ -1200,6 +1202,121 @@ def request_python_stack_dump(
         os.close(pidfd)
 
 
+def refresh_connector_snapshot_from_runtime(
+    *,
+    runtime_root: Path,
+    host: str,
+    port: int,
+    connector_pid: int,
+    connector_start_ticks: int,
+    timeout_seconds: float = CONNECTOR_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    """Refresh snapshot evidence without making snapshot failure a tunnel restart signal."""
+    try:
+        root = runtime_root.expanduser().resolve(strict=True)
+    except OSError:
+        return {"state": "error", "reason": "runtime-root-unavailable"}
+    executable = root / ".venv/bin/python"
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        return {"state": "error", "reason": "runtime-python-unavailable"}
+    if connector_pid <= 0 or connector_start_ticks < 0:
+        return {"state": "error", "reason": "connector-process-identity-unavailable"}
+    mcp_url = f"http://{host}:{port}/mcp"
+    child_environment = os.environ.copy()
+    child_environment.pop("PYTHONHOME", None)
+    child_environment.pop("PYTHONPATH", None)
+    child_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    child_environment["PYTHONNOUSERSITE"] = "1"
+    command = [
+        str(executable),
+        "-I",
+        "-m",
+        "grabowski_client_snapshot",
+        "refresh-if-needed",
+        "--runtime-root",
+        str(root),
+        "--mcp-url",
+        mcp_url,
+        "--connector-pid",
+        str(connector_pid),
+        "--connector-start-ticks",
+        str(connector_start_ticks),
+        "--timeout-seconds",
+        str(timeout_seconds),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(root),
+            env=child_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=max(1.0, timeout_seconds + 2.0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"state": "error", "reason": "snapshot-refresh-process-failed"}
+    encoded = completed.stdout.encode("utf-8", errors="replace")
+    if len(encoded) > CONNECTOR_SNAPSHOT_REFRESH_MAX_OUTPUT_BYTES:
+        return {"state": "error", "reason": "snapshot-refresh-output-too-large"}
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        return {"state": "error", "reason": "snapshot-refresh-output-missing"}
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return {"state": "error", "reason": "snapshot-refresh-output-invalid"}
+    if not isinstance(payload, dict):
+        return {"state": "error", "reason": "snapshot-refresh-output-invalid"}
+    state = payload.get("state")
+    if completed.returncode != 0 or state not in {"not_due", "renewed"}:
+        reason = payload.get("reason")
+        return {
+            "state": "error",
+            "reason": reason if isinstance(reason, str) and len(reason) <= 256 else "snapshot-refresh-failed",
+        }
+    allowed = {
+        key: payload[key]
+        for key in (
+            "state",
+            "reason",
+            "tool_count",
+            "names_sha256",
+            "release_id",
+            "receipt_sha256",
+            "session_id_sha256",
+        )
+        if key in payload
+    }
+    return allowed
+
+
+def _emit_connector_snapshot_refresh(
+    args: argparse.Namespace,
+    probe: ProbeResult,
+) -> None:
+    if (
+        args.component != "tunnel"
+        or args.check_only
+        or probe.pid is None
+        or probe.start_ticks is None
+    ):
+        return
+    result = refresh_connector_snapshot_from_runtime(
+        runtime_root=args.runtime_root,
+        host=args.host,
+        port=args.port,
+        connector_pid=probe.pid,
+        connector_start_ticks=probe.start_ticks,
+    )
+    emit(
+        "grabowski.connector_snapshot.refresh",
+        component=args.component,
+        service=args.service,
+        **result,
+    )
+
+
 def restart_service(service: str) -> None:
     try:
         subprocess.run(
@@ -1262,6 +1379,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
             }
 
             if probe.status == "healthy":
+                _emit_connector_snapshot_refresh(args, probe)
                 state = reset_after_healthy(
                     state,
                     now=int(time.time()),
@@ -1369,6 +1487,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     mcp_url=args.mcp_url,
                 )
                 if final_probe.status == "healthy":
+                    _emit_connector_snapshot_refresh(args, final_probe)
                     recovered_state = reset_after_healthy(
                         next_state,
                         now=int(time.time()),
