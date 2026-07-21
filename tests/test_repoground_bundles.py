@@ -1470,6 +1470,76 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
             "does_not_establish": ["test_sufficiency", "runtime_behavior"],
         }
 
+    def test_context_lane_policy_rejects_missing_or_unknown_configuration(self) -> None:
+        lane_values = {name: [] for name in mcp._REPOGROUND_CONTEXT_LANE_CONFIG}
+        lane_values["unconfigured_lane"] = []
+        with self.assertRaisesRegex(RuntimeError, "configuration mismatch"):
+            mcp._repoground_context_lane_policy(lane_values)
+
+        lane_values = {name: [] for name in mcp._REPOGROUND_CONTEXT_LANE_CONFIG}
+        lane_values.pop("target_symbols")
+        with self.assertRaisesRegex(RuntimeError, "configuration mismatch"):
+            mcp._repoground_context_lane_policy(lane_values)
+
+    def test_budget_context_distinguishes_policy_caps_from_byte_budget(self) -> None:
+        items = [{"id": index} for index in range(5)]
+        context, counts, used_bytes = mcp._repoground_budget_context(
+            [("query_snippets", items)],
+            10_000,
+            lane_item_limits={"query_snippets": 2},
+        )
+
+        self.assertEqual(context["query_snippets"], items[:2])
+        self.assertEqual(counts["query_snippets"]["available"], 5)
+        self.assertEqual(counts["query_snippets"]["considered"], 2)
+        self.assertEqual(counts["query_snippets"]["included"], 2)
+        self.assertEqual(counts["query_snippets"]["policy_omitted"], 3)
+        self.assertEqual(counts["query_snippets"]["budget_omitted"], 0)
+        self.assertEqual(used_bytes, mcp._repoground_json_bytes(context))
+
+    def test_budget_context_preserves_cross_lane_coverage_before_priority_fill(self) -> None:
+        direct_changes = [
+            {"payload": "d" * 120},
+            {"payload": "d" * 60},
+        ]
+        target_symbols = [{"payload": "s" * 20}]
+        causal_relations = [{"payload": "c" * 20}]
+        coverage_context = {
+            "direct_changes": direct_changes[:1],
+            "target_symbols": target_symbols,
+            "causal_relations": causal_relations,
+        }
+        limit = mcp._repoground_json_bytes(coverage_context)
+        self.assertLessEqual(
+            mcp._repoground_json_bytes({"direct_changes": direct_changes}),
+            limit,
+        )
+
+        context, counts, used_bytes = mcp._repoground_budget_context(
+            [
+                ("direct_changes", direct_changes),
+                ("target_symbols", target_symbols),
+                ("causal_relations", causal_relations),
+            ],
+            limit,
+            lane_item_limits={
+                "direct_changes": 2,
+                "target_symbols": 1,
+                "causal_relations": 1,
+            },
+            lane_min_items={
+                "direct_changes": 1,
+                "target_symbols": 1,
+                "causal_relations": 1,
+            },
+        )
+
+        self.assertEqual(len(context["direct_changes"]), 1)
+        self.assertEqual(len(context["target_symbols"]), 1)
+        self.assertEqual(len(context["causal_relations"]), 1)
+        self.assertEqual(counts["direct_changes"]["budget_omitted"], 1)
+        self.assertEqual(used_bytes, mcp._repoground_json_bytes(context))
+
     def test_context_compose_is_deterministic_diff_bound_and_budgeted(self) -> None:
         base, target = self._composer_fixture()
         with (
@@ -1517,7 +1587,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertLessEqual(
             first["compactness"]["ratio"], first["compactness"]["target_max_ratio"]
         )
-        self.assertEqual(first["sampling_policy"]["kind"], "deterministic_lane_caps_v1")
+        self.assertEqual(first["sampling_policy"]["kind"], "deterministic_priority_lane_caps_v2")
         self.assertIn("direct_changes", first["context"])
         self.assertIn("related_tests", first["context"])
         self.assertIn("authority_ordered_rules", first["context"])
@@ -1530,6 +1600,14 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertIn("query_context", first["retrieval_lanes"]["used"])
         self.assertFalse(first["dirty_overlay"]["included_in_revision_diff"])
         self.assertNotIn("raw_diff", first)
+        self.assertEqual(
+            first["sampling_policy"]["allocation_strategy"],
+            "minimum_coverage_then_priority_fill_v1",
+        )
+        self.assertLess(
+            first["sampling_policy"]["lane_order_used"].index("target_symbols"),
+            first["sampling_policy"]["lane_order_used"].index("query_snippets"),
+        )
         self.assertIn("patch_correctness", first["does_not_establish"])
         self.assertIn("merge_readiness", first["does_not_establish"])
 
@@ -1569,6 +1647,10 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertEqual(
             result["context_budget"]["lane_counts"]["target_symbols"]["considered"], 8
         )
+        self.assertEqual(
+            result["sampling_policy"]["effective_priorities"]["target_symbols"], 80
+        )
+        self.assertIn("target_symbols", result["sampling_policy"]["policy_limited_lanes"])
         self.assertLessEqual(
             result["compactness"]["ratio"], result["compactness"]["target_max_ratio"]
         )
