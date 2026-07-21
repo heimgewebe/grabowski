@@ -1,0 +1,49 @@
+name: Review evidence status
+
+on:
+  issue_comment:
+    types:
+      - created
+      - edited
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: review-evidence-status-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  review-evidence-status:
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/grabowski-review-evidence') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout trusted default-branch evaluator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Evaluate sanitized review evidence and publish commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW_GATE_COMMENT_BODY: ${{ github.event.comment.body }}
+          REVIEW_GATE_PR: ${{ github.event.issue.number }}
+          REVIEW_GATE_ACTOR: ${{ github.actor }}
+          REVIEW_GATE_COMMENT_ID: ${{ github.event.comment.id }}
+        run: >-
+          python3 tools/pr_review_gate_ci.py evaluate-comment
+          --pr "$REVIEW_GATE_PR"
+          --actor "$REVIEW_GATE_ACTOR"
+          --comment-id "$REVIEW_GATE_COMMENT_ID"
+          --comment-body-env REVIEW_GATE_COMMENT_BODY
+          --publish-status
