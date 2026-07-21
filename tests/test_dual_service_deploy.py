@@ -1394,6 +1394,217 @@ class SafetyObserverUnitTests(unittest.TestCase):
         install.assert_not_called()
 
 
+class WatchdogHostAssetProjectionTests(unittest.TestCase):
+    def snapshot(self):
+        return SimpleNamespace(repo_head="a" * 40)
+
+    def test_default_projection_declares_complete_watchdog_asset_set(self) -> None:
+        self.assertEqual(5, len(dual.WATCHDOG_HOST_ASSETS))
+        self.assertEqual(
+            {
+                "tools/component_watchdog.py",
+                "systemd/grabowski-operator-watchdog.service.example",
+                "systemd/grabowski-operator-watchdog.timer.example",
+                "systemd/grabowski-tunnel-watchdog.service.example",
+                "systemd/grabowski-tunnel-watchdog.timer.example",
+            },
+            {asset.source.as_posix() for asset in dual.WATCHDOG_HOST_ASSETS},
+        )
+        self.assertEqual(
+            {
+                "grabowski-operator-watchdog.service",
+                "grabowski-operator-watchdog.timer",
+                "grabowski-tunnel-watchdog.service",
+                "grabowski-tunnel-watchdog.timer",
+            },
+            {asset.unit for asset in dual.WATCHDOG_HOST_ASSETS if asset.unit},
+        )
+
+    def test_projection_is_git_head_bound_atomic_and_reversible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "libexec" / "component_watchdog.py"
+            target.parent.mkdir()
+            target.write_bytes(b"old")
+            target.chmod(0o700)
+            asset = dual.WatchdogHostAsset(
+                source=Path("tools/component_watchdog.py"),
+                target=target,
+                mode=0o700,
+            )
+            with (
+                mock.patch.object(core, "git_show", return_value=b"new") as git_show,
+                mock.patch.object(
+                    dual, "verify_watchdog_systemd_fragments", return_value={}
+                ),
+            ):
+                projection = dual.install_watchdog_host_assets(
+                    ROOT, self.snapshot(), assets=(asset,)
+                )
+                self.assertEqual(b"new", target.read_bytes())
+                self.assertEqual(0o700, target.stat().st_mode & 0o777)
+                dual.restore_watchdog_host_assets(projection)
+            self.assertEqual(b"old", target.read_bytes())
+            self.assertEqual(0o700, target.stat().st_mode & 0o777)
+            git_show.assert_called_once_with(ROOT, "a" * 40, asset.source)
+
+    def test_projection_rejects_symlink_and_hardlink_targets_without_damage(self) -> None:
+        for kind in ("symlink", "hardlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                victim = root / "victim"
+                victim.write_bytes(b"keep")
+                target = root / "target"
+                if kind == "symlink":
+                    target.symlink_to(victim)
+                else:
+                    target.hardlink_to(victim)
+                asset = dual.WatchdogHostAsset(
+                    source=Path("tools/component_watchdog.py"),
+                    target=target,
+                    mode=0o700,
+                )
+                with mock.patch.object(core, "git_show", return_value=b"new"):
+                    with self.assertRaises(core.DeployError):
+                        dual.install_watchdog_host_assets(
+                            ROOT, self.snapshot(), assets=(asset,)
+                        )
+                self.assertEqual(b"keep", victim.read_bytes())
+
+    def test_partial_projection_failure_restores_prior_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = dual.WatchdogHostAsset(
+                source=Path("first"), target=root / "first", mode=0o700
+            )
+            second = dual.WatchdogHostAsset(
+                source=Path("second"), target=root / "second", mode=0o700
+            )
+            first.target.write_bytes(b"old-first")
+            first.target.chmod(0o700)
+            second.target.write_bytes(b"old-second")
+            second.target.chmod(0o700)
+            original_write = dual._atomic_write_watchdog_host_asset
+
+            def write(asset, data, mode, preimage):
+                if asset.target == second.target:
+                    raise core.DeployError("second failed")
+                return original_write(asset, data, mode, preimage)
+
+            with (
+                mock.patch.object(
+                    core,
+                    "git_show",
+                    side_effect=lambda _repo, _head, path: (
+                        b"new-first" if path == first.source else b"new-second"
+                    ),
+                ),
+                mock.patch.object(
+                    dual, "_atomic_write_watchdog_host_asset", side_effect=write
+                ),
+                mock.patch.object(
+                    dual, "verify_watchdog_systemd_fragments", return_value={}
+                ),
+            ):
+                with self.assertRaisesRegex(core.DeployError, "second failed"):
+                    dual.install_watchdog_host_assets(
+                        ROOT, self.snapshot(), assets=(first, second)
+                    )
+            self.assertEqual(b"old-first", first.target.read_bytes())
+            self.assertEqual(b"old-second", second.target.read_bytes())
+
+    def test_post_publish_failure_still_restores_published_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "asset"
+            target.write_bytes(b"old")
+            target.chmod(0o700)
+            asset = dual.WatchdogHostAsset(
+                source=Path("asset"), target=target, mode=0o700
+            )
+            original_write = dual._atomic_write_watchdog_host_asset
+
+            def write_then_fail(asset_arg, data, mode, preimage):
+                original_write(asset_arg, data, mode, preimage)
+                if data == b"new":
+                    raise core.DeployError("readback failed")
+
+            with (
+                mock.patch.object(core, "git_show", return_value=b"new"),
+                mock.patch.object(
+                    dual,
+                    "_atomic_write_watchdog_host_asset",
+                    side_effect=write_then_fail,
+                ),
+                mock.patch.object(
+                    dual, "verify_watchdog_systemd_fragments", return_value={}
+                ),
+            ):
+                with self.assertRaisesRegex(core.DeployError, "readback failed"):
+                    dual.install_watchdog_host_assets(
+                        ROOT, self.snapshot(), assets=(asset,)
+                    )
+            self.assertEqual(b"old", target.read_bytes())
+
+    def test_daemon_reload_failure_restores_changed_unit_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "watchdog.service"
+            target.write_bytes(b"old-unit")
+            target.chmod(0o600)
+            asset = dual.WatchdogHostAsset(
+                source=Path("unit"),
+                target=target,
+                mode=0o600,
+                unit="watchdog.service",
+            )
+            reload_calls = 0
+
+            def reload():
+                nonlocal reload_calls
+                reload_calls += 1
+                if reload_calls == 1:
+                    raise core.DeployError("daemon reload failed")
+
+            with (
+                mock.patch.object(core, "git_show", return_value=b"new-unit"),
+                mock.patch.object(dual, "_systemd_daemon_reload", side_effect=reload),
+                mock.patch.object(
+                    dual, "verify_watchdog_systemd_fragments", return_value={}
+                ),
+            ):
+                with self.assertRaisesRegex(core.DeployError, "daemon reload failed"):
+                    dual.install_watchdog_host_assets(
+                        ROOT, self.snapshot(), assets=(asset,)
+                    )
+            self.assertEqual(2, reload_calls)
+            self.assertEqual(b"old-unit", target.read_bytes())
+            self.assertEqual(0o600, target.stat().st_mode & 0o777)
+
+    def test_systemd_fragment_readback_must_match_projected_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "watchdog.service"
+            target.write_text("[Service]\nType=oneshot\n", encoding="utf-8")
+            asset = dual.WatchdogHostAsset(
+                source=Path("unit"),
+                target=target,
+                mode=0o600,
+                unit="watchdog.service",
+            )
+            completed = SimpleNamespace(
+                returncode=0, stdout=str(target) + "\n", stderr=""
+            )
+            with mock.patch.object(core, "run", return_value=completed):
+                self.assertEqual(
+                    {"watchdog.service": str(target)},
+                    dual.verify_watchdog_systemd_fragments((asset,)),
+                )
+            wrong = SimpleNamespace(
+                returncode=0, stdout=str(target.parent / "other") + "\n", stderr=""
+            )
+            with mock.patch.object(core, "run", return_value=wrong):
+                with self.assertRaisesRegex(core.DeployError, "kanonisch projizierte"):
+                    dual.verify_watchdog_systemd_fragments((asset,))
+
+
 class DeploymentSequenceTests(unittest.TestCase):
     def snapshot(self):
         return SimpleNamespace(
@@ -1409,6 +1620,15 @@ class DeploymentSequenceTests(unittest.TestCase):
             release_id="new",
             protocol_version="2025-06-18",
             agent_instructions=TEST_AGENT_INSTRUCTIONS_IDENTITY,
+        )
+
+    def watchdog_projection(self):
+        return dual.WatchdogHostAssetProjection(
+            repo_head="a" * 40,
+            preimages=(),
+            expected={},
+            changed_targets=(),
+            asset_set_sha256="w" * 64,
         )
 
     def test_url_preflight_requires_operator_listener(self) -> None:
@@ -1512,6 +1732,13 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(core, "capture_pointer", return_value=SimpleNamespace()),
             mock.patch.object(
                 dual,
+                "install_watchdog_host_assets",
+                side_effect=lambda *args: events.append("install:watchdogs")
+                or self.watchdog_projection(),
+            ) as install_watchdogs,
+            mock.patch.object(dual, "restore_watchdog_host_assets") as restore_watchdogs,
+            mock.patch.object(
+                dual,
                 "install_safety_observer_unit",
                 side_effect=lambda *args: events.append("install:observer"),
             ) as install,
@@ -1564,6 +1791,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             [
                 "verify:snapshot",
                 "verify:manifest",
+                "install:watchdogs",
                 "install:observer",
                 "verify:snapshot",
                 f"stop:{dual.TUNNEL_SERVICE}",
@@ -1578,6 +1806,8 @@ class DeploymentSequenceTests(unittest.TestCase):
             ],
         )
         install.assert_called_once_with(ROOT, snapshot)
+        install_watchdogs.assert_called_once_with(ROOT, snapshot)
+        restore_watchdogs.assert_not_called()
 
     def test_legacy_stdio_deploy_never_installs_observer_unit(self) -> None:
         snapshot = self.snapshot()
@@ -1590,6 +1820,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             ),
             mock.patch.object(core, "deploy") as deploy,
             mock.patch.object(core, "build_release") as build,
+            mock.patch.object(dual, "install_watchdog_host_assets") as install_watchdogs,
             mock.patch.object(dual, "install_safety_observer_unit") as install,
         ):
             dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
@@ -1600,6 +1831,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             timeout_seconds=1,
         )
         build.assert_not_called()
+        install_watchdogs.assert_not_called()
         install.assert_not_called()
 
     def test_operator_stop_failure_prevents_pointer_activation(self) -> None:
@@ -1633,6 +1865,10 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(core, "verify_apply_snapshot_unchanged"),
             mock.patch.object(core, "verify_manifest"),
             mock.patch.object(core, "capture_pointer", return_value=SimpleNamespace()),
+            mock.patch.object(
+                dual, "install_watchdog_host_assets", return_value=self.watchdog_projection()
+            ),
+            mock.patch.object(dual, "restore_watchdog_host_assets") as restore_watchdogs,
             mock.patch.object(
                 dual, "install_safety_observer_unit", return_value=repair
             ),
@@ -1703,6 +1939,10 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(core, "verify_manifest"),
             mock.patch.object(core, "capture_pointer", return_value=SimpleNamespace()),
             mock.patch.object(
+                dual, "install_watchdog_host_assets", return_value=self.watchdog_projection()
+            ),
+            mock.patch.object(dual, "restore_watchdog_host_assets") as restore_watchdogs,
+            mock.patch.object(
                 dual, "install_safety_observer_unit", return_value=repair
             ),
             mock.patch.object(dual, "stop_service") as stop,
@@ -1721,7 +1961,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 if line.startswith("PRIMARY-DEPLOY-ERROR: ")
             )
         )
-        self.assertEqual(payload["deploy_phase"], "post-observer-snapshot-revalidation")
+        self.assertEqual(payload["deploy_phase"], "post-host-assets-snapshot-revalidation")
         self.assertEqual(
             payload["observer_safety_repair"],
             {
@@ -1759,6 +1999,10 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(core, "verify_apply_snapshot_unchanged"),
             mock.patch.object(core, "verify_manifest"),
             mock.patch.object(core, "capture_pointer", return_value=SimpleNamespace()),
+            mock.patch.object(
+                dual, "install_watchdog_host_assets", return_value=self.watchdog_projection()
+            ),
+            mock.patch.object(dual, "restore_watchdog_host_assets") as restore_watchdogs,
             mock.patch.object(
                 dual,
                 "install_safety_observer_unit",
