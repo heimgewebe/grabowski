@@ -41,6 +41,7 @@ TERMINAL_TASK_STATES = {
 }
 MAX_FAILED_UNITS = 2_000
 MAX_JOB_SCAN_ENTRIES = 2_000
+MAX_JOB_REGISTRY_ENTRIES = 100_000
 MAX_ARCHIVE_JOBS_PER_PLAN = 128
 MAX_JOB_RUNTIME_SECONDS = 2_592_000
 JOB_RUNTIME_GRACE_SECONDS = 300
@@ -938,16 +939,27 @@ def build_plan(
     if len(failed) > MAX_FAILED_UNITS:
         raise RuntimeError("failed-unit inventory exceeds the bounded scan")
 
-    entries = sorted(
-        (
-            entry
-            for entry in jobs_root.iterdir()
-            if entry.name.startswith("grabowski-job-")
-        ),
-        key=lambda entry: entry.name,
-    )
-    if len(entries) > MAX_JOB_SCAN_ENTRIES:
-        raise RuntimeError("job registry exceeds the bounded retention scan")
+    registry_entries = [
+        entry
+        for entry in jobs_root.iterdir()
+        if entry.name.startswith("grabowski-job-")
+    ]
+    if len(registry_entries) > MAX_JOB_REGISTRY_ENTRIES:
+        raise RuntimeError("job registry exceeds the bounded discovery limit")
+    registry_entries.sort(key=lambda entry: entry.name)
+    primary_entries = registry_entries[:MAX_JOB_SCAN_ENTRIES]
+    failed_job_names = {
+        unit.removesuffix(".service")
+        for unit in failed
+        if JOB_UNIT.fullmatch(unit)
+    }
+    selected_by_name = {entry.name: entry for entry in primary_entries}
+    for entry in registry_entries[MAX_JOB_SCAN_ENTRIES:]:
+        if entry.name in failed_job_names:
+            selected_by_name[entry.name] = entry
+    entries = sorted(selected_by_name.values(), key=lambda entry: entry.name)
+    job_scan_truncated = len(registry_entries) > len(entries)
+    job_scan_deferred_count = len(registry_entries) - len(entries)
     typed_entries = [entry for entry in entries if JOB_NAME.fullmatch(entry.name)]
     job_units = [entry.name + ".service" for entry in typed_entries]
     worker_units = [unit for unit in failed if WORKER_UNIT.fullmatch(unit)]
@@ -1086,7 +1098,11 @@ def build_plan(
         "task_db": str(task_db),
         "worker_db": str(worker_db),
         "resource_db": str(resource_db),
+        "job_registry_entry_count": len(registry_entries),
         "job_scan_count": len(entries),
+        "job_scan_truncated": job_scan_truncated,
+        "job_scan_deferred_count": job_scan_deferred_count,
+        "archive_inventory_complete": not job_scan_truncated,
         "archive_eligible_count": len(eligible),
         "archive_deferred_count": archive_deferred_count,
         "protected_nonterminal_jobs": sorted(

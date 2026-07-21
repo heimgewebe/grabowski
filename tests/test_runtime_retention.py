@@ -853,6 +853,92 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(plan["archive_eligible_count"], 3)
             self.assertEqual(plan["archive_deferred_count"], 1)
 
+    def test_oversized_job_registry_keeps_task_reset_planning_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            states: dict[str, dict[str, str]] = {}
+            for index in range(3):
+                job_name = f"grabowski-job-{index + 1:012x}"
+                unit = job_name + ".service"
+                self._job(jobs, job_name, 100 + index)
+                if index < 2:
+                    states[unit] = self._state(unit)
+            task_unit = "grabowski-task-" + "a" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+            with patch.object(RETENTION, "MAX_JOB_SCAN_ENTRIES", 2):
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50,
+                    max_archive_jobs=2,
+                    now=1_000,
+                    jobs_root=jobs,
+                    archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=task_db,
+                    failed_units=[task_unit],
+                    unit_states=states,
+                )
+            self.assertEqual(plan["job_registry_entry_count"], 3)
+            self.assertEqual(plan["job_scan_count"], 2)
+            self.assertTrue(plan["job_scan_truncated"])
+            self.assertEqual(plan["job_scan_deferred_count"], 1)
+            self.assertFalse(plan["archive_inventory_complete"])
+            self.assertEqual(plan["reset_failed_units"], [task_unit])
+
+    def test_failed_job_outside_primary_scan_is_still_classified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            names = [
+                "grabowski-job-000000000001",
+                "grabowski-job-000000000002",
+                "grabowski-job-ffffffffffff",
+            ]
+            states: dict[str, dict[str, str]] = {}
+            for index, job_name in enumerate(names):
+                unit = job_name + ".service"
+                self._job(jobs, job_name, 100 + index)
+                states[unit] = self._state(
+                    unit,
+                    active="failed" if index == 2 else "inactive",
+                    load="loaded" if index == 2 else "not-found",
+                    result="exit-code" if index == 2 else "success",
+                )
+            failed_unit = names[-1] + ".service"
+            with patch.object(RETENTION, "MAX_JOB_SCAN_ENTRIES", 2):
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50,
+                    max_archive_jobs=3,
+                    now=1_000,
+                    jobs_root=jobs,
+                    archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3",
+                    failed_units=[failed_unit],
+                    unit_states=states,
+                )
+            self.assertEqual(plan["job_registry_entry_count"], 3)
+            self.assertEqual(plan["job_scan_count"], 3)
+            self.assertFalse(plan["job_scan_truncated"])
+            self.assertIn(failed_unit, plan["reset_failed_units"])
+
+    def test_job_registry_discovery_limit_remains_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            for index in range(3):
+                self._job(jobs, f"grabowski-job-{index + 1:012x}", 100 + index)
+            with patch.object(RETENTION, "MAX_JOB_REGISTRY_ENTRIES", 2):
+                with self.assertRaisesRegex(RuntimeError, "bounded discovery limit"):
+                    RETENTION.build_plan(
+                        jobs_root=jobs,
+                        archive_root=root / "archive",
+                        receipt_root=root / "receipts",
+                        task_db=root / "missing.sqlite3",
+                        failed_units=[],
+                        unit_states={},
+                    )
+
     def test_failed_job_keeps_failed_state_while_archive_is_deferred(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
