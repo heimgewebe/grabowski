@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 import sys
 import tempfile
@@ -57,6 +58,7 @@ class RuntimePythonBindingTests(unittest.TestCase):
         *,
         transport: str = "local",
         checkout: bool = True,
+        enabled: bool = True,
     ) -> list[str]:
         with (
             patch.object(tasks, "GRABOWSKI_RUNTIME_PYTHON", self.runtime_python),
@@ -68,7 +70,30 @@ class RuntimePythonBindingTests(unittest.TestCase):
                 command,
                 target={"transport": transport},
                 cwd="/tmp/grabowski-worktree",
+                enabled=enabled,
             )
+
+    def test_task_start_runtime_python_is_explicit_opt_in(self) -> None:
+        parameter = inspect.signature(tasks.grabowski_task_start).parameters[
+            "runtime_python"
+        ]
+        self.assertIs(parameter.default, False)
+
+    def test_default_unqualified_python_is_unchanged_without_checkout_probe(self) -> None:
+        command = ["python3", "-c", "import mcp"]
+        with patch.object(tasks, "_is_local_grabowski_checkout") as checkout_probe:
+            result = tasks._bind_grabowski_runtime_python(
+                command,
+                target={"transport": "local"},
+                cwd="/tmp/grabowski-worktree",
+                enabled=False,
+            )
+        self.assertIs(result, command)
+        checkout_probe.assert_not_called()
+
+    def test_pytest_command_is_unchanged_without_opt_in(self) -> None:
+        command = ["python", "-m", "pytest"]
+        self.assertIs(self._bind(command, enabled=False), command)
 
     def test_direct_unqualified_python_uses_runtime_interpreter(self) -> None:
         command = ["python3", "-c", "import mcp"]
@@ -112,6 +137,7 @@ class RuntimePythonBindingTests(unittest.TestCase):
                 command,
                 target={"transport": "ssh"},
                 cwd="/remote/repository",
+                enabled=True,
             )
         self.assertIs(result, command)
         checkout_probe.assert_not_called()
@@ -127,6 +153,7 @@ class RuntimePythonBindingTests(unittest.TestCase):
                     ["python", "-c", "import mcp"],
                     target={"transport": "local"},
                     cwd="/tmp/grabowski-worktree",
+                    enabled=True,
                 )
 
     def test_origin_normalization_accepts_canonical_github_forms(self) -> None:

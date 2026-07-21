@@ -1008,7 +1008,12 @@ def _bind_grabowski_runtime_python(
     *,
     target: dict[str, Any],
     cwd: str,
+    enabled: bool,
 ) -> list[str]:
+    if not isinstance(enabled, bool):
+        raise ValueError("runtime_python must be boolean")
+    if not enabled:
+        return command
     python_index = _unqualified_python_index(command)
     if python_index is None or target["transport"] != "local":
         return command
@@ -2107,6 +2112,7 @@ def grabowski_task_start(
     chronik_outbox: bool = False,
     chronik_outbox_state_root: str | None = None,
     chronik_operation: str = "other",
+    runtime_python: bool = False,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -2119,7 +2125,10 @@ def grabowski_task_start(
     recovery_gate = _require_recovery_gate(command)
     working_directory = _validate_cwd(host, cwd)
     command = _bind_grabowski_runtime_python(
-        command, target=target, cwd=working_directory
+        command,
+        target=target,
+        cwd=working_directory,
+        enabled=runtime_python,
     )
     runtime = operator._job_runtime(runtime_seconds)
     policy = _validate_resume_policy(resume_policy)
