@@ -1400,7 +1400,7 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         return SimpleNamespace(repo_head="a" * 40)
 
     def test_default_projection_declares_complete_watchdog_asset_set(self) -> None:
-        self.assertEqual(6, len(dual.WATCHDOG_HOST_ASSETS))
+        self.assertEqual(8, len(dual.WATCHDOG_HOST_ASSETS))
         self.assertEqual(
             {
                 "tools/component_watchdog.py",
@@ -1409,6 +1409,8 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 "systemd/grabowski-operator-watchdog.timer.example",
                 "systemd/grabowski-tunnel-watchdog.service.example",
                 "systemd/grabowski-tunnel-watchdog.timer.example",
+                "systemd/grabowski-runtime-retention.service.example",
+                "systemd/grabowski-runtime-retention.timer.example",
             },
             {asset.source.as_posix() for asset in dual.WATCHDOG_HOST_ASSETS},
         )
@@ -1418,6 +1420,8 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 "grabowski-operator-watchdog.timer",
                 "grabowski-tunnel-watchdog.service",
                 "grabowski-tunnel-watchdog.timer",
+                "grabowski-runtime-retention.service",
+                "grabowski-runtime-retention.timer",
             },
             {asset.unit for asset in dual.WATCHDOG_HOST_ASSETS if asset.unit},
         )

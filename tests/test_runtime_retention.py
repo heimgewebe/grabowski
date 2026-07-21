@@ -277,13 +277,22 @@ class RuntimeRetentionTests(unittest.TestCase):
                 archive_root=archive,
                 receipt_root=receipts,
                 task_db=task_db,
-                failed_units=[job_unit, task_unit, "grabowski-gui-worker-deadbeef.service"],
+                failed_units=[
+                    job_unit,
+                    task_unit,
+                    "grabowski-gui-worker-deadbeef.service",
+                    "grabowski-operator.service",
+                ],
                 unit_states={job_unit: self._state(job_unit)},
             )
 
             self.assertEqual(plan["reset_failed_units"], [job_unit, task_unit])
             self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [job_unit])
-            self.assertEqual(plan["blocked"][0]["unit"], "grabowski-gui-worker-deadbeef.service")
+            blocked_units = {item["unit"] for item in plan["blocked"]}
+            self.assertEqual(
+                blocked_units,
+                {"grabowski-gui-worker-deadbeef.service", "grabowski-operator.service"},
+            )
             self.assertRegex(plan["plan_sha256"], r"^[0-9a-f]{64}$")
 
     def test_failed_worker_reset_requires_bound_db_systemd_and_no_live_lease(self) -> None:
@@ -735,13 +744,33 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertGreaterEqual(reset.call_count, 1)
             self.assertEqual(reset.call_args.args[0], ["systemctl", "--user", "reset-failed", unit])
 
-    def test_unknown_task_outcome_remains_blocked(self) -> None:
+    def test_nonterminal_and_ambiguous_task_outcomes_remain_blocked(self) -> None:
+        for state in ("running", "outcome_unknown", "interrupted"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                jobs = root / "jobs"
+                jobs.mkdir(mode=0o700)
+                task_unit = "grabowski-task-" + "b" * 24 + "-a1.service"
+                task_db = self._task_db(root / "tasks.sqlite3", task_unit, state)
+                plan = RETENTION.build_plan(
+                    jobs_root=jobs,
+                    archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=task_db,
+                    failed_units=[task_unit],
+                    unit_states={},
+                )
+                self.assertEqual(plan["reset_failed_units"], [])
+                self.assertIn("not proven terminal", plan["blocked"][0]["reason"])
+
+    def test_task_reset_preserves_durable_failed_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            root.chmod(0o700)
             jobs = root / "jobs"
             jobs.mkdir(mode=0o700)
-            task_unit = "grabowski-task-" + "b" * 24 + "-a1.service"
-            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "outcome_unknown")
+            task_unit = "grabowski-task-" + "c" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
             plan = RETENTION.build_plan(
                 jobs_root=jobs,
                 archive_root=root / "archive",
@@ -750,8 +779,35 @@ class RuntimeRetentionTests(unittest.TestCase):
                 failed_units=[task_unit],
                 unit_states={},
             )
-            self.assertEqual(plan["reset_failed_units"], [])
-            self.assertIn("not proven terminal", plan["blocked"][0]["reason"])
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict(
+                "sys.modules",
+                {
+                    "grabowski_self_deploy": fake_self_deploy,
+                    "grabowski_mcp": fake_base,
+                },
+            ), patch.object(RETENTION, "_run", reset):
+                result = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+
+            self.assertTrue(result["completed"])
+            reset.assert_called_once_with(
+                ["systemctl", "--user", "reset-failed", task_unit]
+            )
+            with sqlite3.connect(task_db) as connection:
+                state = connection.execute(
+                    "SELECT state FROM tasks WHERE unit = ?", (task_unit,)
+                ).fetchone()[0]
+            self.assertEqual(state, "failed")
 
     def test_archive_collision_blocks_reset_of_old_job(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1563,6 +1619,56 @@ class RuntimeRetentionTests(unittest.TestCase):
             (root / "link").symlink_to(root / "real")
             with self.assertRaisesRegex(RuntimeError, "symlink"):
                 RETENTION._archive_file_manifest(root)
+
+    def test_periodic_apply_rejects_plan_drift_before_mutation(self) -> None:
+        first = {
+            "plan_sha256": "a" * 64,
+            "reset_failed_units": ["grabowski-task-" + "a" * 24 + "-a1.service"],
+            "archive_jobs": [],
+        }
+        second = {
+            "plan_sha256": "b" * 64,
+            "reset_failed_units": first["reset_failed_units"],
+            "archive_jobs": [],
+        }
+        with patch.object(
+            RETENTION, "build_plan", side_effect=[first, second]
+        ), patch.object(RETENTION, "apply_plan") as apply:
+            with self.assertRaisesRegex(RuntimeError, "drifted"):
+                RETENTION.apply_periodic_plan()
+        apply.assert_not_called()
+
+    def test_periodic_apply_stable_noop_is_idempotent(self) -> None:
+        plan = {
+            "plan_sha256": "c" * 64,
+            "reset_failed_units": [],
+            "archive_jobs": [],
+        }
+        with patch.object(
+            RETENTION, "build_plan", side_effect=[plan, plan, plan, plan]
+        ), patch.object(RETENTION, "apply_plan") as apply:
+            first = RETENTION.apply_periodic_plan()
+            second = RETENTION.apply_periodic_plan()
+        self.assertEqual(first, second)
+        self.assertTrue(first["completed"])
+        self.assertFalse(first["mutated"])
+        apply.assert_not_called()
+
+    def test_periodic_apply_reuses_hash_bound_apply_contract(self) -> None:
+        plan = {
+            "plan_sha256": "d" * 64,
+            "reset_failed_units": ["grabowski-task-" + "d" * 24 + "-a1.service"],
+            "archive_jobs": [],
+        }
+        receipt = {"completed": True, "plan_sha256": plan["plan_sha256"]}
+        with patch.object(
+            RETENTION, "build_plan", side_effect=[plan, plan]
+        ), patch.object(RETENTION, "apply_plan", return_value=receipt) as apply:
+            result = RETENTION.apply_periodic_plan()
+        self.assertEqual(result, receipt)
+        apply.assert_called_once_with(
+            plan, expected_plan_sha256=plan["plan_sha256"]
+        )
 
 
 if __name__ == "__main__":

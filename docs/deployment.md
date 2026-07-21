@@ -206,6 +206,25 @@ spätere hashgebundene Läufe abgearbeitet. Ein alter fehlgeschlagener Job behä
 seinen Failed-Zustand, solange seine Archivierung durch diese Batchgrenze noch
 aufgeschoben ist.
 
+Für die laufende Host-Hygiene kann dieselbe Retention periodisch über
+`grabowski-runtime-retention.timer` ausgeführt werden. Der Timer startet die
+releasegebundene Runtime-Asset-Kopie von `tools/maintain_runtime_state.py` mit
+`--periodic-apply`. Dieser Modus baut zwei unmittelbar aufeinanderfolgende,
+bounded Live-Pläne. Nur wenn beide `plan_sha256` exakt übereinstimmen, wird der
+zweite Plan an den unveränderten `apply_plan`-Pfad übergeben; dessen Worker-
+Revalidierung, Intent-/Completion-Audit und create-only Retention-Receipts
+bleiben unverändert. Drift zwischen den beiden Snapshots führt vor jeder
+Mutation zum Fehler. Ein stabiler Plan ohne Reset- oder Archivaktionen endet
+erfolgreich als idempotenter No-op und erzeugt kein redundantes Terminal-
+Receipt.
+
+Damit bleibt die eigentliche Fehlerwahrheit in Job-/Task-/Worker-Datenbanken,
+Finalisierungsbelegen und Attention-Projektionen erhalten. Entfernt wird nur der
+globale systemd-`failed`-Marker für bereits terminal bewiesene typisierte Units.
+Unbekannte Infrastruktur-Units, laufende oder uneindeutige Tasks und Worker mit
+fehlender Terminalisierungsevidenz beziehungsweise aktiven Leases bleiben
+unangetastet und damit als aktuelle Host-Signale sichtbar.
+
 Historische Sammelarchive des Vertrags
 `legacy-self-deploy-without-finalization-<unix>` werden über einen getrennten,
 ausschließlich lesenden Statuspfad inventarisiert:
