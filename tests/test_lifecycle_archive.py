@@ -221,6 +221,12 @@ class TaskArchiveSegmentTests(unittest.TestCase):
             self.assertEqual(manifest["record_count"], 2)
             self.assertEqual(manifest["first_task_id"], "task-a")
             self.assertEqual(manifest["last_task_id"], "task-b")
+            records_path = Path(first["segment_dir"]) / "records.jsonl"
+            self.assertEqual(first["records_bytes"], records_path.stat().st_size)
+            self.assertEqual(
+                first["record_hash_sequence_sha256"],
+                lifecycle.sha256_json(manifest["record_sha256s"]),
+            )
             second = lifecycle.write_task_archive_segment(
                 records,
                 archive_root=root,
@@ -270,6 +276,33 @@ class TaskArchiveSegmentTests(unittest.TestCase):
             payload = json.loads(records_path.read_text(encoding="utf-8"))
             payload["state"] = "failed"
             records_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            with self.assertRaises(lifecycle.LifecycleArchiveIntegrityError):
+                lifecycle.verify_task_archive_segment(segment_dir)
+
+    def test_segment_verification_rejects_rehashed_manifest_semantic_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "archives"
+            result = lifecycle.write_task_archive_segment(
+                [self.task("task-a", 10)],
+                archive_root=root,
+                source_store_sha256="c" * 64,
+                source_schema_version="5",
+                plan_sha256="d" * 64,
+            )
+            segment_dir = Path(result["segment_dir"])
+            manifest_path = segment_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["kind"] = "tampered_archive_kind"
+            body = {
+                key: value
+                for key, value in manifest.items()
+                if key != "manifest_sha256"
+            }
+            manifest["manifest_sha256"] = lifecycle.sha256_json(body)
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
             with self.assertRaises(lifecycle.LifecycleArchiveIntegrityError):
                 lifecycle.verify_task_archive_segment(segment_dir)
 

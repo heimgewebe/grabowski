@@ -24,11 +24,69 @@ from urllib.parse import urlsplit
 import deploy_runtime as core
 
 
+@dataclass(frozen=True)
+class WatchdogHostAsset:
+    source: Path
+    target: Path
+    mode: int
+    unit: str | None = None
+
+
+@dataclass(frozen=True)
+class WatchdogHostAssetPreimage:
+    asset: WatchdogHostAsset
+    existed: bool
+    content: bytes | None
+    mode: int | None
+    identity: tuple[int, int] | None
+
+
+@dataclass(frozen=True)
+class WatchdogHostAssetProjection:
+    repo_head: str
+    preimages: tuple[WatchdogHostAssetPreimage, ...]
+    expected: dict[str, bytes]
+    changed_targets: tuple[str, ...]
+    asset_set_sha256: str
+
+
 TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 OPERATOR_SERVICE = "grabowski-operator.service"
 SAFETY_OBSERVER_SERVICE = "grabowski-safety-observer.service"
 SAFETY_OBSERVER_UNIT_RELATIVE = Path("systemd/grabowski-safety-observer.service.example")
 SAFETY_OBSERVER_UNIT_PATH = core.HOME / ".config/systemd/user/grabowski-safety-observer.service"
+WATCHDOG_HOST_ASSET_MAX_BYTES = 1_048_576
+WATCHDOG_HOST_ASSETS = (
+    WatchdogHostAsset(
+        source=Path("tools/component_watchdog.py"),
+        target=core.HOME / ".local/libexec/grabowski/component_watchdog.py",
+        mode=0o700,
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-operator-watchdog.service.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-operator-watchdog.service",
+        mode=0o600,
+        unit="grabowski-operator-watchdog.service",
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-operator-watchdog.timer.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-operator-watchdog.timer",
+        mode=0o600,
+        unit="grabowski-operator-watchdog.timer",
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-tunnel-watchdog.service.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-tunnel-watchdog.service",
+        mode=0o600,
+        unit="grabowski-tunnel-watchdog.service",
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-tunnel-watchdog.timer.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-tunnel-watchdog.timer",
+        mode=0o600,
+        unit="grabowski-tunnel-watchdog.timer",
+    ),
+)
 OBSERVER_FORBIDDEN_RELATIONS = {
     "Wants",
     "Requires",
@@ -895,6 +953,530 @@ def _verify_safety_observer_executes(unit_name: str) -> dict[str, str]:
     return values
 
 
+def _watchdog_host_asset_bytes(
+    repo: Path,
+    repo_head: str,
+    asset: WatchdogHostAsset,
+) -> bytes:
+    try:
+        data = core.git_show(repo, repo_head, asset.source)
+    except Exception as exc:
+        core.fail(
+            "Watchdog-Host-Asset konnte nicht aus dem gebundenen Git-Stand gelesen werden",
+            phase="watchdog-host-asset-source",
+            details={
+                "source": asset.source.as_posix(),
+                "repo_head": repo_head,
+                "error_type": type(exc).__name__,
+            },
+        )
+    if not data or len(data) > WATCHDOG_HOST_ASSET_MAX_BYTES:
+        core.fail(
+            "Watchdog-Host-Asset hat eine unzulässige Größe",
+            phase="watchdog-host-asset-source",
+            details={"source": asset.source.as_posix(), "bytes": len(data)},
+        )
+    return data
+
+
+def _read_watchdog_host_asset(
+    asset: WatchdogHostAsset,
+) -> WatchdogHostAssetPreimage:
+    target = asset.target
+    try:
+        linked = target.lstat()
+    except FileNotFoundError:
+        return WatchdogHostAssetPreimage(asset, False, None, None, None)
+    if (
+        not statmod.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.getuid()
+        or linked.st_nlink != 1
+        or linked.st_size > WATCHDOG_HOST_ASSET_MAX_BYTES
+    ):
+        core.fail(
+            "Watchdog-Host-Asset-Ziel ist keine eindeutige benutzereigene reguläre Datei",
+            phase="watchdog-host-asset-target",
+            details={"target": str(target)},
+        )
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as exc:
+        core.fail(
+            "Watchdog-Host-Asset-Ziel konnte nicht sicher geöffnet werden",
+            phase="watchdog-host-asset-target",
+            details={"target": str(target), "error_type": type(exc).__name__},
+        )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            core.fail(
+                "Watchdog-Host-Asset-Ziel driftete während des sicheren Öffnens",
+                phase="watchdog-host-asset-target-drift",
+                details={"target": str(target)},
+            )
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, WATCHDOG_HOST_ASSET_MAX_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > WATCHDOG_HOST_ASSET_MAX_BYTES:
+                core.fail(
+                    "Watchdog-Host-Asset-Ziel überschreitet die Größenbegrenzung",
+                    phase="watchdog-host-asset-target",
+                    details={"target": str(target)},
+                )
+        content = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    return WatchdogHostAssetPreimage(
+        asset=asset,
+        existed=True,
+        content=content,
+        mode=statmod.S_IMODE(linked.st_mode),
+        identity=(linked.st_dev, linked.st_ino),
+    )
+
+
+def _watchdog_target_matches_preimage(
+    directory_fd: int,
+    name: str,
+    preimage: WatchdogHostAssetPreimage,
+) -> bool:
+    try:
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return not preimage.existed
+    if not preimage.existed or preimage.identity is None:
+        return False
+    return (
+        statmod.S_ISREG(info.st_mode)
+        and info.st_uid == os.getuid()
+        and info.st_nlink == 1
+        and (info.st_dev, info.st_ino) == preimage.identity
+    )
+
+
+def _atomic_write_watchdog_host_asset(
+    asset: WatchdogHostAsset,
+    data: bytes,
+    mode: int,
+    preimage: WatchdogHostAssetPreimage,
+) -> None:
+    if not data or len(data) > WATCHDOG_HOST_ASSET_MAX_BYTES:
+        core.fail("Ungültiger Watchdog-Host-Asset-Payload", phase="watchdog-host-asset-write")
+    directory_fd, directory_fds, directory_edges = _open_observer_unit_directory(
+        asset.target.parent
+    )
+    incoming_name = f".{asset.target.name}.incoming-{secrets.token_hex(12)}"
+    descriptor = -1
+    published = False
+    preserve_incoming = False
+    try:
+        _require_parent_mapping(asset.target.parent, directory_fd, directory_edges)
+        if not _watchdog_target_matches_preimage(directory_fd, asset.target.name, preimage):
+            core.fail(
+                "Watchdog-Host-Asset-Ziel driftete vor atomarer Veröffentlichung",
+                phase="watchdog-host-asset-target-drift",
+                details={"target": str(asset.target)},
+            )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(incoming_name, flags, 0o600, dir_fd=directory_fd)
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                core.fail(
+                    "Watchdog-Host-Asset konnte nicht vollständig geschrieben werden",
+                    phase="watchdog-host-asset-write",
+                )
+            view = view[written:]
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        incoming = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(incoming.st_mode)
+            or incoming.st_uid != os.getuid()
+            or incoming.st_nlink != 1
+            or statmod.S_IMODE(incoming.st_mode) != mode
+        ):
+            core.fail(
+                "Temporäres Watchdog-Host-Asset ist nicht sicher",
+                phase="watchdog-host-asset-write",
+            )
+        _require_parent_mapping(asset.target.parent, directory_fd, directory_edges)
+        if not _watchdog_target_matches_preimage(directory_fd, asset.target.name, preimage):
+            core.fail(
+                "Watchdog-Host-Asset-Ziel driftete unmittelbar vor Veröffentlichung",
+                phase="watchdog-host-asset-target-drift",
+                details={"target": str(asset.target)},
+            )
+        if preimage.existed:
+            _renameat2(
+                directory_fd,
+                incoming_name,
+                directory_fd,
+                asset.target.name,
+                RENAME_EXCHANGE,
+            )
+            preserve_incoming = True
+            try:
+                published_info = os.stat(
+                    asset.target.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                displaced_info = os.stat(
+                    incoming_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                core.fail(
+                    "Watchdog-Host-Asset-Austausch konnte nicht sicher verifiziert werden",
+                    phase="watchdog-host-asset-target-drift",
+                    details={
+                        "target": str(asset.target),
+                        "retained_incoming_name": incoming_name,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+            if (
+                (published_info.st_dev, published_info.st_ino)
+                != (incoming.st_dev, incoming.st_ino)
+                or preimage.identity is None
+                or (displaced_info.st_dev, displaced_info.st_ino) != preimage.identity
+            ):
+                core.fail(
+                    "Watchdog-Host-Asset-Ziel driftete während des atomaren Austauschs; verdrängtes Objekt wurde erhalten",
+                    phase="watchdog-host-asset-target-drift",
+                    details={
+                        "target": str(asset.target),
+                        "retained_incoming_name": incoming_name,
+                    },
+                )
+            os.unlink(incoming_name, dir_fd=directory_fd)
+            preserve_incoming = False
+        else:
+            try:
+                _renameat2(
+                    directory_fd,
+                    incoming_name,
+                    directory_fd,
+                    asset.target.name,
+                    RENAME_NOREPLACE,
+                )
+            except OSError as exc:
+                core.fail(
+                    "Watchdog-Host-Asset-Ziel wurde gleichzeitig angelegt",
+                    phase="watchdog-host-asset-target-drift",
+                    details={
+                        "target": str(asset.target),
+                        "error_type": type(exc).__name__,
+                        "errno": exc.errno,
+                    },
+                )
+        published = True
+        os.fsync(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not published and not preserve_incoming:
+            try:
+                os.unlink(incoming_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+        for opened_fd in reversed(directory_fds):
+            try:
+                os.close(opened_fd)
+            except OSError:
+                pass
+    installed = _read_watchdog_host_asset(asset)
+    if (
+        not installed.existed
+        or installed.content != data
+        or installed.mode != mode
+    ):
+        core.fail(
+            "Watchdog-Host-Asset stimmt nach Installation nicht exakt",
+            phase="watchdog-host-asset-readback",
+            details={"target": str(asset.target)},
+        )
+
+
+def _remove_watchdog_host_asset(
+    preimage: WatchdogHostAssetPreimage,
+) -> None:
+    asset = preimage.asset
+    current = _read_watchdog_host_asset(asset)
+    if not current.existed or current.identity is None:
+        core.fail(
+            "Watchdog-Host-Asset fehlt vor Rücksicherung",
+            phase="watchdog-host-asset-rollback",
+            details={"target": str(asset.target)},
+        )
+    directory_fd, directory_fds, directory_edges = _open_observer_unit_directory(
+        asset.target.parent
+    )
+    try:
+        _require_parent_mapping(asset.target.parent, directory_fd, directory_edges)
+        if not _watchdog_target_matches_preimage(directory_fd, asset.target.name, current):
+            core.fail(
+                "Watchdog-Host-Asset driftete vor Entfernung",
+                phase="watchdog-host-asset-rollback",
+                details={"target": str(asset.target)},
+            )
+        os.unlink(asset.target.name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        for opened_fd in reversed(directory_fds):
+            try:
+                os.close(opened_fd)
+            except OSError:
+                pass
+
+
+def _systemd_daemon_reload() -> None:
+    result = core.run(
+        ["systemctl", "--user", "daemon-reload"],
+        check=False,
+        capture=True,
+        timeout=core.TIMEOUTS["service_start"],
+    )
+    if result.returncode != 0:
+        core.fail(
+            "systemd daemon-reload für Watchdog-Host-Assets fehlgeschlagen",
+            phase="watchdog-host-asset-daemon-reload",
+            details={"returncode": result.returncode},
+        )
+
+
+def verify_watchdog_systemd_fragments(
+    assets: tuple[WatchdogHostAsset, ...] = WATCHDOG_HOST_ASSETS,
+) -> dict[str, str]:
+    fragments: dict[str, str] = {}
+    for asset in assets:
+        if asset.unit is None:
+            continue
+        result = core.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                asset.unit,
+                "--property=FragmentPath",
+                "--value",
+            ],
+            check=False,
+            capture=True,
+            timeout=core.TIMEOUTS["systemd_query"],
+        )
+        fragment = result.stdout.strip() if result.returncode == 0 else ""
+        if not fragment or Path(fragment).resolve() != asset.target.resolve():
+            core.fail(
+                "systemd verwendet nicht das kanonisch projizierte Watchdog-Asset",
+                phase="watchdog-host-asset-systemd-readback",
+                details={
+                    "unit": asset.unit,
+                    "expected": str(asset.target),
+                    "observed": fragment,
+                    "returncode": result.returncode,
+                },
+            )
+        fragments[asset.unit] = fragment
+    return fragments
+
+
+def _watchdog_asset_set_sha256(
+    assets: tuple[WatchdogHostAsset, ...],
+    expected: dict[str, bytes],
+) -> str:
+    payload = [
+        {
+            "source": asset.source.as_posix(),
+            "target": str(asset.target),
+            "mode": oct(asset.mode),
+            "unit": asset.unit,
+            "sha256": hashlib.sha256(expected[str(asset.target)]).hexdigest(),
+        }
+        for asset in assets
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def restore_watchdog_host_assets(
+    projection: WatchdogHostAssetProjection,
+) -> None:
+    changed = set(projection.changed_targets)
+    if not changed:
+        return
+    unit_changed = False
+    for preimage in reversed(projection.preimages):
+        target_key = str(preimage.asset.target)
+        if target_key not in changed:
+            continue
+        expected = projection.expected[target_key]
+        current = _read_watchdog_host_asset(preimage.asset)
+        if (
+            not current.existed
+            or current.content != expected
+            or current.mode != preimage.asset.mode
+        ):
+            core.fail(
+                "Watchdog-Host-Asset driftete; Rücksicherung verweigert",
+                phase="watchdog-host-asset-rollback",
+                details={"target": target_key},
+            )
+        if preimage.existed:
+            assert preimage.content is not None and preimage.mode is not None
+            _atomic_write_watchdog_host_asset(
+                preimage.asset,
+                preimage.content,
+                preimage.mode,
+                current,
+            )
+        else:
+            _remove_watchdog_host_asset(current)
+        unit_changed = unit_changed or preimage.asset.unit is not None
+    if unit_changed:
+        _systemd_daemon_reload()
+        verify_watchdog_systemd_fragments(
+            tuple(
+                preimage.asset
+                for preimage in projection.preimages
+                if preimage.existed
+            )
+        )
+
+
+def install_watchdog_host_assets(
+    repo: Path,
+    snapshot: core.Snapshot,
+    *,
+    assets: tuple[WatchdogHostAsset, ...] = WATCHDOG_HOST_ASSETS,
+) -> WatchdogHostAssetProjection:
+    if not assets:
+        core.fail("Watchdog-Host-Asset-Satz darf nicht leer sein")
+    expected: dict[str, bytes] = {}
+    preimages: list[WatchdogHostAssetPreimage] = []
+    seen_targets: set[Path] = set()
+    for asset in assets:
+        if not asset.target.is_absolute() or asset.target in seen_targets:
+            core.fail(
+                "Watchdog-Host-Asset-Ziele müssen absolut und eindeutig sein",
+                phase="watchdog-host-asset-contract",
+            )
+        if asset.mode not in {0o600, 0o700}:
+            core.fail(
+                "Watchdog-Host-Asset verwendet einen unzulässigen Dateimodus",
+                phase="watchdog-host-asset-contract",
+            )
+        seen_targets.add(asset.target)
+        expected[str(asset.target)] = _watchdog_host_asset_bytes(
+            repo, snapshot.repo_head, asset
+        )
+        preimages.append(_read_watchdog_host_asset(asset))
+    changed: list[str] = []
+    projection = WatchdogHostAssetProjection(
+        repo_head=snapshot.repo_head,
+        preimages=tuple(preimages),
+        expected=expected,
+        changed_targets=(),
+        asset_set_sha256=_watchdog_asset_set_sha256(assets, expected),
+    )
+    try:
+        for preimage in preimages:
+            asset = preimage.asset
+            data = expected[str(asset.target)]
+            if (
+                preimage.existed
+                and preimage.content == data
+                and preimage.mode == asset.mode
+            ):
+                continue
+            try:
+                _atomic_write_watchdog_host_asset(asset, data, asset.mode, preimage)
+            except Exception as write_error:
+                try:
+                    current = _read_watchdog_host_asset(asset)
+                except Exception:
+                    # A failed state interrogation must never hide the original
+                    # publication failure. Conservatively include the target in
+                    # rollback scope because publication may already have happened.
+                    changed.append(str(asset.target))
+                else:
+                    if (
+                        current.existed
+                        and current.content == data
+                        and current.mode == asset.mode
+                    ):
+                        changed.append(str(asset.target))
+                raise write_error
+            changed.append(str(asset.target))
+        projection = WatchdogHostAssetProjection(
+            repo_head=snapshot.repo_head,
+            preimages=tuple(preimages),
+            expected=expected,
+            changed_targets=tuple(changed),
+            asset_set_sha256=_watchdog_asset_set_sha256(assets, expected),
+        )
+        if any(
+            preimage.asset.unit is not None
+            and str(preimage.asset.target) in set(changed)
+            for preimage in preimages
+        ):
+            _systemd_daemon_reload()
+        verify_watchdog_systemd_fragments(assets)
+        for asset in assets:
+            installed = _read_watchdog_host_asset(asset)
+            if (
+                not installed.existed
+                or installed.content != expected[str(asset.target)]
+                or installed.mode != asset.mode
+            ):
+                core.fail(
+                    "Watchdog-Host-Asset driftete während des finalen Readbacks",
+                    phase="watchdog-host-asset-readback",
+                    details={"target": str(asset.target)},
+                )
+        return projection
+    except Exception as original:
+        if changed:
+            partial = WatchdogHostAssetProjection(
+                repo_head=snapshot.repo_head,
+                preimages=tuple(preimages),
+                expected=expected,
+                changed_targets=tuple(changed),
+                asset_set_sha256=_watchdog_asset_set_sha256(assets, expected),
+            )
+            try:
+                restore_watchdog_host_assets(partial)
+            except Exception as rollback_error:
+                core.fail(
+                    "Watchdog-Host-Asset-Installation und Rücksicherung schlugen fehl",
+                    phase="watchdog-host-asset-rollback",
+                    details={
+                        "install_error": str(original),
+                        "rollback_error": str(rollback_error),
+                    },
+                )
+        raise
+
+
 def install_safety_observer_unit(
     repo: Path,
     snapshot: core.Snapshot,
@@ -1613,8 +2195,23 @@ def deploy_url(
         release_path=build.release_path,
         previous=core.capture_pointer(runtime),
     )
-    observer_repair = install_safety_observer_unit(repo, snapshot)
-    phase = "post-observer-snapshot-revalidation"
+    watchdog_projection = install_watchdog_host_assets(repo, snapshot)
+    try:
+        observer_repair = install_safety_observer_unit(repo, snapshot)
+    except Exception as original:
+        try:
+            restore_watchdog_host_assets(watchdog_projection)
+        except Exception as rollback_error:
+            core.fail(
+                "Safety-Observer-Installation scheiterte und Watchdog-Host-Assets konnten nicht rückgesichert werden",
+                phase="watchdog-host-asset-rollback",
+                details={
+                    "observer_error": str(original),
+                    "watchdog_rollback_error": str(rollback_error),
+                },
+            )
+        raise
+    phase = "post-host-assets-snapshot-revalidation"
     try:
         core.verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
         phase = "stop-tunnel"
@@ -1678,8 +2275,14 @@ def deploy_url(
         print(f"Runtime-PID:     {identity['process']['pid']}")
         print(f"Runtime:         {runtime}")
         print(f"Release:         {build.release_path}")
+        print(f"Watchdog-Assets: {watchdog_projection.asset_set_sha256}")
         print(f"Legacy-Backup:   {activation.legacy_backup}")
     except Exception as original:
+        watchdog_rollback_error: Exception | None = None
+        try:
+            restore_watchdog_host_assets(watchdog_projection)
+        except Exception as rollback_error:
+            watchdog_rollback_error = rollback_error
         primary_error = _error_summary(original)
         primary_error.setdefault("phase", phase)
         primary_error["deploy_phase"] = phase
@@ -1698,13 +2301,31 @@ def deploy_url(
                 "retained_sha256"
             ]
         primary_error["observer_safety_repair"] = observer_repair_evidence
+        primary_error["watchdog_host_assets"] = {
+            "repo_head": watchdog_projection.repo_head,
+            "asset_set_sha256": watchdog_projection.asset_set_sha256,
+            "changed_targets": list(watchdog_projection.changed_targets),
+            "rollback": (
+                "failed" if watchdog_rollback_error is not None else "restored"
+            ),
+        }
+        if watchdog_rollback_error is not None:
+            primary_error["watchdog_host_assets"]["rollback_error"] = str(
+                watchdog_rollback_error
+            )
         print(
             "PRIMARY-DEPLOY-ERROR: "
             + json.dumps(primary_error, sort_keys=True),
             file=sys.stderr,
         )
+        rollback_original = original
+        if watchdog_rollback_error is not None:
+            rollback_original = core.DeployError(
+                "Deployment und Watchdog-Host-Asset-Rücksicherung fehlgeschlagen: "
+                f"{original}; watchdog rollback: {watchdog_rollback_error}"
+            )
         rollback_url(
-            original,
+            rollback_original,
             activation=activation,
             contract=snapshot.contract,
             timeout_seconds=timeout_seconds,

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import errno
+import faulthandler
+import fcntl
 from datetime import datetime, timezone
 
 import hashlib
@@ -121,6 +124,12 @@ CONSUMER_VIEWS = consumer_surface.CONSUMER_VIEWS
 CONSUMER_VIEW_ALIASES = consumer_surface.CONSUMER_VIEW_ALIASES
 MAX_CONSUMER_FIELDS = consumer_surface.MAX_CONSUMER_FIELDS
 MAX_CONSUMER_CURSOR_BYTES = consumer_surface.MAX_CONSUMER_CURSOR_BYTES
+HTTP_SESSION_IDLE_TIMEOUT_SECONDS = 1_800
+MCP_SESSION_LOCK_PROBE_TIMEOUT_SECONDS = 1.0
+MCP_LIVENESS_PATH = "/_grabowski/mcp-liveness"
+STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
+STACK_DUMP_MAX_BYTES = 1_048_576
+_STACK_DUMP_FILE: Any | None = None
 
 _canonical_json_bytes = consumer_surface.canonical_json_bytes
 _normalize_consumer_view = consumer_surface.normalize_view
@@ -239,6 +248,165 @@ def _find_server() -> FastMCP:
 
 
 mcp = _find_server()
+
+
+def _mcp_custom_route(path: str, **kwargs: Any) -> Any:
+    custom_route = getattr(mcp, "custom_route", None)
+    if callable(custom_route):
+        return custom_route(path, **kwargs)
+
+    def undecorated(function: Any) -> Any:
+        return function
+
+    return undecorated
+
+
+def _protected_resource_metadata(base_url: str) -> dict[str, Any]:
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.netloc
+    ):
+        raise RuntimeError("protected resource metadata requires loopback HTTP")
+    return {
+        "resource": f"{parsed.scheme}://{parsed.netloc}/mcp",
+        "resource_name": "Grabowski MCP",
+        "authorization_servers": [],
+        "bearer_methods_supported": [],
+    }
+
+
+@_mcp_custom_route(
+    "/.well-known/oauth-protected-resource",
+    methods=["GET"],
+    include_in_schema=False,
+)
+@_mcp_custom_route(
+    "/.well-known/oauth-protected-resource/mcp",
+    methods=["GET"],
+    include_in_schema=False,
+)
+async def oauth_protected_resource_metadata(request: Any) -> Any:
+    # Keep source-only contract tests independent of optional runtime packages.
+    from starlette.responses import JSONResponse
+
+    return JSONResponse(
+        _protected_resource_metadata(str(request.base_url)),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def _session_creation_lock_available(timeout_seconds: float) -> bool:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    try:
+        manager = mcp.session_manager
+    except RuntimeError:
+        return False
+    lock = getattr(manager, "_session_creation_lock", None)
+    if lock is None:
+        return False
+    async def acquire_and_release() -> bool:
+        async with lock:
+            return True
+
+    try:
+        return await asyncio.wait_for(
+            acquire_and_release(), timeout=timeout_seconds
+        )
+    except (asyncio.TimeoutError, RuntimeError):
+        return False
+
+
+@_mcp_custom_route(
+    MCP_LIVENESS_PATH,
+    methods=["GET"],
+    include_in_schema=False,
+)
+async def mcp_session_manager_liveness(_request: Any) -> Any:
+    from starlette.responses import JSONResponse
+
+    available = await _session_creation_lock_available(
+        MCP_SESSION_LOCK_PROBE_TIMEOUT_SECONDS
+    )
+    return JSONResponse(
+        {
+            "healthy": available,
+            "session_creation_lock_available": available,
+        },
+        status_code=200 if available else 503,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _configure_http_runtime() -> None:
+    if not callable(getattr(mcp, "custom_route", None)):
+        raise RuntimeError("FastMCP custom_route support is required")
+    mcp.streamable_http_app()
+    manager = mcp.session_manager
+    if getattr(manager, "_session_creation_lock", None) is None:
+        raise RuntimeError("FastMCP session creation lock is unavailable")
+    manager.session_idle_timeout = HTTP_SESSION_IDLE_TIMEOUT_SECONDS
+
+
+def _open_stack_dump_memfd(max_bytes: int = STACK_DUMP_MAX_BYTES) -> Any:
+    if max_bytes <= 0:
+        raise ValueError("stack dump capacity must be positive")
+    if not hasattr(os, "memfd_create"):
+        raise RuntimeError("memfd_create is unavailable")
+    required = (
+        "MFD_CLOEXEC",
+        "MFD_ALLOW_SEALING",
+    )
+    if any(not hasattr(os, name) for name in required):
+        raise RuntimeError("memfd sealing flags are unavailable")
+    seal_names = ("F_ADD_SEALS", "F_SEAL_GROW", "F_SEAL_SHRINK")
+    if any(not hasattr(fcntl, name) for name in seal_names):
+        raise RuntimeError("memfd seal operations are unavailable")
+    descriptor = os.memfd_create(
+        STACK_DUMP_MEMFD_NAME,
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    try:
+        os.ftruncate(descriptor, max_bytes)
+        fcntl.fcntl(
+            descriptor,
+            fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK,
+        )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return os.fdopen(descriptor, "wb", buffering=0)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _configure_faulthandler() -> None:
+    global _STACK_DUMP_FILE
+    try:
+        faulthandler.enable(all_threads=True)
+    except (OSError, RuntimeError, ValueError):
+        pass
+    stream: Any | None = None
+    try:
+        stream = _open_stack_dump_memfd()
+        if hasattr(signal, "SIGUSR1"):
+            faulthandler.register(
+                signal.SIGUSR1,
+                file=stream,
+                all_threads=True,
+                chain=False,
+            )
+        _STACK_DUMP_FILE = stream
+    except (OSError, RuntimeError, ValueError):
+        if stream is not None:
+            stream.close()
+        _STACK_DUMP_FILE = None
+        # Stack capture is recovery evidence, not a startup dependency.
+        return
 
 
 def _redact_dynamic_secret(text: str, secret: str) -> str:
@@ -3578,6 +3746,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    _configure_faulthandler()
     if args.transport == "streamable-http":
         if args.host != "127.0.0.1":
             raise SystemExit(
@@ -3587,6 +3756,7 @@ def main() -> None:
             raise SystemExit("port must be between 1024 and 65535")
         mcp.settings.host = args.host
         mcp.settings.port = args.port
+        _configure_http_runtime()
     mcp.run(transport=args.transport)
 
 

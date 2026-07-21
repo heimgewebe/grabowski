@@ -95,6 +95,12 @@ class LifecycleReadSurfaceTests(unittest.TestCase):
         self.assertEqual(first["record_count"], 2)
         self.assertEqual(first["records"][0]["task_id"], "task-a")
         self.assertEqual(first["manifest"]["segment_id"], segment_id)
+        records_path = Path(written["segment_dir"]) / "records.jsonl"
+        self.assertEqual(first["records_bytes"], records_path.stat().st_size)
+        self.assertEqual(
+            first["record_hash_sequence_sha256"],
+            lifecycle.sha256_json(first["manifest"]["record_sha256s"]),
+        )
         second = read_surface.task_archive_read(
             segment_id,
             archive_root=self.root,
@@ -153,10 +159,55 @@ class LifecycleReadSurfaceTests(unittest.TestCase):
             catalog["integrity_state"],
             "catalog_manifests_verified_records_unverified",
         )
-        with self.assertRaises(lifecycle.LifecycleArchiveIntegrityError):
+        with self.assertRaises(read_surface.LifecycleReadSurfaceIntegrityError):
             read_surface.task_archive_read(
                 written["manifest"]["segment_id"],
                 archive_root=self.root,
+            )
+
+    def test_full_verify_integrity_error_is_translated_at_surface_boundary(self) -> None:
+        written = self.write_segment([task("task-a", 10)])
+        with mock.patch.object(
+            lifecycle,
+            "verify_task_archive_segment",
+            side_effect=lifecycle.LifecycleArchiveIntegrityError("full verify failed"),
+        ):
+            with self.assertRaisesRegex(
+                read_surface.LifecycleReadSurfaceIntegrityError,
+                "full verify failed",
+            ):
+                read_surface.task_archive_read(
+                    written["manifest"]["segment_id"],
+                    archive_root=self.root,
+                )
+
+    def test_read_cursor_rejects_cross_view_and_tampering(self) -> None:
+        written = self.write_segment([task("task-a", 10), task("task-b", 20)])
+        segment_id = written["manifest"]["segment_id"]
+        first = read_surface.task_archive_read(
+            segment_id,
+            archive_root=self.root,
+            limit=1,
+            view="standard",
+        )
+        cursor = first["pagination"]["next_cursor"]
+        self.assertIsInstance(cursor, str)
+        with self.assertRaises(ValueError):
+            read_surface.task_archive_read(
+                segment_id,
+                archive_root=self.root,
+                limit=1,
+                cursor=cursor,
+                view="evidence",
+            )
+        tampered = cursor[:-1] + ("A" if cursor[-1] != "A" else "B")
+        with self.assertRaises(ValueError):
+            read_surface.task_archive_read(
+                segment_id,
+                archive_root=self.root,
+                limit=1,
+                cursor=tampered,
+                view="standard",
             )
 
     def test_unexpected_hidden_root_entry_fails_closed(self) -> None:
@@ -173,6 +224,38 @@ class LifecycleReadSurfaceTests(unittest.TestCase):
         with self.assertRaises(read_surface.LifecycleReadSurfaceIntegrityError):
             read_surface.task_archive_list(archive_root=self.root)
 
+    def test_manifest_file_symlink_fails_closed(self) -> None:
+        written = self.write_segment([task("task-a", 10)])
+        segment_dir = Path(written["segment_dir"])
+        manifest_path = segment_dir / "manifest.json"
+        outside = Path(self.temp.name) / "outside-manifest.json"
+        outside.write_bytes(manifest_path.read_bytes())
+        manifest_path.unlink()
+        manifest_path.symlink_to(outside)
+        with self.assertRaises(read_surface.LifecycleReadSurfaceIntegrityError):
+            read_surface.task_archive_list(archive_root=self.root)
+        with self.assertRaises(read_surface.LifecycleReadSurfaceIntegrityError):
+            read_surface.task_archive_read(
+                written["manifest"]["segment_id"],
+                archive_root=self.root,
+            )
+
+    def test_records_file_symlink_fails_closed(self) -> None:
+        written = self.write_segment([task("task-a", 10)])
+        segment_dir = Path(written["segment_dir"])
+        records_path = segment_dir / "records.jsonl"
+        outside = Path(self.temp.name) / "outside-records.jsonl"
+        outside.write_bytes(records_path.read_bytes())
+        records_path.unlink()
+        records_path.symlink_to(outside)
+        with self.assertRaises(read_surface.LifecycleReadSurfaceIntegrityError):
+            read_surface.task_archive_list(archive_root=self.root)
+        with self.assertRaises(read_surface.LifecycleReadSurfaceIntegrityError):
+            read_surface.task_archive_read(
+                written["manifest"]["segment_id"],
+                archive_root=self.root,
+            )
+
     def test_symlink_archive_root_fails_closed(self) -> None:
         actual = Path(self.temp.name) / "actual"
         actual.mkdir()
@@ -186,9 +269,18 @@ class LifecycleReadSurfaceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             read_surface.task_archive_read("segment-xyz", archive_root=self.root)
 
-    def test_full_verified_read_respects_server_owned_records_bound(self) -> None:
+    def test_full_verified_read_allows_exact_bound_and_rejects_plus_one(self) -> None:
         written = self.write_segment([task("task-a", 10)])
-        with mock.patch.object(read_surface, "MAX_RECORDS_BYTES", 1):
+        records_path = Path(written["segment_dir"]) / "records.jsonl"
+        records_bytes = records_path.stat().st_size
+        with mock.patch.object(read_surface, "MAX_RECORDS_BYTES", records_bytes):
+            result = read_surface.task_archive_read(
+                written["manifest"]["segment_id"],
+                archive_root=self.root,
+                view="evidence",
+            )
+        self.assertEqual(result["records_bytes"], records_bytes)
+        with mock.patch.object(read_surface, "MAX_RECORDS_BYTES", records_bytes - 1):
             with self.assertRaises(read_surface.LifecycleReadSurfaceIntegrityError):
                 read_surface.task_archive_read(
                     written["manifest"]["segment_id"],

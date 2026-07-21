@@ -66,8 +66,6 @@ def _read_bounded_regular_json(
     path: Path,
     max_bytes: int,
 ) -> tuple[dict[str, Any], int]:
-    if path.is_symlink() or not path.is_file():
-        raise LifecycleReadSurfaceIntegrityError(f"archive file is missing or unsafe: {path.name}")
     try:
         payload = lifecycle._read_regular_bytes(path, max_bytes=max_bytes)
         value = json.loads(payload.decode("utf-8"))
@@ -116,53 +114,22 @@ def _verify_manifest_only(
     )
     records_bytes = _regular_file_size(records_path)
 
-    expected_manifest_sha256 = manifest.get("manifest_sha256")
-    if not isinstance(expected_manifest_sha256, str) or lifecycle.SHA256.fullmatch(expected_manifest_sha256) is None:
-        raise LifecycleReadSurfaceIntegrityError("archive manifest digest is missing or invalid")
-    body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
-    if lifecycle.sha256_json(body) != expected_manifest_sha256:
-        raise LifecycleReadSurfaceIntegrityError("archive manifest digest mismatch")
-    if manifest.get("schema_version") != lifecycle.SCHEMA_VERSION:
-        raise LifecycleReadSurfaceIntegrityError("unsupported archive manifest schema")
-    if manifest.get("kind") != "grabowski_task_archive_segment":
-        raise LifecycleReadSurfaceIntegrityError("archive manifest kind mismatch")
-    if manifest.get("segment_id") != segment_dir.name:
-        raise LifecycleReadSurfaceIntegrityError("archive segment identity mismatch")
-
-    for key in ("source_store_sha256", "plan_sha256", "segment_sha256", "segment_identity_sha256"):
-        value = manifest.get(key)
-        if not isinstance(value, str) or lifecycle.SHA256.fullmatch(value) is None:
-            raise LifecycleReadSurfaceIntegrityError(f"archive manifest {key} is invalid")
-    identity_body = {
-        "source_store_sha256": manifest["source_store_sha256"],
-        "source_schema_version": manifest.get("source_schema_version"),
-        "plan_sha256": manifest["plan_sha256"],
-        "segment_sha256": manifest["segment_sha256"],
-    }
-    if lifecycle.sha256_json(identity_body) != manifest["segment_identity_sha256"]:
-        raise LifecycleReadSurfaceIntegrityError("archive segment identity digest mismatch")
-    if segment_dir.name != f"segment-{manifest['segment_identity_sha256'][:24]}":
-        raise LifecycleReadSurfaceIntegrityError("archive segment directory name mismatch")
-
-    record_count = manifest.get("record_count")
-    record_sha256s = manifest.get("record_sha256s")
-    if isinstance(record_count, bool) or not isinstance(record_count, int) or record_count < 1:
-        raise LifecycleReadSurfaceIntegrityError("archive record count is invalid")
-    if not isinstance(record_sha256s, list) or len(record_sha256s) != record_count:
-        raise LifecycleReadSurfaceIntegrityError("archive record hash sequence is invalid")
-    if any(not isinstance(value, str) or lifecycle.SHA256.fullmatch(value) is None for value in record_sha256s):
-        raise LifecycleReadSurfaceIntegrityError("archive record hash sequence contains invalid digest")
-    if manifest.get("first_record_sha256") != record_sha256s[0]:
-        raise LifecycleReadSurfaceIntegrityError("archive first record digest mismatch")
-    if manifest.get("last_record_sha256") != record_sha256s[-1]:
-        raise LifecycleReadSurfaceIntegrityError("archive last record digest mismatch")
+    try:
+        manifest_evidence = lifecycle._validate_task_archive_manifest(
+            segment_dir,
+            manifest,
+        )
+    except lifecycle.LifecycleArchiveIntegrityError as exc:
+        raise LifecycleReadSurfaceIntegrityError(str(exc)) from exc
 
     return {
         "manifest": manifest,
-        "manifest_sha256": expected_manifest_sha256,
+        "manifest_sha256": manifest_evidence["manifest_sha256"],
         "manifest_bytes": manifest_bytes,
         "records_bytes": records_bytes,
-        "record_hash_sequence_sha256": lifecycle.sha256_json(record_sha256s),
+        "record_hash_sequence_sha256": manifest_evidence[
+            "record_hash_sequence_sha256"
+        ],
     }
 
 
@@ -330,16 +297,14 @@ def task_archive_read(
     selected_limit = _validated_limit(limit)
     root = _safe_archive_root(archive_root)
     segment_dir = _segment_dir(root, segment_id)
-    manifest_evidence = _verify_manifest_only(segment_dir)
-    if manifest_evidence["records_bytes"] > MAX_RECORDS_BYTES:
-        raise LifecycleReadSurfaceIntegrityError(
-            "archive segment exceeds server-owned full-verification read bound"
+    try:
+        verified = lifecycle.verify_task_archive_segment(
+            segment_dir,
+            max_manifest_bytes=MAX_MANIFEST_BYTES,
+            max_records_bytes=MAX_RECORDS_BYTES,
         )
-    verified = lifecycle.verify_task_archive_segment(
-        segment_dir,
-        max_manifest_bytes=MAX_MANIFEST_BYTES,
-        max_records_bytes=MAX_RECORDS_BYTES,
-    )
+    except lifecycle.LifecycleArchiveIntegrityError as exc:
+        raise LifecycleReadSurfaceIntegrityError(str(exc)) from exc
     manifest = verified["manifest"]
     records = verified["records"]
     snapshot_sha256 = manifest["manifest_sha256"]
@@ -397,8 +362,8 @@ def task_archive_read(
     }
     if selected_view == "evidence":
         payload["manifest"] = manifest
-        payload["records_bytes"] = manifest_evidence["records_bytes"]
-        payload["record_hash_sequence_sha256"] = manifest_evidence[
+        payload["records_bytes"] = verified["records_bytes"]
+        payload["record_hash_sequence_sha256"] = verified[
             "record_hash_sequence_sha256"
         ]
     return consumer_surface.project_fields(
