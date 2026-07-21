@@ -1,5 +1,33 @@
 {
   "accepted_additions": {
+    "grabowski_agent_workspace_reconcile_idle_tmux": {
+      "evidence_refs": [
+        "contract:idle-tmux-stale-abandonment-v1",
+        "friction:9664885f36ec491f89ff1a19f32d660d",
+        "tests:test_agent_workspace.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only the exact transition from a non-authoritative idle tmux session to the existing non-destructive stale-workspace reconciliation path.",
+        "evidence": "Exact workspace and plan SHA binding, final blocker-set eligibility, exact session binding, typed confirmation, immediate pre-kill plan recheck, durable transition receipt, post-kill full-plan recheck and preserved checkout evidence."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Extending the existing stale reconciliation tool was rejected because its historical non-destructive capability semantics are frozen; generic tmux or process controls would bypass workspace-specific liveness, reference, lease, task and evidence gates.",
+      "rationale": "Idle tmux removal is a distinct destructive authority boundary. Keeping it separate preserves the frozen non-destructive stale-reconciliation contract while exposing only one plan-bound session removal followed by the existing reconciliation path.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "agent-workspace",
+        "effects": [
+          "audit-append",
+          "receipt-create",
+          "tmux-session-remove",
+          "workspace-event-append"
+        ],
+        "read_only": false,
+        "reversibility": "historical-evidence-retained",
+        "risk_class": "high",
+        "tool": "grabowski_agent_workspace_reconcile_idle_tmux"
+      }
+    },
     "grabowski_agent_workspace_writer_handoff": {
       "evidence_refs": [
         "bureau:issue-687",

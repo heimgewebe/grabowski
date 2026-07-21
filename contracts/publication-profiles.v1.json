@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "d3c6d40516eebc0f04b7e55de5e5f887c3cbff8436d6f5c3548b12a7689f9e8e"
+    "sha256": "54c92f994723e2f73e813f8524bcbe75dce09602ede2c0df0cf8e30f7033d2e0"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "50853d546630b29c2ee0cd344d0ecdbe614832986f0587842b9bc5eebb9c0ff3"
+    "sha256": "c9d101f3e43e8a0dc54552de272a03d51e720dcfa1ae38f19bbc784e27176e7f"
   },
   "counts": {
     "core": 22,
-    "full": 157,
-    "operator": 142
+    "full": 158,
+    "operator": 143
   },
   "profiles": {
     "core": [
@@ -184,6 +184,7 @@
       "grabowski_agent_workspace_optimize",
       "grabowski_agent_workspace_cleanup_plan",
       "grabowski_agent_workspace_reconcile_stale",
+      "grabowski_agent_workspace_reconcile_idle_tmux",
       "grabowski_agent_workspace_cleanup",
       "grabowski_agent_execution_route",
       "grabowski_coding_agent_catalog",
@@ -328,6 +329,7 @@
       "grabowski_agent_workspace_optimize",
       "grabowski_agent_workspace_cleanup_plan",
       "grabowski_agent_workspace_reconcile_stale",
+      "grabowski_agent_workspace_reconcile_idle_tmux",
       "grabowski_agent_workspace_cleanup",
       "grabowski_agent_execution_route",
       "grabowski_coding_agent_catalog",
