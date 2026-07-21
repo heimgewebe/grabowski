@@ -64,18 +64,41 @@ Die Segmentarchivierung begründet ausdrücklich keine Erlaubnis, Records aus de
 
 `build_effect_execution_receipt()` erzeugt anschließend ausschließlich den unveränderlichen Beleg für einen bereits beobachteten Effektversuch. Das Receipt bindet Plan, Revalidation, Source-Bindings, Lease-Bindings und Post-State-Digests. Ein bestätigter Erfolg ist nur mit verifiziertem Post-State zulässig. Ein unbekannter Transportausgang oder ein bestätigter Fehler nach möglicher beziehungsweise erfolgter Mutation wird zwingend als `recovery_required` klassifiziert und benötigt mindestens eine konkrete Recovery-Referenz; `blind_retry_allowed` bleibt immer `false`.
 
-`write_effect_execution_receipt()` persistiert create-only unter einer aus der Execution-ID abgeleiteten Identität und ist nur für exakt denselben Plan-/Revalidation-/Receipt-Inhalt idempotent wiederholbar. Ein gleichnamiger widersprüchlicher Beleg schlägt fail-closed fehl. Writer und Verifier verlangen die Ursprungsbelege erneut, sodass ein selbstkonsistent neu gehashter Receipt-Body keine fremde Plan- oder Source-Bindung vortäuschen kann. Das Receipt selbst führt keinen Effekt aus und begründet weder Löschautorität noch abgeschlossene Recovery.
+Ein Execution-Receipt darf nur einen Effektversuch belegen, dessen Startzeitpunkt strikt vor der frühesten im Revalidation-Beleg gebundenen Lease-Ablaufzeit liegt. Writer und Verifier erzwingen dieselbe Zeitgrenze; auch ein selbstkonsistent neu gehashter Receipt-Body mit zu spätem Start schlägt fail-closed fehl. Der Receipt-Abschluss darf für einen `recovery_required`-Ausgang nach dem Lease-Ablauf liegen, damit ein unbekannter Transport- oder Mutationseffekt weiterhin unveränderlich dokumentiert werden kann.
+
+`write_effect_execution_receipt()` persistiert create-only unter einer aus der Execution-ID abgeleiteten Identität und ist nur für exakt denselben Plan-/Revalidation-/Receipt-Inhalt idempotent wiederholbar. Ein gleichnamiger widersprüchlicher Beleg schlägt fail-closed fehl. Writer und Verifier verlangen dieselben Ursprungsbelege und prüfen deren exakte Digest-Bindungen erneut. Das Receipt selbst führt keinen Effekt aus und begründet weder Löschautorität noch abgeschlossene Recovery.
+
+## Recovery-sicherer Task-Archive Projection Switch
+
+`apply_task_archive_projection_switch()` ist der erste konkrete T071-Effektadapter. Er verändert nicht den Taskstore, sondern persistiert create-only einen Projektionsumschaltbeleg für ein bereits vollständig verifiziertes Archivsegment.
+
+Der Switch ist gebunden an:
+
+- Segment-ID und Segment-Identity-SHA-256;
+- Manifest-, Segment-, Archivplan- und Quellstore-SHA-256;
+- die vollständige Task-ID-zu-Record-SHA-256-Bindung des Archivsegments;
+- einen `current_projection_switch`-Effect-Plan mit ausschließlich `archived` klassifizierten Identitäten;
+- dessen unmittelbaren `ready_for_effect`-Revalidation-Beleg;
+- die exakte Projection-Root-Ressource als gebundene Lease;
+- einen `applied_at_unix`, der strikt vor der frühesten gebundenen Lease-Ablaufzeit liegt.
+
+Die Mutation wird innerhalb eines exklusiven Directory-Locks serialisiert. Ein vorhandener identischer Switch ist idempotent. Mehrere Archivsegmente dürfen denselben Task nur dann projizieren, wenn sie exakt denselben Record-SHA-256 binden; ein abweichender Record-Hash wird vor dem zweiten Switch-Write abgelehnt. Jeder spätere `load_task_archive_projection()`-Readback verifiziert die Switch-Dateien und die referenzierten Archivsegmente erneut.
+
+`bounded_current_task_projection()` blendet einen projizierten Task nur aus, wenn der aktuell vorgelegte Taskrecord bytekanonisch denselben SHA-256 wie der archivierte Record besitzt. Jede Record-Drift schlägt fail-closed fehl. Die Umschaltung löscht keine Taskzeile, kein Archiv und keinen Recovery-Beleg und begründet weiterhin keine physische Löschautorität.
+
+Der erfolgreiche Switch liefert verifizierte Post-State-Digests für Archivmanifest, Switch und Gesamtprojektion. Diese Digests können unmittelbar in ein create-only Execution-Receipt übernommen werden. Scheitert ein späterer Schritt, bleibt der deterministische Switch als Recovery-Readback erhalten.
 
 ## Noch getrennte Integrationsarbeit
 
 Für den vollständigen T071-Abschluss fehlen nach diesem Core noch:
 
-- Ausführungsadapter, die den bereits belegten Plan/Revalidation/Receipt-Vertrag tatsächlich umsetzen, ohne Blind-Retry zu erlauben;
-- persistente Workspace-Archive und Retention-Konvergenz;
-- atomare beziehungsweise recovery-sichere Umstellung der aktiven Taskprojektion nach Segmentverifikation;
-- Deployment und isolierter Livebeweis.
+- produktive Anbindung der aktuellen Task-Leseoberflächen an den verifizierten Projection-Switch-State;
+- persistente Workspace-Close-/Archive-Konvergenz und Retention-Konvergenz;
+- gegebenenfalls weitere Effektadapter auf demselben Plan/Revalidation/Receipt-Vertrag, ohne Blind-Retry zu erlauben;
+- Deployment eines kohärenten T071-Heads und isolierter Livebeweis;
+- abschließende Audit-Integritätsprüfung und Bureau-Closeout.
 
-Diese Schritte dürfen die bestehenden Safety-Grenzen nicht lockern: dirty, fremd geschützt, gemeinsam referenziert oder uneindeutig bleibt unberührbar.
+Das separat als Bureau-Candidate erfasste Directory-FD/openat-Hardening bleibt ein eigener Follow-up-Pfad. Es darf diese Safety-Grenzen weiter verkleinern, ist aber keine Erlaubnis, dirty, fremd geschützte, gemeinsam referenzierte oder uneindeutige Zustände anzufassen.
 
 ## Hashgebundene Live-Evidenzaggregation
 
