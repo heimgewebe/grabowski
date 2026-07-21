@@ -2125,6 +2125,56 @@ class DeploymentSequenceTests(unittest.TestCase):
                 expected_agent_instructions=TEST_AGENT_INSTRUCTIONS_IDENTITY,
             )
 
+    def test_tunnel_drain_metrics_require_unique_complete_nonnegative_values(self) -> None:
+        valid = (
+            "commands_queue_length{scope=\"controlplane\"} 0\n"
+            "dispatcher_worker_pool_occupancy{scope=\"dispatcher\"} 2\n"
+        )
+        self.assertEqual(
+            {
+                "commands_queue_length": 0.0,
+                "dispatcher_worker_pool_occupancy": 2.0,
+            },
+            dual._parse_tunnel_drain_metrics(valid),
+        )
+        invalid = {
+            "missing": "commands_queue_length 0\n",
+            "duplicate": valid + "dispatcher_worker_pool_occupancy 0\n",
+            "negative": valid.replace("occupancy{scope=\"dispatcher\"} 2", "occupancy{scope=\"dispatcher\"} -1"),
+            "nan": valid.replace("occupancy{scope=\"dispatcher\"} 2", "occupancy{scope=\"dispatcher\"} NaN"),
+        }
+        for name, payload in invalid.items():
+            with self.subTest(name=name), self.assertRaises(core.DeployError):
+                dual._parse_tunnel_drain_metrics(payload)
+
+    def test_tunnel_drain_wait_requires_consecutive_idle_samples(self) -> None:
+        busy = (
+            "commands_queue_length 0\n"
+            "dispatcher_worker_pool_occupancy 1\n"
+        )
+        idle = (
+            "commands_queue_length 0\n"
+            "dispatcher_worker_pool_occupancy 0\n"
+        )
+        with (
+            mock.patch.object(core, "http_text", side_effect=[busy, idle, idle, idle]),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            result = dual.wait_for_tunnel_dispatcher_idle(timeout_seconds=5)
+        self.assertEqual(4, result["attempts"])
+        self.assertEqual(3, result["consecutive_idle_samples"])
+        self.assertEqual(0.0, result["metrics"]["dispatcher_worker_pool_occupancy"])
+
+    def test_tunnel_drain_wait_fails_closed_without_metrics(self) -> None:
+        with (
+            mock.patch.object(core, "http_text", return_value=None),
+            mock.patch.object(dual.time, "monotonic", side_effect=[0.0, 2.0]),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.wait_for_tunnel_dispatcher_idle(timeout_seconds=1)
+        self.assertEqual("tunnel-drain-pre-stop", raised.exception.phase)
+        self.assertEqual({"reason": "metrics-unavailable"}, raised.exception.details["last_error"])
+
     def test_cutover_order_is_tunnel_then_operator_and_reverse_on_start(self) -> None:
         events: list[str] = []
         snapshot = self.snapshot()
@@ -2160,6 +2210,11 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "install_safety_observer_unit",
                 side_effect=lambda *args: events.append("install:observer"),
             ) as install,
+            mock.patch.object(
+                dual,
+                "wait_for_tunnel_dispatcher_idle",
+                side_effect=lambda **kwargs: events.append("drain:tunnel") or {},
+            ),
             mock.patch.object(
                 dual,
                 "stop_service",
@@ -2212,6 +2267,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "install:watchdogs",
                 "install:observer",
                 "verify:snapshot",
+                "drain:tunnel",
                 f"stop:{dual.TUNNEL_SERVICE}",
                 f"stop:{dual.OPERATOR_SERVICE}",
                 "verify:snapshot",
@@ -2290,6 +2346,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(
                 dual, "install_safety_observer_unit", return_value=repair
             ),
+            mock.patch.object(dual, "wait_for_tunnel_dispatcher_idle", return_value={}),
             mock.patch.object(dual, "stop_service", side_effect=stop),
             mock.patch.object(core, "activate_pointer") as activate,
             mock.patch.object(dual, "rollback_url", side_effect=rollback),
@@ -2321,6 +2378,60 @@ class DeploymentSequenceTests(unittest.TestCase):
                 **repair,
             },
         )
+
+    def test_drain_failure_aborts_before_service_stop_without_service_rollback(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                dual,
+                "preflight_url",
+                return_value=(
+                    self.snapshot(),
+                    RUNTIME,
+                    dual.ProfileTopology("url", server_url_count=1),
+                ),
+            ),
+            mock.patch.object(core, "build_release", return_value=self.build()),
+            mock.patch.object(core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(core, "verify_manifest"),
+            mock.patch.object(core, "capture_pointer", return_value=SimpleNamespace()),
+            mock.patch.object(
+                dual, "install_watchdog_host_assets", return_value=self.watchdog_projection()
+            ),
+            mock.patch.object(dual, "restore_watchdog_host_assets") as restore_watchdogs,
+            mock.patch.object(
+                dual,
+                "install_safety_observer_unit",
+                return_value={
+                    "changed": False,
+                    "repo_head": "a" * 40,
+                    "sha256": "d" * 64,
+                },
+            ),
+            mock.patch.object(
+                dual,
+                "wait_for_tunnel_dispatcher_idle",
+                side_effect=core.DeployError(
+                    "busy", phase="tunnel-drain-pre-stop"
+                ),
+            ),
+            mock.patch.object(dual, "stop_service") as stop,
+            mock.patch.object(dual, "rollback_url") as rollback,
+            mock.patch("sys.stderr", stderr),
+        ):
+            with self.assertRaisesRegex(core.DeployError, "busy"):
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+        stop.assert_not_called()
+        rollback.assert_not_called()
+        restore_watchdogs.assert_called_once()
+        payload = json.loads(
+            next(
+                line.removeprefix("PRIMARY-DEPLOY-ERROR: ")
+                for line in stderr.getvalue().splitlines()
+                if line.startswith("PRIMARY-DEPLOY-ERROR: ")
+            )
+        )
+        self.assertEqual("tunnel-drain-pre-stop", payload["deploy_phase"])
 
     def test_post_observer_snapshot_failure_retains_repair_and_rolls_back(self) -> None:
         stderr = io.StringIO()
@@ -2430,6 +2541,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                     "sha256": "d" * 64,
                 },
             ),
+            mock.patch.object(dual, "wait_for_tunnel_dispatcher_idle", return_value={}),
             mock.patch.object(dual, "stop_service", side_effect=stop),
             mock.patch.object(dual, "rollback_url", side_effect=rollback),
             mock.patch("sys.stderr", stderr),
