@@ -788,6 +788,24 @@ def _effect_receipt_status(
     return "recovery_required"
 
 
+def _earliest_revalidation_lease_expiry(
+    revalidation: Mapping[str, Any],
+) -> int:
+    bindings = revalidation.get("lease_bindings")
+    if not isinstance(bindings, list) or not bindings:
+        raise LifecycleEffectPlanIntegrityError(
+            "ready effect revalidation lacks lease bindings"
+        )
+    expiries = [item.get("expires_at_unix") for item in bindings if isinstance(item, Mapping)]
+    if len(expiries) != len(bindings) or any(
+        not isinstance(value, int) or isinstance(value, bool) for value in expiries
+    ):
+        raise LifecycleEffectPlanIntegrityError(
+            "effect revalidation lease expiry binding is invalid"
+        )
+    return min(expiries)
+
+
 def build_effect_execution_receipt(
     plan: Mapping[str, Any],
     revalidation: Mapping[str, Any],
@@ -821,6 +839,12 @@ def build_effect_execution_receipt(
             raise ValueError(f"{label} must be an integer")
     if started_at_unix < validated_revalidation["now_unix"]:
         raise ValueError("effect execution may not start before revalidation")
+    if started_at_unix >= _earliest_revalidation_lease_expiry(
+        validated_revalidation
+    ):
+        raise ValueError(
+            "effect execution may not start at or after earliest lease expiry"
+        )
     if completed_at_unix < started_at_unix:
         raise ValueError("effect execution completion precedes its start")
     if transport_outcome not in TRANSPORT_OUTCOMES:
@@ -1060,6 +1084,12 @@ def _validate_effect_execution_receipt_binding(
     if value["started_at_unix"] < validated_revalidation["now_unix"]:
         raise LifecycleEffectPlanIntegrityError(
             "effect execution receipt predates its revalidation"
+        )
+    if value["started_at_unix"] >= _earliest_revalidation_lease_expiry(
+        validated_revalidation
+    ):
+        raise LifecycleEffectPlanIntegrityError(
+            "effect execution receipt started outside the bound leases"
         )
     return value
 
