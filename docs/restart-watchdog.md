@@ -53,45 +53,74 @@ getrennte Komponenten-Watchdogs auf Basis von `tools/component_watchdog.py`:
 `grabowski-operator-watchdog` und `grabowski-tunnel-watchdog`. Jeder startet
 ausschließlich seinen eigenen Dienst neu.
 
-### Vollständiger read-only MCP-Lebenszyklus (Operator)
+### Vollständige read-only Operatorprüfung
 
-Der Operator-Probe erzeugt **keine zweite Sitzung am stateful Live-HTTP-Port**.
-Eine solche konkurrierende Initialisierung kann am Sitzungs-Erzeugungslock des
-MCP-Servers blockieren und den zu prüfenden Pfad selbst verschlechtern.
-Stattdessen kombiniert der Watchdog zwei getrennte Belege:
+Der Operator-Watchdog kombiniert zwei voneinander unabhängige Belege:
 
-1. Der laufende `grabowski-operator.service`, seine MainPID, sein Listener und
-   die Bindung an die erwartete deployte Runtime werden geprüft.
-2. Aus genau dieser Runtime wird ein isolierter, kurzlebiger
-   `grabowski_operator --transport stdio`-Prozess gestartet.
-3. Über newline-gerahmtes JSON-RPC läuft der vollständige MCP-Lebenszyklus:
-   `initialize`, `notifications/initialized`, danach `tools/call` mit exakt
-   `grabowski_runtime_health` und leeren Argumenten. `tools/list` findet nicht
-   statt und ist kein Ersatz für den echten Toolaufruf.
-4. Akzeptiert werden nur eine formgültige Initialize-Antwort, ein boolesches
-   `isError` ungleich `true` und ein Tool-Payload mit `healthy: true`.
-   `healthy: false` wird als `mcp-runtime-unhealthy` sichtbar, führt aber als
-   `indeterminate` nicht zu einer Operator-Restart-Schleife.
-5. stdin wird anschließend geschlossen; der Kindprozess muss innerhalb des
-   begrenzten Shutdown-Fensters sauber enden. Andernfalls wird er zuerst mit
-   TERM, danach nötigenfalls mit KILL beendet und der Probe bleibt fehlgeschlagen.
+1. Er prüft MainPID, Listener und Bindung an die erwartete deployte Runtime.
+2. Eine interne Loopback-Route prüft, ob die echte HTTP-Eventloop antwortet und
+   ob der FastMCP-`_session_creation_lock` innerhalb einer Sekunde kurz
+   erworben und wieder freigegeben werden kann. Dabei wird **keine neue
+   MCP-Sitzung erzeugt** und keine produktive Sitzung verändert.
+3. Zusätzlich startet der Watchdog aus derselben Runtime einen isolierten,
+   kurzlebigen stdio-Prozess. Dort läuft der vollständige MCP-Lebenszyklus mit
+   `initialize`, `notifications/initialized` und exakt dem Read-Tool
+   `grabowski_runtime_health`.
+4. Ein fachliches `healthy: false` bleibt `indeterminate` und löst keine
+   Restart-Schleife aus. Eine nicht antwortende Eventloop, ein dauerhaft
+   belegter Session-Erzeugungslock oder ein konkreter stdio-Transportfehler
+   gelten dagegen als Operatorfehler.
 
-Grenzen: ein gemeinsamer Lebenszyklus-Timeout (`--http-timeout`, historischer
-Kompatibilitätsname; Standard 2 s), maximal 64 KiB stdout-Protokollantwort,
-kein Netzwerkzugriff des Probes und keine Zielmutation. stderr des isolierten
-Kindprozesses wird verworfen, damit es weder den JSON-RPC-Kanal beschädigt noch
-einen Pipe-Stau erzeugt. `PYTHONDONTWRITEBYTECODE=1` verhindert Schreibnebenwirkungen
-im deployten Runtime-Baum.
+Diese Aufteilung vermeidet den früheren Blindflug, ohne den bekannten
+Session-Erzeugungslock durch einen konkurrierenden Watchdog-Handshake selbst
+zu belasten. Der Live-Probe besteht aus genau einem begrenzten GET gegen
+Loopback; Antwortzeit und Antwortgröße sind auf zwei Sekunden und 64 KiB
+begrenzt.
 
-Der Probe belegt damit Live-Prozessidentität sowie die Start-, Protokoll- und
-Toolfähigkeit derselben deployten Runtime. Er belegt ausdrücklich **nicht**,
-dass eine neue HTTP-MCP-Sitzung parallel zum produktiven Connector eröffnet
-werden kann. Genau diese Nichtstörung erlaubt eine produktive Watchdog-Unit;
-`--check-only` bleibt für manuelle Diagnose verfügbar.
+Der Operator registriert `SIGUSR1` auf einem anonymen Linux-Memfd mit exakt
+1 MiB Kapazität. `F_SEAL_GROW` und `F_SEAL_SHRINK` verhindern, dass auch viele
+fremde Signale diesen Speicher vergrößern oder umformen. Vor einem
+automatischen Neustart ermittelt der Watchdog genau diesen Deskriptor über
+`/proc/<pid>/fd`, merkt sich seine aktuelle Schreibposition, sendet ein Signal
+und liest ausschließlich die neu geschriebenen Bytes aus. Das Signal wird über
+ein Linux-`pidfd` an genau den zuvor gebundenen Prozess gesendet; ändert sich
+die `/proc`-Startidentität während der Aufnahme, verwirft der Watchdog den Dump
+fail-closed. Fehlt `pidfd`- oder Memfd-Unterstützung, läuft der notwendige
+Recovery-Neustart ohne Stackdump weiter.
+
+Die persistente Evidenz liegt in einem festen Ring aus acht Slots unter
+`~/.local/state/grabowski/operator-stackdumps-v1/`. Jeder Slot beginnt mit
+einem kanonischen JSON-Kopf aus Restart-Generation, PID, Prozess-Startidentität,
+Aufnahmezeit, Payload-Größe und Payload-Hash. Nur der im aktuellen Watchdog-Ereignis
+referenzierte Receipt gilt als frisch; eine bei fehlgeschlagener Publikation
+verbleibende ältere Slotdatei weist durch ihren Kopf weiterhin ihre ältere
+Generation aus.
+
+Jeder Slot entsteht aus einer neuen Exklusivdatei mit Modus 0600 und wird per
+atomarem Replace veröffentlicht. Eine einzige deterministisch benannte,
+ebenfalls auf 1 MiB begrenzte Pending-Datei verhindert, dass Prozessabbrüche
+beliebig viele temporäre Dateien hinterlassen. Bestehende Hardlinks oder
+Symlinks werden dadurch ersetzt, ohne ihr Ziel vor der Prüfung zu öffnen oder
+zu truncaten. Der Ring begrenzt die veröffentlichte Evidenz auf acht Dateien
+zu jeweils höchstens 1 MiB; zusätzlich kann höchstens eine begrenzte
+Pending-Datei existieren. Weitere externe Signale verändern bereits
+publizierte Evidenz nicht. Ist der feste 1-MiB-Memfd bereits vollständig
+beschrieben, wird kein weiteres Diagnosesignal gesendet und der
+Recovery-Neustart läuft ohne frischen Dump weiter. Die Stackaufnahme ist
+Diagnoseevidenz und darf einen notwendigen Neustart nicht blockieren.
+
+Der HTTP-Sitzungsmanager beendet inaktive Sitzungen nach 1.800 Sekunden. Das
+begrenzt verwaiste Zustände, ohne normale Connector-Sitzungen aggressiv zu
+unterbrechen. Weil die Härtung an die aktuell gepinnte FastMCP-Implementierung
+gebunden ist, verweigert der Operator den HTTP-Start, falls `custom_route` oder
+der Session-Erzeugungslock nicht mehr verfügbar sind. Die vom Tunnel
+abgefragten Pfade `/.well-known/oauth-protected-resource` und
+`/.well-known/oauth-protected-resource/mcp` liefern deterministisches JSON für
+den auth-freien Loopback-Betrieb statt einer nicht parsebaren 404-Antwort.
 
 ### Backoff mit Jitter und persistenter Sperrzeit
 
-Failure-Threshold (3 aufeinanderfolgende Fehlmessungen) und Restart-Budget
+Failure-Threshold (2 aufeinanderfolgende Fehlmessungen) und Restart-Budget
 (3 Neustarts pro 15 Minuten) bleiben unverändert fail-closed und werden vor
 dem Backoff geprüft. Zusätzlich trägt der State einen begrenzten
 exponentiellen Restart-Backoff:
@@ -131,7 +160,7 @@ nicht deklariert werden. Die Aufteilung ist deshalb:
   Unit (eine Budget-Wahrheit).
 - `RandomizedDelaySec=3s` in den Timern bleibt reine äußere Entkopplung der
   Timerläufe; der semantische Watchdog trägt den eigentlichen Backoff. Der
-  leichte Tunnelcheck läuft alle 30 s, der rund 0,8 s teure stdio-Operatorcheck
+  leichte Tunnelcheck läuft alle 30 s, der sitzungsfreie Eventloop-/Lock- plus stdio-Operatorcheck
   alle 60 s, um unnötige Prozess- und Importlast zu halbieren.
 - `SuccessExitStatus=1` wertet Routine-Evidenz (Fehlmessung, aufgeschobener
   Neustart) nicht als Unit-Fehler; Exit 2/3/4 (indeterminate, Budget
@@ -143,11 +172,11 @@ nicht deklariert werden. Die Aufteilung ist deshalb:
 
 Die beiden Komponentenprüfungen liefern getrennte lokale Belege:
 Der Tunnel-Watchdog prüft dessen `/healthz` und `/readyz`; der
-Operator-Watchdog prüft Live-Prozess/Listener und ruft das Read-Tool
-`grabowski_runtime_health` in einem isolierten stdio-MCP-Prozess aus derselben
-deployten Runtime auf. Das beweist weder den produktiven HTTP-Sitzungspfad noch
-einen durchgängigen Pfad Tunnel → Operator oder den
-ChatGPT-Control-Plane-Roundtrip.
+Operator-Watchdog prüft Live-Prozess/Listener, die lokale HTTP-Eventloop,
+den FastMCP-Session-Erzeugungslock und einen isolierten stdio-Pfad aus derselben
+deployten Runtime. Nicht belegt bleiben jeder einzelne Schritt einer bereits
+bestehenden produktiven MCP-Sitzung, der vollständige Roundtrip durch die
+OpenAI-Control-Plane und die korrekte Zuordnung einer konkreten ChatGPT-Sitzung.
 
 Connection-Generation, das Verwerfen veralteter Antworten und die
 Neuerkennung des Tool-Katalogs durch den Client liegen außerhalb dieses
