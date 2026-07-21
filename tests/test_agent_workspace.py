@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -5195,6 +5196,12 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertFalse(transition["eligible"])
         self.assertEqual(transition["session_name"], manifest["session_name"])
 
+    def test_stale_reconcile_remains_non_destructive_api(self) -> None:
+        parameters = inspect.signature(
+            workspace.grabowski_agent_workspace_reconcile_stale
+        ).parameters
+        self.assertNotIn("remove_idle_tmux_session", parameters)
+
     def test_idle_tmux_transition_removes_exact_session_and_reconciles_stale(self) -> None:
         manifest = self.manifest()
         manifest["created_at"] = "2026-01-01T00:00:00+00:00"
@@ -5228,21 +5235,25 @@ class AgentWorkspaceTests(unittest.TestCase):
             transition = plan["stale_reconciliation"]["idle_tmux_transition"]
             self.assertTrue(transition["eligible"])
             self.assertFalse(plan["stale_reconciliation"]["eligible"])
-            result = workspace.grabowski_agent_workspace_reconcile_stale(
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
                 manifest["workspace_id"],
                 plan["plan_sha256"],
                 "remove-idle-tmux-and-mark-stale-workspace-abandoned",
-                remove_idle_tmux_session=True,
             )
 
         tmux.assert_called_once()
         self.assertEqual(result["state"], "stale_workspace_reconciled")
         self.assertTrue(result["tmux_removed"])
         self.assertTrue(result["tmux_mutation_performed"])
+        transition_receipt = result["idle_tmux_transition_receipt"]
+        self.assertTrue(transition_receipt["tmux_removed"])
+        self.assertTrue(transition_receipt["tmux_mutation_performed"])
+        self.assertFalse(transition_receipt["task_mutation_performed"])
+        self.assertFalse(transition_receipt["resource_mutation_performed"])
+        self.assertFalse(transition_receipt["worktree_mutation_performed"])
         receipt = result["close_receipt"]
         self.assertEqual(receipt["closure_outcome"], "abandoned_stale_workspace")
-        self.assertTrue(receipt["tmux_removed"])
-        self.assertTrue(receipt["tmux_mutation_performed"])
+        self.assertFalse(receipt["tmux_removed"])
         self.assertTrue(self.git.writer.exists())
         persisted = workspace._manifest(manifest["workspace_id"])
         self.assertTrue(
@@ -5274,13 +5285,12 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertFalse(
                 plan["stale_reconciliation"]["idle_tmux_transition"]["eligible"]
             )
-            result = workspace.grabowski_agent_workspace_reconcile_stale(
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
                 manifest["workspace_id"],
                 plan["plan_sha256"],
                 "remove-idle-tmux-and-mark-stale-workspace-abandoned",
-                remove_idle_tmux_session=True,
             )
-        self.assertEqual(result["state"], "stale_reconciliation_blocked")
+        self.assertEqual(result["state"], "idle_tmux_transition_blocked")
         tmux.assert_not_called()
 
     def test_idle_tmux_transition_rechecks_full_plan_after_session_removal(self) -> None:
@@ -5291,6 +5301,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         session_live = True
         resource_observations = iter(
             [
+                [],
                 [],
                 [],
                 [{"resource_key": "path:/new-live-resource"}],
@@ -5327,11 +5338,10 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertTrue(
                 plan["stale_reconciliation"]["idle_tmux_transition"]["eligible"]
             )
-            result = workspace.grabowski_agent_workspace_reconcile_stale(
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
                 manifest["workspace_id"],
                 plan["plan_sha256"],
                 "remove-idle-tmux-and-mark-stale-workspace-abandoned",
-                remove_idle_tmux_session=True,
             )
 
         self.assertEqual(
@@ -5348,6 +5358,52 @@ class AgentWorkspaceTests(unittest.TestCase):
         persisted = workspace._manifest(manifest["workspace_id"])
         self.assertIsNone(persisted.get("close_receipt"))
 
+    def test_idle_tmux_transition_rechecks_plan_immediately_before_kill(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        resource_observations = iter(
+            [
+                [],
+                [],
+                [{"resource_key": "path:/new-live-resource"}],
+            ]
+        )
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.resources,
+                "list_resources",
+                side_effect=lambda **kwargs: next(resource_observations),
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_result") as tmux,
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertTrue(
+                plan["stale_reconciliation"]["idle_tmux_transition"]["eligible"]
+            )
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "plan changed before idle tmux removal",
+            ):
+                workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                    manifest["workspace_id"],
+                    plan["plan_sha256"],
+                    "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+                )
+
+        tmux.assert_not_called()
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertIsNone(persisted.get("close_receipt"))
+
     def test_idle_tmux_transition_requires_distinct_typed_confirmation(self) -> None:
         manifest = self.manifest()
         workspace._write_manifest(manifest)
@@ -5356,11 +5412,10 @@ class AgentWorkspaceTests(unittest.TestCase):
                 workspace.AgentWorkspaceError,
                 "remove-idle-tmux-and-mark-stale-workspace-abandoned",
             ):
-                workspace.grabowski_agent_workspace_reconcile_stale(
+                workspace.grabowski_agent_workspace_reconcile_idle_tmux(
                     manifest["workspace_id"],
                     "a" * 64,
                     "mark-stale-workspace-abandoned",
-                    remove_idle_tmux_session=True,
                 )
 
     def test_interrupted_task_requires_reconciliation_without_claiming_liveness(self) -> None:

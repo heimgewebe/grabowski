@@ -1071,6 +1071,22 @@ TOOL_PROFILES.update(
             "effects": ["receipt-create", "workspace-event-append", "audit-append"],
             "reversibility": "historical-evidence-retained",
         },
+        "grabowski_agent_workspace_reconcile_idle_tmux": {
+            "category": "agent-workspace",
+            "purpose": (
+                "Remove only the exact non-authoritative idle tmux session from one "
+                "provably inactive stale workspace, then invoke the existing "
+                "non-destructive stale reconciliation."
+            ),
+            "risk_class": "high",
+            "effects": [
+                "audit-append",
+                "receipt-create",
+                "tmux-session-remove",
+                "workspace-event-append",
+            ],
+            "reversibility": "historical-evidence-retained",
+        },
         "grabowski_agent_workspace_cleanup": {
             "category": "agent-workspace",
             "purpose": "Create durable recovery refs and remove one eligible closed writer checkout without deleting workspace evidence.",
