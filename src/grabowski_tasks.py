@@ -40,6 +40,8 @@ TASK_DB = Path(
     )
 ).expanduser()
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
+GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
+GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
 DEFAULT_TASK_LIST_LIMIT = 20
 
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
@@ -955,6 +957,75 @@ def _validate_cwd(host: str, raw: str | None) -> str:
     if target["transport"] == "local":
         return str(operator._resolve_cwd(candidate))
     return candidate
+
+
+def _normalized_github_repository_slug(remote_url: str) -> str | None:
+    value = remote_url.strip()
+    prefixes = (
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "https://github.com/",
+        "http://github.com/",
+    )
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            slug = value[len(prefix):].rstrip("/")
+            if slug.endswith(".git"):
+                slug = slug[:-4]
+            return slug or None
+    return None
+
+
+def _is_local_grabowski_checkout(cwd: str) -> bool:
+    result = operator._run(
+        ["git", "-C", cwd, "config", "--get", "remote.origin.url"],
+        cwd=operator.HOME,
+        timeout_seconds=5,
+        max_output_bytes=4096,
+    )
+    if result.get("returncode") != 0:
+        return False
+    return (
+        _normalized_github_repository_slug(str(result.get("stdout", "")))
+        == GRABOWSKI_REPOSITORY_SLUG
+    )
+
+
+def _unqualified_python_index(command: list[str]) -> int | None:
+    if command[0] in {"python", "python3"}:
+        return 0
+    if command[0] not in {"env", "/bin/env", "/usr/bin/env"}:
+        return None
+    for index, item in enumerate(command[1:], start=1):
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", item):
+            continue
+        return index if item in {"python", "python3"} else None
+    return None
+
+
+def _bind_grabowski_runtime_python(
+    command: list[str],
+    *,
+    target: dict[str, Any],
+    cwd: str,
+    enabled: bool,
+) -> list[str]:
+    if not isinstance(enabled, bool):
+        raise ValueError("runtime_python must be boolean")
+    if not enabled:
+        return command
+    python_index = _unqualified_python_index(command)
+    if python_index is None or target["transport"] != "local":
+        return command
+    if not _is_local_grabowski_checkout(cwd):
+        return command
+    if not GRABOWSKI_RUNTIME_PYTHON.is_file() or not os.access(
+        GRABOWSKI_RUNTIME_PYTHON, os.X_OK
+    ):
+        raise RuntimeError("Grabowski runtime Python is unavailable")
+    bound = list(command)
+    bound[python_index] = str(GRABOWSKI_RUNTIME_PYTHON)
+    return bound
 
 
 def _validate_weights(cpu_weight: int, io_weight: int) -> tuple[int, int]:
@@ -2041,6 +2112,7 @@ def grabowski_task_start(
     chronik_outbox: bool = False,
     chronik_outbox_state_root: str | None = None,
     chronik_operation: str = "other",
+    runtime_python: bool = False,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -2052,6 +2124,12 @@ def grabowski_task_start(
     command = _validate_command(argv)
     recovery_gate = _require_recovery_gate(command)
     working_directory = _validate_cwd(host, cwd)
+    command = _bind_grabowski_runtime_python(
+        command,
+        target=target,
+        cwd=working_directory,
+        enabled=runtime_python,
+    )
     runtime = operator._job_runtime(runtime_seconds)
     policy = _validate_resume_policy(resume_policy)
     cpu, io = _validate_weights(cpu_weight, io_weight)
