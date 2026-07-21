@@ -70,3 +70,18 @@ Für den vollständigen T071-Abschluss fehlen nach diesem Core noch:
 - Deployment und isolierter Livebeweis.
 
 Diese Schritte dürfen die bestehenden Safety-Grenzen nicht lockern: dirty, fremd geschützt, gemeinsam referenziert oder uneindeutig bleibt unberührbar.
+
+## Hashgebundene Live-Evidenzaggregation
+
+`grabowski_lifecycle_evidence` normalisiert die sieben für T071 relevanten aktuellen Quellen `task`, `workspace`, `lease`, `checkout`, `process`, `tmux` und `receipt` in einen gemeinsamen Evidenzsnapshot. Eine Quelle gilt nur dann als beobachtet, wenn ihr aktueller Zustand explizit geprüft wurde; auch ein belegtes Nichtvorhandensein ist eine Beobachtung. Für jede beobachtete Quelle ist zusätzlich der SHA-256-Digest der normalisierten, redigierten Quellprojektion erforderlich. Fehlende Beobachtungen, fehlende Digests und Quellfehler werden als `ambiguous` klassifiziert und begründen keine Archivierungsautorität.
+
+Die Aggregation bildet zusätzliche Safety-Fälle explizit ab:
+
+- offene Workspace- oder Taskrollen bleiben `active`;
+- aktive exakte Leases bleiben `blocking`;
+- dirty Checkouts, Shared-Workspace-Referenzen und aktive fremde Retentionen bleiben `untouchable`;
+- eine abgelaufene fremde Retention bleibt `recovery_required`, bis eine getrennte Recovery-Archivierung belegt ist;
+- eine tmux-Session ohne lebende Rollen- oder Prozessbindung ist `ambiguous` und wird weder als aktive Arbeit noch als Cleanup-Freigabe interpretiert;
+- unbekannte Prozess- oder systemd-nahe Beobachtungen bleiben fail-closed.
+
+Der normalisierte Snapshot erhält einen eigenen `evidence_sha256`. Er ist read-only und begründet weder einen Effekt noch eine Aussage darüber, dass die Quellzustände nach der Beobachtung unverändert geblieben sind. Die spätere Effektplanung muss den Snapshot deshalb erneut gegen aktuelle Quellen und exakte Leases binden.

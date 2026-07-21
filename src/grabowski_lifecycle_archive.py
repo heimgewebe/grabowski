@@ -43,6 +43,9 @@ class LifecycleEvidence:
     active_lease: bool | None = False
     foreign_retention: bool | None = False
     shared_reference: bool | None = False
+    open_task_role: bool | None = False
+    retention_recovery_required: bool | None = False
+    tmux_session_only: bool | None = False
     receipt_integrity_valid: bool | None = True
     observation_errors: tuple[str, ...] = ()
 
@@ -68,6 +71,9 @@ def _unknown_boolean_fields(evidence: LifecycleEvidence) -> list[str]:
         "active_lease",
         "foreign_retention",
         "shared_reference",
+        "open_task_role",
+        "retention_recovery_required",
+        "tmux_session_only",
         "receipt_integrity_valid",
     )
     return [name for name in fields if getattr(evidence, name) is None]
@@ -92,6 +98,12 @@ def classify_lifecycle(evidence: LifecycleEvidence) -> dict[str, Any]:
         if evidence.receipt_integrity_valid is not True:
             classification = "recovery_required"
             reasons.append("archive_receipt_integrity_missing_or_invalid")
+        elif evidence.retention_recovery_required:
+            classification = "recovery_required"
+            reasons.append("retention_recovery_archive_required")
+        elif evidence.tmux_session_only:
+            classification = "ambiguous"
+            reasons.append("tmux_session_without_live_role_or_process")
         else:
             contradictory = any(
                 (
@@ -101,6 +113,7 @@ def classify_lifecycle(evidence: LifecycleEvidence) -> dict[str, Any]:
                     evidence.dirty,
                     evidence.foreign_retention,
                     evidence.shared_reference,
+                    evidence.open_task_role,
                 )
             )
             if contradictory or evidence.state in ACTIVE_TASK_STATES | RECOVERY_TASK_STATES:
@@ -118,6 +131,9 @@ def classify_lifecycle(evidence: LifecycleEvidence) -> dict[str, Any]:
     elif evidence.shared_reference:
         classification = "untouchable"
         reasons.append("shared_reference")
+    elif evidence.open_task_role:
+        classification = "active"
+        reasons.append("open_task_role")
     elif evidence.active_task or evidence.state in ACTIVE_TASK_STATES:
         classification = "active"
         reasons.append("active_task")
@@ -127,6 +143,12 @@ def classify_lifecycle(evidence: LifecycleEvidence) -> dict[str, Any]:
     elif evidence.active_lease:
         classification = "blocking"
         reasons.append("active_lease")
+    elif evidence.retention_recovery_required:
+        classification = "recovery_required"
+        reasons.append("retention_recovery_archive_required")
+    elif evidence.tmux_session_only:
+        classification = "ambiguous"
+        reasons.append("tmux_session_without_live_role_or_process")
     elif evidence.state in RECOVERY_TASK_STATES:
         classification = "recovery_required"
         reasons.append(f"task_state:{evidence.state}")
