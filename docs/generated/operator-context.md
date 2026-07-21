@@ -121,6 +121,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_task_cancel` | task | no | medium | Stop one task process group while retaining its persistent record. |
 | `grabowski_task_resume` | task | no | variable | Recreate a missing or stopped task unit from its persistent record. |
 | `grabowski_task_list` | task | yes | low | List recent persistent task records with optional state filtering. |
+| `grabowski_chronik_outbox_import` | coding-memory | no | medium | Import one redacted Grabowski outbox JSONL into optional local Chronik. |
+| `grabowski_chronik_history` | coding-memory | yes | low | Read bounded historical coding events without asserting current truth. |
 | `grabowski_task_reconcile_check` | task | yes | low | Preview reconcile effects for persistent task records without mutating state. |
 | `grabowski_task_reconcile_refresh` | task | no | medium | Refresh persistent task records and release terminal leases without resuming processes. |
 | `grabowski_task_reconcile_resume` | task | no | high | Resume bounded retry-safe tasks after reconcile verification. |
@@ -184,6 +186,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_competition_compare` | agent-workspace | yes | low | Generate a deterministic contrast matrix, consensus signals and validation opportunities from exactly two bound external candidates. |
 | `grabowski_agent_bootstrap` | operations-observability | yes | low | Return a release-evidence-bound adaptive agent entry capsule without authorizing execution. |
 | `grabowski_call_shape_check` | operations-observability | yes | low | Deterministically lint one proposed tool-call shape before execution. |
+| `grabowski_task_archive_list` | task-archive | yes | low | List immutable task archive segments through a bounded manifest-verified catalog. |
+| `grabowski_task_archive_read` | task-archive | yes | low | Read one fully integrity-verified immutable task archive segment with bounded pagination. |
 
 ## Policy contract
 

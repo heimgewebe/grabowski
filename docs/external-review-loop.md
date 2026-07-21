@@ -112,6 +112,14 @@ Audits support policy calibration. Useful aggregate signals are:
 
 Increase depth when late findings or escaped defects cluster in a tier. Reduce depth only after a meaningful, reproducible sample shows low interception value and no corresponding rise in escaped defects. The current implementation emits `increase_depth`, `repair_evidence`, or `observe`; it never automatically weakens policy.
 
+## Review evidence schema boundary
+
+`tools/review_evidence_schemas.py` defines dependency-free schema models for the three JSON evidence inputs consumed by the gate: Grabowski self-review, optional external review evidence, and legacy Claude ultrareview evidence. Each model can emit a Draft 2020-12 JSON Schema document through `json_schema_for(...)`; the runtime loader uses the same model directly, so documentation and machine validation share one field definition.
+
+The schema layer validates `schema_version: 1`, required fields, primitive JSON types, bounded numeric primitives, array item primitives, fixed discriminator values, and unknown top-level fields. Structural self-review failures are fatal because self-review is the required gate evidence. Structural failures in optional external or legacy Claude evidence remain advisory warnings and cannot turn optional diagnostics into a merge requirement. Existing schema-version-1 payloads remain the compatibility boundary; the deprecated `codex_review`, `claude_review`, and `external_review` self-review fields remain structurally accepted but do not regain policy authority. No migration is required for valid v1 evidence.
+
+Schema validation is intentionally structural. Current PR identity, `head_sha`, `diff_sha256`, complete file coverage, review depth, terminal triage, and merge policy remain checks of `evaluate_review_gate`. A structurally valid stale evidence file therefore still fails the existing head/diff binding instead of acquiring authority from the schema layer.
+
 ## Optional external diagnostics
 
 External review tools remain available for unusual uncertainty, incident analysis, or a deliberate second opinion. Their evidence may be supplied with `--external-review-evidence`; invalid evidence produces warnings, not a merge block. Legacy Claude packet requirements, policy waivers, and `self_review_required=false` are deprecated. External review output does not satisfy or shorten the required self-review loop.

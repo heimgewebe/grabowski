@@ -30,7 +30,7 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("--service tunnel-client-grabowski.service", tunnel)
         self.assertNotIn("grabowski-operator.service", tunnel)
 
-    def test_tunnel_dependency_is_non_binding(self) -> None:
+    def test_tunnel_restart_follows_operator_without_failure_binding(self) -> None:
         text = (
             ROOT
             / "systemd"
@@ -39,8 +39,8 @@ class DurableSystemdContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("Wants=grabowski-operator.service", text)
         self.assertIn("After=grabowski-operator.service", text)
+        self.assertIn("PartOf=grabowski-operator.service", text)
         self.assertNotIn("BindsTo=", text)
-        self.assertNotIn("PartOf=", text)
 
     def test_watchdog_cadence_matches_probe_cost(self) -> None:
         operator = (
@@ -63,7 +63,6 @@ class DurableSystemdContractTests(unittest.TestCase):
             self.assertNotIn("--check-only", text)
             self.assertIn("SuccessExitStatus=1", text)
             self.assertIn("TimeoutStartSec=90", text)
-            self.assertIn("--failure-threshold 3", text)
             self.assertIn("--max-restarts 3", text)
             self.assertIn("--restart-window 900", text)
             self.assertIn("--backoff-base 60", text)
@@ -72,7 +71,12 @@ class DurableSystemdContractTests(unittest.TestCase):
             ROOT / "systemd" / "grabowski-operator-watchdog.service.example"
         ).read_text(encoding="utf-8")
         self.assertIn("PYTHONDONTWRITEBYTECODE=1", operator)
+        self.assertIn("--failure-threshold 2", operator)
         self.assertNotIn("--mcp-url", operator)
+        tunnel = (
+            ROOT / "systemd" / "grabowski-tunnel-watchdog.service.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--failure-threshold 3", tunnel)
 
     def test_timers_keep_decorrelation_while_watchdog_owns_backoff(self) -> None:
         for name in (

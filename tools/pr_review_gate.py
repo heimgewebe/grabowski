@@ -13,6 +13,11 @@ import shutil
 import subprocess
 from typing import Any
 
+try:
+    from review_evidence_schemas import REVIEW_POLICY_VERSION, validate_evidence
+except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
+    from tools.review_evidence_schemas import REVIEW_POLICY_VERSION, validate_evidence
+
 TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reason", "not_applicable"}
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
 STRONG_SEVERITIES = {"p0", "p1", "high", "critical"}
@@ -25,6 +30,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
 MAX_REQUIRED_CHECK_NAMES = 64
 MAX_REQUIRED_CHECK_NAME_LENGTH = 200
 PASS_CHECK_BUCKETS = {"pass"}
+DERIVED_REVIEW_STATUS_NAMES = {"Review evidence gate"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
@@ -627,7 +633,13 @@ def classify_complexity(
     }
 
 
-def _load_json_file(path: Path | None, *, label: str) -> dict[str, Any] | None:
+def _load_json_file(
+    path: Path | None,
+    *,
+    label: str,
+    validate_schema: bool = False,
+    schema_failures_fatal: bool = True,
+) -> dict[str, Any] | None:
     if path is None:
         return None
     if not path.is_file():
@@ -641,19 +653,35 @@ def _load_json_file(path: Path | None, *, label: str) -> dict[str, Any] | None:
         raise GateInputError(f"{label} file is not valid JSON: {path}") from exc
     if not isinstance(payload, dict):
         raise GateInputError(f"{label} must be a JSON object")
+    if validate_schema:
+        schema_failures = validate_evidence(payload, label=label)
+        if schema_failures and schema_failures_fatal:
+            raise GateInputError(
+                f"{label} schema validation failed: " + "; ".join(schema_failures)
+            )
     return payload
 
 
 def load_self_review(path: Path | None) -> dict[str, Any] | None:
-    return _load_json_file(path, label="self-review")
+    return _load_json_file(path, label="self-review", validate_schema=True)
 
 
 def load_claude_evidence(path: Path | None) -> dict[str, Any] | None:
-    return _load_json_file(path, label="Claude evidence")
+    return _load_json_file(
+        path,
+        label="Claude evidence",
+        validate_schema=True,
+        schema_failures_fatal=False,
+    )
 
 
 def load_external_review_evidence(path: Path | None) -> dict[str, Any] | None:
-    return _load_json_file(path, label="external review evidence")
+    return _load_json_file(
+        path,
+        label="external review evidence",
+        validate_schema=True,
+        schema_failures_fatal=False,
+    )
 
 
 def load_policy_waiver(path: Path | None) -> dict[str, Any] | None:
@@ -853,7 +881,10 @@ def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any, *, repo_nam
         return []
     if not isinstance(evidence, dict):
         return ["evidence is not a JSON object"]
-    failures: list[str] = []
+    failures: list[str] = [
+        f"schema validation failed: {failure}"
+        for failure in validate_evidence(evidence, label="Claude evidence")
+    ]
     head = pr.get("headRefOid")
     pr_number = pr.get("number")
     schema_version = evidence.get("schema_version")
@@ -1198,7 +1229,12 @@ def _external_review_failures(
     if not isinstance(external_review, dict):
         return ["external review evidence is not a JSON object"]
 
-    failures: list[str] = []
+    failures: list[str] = [
+        f"schema validation failed: {failure}"
+        for failure in validate_evidence(
+            external_review, label="external review evidence"
+        )
+    ]
     head = pr.get("headRefOid")
     pr_number = pr.get("number")
 
@@ -1537,6 +1573,8 @@ def build_self_review_audit(
         "repo": _canonical_repo_slug(state.get("repoName")),
         "pr": pr.get("number"),
         "head_sha": pr.get("headRefOid"),
+        "base_sha": pr.get("baseRefOid"),
+        "review_policy_version": REVIEW_POLICY_VERSION,
         "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
         "review_tier": complexity.get("review_tier"),
         "minimum_review_iterations": complexity.get("minimum_self_review_iterations"),
@@ -1643,6 +1681,11 @@ def _required_check_names_from_catalog(text: str) -> tuple[str, ...]:
             raise GateInputError(
                 f"target required-check catalog entry {index} exceeds "
                 f"{MAX_REQUIRED_CHECK_NAME_LENGTH} characters"
+            )
+        if name in DERIVED_REVIEW_STATUS_NAMES:
+            raise GateInputError(
+                "target required-check catalog must not include derived review status "
+                f"{name!r}"
             )
         normalized.append(name)
     if len(normalized) != len(set(normalized)):
@@ -2036,6 +2079,8 @@ def evaluate_review_gate(
             continue
         name = check.get("name")
         bucket = check.get("bucket")
+        if name in DERIVED_REVIEW_STATUS_NAMES:
+            continue
         if name in expected_check_names:
             expected_check_buckets_by_name[name].append(bucket)
             if bucket not in PASS_CHECK_BUCKETS:

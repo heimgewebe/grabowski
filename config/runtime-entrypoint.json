@@ -156,7 +156,9 @@
     "grabowski_agent_competition_status",
     "grabowski_agent_competition_compare",
     "grabowski_agent_bootstrap",
-    "grabowski_call_shape_check"
+    "grabowski_call_shape_check",
+    "grabowski_task_archive_list",
+    "grabowski_task_archive_read"
   ],
   "mode": "module",
   "module": "grabowski_operator",
@@ -378,6 +380,14 @@
     {
       "module": "grabowski_juno_storage",
       "source": "src/grabowski_juno_storage.py"
+    },
+    {
+      "module": "grabowski_lifecycle_archive",
+      "source": "src/grabowski_lifecycle_archive.py"
+    },
+    {
+      "module": "grabowski_lifecycle_read_surface",
+      "source": "src/grabowski_lifecycle_read_surface.py"
     }
   ],
   "runtime_assets": [

@@ -141,7 +141,7 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 155)
+        self.assertEqual(len(tools), 159)
         self.assertTrue(
             {
                 "grabowski_juno_status",

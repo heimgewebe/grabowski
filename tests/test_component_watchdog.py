@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -179,8 +180,10 @@ class McpLifecycleProbeTests(unittest.TestCase):
                     "MainPID": "123",
                 },
             ),
+            patch.object(watchdog, "process_start_ticks", return_value=42),
             patch.object(watchdog, "process_age_seconds", return_value=120.0),
             patch.object(watchdog, "operator_identity_ok", return_value=True),
+            patch.object(watchdog, "mcp_http_probe", return_value=None),
             patch.object(
                 watchdog,
                 "mcp_stdio_probe_from_runtime",
@@ -215,6 +218,592 @@ class McpLifecycleProbeTests(unittest.TestCase):
             executable.symlink_to(sys.executable)
             with self.assertRaisesRegex(watchdog.WatchdogError, "invalid-mcp-module"):
                 watchdog.mcp_stdio_probe_from_runtime(root, "../bad", 1)
+
+
+class ControlPlanePollProbeTests(unittest.TestCase):
+    def test_recent_control_plane_poll_is_healthy(self) -> None:
+        metrics = (
+            "# TYPE commands_poll_last_successful_timestamp_seconds gauge\n"
+            "commands_poll_last_successful_timestamp_seconds{otel_scope_name=\"controlplane\"} 1000\n"
+        )
+        with patch.object(watchdog, "get_bounded_text", return_value=metrics):
+            self.assertIsNone(
+                watchdog.control_plane_poll_probe(
+                    watchdog.DEFAULT_METRICS_URL, 2, 90, now=1050
+                )
+            )
+
+    def test_stale_missing_and_unavailable_control_plane_poll_fail(self) -> None:
+        stale = "commands_poll_last_successful_timestamp_seconds 1000\n"
+        with patch.object(watchdog, "get_bounded_text", return_value=stale):
+            self.assertEqual(
+                "control-plane-poll-stale",
+                watchdog.control_plane_poll_probe(
+                    watchdog.DEFAULT_METRICS_URL, 2, 90, now=1091
+                ),
+            )
+        with patch.object(watchdog, "get_bounded_text", return_value="# no sample\n"):
+            self.assertEqual(
+                "control-plane-poll-missing",
+                watchdog.control_plane_poll_probe(
+                    watchdog.DEFAULT_METRICS_URL, 2, 90, now=1091
+                ),
+            )
+        with patch.object(watchdog, "get_bounded_text", return_value=None):
+            self.assertEqual(
+                "control-plane-metrics-unavailable",
+                watchdog.control_plane_poll_probe(
+                    watchdog.DEFAULT_METRICS_URL, 2, 90, now=1091
+                ),
+            )
+
+    def test_metric_parser_ignores_nonfinite_and_other_series(self) -> None:
+        metrics = (
+            "other_metric 4\n"
+            "commands_poll_last_successful_timestamp_seconds NaN\n"
+            "commands_poll_last_successful_timestamp_seconds{scope=\"a\"} 42.5 123\n"
+        )
+        self.assertEqual(
+            (42.5,),
+            watchdog.prometheus_metric_samples(
+                metrics, watchdog.CONTROL_PLANE_POLL_METRIC
+            ),
+        )
+
+    def test_missing_poll_evidence_is_indeterminate_not_restartable(self) -> None:
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                return_value={
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": "321",
+                },
+            ),
+            patch.object(watchdog, "process_start_ticks", return_value=77),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "tunnel_identity_ok", return_value=True),
+            patch.object(watchdog, "get_probe", return_value=True),
+            patch.object(
+                watchdog,
+                "control_plane_poll_probe",
+                return_value="control-plane-metrics-unavailable",
+            ),
+        ):
+            result = watchdog.probe_component(
+                component="tunnel",
+                service="tunnel-client-grabowski.service",
+                runtime_root=Path("/runtime"),
+                module="grabowski_operator",
+                profile="grabowski",
+                host="127.0.0.1",
+                port=18181,
+                health_url=watchdog.DEFAULT_HEALTH_URL,
+                ready_url=watchdog.DEFAULT_READY_URL,
+                startup_grace=20,
+                http_timeout=2,
+            )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(
+            ("control-plane-metrics-unavailable",), result.reasons
+        )
+
+    def test_stale_poll_is_indeterminate_not_restartable(self) -> None:
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                return_value={
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": "321",
+                },
+            ),
+            patch.object(watchdog, "process_start_ticks", return_value=77),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "tunnel_identity_ok", return_value=True),
+            patch.object(watchdog, "get_probe", return_value=True),
+            patch.object(
+                watchdog,
+                "control_plane_poll_probe",
+                return_value="control-plane-poll-stale",
+            ),
+        ):
+            result = watchdog.probe_component(
+                component="tunnel",
+                service="tunnel-client-grabowski.service",
+                runtime_root=Path("/runtime"),
+                module="grabowski_operator",
+                profile="grabowski",
+                host="127.0.0.1",
+                port=18181,
+                health_url=watchdog.DEFAULT_HEALTH_URL,
+                ready_url=watchdog.DEFAULT_READY_URL,
+                startup_grace=20,
+                http_timeout=2,
+            )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(("control-plane-poll-stale",), result.reasons)
+
+
+class McpHttpLivenessProbeTests(unittest.TestCase):
+    def test_live_http_probe_uses_one_session_free_get(self) -> None:
+        payload = json.dumps(
+            {
+                "healthy": True,
+                "session_creation_lock_available": True,
+            }
+        ).encode("utf-8")
+        with patch.object(
+            watchdog,
+            "_mcp_http_request",
+            return_value=(
+                200,
+                {"content-type": "application/json"},
+                payload,
+            ),
+        ) as request:
+            self.assertIsNone(
+                watchdog.mcp_http_probe(
+                    "http://127.0.0.1:18181/_grabowski/mcp-liveness", 2
+                )
+            )
+        request.assert_called_once_with(
+            host="127.0.0.1",
+            port=18181,
+            path="/_grabowski/mcp-liveness",
+            timeout=2,
+        )
+
+    def test_live_http_failures_are_precise(self) -> None:
+        with patch.object(
+            watchdog,
+            "_mcp_http_request",
+            side_effect=watchdog.McpProbeFailure("mcp-http-request-failed"),
+        ):
+            self.assertEqual(
+                "mcp-http-request-failed",
+                watchdog.mcp_http_probe(watchdog.DEFAULT_MCP_URL, 2),
+            )
+        with patch.object(
+            watchdog,
+            "_mcp_http_request",
+            return_value=(503, {"content-type": "application/json"}, b"{}"),
+        ):
+            self.assertEqual(
+                "mcp-session-creation-lock-busy",
+                watchdog.mcp_http_probe(watchdog.DEFAULT_MCP_URL, 2),
+            )
+        with patch.object(
+            watchdog,
+            "_mcp_http_request",
+            return_value=(200, {"content-type": "text/plain"}, b"ok"),
+        ):
+            self.assertEqual(
+                "mcp-http-content-type-invalid",
+                watchdog.mcp_http_probe(watchdog.DEFAULT_MCP_URL, 2),
+            )
+        with patch.object(
+            watchdog,
+            "_mcp_http_request",
+            return_value=(
+                200,
+                {"content-type": "application/json"},
+                b'{"healthy":true,"session_creation_lock_available":false}',
+            ),
+        ):
+            self.assertEqual(
+                "mcp-session-creation-lock-busy",
+                watchdog.mcp_http_probe(watchdog.DEFAULT_MCP_URL, 2),
+            )
+
+    def test_live_endpoint_failure_makes_operator_unhealthy(self) -> None:
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                return_value={
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": "123",
+                },
+            ),
+            patch.object(watchdog, "process_start_ticks", return_value=42),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "operator_identity_ok", return_value=True),
+            patch.object(
+                watchdog,
+                "mcp_http_probe",
+                return_value="mcp-session-creation-lock-busy",
+            ),
+            patch.object(
+                watchdog, "mcp_stdio_probe_from_runtime", return_value=None
+            ),
+        ):
+            result = watchdog.probe_component(
+                component="operator",
+                service="grabowski-operator.service",
+                runtime_root=Path("/runtime"),
+                module="grabowski_operator",
+                profile="grabowski",
+                host="127.0.0.1",
+                port=18181,
+                health_url="http://127.0.0.1:18080/healthz",
+                ready_url="http://127.0.0.1:18080/readyz",
+                startup_grace=20,
+                http_timeout=2,
+            )
+        self.assertEqual("unhealthy", result.status)
+        self.assertEqual(("mcp-session-creation-lock-busy",), result.reasons)
+
+    def test_concrete_failure_outranks_runtime_unhealthy(self) -> None:
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                return_value={
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": "123",
+                },
+            ),
+            patch.object(watchdog, "process_start_ticks", return_value=42),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "operator_identity_ok", return_value=True),
+            patch.object(
+                watchdog,
+                "mcp_http_probe",
+                return_value="mcp-runtime-unhealthy",
+            ),
+            patch.object(
+                watchdog,
+                "mcp_stdio_probe_from_runtime",
+                return_value="mcp-stdio-process-exited",
+            ),
+        ):
+            result = watchdog.probe_component(
+                component="operator",
+                service="grabowski-operator.service",
+                runtime_root=Path("/runtime"),
+                module="grabowski_operator",
+                profile="grabowski",
+                host="127.0.0.1",
+                port=18181,
+                health_url="http://127.0.0.1:18080/healthz",
+                ready_url="http://127.0.0.1:18080/readyz",
+                startup_grace=20,
+                http_timeout=2,
+            )
+        self.assertEqual("unhealthy", result.status)
+        self.assertEqual(("mcp-stdio-process-exited",), result.reasons)
+
+    def test_stack_dump_atomic_replace_preserves_hardlink_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            victim = root / "victim.log"
+            path = root / "stack.log"
+            victim.write_bytes(b"keep-me")
+            path.hardlink_to(victim)
+            old_inode = path.stat().st_ino
+            self.assertTrue(
+                watchdog._write_stack_dump_target(path, b"new-dump", 16)
+            )
+            self.assertEqual(b"keep-me", victim.read_bytes())
+            self.assertEqual(b"new-dump", path.read_bytes())
+            self.assertNotEqual(old_inode, path.stat().st_ino)
+            self.assertEqual(1, path.stat().st_nlink)
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+
+    def test_stack_dump_atomic_replace_preserves_symlink_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            victim = root / "victim.log"
+            path = root / "stack.log"
+            victim.write_bytes(b"keep-me")
+            path.symlink_to(victim)
+            self.assertTrue(
+                watchdog._write_stack_dump_target(path, b"new-dump", 16)
+            )
+            self.assertEqual(b"keep-me", victim.read_bytes())
+            self.assertFalse(path.is_symlink())
+            self.assertEqual(b"new-dump", path.read_bytes())
+
+    def test_stack_dump_pending_replace_preserves_link_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            victim = root / "victim.log"
+            path = root / "stack.log"
+            pending = root / ".stackdump.pending.tmp"
+            victim.write_bytes(b"keep-me")
+            pending.symlink_to(victim)
+            self.assertTrue(
+                watchdog._write_stack_dump_target(path, b"new-dump", 16)
+            )
+            self.assertEqual(b"keep-me", victim.read_bytes())
+            self.assertFalse(pending.exists())
+            self.assertEqual(b"new-dump", path.read_bytes())
+
+    def test_stack_dump_slot_ring_is_generation_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            first = watchdog._stack_dump_slot_path(state_dir, 1)
+            wrapped = watchdog._stack_dump_slot_path(
+                state_dir, 1 + watchdog.STACK_DUMP_SLOT_COUNT
+            )
+            self.assertEqual(first, wrapped)
+            self.assertIn(watchdog.STACK_DUMP_DIRECTORY_NAME, first.parts)
+
+    def test_stack_dump_request_extracts_only_new_memfd_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(
+                    watchdog,
+                    "_process_start_ticks",
+                    side_effect=[42, 42, 42],
+                ),
+                patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog, "_stack_dump_memfd_is_bounded", return_value=True
+                ),
+                patch.object(
+                    watchdog,
+                    "_stack_dump_memfd_position",
+                    side_effect=[10, 18],
+                ) as position,
+                patch.object(
+                    watchdog,
+                    "_read_stack_dump_memfd",
+                    return_value=b"new-dump",
+                ) as read,
+                patch.object(
+                    watchdog,
+                    "_write_stack_dump_target",
+                    return_value=True,
+                ) as write,
+                patch.object(watchdog.signal, "pidfd_send_signal") as send_signal,
+                patch.object(watchdog.os, "close") as close,
+                patch.object(watchdog.time, "sleep") as sleep,
+            ):
+                receipt = watchdog.request_python_stack_dump(
+                    123,
+                    state_dir=state_dir,
+                    restart_generation=9,
+                    captured_at_unix=1_000,
+                    expected_start_ticks=42,
+                    max_bytes=4_096,
+                )
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertEqual(9, receipt["restart_generation"])
+            self.assertEqual(1, receipt["slot"])
+            self.assertEqual(123, receipt["pid"])
+            self.assertEqual(42, receipt["process_start_ticks"])
+            self.assertEqual(8, receipt["payload_bytes"])
+            self.assertEqual(
+                "operator-stackdumps-v1/slot-1.dump",
+                receipt["relative_path"],
+            )
+            send_signal.assert_called_once_with(99, watchdog.signal.SIGUSR1)
+            close.assert_called_once_with(99)
+            sleep.assert_called_once_with(0.25)
+            self.assertEqual(2, position.call_count)
+            read.assert_called_once_with(
+                123, 7, 10, 18, 4_096, Path("/proc")
+            )
+            written_path, evidence, limit = write.call_args.args
+            self.assertEqual(
+                watchdog._stack_dump_slot_path(state_dir, 9), written_path
+            )
+            self.assertEqual(4_096, limit)
+            header_bytes, stack = evidence.split(b"\n", 1)
+            header = json.loads(header_bytes)
+            self.assertEqual(9, header["restart_generation"])
+            self.assertEqual(b"new-dump", stack)
+            self.assertEqual(
+                receipt["evidence_sha256"],
+                hashlib.sha256(evidence).hexdigest(),
+            )
+
+    def test_failed_publish_leaves_only_self_identifying_old_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            slot = watchdog._stack_dump_slot_path(state_dir, 1)
+            old = watchdog._stack_dump_evidence_bytes(
+                b"old-dump",
+                pid=11,
+                restart_generation=1,
+                captured_at_unix=100,
+                process_start_ticks=7,
+                max_bytes=4_096,
+            )
+            assert old is not None
+            self.assertTrue(
+                watchdog._write_stack_dump_target(slot, old[0], 4_096)
+            )
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(
+                    watchdog,
+                    "_process_start_ticks",
+                    side_effect=[42, 42, 42],
+                ),
+                patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog, "_stack_dump_memfd_is_bounded", return_value=True
+                ),
+                patch.object(
+                    watchdog,
+                    "_stack_dump_memfd_position",
+                    side_effect=[0, 8],
+                ),
+                patch.object(
+                    watchdog,
+                    "_read_stack_dump_memfd",
+                    return_value=b"new-dump",
+                ),
+                patch.object(
+                    watchdog,
+                    "_write_stack_dump_target",
+                    return_value=False,
+                ),
+                patch.object(watchdog.signal, "pidfd_send_signal"),
+                patch.object(watchdog.os, "close"),
+                patch.object(watchdog.time, "sleep"),
+            ):
+                receipt = watchdog.request_python_stack_dump(
+                    123,
+                    state_dir=state_dir,
+                    restart_generation=9,
+                    captured_at_unix=1_000,
+                    expected_start_ticks=42,
+                    max_bytes=4_096,
+                )
+            self.assertIsNone(receipt)
+            header = json.loads(slot.read_bytes().split(b"\n", 1)[0])
+            self.assertEqual(1, header["restart_generation"])
+            self.assertNotEqual(9, header["restart_generation"])
+
+    def test_stack_dump_request_fails_without_unique_memfd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(watchdog, "_process_start_ticks", return_value=42),
+                patch.object(watchdog, "_stack_dump_memfd", return_value=None),
+                patch.object(watchdog.os, "close"),
+            ):
+                self.assertIsNone(
+                    watchdog.request_python_stack_dump(
+                        123,
+                        state_dir=Path(temp_dir),
+                        restart_generation=1,
+                        captured_at_unix=100,
+                        expected_start_ticks=42,
+                    )
+                )
+
+    def test_stack_dump_request_fails_closed_without_pidfd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=None),
+                patch.object(watchdog, "_stack_dump_memfd") as memfd,
+            ):
+                self.assertIsNone(
+                    watchdog.request_python_stack_dump(
+                        123,
+                        state_dir=Path(temp_dir),
+                        restart_generation=1,
+                        captured_at_unix=100,
+                        expected_start_ticks=42,
+                    )
+                )
+            memfd.assert_not_called()
+
+    def test_stack_dump_request_does_not_signal_unbounded_memfd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(watchdog, "_process_start_ticks", return_value=42),
+                patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog, "_stack_dump_memfd_is_bounded", return_value=False
+                ),
+                patch.object(watchdog.signal, "pidfd_send_signal") as send_signal,
+                patch.object(watchdog.os, "close"),
+            ):
+                self.assertIsNone(
+                    watchdog.request_python_stack_dump(
+                        123,
+                        state_dir=Path(temp_dir),
+                        restart_generation=1,
+                        captured_at_unix=100,
+                        expected_start_ticks=42,
+                    )
+                )
+            send_signal.assert_not_called()
+
+    def test_stack_dump_request_does_not_signal_when_memfd_is_full(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(watchdog, "_process_start_ticks", return_value=42),
+                patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog, "_stack_dump_memfd_is_bounded", return_value=True
+                ),
+                patch.object(
+                    watchdog,
+                    "_stack_dump_memfd_position",
+                    return_value=watchdog.STACK_DUMP_MAX_BYTES,
+                ),
+                patch.object(watchdog.signal, "pidfd_send_signal") as send_signal,
+                patch.object(watchdog.os, "close"),
+            ):
+                self.assertIsNone(
+                    watchdog.request_python_stack_dump(
+                        123,
+                        state_dir=Path(temp_dir),
+                        restart_generation=1,
+                        captured_at_unix=100,
+                        expected_start_ticks=42,
+                    )
+                )
+            send_signal.assert_not_called()
+
+    def test_stack_dump_request_does_not_signal_after_pid_identity_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(
+                    watchdog,
+                    "_process_start_ticks",
+                    side_effect=[42, 43],
+                ),
+                patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog, "_stack_dump_memfd_is_bounded", return_value=True
+                ),
+                patch.object(watchdog, "_stack_dump_memfd_position", return_value=10),
+                patch.object(watchdog.signal, "pidfd_send_signal") as send_signal,
+                patch.object(watchdog.os, "close"),
+            ):
+                self.assertIsNone(
+                    watchdog.request_python_stack_dump(
+                        123,
+                        state_dir=Path(temp_dir),
+                        restart_generation=1,
+                        captured_at_unix=100,
+                        expected_start_ticks=42,
+                    )
+                )
+            send_signal.assert_not_called()
+
 
 
 class BackoffDecisionTests(unittest.TestCase):
@@ -350,6 +939,88 @@ class StateFileTests(unittest.TestCase):
             original = watchdog.WatchdogState(1, [10, 20], 4, 5000, 9)
             watchdog.save_state(path, original)
             self.assertEqual(original, watchdog.load_state(path))
+
+
+class ConnectorSnapshotRefreshTests(unittest.TestCase):
+    def _runtime(self, root: Path) -> Path:
+        runtime = root / "runtime"
+        executable = runtime / ".venv" / "bin" / "python"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        return runtime
+
+    def test_refresh_invokes_runtime_snapshot_module_with_process_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(Path(tmp))
+            completed = watchdog.subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=(
+                    '{"state":"renewed","reason":"renewal-window",'
+                    '"tool_count":155,"session_id_sha256":"' + "a" * 64 + '"}\n'
+                ),
+                stderr="",
+            )
+            with patch.object(watchdog.subprocess, "run", return_value=completed) as runner:
+                result = watchdog.refresh_connector_snapshot_from_runtime(
+                    runtime_root=runtime,
+                    host="127.0.0.1",
+                    port=18181,
+                    connector_pid=123,
+                    connector_start_ticks=456,
+                )
+            self.assertEqual(result["state"], "renewed")
+            command = runner.call_args.args[0]
+            self.assertIn("grabowski_client_snapshot", command)
+            self.assertIn("123", command)
+            self.assertIn("456", command)
+            self.assertIn("http://127.0.0.1:18181/mcp", command)
+
+    def test_refresh_failure_is_reported_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(Path(tmp))
+            completed = watchdog.subprocess.CompletedProcess(
+                [], 2, stdout='{"state":"error","reason":"bind-failed"}\n', stderr=""
+            )
+            with patch.object(watchdog.subprocess, "run", return_value=completed):
+                result = watchdog.refresh_connector_snapshot_from_runtime(
+                    runtime_root=runtime,
+                    host="127.0.0.1",
+                    port=18181,
+                    connector_pid=123,
+                    connector_start_ticks=456,
+                )
+            self.assertEqual(result, {"state": "error", "reason": "bind-failed"})
+
+    def test_healthy_tunnel_runs_refresh_but_check_only_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    ["--component", "tunnel", "--state-dir", tmp]
+                )
+            )
+            probe = watchdog.ProbeResult("healthy", pid=123, age_seconds=30.0, start_ticks=456)
+            with (
+                patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(watchdog, "refresh_connector_snapshot_from_runtime", return_value={"state": "not_due"}) as refresh,
+                patch.object(watchdog, "emit"),
+            ):
+                self.assertEqual(watchdog.run_watchdog(args), 0)
+                refresh.assert_called_once()
+
+            check_args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    ["--component", "tunnel", "--state-dir", tmp, "--check-only"]
+                )
+            )
+            with (
+                patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(watchdog, "refresh_connector_snapshot_from_runtime") as refresh,
+                patch.object(watchdog, "emit"),
+            ):
+                self.assertEqual(watchdog.run_watchdog(check_args), 0)
+                refresh.assert_not_called()
 
 
 class WatchdogPolicyTests(unittest.TestCase):

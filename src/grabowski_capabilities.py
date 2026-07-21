@@ -701,6 +701,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_task_archive_list": {
+        "category": "task-archive",
+        "purpose": "List immutable task archive segments through a bounded manifest-verified catalog.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_task_archive_read": {
+        "category": "task-archive",
+        "purpose": "Read one fully integrity-verified immutable task archive segment with bounded pagination.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_task_reconcile_check": {
         "category": "task",
         "purpose": "Preview reconcile effects for persistent task records without mutating state.",
