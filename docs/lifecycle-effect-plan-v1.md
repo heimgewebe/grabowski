@@ -62,4 +62,4 @@ Dieser Slice führt absichtlich keine Archiv-, Retention-, Projektions- oder Lö
 - MCP-/Capability-Registrierung;
 - Deployment und isolierter Livebeweis.
 
-Physische Löschung bleibt außerhalb des T071-Vertrags.\n
+Physische Löschung bleibt außerhalb des T071-Vertrags.
