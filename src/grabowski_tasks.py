@@ -42,6 +42,18 @@ TASK_DB = Path(
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
 GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
 GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
+MANAGED_BUILD_RESOLVER = (
+    operator.HOME / ".local/lib/heim-pc/managed-build/scripts/managed_build.py"
+)
+MANAGED_BUILD_PYTHON = Path("/usr/bin/python3")
+MANAGED_CARGO_CACHE_ROOT = operator.HOME / ".cache/heim-pc/managed-builds/cargo"
+MANAGED_CARGO_PROFILE = "operator-task"
+SYSTEMD_ENV_EXECUTABLE = "/usr/bin/env"
+SCRIPT_EXECUTABLES = frozenset({"bash", "sh", "zsh", "fish", "python", "python3"})
+CARGO_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])cargo(?:$|[^A-Za-z0-9_])")
+JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
+MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
+MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 DEFAULT_TASK_LIST_LIMIT = 20
 
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
@@ -1026,6 +1038,257 @@ def _bind_grabowski_runtime_python(
     bound = list(command)
     bound[python_index] = str(GRABOWSKI_RUNTIME_PYTHON)
     return bound
+
+
+def _explicit_cargo_target_dir(command: list[str]) -> bool:
+    return any("CARGO_TARGET_DIR=" in item for item in command)
+
+
+def _local_git_root(cwd: str) -> Path | None:
+    result = operator._run(
+        ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+        cwd=operator.HOME,
+        timeout_seconds=5,
+        max_output_bytes=4096,
+    )
+    if result.get("returncode") != 0:
+        return None
+    value = str(result.get("stdout", "")).strip()
+    if not value or not value.startswith("/") or "\x00" in value:
+        return None
+    root = Path(value)
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError:
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def _regular_cargo_lock(root: Path) -> bool:
+    path = root / "Cargo.lock"
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+
+
+def _bounded_regular_text(candidate: Path, root: Path) -> str | None:
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+        info = resolved.lstat()
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        return None
+    if info.st_size > MAX_BUILD_SCRIPT_INSPECTION_BYTES:
+        return None
+    try:
+        return resolved.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _wrapper_definition_mentions_cargo(executable: str, root: Path) -> bool:
+    names = (
+        ("Justfile", "justfile", ".justfile")
+        if executable == "just"
+        else ("GNUmakefile", "makefile", "Makefile")
+    )
+    for name in names:
+        text = _bounded_regular_text(root / name, root)
+        if text is not None and CARGO_TOKEN.search(text) is not None:
+            return True
+    return False
+
+
+def _text_may_invoke_cargo(text: str, root: Path) -> bool:
+    if CARGO_TOKEN.search(text) is not None:
+        return True
+    if JUST_TOKEN.search(text) is not None and _wrapper_definition_mentions_cargo("just", root):
+        return True
+    if MAKE_TOKEN.search(text) is not None and _wrapper_definition_mentions_cargo("make", root):
+        return True
+    return False
+
+
+def _bounded_script_mentions_cargo(candidate: Path, root: Path) -> bool:
+    text = _bounded_regular_text(candidate, root)
+    return text is not None and _text_may_invoke_cargo(text, root)
+
+def _command_may_invoke_cargo(command: list[str], *, cwd: str, root: Path) -> bool:
+    executable = Path(command[0]).name
+    if executable == "cargo":
+        return True
+    if executable in {"just", "make"}:
+        return _wrapper_definition_mentions_cargo(executable, root)
+    if executable in {"env", "command"}:
+        for index, item in enumerate(command[1:], start=1):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", item):
+                continue
+            return _command_may_invoke_cargo(command[index:], cwd=cwd, root=root)
+        return False
+    if executable in SCRIPT_EXECUTABLES:
+        if _text_may_invoke_cargo(" ".join(command[1:]), root):
+            return True
+        for item in command[1:]:
+            if item.startswith("-"):
+                continue
+            candidate = Path(item)
+            if not candidate.is_absolute():
+                candidate = Path(cwd) / candidate
+            if _bounded_script_mentions_cargo(candidate, root):
+                return True
+        return False
+    executable_path = Path(command[0])
+    if "/" in command[0]:
+        if not executable_path.is_absolute():
+            executable_path = Path(cwd) / executable_path
+        return _bounded_script_mentions_cargo(executable_path, root)
+    return False
+
+
+def _managed_cargo_profile(command: list[str]) -> str:
+    current = command
+    if Path(current[0]).name in {"env", "command"}:
+        for index, item in enumerate(current[1:], start=1):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", item):
+                continue
+            return _managed_cargo_profile(current[index:])
+        return MANAGED_CARGO_PROFILE
+    if Path(current[0]).name != "cargo":
+        return MANAGED_CARGO_PROFILE
+    args = current[1:]
+    if "--profile" in args:
+        index = args.index("--profile")
+        if index + 1 < len(args):
+            value = args[index + 1]
+            if value.replace("-", "").replace("_", "").isalnum():
+                return value
+    if "--release" in args:
+        return "release"
+    for candidate in ("test", "bench", "check", "doc"):
+        if candidate in args:
+            return candidate
+    return "dev"
+
+
+def _resolve_managed_cargo_target_dir(
+    command: list[str],
+    *,
+    target: dict[str, Any],
+    cwd: str,
+    execution_backend: str,
+) -> str | None:
+    if target["transport"] != "local" or execution_backend != "systemd-user":
+        return None
+    if _explicit_cargo_target_dir(command):
+        return None
+    root = _local_git_root(cwd)
+    if root is None or not _regular_cargo_lock(root):
+        return None
+    if not _command_may_invoke_cargo(command, cwd=cwd, root=root):
+        return None
+    try:
+        resolver_info = MANAGED_BUILD_RESOLVER.lstat()
+        python_resolved = MANAGED_BUILD_PYTHON.resolve(strict=True)
+        python_info = python_resolved.stat()
+    except OSError as exc:
+        raise RuntimeError("Managed-build resolver runtime is unavailable") from exc
+    if (
+        stat.S_ISLNK(resolver_info.st_mode)
+        or not stat.S_ISREG(resolver_info.st_mode)
+        or not stat.S_ISREG(python_info.st_mode)
+        or python_resolved.parent != Path("/usr/bin")
+    ):
+        raise RuntimeError("Managed-build resolver runtime is unsafe")
+    profile = _managed_cargo_profile(command)
+    result = operator._run(
+        [
+            str(MANAGED_BUILD_PYTHON),
+            str(MANAGED_BUILD_RESOLVER),
+            "prepare-environment",
+            "--repo",
+            str(root),
+            "--tool",
+            "cargo",
+            "--profile",
+            profile,
+            "--executable",
+            "cargo",
+        ],
+        cwd=operator.HOME,
+        timeout_seconds=10,
+        max_output_bytes=16 * 1024,
+    )
+    if result.get("returncode") != 0:
+        raise RuntimeError("Managed-build resolver failed for Cargo task")
+    try:
+        payload = json.loads(str(result.get("stdout", "")))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Managed-build resolver returned invalid JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "heim_pc.managed_build_environment_prepared"
+        or payload.get("tool") != "cargo"
+        or payload.get("profile") != profile
+        or payload.get("repository_root") != str(root)
+    ):
+        raise RuntimeError("Managed-build resolver returned an incompatible contract")
+    environment = payload.get("environment")
+    if not isinstance(environment, dict) or set(environment) != {"CARGO_TARGET_DIR"}:
+        raise RuntimeError("Managed-build resolver returned an invalid Cargo environment")
+    raw_target = environment.get("CARGO_TARGET_DIR")
+    raw_cache = payload.get("cache_path")
+    prepared_paths = payload.get("prepared_paths")
+    if (
+        not isinstance(raw_target, str)
+        or not raw_target.startswith("/")
+        or "\x00" in raw_target
+        or not isinstance(raw_cache, str)
+        or not raw_cache.startswith("/")
+        or "\x00" in raw_cache
+        or not isinstance(prepared_paths, list)
+        or any(not isinstance(item, str) for item in prepared_paths)
+    ):
+        raise RuntimeError("Managed-build resolver returned an invalid Cargo target path")
+    target_dir = Path(raw_target)
+    cache_path = Path(raw_cache)
+    try:
+        relative_cache = cache_path.relative_to(MANAGED_CARGO_CACHE_ROOT)
+    except ValueError as exc:
+        raise RuntimeError("Managed-build resolver Cargo cache escapes the managed cache") from exc
+    if len(relative_cache.parts) != 1 or target_dir != cache_path / "target":
+        raise RuntimeError("Managed-build resolver returned an invalid Cargo cache binding")
+    if str(cache_path) not in prepared_paths or str(target_dir) not in prepared_paths:
+        raise RuntimeError("Managed-build resolver did not prepare the Cargo cache binding")
+    if target_dir == root or root in target_dir.parents:
+        raise RuntimeError("Managed-build resolver Cargo target points into the worktree")
+    return str(target_dir)
+
+
+def _bind_managed_cargo_environment(
+    command: list[str],
+    *,
+    target: dict[str, Any],
+    cwd: str,
+    execution_backend: str,
+) -> list[str]:
+    cargo_target_dir = _resolve_managed_cargo_target_dir(
+        command,
+        target=target,
+        cwd=cwd,
+        execution_backend=execution_backend,
+    )
+    if cargo_target_dir is None:
+        return command
+    return [
+        SYSTEMD_ENV_EXECUTABLE,
+        f"CARGO_TARGET_DIR={cargo_target_dir}",
+        *command,
+    ]
 
 
 def _validate_weights(cpu_weight: int, io_weight: int) -> tuple[int, int]:
@@ -2177,6 +2440,12 @@ def grabowski_task_start(
         owner_id=lease_owner,
         host=host,
         opaque_command=True,
+    )
+    command = _bind_managed_cargo_environment(
+        command,
+        target=target,
+        cwd=working_directory,
+        execution_backend=execution_backend,
     )
     attempt = 1
     unit = _task_unit(task_id, attempt)
