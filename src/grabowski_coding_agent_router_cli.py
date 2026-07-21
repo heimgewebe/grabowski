@@ -66,7 +66,9 @@ def _assert_probe_digest_safe(value: Any, *, path: tuple[str, ...] = ()) -> None
             if (
                 key not in ALLOWED_SENSITIVE_METADATA_FIELDS
                 and any(
-                    normalized == token or normalized.endswith(token)
+                    normalized == token
+                    or normalized.startswith(f"{token}_")
+                    or normalized.endswith(f"_{token}")
                     for token in SENSITIVE_PROBE_FIELD_TOKENS
                 )
             ):

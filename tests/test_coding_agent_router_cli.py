@@ -163,6 +163,12 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             cli._assert_probe_digest_safe(
                 {"providers": {"claude": {"auth": {"password": "redacted"}}}}
             )
+        for sensitive_field in ("token_hint", "auth_secret", "credential_value"):
+            with self.subTest(sensitive_field=sensitive_field):
+                with self.assertRaisesRegex(
+                    cli.CodingAgentRouterCliError, "sensitive field"
+                ):
+                    cli._assert_probe_digest_safe({sensitive_field: "redacted"})
         cli._assert_probe_digest_safe(
             {
                 "api_key_environment_scrubbed": ["OPENAI_API_KEY"],
