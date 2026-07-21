@@ -30,6 +30,7 @@ class WatchdogHostAsset:
     target: Path
     mode: int
     unit: str | None = None
+    reloads_systemd: bool = False
 
 
 @dataclass(frozen=True)
@@ -55,12 +56,25 @@ OPERATOR_SERVICE = "grabowski-operator.service"
 SAFETY_OBSERVER_SERVICE = "grabowski-safety-observer.service"
 SAFETY_OBSERVER_UNIT_RELATIVE = Path("systemd/grabowski-safety-observer.service.example")
 SAFETY_OBSERVER_UNIT_PATH = core.HOME / ".config/systemd/user/grabowski-safety-observer.service"
+TUNNEL_OPERATOR_DEPENDENCY_RELATIVE = Path(
+    "systemd/tunnel-client-grabowski.service.d/70-operator-dependency.conf.example"
+)
+TUNNEL_OPERATOR_DEPENDENCY_PATH = (
+    core.HOME
+    / ".config/systemd/user/tunnel-client-grabowski.service.d/70-operator-dependency.conf"
+)
 WATCHDOG_HOST_ASSET_MAX_BYTES = 1_048_576
 WATCHDOG_HOST_ASSETS = (
     WatchdogHostAsset(
         source=Path("tools/component_watchdog.py"),
         target=core.HOME / ".local/libexec/grabowski/component_watchdog.py",
         mode=0o700,
+    ),
+    WatchdogHostAsset(
+        source=TUNNEL_OPERATOR_DEPENDENCY_RELATIVE,
+        target=TUNNEL_OPERATOR_DEPENDENCY_PATH,
+        mode=0o600,
+        reloads_systemd=True,
     ),
     WatchdogHostAsset(
         source=Path("systemd/grabowski-operator-watchdog.service.example"),
@@ -1299,6 +1313,44 @@ def verify_watchdog_systemd_fragments(
     return fragments
 
 
+def verify_tunnel_operator_dependency(
+    assets: tuple[WatchdogHostAsset, ...] = WATCHDOG_HOST_ASSETS,
+) -> dict[str, tuple[str, ...]]:
+    if not any(asset.source == TUNNEL_OPERATOR_DEPENDENCY_RELATIVE for asset in assets):
+        return {}
+    properties = ("Wants", "After", "PartOf")
+    argv = ["systemctl", "--user", "show", TUNNEL_SERVICE]
+    argv.extend(f"--property={name}" for name in properties)
+    result = core.run(
+        argv,
+        check=False,
+        capture=True,
+        timeout=core.TIMEOUTS["systemd_query"],
+    )
+    observed: dict[str, tuple[str, ...]] = {}
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in properties:
+                observed[key] = tuple(sorted(value.split()))
+    missing = [
+        name
+        for name in properties
+        if OPERATOR_SERVICE not in observed.get(name, ())
+    ]
+    if result.returncode != 0 or missing:
+        core.fail(
+            "Tunnel-Operator-Abhängigkeit ist nach daemon-reload nicht wirksam",
+            phase="watchdog-host-asset-dependency-readback",
+            details={
+                "returncode": result.returncode,
+                "missing_properties": missing,
+                "observed": {key: list(value) for key, value in observed.items()},
+            },
+        )
+    return observed
+
+
 def _watchdog_asset_set_sha256(
     assets: tuple[WatchdogHostAsset, ...],
     expected: dict[str, bytes],
@@ -1309,6 +1361,7 @@ def _watchdog_asset_set_sha256(
             "target": str(asset.target),
             "mode": oct(asset.mode),
             "unit": asset.unit,
+            "reloads_systemd": asset.reloads_systemd,
             "sha256": hashlib.sha256(expected[str(asset.target)]).hexdigest(),
         }
         for asset in assets
@@ -1351,7 +1404,9 @@ def restore_watchdog_host_assets(
             )
         else:
             _remove_watchdog_host_asset(current)
-        unit_changed = unit_changed or preimage.asset.unit is not None
+        unit_changed = unit_changed or (
+            preimage.asset.unit is not None or preimage.asset.reloads_systemd
+        )
     if unit_changed:
         _systemd_daemon_reload()
         verify_watchdog_systemd_fragments(
@@ -1434,13 +1489,14 @@ def install_watchdog_host_assets(
             changed_targets=tuple(changed),
             asset_set_sha256=_watchdog_asset_set_sha256(assets, expected),
         )
-        if any(
+        if any(asset.reloads_systemd for asset in assets) or any(
             preimage.asset.unit is not None
             and str(preimage.asset.target) in set(changed)
             for preimage in preimages
         ):
             _systemd_daemon_reload()
         verify_watchdog_systemd_fragments(assets)
+        verify_tunnel_operator_dependency(assets)
         for asset in assets:
             installed = _read_watchdog_host_asset(asset)
             if (
