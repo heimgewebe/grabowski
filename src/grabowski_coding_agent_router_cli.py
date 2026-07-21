@@ -19,7 +19,16 @@ import grabowski_coding_agent_router as router
 
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
 COMMAND_TIMEOUT_SECONDS = 20
-PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v2"
+PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v3"
+PROBE_DIGEST_FIELDS = (
+    "schema_version",
+    "observed_at",
+    "harnesses",
+    "providers",
+    "verified_quota_pools",
+    "model_invocations",
+    "paid_api_requests_authorized",
+)
 SENSITIVE_PROBE_FIELD_TOKENS = (
     "password",
     "passwd",
@@ -73,9 +82,15 @@ def _assert_probe_digest_safe(value: Any, *, path: tuple[str, ...] = ()) -> None
 
 
 def _probe_digest(value: dict[str, Any]) -> str:
-    _assert_probe_digest_safe(value)
+    missing = [field for field in PROBE_DIGEST_FIELDS if field not in value]
+    if missing:
+        raise CodingAgentRouterCliError(
+            f"probe digest payload is missing fields: {', '.join(missing)}"
+        )
+    projection = {field: value[field] for field in PROBE_DIGEST_FIELDS}
+    _assert_probe_digest_safe(projection)
     payload = json.dumps(
-        value,
+        projection,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

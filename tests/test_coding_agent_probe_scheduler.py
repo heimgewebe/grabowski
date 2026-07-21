@@ -116,11 +116,28 @@ if sys.argv[1] == "probe":
         "observed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "harnesses": {{}},
         "providers": {{"codex": {{"available": True}}}},
-        "api_key_environment_scrubbed": [],
+        "verified_quota_pools": [],
+        "api_key_environment_scrubbed": {list(SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV)!r},
+        "model_invocations": 0,
+        "paid_api_requests_authorized": 0,
     }}
-    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    digest_fields = (
+        "schema_version",
+        "observed_at",
+        "harnesses",
+        "providers",
+        "verified_quota_pools",
+        "model_invocations",
+        "paid_api_requests_authorized",
+    )
+    canonical = json.dumps(
+        {{field: body[field] for field in digest_fields}},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
     body["catalog_probe_sha256"] = hmac.new(
-        b"grabowski-coding-agent-probe-v2", canonical, hashlib.sha256
+        b"grabowski-coding-agent-probe-v3", canonical, hashlib.sha256
     ).hexdigest()
     if {tamper_digest!r}:
         body["catalog_probe_sha256"] = "0" * 64
@@ -192,7 +209,11 @@ else:
             "harnesses": {},
             "providers": {},
             "verified_quota_pools": [],
-            "api_key_environment_scrubbed": [],
+            "api_key_environment_scrubbed": list(
+                SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
+            ),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
         }
         canonical = json.dumps(
             probe,
@@ -206,13 +227,40 @@ else:
         ):
             SCHEDULER.validate_probe(probe)
 
+    def test_probe_validation_rejects_tampered_scrub_claim_outside_digest(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": SCHEDULER.iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": [],
+            "api_key_environment_scrubbed": list(
+                SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
+            ),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        digest = SCHEDULER.probe_digest(probe)
+        probe["catalog_probe_sha256"] = digest
+        probe["api_key_environment_scrubbed"] = ["OPENAI_API_KEY"]
+        self.assertEqual(digest, SCHEDULER.probe_digest(probe))
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError,
+            "api_key_environment_scrubbed is invalid",
+        ):
+            SCHEDULER.validate_probe(probe)
+
     def test_probe_validation_rejects_invalid_verified_pool_claims(self) -> None:
         base = {
             "schema_version": 2,
             "observed_at": SCHEDULER.iso_now(),
             "harnesses": {},
             "providers": {},
-            "api_key_environment_scrubbed": [],
+            "api_key_environment_scrubbed": list(
+                SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
+            ),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
         }
         for value in (
             ["grok-com", "grok-com"],
@@ -234,7 +282,11 @@ else:
             "harnesses": {},
             "providers": {},
             "verified_quota_pools": ["grok-com"],
-            "api_key_environment_scrubbed": [],
+            "api_key_environment_scrubbed": list(
+                SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
+            ),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
         }
         probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
         before = {
@@ -268,7 +320,11 @@ else:
             "harnesses": {},
             "providers": {},
             "verified_quota_pools": ["jules-account"],
-            "api_key_environment_scrubbed": [],
+            "api_key_environment_scrubbed": list(
+                SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
+            ),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
         }
         probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
         after = {

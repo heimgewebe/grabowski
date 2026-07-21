@@ -92,6 +92,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             "observed_at": cli._iso_now(),
             "harnesses": {},
             "providers": {},
+            "verified_quota_pools": [],
             "api_key_environment_scrubbed": [],
             "model_invocations": 0,
             "paid_api_requests_authorized": 0,
@@ -184,6 +185,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(probe["model_invocations"], 0)
         self.assertEqual(probe["paid_api_requests_authorized"], 0)
         self.assertEqual(probe["verified_quota_pools"], [])
+        self.assertIn("OPENROUTER_API_KEY", probe["api_key_environment_scrubbed"])
         digest_input = dict(probe)
         digest = digest_input.pop("catalog_probe_sha256")
         self.assertEqual(digest, cli._probe_digest(digest_input))

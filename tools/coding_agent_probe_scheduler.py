@@ -44,7 +44,16 @@ PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 SPECIAL_PERMISSION_BITS = stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
 PROCESS_TERMINATION_GRACE_SECONDS = 2
-PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v2"
+PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v3"
+PROBE_DIGEST_FIELDS = (
+    "schema_version",
+    "observed_at",
+    "harnesses",
+    "providers",
+    "verified_quota_pools",
+    "model_invocations",
+    "paid_api_requests_authorized",
+)
 SENSITIVE_PROBE_FIELD_TOKENS = (
     "password",
     "passwd",
@@ -63,6 +72,14 @@ FORBIDDEN_API_KEY_ENV = (
     "GOOGLE_API_KEY",
     "OPENROUTER_API_KEY",
     "AZURE_OPENAI_API_KEY",
+)
+EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "XAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
 )
 
 
@@ -115,9 +132,15 @@ def assert_probe_digest_safe(value: Any, *, path: tuple[str, ...] = ()) -> None:
 
 
 def probe_digest(value: dict[str, Any]) -> str:
-    assert_probe_digest_safe(value)
+    missing = [field for field in PROBE_DIGEST_FIELDS if field not in value]
+    if missing:
+        raise ProbeSchedulerError(
+            f"probe digest payload is missing fields: {', '.join(missing)}"
+        )
+    projection = {field: value[field] for field in PROBE_DIGEST_FIELDS}
+    assert_probe_digest_safe(projection)
     payload = json.dumps(
-        value,
+        projection,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -564,6 +587,14 @@ def validate_probe(probe: dict[str, Any]) -> None:
     digest_input.pop("catalog_probe_sha256", None)
     if digest != probe_digest(digest_input):
         raise ProbeSchedulerError("probe digest does not match its payload")
+    scrubbed_environment = probe.get("api_key_environment_scrubbed")
+    if (
+        not isinstance(scrubbed_environment, list)
+        or any(not isinstance(name, str) for name in scrubbed_environment)
+        or len(set(scrubbed_environment)) != len(scrubbed_environment)
+        or set(scrubbed_environment) != set(EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV)
+    ):
+        raise ProbeSchedulerError("probe api_key_environment_scrubbed is invalid")
     if not isinstance(probe.get("providers"), dict):
         raise ProbeSchedulerError("probe providers are missing")
     verified_pools = probe.get("verified_quota_pools", [])
