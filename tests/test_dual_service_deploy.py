@@ -1545,6 +1545,81 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                     )
             self.assertEqual(b"old", target.read_bytes())
 
+    def test_failed_publication_state_probe_preserves_original_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "asset"
+            target.write_bytes(b"old")
+            target.chmod(0o700)
+            asset = dual.WatchdogHostAsset(
+                source=Path("asset"), target=target, mode=0o700
+            )
+            metadata = target.stat()
+            preimage = dual.WatchdogHostAssetPreimage(
+                asset=asset,
+                existed=True,
+                content=b"old",
+                mode=0o700,
+                identity=(metadata.st_dev, metadata.st_ino),
+            )
+            with (
+                mock.patch.object(core, "git_show", return_value=b"new"),
+                mock.patch.object(
+                    dual,
+                    "_read_watchdog_host_asset",
+                    side_effect=[preimage, core.DeployError("probe failed")],
+                ),
+                mock.patch.object(
+                    dual,
+                    "_atomic_write_watchdog_host_asset",
+                    side_effect=core.DeployError("write failed"),
+                ),
+                mock.patch.object(dual, "restore_watchdog_host_assets") as restore,
+            ):
+                with self.assertRaisesRegex(core.DeployError, "write failed"):
+                    dual.install_watchdog_host_assets(
+                        ROOT, self.snapshot(), assets=(asset,)
+                    )
+            restore.assert_called_once()
+            partial = restore.call_args.args[0]
+            self.assertEqual((str(target),), partial.changed_targets)
+
+    def test_rollback_removes_new_unit_without_requiring_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "watchdog.service"
+            target.write_bytes(b"new-unit")
+            target.chmod(0o600)
+            asset = dual.WatchdogHostAsset(
+                source=Path("unit"),
+                target=target,
+                mode=0o600,
+                unit="watchdog.service",
+            )
+            projection = dual.WatchdogHostAssetProjection(
+                repo_head="a" * 40,
+                preimages=(
+                    dual.WatchdogHostAssetPreimage(
+                        asset=asset,
+                        existed=False,
+                        content=None,
+                        mode=None,
+                        identity=None,
+                    ),
+                ),
+                expected={str(target): b"new-unit"},
+                changed_targets=(str(target),),
+                asset_set_sha256="b" * 64,
+            )
+            with (
+                mock.patch.object(dual, "_systemd_daemon_reload") as reload,
+                mock.patch.object(
+                    dual, "verify_watchdog_systemd_fragments", return_value={}
+                ) as verify,
+            ):
+                dual.restore_watchdog_host_assets(projection)
+            self.assertFalse(target.exists())
+            reload.assert_called_once_with()
+            verify.assert_called_once_with(())
+
     def test_daemon_reload_failure_restores_changed_unit_asset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "watchdog.service"

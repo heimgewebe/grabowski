@@ -1355,7 +1355,11 @@ def restore_watchdog_host_assets(
     if unit_changed:
         _systemd_daemon_reload()
         verify_watchdog_systemd_fragments(
-            tuple(preimage.asset for preimage in projection.preimages)
+            tuple(
+                preimage.asset
+                for preimage in projection.preimages
+                if preimage.existed
+            )
         )
 
 
@@ -1406,15 +1410,22 @@ def install_watchdog_host_assets(
                 continue
             try:
                 _atomic_write_watchdog_host_asset(asset, data, asset.mode, preimage)
-            except Exception:
-                current = _read_watchdog_host_asset(asset)
-                if (
-                    current.existed
-                    and current.content == data
-                    and current.mode == asset.mode
-                ):
+            except Exception as write_error:
+                try:
+                    current = _read_watchdog_host_asset(asset)
+                except Exception:
+                    # A failed state interrogation must never hide the original
+                    # publication failure. Conservatively include the target in
+                    # rollback scope because publication may already have happened.
                     changed.append(str(asset.target))
-                raise
+                else:
+                    if (
+                        current.existed
+                        and current.content == data
+                        and current.mode == asset.mode
+                    ):
+                        changed.append(str(asset.target))
+                raise write_error
             changed.append(str(asset.target))
         projection = WatchdogHostAssetProjection(
             repo_head=snapshot.repo_head,
