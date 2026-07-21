@@ -29,6 +29,13 @@ SPEC.loader.exec_module(SCHEDULER)
 
 class CodingAgentProbeSchedulerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.original_expected_router_scrubbed_env = (
+            SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV
+        )
+        SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV = (
+            "ROUTER_AUTH_ENV_A",
+            "ROUTER_AUTH_ENV_B",
+        )
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.state = self.root / "state.json"
@@ -50,6 +57,9 @@ class CodingAgentProbeSchedulerTests(unittest.TestCase):
         os.chmod(self.state, 0o600)
 
     def tearDown(self) -> None:
+        SCHEDULER.EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV = (
+            self.original_expected_router_scrubbed_env
+        )
         self.temporary.cleanup()
 
     @staticmethod
@@ -216,7 +226,7 @@ else:
             "paid_api_requests_authorized": 0,
         }
         canonical = json.dumps(
-            probe,
+            {field: probe[field] for field in SCHEDULER.PROBE_DIGEST_FIELDS},
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
