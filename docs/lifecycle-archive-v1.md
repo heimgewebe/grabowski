@@ -9,7 +9,7 @@ Er trennt drei Dinge, die zuvor leicht vermischt wurden:
 2. unveränderliche Archivierung terminaler Taskdatensätze;
 3. eine begrenzte Standardprojektion, die nur handlungsrelevante Zustände zeigt.
 
-Der Core löscht keine Task-, Workspace- oder Recovery-Belege und registriert noch keine neue MCP-Oberfläche. Diese Integration bleibt getrennt, solange zentrale Registrierungsdateien durch andere laufende Arbeiten exklusiv belegt sind.
+Der Core löscht keine Task-, Workspace- oder Recovery-Belege. Physisches Pruning bleibt außerhalb des T071-Vertrags.
 
 ## Einheitliche Klassifikation
 
@@ -51,12 +51,14 @@ Der Plan bindet Task-IDs und die SHA-256-Digests der vollständigen Record-Proje
 
 `write_task_archive_segment()` erzeugt create-only:
 
-- `records.jsonl` mit kanonisch sortierten vollständigen Taskrecords;
+- `records.jsonl` mit kanonisch sortierten Task-Archivrecords;
 - `manifest.json` mit Quellstore-Digest, Quellschema, Plan-Digest, Record-Anzahl, erstem und letztem Record-Hash, vollständiger Record-Hashfolge und Segment-SHA-256.
 
 Dateien und Verzeichnisse werden fsync-sicher persistiert. Ein identisches Segment ist idempotent lesbar. Existierende widersprüchliche Segmente oder manipulierte Records schlagen fail-closed fehl.
 
-Die Segmentarchivierung begründet ausdrücklich keine Erlaubnis, Records aus der Taskdatenbank zu löschen. Die spätere aktive Projektion darf erst nach erfolgreicher Segmentverifikation umgestellt werden.
+Für produktive Task-Store-Archive definiert `grabowski_tasks._task_archive_record()` die stabile Record-Projektion. Sie ist bewusst unabhängig von später veränderbarer Redaktionslogik: Identität, Status, Ressourcen- und Terminalisierungsbindungen werden explizit gespeichert; dynamische oder potentiell sensible JSON-Payloads werden durch SHA-256-Digests gebunden. Dadurch kann die aktuelle Task-Projektion einen unveränderten Datenbankrecord auch nach einer späteren Änderung der Ausgaberadaktion zuverlässig gegen das Archiv prüfen.
+
+Die Segmentarchivierung begründet ausdrücklich keine Erlaubnis, Records aus der Taskdatenbank zu löschen. Die aktive Projektion darf erst nach erfolgreicher Segmentverifikation umgestellt werden.
 
 ## Effect Plan, Revalidation und create-only Execution Receipts
 
@@ -70,7 +72,7 @@ Ein Execution-Receipt darf nur einen Effektversuch belegen, dessen Startzeitpunk
 
 ## Recovery-sicherer Task-Archive Projection Switch
 
-`apply_task_archive_projection_switch()` ist der erste konkrete T071-Effektadapter. Er verändert nicht den Taskstore, sondern persistiert create-only einen Projektionsumschaltbeleg für ein bereits vollständig verifiziertes Archivsegment.
+`apply_task_archive_projection_switch()` verändert nicht den Taskstore, sondern persistiert create-only einen Projektionsumschaltbeleg für ein bereits vollständig verifiziertes Archivsegment.
 
 Der Switch ist gebunden an:
 
@@ -88,11 +90,26 @@ Die Mutation wird innerhalb eines exklusiven Directory-Locks serialisiert. Ein v
 
 Der erfolgreiche Switch liefert verifizierte Post-State-Digests für Archivmanifest, Switch und Gesamtprojektion. Diese Digests können unmittelbar in ein create-only Execution-Receipt übernommen werden. Scheitert ein späterer Schritt, bleibt der deterministische Switch als Recovery-Readback erhalten.
 
+## Produktive Current-Task-Leseoberfläche
+
+`grabowski_task_list` lädt vor jeder paginierten Ausgabe den verifizierten Task-Projection-Switch-State. Der Standardpfad ist damit die aktuelle Handlungsprojektion und nicht mehr die unverdichtete historische Datenbankansicht.
+
+Für jeden projizierten Task wird innerhalb desselben SQLite-Read-Snapshots erneut der gespeicherte Taskrecord gelesen, in die stabile Archivprojektion überführt und gegen den im Archiv gebundenen Record-SHA-256 geprüft. Ein fehlender Taskrecord oder jede relevante Record-Drift blockiert die gesamte Leseoberfläche fail-closed. Die physische Taskzeile bleibt dabei erhalten.
+
+Pagination und Counts folgen derselben Projektion:
+
+- archivierte Records verbrauchen keinen Platz in einer Current-Page;
+- `total_matching`, `state_counts` und `projection_counts` beziehen sich auf `current_projection`;
+- der Cursor ist zusätzlich an `projection_sha256` gebunden;
+- ändert sich die Projection zwischen zwei Seiten, wird der alte Cursor mit `cursor_snapshot_changed` abgelehnt;
+- `current_projection` bleibt auch bei feldprojizierten Antworten als erforderliche Safety-Evidenz erhalten.
+
+Die Archive- und Projection-Roots folgen expliziten `GRABOWSKI_TASK_ARCHIVE_ROOT`- beziehungsweise `GRABOWSKI_TASK_PROJECTION_ROOT`-Overrides. Ohne Override liegen sie neben der tatsächlich geöffneten `TASK_DB`; dadurch lesen isolierte Test- oder Recovery-Stores nicht versehentlich den produktiven Projection-State.
+
 ## Noch getrennte Integrationsarbeit
 
-Für den vollständigen T071-Abschluss fehlen nach diesem Core noch:
+Für den vollständigen T071-Abschluss fehlen weiterhin:
 
-- produktive Anbindung der aktuellen Task-Leseoberflächen an den verifizierten Projection-Switch-State;
 - persistente Workspace-Close-/Archive-Konvergenz und Retention-Konvergenz;
 - gegebenenfalls weitere Effektadapter auf demselben Plan/Revalidation/Receipt-Vertrag, ohne Blind-Retry zu erlauben;
 - Deployment eines kohärenten T071-Heads und isolierter Livebeweis;

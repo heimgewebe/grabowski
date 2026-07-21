@@ -23,6 +23,7 @@ import grabowski_resources as resources
 import grabowski_nonconflict as nonconflict
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
+import grabowski_lifecycle_projection as lifecycle_projection
 import grabowski_sqlite_store as sqlite_store
 try:
     import grabowski_operator_core as operator
@@ -40,6 +41,7 @@ TASK_DB = Path(
     )
 ).expanduser()
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
+TASK_LIST_SCAN_BATCH = 100
 GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
 GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
 MANAGED_BUILD_RESOLVER = (
@@ -2094,6 +2096,202 @@ def _task_state_counts(
     return exact, projections, unknown_state_count
 
 
+def _task_archive_payload_sha256(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeError("Stored task archive payload is not text")
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _task_archive_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the stable, redaction-independent record bound into task archives."""
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_task_archive_record",
+        "task_id": record["task_id"],
+        "host": record["host"],
+        "unit": record["unit"],
+        "authoritative_unit": record.get("authoritative_unit") or record["unit"],
+        "execution_backend": record.get("execution_backend") or "systemd-user",
+        "systemd_scope": record.get("systemd_scope") or "user",
+        "attempt": int(record["attempt"]),
+        "state": record["state"],
+        "resume_policy": record["resume_policy"],
+        "argv_sha256": record["argv_sha256"],
+        "cwd": record["cwd"],
+        "runtime_seconds": int(record["runtime_seconds"]),
+        "cpu_weight": int(record["cpu_weight"]),
+        "io_weight": int(record["io_weight"]),
+        "memory_max_bytes": record.get("memory_max_bytes"),
+        "created_at_unix": int(record["created_at_unix"]),
+        "updated_at_unix": int(record["updated_at_unix"]),
+        "launcher_sha256": _task_archive_payload_sha256(record["launcher_json"]),
+        "last_observation_sha256": _task_archive_payload_sha256(
+            record.get("last_observation_json")
+        ),
+        "resource_keys_sha256": _task_archive_payload_sha256(
+            record.get("resource_keys_json") or "[]"
+        ),
+        "lease_owner_id": record.get("lease_owner_id"),
+        "request_id": record.get("request_id"),
+        "origin_ref": record.get("origin_ref"),
+        "external_run_id": record.get("external_run_id"),
+        "execution_envelope_sha256": record.get("execution_envelope_sha256"),
+        "acceptance_sha256": _task_archive_payload_sha256(
+            record.get("acceptance_json") or "[]"
+        ),
+        "request_sha256": record.get("request_sha256"),
+        "chronik_outbox_enabled": bool(record.get("chronik_outbox_enabled")),
+        "chronik_outbox_state_root": record.get("chronik_outbox_state_root"),
+        "chronik_context_sha256": _task_archive_payload_sha256(
+            record.get("chronik_context_json")
+        ),
+        "terminalization_sha256": record.get("terminalization_sha256"),
+        "terminalized_at_unix": record.get("terminalized_at_unix"),
+        "lifecycle_receipt_sha256": record.get("lifecycle_receipt_sha256"),
+        "repository_scope_manifest_sha256": _task_archive_payload_sha256(
+            record.get("repository_scope_manifest_json")
+        ),
+    }
+
+
+def _task_archive_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_TASK_ARCHIVE_ROOT")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else TASK_DB.parent / "task-archives"
+    )
+
+
+def _task_projection_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_TASK_PROJECTION_ROOT")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else TASK_DB.parent / "task-projection"
+    )
+
+
+def _task_current_projection() -> dict[str, Any]:
+    return lifecycle_projection.load_task_archive_projection(
+        projection_root=_task_projection_root(),
+        archive_root=_task_archive_root(),
+    )
+
+
+def _projected_task_state_counts(
+    connection: sqlite3.Connection,
+    projection: dict[str, Any],
+) -> tuple[dict[str, int], int]:
+    bindings = projection.get("archived_task_bindings")
+    if not isinstance(bindings, dict):
+        raise lifecycle_projection.LifecycleProjectionIntegrityError(
+            "current task projection bindings are invalid"
+        )
+    exact = {state: 0 for state in sorted(TASK_STATES)}
+    unknown_state_count = 0
+    for task_id in sorted(bindings):
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise lifecycle_projection.LifecycleProjectionIntegrityError(
+                f"projected task row is missing from current store: {task_id}"
+            )
+        raw = dict(row)
+        archive_record = _task_archive_record(raw)
+        if lifecycle_projection.bounded_current_task_projection(
+            [archive_record],
+            projection=projection,
+        ):
+            raise lifecycle_projection.LifecycleProjectionIntegrityError(
+                f"projected task unexpectedly remains current: {task_id}"
+            )
+        state = str(raw["state"])
+        if state in exact:
+            exact[state] += 1
+        else:
+            unknown_state_count += 1
+    return exact, unknown_state_count
+
+
+def _subtract_projected_task_counts(
+    exact: dict[str, int],
+    unknown_state_count: int,
+    projected_exact: dict[str, int],
+    projected_unknown_state_count: int,
+) -> tuple[dict[str, int], dict[str, int], int]:
+    current_exact: dict[str, int] = {}
+    for state in sorted(TASK_STATES):
+        remaining = exact[state] - projected_exact[state]
+        if remaining < 0:
+            raise lifecycle_projection.LifecycleProjectionIntegrityError(
+                f"projected task count exceeds stored state count: {state}"
+            )
+        current_exact[state] = remaining
+    current_unknown = unknown_state_count - projected_unknown_state_count
+    if current_unknown < 0:
+        raise lifecycle_projection.LifecycleProjectionIntegrityError(
+            "projected unknown task count exceeds stored unknown state count"
+        )
+    current_projections = {
+        name: sum(current_exact[state] for state in states)
+        for name, states in sorted(TASK_STATE_PROJECTIONS.items())
+    }
+    return current_exact, current_projections, current_unknown
+
+
+def _task_list_current_rows(
+    connection: sqlite3.Connection,
+    *,
+    where: list[str],
+    parameters: list[Any],
+    cursor_created_at: int | None,
+    cursor_task_id: str | None,
+    limit: int,
+    projection: dict[str, Any],
+) -> list[sqlite3.Row]:
+    selected: list[sqlite3.Row] = []
+    scan_created_at = cursor_created_at
+    scan_task_id = cursor_task_id
+    batch_limit = max(TASK_LIST_SCAN_BATCH, limit + 1)
+    while len(selected) < limit + 1:
+        scan_where = list(where)
+        scan_parameters = list(parameters)
+        if scan_created_at is not None and scan_task_id is not None:
+            scan_where.append(
+                "(created_at_unix < ? OR (created_at_unix = ? AND task_id < ?))"
+            )
+            scan_parameters.extend([scan_created_at, scan_created_at, scan_task_id])
+        where_sql = f" WHERE {' AND '.join(scan_where)}" if scan_where else ""
+        rows = connection.execute(
+            f"SELECT * FROM tasks{where_sql} "
+            "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
+            (*scan_parameters, batch_limit),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            archive_record = _task_archive_record(dict(row))
+            current = lifecycle_projection.bounded_current_task_projection(
+                [archive_record],
+                projection=projection,
+            )
+            if current:
+                selected.append(row)
+                if len(selected) >= limit + 1:
+                    break
+        if len(selected) >= limit + 1 or len(rows) < batch_limit:
+            break
+        last = rows[-1]
+        scan_created_at = int(last["created_at_unix"])
+        scan_task_id = str(last["task_id"])
+    return selected
+
+
 def _task_recommended_next_action(state: str) -> str:
     if state in {"launching", "running"}:
         return "read grabowski_task_status before deciding the next action"
@@ -3128,11 +3326,29 @@ def grabowski_task_list(
         return _task_schema_inventory()
     selected_view = consumer_surface.normalize_view(view)
     _recover_pending_task_terminalizations()
+    current_projection = _task_current_projection()
+    projection_sha256 = current_projection.get("projection_sha256")
+    archived_task_bindings = current_projection.get("archived_task_bindings")
+    projection_switches = current_projection.get("switches")
+    if (
+        not isinstance(projection_sha256, str)
+        or SHA256.fullmatch(projection_sha256) is None
+        or not isinstance(archived_task_bindings, dict)
+        or not isinstance(projection_switches, list)
+    ):
+        raise lifecycle_projection.LifecycleProjectionIntegrityError(
+            "current task projection metadata is invalid"
+        )
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
     filter_states = _task_filter_states(state)
-    scope = f"task-list:{selected_view}:{state or 'all'}"
-    position = consumer_surface.decode_cursor(cursor, scope)
+    snapshot_scope = f"task-list:{selected_view}:{state or 'all'}"
+    scope = f"{snapshot_scope}:{projection_sha256}"
+    position = consumer_surface.decode_cursor(
+        cursor,
+        scope,
+        snapshot_scope=snapshot_scope,
+    )
     cursor_created_at: int | None = None
     cursor_task_id: str | None = None
     if position is not None:
@@ -3152,21 +3368,36 @@ def grabowski_task_list(
         placeholders = ",".join("?" for _ in filter_states)
         where.append(f"state IN ({placeholders})")
         parameters.extend(filter_states)
-    if cursor_created_at is not None and cursor_task_id is not None:
-        where.append("(created_at_unix < ? OR (created_at_unix = ? AND task_id < ?))")
-        parameters.extend([cursor_created_at, cursor_created_at, cursor_task_id])
-    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
     with _task_read_snapshot() as connection:
-        rows = connection.execute(
-            f"SELECT * FROM tasks{where_sql} "
-            "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
-            (*parameters, limit + 1),
-        ).fetchall()
-        state_counts, projection_counts, unknown_state_count = _task_state_counts(connection)
+        rows = _task_list_current_rows(
+            connection,
+            where=where,
+            parameters=parameters,
+            cursor_created_at=cursor_created_at,
+            cursor_task_id=cursor_task_id,
+            limit=limit,
+            projection=current_projection,
+        )
+        retained_state_counts, _, retained_unknown_state_count = _task_state_counts(connection)
+        projected_state_counts, projected_unknown_state_count = _projected_task_state_counts(
+            connection,
+            current_projection,
+        )
+        state_counts, projection_counts, unknown_state_count = _subtract_projected_task_counts(
+            retained_state_counts,
+            retained_unknown_state_count,
+            projected_state_counts,
+            projected_unknown_state_count,
+        )
         if filter_states is None:
             total_matching = sum(state_counts.values()) + unknown_state_count
         else:
             total_matching = sum(state_counts[item] for item in filter_states)
+    projection_readback = _task_current_projection()
+    if projection_readback.get("projection_sha256") != projection_sha256:
+        raise lifecycle_projection.LifecycleProjectionIntegrityError(
+            "current task projection changed during list read"
+        )
     has_more = len(rows) > limit
     page_rows = rows[:limit]
     tasks = [_public_for_view(dict(row), selected_view) for row in page_rows]
@@ -3213,12 +3444,18 @@ def grabowski_task_list(
         ),
         "state_filter_states": list(filter_states or ()),
         "state_counts": state_counts,
-        "state_counts_scope": "all_tasks",
+        "state_counts_scope": "current_projection",
         "state_counts_complete": unknown_state_count == 0,
         "unknown_state_count": unknown_state_count,
         "projection_counts": projection_counts,
-        "projection_counts_scope": "all_tasks",
+        "projection_counts_scope": "current_projection",
         "projection_counts_overlap": True,
+        "current_projection": {
+            "status": "verified",
+            "projection_sha256": projection_sha256,
+            "switch_count": len(projection_switches),
+            "projected_task_count": len(archived_task_bindings),
+        },
         "tasks": tasks,
         "pagination": {
             "limit": limit,
@@ -3226,6 +3463,7 @@ def grabowski_task_list(
             "has_more": has_more,
             "next_cursor": next_cursor,
             "ordering": "created_at_unix_desc_task_id_desc",
+            "snapshot_sha256": projection_sha256,
         },
         "warnings": warnings,
         "recommended_next_action": (
@@ -3237,16 +3475,24 @@ def grabowski_task_list(
             "task_output_correctness",
             "safe_unchanged_retry",
             "resource_release_complete",
+            "physical_archive_pruning",
         ],
     }
     if selected_view == "evidence":
         payload["database"] = str(TASK_DB)
+        payload["current_projection"].update(
+            {
+                "projection_root": str(_task_projection_root()),
+                "archive_root": str(_task_archive_root()),
+            }
+        )
     return consumer_surface.project_fields(
         payload,
         fields=fields,
         required=(
             "schema_version",
             "view",
+            "current_projection",
             "warnings",
             "recommended_next_action",
             "does_not_establish",

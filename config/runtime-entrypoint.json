@@ -392,6 +392,18 @@
       "source": "src/grabowski_lifecycle_archive.py"
     },
     {
+      "module": "grabowski_lifecycle_evidence",
+      "source": "src/grabowski_lifecycle_evidence.py"
+    },
+    {
+      "module": "grabowski_lifecycle_effect_plan",
+      "source": "src/grabowski_lifecycle_effect_plan.py"
+    },
+    {
+      "module": "grabowski_lifecycle_projection",
+      "source": "src/grabowski_lifecycle_projection.py"
+    },
+    {
       "module": "grabowski_lifecycle_read_surface",
       "source": "src/grabowski_lifecycle_read_surface.py"
     }
