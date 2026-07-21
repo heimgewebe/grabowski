@@ -812,6 +812,88 @@ class StateFileTests(unittest.TestCase):
             self.assertEqual(original, watchdog.load_state(path))
 
 
+class ConnectorSnapshotRefreshTests(unittest.TestCase):
+    def _runtime(self, root: Path) -> Path:
+        runtime = root / "runtime"
+        executable = runtime / ".venv" / "bin" / "python"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        return runtime
+
+    def test_refresh_invokes_runtime_snapshot_module_with_process_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(Path(tmp))
+            completed = watchdog.subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=(
+                    '{"state":"renewed","reason":"renewal-window",'
+                    '"tool_count":155,"session_id_sha256":"' + "a" * 64 + '"}\n'
+                ),
+                stderr="",
+            )
+            with patch.object(watchdog.subprocess, "run", return_value=completed) as runner:
+                result = watchdog.refresh_connector_snapshot_from_runtime(
+                    runtime_root=runtime,
+                    host="127.0.0.1",
+                    port=18181,
+                    connector_pid=123,
+                    connector_start_ticks=456,
+                )
+            self.assertEqual(result["state"], "renewed")
+            command = runner.call_args.args[0]
+            self.assertIn("grabowski_client_snapshot", command)
+            self.assertIn("123", command)
+            self.assertIn("456", command)
+            self.assertIn("http://127.0.0.1:18181/mcp", command)
+
+    def test_refresh_failure_is_reported_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(Path(tmp))
+            completed = watchdog.subprocess.CompletedProcess(
+                [], 2, stdout='{"state":"error","reason":"bind-failed"}\n', stderr=""
+            )
+            with patch.object(watchdog.subprocess, "run", return_value=completed):
+                result = watchdog.refresh_connector_snapshot_from_runtime(
+                    runtime_root=runtime,
+                    host="127.0.0.1",
+                    port=18181,
+                    connector_pid=123,
+                    connector_start_ticks=456,
+                )
+            self.assertEqual(result, {"state": "error", "reason": "bind-failed"})
+
+    def test_healthy_tunnel_runs_refresh_but_check_only_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    ["--component", "tunnel", "--state-dir", tmp]
+                )
+            )
+            probe = watchdog.ProbeResult("healthy", pid=123, age_seconds=30.0, start_ticks=456)
+            with (
+                patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(watchdog, "refresh_connector_snapshot_from_runtime", return_value={"state": "not_due"}) as refresh,
+                patch.object(watchdog, "emit"),
+            ):
+                self.assertEqual(watchdog.run_watchdog(args), 0)
+                refresh.assert_called_once()
+
+            check_args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    ["--component", "tunnel", "--state-dir", tmp, "--check-only"]
+                )
+            )
+            with (
+                patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(watchdog, "refresh_connector_snapshot_from_runtime") as refresh,
+                patch.object(watchdog, "emit"),
+            ):
+                self.assertEqual(watchdog.run_watchdog(check_args), 0)
+                refresh.assert_not_called()
+
+
 class WatchdogPolicyTests(unittest.TestCase):
     def test_services_are_independent(self) -> None:
         operator = watchdog.normalize_args(watchdog.parser().parse_args(["--component", "operator"]))

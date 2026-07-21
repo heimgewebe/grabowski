@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import tempfile
@@ -22,6 +23,7 @@ class ClientSnapshotTests(unittest.TestCase):
         self.patches = (
             mock.patch.object(snapshot, "STATE_ROOT", root),
             mock.patch.object(snapshot, "SNAPSHOT_PATH", root / "current.json"),
+            mock.patch.object(snapshot, "OBSERVER_STATE_PATH", root / "observer.json"),
             mock.patch.object(snapshot, "LOCK_PATH", root / ".lock"),
         )
         for patch in self.patches:
@@ -137,6 +139,111 @@ class ClientSnapshotTests(unittest.TestCase):
         )
         with self.assertRaises(snapshot.ClientSnapshotError):
             snapshot.bind_snapshot(parameters, now_unix=1_000)
+
+    def test_auto_refresh_preserves_fresh_external_snapshot_until_renewal_window(self) -> None:
+        snapshot.bind_snapshot(self.parameters(), now_unix=1_000)
+        reason = snapshot._snapshot_refresh_reason(
+            session_id=snapshot.connector_session_id(10, 20),
+            expected_release_id=RELEASE_ID,
+            now_unix=1_100,
+        )
+        self.assertIsNone(reason)
+
+    def test_auto_refresh_detects_tunnel_session_change(self) -> None:
+        session = snapshot.connector_session_id(10, 20)
+        snapshot.bind_snapshot(
+            self.parameters(client_id=snapshot.AUTO_REFRESH_CLIENT_ID, session_id=session),
+            now_unix=1_000,
+        )
+        reason = snapshot._snapshot_refresh_reason(
+            session_id=snapshot.connector_session_id(11, 21),
+            expected_release_id=RELEASE_ID,
+            now_unix=1_100,
+        )
+        self.assertEqual(reason, "connector-session-changed")
+
+    def test_auto_refresh_detects_release_change_and_renewal_window(self) -> None:
+        session = snapshot.connector_session_id(10, 20)
+        snapshot.bind_snapshot(
+            self.parameters(client_id=snapshot.AUTO_REFRESH_CLIENT_ID, session_id=session),
+            now_unix=1_000,
+        )
+        self.assertEqual(
+            snapshot._snapshot_refresh_reason(
+                session_id=session,
+                expected_release_id="new-release",
+                now_unix=1_100,
+            ),
+            "runtime-release-changed",
+        )
+        self.assertEqual(
+            snapshot._snapshot_refresh_reason(
+                session_id=session,
+                expected_release_id=RELEASE_ID,
+                now_unix=1_000 + snapshot.SNAPSHOT_TTL_SECONDS - snapshot.AUTO_REFRESH_RENEW_MARGIN_SECONDS,
+            ),
+            "renewal-window",
+        )
+
+
+    def test_external_snapshot_uses_observer_marker_to_detect_later_session_change(self) -> None:
+        snapshot.bind_snapshot(self.parameters(), now_unix=1_000)
+        first = snapshot.connector_session_id(10, 20)
+        snapshot._write_observer_state(
+            session_id=first, release_id=RELEASE_ID, now_unix=1_000
+        )
+        last_session, invalid = snapshot._observer_session_state()
+        self.assertFalse(invalid)
+        self.assertEqual(
+            snapshot._snapshot_refresh_reason(
+                session_id=snapshot.connector_session_id(11, 21),
+                expected_release_id=RELEASE_ID,
+                now_unix=1_100,
+                last_observed_session_id=last_session,
+                observer_state_invalid=invalid,
+            ),
+            "connector-session-changed",
+        )
+
+    def test_tool_listing_collects_all_pages_and_rejects_cursor_cycles(self) -> None:
+        class Page:
+            def __init__(self, names: list[str], next_cursor: str | None) -> None:
+                self.tools = [type("Tool", (), {"name": name})() for name in names]
+                self.nextCursor = next_cursor
+
+        class Client:
+            def __init__(self, pages: dict[str | None, Page]) -> None:
+                self.pages = pages
+
+            async def list_tools(self, cursor: str | None = None) -> Page:
+                return self.pages[cursor]
+
+        names = asyncio.run(
+            snapshot._list_all_tool_names(
+                Client({None: Page(["b"], "next"), "next": Page(["a"], None)})
+            )
+        )
+        self.assertEqual(names, ["b", "a"])
+        with self.assertRaises(snapshot.ClientSnapshotError):
+            asyncio.run(
+                snapshot._list_all_tool_names(
+                    Client({None: Page(["a"], "loop"), "loop": Page(["b"], "loop")})
+                )
+            )
+
+    def test_tool_name_hash_matches_runtime_contract_encoding(self) -> None:
+        expected = snapshot.hashlib.sha256(b'["a","b"]').hexdigest()
+        self.assertEqual(snapshot._tool_names_sha256(["b", "a"]), expected)
+        with self.assertRaises(snapshot.ClientSnapshotError):
+            snapshot._tool_names_sha256(["a", "a"])
+
+    def test_runtime_release_id_is_read_from_current_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "deployment-manifest.json").write_text(
+                json.dumps({"release_id": RELEASE_ID}), encoding="utf-8"
+            )
+            self.assertEqual(snapshot._runtime_release_id(root), RELEASE_ID)
 
 
 if __name__ == "__main__":
