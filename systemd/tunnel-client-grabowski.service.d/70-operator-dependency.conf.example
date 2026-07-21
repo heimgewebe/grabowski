@@ -1,3 +1,4 @@
 [Unit]
 Wants=grabowski-operator.service
 After=grabowski-operator.service
+PartOf=grabowski-operator.service

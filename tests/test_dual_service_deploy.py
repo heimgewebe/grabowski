@@ -7,6 +7,7 @@ import errno
 import io
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -1399,10 +1400,11 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         return SimpleNamespace(repo_head="a" * 40)
 
     def test_default_projection_declares_complete_watchdog_asset_set(self) -> None:
-        self.assertEqual(5, len(dual.WATCHDOG_HOST_ASSETS))
+        self.assertEqual(6, len(dual.WATCHDOG_HOST_ASSETS))
         self.assertEqual(
             {
                 "tools/component_watchdog.py",
+                "systemd/tunnel-client-grabowski.service.d/70-operator-dependency.conf.example",
                 "systemd/grabowski-operator-watchdog.service.example",
                 "systemd/grabowski-operator-watchdog.timer.example",
                 "systemd/grabowski-tunnel-watchdog.service.example",
@@ -1419,6 +1421,72 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
             },
             {asset.unit for asset in dual.WATCHDOG_HOST_ASSETS if asset.unit},
         )
+
+    def test_dependency_dropin_requires_reload_and_has_no_fragment_unit(self) -> None:
+        asset = next(
+            item
+            for item in dual.WATCHDOG_HOST_ASSETS
+            if item.source == dual.TUNNEL_OPERATOR_DEPENDENCY_RELATIVE
+        )
+        self.assertTrue(asset.reloads_systemd)
+        self.assertIsNone(asset.unit)
+        self.assertEqual(dual.TUNNEL_OPERATOR_DEPENDENCY_PATH, asset.target)
+
+    def test_effective_tunnel_operator_dependency_readback(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["systemctl"],
+            0,
+            "Wants=grabowski-operator.service network-online.target\n"
+            "After=grabowski-operator.service network-online.target\n"
+            "PartOf=grabowski-operator.service\n",
+            "",
+        )
+        with mock.patch.object(core, "run", return_value=completed) as run:
+            observed = dual.verify_tunnel_operator_dependency()
+        self.assertIn("grabowski-operator.service", observed["PartOf"])
+        self.assertIn("grabowski-operator.service", observed["After"])
+        self.assertIn("grabowski-operator.service", observed["Wants"])
+        self.assertIn("--property=PartOf", run.call_args.args[0])
+
+    def test_effective_tunnel_operator_dependency_fails_closed_without_partof(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["systemctl"],
+            0,
+            "Wants=grabowski-operator.service\n"
+            "After=grabowski-operator.service\n"
+            "PartOf=\n",
+            "",
+        )
+        with mock.patch.object(core, "run", return_value=completed):
+            with self.assertRaises(core.DeployError):
+                dual.verify_tunnel_operator_dependency()
+
+    def test_unchanged_dependency_dropin_still_reloads_before_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "70-operator-dependency.conf"
+            target.write_bytes(b"new")
+            target.chmod(0o600)
+            asset = dual.WatchdogHostAsset(
+                source=dual.TUNNEL_OPERATOR_DEPENDENCY_RELATIVE,
+                target=target,
+                mode=0o600,
+                reloads_systemd=True,
+            )
+            with (
+                mock.patch.object(core, "git_show", return_value=b"new"),
+                mock.patch.object(dual, "_systemd_daemon_reload") as reload,
+                mock.patch.object(
+                    dual, "verify_watchdog_systemd_fragments", return_value={}
+                ),
+                mock.patch.object(
+                    dual, "verify_tunnel_operator_dependency", return_value={}
+                ),
+            ):
+                projection = dual.install_watchdog_host_assets(
+                    ROOT, self.snapshot(), assets=(asset,)
+                )
+        self.assertEqual((), projection.changed_targets)
+        reload.assert_called_once_with()
 
     def test_projection_is_git_head_bound_atomic_and_reversible(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
