@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -179,6 +180,7 @@ class McpLifecycleProbeTests(unittest.TestCase):
                     "MainPID": "123",
                 },
             ),
+            patch.object(watchdog, "process_start_ticks", return_value=42),
             patch.object(watchdog, "process_age_seconds", return_value=120.0),
             patch.object(watchdog, "operator_identity_ok", return_value=True),
             patch.object(watchdog, "mcp_http_probe", return_value=None),
@@ -301,6 +303,7 @@ class McpHttpLivenessProbeTests(unittest.TestCase):
                     "MainPID": "123",
                 },
             ),
+            patch.object(watchdog, "process_start_ticks", return_value=42),
             patch.object(watchdog, "process_age_seconds", return_value=120.0),
             patch.object(watchdog, "operator_identity_ok", return_value=True),
             patch.object(
@@ -340,6 +343,7 @@ class McpHttpLivenessProbeTests(unittest.TestCase):
                     "MainPID": "123",
                 },
             ),
+            patch.object(watchdog, "process_start_ticks", return_value=42),
             patch.object(watchdog, "process_age_seconds", return_value=120.0),
             patch.object(watchdog, "operator_identity_ok", return_value=True),
             patch.object(
@@ -400,11 +404,45 @@ class McpHttpLivenessProbeTests(unittest.TestCase):
             self.assertFalse(path.is_symlink())
             self.assertEqual(b"new-dump", path.read_bytes())
 
+    def test_stack_dump_pending_replace_preserves_link_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            victim = root / "victim.log"
+            path = root / "stack.log"
+            pending = root / ".stackdump.pending.tmp"
+            victim.write_bytes(b"keep-me")
+            pending.symlink_to(victim)
+            self.assertTrue(
+                watchdog._write_stack_dump_target(path, b"new-dump", 16)
+            )
+            self.assertEqual(b"keep-me", victim.read_bytes())
+            self.assertFalse(pending.exists())
+            self.assertEqual(b"new-dump", path.read_bytes())
+
+    def test_stack_dump_slot_ring_is_generation_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            first = watchdog._stack_dump_slot_path(state_dir, 1)
+            wrapped = watchdog._stack_dump_slot_path(
+                state_dir, 1 + watchdog.STACK_DUMP_SLOT_COUNT
+            )
+            self.assertEqual(first, wrapped)
+            self.assertIn(watchdog.STACK_DUMP_DIRECTORY_NAME, first.parts)
+
     def test_stack_dump_request_extracts_only_new_memfd_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "stack.log"
+            state_dir = Path(temp_dir)
             with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(
+                    watchdog,
+                    "_process_start_ticks",
+                    side_effect=[42, 42, 42],
+                ),
                 patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog, "_stack_dump_memfd_is_bounded", return_value=True
+                ),
                 patch.object(
                     watchdog,
                     "_stack_dump_memfd_position",
@@ -420,46 +458,222 @@ class McpHttpLivenessProbeTests(unittest.TestCase):
                     "_write_stack_dump_target",
                     return_value=True,
                 ) as write,
-                patch.object(watchdog.os, "kill") as kill,
+                patch.object(watchdog.signal, "pidfd_send_signal") as send_signal,
+                patch.object(watchdog.os, "close") as close,
                 patch.object(watchdog.time, "sleep") as sleep,
             ):
-                self.assertTrue(
-                    watchdog.request_python_stack_dump(
-                        123, path=path, max_bytes=16
-                    )
+                receipt = watchdog.request_python_stack_dump(
+                    123,
+                    state_dir=state_dir,
+                    restart_generation=9,
+                    captured_at_unix=1_000,
+                    expected_start_ticks=42,
+                    max_bytes=4_096,
                 )
-            kill.assert_called_once_with(123, watchdog.signal.SIGUSR1)
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertEqual(9, receipt["restart_generation"])
+            self.assertEqual(1, receipt["slot"])
+            self.assertEqual(123, receipt["pid"])
+            self.assertEqual(42, receipt["process_start_ticks"])
+            self.assertEqual(8, receipt["payload_bytes"])
+            self.assertEqual(
+                "operator-stackdumps-v1/slot-1.dump",
+                receipt["relative_path"],
+            )
+            send_signal.assert_called_once_with(99, watchdog.signal.SIGUSR1)
+            close.assert_called_once_with(99)
             sleep.assert_called_once_with(0.25)
             self.assertEqual(2, position.call_count)
             read.assert_called_once_with(
-                123, 7, 10, 18, 16, Path("/proc")
+                123, 7, 10, 18, 4_096, Path("/proc")
             )
-            write.assert_called_once_with(path, b"new-dump", 16)
+            written_path, evidence, limit = write.call_args.args
+            self.assertEqual(
+                watchdog._stack_dump_slot_path(state_dir, 9), written_path
+            )
+            self.assertEqual(4_096, limit)
+            header_bytes, stack = evidence.split(b"\n", 1)
+            header = json.loads(header_bytes)
+            self.assertEqual(9, header["restart_generation"])
+            self.assertEqual(b"new-dump", stack)
+            self.assertEqual(
+                receipt["evidence_sha256"],
+                hashlib.sha256(evidence).hexdigest(),
+            )
 
-    def test_failed_fresh_dump_removes_stale_output(self) -> None:
+    def test_failed_publish_leaves_only_self_identifying_old_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "stack.log"
-            path.write_bytes(b"stale")
+            state_dir = Path(temp_dir)
+            slot = watchdog._stack_dump_slot_path(state_dir, 1)
+            old = watchdog._stack_dump_evidence_bytes(
+                b"old-dump",
+                pid=11,
+                restart_generation=1,
+                captured_at_unix=100,
+                process_start_ticks=7,
+                max_bytes=4_096,
+            )
+            assert old is not None
+            self.assertTrue(
+                watchdog._write_stack_dump_target(slot, old[0], 4_096)
+            )
             with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(
+                    watchdog,
+                    "_process_start_ticks",
+                    side_effect=[42, 42, 42],
+                ),
                 patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog, "_stack_dump_memfd_is_bounded", return_value=True
+                ),
                 patch.object(
                     watchdog,
                     "_stack_dump_memfd_position",
-                    side_effect=[0, 0],
+                    side_effect=[0, 8],
                 ),
-                patch.object(watchdog.os, "kill"),
+                patch.object(
+                    watchdog,
+                    "_read_stack_dump_memfd",
+                    return_value=b"new-dump",
+                ),
+                patch.object(
+                    watchdog,
+                    "_write_stack_dump_target",
+                    return_value=False,
+                ),
+                patch.object(watchdog.signal, "pidfd_send_signal"),
+                patch.object(watchdog.os, "close"),
                 patch.object(watchdog.time, "sleep"),
             ):
-                self.assertFalse(
-                    watchdog.request_python_stack_dump(
-                        123, path=path, max_bytes=16
-                    )
+                receipt = watchdog.request_python_stack_dump(
+                    123,
+                    state_dir=state_dir,
+                    restart_generation=9,
+                    captured_at_unix=1_000,
+                    expected_start_ticks=42,
+                    max_bytes=4_096,
                 )
-            self.assertFalse(path.exists())
+            self.assertIsNone(receipt)
+            header = json.loads(slot.read_bytes().split(b"\n", 1)[0])
+            self.assertEqual(1, header["restart_generation"])
+            self.assertNotEqual(9, header["restart_generation"])
 
     def test_stack_dump_request_fails_without_unique_memfd(self) -> None:
-        with patch.object(watchdog, "_stack_dump_memfd", return_value=None):
-            self.assertFalse(watchdog.request_python_stack_dump(123))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(watchdog, "_process_start_ticks", return_value=42),
+                patch.object(watchdog, "_stack_dump_memfd", return_value=None),
+                patch.object(watchdog.os, "close"),
+            ):
+                self.assertIsNone(
+                    watchdog.request_python_stack_dump(
+                        123,
+                        state_dir=Path(temp_dir),
+                        restart_generation=1,
+                        captured_at_unix=100,
+                        expected_start_ticks=42,
+                    )
+                )
+
+    def test_stack_dump_request_fails_closed_without_pidfd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=None),
+                patch.object(watchdog, "_stack_dump_memfd") as memfd,
+            ):
+                self.assertIsNone(
+                    watchdog.request_python_stack_dump(
+                        123,
+                        state_dir=Path(temp_dir),
+                        restart_generation=1,
+                        captured_at_unix=100,
+                        expected_start_ticks=42,
+                    )
+                )
+            memfd.assert_not_called()
+
+    def test_stack_dump_request_does_not_signal_unbounded_memfd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(watchdog, "_process_start_ticks", return_value=42),
+                patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog, "_stack_dump_memfd_is_bounded", return_value=False
+                ),
+                patch.object(watchdog.signal, "pidfd_send_signal") as send_signal,
+                patch.object(watchdog.os, "close"),
+            ):
+                self.assertIsNone(
+                    watchdog.request_python_stack_dump(
+                        123,
+                        state_dir=Path(temp_dir),
+                        restart_generation=1,
+                        captured_at_unix=100,
+                        expected_start_ticks=42,
+                    )
+                )
+            send_signal.assert_not_called()
+
+    def test_stack_dump_request_does_not_signal_when_memfd_is_full(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(watchdog, "_process_start_ticks", return_value=42),
+                patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog, "_stack_dump_memfd_is_bounded", return_value=True
+                ),
+                patch.object(
+                    watchdog,
+                    "_stack_dump_memfd_position",
+                    return_value=watchdog.STACK_DUMP_MAX_BYTES,
+                ),
+                patch.object(watchdog.signal, "pidfd_send_signal") as send_signal,
+                patch.object(watchdog.os, "close"),
+            ):
+                self.assertIsNone(
+                    watchdog.request_python_stack_dump(
+                        123,
+                        state_dir=Path(temp_dir),
+                        restart_generation=1,
+                        captured_at_unix=100,
+                        expected_start_ticks=42,
+                    )
+                )
+            send_signal.assert_not_called()
+
+    def test_stack_dump_request_does_not_signal_after_pid_identity_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(watchdog, "_stack_dump_pidfd", return_value=99),
+                patch.object(
+                    watchdog,
+                    "_process_start_ticks",
+                    side_effect=[42, 43],
+                ),
+                patch.object(watchdog, "_stack_dump_memfd", return_value=7),
+                patch.object(
+                    watchdog, "_stack_dump_memfd_is_bounded", return_value=True
+                ),
+                patch.object(watchdog, "_stack_dump_memfd_position", return_value=10),
+                patch.object(watchdog.signal, "pidfd_send_signal") as send_signal,
+                patch.object(watchdog.os, "close"),
+            ):
+                self.assertIsNone(
+                    watchdog.request_python_stack_dump(
+                        123,
+                        state_dir=Path(temp_dir),
+                        restart_generation=1,
+                        captured_at_unix=100,
+                        expected_start_ticks=42,
+                    )
+                )
+            send_signal.assert_not_called()
 
 
 

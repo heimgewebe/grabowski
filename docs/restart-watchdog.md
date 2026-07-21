@@ -82,16 +82,32 @@ Der Operator registriert `SIGUSR1` auf einem anonymen Linux-Memfd mit exakt
 fremde Signale diesen Speicher vergrößern oder umformen. Vor einem
 automatischen Neustart ermittelt der Watchdog genau diesen Deskriptor über
 `/proc/<pid>/fd`, merkt sich seine aktuelle Schreibposition, sendet ein Signal
-und liest ausschließlich die neu geschriebenen Bytes aus.
+und liest ausschließlich die neu geschriebenen Bytes aus. Das Signal wird über
+ein Linux-`pidfd` an genau den zuvor gebundenen Prozess gesendet; ändert sich
+die `/proc`-Startidentität während der Aufnahme, verwirft der Watchdog den Dump
+fail-closed. Fehlt `pidfd`- oder Memfd-Unterstützung, läuft der notwendige
+Recovery-Neustart ohne Stackdump weiter.
 
-Die persistente Datei
-`~/.local/state/grabowski/operator-stackdump.log` entsteht erst danach aus
-einer neuen Exklusivdatei mit Modus 0600 und wird per atomarem Replace
-veröffentlicht. Bestehende Hardlinks oder Symlinks werden dadurch ersetzt,
-ohne ihr Ziel vor der Prüfung zu öffnen oder zu truncaten. Pro Recovery wird
-höchstens 1 MiB persistiert; weitere externe Signale verändern die persistente
-Datei nicht. Die Stackaufnahme ist Diagnoseevidenz und darf einen notwendigen
-Neustart nicht blockieren.
+Die persistente Evidenz liegt in einem festen Ring aus acht Slots unter
+`~/.local/state/grabowski/operator-stackdumps-v1/`. Jeder Slot beginnt mit
+einem kanonischen JSON-Kopf aus Restart-Generation, PID, Prozess-Startidentität,
+Aufnahmezeit, Payload-Größe und Payload-Hash. Nur der im aktuellen Watchdog-Ereignis
+referenzierte Receipt gilt als frisch; eine bei fehlgeschlagener Publikation
+verbleibende ältere Slotdatei weist durch ihren Kopf weiterhin ihre ältere
+Generation aus.
+
+Jeder Slot entsteht aus einer neuen Exklusivdatei mit Modus 0600 und wird per
+atomarem Replace veröffentlicht. Eine einzige deterministisch benannte,
+ebenfalls auf 1 MiB begrenzte Pending-Datei verhindert, dass Prozessabbrüche
+beliebig viele temporäre Dateien hinterlassen. Bestehende Hardlinks oder
+Symlinks werden dadurch ersetzt, ohne ihr Ziel vor der Prüfung zu öffnen oder
+zu truncaten. Der Ring begrenzt die veröffentlichte Evidenz auf acht Dateien
+zu jeweils höchstens 1 MiB; zusätzlich kann höchstens eine begrenzte
+Pending-Datei existieren. Weitere externe Signale verändern bereits
+publizierte Evidenz nicht. Ist der feste 1-MiB-Memfd bereits vollständig
+beschrieben, wird kein weiteres Diagnosesignal gesendet und der
+Recovery-Neustart läuft ohne frischen Dump weiter. Die Stackaufnahme ist
+Diagnoseevidenz und darf einen notwendigen Neustart nicht blockieren.
 
 Der HTTP-Sitzungsmanager beendet inaktive Sitzungen nach 1.800 Sekunden. Das
 begrenzt verwaiste Zustände, ohne normale Connector-Sitzungen aggressiv zu

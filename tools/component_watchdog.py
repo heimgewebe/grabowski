@@ -5,6 +5,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import fcntl
+import hashlib
 import http.client
 import json
 import os
@@ -34,7 +35,8 @@ PROTOCOL_VERSION = "2025-06-18"
 MCP_HEALTH_TOOL = "grabowski_runtime_health"
 MCP_MAX_RESPONSE_BYTES = 65536
 MCP_STDIO_SHUTDOWN_TIMEOUT = 2.0
-STACK_DUMP_PATH = DEFAULT_STATE_DIR / "operator-stackdump.log"
+STACK_DUMP_DIRECTORY_NAME = "operator-stackdumps-v1"
+STACK_DUMP_SLOT_COUNT = 8
 STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
 STACK_DUMP_MAX_BYTES = 1_048_576
 DEFAULT_BACKOFF_BASE = 60
@@ -57,6 +59,7 @@ class ProbeResult:
     reasons: tuple[str, ...] = ()
     pid: int | None = None
     age_seconds: float | None = None
+    start_ticks: int | None = None
 
 
 @dataclass
@@ -125,7 +128,7 @@ def read_cmdline(proc_root: Path, pid: int) -> list[str]:
     ]
 
 
-def process_age_seconds(proc_root: Path, pid: int) -> float:
+def process_start_ticks(proc_root: Path, pid: int) -> int:
     stat_text = (proc_root / str(pid) / "stat").read_text(
         encoding="utf-8", errors="replace"
     )
@@ -135,7 +138,23 @@ def process_age_seconds(proc_root: Path, pid: int) -> float:
     fields = stat_text[closing + 2 :].split()
     if len(fields) <= 19:
         raise WatchdogError("proc-stat-incomplete")
-    start_ticks = int(fields[19])
+    try:
+        start_ticks = int(fields[19])
+    except ValueError as exc:
+        raise WatchdogError("proc-stat-invalid-start-time") from exc
+    if start_ticks < 0:
+        raise WatchdogError("proc-stat-invalid-start-time")
+    return start_ticks
+
+
+def process_age_seconds(
+    proc_root: Path,
+    pid: int,
+    *,
+    start_ticks: int | None = None,
+) -> float:
+    if start_ticks is None:
+        start_ticks = process_start_ticks(proc_root, pid)
     uptime = float((proc_root / "uptime").read_text(encoding="ascii").split()[0])
     ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
     return max(0.0, uptime - (start_ticks / ticks))
@@ -557,7 +576,8 @@ def probe_component(
         return ProbeResult("unhealthy", ("service-inactive",), pid or None)
 
     try:
-        age = process_age_seconds(proc_root, pid)
+        start_ticks = process_start_ticks(proc_root, pid)
+        age = process_age_seconds(proc_root, pid, start_ticks=start_ticks)
     except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, WatchdogError):
         return ProbeResult("indeterminate", ("process-age-unavailable",), pid)
 
@@ -571,7 +591,7 @@ def probe_component(
                 runtime_root, module, http_timeout
             )
         except WatchdogError as exc:
-            return ProbeResult("indeterminate", (str(exc),), pid, age)
+            return ProbeResult("indeterminate", (str(exc),), pid, age, start_ticks)
         failures = tuple(
             failure
             for failure in (live_failure, isolated_failure)
@@ -587,7 +607,7 @@ def probe_component(
         elif "mcp-runtime-unhealthy" in failures:
             if not reasons:
                 return ProbeResult(
-                    "indeterminate", ("mcp-runtime-unhealthy",), pid, age
+                    "indeterminate", ("mcp-runtime-unhealthy",), pid, age, start_ticks
                 )
             reasons.append("mcp-runtime-unhealthy")
     elif component == "tunnel":
@@ -599,15 +619,19 @@ def probe_component(
             if not get_probe(ready_url, "ready", http_timeout):
                 reasons.append("readiness-failed")
         except WatchdogError as exc:
-            return ProbeResult("indeterminate", (str(exc),), pid, age)
+            return ProbeResult("indeterminate", (str(exc),), pid, age, start_ticks)
     else:
         raise WatchdogError("invalid-component")
 
     if not reasons:
-        return ProbeResult("healthy", pid=pid, age_seconds=age)
+        return ProbeResult(
+            "healthy", pid=pid, age_seconds=age, start_ticks=start_ticks
+        )
     if age < startup_grace:
-        return ProbeResult("startup-grace", tuple(reasons), pid, age)
-    return ProbeResult("unhealthy", tuple(reasons), pid, age)
+        return ProbeResult(
+            "startup-grace", tuple(reasons), pid, age, start_ticks
+        )
+    return ProbeResult("unhealthy", tuple(reasons), pid, age, start_ticks)
 
 
 def ensure_state_dir(path: Path) -> Path:
@@ -806,6 +830,31 @@ def decide(
     )
 
 
+def _process_start_ticks(
+    pid: int,
+    proc_root: Path = Path("/proc"),
+) -> int | None:
+    if pid <= 0:
+        return None
+    try:
+        return process_start_ticks(proc_root, pid)
+    except (OSError, ValueError, WatchdogError):
+        return None
+
+
+def _stack_dump_pidfd(pid: int) -> int | None:
+    if (
+        pid <= 0
+        or not hasattr(os, "pidfd_open")
+        or not hasattr(signal, "pidfd_send_signal")
+    ):
+        return None
+    try:
+        return os.pidfd_open(pid, 0)
+    except (OSError, ValueError):
+        return None
+
+
 def _stack_dump_memfd(
     pid: int,
     proc_root: Path = Path("/proc"),
@@ -829,6 +878,44 @@ def _stack_dump_memfd(
         if target in {expected, f"{expected} (deleted)"}:
             matches.append(int(entry.name))
     return matches[0] if len(matches) == 1 else None
+
+
+def _stack_dump_memfd_is_bounded(
+    pid: int,
+    descriptor: int,
+    max_bytes: int,
+    proc_root: Path = Path("/proc"),
+) -> bool:
+    if pid <= 0 or descriptor < 0 or max_bytes <= 0:
+        return False
+    seal_names = ("F_GET_SEALS", "F_SEAL_GROW", "F_SEAL_SHRINK")
+    if any(not hasattr(fcntl, name) for name in seal_names):
+        return False
+    path = proc_root / str(pid) / "fd" / str(descriptor)
+    expected = f"memfd:{STACK_DUMP_MEMFD_NAME}"
+    try:
+        target = os.readlink(path).lstrip("/")
+    except OSError:
+        return False
+    if target not in {expected, f"{expected} (deleted)"}:
+        return False
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    source = -1
+    try:
+        source = os.open(path, flags)
+        metadata = os.fstat(source)
+        required_seals = fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK
+        seals = fcntl.fcntl(source, fcntl.F_GET_SEALS)
+        return (
+            statmod.S_ISREG(metadata.st_mode)
+            and metadata.st_size == max_bytes
+            and seals & required_seals == required_seals
+        )
+    except OSError:
+        return False
+    finally:
+        if source >= 0:
+            os.close(source)
 
 
 def _stack_dump_memfd_position(
@@ -875,6 +962,9 @@ def _read_stack_dump_memfd(
         or end > max_bytes
     ):
         return None
+    seal_names = ("F_GET_SEALS", "F_SEAL_GROW", "F_SEAL_SHRINK")
+    if any(not hasattr(fcntl, name) for name in seal_names):
+        return None
     path = proc_root / str(pid) / "fd" / str(descriptor)
     expected = f"memfd:{STACK_DUMP_MEMFD_NAME}"
     try:
@@ -905,23 +995,54 @@ def _read_stack_dump_memfd(
     return payload if len(payload) == end - start else None
 
 
-def _remove_stack_dump_target(path: Path) -> bool:
-    try:
-        parent_metadata = path.parent.lstat()
-        if not statmod.S_ISDIR(parent_metadata.st_mode):
-            return False
-        path.unlink(missing_ok=True)
-        directory_flags = os.O_RDONLY | os.O_CLOEXEC
-        if hasattr(os, "O_DIRECTORY"):
-            directory_flags |= os.O_DIRECTORY
-        directory_descriptor = os.open(path.parent, directory_flags)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
-    except OSError:
-        return False
-    return True
+def _stack_dump_slot_path(
+    state_dir: Path,
+    restart_generation: int,
+) -> Path:
+    if restart_generation < 1:
+        raise ValueError("restart_generation must be positive")
+    slot = restart_generation % STACK_DUMP_SLOT_COUNT
+    return state_dir / STACK_DUMP_DIRECTORY_NAME / f"slot-{slot}.dump"
+
+
+def _stack_dump_evidence_bytes(
+    payload: bytes,
+    *,
+    pid: int,
+    restart_generation: int,
+    captured_at_unix: int,
+    process_start_ticks: int,
+    max_bytes: int,
+) -> tuple[bytes, dict[str, object]] | None:
+    if (
+        not payload
+        or pid <= 0
+        or restart_generation < 1
+        or captured_at_unix <= 0
+        or process_start_ticks < 0
+        or max_bytes <= 0
+    ):
+        return None
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    header = {
+        "captured_at_unix": captured_at_unix,
+        "kind": "grabowski_operator_stack_dump",
+        "payload_bytes": len(payload),
+        "payload_sha256": payload_sha256,
+        "pid": pid,
+        "process_start_ticks": process_start_ticks,
+        "restart_generation": restart_generation,
+        "schema_version": 1,
+    }
+    encoded_header = json.dumps(
+        header,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    evidence = encoded_header + b"\n" + payload
+    if len(evidence) > max_bytes:
+        return None
+    return evidence, header
 
 
 def _write_stack_dump_target(
@@ -936,17 +1057,27 @@ def _write_stack_dump_target(
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         parent_metadata = path.parent.lstat()
-        if not statmod.S_ISDIR(parent_metadata.st_mode):
+        if (
+            not statmod.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != os.getuid()
+        ):
             return False
         os.chmod(path.parent, 0o700)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            dir=path.parent,
-        )
-        temporary_path = Path(temporary_name)
+        temporary_path = path.parent / ".stackdump.pending.tmp"
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            return False
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary_path, flags, 0o600)
         metadata = os.fstat(descriptor)
-        if not statmod.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        if (
+            not statmod.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.getuid()
+        ):
             return False
         os.fchmod(descriptor, 0o600)
         view = memoryview(payload)
@@ -984,6 +1115,7 @@ def _write_stack_dump_target(
     return (
         statmod.S_ISREG(metadata.st_mode)
         and metadata.st_nlink == 1
+        and metadata.st_uid == os.getuid()
         and statmod.S_IMODE(metadata.st_mode) == 0o600
         and metadata.st_size == len(payload)
     )
@@ -991,34 +1123,81 @@ def _write_stack_dump_target(
 
 def request_python_stack_dump(
     pid: int,
-    path: Path = STACK_DUMP_PATH,
+    *,
+    state_dir: Path,
+    restart_generation: int,
+    captured_at_unix: int,
+    expected_start_ticks: int | None = None,
     max_bytes: int = STACK_DUMP_MAX_BYTES,
     proc_root: Path = Path("/proc"),
-) -> bool:
-    if pid <= 0 or max_bytes <= 0 or not hasattr(signal, "SIGUSR1"):
-        return False
-    descriptor = _stack_dump_memfd(pid, proc_root)
-    if descriptor is None:
-        return False
-    before = _stack_dump_memfd_position(
-        pid, descriptor, max_bytes, proc_root
-    )
-    if before is None or not _remove_stack_dump_target(path):
-        return False
+) -> dict[str, object] | None:
+    if (
+        pid <= 0
+        or restart_generation < 1
+        or captured_at_unix <= 0
+        or expected_start_ticks is None
+        or expected_start_ticks < 0
+        or max_bytes <= 0
+        or not hasattr(signal, "SIGUSR1")
+    ):
+        return None
+    pidfd = _stack_dump_pidfd(pid)
+    if pidfd is None:
+        return None
     try:
-        os.kill(pid, signal.SIGUSR1)
-    except OSError:
-        return False
-    time.sleep(0.25)
-    after = _stack_dump_memfd_position(pid, descriptor, max_bytes, proc_root)
-    if after is None or after <= before:
-        return False
-    payload = _read_stack_dump_memfd(
-        pid, descriptor, before, after, max_bytes, proc_root
-    )
-    return payload is not None and _write_stack_dump_target(
-        path, payload, max_bytes
-    )
+        if _process_start_ticks(pid, proc_root) != expected_start_ticks:
+            return None
+        descriptor = _stack_dump_memfd(pid, proc_root)
+        if descriptor is None or not _stack_dump_memfd_is_bounded(
+            pid, descriptor, max_bytes, proc_root
+        ):
+            return None
+        before = _stack_dump_memfd_position(
+            pid, descriptor, max_bytes, proc_root
+        )
+        if before is None or before >= max_bytes:
+            return None
+        if _process_start_ticks(pid, proc_root) != expected_start_ticks:
+            return None
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGUSR1)
+        except OSError:
+            return None
+        time.sleep(0.25)
+        if _process_start_ticks(pid, proc_root) != expected_start_ticks:
+            return None
+        after = _stack_dump_memfd_position(pid, descriptor, max_bytes, proc_root)
+        if after is None or after <= before:
+            return None
+        payload = _read_stack_dump_memfd(
+            pid, descriptor, before, after, max_bytes, proc_root
+        )
+        if payload is None:
+            return None
+        packaged = _stack_dump_evidence_bytes(
+            payload,
+            pid=pid,
+            restart_generation=restart_generation,
+            captured_at_unix=captured_at_unix,
+            process_start_ticks=expected_start_ticks,
+            max_bytes=max_bytes,
+        )
+        if packaged is None:
+            return None
+        evidence, header = packaged
+        path = _stack_dump_slot_path(state_dir, restart_generation)
+        if not _write_stack_dump_target(path, evidence, max_bytes):
+            return None
+        receipt: dict[str, object] = {
+            **header,
+            "evidence_bytes": len(evidence),
+            "evidence_sha256": hashlib.sha256(evidence).hexdigest(),
+            "relative_path": str(path.relative_to(state_dir)),
+            "slot": restart_generation % STACK_DUMP_SLOT_COUNT,
+        }
+        return receipt
+    finally:
+        os.close(pidfd)
 
 
 def restart_service(service: str) -> None:
@@ -1105,9 +1284,10 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 emit("grabowski.component_watchdog.unhealthy", **common)
                 return 1
 
+            decision_now = int(time.time())
             action, next_state = decide(
                 state,
-                now=int(time.time()),
+                now=decision_now,
                 failure_threshold=args.failure_threshold,
                 max_restarts=args.max_restarts,
                 restart_window=args.restart_window,
@@ -1141,18 +1321,21 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 )
                 return 1
 
-            stack_dump_requested = (
-                args.component == "operator"
-                and probe.pid is not None
-                and request_python_stack_dump(
+            stack_dump_receipt = None
+            if args.component == "operator" and probe.pid is not None:
+                stack_dump_receipt = request_python_stack_dump(
                     probe.pid,
-                    path=state_dir / "operator-stackdump.log",
+                    state_dir=state_dir,
+                    restart_generation=next_state.restart_generation,
+                    captured_at_unix=decision_now,
+                    expected_start_ticks=probe.start_ticks,
                 )
-            )
+            stack_dump_requested = stack_dump_receipt is not None
             emit(
                 "grabowski.component_watchdog.restarting",
                 **common,
                 stack_dump_requested=stack_dump_requested,
+                stack_dump_receipt=stack_dump_receipt,
                 backoff_level=next_state.backoff_level,
                 next_restart_not_before=next_state.next_restart_not_before,
                 restart_generation=next_state.restart_generation,
@@ -1164,6 +1347,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     component=args.component,
                     service=args.service,
                     persisted=True,
+                    receipt=stack_dump_receipt,
                     max_bytes=STACK_DUMP_MAX_BYTES,
                 )
             deadline = time.monotonic() + args.recovery_timeout
