@@ -82,12 +82,28 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
                 with self.assertRaises(router.CodingAgentRouterError):
                     router._load_catalog()
 
-    def test_embedded_digest_tamper_is_rejected(self) -> None:
-        with mock.patch.object(catalog_data, "CATALOG_CANONICAL_SHA256", "0" * 64):
-            with self.assertRaisesRegex(
-                router.CodingAgentRouterError, "embedded coding-agent catalog digest mismatch"
-            ):
-                router._embedded_catalog()
+
+
+    def test_catalog_health_uses_one_catalog_selection(self) -> None:
+        selection = (router._deployment_catalog_path(), "deployment_catalog")
+        with mock.patch.object(
+            router, "_catalog_selection", side_effect=[selection]
+        ) as selector:
+            health = router.coding_agent_catalog_health()
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["path"], str(selection[0]))
+        self.assertEqual(health["source"], selection[1])
+        self.assertEqual(selector.call_count, 1)
+
+    def test_catalog_readback_reuses_loaded_catalog_selection(self) -> None:
+        selection = (router._deployment_catalog_path(), "deployment_catalog")
+        with mock.patch.object(
+            router, "_catalog_selection", side_effect=[selection]
+        ) as selector:
+            body = router.grabowski_coding_agent_catalog()
+        self.assertEqual(body["catalog_path"], str(selection[0]))
+        self.assertEqual(body["validation"]["catalog_source"], selection[1])
+        self.assertEqual(selector.call_count, 1)
 
 
 if __name__ == "__main__":

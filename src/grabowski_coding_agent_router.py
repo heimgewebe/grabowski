@@ -10,7 +10,6 @@ import stat
 import sys
 from typing import Any
 
-import grabowski_coding_agent_catalog_data as catalog_data
 import grabowski_operator_core as operator
 
 mcp = operator.mcp
@@ -171,37 +170,17 @@ def _deployment_catalog_path() -> Path:
     return module_path.parent.parent / "config" / "coding-agent-catalog.json"
 
 
-def _catalog_path() -> Path:
+def _catalog_selection() -> tuple[Path, str]:
     configured = os.environ.get(CATALOG_ENV)
     override_enabled = os.environ.get(CATALOG_OVERRIDE_ENV) == "1"
     if configured and override_enabled:
-        return Path(configured).expanduser()
-    return _deployment_catalog_path()
+        return Path(configured).expanduser(), "environment-override"
+    return _deployment_catalog_path(), "deployment_catalog"
 
 
-def _catalog_source() -> str:
-    configured = os.environ.get(CATALOG_ENV)
-    override_enabled = os.environ.get(CATALOG_OVERRIDE_ENV) == "1"
-    return "environment-override" if configured and override_enabled else "deployment_catalog"
+def _catalog_path() -> Path:
+    return _catalog_selection()[0]
 
-
-def _embedded_catalog() -> dict[str, Any]:
-    """Validate the generated catalog copy without granting it runtime authority."""
-    payload = catalog_data.CATALOG_JSON.encode("utf-8")
-    if len(payload) > MAX_CATALOG_BYTES:
-        raise CodingAgentRouterError("embedded coding-agent catalog exceeds size limit")
-    digest = hashlib.sha256(payload).hexdigest()
-    if digest != catalog_data.CATALOG_CANONICAL_SHA256:
-        raise CodingAgentRouterError("embedded coding-agent catalog digest mismatch")
-    try:
-        value = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise CodingAgentRouterError(
-            "embedded coding-agent catalog is not valid UTF-8 JSON"
-        ) from exc
-    if not isinstance(value, dict):
-        raise CodingAgentRouterError("embedded coding-agent catalog root must be an object")
-    return value
 
 def _state_path() -> Path:
     configured = os.environ.get(STATE_ENV)
@@ -658,24 +637,29 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _load_catalog() -> tuple[dict[str, Any], dict[str, Any]]:
-    path = _catalog_path()
+def _load_catalog_selection(
+    path: Path, source: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
     catalog = _read_json_object(
         path,
         label="coding-agent catalog",
         max_bytes=MAX_CATALOG_BYTES,
     )
     validation = _validate_catalog(catalog)
-    validation["catalog_source"] = _catalog_source()
+    validation["catalog_source"] = source
+    validation["catalog_path"] = str(path)
     return catalog, validation
+
+
+def _load_catalog() -> tuple[dict[str, Any], dict[str, Any]]:
+    return _load_catalog_selection(*_catalog_selection())
 
 
 def coding_agent_catalog_health() -> dict[str, Any]:
     """Return bounded semantic health for the exact catalog selected by the router."""
-    path = _catalog_path()
-    source = _catalog_source()
+    path, source = _catalog_selection()
     try:
-        _catalog, validation = _load_catalog()
+        _catalog, validation = _load_catalog_selection(path, source)
     except (OSError, CodingAgentRouterError) as exc:
         return {
             "ready": False,
@@ -686,8 +670,8 @@ def coding_agent_catalog_health() -> dict[str, Any]:
         }
     return {
         "ready": True,
-        "source": source,
-        "path": str(path),
+        "source": validation["catalog_source"],
+        "path": validation["catalog_path"],
         **validation,
     }
 
@@ -1450,9 +1434,7 @@ def grabowski_coding_agent_catalog(include_disabled: bool = False) -> dict[str, 
     body = {
         "schema_version": 2,
         "catalog_version": catalog.get("catalog_version"),
-        "catalog_path": (
-            str(_catalog_path()) if _catalog_path() is not None else None
-        ),
+        "catalog_path": validation["catalog_path"],
         "validation": validation,
         "catalog_fresh": _state_catalog_fresh(state),
         "state_available": bool(state),

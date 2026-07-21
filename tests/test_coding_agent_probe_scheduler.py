@@ -392,6 +392,12 @@ else:
             SCHEDULER.assert_probe_digest_safe(
                 {"providers": {"claude": {"auth": {"password": "redacted"}}}}
             )
+        for sensitive_field in ("token_hint", "auth_secret", "credential_value"):
+            with self.subTest(sensitive_field=sensitive_field):
+                with self.assertRaisesRegex(
+                    SCHEDULER.ProbeSchedulerError, "sensitive field"
+                ):
+                    SCHEDULER.assert_probe_digest_safe({sensitive_field: "redacted"})
         SCHEDULER.assert_probe_digest_safe(
             {
                 "api_key_environment_scrubbed": ["ROUTER_AUTH_ENV_A"],
