@@ -1,4 +1,5 @@
 import hashlib
+import itertools
 import importlib.util
 import json
 from pathlib import Path
@@ -1051,10 +1052,11 @@ class WatchdogPolicyTests(unittest.TestCase):
             check=True,
             stdout=watchdog.subprocess.PIPE,
             stderr=watchdog.subprocess.PIPE,
+            text=True,
             timeout=watchdog.SERVICE_RESTART_REQUEST_TIMEOUT_SECONDS,
         )
 
-    def test_restart_service_fails_closed_when_restart_cannot_be_queued(self) -> None:
+    def test_restart_service_reports_queue_timeout_separately(self) -> None:
         with patch.object(
             watchdog.subprocess,
             "run",
@@ -1063,8 +1065,59 @@ class WatchdogPolicyTests(unittest.TestCase):
                 timeout=watchdog.SERVICE_RESTART_REQUEST_TIMEOUT_SECONDS,
             ),
         ):
-            with self.assertRaisesRegex(watchdog.WatchdogError, "service-restart-failed"):
+            with self.assertRaisesRegex(watchdog.WatchdogError, "service-restart-timeout"):
                 watchdog.restart_service("grabowski-operator.service")
+
+    def test_restart_service_preserves_bounded_single_line_systemd_error(self) -> None:
+        stderr = "D-Bus request failed\n" + ("x" * 600)
+        with patch.object(
+            watchdog.subprocess,
+            "run",
+            side_effect=watchdog.subprocess.CalledProcessError(
+                returncode=5,
+                cmd=["systemctl", "--user", "--no-block", "restart"],
+                stderr=stderr,
+            ),
+        ):
+            with self.assertRaises(watchdog.WatchdogError) as raised:
+                watchdog.restart_service("grabowski-operator.service")
+
+        message = str(raised.exception)
+        self.assertTrue(message.startswith("service-restart-failed: D-Bus request failed "))
+        detail = message.removeprefix("service-restart-failed: ")
+        self.assertLessEqual(len(detail), watchdog.SERVICE_RESTART_ERROR_MAX_CHARS)
+        self.assertNotIn("\n", detail)
+
+    def test_new_process_instance_detection_is_fail_closed_when_identity_is_uncertain(self) -> None:
+        cases = (
+            (watchdog.ProbeResult("unhealthy"), watchdog.ProbeResult("healthy"), False),
+            (watchdog.ProbeResult("unhealthy"), watchdog.ProbeResult("healthy", pid=456), True),
+            (
+                watchdog.ProbeResult("unhealthy", pid=123, start_ticks=10),
+                watchdog.ProbeResult("healthy", pid=456, start_ticks=10),
+                True,
+            ),
+            (
+                watchdog.ProbeResult("unhealthy", pid=123, start_ticks=10),
+                watchdog.ProbeResult("healthy", pid=123, start_ticks=20),
+                True,
+            ),
+            (
+                watchdog.ProbeResult("unhealthy", pid=123, start_ticks=10),
+                watchdog.ProbeResult("healthy", pid=123, start_ticks=10),
+                False,
+            ),
+            (
+                watchdog.ProbeResult("unhealthy", pid=123),
+                watchdog.ProbeResult("healthy", pid=123, start_ticks=20),
+                False,
+            ),
+        )
+        for previous, current, expected in cases:
+            with self.subTest(previous=previous, current=current):
+                self.assertEqual(
+                    expected, watchdog._is_new_process_instance(previous, current)
+                )
 
     def test_default_recovery_timeout_covers_slow_systemd_restart(self) -> None:
         args = watchdog.normalize_args(
@@ -1073,7 +1126,7 @@ class WatchdogPolicyTests(unittest.TestCase):
         self.assertEqual(watchdog.DEFAULT_RECOVERY_TIMEOUT_SECONDS, args.recovery_timeout)
         self.assertEqual(60.0, args.recovery_timeout)
 
-    def test_recovery_waits_for_restarted_process_identity(self) -> None:
+    def test_recovery_only_after_new_process_is_seen(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args = watchdog.normalize_args(
                 watchdog.parser().parse_args(
@@ -1103,8 +1156,16 @@ class WatchdogPolicyTests(unittest.TestCase):
                 patch.object(watchdog, "restart_service"),
                 patch.object(watchdog, "emit"),
                 patch.object(watchdog.time, "sleep"),
-                patch.object(watchdog.time, "monotonic", side_effect=[0.0, 0.0, 1.0]),
-                patch.object(watchdog.time, "time", side_effect=[1000.0, 1001.0]),
+                patch.object(
+                    watchdog.time,
+                    "monotonic",
+                    side_effect=itertools.chain([0.0, 0.0], itertools.repeat(1.0)),
+                ),
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.chain([1000.0], itertools.repeat(1001.0)),
+                ),
             ):
                 self.assertEqual(0, watchdog.run_watchdog(args))
 
@@ -1141,8 +1202,12 @@ class WatchdogPolicyTests(unittest.TestCase):
                 patch.object(watchdog, "restart_service"),
                 patch.object(watchdog, "emit"),
                 patch.object(watchdog.time, "sleep"),
-                patch.object(watchdog.time, "monotonic", side_effect=[0.0, 0.0]),
-                patch.object(watchdog.time, "time", side_effect=[1000.0, 1001.0]),
+                patch.object(watchdog.time, "monotonic", side_effect=itertools.repeat(0.0)),
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.chain([1000.0], itertools.repeat(1001.0)),
+                ),
             ):
                 self.assertEqual(0, watchdog.run_watchdog(args))
             state = watchdog.load_state(Path(tmp) / "operator-watchdog-state.json")
