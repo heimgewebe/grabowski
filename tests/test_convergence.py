@@ -290,15 +290,28 @@ class ConvergenceTests(unittest.TestCase):
                 "evidence_ref": "grabowski:checkout:chk-main",
                 "subject_sha256": "d" * 64,
             },
+            "closure": {
+                "schema_version": 1,
+                "closure_id": "cls-test-1",
+                "status": "closed",
+                "bureau_task_ref": "bureau:task:T001:verified",
+                "chronik_event_ref": "chronik:event:E123",
+                "cleanup_evidence": ["grabowski:checkout:chk-main"],
+                "residual_risks": [],
+            },
         }
         req_dict, req_bytes, req_sha256 = convergence.build_pr_closure_request(
-            evidence, risk_level="R2", assessment_id="pr-closure-test-1"
+            evidence,
+            risk_level="R2",
+            assessment_id="pr-closure-test-1",
+            observed_at="2026-07-22T22:00:00Z",
         )
         self.assertEqual(req_dict["schema_version"], 1)
         self.assertEqual(req_dict["risk_level"], "R2")
-        self.assertEqual(req_dict["classification"]["change_class"], "pr_closure")
+        self.assertEqual(req_dict["classification"]["change_class"], "lifecycle")
         self.assertEqual(req_dict["classification"]["blocked_by"], [])
         self.assertEqual(req_dict["observation"]["source_state"], "current")
+        self.assertEqual(req_dict["observation"]["observed_at"], "2026-07-22T22:00:00Z")
         self.assertIn("closure", req_dict)
         self.assertEqual(req_dict["closure"]["status"], "closed")
         self.assertEqual(hashlib.sha256(req_bytes).hexdigest(), req_sha256)
@@ -309,21 +322,112 @@ class ConvergenceTests(unittest.TestCase):
                 "status": "conflicted",
                 "repository": "heimgewebe/grabowski",
                 "pr_number": 235,
+                "subject_sha256": "a" * 64,
             },
             "checkout": {
                 "status": "dirty",
                 "dirty": True,
                 "checkout_key": "chk-dirty",
+                "subject_sha256": "b" * 64,
             },
         }
-        req_dict, req_bytes, req_sha256 = convergence.build_pr_closure_request(evidence)
-        self.assertEqual(req_dict["observation"]["source_state"], "partial")
+        req_dict, req_bytes, req_sha256 = convergence.build_pr_closure_request(
+            evidence, observed_at="2026-07-22T22:00:00Z"
+        )
+        self.assertEqual(req_dict["observation"]["source_state"], "unknown")
         self.assertIn("conflicting_evidence:pr_merge", req_dict["classification"]["blocked_by"])
         self.assertIn("checkout_dirty", req_dict["classification"]["blocked_by"])
         self.assertIn("evidence_missing:deployment_live", req_dict["classification"]["blocked_by"])
         self.assertIn("evidence_missing:obligation", req_dict["classification"]["blocked_by"])
         self.assertNotIn("closure", req_dict)
         self.assertEqual(hashlib.sha256(req_bytes).hexdigest(), req_sha256)
+
+    def test_missing_or_invalid_observed_at_fails_input(self):
+        with self.assertRaisesRegex(convergence.ConvergenceInputError, "observed_at"):
+            convergence.build_pr_closure_request({}, observed_at=None)
+        with self.assertRaisesRegex(convergence.ConvergenceInputError, "observed_at"):
+            convergence.build_pr_closure_request({}, observed_at="invalid-date")
+
+    def test_invalid_subject_sha256_fails_input(self):
+        bad_evidence = {
+            "pr_merge": {
+                "status": "merged",
+                "subject_sha256": "NotALowercaseSha256"
+            }
+        }
+        with self.assertRaisesRegex(convergence.ConvergenceInputError, "subject_sha256"):
+            convergence.build_pr_closure_request(bad_evidence, observed_at="2026-07-22T22:00:00Z")
+
+    def test_invalid_change_class_fails_input(self):
+        with self.assertRaisesRegex(convergence.ConvergenceInputError, "change_class"):
+            convergence.build_pr_closure_request(
+                {}, observed_at="2026-07-22T22:00:00Z", change_class="invalid_class"
+            )
+
+    def test_source_state_never_partial_or_missing(self):
+        req_dict, _, _ = convergence.build_pr_closure_request(
+            {"pr_merge": {"status": "stale", "subject_sha256": "a" * 64}},
+            observed_at="2026-07-22T22:00:00Z",
+        )
+        self.assertEqual(req_dict["observation"]["source_state"], "stale")
+        self.assertNotIn(req_dict["observation"]["source_state"], ("partial", "missing"))
+
+    def test_supplied_category_strings_do_not_synthesize_closure(self):
+        evidence = {
+            "pr_merge": {"status": "merged", "subject_sha256": "a" * 64},
+            "deployment_live": {"status": "live", "subject_sha256": "b" * 64},
+            "obligation": {"status": "completed", "subject_sha256": "c" * 64},
+            "checkout": {"status": "cleaned", "subject_sha256": "d" * 64},
+        }
+        req_dict, _, _ = convergence.build_pr_closure_request(evidence, observed_at="2026-07-22T22:00:00Z")
+        self.assertNotIn("closure", req_dict)
+
+    def test_real_regelkreis_conformance_and_evaluation(self):
+        protocol_repo = convergence._protocol_repo()
+        regelkreis_src = protocol_repo / "src"
+        if str(regelkreis_src) not in sys.path:
+            sys.path.insert(0, str(regelkreis_src))
+        import regelkreis.core as rc
+
+        contract_root = rc.locate_contract_root(protocol_repo)
+
+        effects = [
+            {"schema_version": 1, "kind": "merge", "evidence_ref": "github-pr:repo#1@sha", "subject_sha256": "a" * 64},
+            {"schema_version": 1, "kind": "deployment", "evidence_ref": "release:rel-1", "subject_sha256": "b" * 64},
+        ]
+        verifications = [
+            {"schema_version": 1, "kind": v, "result": "pass", "evidence_ref": f"ref-{v}", "subject_sha256": "c" * 64}
+            for v in ["tests", "review", "ci", "deployment_identity", "runtime_identity", "service_health", "smoke_test", "negative_control"]
+        ]
+        closure = {
+            "schema_version": 1,
+            "closure_id": "cls-001",
+            "status": "closed",
+            "bureau_task_ref": "bureau:task:T123",
+            "chronik_event_ref": "chronik:event:E123",
+            "cleanup_evidence": ["grabowski:checkout:chk1"],
+            "residual_risks": [],
+        }
+        evidence = {"effects": effects, "verifications": verifications, "closure": closure}
+        req_dict, _, _ = convergence.build_pr_closure_request(
+            evidence, risk_level="R2", assessment_id="pr-closure-conf-1", observed_at="2026-07-22T22:00:00Z"
+        )
+
+        validated = rc.validate_request(contract_root, req_dict)
+        self.assertEqual(validated["assessment_id"], "pr-closure-conf-1")
+
+        eval_res = rc.evaluate(req_dict, contract_root)
+        self.assertEqual(eval_res["status"], "terminally_closed")
+
+        req_no_closure, _, _ = convergence.build_pr_closure_request(
+            {"effects": effects, "verifications": verifications},
+            risk_level="R2",
+            assessment_id="pr-closure-conf-2",
+            observed_at="2026-07-22T22:00:00Z",
+        )
+        self.assertNotIn("closure", req_no_closure)
+        eval_no_closure = rc.evaluate(req_no_closure, contract_root)
+        self.assertEqual(eval_no_closure["status"], "evidence_missing")
 
 
 if __name__ == "__main__":

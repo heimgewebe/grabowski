@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import ProxyHandler, Request, build_opener, urlopen
+from urllib.request import Request, urlopen
 
 SCHEMA_VERSION = 1
 DEFAULT_URL = "http://100.111.206.65:8765"
@@ -179,9 +179,8 @@ class AgentClient:
             headers=headers,
             method=method.upper(),
         )
-        opener = build_opener(ProxyHandler({}))
         try:
-            with opener.open(request, timeout=self.network_timeout) as response:
+            with urlopen(request, timeout=self.network_timeout) as response:
                 payload = response.read()
                 status = response.status
         except HTTPError as exc:
