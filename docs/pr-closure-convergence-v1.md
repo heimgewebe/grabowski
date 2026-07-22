@@ -8,6 +8,8 @@ The PR closure convergence optimization provides a deterministic, hash-bound req
 
 - Source records (PR, deployment, Bureau/obligation, checkout/worktree) remain authoritative in their existing stores.
 - The request builder consumes explicitly supplied evidence receipts and source references. It requires explicit valid ISO 8601 date-time observations and lowercase 64-hex SHA-256 digests. It never invents missing evidence or synthesizes closure from category status strings, and never creates a second lifecycle database.
+- By default (`evidence_authority='supplied'`), caller-supplied evidence forces `source_state='unknown'` (unless stale evidence forces `'stale'`) and adds `supplied_evidence_requires_authoritative_read` to `blocked_by`, evaluating non-terminal. `evidence_authority='authoritative_receipts'` requires an explicit `source_state` parameter ('current', 'stale', or 'unknown') and preserves caller-provided authority designation without cryptographically verifying provenance.
+- Category status dictionaries (e.g. `pr_merge.status='merged'`) are descriptive supplied coverage only and MUST NEVER synthesize effect receipts. Only protocol-compatible raw effects, verifications, and closure participate in evaluator evidence.
 - Recommendations do not grant mutation authority (no automatic merge, deployment, obligation closeout, or worktree deletion).
 - All governor boundaries (review, CI, lease safety, dirty checkout protection) remain fail-closed.
 - The evaluator (`regelkreis.core.evaluate`), not this builder, decides terminal closure.

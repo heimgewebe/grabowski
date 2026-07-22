@@ -344,6 +344,27 @@ ALLOWED_CHANGE_CLASSES = frozenset(
     }
 )
 ALLOWED_SOURCE_STATES = frozenset({"current", "stale", "unknown"})
+ALLOWED_EVIDENCE_AUTHORITIES = frozenset({"supplied", "authoritative_receipts"})
+ALLOWED_EFFECT_KINDS = frozenset(
+    {"commit", "pull_request", "merge", "artifact", "deployment", "configuration_change"}
+)
+ALLOWED_VERIFICATION_KINDS = frozenset(
+    {
+        "deterministic_regeneration",
+        "tests",
+        "review",
+        "independent_review",
+        "ci",
+        "deployment_identity",
+        "runtime_identity",
+        "service_health",
+        "smoke_test",
+        "negative_control",
+        "consumer_compatibility",
+        "recovery",
+        "product_outcome",
+    }
+)
 ISO_DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -370,16 +391,36 @@ def _sha256_canonical(val: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def build_pr_closure_profile(evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_pr_closure_profile(
+    evidence: dict[str, Any] | None = None,
+    *,
+    evidence_authority: str = "supplied",
+    source_state: str | None = None,
+) -> dict[str, Any]:
     """
     Builds a PR closure evidence profile binding PR/merge, deployment/live,
     obligation, and checkout evidence categories.
-    Validates explicit receipts and source refs. Never fabricates subject_sha256 or live truth.
+
+    Trust boundary & provenance non-claim:
+    - Default `evidence_authority` is 'supplied'. Caller-supplied evidence cannot,
+      by itself, yield `source_state=current` or terminal closure.
+    - Setting `evidence_authority='authoritative_receipts'` preserves the caller-provided
+      authority designation and requires an explicit `source_state` ('current', 'stale', or 'unknown').
+      The builder only preserves this caller-provided designation and does NOT cryptographically verify provenance.
+    - Category status dictionaries (e.g. pr_merge.status='merged', deployment_live.status='live')
+      are descriptive supplied coverage only and MUST NEVER synthesize effect or verification receipts.
+      Only protocol-compatible raw effects, verifications, and closure participate in evaluator evidence.
     """
     if evidence is None:
         evidence = {}
     if not isinstance(evidence, dict):
         raise ConvergenceInputError("evidence must be a dictionary")
+
+    authority = evidence.get("evidence_authority") or evidence_authority
+    if authority not in ALLOWED_EVIDENCE_AUTHORITIES:
+        raise ConvergenceInputError(
+            f"evidence_authority must be 'supplied' or 'authoritative_receipts', got '{authority}'"
+        )
 
     profile_categories: dict[str, dict[str, Any]] = {}
     blocked_by: list[str] = []
@@ -396,6 +437,8 @@ def build_pr_closure_profile(evidence: dict[str, Any] | None = None) -> dict[str
             if not isinstance(item, dict):
                 raise ConvergenceInputError(f"effects[{idx}] must be a dictionary")
             kind = _text(item.get("kind"), f"effects[{idx}].kind")
+            if kind not in ALLOWED_EFFECT_KINDS:
+                raise ConvergenceInputError(f"effects[{idx}].kind '{kind}' is not a valid v1 effect kind")
             ref = _text(item.get("evidence_ref"), f"effects[{idx}].evidence_ref")
             subj_sha = _validate_sha256(item.get("subject_sha256"), label=f"effects[{idx}].subject_sha256")
             effects.append({
@@ -412,6 +455,8 @@ def build_pr_closure_profile(evidence: dict[str, Any] | None = None) -> dict[str
             if not isinstance(item, dict):
                 raise ConvergenceInputError(f"verifications[{idx}] must be a dictionary")
             kind = _text(item.get("kind"), f"verifications[{idx}].kind")
+            if kind not in ALLOWED_VERIFICATION_KINDS:
+                raise ConvergenceInputError(f"verifications[{idx}].kind '{kind}' is not a valid v1 verification kind")
             ref = _text(item.get("evidence_ref"), f"verifications[{idx}].evidence_ref")
             subj_sha = _validate_sha256(item.get("subject_sha256"), label=f"verifications[{idx}].subject_sha256")
             result = _text(item.get("result"), f"verifications[{idx}].result")
@@ -435,6 +480,19 @@ def build_pr_closure_profile(evidence: dict[str, Any] | None = None) -> dict[str
                 s = _validate_sha256(item.get("subject_sha256"), label=f"source_refs[{idx}].subject_sha256")
                 source_refs.append({"kind": k, "ref": r, "subject_sha256": s})
 
+    raw_closure = evidence.get("closure") if isinstance(evidence, dict) else None
+
+    merge_effect = next((e for e in effects if e["kind"] == "merge"), None)
+    deploy_effect = next((e for e in effects if e["kind"] == "deployment"), None)
+    has_deploy_identity_pass = any(v["kind"] == "deployment_identity" and v["result"] == "pass" for v in verifications)
+
+    has_obligation_ref = isinstance(raw_closure, dict) and bool(raw_closure.get("bureau_task_ref"))
+    has_checkout_cleanup = (
+        isinstance(raw_closure, dict)
+        and isinstance(raw_closure.get("cleanup_evidence"), list)
+        and len(raw_closure.get("cleanup_evidence")) > 0
+    )
+
     # Category 1: pr_merge
     pr_data = evidence.get("pr_merge")
     if isinstance(pr_data, dict):
@@ -443,32 +501,42 @@ def build_pr_closure_profile(evidence: dict[str, Any] | None = None) -> dict[str
         subj_sha = pr_data.get("subject_sha256")
         if subj_sha is not None:
             _validate_sha256(subj_sha, label="pr_merge.subject_sha256")
-        if status in ("merged", "pass") and subj_sha:
-            if not any(e.get("kind") == "merge" and e.get("evidence_ref") == ref for e in effects):
-                effects.append({
-                    "schema_version": 1,
-                    "kind": "merge",
-                    "evidence_ref": ref,
-                    "subject_sha256": subj_sha,
-                })
-            claims.append(f"Supplied PR merge evidence: {ref}")
             source_refs.append({"kind": "git_commit", "ref": ref, "subject_sha256": subj_sha})
-            profile_categories["pr_merge"] = {"status": "supplied", "ref": ref, "subject_sha256": subj_sha}
-        elif status == "conflicted":
+
+        if status == "conflicted":
             conflicts.append(f"pr_merge:{ref}")
             blocked_by.append("conflicting_evidence:pr_merge")
             profile_categories["pr_merge"] = {"status": "conflicted", "ref": ref, "subject_sha256": subj_sha or ""}
         elif status == "stale":
             blocked_by.append("source_stale:pr_merge")
             profile_categories["pr_merge"] = {"status": "stale", "ref": ref, "subject_sha256": subj_sha or ""}
+        elif merge_effect:
+            claims.append(f"Supplied PR merge evidence: {merge_effect['evidence_ref']}")
+            profile_categories["pr_merge"] = {
+                "status": "supplied" if status in ("merged", "pass") else status,
+                "ref": merge_effect["evidence_ref"],
+                "subject_sha256": merge_effect["subject_sha256"],
+            }
         else:
             missing_evidence.append("pr_merge")
             blocked_by.append("evidence_missing:pr_merge")
-            profile_categories["pr_merge"] = {"status": status, "ref": ref, "subject_sha256": subj_sha or ""}
+            profile_categories["pr_merge"] = {
+                "status": status if status not in ("merged", "pass") else "supplied",
+                "ref": ref,
+                "subject_sha256": subj_sha or "",
+            }
     else:
-        missing_evidence.append("pr_merge")
-        blocked_by.append("evidence_missing:pr_merge")
-        profile_categories["pr_merge"] = {"status": "missing", "ref": "", "subject_sha256": ""}
+        if merge_effect:
+            claims.append(f"Supplied PR merge evidence: {merge_effect['evidence_ref']}")
+            profile_categories["pr_merge"] = {
+                "status": "supplied",
+                "ref": merge_effect["evidence_ref"],
+                "subject_sha256": merge_effect["subject_sha256"],
+            }
+        else:
+            missing_evidence.append("pr_merge")
+            blocked_by.append("evidence_missing:pr_merge")
+            profile_categories["pr_merge"] = {"status": "missing", "ref": "", "subject_sha256": ""}
 
     # Category 2: deployment_live
     deploy_data = evidence.get("deployment_live")
@@ -478,32 +546,42 @@ def build_pr_closure_profile(evidence: dict[str, Any] | None = None) -> dict[str
         subj_sha = deploy_data.get("subject_sha256")
         if subj_sha is not None:
             _validate_sha256(subj_sha, label="deployment_live.subject_sha256")
-        if status in ("live", "pass") and subj_sha:
-            if not any(e.get("kind") == "deployment" and e.get("evidence_ref") == ref for e in effects):
-                effects.append({
-                    "schema_version": 1,
-                    "kind": "deployment",
-                    "evidence_ref": ref,
-                    "subject_sha256": subj_sha,
-                })
-            claims.append(f"Supplied deployment evidence: {ref}")
             source_refs.append({"kind": "artifact", "ref": ref, "subject_sha256": subj_sha})
-            profile_categories["deployment_live"] = {"status": "supplied", "ref": ref, "subject_sha256": subj_sha}
-        elif status == "conflicted":
+
+        if status == "conflicted":
             conflicts.append(f"deployment_live:{ref}")
             blocked_by.append("conflicting_evidence:deployment_live")
             profile_categories["deployment_live"] = {"status": "conflicted", "ref": ref, "subject_sha256": subj_sha or ""}
         elif status == "stale":
             blocked_by.append("source_stale:deployment_live")
             profile_categories["deployment_live"] = {"status": "stale", "ref": ref, "subject_sha256": subj_sha or ""}
+        elif deploy_effect and has_deploy_identity_pass:
+            claims.append(f"Supplied deployment evidence: {deploy_effect['evidence_ref']}")
+            profile_categories["deployment_live"] = {
+                "status": "supplied" if status in ("live", "pass") else status,
+                "ref": deploy_effect["evidence_ref"],
+                "subject_sha256": deploy_effect["subject_sha256"],
+            }
         else:
             missing_evidence.append("deployment_live")
             blocked_by.append("evidence_missing:deployment_live")
-            profile_categories["deployment_live"] = {"status": status, "ref": ref, "subject_sha256": subj_sha or ""}
+            profile_categories["deployment_live"] = {
+                "status": status if status not in ("live", "pass") else "supplied",
+                "ref": ref,
+                "subject_sha256": subj_sha or "",
+            }
     else:
-        missing_evidence.append("deployment_live")
-        blocked_by.append("evidence_missing:deployment_live")
-        profile_categories["deployment_live"] = {"status": "missing", "ref": "", "subject_sha256": ""}
+        if deploy_effect and has_deploy_identity_pass:
+            claims.append(f"Supplied deployment evidence: {deploy_effect['evidence_ref']}")
+            profile_categories["deployment_live"] = {
+                "status": "supplied",
+                "ref": deploy_effect["evidence_ref"],
+                "subject_sha256": deploy_effect["subject_sha256"],
+            }
+        else:
+            missing_evidence.append("deployment_live")
+            blocked_by.append("evidence_missing:deployment_live")
+            profile_categories["deployment_live"] = {"status": "missing", "ref": "", "subject_sha256": ""}
 
     # Category 3: obligation
     ob_data = evidence.get("obligation")
@@ -513,25 +591,40 @@ def build_pr_closure_profile(evidence: dict[str, Any] | None = None) -> dict[str
         subj_sha = ob_data.get("subject_sha256")
         if subj_sha is not None:
             _validate_sha256(subj_sha, label="obligation.subject_sha256")
-        if status in ("completed", "closed", "pass") and subj_sha:
-            claims.append(f"Supplied obligation evidence: {ref}")
             source_refs.append({"kind": "obligation", "ref": ref, "subject_sha256": subj_sha})
-            profile_categories["obligation"] = {"status": "supplied", "ref": ref, "subject_sha256": subj_sha}
-        elif status == "conflicted":
+
+        if status == "conflicted":
             conflicts.append(f"obligation:{ref}")
             blocked_by.append("conflicting_evidence:obligation")
             profile_categories["obligation"] = {"status": "conflicted", "ref": ref, "subject_sha256": subj_sha or ""}
         elif status == "stale":
             blocked_by.append("source_stale:obligation")
             profile_categories["obligation"] = {"status": "stale", "ref": ref, "subject_sha256": subj_sha or ""}
+        elif has_obligation_ref:
+            ob_ref = raw_closure["bureau_task_ref"]
+            claims.append(f"Supplied obligation evidence: {ob_ref}")
+            profile_categories["obligation"] = {
+                "status": "supplied" if status in ("completed", "closed", "pass") else status,
+                "ref": ob_ref,
+                "subject_sha256": subj_sha or "",
+            }
         else:
             missing_evidence.append("obligation")
             blocked_by.append("evidence_missing:obligation")
-            profile_categories["obligation"] = {"status": status, "ref": ref, "subject_sha256": subj_sha or ""}
+            profile_categories["obligation"] = {
+                "status": status if status not in ("completed", "closed", "pass") else "supplied",
+                "ref": ref,
+                "subject_sha256": subj_sha or "",
+            }
     else:
-        missing_evidence.append("obligation")
-        blocked_by.append("evidence_missing:obligation")
-        profile_categories["obligation"] = {"status": "missing", "ref": "", "subject_sha256": ""}
+        if has_obligation_ref:
+            ob_ref = raw_closure["bureau_task_ref"]
+            claims.append(f"Supplied obligation evidence: {ob_ref}")
+            profile_categories["obligation"] = {"status": "supplied", "ref": ob_ref, "subject_sha256": ""}
+        else:
+            missing_evidence.append("obligation")
+            blocked_by.append("evidence_missing:obligation")
+            profile_categories["obligation"] = {"status": "missing", "ref": "", "subject_sha256": ""}
 
     # Category 4: checkout
     chk_data = evidence.get("checkout")
@@ -541,11 +634,9 @@ def build_pr_closure_profile(evidence: dict[str, Any] | None = None) -> dict[str
         subj_sha = chk_data.get("subject_sha256")
         if subj_sha is not None:
             _validate_sha256(subj_sha, label="checkout.subject_sha256")
-        if status in ("cleaned", "archived", "pass") and subj_sha:
-            claims.append(f"Supplied checkout cleanup evidence: {ref}")
             source_refs.append({"kind": "checkout", "ref": ref, "subject_sha256": subj_sha})
-            profile_categories["checkout"] = {"status": "supplied", "ref": ref, "subject_sha256": subj_sha}
-        elif chk_data.get("dirty") or status == "dirty":
+
+        if chk_data.get("dirty") or status == "dirty":
             conflicts.append(f"checkout_dirty:{ref}")
             blocked_by.append("checkout_dirty")
             profile_categories["checkout"] = {"status": "dirty", "ref": ref, "subject_sha256": subj_sha or ""}
@@ -556,14 +647,31 @@ def build_pr_closure_profile(evidence: dict[str, Any] | None = None) -> dict[str
         elif status == "stale":
             blocked_by.append("source_stale:checkout")
             profile_categories["checkout"] = {"status": "stale", "ref": ref, "subject_sha256": subj_sha or ""}
+        elif has_checkout_cleanup:
+            chk_ref = raw_closure["cleanup_evidence"][0]
+            claims.append(f"Supplied checkout cleanup evidence: {chk_ref}")
+            profile_categories["checkout"] = {
+                "status": "supplied" if status in ("cleaned", "archived", "pass") else status,
+                "ref": chk_ref,
+                "subject_sha256": subj_sha or "",
+            }
         else:
-            missing_evidence.append(f"checkout:{ref}")
+            missing_evidence.append("checkout")
             blocked_by.append("evidence_missing:checkout")
-            profile_categories["checkout"] = {"status": status, "ref": ref, "subject_sha256": subj_sha or ""}
+            profile_categories["checkout"] = {
+                "status": status if status not in ("cleaned", "archived", "pass") else "supplied",
+                "ref": ref,
+                "subject_sha256": subj_sha or "",
+            }
     else:
-        missing_evidence.append("checkout")
-        blocked_by.append("evidence_missing:checkout")
-        profile_categories["checkout"] = {"status": "missing", "ref": "", "subject_sha256": ""}
+        if has_checkout_cleanup:
+            chk_ref = raw_closure["cleanup_evidence"][0]
+            claims.append(f"Supplied checkout cleanup evidence: {chk_ref}")
+            profile_categories["checkout"] = {"status": "supplied", "ref": chk_ref, "subject_sha256": ""}
+        else:
+            missing_evidence.append("checkout")
+            blocked_by.append("evidence_missing:checkout")
+            profile_categories["checkout"] = {"status": "missing", "ref": "", "subject_sha256": ""}
 
     dedup_refs: list[dict[str, str]] = []
     seen_ref_keys: set[str] = set()
@@ -593,11 +701,21 @@ def build_pr_closure_assessment_request(
     assessment_id: str | None = None,
     observed_at: str | None = None,
     change_class: str = "lifecycle",
+    evidence_authority: str = "supplied",
+    source_state: str | None = None,
 ) -> dict[str, Any]:
     """
     Builds a deterministic assessment request suitable for the convergence evaluator.
     Requires an explicit valid ISO 8601 date-time observation.
     Never invents missing evidence or synthesizes closure from category status strings.
+
+    Trust boundary & provenance non-claim:
+    - Default `evidence_authority` is 'supplied'. Supplying evidence forces `source_state='unknown'`
+      (unless stale evidence forces 'stale') and adds 'supplied_evidence_requires_authoritative_read'
+      to `blocked_by`, preventing caller-supplied data from by itself evaluating terminally closed.
+    - Setting `evidence_authority='authoritative_receipts'` requires an explicit `source_state`
+      ('current', 'stale', or 'unknown'). The builder preserves the caller-provided authority
+      designation and does NOT cryptographically verify provenance.
     """
     observed_at = _validate_iso_datetime(observed_at, label="observed_at")
     if risk_level not in ("R0", "R1", "R2", "R3"):
@@ -605,18 +723,42 @@ def build_pr_closure_assessment_request(
     if change_class not in ALLOWED_CHANGE_CLASSES:
         raise ConvergenceInputError(f"change_class must be one of {sorted(ALLOWED_CHANGE_CLASSES)}")
 
-    profile = build_pr_closure_profile(evidence)
+    if evidence is None:
+        evidence = {}
+
+    authority = evidence.get("evidence_authority") or evidence_authority
+    if authority not in ALLOWED_EVIDENCE_AUTHORITIES:
+        raise ConvergenceInputError(
+            f"evidence_authority must be 'supplied' or 'authoritative_receipts', got '{authority}'"
+        )
+
+    source_st = evidence.get("source_state") or source_state
+
+    profile = build_pr_closure_profile(
+        evidence,
+        evidence_authority=authority,
+        source_state=source_st,
+    )
 
     categories_sha = _sha256_canonical(profile["categories"])
     if not assessment_id:
         assessment_id = f"pr-closure-{categories_sha[:16]}"
 
-    if any("source_stale" in item for item in profile["blocked_by"]):
-        source_state = "stale"
-    elif profile["blocked_by"] or profile["conflicts"] or profile["missing_evidence"]:
-        source_state = "unknown"
-    else:
-        source_state = "current"
+    blocked_by = list(profile["blocked_by"])
+
+    if authority == "supplied":
+        if "supplied_evidence_requires_authoritative_read" not in blocked_by:
+            blocked_by.append("supplied_evidence_requires_authoritative_read")
+        if any("source_stale" in item for item in blocked_by) or source_st == "stale":
+            effective_source_state = "stale"
+        else:
+            effective_source_state = "unknown"
+    else:  # authoritative_receipts
+        if source_st is None or source_st not in ALLOWED_SOURCE_STATES:
+            raise ConvergenceInputError(
+                "authoritative_receipts requires an explicit source_state argument ('current', 'stale', or 'unknown')"
+            )
+        effective_source_state = source_st
 
     does_not_establish = [
         "automatic_merge_authority",
@@ -626,14 +768,20 @@ def build_pr_closure_assessment_request(
         "bureau_mutation",
     ]
 
-    source_refs = profile["source_refs"]
+    claims = list(profile["claims"])
+    source_refs = list(profile["source_refs"])
     if not source_refs:
         input_sha = hashlib.sha256(categories_sha.encode("utf-8")).hexdigest()
         source_refs = [{
             "kind": "assessment_input",
-            "ref": f"grabowski:assessment-request:{assessment_id}",
+            "ref": f"grabowski:assessment-request-input:{assessment_id}",
             "subject_sha256": input_sha,
         }]
+        claims.append("Bound to request input parameters (input-binding reference only; does not establish source truth)")
+        does_not_establish.append("source_truth_from_input_binding")
+
+    if not claims:
+        claims = ["No positive evidence claims read"]
 
     request: dict[str, Any] = {
         "schema_version": 1,
@@ -643,15 +791,15 @@ def build_pr_closure_assessment_request(
             "schema_version": 1,
             "change_class": change_class,
             "semantic_change": "material",
-            "blocked_by": profile["blocked_by"],
+            "blocked_by": sorted(set(blocked_by)),
         },
         "observation": {
             "schema_version": 1,
             "observation_id": f"obs-{assessment_id}",
             "observed_at": observed_at,
-            "source_state": source_state,
-            "claims": profile["claims"] or ["No positive evidence claims read"],
-            "does_not_establish": does_not_establish,
+            "source_state": effective_source_state,
+            "claims": claims,
+            "does_not_establish": sorted(set(does_not_establish)),
             "source_refs": source_refs,
         },
         "effects": profile["effects"],
@@ -688,6 +836,8 @@ def build_pr_closure_request(
     assessment_id: str | None = None,
     observed_at: str | None = None,
     change_class: str = "lifecycle",
+    evidence_authority: str = "supplied",
+    source_state: str | None = None,
 ) -> tuple[dict[str, Any], bytes, str]:
     """
     Emits a deterministic hash-bound (request_dict, request_bytes, request_sha256) tuple.
@@ -698,9 +848,12 @@ def build_pr_closure_request(
         assessment_id=assessment_id,
         observed_at=observed_at,
         change_class=change_class,
+        evidence_authority=evidence_authority,
+        source_state=source_state,
     )
     request_bytes = json.dumps(
         request_dict, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     request_sha256 = hashlib.sha256(request_bytes).hexdigest()
     return request_dict, request_bytes, request_sha256
+

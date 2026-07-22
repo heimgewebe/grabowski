@@ -264,32 +264,17 @@ class ConvergenceTests(unittest.TestCase):
         self.assertEqual(checks["terminal-closure-gate"], "fail")
 
     def test_build_pr_closure_request_complete_evidence(self):
+        effects = [
+            {"schema_version": 1, "kind": "merge", "evidence_ref": "github-pr:heimgewebe/grabowski#235@0b09e6d7dfdb", "subject_sha256": "a" * 64},
+            {"schema_version": 1, "kind": "deployment", "evidence_ref": "grabowski-release:rel-123", "subject_sha256": "b" * 64},
+        ]
+        verifications = [
+            {"schema_version": 1, "kind": v, "result": "pass", "evidence_ref": f"ref-{v}", "subject_sha256": "c" * 64}
+            for v in ["tests", "review", "ci", "deployment_identity", "runtime_identity", "service_health", "smoke_test", "negative_control"]
+        ]
         evidence = {
-            "pr_merge": {
-                "status": "merged",
-                "repository": "heimgewebe/grabowski",
-                "pr_number": 235,
-                "evidence_ref": "github-pr:heimgewebe/grabowski#235@0b09e6d7dfdb",
-                "subject_sha256": "a" * 64,
-            },
-            "deployment_live": {
-                "status": "live",
-                "release_id": "rel-123",
-                "evidence_ref": "grabowski-release:rel-123",
-                "subject_sha256": "b" * 64,
-            },
-            "obligation": {
-                "status": "completed",
-                "obligation_id": "goo-12345678",
-                "bureau_task_ref": "bureau:task:T001:verified",
-                "subject_sha256": "c" * 64,
-            },
-            "checkout": {
-                "status": "cleaned",
-                "checkout_key": "chk-main",
-                "evidence_ref": "grabowski:checkout:chk-main",
-                "subject_sha256": "d" * 64,
-            },
+            "effects": effects,
+            "verifications": verifications,
             "closure": {
                 "schema_version": 1,
                 "closure_id": "cls-test-1",
@@ -305,6 +290,8 @@ class ConvergenceTests(unittest.TestCase):
             risk_level="R2",
             assessment_id="pr-closure-test-1",
             observed_at="2026-07-22T22:00:00Z",
+            evidence_authority="authoritative_receipts",
+            source_state="current",
         )
         self.assertEqual(req_dict["schema_version"], 1)
         self.assertEqual(req_dict["risk_level"], "R2")
@@ -372,7 +359,7 @@ class ConvergenceTests(unittest.TestCase):
         self.assertEqual(req_dict["observation"]["source_state"], "stale")
         self.assertNotIn(req_dict["observation"]["source_state"], ("partial", "missing"))
 
-    def test_supplied_category_strings_do_not_synthesize_closure(self):
+    def test_supplied_category_strings_do_not_synthesize_closure_or_effects(self):
         evidence = {
             "pr_merge": {"status": "merged", "subject_sha256": "a" * 64},
             "deployment_live": {"status": "live", "subject_sha256": "b" * 64},
@@ -380,7 +367,49 @@ class ConvergenceTests(unittest.TestCase):
             "checkout": {"status": "cleaned", "subject_sha256": "d" * 64},
         }
         req_dict, _, _ = convergence.build_pr_closure_request(evidence, observed_at="2026-07-22T22:00:00Z")
+        self.assertEqual(req_dict["effects"], [])
+        self.assertEqual(req_dict["verifications"], [])
+        self.assertEqual(req_dict["observation"]["source_state"], "unknown")
         self.assertNotIn("closure", req_dict)
+
+    def test_invalid_effect_or_verification_kinds_fail_before_evaluator(self):
+        bad_effect = {
+            "effects": [
+                {"schema_version": 1, "kind": "invalid_kind", "evidence_ref": "ref", "subject_sha256": "a" * 64}
+            ]
+        }
+        with self.assertRaisesRegex(convergence.ConvergenceInputError, "not a valid v1 effect kind"):
+            convergence.build_pr_closure_request(bad_effect, observed_at="2026-07-22T22:00:00Z")
+
+        bad_verification = {
+            "verifications": [
+                {"schema_version": 1, "kind": "invalid_kind", "result": "pass", "evidence_ref": "ref", "subject_sha256": "a" * 64}
+            ]
+        }
+        with self.assertRaisesRegex(convergence.ConvergenceInputError, "not a valid v1 verification kind"):
+            convergence.build_pr_closure_request(bad_verification, observed_at="2026-07-22T22:00:00Z")
+
+    def test_no_invented_source_refs_uses_input_binding_ref(self):
+        req_dict, _, _ = convergence.build_pr_closure_request({}, observed_at="2026-07-22T22:00:00Z")
+        source_refs = req_dict["observation"]["source_refs"]
+        self.assertEqual(len(source_refs), 1)
+        self.assertEqual(source_refs[0]["kind"], "assessment_input")
+        self.assertIn("input-binding reference only", req_dict["observation"]["claims"][-1])
+        self.assertIn("source_truth_from_input_binding", req_dict["observation"]["does_not_establish"])
+
+    def test_authoritative_receipts_requires_explicit_source_state(self):
+        with self.assertRaisesRegex(convergence.ConvergenceInputError, "authoritative_receipts requires an explicit source_state"):
+            convergence.build_pr_closure_request(
+                {},
+                observed_at="2026-07-22T22:00:00Z",
+                evidence_authority="authoritative_receipts",
+            )
+        with self.assertRaisesRegex(convergence.ConvergenceInputError, "evidence_authority must be"):
+            convergence.build_pr_closure_request(
+                {},
+                observed_at="2026-07-22T22:00:00Z",
+                evidence_authority="invalid_authority",
+            )
 
     def test_real_regelkreis_conformance_and_evaluation(self):
         protocol_repo = convergence._protocol_repo()
@@ -409,8 +438,25 @@ class ConvergenceTests(unittest.TestCase):
             "residual_risks": [],
         }
         evidence = {"effects": effects, "verifications": verifications, "closure": closure}
+
+        # Supplied authority forces source_state=unknown and adds blocking classification reason
+        req_supplied, _, _ = convergence.build_pr_closure_request(
+            evidence, risk_level="R2", assessment_id="pr-closure-conf-supplied", observed_at="2026-07-22T22:00:00Z"
+        )
+        self.assertEqual(req_supplied["observation"]["source_state"], "unknown")
+        self.assertIn("supplied_evidence_requires_authoritative_read", req_supplied["classification"]["blocked_by"])
+        eval_supplied = rc.evaluate(req_supplied, contract_root)
+        self.assertNotEqual(eval_supplied["status"], "terminally_closed")
+        self.assertIn(eval_supplied["status"], ("blocked", "source_stale"))
+
+        # Authoritative_receipts with explicit source_state=current evaluates terminally_closed
         req_dict, _, _ = convergence.build_pr_closure_request(
-            evidence, risk_level="R2", assessment_id="pr-closure-conf-1", observed_at="2026-07-22T22:00:00Z"
+            evidence,
+            risk_level="R2",
+            assessment_id="pr-closure-conf-1",
+            observed_at="2026-07-22T22:00:00Z",
+            evidence_authority="authoritative_receipts",
+            source_state="current",
         )
 
         validated = rc.validate_request(contract_root, req_dict)
@@ -424,10 +470,13 @@ class ConvergenceTests(unittest.TestCase):
             risk_level="R2",
             assessment_id="pr-closure-conf-2",
             observed_at="2026-07-22T22:00:00Z",
+            evidence_authority="authoritative_receipts",
+            source_state="current",
         )
         self.assertNotIn("closure", req_no_closure)
         eval_no_closure = rc.evaluate(req_no_closure, contract_root)
-        self.assertEqual(eval_no_closure["status"], "evidence_missing")
+        self.assertNotEqual(eval_no_closure["status"], "terminally_closed")
+        self.assertIn(eval_no_closure["status"], ("blocked", "evidence_missing"))
 
 
 if __name__ == "__main__":
