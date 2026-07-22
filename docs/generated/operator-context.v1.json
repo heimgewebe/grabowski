@@ -2571,6 +2571,10 @@
         "source": "src/grabowski_lifecycle_archive.py"
       },
       {
+        "module": "grabowski_lifecycle_collectors",
+        "source": "src/grabowski_lifecycle_collectors.py"
+      },
+      {
         "module": "grabowski_lifecycle_evidence",
         "source": "src/grabowski_lifecycle_evidence.py"
       },
@@ -2604,14 +2608,14 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "8960dbc560b32fc1cf8bf5bd639a8eddeb291e525b2751b8db481399cc780973"
+      "sha256": "6d90e320a7a436b8540730dbd1a44bb47fd0cf6aad78a5710a2d62602ff14e28"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
       "src/grabowski_agent_competition.py": "a73185abdcd26b6bad07b1fc5511182b820fd0e7b6eee3fbb9b558f5df83f442",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "f5a7fa7f8c56088a184db9ec59190488c2fea20e80606048f51a78bbbbf00ecc",
+      "src/grabowski_agent_workspace.py": "b3b0635cb3eead8f67e2841c944ea12f91136f8e189f5850fdc4278bc3dfb6d4",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "4ea793a295ca5d4dc73489795984fe8ffd27d623377d058c6fe5d71ee477fec8",
@@ -2639,7 +2643,8 @@
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
       "src/grabowski_lifecycle_archive.py": "2dcddcd320047f4f14d260aa4127826b5f942a2645446f55919135846c07ae50",
-      "src/grabowski_lifecycle_effect_plan.py": "d317788801bc677cbf618109f678b5c781ee1cac7f8672ec3bf0954a4859cdd3",
+      "src/grabowski_lifecycle_collectors.py": "33e9f34d7bfb7ed99cebe3dfc3f4e91e6c5f68ebf24a20f38a10aba6a317b885",
+      "src/grabowski_lifecycle_effect_plan.py": "3cb6643fe10ee3fee3a914488605a79590a9354193e0ccc397c4a9d863fad567",
       "src/grabowski_lifecycle_evidence.py": "fc36996f2a70bfd601ffeb90bed9457c1c5225c9a67a1e00e3a41d10551e6a14",
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",

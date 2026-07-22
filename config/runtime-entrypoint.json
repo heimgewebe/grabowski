@@ -392,6 +392,10 @@
       "source": "src/grabowski_lifecycle_archive.py"
     },
     {
+      "module": "grabowski_lifecycle_collectors",
+      "source": "src/grabowski_lifecycle_collectors.py"
+    },
+    {
       "module": "grabowski_lifecycle_evidence",
       "source": "src/grabowski_lifecycle_evidence.py"
     },
