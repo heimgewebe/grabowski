@@ -90,6 +90,27 @@ class DurableSystemdContractTests(unittest.TestCase):
                 line for line in text.splitlines() if not line.startswith("#")
             ))
 
+    def test_runtime_retention_timer_uses_release_bound_hash_guarded_tool(self) -> None:
+        service = (
+            ROOT / "systemd" / "grabowski-runtime-retention.service.example"
+        ).read_text(encoding="utf-8")
+        timer = (
+            ROOT / "systemd" / "grabowski-runtime-retention.timer.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "%h/.local/share/grabowski-mcp/tools/maintain_runtime_state.py",
+            service,
+        )
+        self.assertIn("--periodic-apply", service)
+        self.assertIn("ProtectSystem=strict", service)
+        self.assertIn("ProtectHome=read-only", service)
+        self.assertIn("ReadWritePaths=%h/.local/state/grabowski", service)
+        self.assertNotIn("PrivateDevices=", service)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX", service)
+        self.assertIn("OnUnitActiveSec=5min", timer)
+        self.assertIn("RandomizedDelaySec=30s", timer)
+        self.assertIn("Persistent=true", timer)
+
 
 if __name__ == "__main__":
     unittest.main()
