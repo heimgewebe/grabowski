@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping, Sequence
 SCHEMA_VERSION = 1
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 TERMINAL_TASK_STATES = frozenset({"completed", "failed", "cancelled", "timed_out", "signalled"})
+ATTENTION_GATED_TASK_STATES = frozenset({"failed", "timed_out", "signalled"})
 RECOVERY_TASK_STATES = frozenset({"interrupted", "outcome_unknown"})
 ACTIVE_TASK_STATES = frozenset({"launching", "running"})
 CURRENT_CLASSIFICATIONS = frozenset(
@@ -267,6 +268,26 @@ def build_task_archive_plan(
         receipt = record.get("lifecycle_receipt_sha256")
         if not isinstance(receipt, str) or SHA256.fullmatch(receipt) is None:
             reason_codes.append("lifecycle_receipt_missing_or_invalid")
+        state = record.get("state")
+        if state in ATTENTION_GATED_TASK_STATES:
+            import grabowski_task_attention as task_attention
+            import grabowski_tasks as task_store
+
+            try:
+                authoritative_record = task_store._row_raw(identity)
+                if (
+                    authoritative_record.get("state") != state
+                    or authoritative_record.get("lifecycle_receipt_sha256") != receipt
+                ):
+                    reason_codes.append("attention_authority_binding_mismatch")
+                else:
+                    closeout = task_attention.terminal_closeout_plan(authoritative_record)
+                    if not closeout.get("archive_ready"):
+                        reason_codes.append(
+                            f"attention_closeout:{closeout.get('closeout_state') or 'invalid'}"
+                        )
+            except Exception:
+                reason_codes.append("attention_authority_unavailable")
         if reason_codes:
             blocked.append({"task_id": identity, "reason_codes": reason_codes})
         else:
@@ -281,6 +302,12 @@ def build_task_archive_plan(
         "eligible_task_ids": [record["task_id"] for record in eligible],
         "eligible_record_sha256s": [sha256_json(record) for record in eligible],
         "blocked": sorted(blocked, key=lambda value: value["task_id"]),
+        "attention_gate": {
+            "required_states": sorted(ATTENTION_GATED_TASK_STATES),
+            "authority": "grabowski_task_attention.terminal_closeout_plan",
+            "binding": ["task_id", "state", "lifecycle_receipt_sha256"],
+            "fail_closed": True,
+        },
         "mutation_performed": False,
         "does_not_establish": [
             "permission_to_delete_task_rows",

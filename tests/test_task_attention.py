@@ -491,6 +491,50 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(1, result["classification_counts"]["decision_closed"])
         self.assertEqual(1, result["classification_counts"]["outcome_unknown"])
 
+    def test_terminal_closeout_plan_requires_attention_before_failed_task_archive(self) -> None:
+        record = self._failed_task()
+
+        plan = attention.terminal_closeout_plan(record)
+
+        self.assertEqual("attention_required", plan["closeout_state"])
+        self.assertFalse(plan["archive_ready"])
+        self.assertEqual("actionable", plan["attention_classification"])
+        self.assertEqual("decide_task_attention", plan["operator_obligation"]["kind"])
+
+    def test_terminal_closeout_plan_accepts_evidence_bound_closed_decision(self) -> None:
+        record = self._failed_task()
+        attention.record_decision(self._parameters(record, decision="closed"))
+
+        plan = attention.terminal_closeout_plan(tasks._row(str(record["task_id"])))
+
+        self.assertEqual("ready_to_archive", plan["closeout_state"])
+        self.assertTrue(plan["archive_ready"])
+        self.assertEqual("decision_closed", plan["attention_classification"])
+        self.assertIsNone(plan["operator_obligation"])
+
+    def test_terminal_closeout_plan_keeps_deferred_attention_visible(self) -> None:
+        record = self._failed_task()
+        attention.record_decision(self._parameters(record, decision="deferred"))
+
+        plan = attention.terminal_closeout_plan(tasks._row(str(record["task_id"])))
+
+        self.assertEqual("attention_deferred", plan["closeout_state"])
+        self.assertFalse(plan["archive_ready"])
+        self.assertEqual("resolve_deferred_attention", plan["operator_obligation"]["kind"])
+
+    def test_terminal_closeout_plan_completed_task_needs_no_attention_decision(self) -> None:
+        started = self._start()["task"]
+        task_id = str(started["task_id"])
+        tasks._set_state(task_id, "completed", observation={"state": "completed"})
+
+        plan = attention.terminal_closeout_plan(tasks._row(task_id))
+
+        self.assertEqual("ready_to_archive", plan["closeout_state"])
+        self.assertTrue(plan["archive_ready"])
+        self.assertFalse(plan["attention_required"])
+        self.assertEqual("not_required", plan["attention_classification"])
+        self.assertIsNone(plan["operator_obligation"])
+
     def test_current_reconciliation_excludes_closed_and_superseded_but_keeps_deferred(self) -> None:
         closed = self._failed_task()
         attention.record_decision(self._parameters(closed, decision="closed"))
