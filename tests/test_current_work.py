@@ -468,10 +468,13 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertTrue(first["pagination"]["has_more"])
         second = project(
             tasks_payload={"tasks": tasks, "pagination": {"has_more": False}},
+            generated_at_unix=101,
             limit=1,
             cursor=first["pagination"]["next_cursor"],
         )
         self.assertEqual(first["snapshot_sha256"], second["snapshot_sha256"])
+        self.assertEqual(first["work"][0]["observation"]["observed_at_unix"], 100)
+        self.assertEqual(second["work"][0]["observation"]["observed_at_unix"], 101)
         self.assertNotEqual(first["work"][0]["work_id"], second["work"][0]["work_id"])
         with self.assertRaisesRegex(
             current_work.CurrentWorkProjectionError, "another live snapshot"

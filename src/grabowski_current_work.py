@@ -116,6 +116,16 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _snapshot_group(group: dict[str, Any]) -> dict[str, Any]:
+    snapshot_group = dict(group)
+    observation = snapshot_group.get("observation")
+    if isinstance(observation, dict):
+        snapshot_observation = dict(observation)
+        snapshot_observation.pop("observed_at_unix", None)
+        snapshot_group["observation"] = snapshot_observation
+    return snapshot_group
+
+
 def _group(work_id: str, kind: str, binding_id: str) -> dict[str, Any]:
     return {
         "work_id": work_id,
@@ -1138,7 +1148,7 @@ def build_current_work_projection(
 
     snapshot_material = {
         "view": view,
-        "groups": projected,
+        "groups": [_snapshot_group(group) for group in projected],
         "unbound_tmux": unbound_tmux,
         "unbound_processes": unbound_processes,
         "source_errors": errors,
