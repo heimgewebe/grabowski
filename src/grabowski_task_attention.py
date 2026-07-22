@@ -834,7 +834,10 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
         if view == "history"
         else "task-attention-reconciliation:current:v1"
     )
-    position = consumer_surface.decode_cursor(cursor, scope)
+    try:
+        position = consumer_surface.decode_cursor(cursor, scope)
+    except ValueError as exc:
+        raise TaskAttentionInputError(str(exc)) from exc
     cursor_created_at: int | None = None
     cursor_task_id: str | None = None
     if position is not None:
