@@ -796,7 +796,34 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             {"surface": "grabowski_checkout_inventory", "repository": REPOSITORY},
         )
 
+    def test_convergence_recommendation_prioritizes_finishable_chains(self) -> None:
+        # Construct a project with a closed-not-cleaned work group (terminal task with live surfaces/cleanup candidate)
+        result = project(
+            tasks_payload={
+                "tasks": [task("t-done", state="completed", updated=50)],
+                "pagination": {"has_more": False},
+            },
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "chk-candidate",
+                            "/home/alex/repos/.worktrees/chk-candidate",
+                            cleanup_candidate=True,
+                            task_ids=["t-done"],
+                        )
+                    ],
+                }
+            ],
+        )
+        self.assertIn("next_convergence_action", result)
+        self.assertIn("reconcile terminal worktree hygiene", result["next_convergence_action"])
+        self.assertEqual(result["convergence_summary"]["primary_stage"], "closed-not-cleaned")
+        self.assertTrue(result["convergence_summary"]["finishable_chain_prioritized"])
+        self.assertEqual(result["convergence_summary"]["closed_not_cleaned_count"], 1)
 
 
 if __name__ == "__main__":
     unittest.main()
+

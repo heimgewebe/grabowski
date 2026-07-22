@@ -1060,6 +1060,116 @@ def _annotate_groups(
         }
 
 
+def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, Any]:
+    """
+    Evaluates evidence signals for a single projected work group and derives
+    a read-only convergence stage and recommended next action.
+    Prioritizes finishable chains:
+    1. merge-ready
+    2. merged-not-live
+    3. live-not-closed
+    4. closed-not-cleaned
+    Does NOT grant mutation authority.
+    """
+    source_states = set(group.get("source_states", []))
+    action_reasons = set(group.get("action_reasons", []))
+    projection_state = group.get("projection_state", "unknown")
+    checkout_refs = group.get("checkout_refs", [])
+    has_dirty_checkout = any(c.get("dirty") for c in checkout_refs)
+    has_cleanup_candidate = any(c.get("cleanup_candidate") for c in checkout_refs)
+    has_live_surfaces = bool(
+        group.get("lease_summary", {}).get("count", 0)
+        or checkout_refs
+        or group.get("worker_refs")
+        or group.get("physical_refs", {}).get("tmux_sessions")
+        or group.get("physical_refs", {}).get("processes")
+    )
+
+    # 1. merge-ready: PR/branch review and CI green, ready to merge
+    if "pr-ready-for-merge" in action_reasons or "pr-review-pass" in source_states:
+        return {
+            "convergence_stage": "merge-ready",
+            "next_convergence_action": "evaluate PR readiness for merge before dispatching merge",
+            "finishable_chain": True,
+            "priority": 1,
+        }
+
+    # 2. merged-not-live: PR merged or commit on main, but deployment live check pending/missing
+    if "pr-merged" in source_states or "commit-on-main" in source_states:
+        if "deployment-live" not in source_states:
+            return {
+                "convergence_stage": "merged-not-live",
+                "next_convergence_action": "evaluate deployment readiness for live release",
+                "finishable_chain": True,
+                "priority": 2,
+            }
+
+    # 3. live-not-closed: deployment live, but obligation / task attention open
+    if "deployment-live" in source_states or "runtime-live" in source_states:
+        if projection_state in ("blocking", "active", "resumable") or "obligation-open" in source_states:
+            return {
+                "convergence_stage": "live-not-closed",
+                "next_convergence_action": "assess terminal PR closure with convergence evaluator before closing obligation",
+                "finishable_chain": True,
+                "priority": 3,
+            }
+
+    # 4. closed-not-cleaned: task/obligation terminal or closed, but checkout/leases/tmux retained
+    if (
+        (
+            projection_state in ("terminal_archived", "blocking")
+            or "task-completed" in source_states
+            or "attention:decision_closed" in source_states
+            or "task:completed" in source_states
+        )
+        and (has_cleanup_candidate or "cleanup-candidate" in action_reasons or (projection_state == "terminal_archived" and has_live_surfaces))
+    ):
+        return {
+            "convergence_stage": "closed-not-cleaned",
+            "next_convergence_action": "reconcile terminal worktree hygiene and release retained leases",
+            "finishable_chain": True,
+            "priority": 4,
+        }
+
+    # Fallbacks for other states
+    if projection_state == "blocking":
+        reason_str = ", ".join(sorted(action_reasons)[:2]) or "unresolved evidence"
+        return {
+            "convergence_stage": "blocking",
+            "next_convergence_action": f"inspect blocking work group: {reason_str}",
+            "finishable_chain": False,
+            "priority": 5,
+        }
+    elif projection_state == "resumable":
+        return {
+            "convergence_stage": "resumable",
+            "next_convergence_action": "inspect resumable work group and attention state",
+            "finishable_chain": False,
+            "priority": 6,
+        }
+    elif projection_state == "active":
+        return {
+            "convergence_stage": "active",
+            "next_convergence_action": "monitor active work execution",
+            "finishable_chain": False,
+            "priority": 7,
+        }
+    elif projection_state == "terminal_archived" and not has_live_surfaces:
+        return {
+            "convergence_stage": "terminal_archived",
+            "next_convergence_action": "none: work group terminal and cleaned",
+            "finishable_chain": False,
+            "priority": 8,
+        }
+
+    return {
+        "convergence_stage": "unknown",
+        "next_convergence_action": "inspect work group bindings and authority references",
+        "finishable_chain": False,
+        "priority": 9,
+    }
+
+
 def build_current_work_projection(
     *,
     tasks_payload: dict[str, Any] | None,
@@ -1170,6 +1280,27 @@ def build_current_work_projection(
         source_errors=errors,
     )
 
+    chain_candidates: list[dict[str, Any]] = []
+    for group in projected:
+        rec = derive_group_convergence_recommendation(group)
+        group["convergence_stage"] = rec["convergence_stage"]
+        group["next_convergence_action"] = rec["next_convergence_action"]
+        chain_candidates.append(rec)
+
+    finishable_items = [c for c in chain_candidates if c["finishable_chain"]]
+    if finishable_items:
+        finishable_items.sort(key=lambda x: x["priority"])
+        top_rec = finishable_items[0]
+    elif chain_candidates:
+        chain_candidates.sort(key=lambda x: x["priority"])
+        top_rec = chain_candidates[0]
+    else:
+        top_rec = {
+            "convergence_stage": "none",
+            "next_convergence_action": "none: workspace converged",
+            "priority": 9,
+        }
+
     snapshot_material = {
         "view": view,
         "groups": [_snapshot_group(group) for group in projected],
@@ -1263,6 +1394,15 @@ def build_current_work_projection(
             if state_counts["resumable"]
             else "none"
         ),
+        "next_convergence_action": top_rec["next_convergence_action"],
+        "convergence_summary": {
+            "finishable_chain_prioritized": top_rec.get("finishable_chain", False),
+            "primary_stage": top_rec["convergence_stage"],
+            "merge_ready_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "merge-ready"),
+            "merged_not_live_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "merged-not-live"),
+            "live_not_closed_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "live-not-closed"),
+            "closed_not_cleaned_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "closed-not-cleaned"),
+        },
         "does_not_establish": [
             "a new independently mutable lifecycle or work-state truth",
             "a new task, lease, checkout, worker, process or tmux authority",
@@ -1270,5 +1410,7 @@ def build_current_work_projection(
             "terminal success from a tmux session, process or heuristic relation alone",
             "absence of work beyond any explicitly truncated or failed source",
             "authority from task cwd overlap or session naming heuristics",
+            "mutation authority or automatic execution from convergence recommendation",
         ],
     }
+

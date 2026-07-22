@@ -263,6 +263,69 @@ class ConvergenceTests(unittest.TestCase):
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual(checks["terminal-closure-gate"], "fail")
 
+    def test_build_pr_closure_request_complete_evidence(self):
+        evidence = {
+            "pr_merge": {
+                "status": "merged",
+                "repository": "heimgewebe/grabowski",
+                "pr_number": 235,
+                "evidence_ref": "github-pr:heimgewebe/grabowski#235@0b09e6d7dfdb",
+                "subject_sha256": "a" * 64,
+            },
+            "deployment_live": {
+                "status": "live",
+                "release_id": "rel-123",
+                "evidence_ref": "grabowski-release:rel-123",
+                "subject_sha256": "b" * 64,
+            },
+            "obligation": {
+                "status": "completed",
+                "obligation_id": "goo-12345678",
+                "bureau_task_ref": "bureau:task:T001:verified",
+                "subject_sha256": "c" * 64,
+            },
+            "checkout": {
+                "status": "cleaned",
+                "checkout_key": "chk-main",
+                "evidence_ref": "grabowski:checkout:chk-main",
+                "subject_sha256": "d" * 64,
+            },
+        }
+        req_dict, req_bytes, req_sha256 = convergence.build_pr_closure_request(
+            evidence, risk_level="R2", assessment_id="pr-closure-test-1"
+        )
+        self.assertEqual(req_dict["schema_version"], 1)
+        self.assertEqual(req_dict["risk_level"], "R2")
+        self.assertEqual(req_dict["classification"]["change_class"], "pr_closure")
+        self.assertEqual(req_dict["classification"]["blocked_by"], [])
+        self.assertEqual(req_dict["observation"]["source_state"], "current")
+        self.assertIn("closure", req_dict)
+        self.assertEqual(req_dict["closure"]["status"], "closed")
+        self.assertEqual(hashlib.sha256(req_bytes).hexdigest(), req_sha256)
+
+    def test_build_pr_closure_request_missing_and_conflicting_evidence(self):
+        evidence = {
+            "pr_merge": {
+                "status": "conflicted",
+                "repository": "heimgewebe/grabowski",
+                "pr_number": 235,
+            },
+            "checkout": {
+                "status": "dirty",
+                "dirty": True,
+                "checkout_key": "chk-dirty",
+            },
+        }
+        req_dict, req_bytes, req_sha256 = convergence.build_pr_closure_request(evidence)
+        self.assertEqual(req_dict["observation"]["source_state"], "partial")
+        self.assertIn("conflicting_evidence:pr_merge", req_dict["classification"]["blocked_by"])
+        self.assertIn("checkout_dirty", req_dict["classification"]["blocked_by"])
+        self.assertIn("evidence_missing:deployment_live", req_dict["classification"]["blocked_by"])
+        self.assertIn("evidence_missing:obligation", req_dict["classification"]["blocked_by"])
+        self.assertNotIn("closure", req_dict)
+        self.assertEqual(hashlib.sha256(req_bytes).hexdigest(), req_sha256)
+
 
 if __name__ == "__main__":
     unittest.main()
+

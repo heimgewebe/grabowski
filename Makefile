@@ -18,7 +18,7 @@ syntax:
 >$(PYTHON) -m py_compile $(wildcard src/*.py) $(wildcard tools/*.py) $(wildcard tools/juno/*.py)
 
 test:
->set -eu; install -d -m 700 "$(CURDIR)/build"; test_home="$$(mktemp -d "$(CURDIR)/build/test-home.XXXXXX")"; trap 'rm -rf "$$test_home"' EXIT; install -d -m 700 "$$test_home/.config/grabowski"; install -m 600 config/access.home-wide-operator.example.json "$$test_home/.config/grabowski/access.json"; HOME="$$test_home" $(PYTHON) -m unittest discover -s tests -v
+>umask 077; set -eu; install -d -m 700 "$(CURDIR)/build"; test_home="$$(mktemp -d "$(CURDIR)/build/test-home.XXXXXX")"; trap 'rm -rf "$$test_home"' EXIT; install -d -m 700 "$$test_home/.config/grabowski"; install -m 600 config/access.home-wide-operator.example.json "$$test_home/.config/grabowski/access.json"; HOME="$$test_home" GRABOWSKI_CHRONIK_ROOT="$$test_home/chronik" GRABOWSKI_OPERATOR_OBLIGATION_ROOT="$$test_home/obligations" GRABOWSKI_RECOVERY_ROOT="$$test_home/recovery" GRABOWSKI_BLOCKADE_ROOT="$$test_home/blockades" $(PYTHON) -m unittest discover -s tests -v
 
 policy:
 >$(PYTHON) tools/validate_access_policy.py
