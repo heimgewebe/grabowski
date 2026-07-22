@@ -42,6 +42,9 @@ MCP_MAX_RESPONSE_BYTES = 65536
 MCP_STDIO_SHUTDOWN_TIMEOUT = 2.0
 CONNECTOR_SNAPSHOT_REFRESH_MAX_OUTPUT_BYTES = 64 * 1024
 CONNECTOR_SNAPSHOT_REFRESH_TIMEOUT_SECONDS = 8.0
+SERVICE_RESTART_REQUEST_TIMEOUT_SECONDS = 5.0
+SERVICE_RESTART_ERROR_MAX_CHARS = 512
+DEFAULT_RECOVERY_TIMEOUT_SECONDS = 60.0
 STACK_DUMP_DIRECTORY_NAME = "operator-stackdumps-v1"
 STACK_DUMP_SLOT_COUNT = 8
 STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
@@ -1406,17 +1409,43 @@ def _emit_connector_snapshot_refresh(
     )
 
 
+def _bounded_restart_stderr(stderr: str | None) -> str:
+    if not stderr:
+        return ""
+    return " ".join(stderr.split())[:SERVICE_RESTART_ERROR_MAX_CHARS]
+
+
 def restart_service(service: str) -> None:
     try:
         subprocess.run(
-            ["systemctl", "--user", "restart", service],
+            ["systemctl", "--user", "--no-block", "restart", service],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=20,
+            text=True,
+            timeout=SERVICE_RESTART_REQUEST_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise WatchdogError("service-restart-failed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise WatchdogError("service-restart-timeout") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = _bounded_restart_stderr(exc.stderr)
+        if detail:
+            raise WatchdogError(f"service-restart-failed: {detail}") from exc
+        raise WatchdogError(f"service-restart-failed: exit-{exc.returncode}") from exc
+    except OSError as exc:
+        raise WatchdogError("service-restart-exec-failed") from exc
+
+
+def _is_new_process_instance(previous: ProbeResult, current: ProbeResult) -> bool:
+    if current.pid is None:
+        return False
+    if previous.pid is None:
+        return True
+    if current.pid != previous.pid:
+        return True
+    if previous.start_ticks is None or current.start_ticks is None:
+        return False
+    return current.start_ticks != previous.start_ticks
 
 
 def run_watchdog(args: argparse.Namespace) -> int:
@@ -1579,7 +1608,9 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     metrics_url=args.metrics_url,
                     control_plane_poll_max_age=args.control_plane_poll_max_age,
                 )
-                if final_probe.status == "healthy":
+                if final_probe.status == "healthy" and _is_new_process_instance(
+                    probe, final_probe
+                ):
                     _emit_connector_snapshot_refresh(args, final_probe)
                     recovered_state = reset_after_healthy(
                         next_state,
@@ -1641,7 +1672,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--backoff-max", type=int, default=DEFAULT_BACKOFF_MAX)
     result.add_argument("--startup-grace", type=float, default=20)
     result.add_argument("--http-timeout", type=float, default=2)
-    result.add_argument("--recovery-timeout", type=float, default=20)
+    result.add_argument(
+        "--recovery-timeout", type=float, default=DEFAULT_RECOVERY_TIMEOUT_SECONDS
+    )
     result.add_argument("--check-only", action="store_true")
     return result
 

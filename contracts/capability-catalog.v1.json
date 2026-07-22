@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "97d6486947981379b1f9ef62f70136d1ad5d7e9cb1c2551e69c7a77a9452254c",
+  "capability_source_sha256": "84d8147c050eddfb1aa6f9072f0642c5d25004c220bf3cf77e96d199ecfcae38",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "6d90e320a7a436b8540730dbd1a44bb47fd0cf6aad78a5710a2d62602ff14e28",
+  "contract_sha256": "1a9a3a0ff0adb2e05d1b112d31ab010cf11fe10b3a8f73fcddd7e6d717dc3431",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -471,6 +471,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_summary"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Project bounded current operator work without creating a second lifecycle truth.",
+      "effects": [],
+      "id": "grabowski_current_work",
+      "purpose": "Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_current_work"
     },
     {
       "category": "version-control",
