@@ -7434,6 +7434,101 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
             result["output"]["skipped"][0]["reason"],
         )
 
+    def test_expired_retention_can_be_adopted_after_exact_terminal_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = str(Path(tmp) / "expired-retention-worktree")
+            item = self._owned_item(checkout, state="unclassified_clean")
+            item["lifecycle"]["retention"] = {
+                "owner_id": "operator:expired-owner",
+                "retention_until_unix": int(time.time()) - 60,
+            }
+            inventory = {
+                "inventory_sha256": "a" * 64,
+                "worktrees": [item],
+            }
+
+            def github_runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv[:2] == ["repo", "view"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": json.dumps({"defaultBranchRef": {"name": "main"}}),
+                        "stderr": "",
+                    }
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps(
+                        [
+                            {
+                                "number": 81,
+                                "url": "https://github.com/heimgewebe/grabowski/pull/81",
+                                "state": "MERGED",
+                                "baseRefName": "main",
+                                "headRefName": self.BRANCH,
+                                "headRefOid": self.HEAD,
+                                "mergedAt": "2026-07-22T01:00:00Z",
+                            }
+                        ]
+                    ),
+                    "stderr": "",
+                }
+
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch(
+                    "grabowski_checkouts.grabowski_checkout_archive",
+                    return_value={
+                        "archive": {
+                            "archive_id": "20260722T010000Z-ffffffffffff",
+                            "created_at_unix": 1000,
+                        }
+                    },
+                ) as archive,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    self._parameters(tmp),
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=github_runner,
+                )
+
+        self.assertEqual(1, result["output"]["adopted_unowned_count"])
+        self.assertEqual(0, result["output"]["foreign_owned_count"])
+        archive.assert_called_once()
+        self.assertEqual(self.OWNER, archive.call_args.kwargs["owner_id"])
+
+    def test_expired_retention_does_not_override_foreign_lifecycle_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = str(Path(tmp) / "bound-worktree")
+            item = self._owned_item(checkout, state="unclassified_clean")
+            item["lifecycle"]["retention"] = {
+                "owner_id": "operator:expired-owner",
+                "retention_until_unix": int(time.time()) - 60,
+            }
+            item["lifecycle"]["binding"] = {"owner_id": "operator:binding-owner"}
+            inventory = {
+                "inventory_sha256": "b" * 64,
+                "worktrees": [item],
+            }
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch("grabowski_checkouts.grabowski_checkout_archive") as archive,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    self._parameters(tmp),
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=lambda _repo, _argv: {
+                        "returncode": 1, "stdout": "", "stderr": "must not run"
+                    },
+                )
+
+        archive.assert_not_called()
+        self.assertEqual(0, result["output"]["actions"])
+        self.assertEqual(1, result["output"]["foreign_owned_count"])
+        self.assertEqual(0, result["output"]["adopted_unowned_count"])
+
     def test_surface_marks_worktree_hygiene_as_high_risk_and_not_mechanic_normal(self) -> None:
         spec = next(
             item for item in grips.list_grips()

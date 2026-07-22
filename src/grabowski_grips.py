@@ -2689,14 +2689,25 @@ def _lookup_merged_pr_for_checkout(
     }
 
 
-def _worktree_hygiene_owner(item: dict[str, Any]) -> tuple[str | None, bool]:
+def _worktree_hygiene_owner(
+    item: dict[str, Any],
+    *,
+    now: int,
+) -> tuple[str | None, bool]:
     lifecycle = item.get("lifecycle") if isinstance(item.get("lifecycle"), dict) else {}
-    owners = {
-        record.get("owner_id")
-        for key in ("retention", "binding", "latest_archive")
-        for record in [lifecycle.get(key)]
-        if isinstance(record, dict) and isinstance(record.get("owner_id"), str)
-    }
+    owners: set[str] = set()
+    retention = lifecycle.get("retention")
+    if (
+        isinstance(retention, dict)
+        and isinstance(retention.get("owner_id"), str)
+        and isinstance(retention.get("retention_until_unix"), int)
+        and retention["retention_until_unix"] > now
+    ):
+        owners.add(retention["owner_id"])
+    for key in ("binding", "latest_archive"):
+        record = lifecycle.get(key)
+        if isinstance(record, dict) and isinstance(record.get("owner_id"), str):
+            owners.add(record["owner_id"])
     if len(owners) > 1:
         return None, True
     return (next(iter(owners)) if owners else None), False
@@ -2739,10 +2750,11 @@ def _run_worktree_hygiene_reconcile(
     ownership_conflicts: list[str] = []
     foreign_owned_count = 0
     adopted_unowned_count = 0
+    now = int(time.time())
     for item in inventory.get("worktrees", []):
         if not isinstance(item, dict):
             continue
-        observed_owner, conflict = _worktree_hygiene_owner(item)
+        observed_owner, conflict = _worktree_hygiene_owner(item, now=now)
         if conflict:
             ownership_conflicts.append(str(item.get("path")))
             continue
@@ -2765,7 +2777,6 @@ def _run_worktree_hygiene_reconcile(
     default_branch: str | None = None
     default_branch_error: dict[str, Any] | None = None
     actions = 0
-    now = int(time.time())
 
     for item in candidates:
         path = str(item.get("path"))
