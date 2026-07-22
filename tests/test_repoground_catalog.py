@@ -299,7 +299,7 @@ class RepoGroundCatalogResolverTests(CatalogFixture):
         self.assertEqual("alice__demo", slashed["selected"][0]["repo_id"])
 
     def test_malformed_owner_slash_repo_identity_fails_before_scanning(self) -> None:
-        for repo in ("/demo", "alice/", "alice/demo/extra"):
+        for repo in ("/demo", "alice/", "alice/demo/extra", "alice__demo/extra"):
             with self.subTest(repo=repo), patch.object(
                 catalog, "scan_catalog", wraps=catalog.scan_catalog
             ) as scan:

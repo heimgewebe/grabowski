@@ -456,7 +456,9 @@ def _normalize_repo_query(repo: str | None) -> str | None:
         separator = "__"
     if separator is not None:
         owner, repository = repo.split(separator, 1)
-        if not _safe_segment(owner) or not _safe_segment(repository):
+        if (separator == "/" and "__" in owner) or not _safe_segment(
+            owner
+        ) or not _safe_segment(repository):
             raise ValueError(
                 "repo must be a safe repository name, owner__repository, or owner/repository identity"
             )

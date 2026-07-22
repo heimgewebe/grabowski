@@ -618,7 +618,13 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(publication_missing["reason"], "no_bundle_found")
 
     def test_invalid_repo_name_is_rejected(self) -> None:
-        for repo in ("../demo", "/demo", "heimgewebe/", "heimgewebe/demo/extra"):
+        for repo in (
+            "../demo",
+            "/demo",
+            "heimgewebe/",
+            "heimgewebe/demo/extra",
+            "heimgewebe__demo/extra",
+        ):
             with self.subTest(repo=repo), self.assertRaises(ValueError):
                 mcp.repoground_bundle_discover(repo=repo)
 

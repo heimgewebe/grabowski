@@ -6453,7 +6453,9 @@ def _repoground_validate_repo(repo: str | None) -> str | None:
                 "repo must be a repository name, owner__repository, or owner/repository identity"
             )
         owner, repository = repo.split("/", 1)
-        if not _REPOGROUND_REPO_RE.fullmatch(owner) or not _REPOGROUND_REPO_RE.fullmatch(
+        if "__" in owner or not _REPOGROUND_REPO_RE.fullmatch(
+            owner
+        ) or not _REPOGROUND_REPO_RE.fullmatch(
             repository
         ):
             raise ValueError(
