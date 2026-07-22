@@ -257,6 +257,10 @@
       "source": "src/grabowski_current_work.py"
     },
     {
+      "module": "grabowski_managed_cargo",
+      "source": "src/grabowski_managed_cargo.py"
+    },
+    {
       "module": "grabowski_current_work_surface",
       "source": "src/grabowski_current_work_surface.py"
     },
