@@ -5598,6 +5598,31 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         tmux.assert_called_once_with(["has-session", "-t", "=gaw-bound-session"])
 
+    def test_tmux_exact_session_identity_uses_display_message_format_argument(self) -> None:
+        with mock.patch.object(
+            workspace,
+            "_tmux_result",
+            return_value={
+                "returncode": 0,
+                "stdout": "$17\t1784737000\n",
+                "stderr": "",
+            },
+        ) as tmux:
+            result = workspace._tmux_exact_session_identity("gaw-bound-session")
+
+        self.assertEqual(
+            result, {"session_id": "$17", "session_created": 1784737000}
+        )
+        tmux.assert_called_once_with(
+            [
+                "display-message",
+                "-p",
+                "-t",
+                "=gaw-bound-session",
+                "#{session_id}\t#{session_created}",
+            ]
+        )
+
     def test_idle_tmux_transition_refuses_prefix_only_session_without_kill(self) -> None:
         manifest = self.manifest()
         manifest["created_at"] = "2026-01-01T00:00:00+00:00"
