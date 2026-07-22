@@ -412,13 +412,33 @@ class ConvergenceTests(unittest.TestCase):
             )
 
     def test_real_regelkreis_conformance_and_evaluation(self):
-        protocol_repo = convergence._protocol_repo()
-        regelkreis_src = protocol_repo / "src"
-        if str(regelkreis_src) not in sys.path:
-            sys.path.insert(0, str(regelkreis_src))
-        import regelkreis.core as rc
+        candidate = next(
+            (
+                parent / "konvergenzregelkreis"
+                for parent in Path(__file__).resolve().parents
+                if (parent / "konvergenzregelkreis").is_dir()
+            ),
+            None,
+        )
+        if candidate is None:
+            self.skipTest("local konvergenzregelkreis checkout unavailable")
+        executable = candidate / ".venv" / "bin" / "regelkreis"
+        if not executable.is_file():
+            self.skipTest("local regelkreis evaluator unavailable")
 
-        contract_root = rc.locate_contract_root(protocol_repo)
+        def evaluate_with_real_cli(request: dict[str, object]) -> tuple[int, dict[str, object]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                request_path = Path(temp_dir) / "assessment-request.json"
+                request_path.write_text(
+                    json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                result = convergence._default_evaluator_runner(
+                    candidate,
+                    [str(executable), "evaluate", str(request_path)],
+                )
+            self.assertIn(result["returncode"], {0, 2, 4, 5, 6})
+            return int(result["returncode"]), json.loads(str(result["stdout"]))
 
         effects = [
             {"schema_version": 1, "kind": "merge", "evidence_ref": "github-pr:repo#1@sha", "subject_sha256": "a" * 64},
@@ -439,17 +459,21 @@ class ConvergenceTests(unittest.TestCase):
         }
         evidence = {"effects": effects, "verifications": verifications, "closure": closure}
 
-        # Supplied authority forces source_state=unknown and adds blocking classification reason
         req_supplied, _, _ = convergence.build_pr_closure_request(
-            evidence, risk_level="R2", assessment_id="pr-closure-conf-supplied", observed_at="2026-07-22T22:00:00Z"
+            evidence,
+            risk_level="R2",
+            assessment_id="pr-closure-conf-supplied",
+            observed_at="2026-07-22T22:00:00Z",
         )
         self.assertEqual(req_supplied["observation"]["source_state"], "unknown")
-        self.assertIn("supplied_evidence_requires_authoritative_read", req_supplied["classification"]["blocked_by"])
-        eval_supplied = rc.evaluate(req_supplied, contract_root)
-        self.assertNotEqual(eval_supplied["status"], "terminally_closed")
-        self.assertIn(eval_supplied["status"], ("blocked", "source_stale"))
+        self.assertIn(
+            "supplied_evidence_requires_authoritative_read",
+            req_supplied["classification"]["blocked_by"],
+        )
+        supplied_rc, eval_supplied = evaluate_with_real_cli(req_supplied)
+        self.assertIn(supplied_rc, {5, 6})
+        self.assertIn(eval_supplied["status"], {"source_stale", "blocked"})
 
-        # Authoritative_receipts with explicit source_state=current evaluates terminally_closed
         req_dict, _, _ = convergence.build_pr_closure_request(
             evidence,
             risk_level="R2",
@@ -458,11 +482,8 @@ class ConvergenceTests(unittest.TestCase):
             evidence_authority="authoritative_receipts",
             source_state="current",
         )
-
-        validated = rc.validate_request(contract_root, req_dict)
-        self.assertEqual(validated["assessment_id"], "pr-closure-conf-1")
-
-        eval_res = rc.evaluate(req_dict, contract_root)
+        authoritative_rc, eval_res = evaluate_with_real_cli(req_dict)
+        self.assertEqual(authoritative_rc, 0)
         self.assertEqual(eval_res["status"], "terminally_closed")
 
         req_no_closure, _, _ = convergence.build_pr_closure_request(
@@ -474,9 +495,9 @@ class ConvergenceTests(unittest.TestCase):
             source_state="current",
         )
         self.assertNotIn("closure", req_no_closure)
-        eval_no_closure = rc.evaluate(req_no_closure, contract_root)
-        self.assertNotEqual(eval_no_closure["status"], "terminally_closed")
-        self.assertIn(eval_no_closure["status"], ("blocked", "evidence_missing"))
+        missing_rc, eval_no_closure = evaluate_with_real_cli(req_no_closure)
+        self.assertIn(missing_rc, {2, 6})
+        self.assertIn(eval_no_closure["status"], {"evidence_missing", "blocked"})
 
 
 if __name__ == "__main__":

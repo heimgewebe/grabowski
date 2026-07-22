@@ -67,14 +67,7 @@ class ConvergenceExecutionError(RuntimeError):
 
 def _protocol_repo() -> Path:
     configured = os.environ.get("GRABOWSKI_CONVERGENCE_PROTOCOL_REPO")
-    if configured:
-        value = Path(configured).expanduser()
-    else:
-        candidate = Path.home() / "repos" / "konvergenzregelkreis"
-        if candidate.exists():
-            value = candidate
-        else:
-            value = Path("/home/alex/repos/konvergenzregelkreis")
+    value = Path(configured).expanduser() if configured else Path.home() / "repos" / "konvergenzregelkreis"
     if not value.is_absolute():
         raise ConvergenceInputError("convergence protocol repository must be absolute")
     return value.resolve()
@@ -436,6 +429,8 @@ def build_pr_closure_profile(
         for idx, item in enumerate(raw_effects):
             if not isinstance(item, dict):
                 raise ConvergenceInputError(f"effects[{idx}] must be a dictionary")
+            if item.get("schema_version") != 1:
+                raise ConvergenceInputError(f"effects[{idx}].schema_version must be 1")
             kind = _text(item.get("kind"), f"effects[{idx}].kind")
             if kind not in ALLOWED_EFFECT_KINDS:
                 raise ConvergenceInputError(f"effects[{idx}].kind '{kind}' is not a valid v1 effect kind")
@@ -454,6 +449,8 @@ def build_pr_closure_profile(
         for idx, item in enumerate(raw_verifications):
             if not isinstance(item, dict):
                 raise ConvergenceInputError(f"verifications[{idx}] must be a dictionary")
+            if item.get("schema_version") != 1:
+                raise ConvergenceInputError(f"verifications[{idx}].schema_version must be 1")
             kind = _text(item.get("kind"), f"verifications[{idx}].kind")
             if kind not in ALLOWED_VERIFICATION_KINDS:
                 raise ConvergenceInputError(f"verifications[{idx}].kind '{kind}' is not a valid v1 verification kind")
@@ -481,6 +478,11 @@ def build_pr_closure_profile(
                 source_refs.append({"kind": k, "ref": r, "subject_sha256": s})
 
     raw_closure = evidence.get("closure") if isinstance(evidence, dict) else None
+    if raw_closure is not None:
+        if not isinstance(raw_closure, dict):
+            raise ConvergenceInputError("closure must be a dictionary")
+        if raw_closure.get("schema_version") != 1:
+            raise ConvergenceInputError("closure.schema_version must be 1")
 
     merge_effect = next((e for e in effects if e["kind"] == "merge"), None)
     deploy_effect = next((e for e in effects if e["kind"] == "deployment"), None)
