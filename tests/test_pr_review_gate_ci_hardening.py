@@ -185,6 +185,33 @@ class ReviewEvidenceHardeningTests(unittest.TestCase):
             ci.COMMENT_STATE_OUTSIDE_WINDOW,
         )
 
+    def test_permission_lookup_failure_is_authorization_unknown(self) -> None:
+        comments = [
+            {
+                "databaseId": 10,
+                "body": f"{ci.COMMENT_PREFIX} current",
+                "author": {"login": "writer"},
+            },
+            {
+                "databaseId": 11,
+                "body": f"{ci.COMMENT_PREFIX} newer",
+                "author": {"login": "unknown"},
+            },
+        ]
+
+        def permission(actor: str) -> str:
+            if actor == "unknown":
+                raise ci.CiEvidenceError("permission lookup failed")
+            return "write"
+
+        state = ci.command_comment_authorization_state(
+            comments,
+            current_comment_id=10,
+            current_comment_body=f"{ci.COMMENT_PREFIX} current",
+            permission_lookup=permission,
+        )
+        self.assertEqual(state, ci.COMMENT_STATE_AUTHORIZATION_UNKNOWN)
+
     def test_future_command_version_does_not_supersede_v1(self) -> None:
         comments = [
             {
@@ -227,6 +254,114 @@ class ReviewEvidenceHardeningTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GITHUB_ACTOR": "actual-writer"}, clear=False):
             with self.assertRaisesRegex(ci.CiEvidenceError, "must match GITHUB_ACTOR"):
                 ci.evaluate_comment_command(args)
+
+    def test_comment_window_read_failure_replaces_old_green_with_failure(self) -> None:
+        args = argparse.Namespace(
+            repo_name="heimgewebe/grabowski",
+            pr=42,
+            actor="writer",
+            comment_id=10,
+            comment_body_env="REVIEW_GATE_COMMENT_BODY",
+            publish_status=True,
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GITHUB_ACTOR": "writer",
+                    "REVIEW_GATE_COMMENT_BODY": f"{ci.COMMENT_PREFIX} payload",
+                },
+                clear=False,
+            ),
+            mock.patch.object(ci, "collaborator_permission", return_value="write"),
+            mock.patch.object(ci, "load_live_pr", return_value=_pr()),
+            mock.patch.object(
+                ci,
+                "current_comment_authorization_state",
+                side_effect=ci.CiEvidenceError("comment API unavailable"),
+            ),
+            mock.patch.object(ci, "publish_commit_status") as publish,
+        ):
+            result = ci.evaluate_comment_command(args)
+
+        self.assertEqual(result, 1)
+        publish.assert_called_once_with(
+            repo_name="heimgewebe/grabowski",
+            head_sha="a" * 40,
+            passed=False,
+            failure_count=1,
+        )
+
+    def test_authorization_unknown_replaces_old_green_with_failure(self) -> None:
+        args = argparse.Namespace(
+            repo_name="heimgewebe/grabowski",
+            pr=42,
+            actor="writer",
+            comment_id=10,
+            comment_body_env="REVIEW_GATE_COMMENT_BODY",
+            publish_status=True,
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GITHUB_ACTOR": "writer",
+                    "REVIEW_GATE_COMMENT_BODY": f"{ci.COMMENT_PREFIX} payload",
+                },
+                clear=False,
+            ),
+            mock.patch.object(ci, "collaborator_permission", return_value="write"),
+            mock.patch.object(ci, "load_live_pr", return_value=_pr()),
+            mock.patch.object(
+                ci,
+                "current_comment_authorization_state",
+                return_value=ci.COMMENT_STATE_AUTHORIZATION_UNKNOWN,
+            ),
+            mock.patch.object(ci, "publish_commit_status") as publish,
+        ):
+            result = ci.evaluate_comment_command(args)
+
+        self.assertEqual(result, 1)
+        publish.assert_called_once_with(
+            repo_name="heimgewebe/grabowski",
+            head_sha="a" * 40,
+            passed=False,
+            failure_count=1,
+        )
+
+    def test_newer_authorized_command_on_final_freshness_skips_old_status_mutation(self) -> None:
+        projection = ci.build_status_projection(_audit_bytes())
+        body = f"{ci.COMMENT_PREFIX} {ci.encode_status_projection(projection)}"
+        args = argparse.Namespace(
+            repo_name="heimgewebe/grabowski",
+            pr=42,
+            actor="writer",
+            comment_id=10,
+            comment_body_env="REVIEW_GATE_COMMENT_BODY",
+            publish_status=True,
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"GITHUB_ACTOR": "writer", "REVIEW_GATE_COMMENT_BODY": body},
+                clear=False,
+            ),
+            mock.patch.object(ci, "collaborator_permission", return_value="write"),
+            mock.patch.object(ci, "load_live_pr", return_value=_pr()) as load_pr,
+            mock.patch.object(
+                ci,
+                "current_comment_authorization_state",
+                side_effect=[ci.COMMENT_STATE_CURRENT, ci.COMMENT_STATE_SUPERSEDED],
+            ) as freshness,
+            mock.patch.object(ci, "current_diff_sha256", return_value="b" * 64),
+            mock.patch.object(ci, "publish_commit_status") as publish,
+        ):
+            result = ci.evaluate_comment_command(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(freshness.call_count, 2)
+        self.assertEqual(load_pr.call_count, 1)
+        publish.assert_not_called()
 
     def test_subprocess_timeout_fails_closed(self) -> None:
         with mock.patch.object(
