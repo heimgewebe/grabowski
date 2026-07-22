@@ -1678,6 +1678,41 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
     return result
 
 
+def apply_periodic_plan(
+    *,
+    minimum_job_age_seconds: int = 86_400,
+    max_archive_jobs: int = MAX_ARCHIVE_JOBS_PER_PLAN,
+) -> dict[str, Any]:
+    """Apply one bounded live retention cycle after two identical snapshots.
+
+    The periodic path deliberately keeps the existing plan-hash contract: it
+    builds the live plan twice and refuses every mutation when those hashes
+    differ. The normal apply path then performs its existing pre-mutation
+    revalidation and receipt/audit writes. A stable actionless plan is returned
+    as a successful no-op so repeated timer runs remain idempotent without
+    manufacturing duplicate terminal receipts.
+    """
+    preview = build_plan(
+        minimum_job_age_seconds=minimum_job_age_seconds,
+        max_archive_jobs=max_archive_jobs,
+    )
+    current = build_plan(
+        minimum_job_age_seconds=minimum_job_age_seconds,
+        max_archive_jobs=max_archive_jobs,
+    )
+    if current["plan_sha256"] != preview["plan_sha256"]:
+        raise RuntimeError("retention plan drifted between periodic snapshots")
+    if not current["reset_failed_units"] and not current["archive_jobs"]:
+        return {
+            "schema_version": 1,
+            "operation": "grabowski-runtime-state-retention-periodic-noop",
+            "plan_sha256": current["plan_sha256"],
+            "completed": True,
+            "mutated": False,
+        }
+    return apply_plan(current, expected_plan_sha256=preview["plan_sha256"])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--minimum-job-age-seconds", type=int, default=86_400)
@@ -1688,11 +1723,12 @@ def main() -> int:
     )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--expected-plan-sha256")
+    parser.add_argument("--periodic-apply", action="store_true")
     parser.add_argument("--legacy-archive-status", action="store_true")
     args = parser.parse_args()
     try:
         if args.legacy_archive_status:
-            if args.apply or args.expected_plan_sha256:
+            if args.apply or args.periodic_apply or args.expected_plan_sha256:
                 raise ValueError(
                     "--legacy-archive-status is incompatible with apply arguments"
                 )
@@ -1702,6 +1738,21 @@ def main() -> int:
                     ensure_ascii=False,
                     sort_keys=True,
                     indent=2,
+                )
+            )
+            return 0
+        if args.periodic_apply:
+            if args.apply or args.expected_plan_sha256:
+                raise ValueError(
+                    "--periodic-apply is incompatible with explicit apply arguments"
+                )
+            receipt = apply_periodic_plan(
+                minimum_job_age_seconds=args.minimum_job_age_seconds,
+                max_archive_jobs=args.max_archive_jobs,
+            )
+            print(
+                json.dumps(
+                    receipt, ensure_ascii=False, sort_keys=True, indent=2
                 )
             )
             return 0
