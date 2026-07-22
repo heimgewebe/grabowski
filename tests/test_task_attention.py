@@ -518,6 +518,113 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(4, result["total_attention"])
         self.assertEqual("raw_task_state_projection_before_decisions", result["total_attention_scope"])
 
+    def test_current_attention_projection_separates_operational_signal_from_raw_history(self) -> None:
+        closed = self._failed_task()
+        attention.record_decision(self._parameters(closed, decision="closed"))
+        superseded = self._failed_task()
+        attention.record_decision(
+            self._parameters(superseded, decision="superseded")
+        )
+        deferred = self._failed_task()
+        attention.record_decision(self._parameters(deferred, decision="deferred"))
+
+        projection = attention.current_attention_projection(
+            [closed, superseded, deferred]
+        )
+
+        self.assertEqual(3, projection["raw_attention_count"])
+        self.assertEqual(1, projection["current_attention_count"])
+        self.assertEqual(2, projection["excluded_attention_count"])
+        self.assertEqual(
+            {"decision_closed": 1, "decision_superseded": 1},
+            projection["excluded_classification_counts"],
+        )
+        self.assertEqual(
+            1, projection["decision_classification_counts"]["decision_deferred"]
+        )
+        self.assertEqual(
+            {closed["task_id"], superseded["task_id"]},
+            projection["excluded_task_ids"],
+        )
+        self.assertRegex(projection["projection_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_task_list_attention_uses_decision_aware_current_projection(self) -> None:
+        closed = self._failed_task()
+        attention.record_decision(self._parameters(closed, decision="closed"))
+        superseded = self._failed_task()
+        attention.record_decision(
+            self._parameters(superseded, decision="superseded")
+        )
+        deferred = self._failed_task()
+        attention.record_decision(self._parameters(deferred, decision="deferred"))
+
+        listed = tasks.grabowski_task_list(state="attention")
+        general = tasks.grabowski_task_list()
+
+        self.assertEqual(1, listed["count"])
+        self.assertEqual(1, listed["total_matching"])
+        self.assertEqual(deferred["task_id"], listed["tasks"][0]["task_id"])
+        self.assertEqual(3, listed["state_counts"]["failed"])
+        self.assertEqual(3, listed["raw_projection_counts"]["attention"])
+        self.assertEqual(1, listed["projection_counts"]["attention"])
+        self.assertEqual(
+            "current_task_projection_after_valid_attention_decisions",
+            listed["projection_counts_semantics"]["attention"],
+        )
+        self.assertEqual(2, listed["attention_projection"]["excluded_attention_count"])
+        self.assertEqual(
+            "inspect current attention tasks before retry",
+            listed["recommended_next_action"],
+        )
+        self.assertEqual(1, len(general["warnings"]))
+        self.assertEqual(deferred["task_id"], general["warnings"][0]["task_id"])
+        self.assertEqual(3, general["raw_projection_counts"]["attention"])
+        self.assertEqual(1, general["projection_counts"]["attention"])
+
+    def test_task_list_attention_degrades_to_raw_visibility_on_evidence_error(self) -> None:
+        failed = self._failed_task()
+
+        with patch.object(
+            attention,
+            "current_attention_projection",
+            side_effect=attention.TaskAttentionIntegrityError("broken evidence"),
+        ):
+            listed = tasks.grabowski_task_list(state="attention")
+
+        self.assertEqual(1, listed["count"])
+        self.assertEqual(1, listed["total_matching"])
+        self.assertEqual(failed["task_id"], listed["tasks"][0]["task_id"])
+        self.assertEqual(1, listed["raw_projection_counts"]["attention"])
+        self.assertEqual(1, listed["projection_counts"]["attention"])
+        self.assertEqual("degraded", listed["attention_projection"]["status"])
+        self.assertEqual(
+            "TaskAttentionIntegrityError",
+            listed["attention_projection"]["evidence_error"],
+        )
+        self.assertEqual(0, listed["attention_projection"]["excluded_attention_count"])
+        self.assertEqual("attention_projection_degraded", listed["warnings"][0]["code"])
+        self.assertEqual(
+            "repair attention projection evidence before relying on closeout filtering",
+            listed["recommended_next_action"],
+        )
+
+    def test_attention_cursor_is_invalidated_by_new_closeout_decision(self) -> None:
+        first = self._failed_task()
+        second = self._failed_task()
+        page = tasks.grabowski_task_list(state="attention", limit=1)
+        self.assertTrue(page["pagination"]["has_more"])
+        closed_task_id = page["tasks"][0]["task_id"]
+        closed = tasks._row(closed_task_id)
+        attention.record_decision(self._parameters(closed, decision="closed"))
+
+        with self.assertRaisesRegex(ValueError, "cursor_snapshot_changed"):
+            tasks.grabowski_task_list(
+                state="attention",
+                limit=1,
+                cursor=page["pagination"]["next_cursor"],
+            )
+        self.assertIn(closed_task_id, {first["task_id"], second["task_id"]})
+
     def test_current_reconciliation_scans_past_filtered_rows_to_fill_page(self) -> None:
         closed = self._failed_task()
         attention.record_decision(self._parameters(closed, decision="closed"))

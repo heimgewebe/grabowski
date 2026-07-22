@@ -2244,6 +2244,90 @@ def _subtract_projected_task_counts(
     return current_exact, current_projections, current_unknown
 
 
+def _task_current_records_for_states(
+    connection: sqlite3.Connection,
+    *,
+    states: tuple[str, ...],
+    projection: dict[str, Any],
+) -> list[dict[str, Any]]:
+    placeholders = ",".join("?" for _ in states)
+    rows = connection.execute(
+        f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+        "ORDER BY created_at_unix DESC, task_id DESC",
+        states,
+    ).fetchall()
+    current_records: list[dict[str, Any]] = []
+    for row in rows:
+        raw = dict(row)
+        archive_record = _task_archive_record(raw)
+        current = lifecycle_projection.bounded_current_task_projection(
+            [archive_record],
+            projection=projection,
+        )
+        if current:
+            current_records.append(raw)
+    return current_records
+
+
+def _task_attention_projection(
+    connection: sqlite3.Connection,
+    projection: dict[str, Any],
+) -> tuple[dict[str, Any], set[str]]:
+    import grabowski_task_attention as task_attention
+
+    records = _task_current_records_for_states(
+        connection,
+        states=TASK_STATE_PROJECTIONS["attention"],
+        projection=projection,
+    )
+    try:
+        projected = task_attention.current_attention_projection(records)
+    except (
+        task_attention.TaskAttentionError,
+        task_attention.TaskAttentionInputError,
+        OSError,
+    ) as exc:
+        raw_bindings = [
+            {
+                "task_id": str(record["task_id"]),
+                "attempt": int(record["attempt"]),
+                "state": str(record["state"]),
+                "updated_at_unix": int(record["updated_at_unix"]),
+            }
+            for record in records
+        ]
+        return (
+            {
+                "status": "degraded",
+                "evidence_error": type(exc).__name__,
+                "projection_sha256": _sha256_json(
+                    {
+                        "schema_version": 1,
+                        "status": "degraded",
+                        "evidence_error": type(exc).__name__,
+                        "task_bindings": raw_bindings,
+                    }
+                ),
+                "raw_attention_count": len(records),
+                "current_attention_count": len(records),
+                "excluded_attention_count": 0,
+                "excluded_classification_counts": {},
+                "decision_candidate_count": None,
+                "decision_classification_counts": {},
+                "scope": "current_task_projection_after_valid_attention_decisions",
+                "raw_scope": "current_task_projection_before_attention_decisions",
+            },
+            set(),
+        )
+    excluded_task_ids = set(projected["excluded_task_ids"])
+    public_projection = {
+        key: value
+        for key, value in projected.items()
+        if key != "excluded_task_ids"
+    }
+    return public_projection, excluded_task_ids
+
+
 def _task_list_current_rows(
     connection: sqlite3.Connection,
     *,
@@ -2253,6 +2337,7 @@ def _task_list_current_rows(
     cursor_task_id: str | None,
     limit: int,
     projection: dict[str, Any],
+    excluded_task_ids: set[str] | None = None,
 ) -> list[sqlite3.Row]:
     selected: list[sqlite3.Row] = []
     scan_created_at = cursor_created_at
@@ -2280,7 +2365,10 @@ def _task_list_current_rows(
                 [archive_record],
                 projection=projection,
             )
-            if current:
+            if current and (
+                excluded_task_ids is None
+                or str(row["task_id"]) not in excluded_task_ids
+            ):
                 selected.append(row)
                 if len(selected) >= limit + 1:
                     break
@@ -3343,25 +3431,6 @@ def grabowski_task_list(
         raise ValueError("limit must be between 1 and 100")
     filter_states = _task_filter_states(state)
     snapshot_scope = f"task-list:{selected_view}:{state or 'all'}"
-    scope = f"{snapshot_scope}:{projection_sha256}"
-    position = consumer_surface.decode_cursor(
-        cursor,
-        scope,
-        snapshot_scope=snapshot_scope,
-    )
-    cursor_created_at: int | None = None
-    cursor_task_id: str | None = None
-    if position is not None:
-        cursor_created_at = position.get("created_at_unix")
-        cursor_task_id = position.get("task_id")
-        if (
-            isinstance(cursor_created_at, bool)
-            or not isinstance(cursor_created_at, int)
-            or cursor_created_at < 0
-            or not isinstance(cursor_task_id, str)
-            or not TASK_ID.fullmatch(cursor_task_id)
-        ):
-            raise ValueError("cursor position is invalid")
     where: list[str] = []
     parameters: list[Any] = []
     if filter_states is not None:
@@ -3369,6 +3438,64 @@ def grabowski_task_list(
         where.append(f"state IN ({placeholders})")
         parameters.extend(filter_states)
     with _task_read_snapshot() as connection:
+        # BEGIN DEFERRED does not pin a SQLite snapshot until the first read.
+        # Pin it before helper calls so row pages, counts and attention decisions
+        # are all derived against one task-store view even if a concurrent writer
+        # commits while the list operation is in progress.
+        connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
+        retained_state_counts, _, retained_unknown_state_count = _task_state_counts(connection)
+        projected_state_counts, projected_unknown_state_count = _projected_task_state_counts(
+            connection,
+            current_projection,
+        )
+        state_counts, raw_projection_counts, unknown_state_count = _subtract_projected_task_counts(
+            retained_state_counts,
+            retained_unknown_state_count,
+            projected_state_counts,
+            projected_unknown_state_count,
+        )
+        attention_projection, attention_excluded_task_ids = _task_attention_projection(
+            connection,
+            current_projection,
+        )
+        if (
+            attention_projection["raw_attention_count"]
+            != raw_projection_counts["attention"]
+        ):
+            raise lifecycle_projection.LifecycleProjectionIntegrityError(
+                "decision-aware attention projection does not match current raw attention count"
+            )
+        projection_counts = dict(raw_projection_counts)
+        projection_counts["attention"] = attention_projection["current_attention_count"]
+        list_snapshot_sha256 = projection_sha256
+        if state == "attention":
+            list_snapshot_sha256 = _sha256_json(
+                {
+                    "archive_projection_sha256": projection_sha256,
+                    "attention_projection_sha256": attention_projection[
+                        "projection_sha256"
+                    ],
+                }
+            )
+        scope = f"{snapshot_scope}:{list_snapshot_sha256}"
+        position = consumer_surface.decode_cursor(
+            cursor,
+            scope,
+            snapshot_scope=snapshot_scope,
+        )
+        cursor_created_at: int | None = None
+        cursor_task_id: str | None = None
+        if position is not None:
+            cursor_created_at = position.get("created_at_unix")
+            cursor_task_id = position.get("task_id")
+            if (
+                isinstance(cursor_created_at, bool)
+                or not isinstance(cursor_created_at, int)
+                or cursor_created_at < 0
+                or not isinstance(cursor_task_id, str)
+                or not TASK_ID.fullmatch(cursor_task_id)
+            ):
+                raise ValueError("cursor position is invalid")
         rows = _task_list_current_rows(
             connection,
             where=where,
@@ -3377,20 +3504,14 @@ def grabowski_task_list(
             cursor_task_id=cursor_task_id,
             limit=limit,
             projection=current_projection,
-        )
-        retained_state_counts, _, retained_unknown_state_count = _task_state_counts(connection)
-        projected_state_counts, projected_unknown_state_count = _projected_task_state_counts(
-            connection,
-            current_projection,
-        )
-        state_counts, projection_counts, unknown_state_count = _subtract_projected_task_counts(
-            retained_state_counts,
-            retained_unknown_state_count,
-            projected_state_counts,
-            projected_unknown_state_count,
+            excluded_task_ids=(
+                attention_excluded_task_ids if state == "attention" else None
+            ),
         )
         if filter_states is None:
             total_matching = sum(state_counts.values()) + unknown_state_count
+        elif state == "attention":
+            total_matching = projection_counts["attention"]
         else:
             total_matching = sum(state_counts[item] for item in filter_states)
     projection_readback = _task_current_projection()
@@ -3424,6 +3545,12 @@ def grabowski_task_list(
             "code": "unknown_task_states",
             "count": unknown_state_count,
         })
+    if attention_projection["status"] != "verified":
+        warnings.append({
+            "code": "attention_projection_degraded",
+            "evidence_error": attention_projection["evidence_error"],
+            "raw_attention_count": attention_projection["raw_attention_count"],
+        })
     warnings.extend(
         {
             "code": "task_requires_attention",
@@ -3432,6 +3559,7 @@ def grabowski_task_list(
         }
         for task in tasks
         if task.get("state") in warning_states
+        and task.get("task_id") not in attention_excluded_task_ids
     )
     payload: dict[str, Any] = {
         "schema_version": 2,
@@ -3448,8 +3576,15 @@ def grabowski_task_list(
         "state_counts_complete": unknown_state_count == 0,
         "unknown_state_count": unknown_state_count,
         "projection_counts": projection_counts,
+        "raw_projection_counts": raw_projection_counts,
         "projection_counts_scope": "current_projection",
+        "projection_counts_semantics": {
+            "active": "current_task_states",
+            "attention": "current_task_projection_after_valid_attention_decisions",
+            "terminal": "current_task_states",
+        },
         "projection_counts_overlap": True,
+        "attention_projection": attention_projection,
         "current_projection": {
             "status": "verified",
             "projection_sha256": projection_sha256,
@@ -3463,13 +3598,17 @@ def grabowski_task_list(
             "has_more": has_more,
             "next_cursor": next_cursor,
             "ordering": "created_at_unix_desc_task_id_desc",
-            "snapshot_sha256": projection_sha256,
+            "snapshot_sha256": list_snapshot_sha256,
         },
         "warnings": warnings,
         "recommended_next_action": (
             "inspect unknown task states before relying on projections"
             if unknown_state_count
-            else "inspect attention tasks before retry" if warnings else "none"
+            else "repair attention projection evidence before relying on closeout filtering"
+            if attention_projection["status"] != "verified"
+            else "inspect current attention tasks before retry"
+            if projection_counts["attention"]
+            else "none"
         ),
         "does_not_establish": [
             "task_output_correctness",

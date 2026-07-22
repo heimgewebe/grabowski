@@ -27,6 +27,8 @@ Expose named task projections through the existing `grabowski_task_list` surface
 
 `interrupted` and `outcome_unknown` are retained recovery states, not current execution truth. They remain visible through `attention` and keep fail-closed recovery semantics, but they do not inflate the active-work count.
 
+The operational `attention` projection is decision-aware: a valid create-only, outcome-bound `closed` or `superseded` decision removes only that exact task attempt from current attention, while `deferred`, missing, stale, or invalid evidence remains visible. The underlying task state is never rewritten. `raw_projection_counts` retains the pre-decision state-derived counts so historical failure volume remains observable, while `projection_counts["attention"]` reports the current actionable projection.
+
 Every response also returns exact state counts and projection counts from one SQLite read snapshot. Projections intentionally overlap and must not be summed. Unknown legacy states are counted explicitly and make the exact-state projection incomplete instead of disappearing silently. Historical rows remain in the task database.
 
 ### P1b — Workspace liveness projection
