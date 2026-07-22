@@ -2581,11 +2581,44 @@ def _run_worktree_ensure(
     )
     return output
 
+def _lookup_default_branch(
+    repo: Path,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    result = github_runner(repo, ["repo", "view", "--json", "defaultBranchRef"])
+    if int(result.get("returncode", 1)) != 0:
+        return {
+            "status": "unavailable",
+            "reason": _truncate_reason(
+                result.get("stderr")
+                or result.get("stdout")
+                or "default branch lookup unavailable"
+            ),
+        }
+    raw = str(result.get("stdout", "")).strip()
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return {
+            "status": "unavailable",
+            "reason": "default branch lookup returned invalid JSON",
+        }
+    default_ref = parsed.get("defaultBranchRef") if isinstance(parsed, dict) else None
+    name = default_ref.get("name") if isinstance(default_ref, dict) else None
+    if not isinstance(name, str) or not name:
+        return {
+            "status": "unavailable",
+            "reason": "default branch lookup returned no branch name",
+        }
+    return {"status": "available", "name": name}
+
+
 def _lookup_merged_pr_for_checkout(
     repo: Path,
     *,
     branch: str,
     head: str,
+    default_branch: str,
     github_runner: GithubRunner,
 ) -> dict[str, Any]:
     result = github_runner(
@@ -2624,6 +2657,7 @@ def _lookup_merged_pr_for_checkout(
         and item.get("state") == "MERGED"
         and item.get("headRefName") == branch
         and item.get("headRefOid") == head
+        and item.get("baseRefName") == default_branch
         and isinstance(item.get("number"), int)
         and isinstance(item.get("url"), str)
         and isinstance(item.get("mergedAt"), str)
@@ -2648,7 +2682,10 @@ def _lookup_merged_pr_for_checkout(
         }
     return {
         "status": "not_terminal",
-        "reason": "no merged PR matches both the checkout branch and exact checkout head",
+        "reason": (
+            "no merged PR matches the checkout branch, exact checkout head, "
+            "and repository default branch"
+        ),
     }
 
 
@@ -2724,6 +2761,9 @@ def _run_worktree_hygiene_reconcile(
     cleaned: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     github_queries = 0
+    candidate_pr_queries = 0
+    default_branch: str | None = None
+    default_branch_error: dict[str, Any] | None = None
     actions = 0
     now = int(time.time())
 
@@ -2750,6 +2790,27 @@ def _run_worktree_hygiene_reconcile(
             continue
 
         if state == "cleanup_candidate" and archive is not None:
+            retention = (
+                lifecycle.get("retention")
+                if isinstance(lifecycle.get("retention"), dict)
+                else None
+            )
+            retention_until_unix = (
+                retention.get("retention_until_unix")
+                if isinstance(retention, dict)
+                else None
+            )
+            if (
+                isinstance(retention_until_unix, int)
+                and retention_until_unix > now
+            ):
+                skipped.append({
+                    "path": path,
+                    "reason": "active_retention_not_elapsed",
+                    "state": state,
+                    "retention_until_unix": retention_until_unix,
+                })
+                continue
             dry = grabowski_checkouts.grabowski_checkout_cleanup(
                 repo=str(repo),
                 checkout_path=path,
@@ -2800,12 +2861,36 @@ def _run_worktree_hygiene_reconcile(
         if not isinstance(branch, str) or not branch or not isinstance(head, str):
             skipped.append({"path": path, "reason": "branch_or_head_unavailable", "state": state})
             continue
-        if github_queries >= WORKTREE_HYGIENE_MAX_CANDIDATES:
-            skipped.append({"path": path, "reason": "github_query_bound_reached", "state": state})
+        if candidate_pr_queries >= WORKTREE_HYGIENE_MAX_CANDIDATES:
+            skipped.append({
+                "path": path,
+                "reason": "github_query_bound_reached",
+                "state": state,
+            })
             continue
+        if default_branch is None and default_branch_error is None:
+            default_branch_evidence = _lookup_default_branch(repo, github_runner)
+            github_queries += 1
+            if default_branch_evidence.get("status") == "available":
+                default_branch = str(default_branch_evidence["name"])
+            else:
+                default_branch_error = default_branch_evidence
+        if default_branch is None:
+            skipped.append({
+                "path": path,
+                "reason": "default_branch_not_proven",
+                "state": state,
+                "terminal_evidence": default_branch_error,
+            })
+            continue
+        candidate_pr_queries += 1
         github_queries += 1
         terminal = _lookup_merged_pr_for_checkout(
-            repo, branch=branch, head=head, github_runner=github_runner
+            repo,
+            branch=branch,
+            head=head,
+            default_branch=default_branch,
+            github_runner=github_runner,
         )
         if terminal.get("status") != "exact_merged":
             skipped.append({
@@ -2871,6 +2956,8 @@ def _run_worktree_hygiene_reconcile(
         "apply_cleanup": apply_cleanup,
         "actions": actions,
         "github_queries": github_queries,
+        "candidate_pr_queries": candidate_pr_queries,
+        "default_branch": default_branch,
         "archived": archived,
         "cleanup_plans": cleanup_plans,
         "cleaned": cleaned,
