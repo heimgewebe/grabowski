@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import heapq
 import json
 from pathlib import Path
 from typing import Any, Iterator
@@ -127,23 +128,45 @@ class _BoundedTopCounter:
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
         self._entries: dict[str, tuple[int, int]] = {}
+        self._minimum_heap: list[tuple[int, str]] = []
         self.evictions = 0
+
+    def _compact_heap_if_needed(self) -> None:
+        if len(self._minimum_heap) <= self.capacity * 4:
+            return
+        self._minimum_heap = [
+            (estimate, value)
+            for value, (estimate, _error) in self._entries.items()
+        ]
+        heapq.heapify(self._minimum_heap)
+
+    def _pop_current_minimum(self) -> tuple[str, int]:
+        while self._minimum_heap:
+            estimate, value = heapq.heappop(self._minimum_heap)
+            current = self._entries.get(value)
+            if current is not None and current[0] == estimate:
+                return value, estimate
+        raise RuntimeError("bounded top counter heap lost all current entries")
 
     def add(self, value: str) -> None:
         current = self._entries.get(value)
         if current is not None:
-            self._entries[value] = (current[0] + 1, current[1])
+            estimate = current[0] + 1
+            self._entries[value] = (estimate, current[1])
+            heapq.heappush(self._minimum_heap, (estimate, value))
+            self._compact_heap_if_needed()
             return
         if len(self._entries) < self.capacity:
             self._entries[value] = (1, 0)
+            heapq.heappush(self._minimum_heap, (1, value))
             return
-        victim, (minimum_count, _) = min(
-            self._entries.items(),
-            key=lambda item: (item[1][0], item[0]),
-        )
+        victim, minimum_count = self._pop_current_minimum()
         del self._entries[victim]
-        self._entries[value] = (minimum_count + 1, minimum_count)
+        estimate = minimum_count + 1
+        self._entries[value] = (estimate, minimum_count)
+        heapq.heappush(self._minimum_heap, (estimate, value))
         self.evictions += 1
+        self._compact_heap_if_needed()
 
     def top(self, limit: int) -> list[dict[str, Any]]:
         ordered = sorted(

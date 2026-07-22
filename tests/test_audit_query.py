@@ -363,6 +363,16 @@ class AuditQueryTests(unittest.TestCase):
         self.assertTrue(result["correlation_incomplete"])
         self.assertEqual(result["matched"], 5)
 
+    def test_bounded_top_counter_compacts_lazy_heap(self) -> None:
+        module = self._load_module([])
+        counter = module._BoundedTopCounter(8)
+        for index in range(1000):
+            counter.add(f"value-{index}")
+
+        self.assertEqual(len(counter._entries), 8)
+        self.assertLessEqual(len(counter._minimum_heap), counter.capacity * 4)
+        self.assertEqual(counter.evictions, 992)
+
     def test_analysis_counts_typed_resources_and_failure_signals(self) -> None:
         module = self._load_module(self._components())
         result = module.analyze_audit()
