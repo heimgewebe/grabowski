@@ -347,6 +347,29 @@
         "tool": "grabowski_coding_agent_route"
       }
     },
+    "grabowski_current_work": {
+      "evidence_refs": [
+        "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T068",
+        "tests:tests/test_current_work.py",
+        "tests:tests/test_current_work_surface.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only a bounded ephemeral projection over existing authoritative task, attention, lease, checkout and worker sources while keeping heuristic physical relations non-authoritative.",
+        "evidence": "Source-bound grouping, exact child-lease aggregation, current/history separation, snapshot-bound pagination, explicit completeness/uncertainty and live-pilot tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Composing generic task, resource, checkout, tmux, process and worker reads client-side was rejected because it would duplicate binding precedence, heuristic separation, bounded pagination and no-second-truth semantics across operators.",
+      "rationale": "Operator current-work comprehension requires one bounded cross-source read shape; it adds no mutation authority and persists no lifecycle state.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "operations-observability",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_current_work"
+      }
+    },
     "grabowski_juno_pair": {
       "evidence_refs": [
         "docs:juno-ipad-agent.md",

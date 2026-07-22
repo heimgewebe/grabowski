@@ -29,9 +29,10 @@ import grabowski_workers
 
 
 mcp = grabowski_operator_core.mcp
+READ_ONLY = grabowski_operator_core.READ_ONLY
 
 
-@mcp.tool(name="grabowski_current_work", annotations=grabowski_operator_core.READ_ONLY)
+@mcp.tool(name="grabowski_current_work", annotations=READ_ONLY)
 def grabowski_current_work(
     repositories: list[str],
     view: str = "current",
