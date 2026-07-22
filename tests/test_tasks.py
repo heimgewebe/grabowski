@@ -2835,6 +2835,8 @@ else:
         {'event_id': 'sha256:' + 'a' * 64, 'target': target_value, 'operation': args.operation or 'other'},
         {'event_id': 'sha256:' + 'b' * 64, 'target': target_value, 'operation': args.operation or 'other'},
     ]
+    if args.component == 'leak':
+        events[0]['stdout'] = 'sensitive historical output'
     query = {'repo': args.repo, 'host': args.host, 'component': args.component, 'operation': args.operation, 'task_class': args.task_class, 'outcome': args.outcome, 'since': args.since, 'limit': args.limit}
     print(json.dumps({'schema_version': 'chronik-coding-history.v1', 'query': query, 'events': events, 'event_ids': [event['event_id'] for event in events], 'historical_only': True, 'does_not_establish': ['current_git_state', 'current_ci_state', 'current_runtime_state', 'safe_retry', 'writer_authority']}))
 """,
@@ -2928,6 +2930,16 @@ else:
             self.assertIn(claim, result["does_not_establish"])
             self.assertIn(claim, result["history"]["does_not_establish"])
         self.assertRegex(result["result_sha256"], r"[0-9a-f]{64}\Z")
+
+    def test_history_rejects_unredacted_event_without_exposure(self) -> None:
+        with patch.object(tasks.operator, "_require_operator_capability"):
+            result = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski", component="leak", limit=2
+            )
+        self.assertFalse(result["available"])
+        self.assertEqual([], result["events"])
+        self.assertNotIn("sensitive historical output", json.dumps(result))
+        self.assertIn("unredacted", result["failure"]["contract_error"])
 
     def test_history_rejects_cli_result_bound_to_different_query(self) -> None:
         source = self.cli.read_text(encoding="utf-8")

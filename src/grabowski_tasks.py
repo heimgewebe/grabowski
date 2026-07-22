@@ -3636,6 +3636,11 @@ def grabowski_chronik_history(
                 )
             if raw_event_ids != [event.get("event_id") for event in raw_events]:
                 raise ValueError("Chronik coding-memory history event_ids are unbound")
+            if any(
+                chronik._contains_forbidden_coding_memory_key(event)
+                for event in raw_events
+            ):
+                raise ValueError("Chronik coding-memory history contains unredacted event")
             if not isinstance(raw_claims, list) or not all(
                 isinstance(claim, str) for claim in raw_claims
             ):
