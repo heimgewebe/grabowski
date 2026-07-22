@@ -1097,7 +1097,7 @@ def build_current_work_projection(
     groups: dict[str, dict[str, Any]] = {}
     tasks, task_paths = _add_tasks(groups, task_rows)
     _apply_attention(groups, tasks, attention_rows)
-    _add_leases(groups, lease_rows, set(tasks))
+    _add_leases(groups, lease_rows, set(tasks) | {item["task_id"] for item in attention_rows})
     _add_workers(groups, browser_rows, gui_rows)
     _add_checkouts(groups, checkouts, tasks, task_paths, view=view)
     unbound_tmux, unbound_tmux_total, unbound_processes, unbound_process_total = _add_physical_surfaces(

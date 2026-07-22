@@ -591,6 +591,26 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["projection_state"], "resumable")
         self.assertIn("attention-decision_deferred", group["action_reasons"])
 
+    def test_attention_only_terminal_task_absorbs_task_owned_live_lease(self) -> None:
+        task_id = "attention-lease-task"
+        result = project(
+            attention_payload={
+                "records": [attention(task_id, "actionable", state="failed")],
+                "pagination": {"has_more": False},
+            },
+            resources_payload={
+                "leases": [lease(f"task:{task_id}", f"path:/tmp/{task_id}")],
+                "count": 1,
+                "truncated": False,
+            },
+        )
+        self.assertEqual(result["total_projected"], 1)
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"task:{task_id}")
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertEqual(group["lease_summary"]["count"], 1)
+        self.assertIn("attention-actionable", group["action_reasons"])
+
     def test_many_child_leases_keep_exact_aggregate_and_bounded_sample(self) -> None:
         owner = "operator:many-children"
         leases = [
