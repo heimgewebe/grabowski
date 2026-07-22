@@ -4,8 +4,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import grabowski_lifecycle_archive as lifecycle
+import grabowski_lifecycle_effect_plan as effect_plan
+import grabowski_lifecycle_evidence as lifecycle_evidence
 
 
 class LifecycleClassificationTests(unittest.TestCase):
@@ -320,6 +323,25 @@ class TaskArchiveSegmentTests(unittest.TestCase):
                 )
 
 
+    def test_segment_writer_rejects_symlink_archive_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "target"
+            target.mkdir()
+            root = base / "archives"
+            root.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleArchiveIntegrityError,
+                "task archive root may not be a symlink",
+            ):
+                lifecycle.write_task_archive_segment(
+                    [self.task("task-a", 10)],
+                    archive_root=root,
+                    source_store_sha256="c" * 64,
+                    source_schema_version="5",
+                    plan_sha256="d" * 64,
+                )
+
     def test_segment_verification_respects_explicit_records_read_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "archives"
@@ -367,6 +389,375 @@ class TaskArchiveSegmentTests(unittest.TestCase):
                     Path(result["segment_dir"]),
                     max_records_bytes=-1,
                 )
+
+
+class TaskArchiveEffectTests(unittest.TestCase):
+    @staticmethod
+    def task(task_id: str, created_at: int = 10) -> dict:
+        return {
+            "task_id": task_id,
+            "state": "completed",
+            "created_at_unix": created_at,
+            "updated_at_unix": created_at + 5,
+            "terminalized_at_unix": created_at + 5,
+            "lifecycle_receipt_sha256": "b" * 64,
+        }
+
+    @staticmethod
+    def classification(task_id: str) -> dict:
+        observed = frozenset(lifecycle_evidence.REQUIRED_SOURCES)
+        source_sha256s = {
+            source: f"{index + 1:x}" * 64
+            for index, source in enumerate(sorted(observed))
+        }
+        return lifecycle_evidence.classify_observation_bundle(
+            lifecycle_evidence.LifecycleObservationBundle(
+                identity=task_id,
+                kind="task",
+                observed_sources=observed,
+                source_sha256s=source_sha256s,
+                state="completed",
+                receipt_integrity_valid=True,
+            )
+        )
+
+    def effect_inputs(self, root: Path, records: list[dict]) -> dict:
+        archive_root = root / "archives"
+        effect_root = root / "effects"
+        classifications = [self.classification(record["task_id"]) for record in records]
+        archive_plan = lifecycle.build_task_archive_plan(
+            records,
+            {item["identity"]: item for item in classifications},
+            now_unix=1000,
+            minimum_age_seconds=100,
+        )
+        owner = "operator:test-task-archive-effect"
+        resources = [
+            lifecycle._task_archive_effect_resource_key(archive_root),
+            lifecycle._task_archive_effect_resource_key(effect_root),
+        ]
+        plan = effect_plan.build_effect_plan(
+            classifications,
+            effect_kind="task_archive",
+            lease_owner_id=owner,
+            required_resource_keys=resources,
+            created_at_unix=1000,
+        )
+        lease_observations = [
+            effect_plan.LeaseObservation(
+                resource_key=resource,
+                owner_id=owner,
+                expires_at_unix=2000,
+                metadata_sha256="a" * 64,
+            )
+            for resource in resources
+        ]
+        return {
+            "archive_root": archive_root,
+            "effect_root": effect_root,
+            "archive_plan": archive_plan,
+            "plan": plan,
+            "current_classifications": {
+                item["identity"]: item for item in classifications
+            },
+            "lease_observations": lease_observations,
+        }
+
+    def execute(self, records: list[dict], inputs: dict, *, execution_id: str = "task-archive:test") -> dict:
+        with mock.patch.object(lifecycle, "_now_unix", side_effect=[1001, 1002, 1003]):
+            return lifecycle.execute_task_archive_effect(
+                records,
+                archive_root=inputs["archive_root"],
+                effect_root=inputs["effect_root"],
+                source_store_sha256="c" * 64,
+                source_schema_version="5",
+                archive_plan=inputs["archive_plan"],
+                plan=inputs["plan"],
+                current_classifications=inputs["current_classifications"],
+                lease_observations=inputs["lease_observations"],
+                execution_id=execution_id,
+            )
+
+    def test_effect_persists_plan_revalidation_archive_and_success_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(Path(directory), records)
+            result = self.execute(records, inputs)
+            receipt = result["effect_receipt"]["receipt"]
+            self.assertEqual(result["status"], "verified")
+            self.assertEqual(receipt["status"], "succeeded")
+            self.assertFalse(receipt["blind_retry_allowed"])
+            self.assertEqual(receipt["effect_kind"], "task_archive")
+            self.assertEqual(
+                receipt["post_state_sha256s"],
+                result["post_state_sha256s"],
+            )
+            self.assertTrue(Path(result["effect_plan_path"]).is_file())
+            self.assertTrue(Path(result["effect_revalidation_path"]).is_file())
+            self.assertTrue(Path(result["effect_receipt"]["receipt_path"]).is_file())
+
+    def test_effect_requires_exact_archive_and_effect_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(Path(directory), records)
+            bad_plan = effect_plan.build_effect_plan(
+                [self.classification("task-a")],
+                effect_kind="task_archive",
+                lease_owner_id="operator:test-task-archive-effect",
+                required_resource_keys=[
+                    lifecycle._task_archive_effect_resource_key(inputs["archive_root"])
+                ],
+                created_at_unix=1000,
+            )
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleArchiveIntegrityError,
+                "lacks exact archive and effect resources",
+            ):
+                lifecycle.execute_task_archive_effect(
+                    records,
+                    archive_root=inputs["archive_root"],
+                    effect_root=inputs["effect_root"],
+                    source_store_sha256="c" * 64,
+                    source_schema_version="5",
+                    archive_plan=inputs["archive_plan"],
+                    plan=bad_plan,
+                    current_classifications=inputs["current_classifications"],
+                    lease_observations=inputs["lease_observations"],
+                    execution_id="task-archive:missing-effect-root",
+                )
+
+    def test_effect_rejects_record_drift_from_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(Path(directory), records)
+            changed = [{**records[0], "updated_at_unix": 99, "terminalized_at_unix": 99}]
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleArchiveIntegrityError,
+                "dry-run record digests",
+            ):
+                self.execute(changed, inputs)
+
+    def test_effect_exact_replay_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(Path(directory), records)
+            first = self.execute(records, inputs)
+            second = self.execute(records, inputs)
+            self.assertTrue(second["idempotent_replay"])
+            self.assertTrue(second["effect_receipt"]["idempotent_replay"])
+            self.assertEqual(
+                first["effect_receipt"]["receipt"],
+                second["effect_receipt"]["receipt"],
+            )
+
+    def test_effect_rejects_symlink_effect_root_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(base, records)
+            target = base / "effect-target"
+            target.mkdir()
+            inputs["effect_root"].symlink_to(target, target_is_directory=True)
+            with mock.patch.object(lifecycle, "write_task_archive_segment") as writer:
+                with self.assertRaisesRegex(
+                    lifecycle.LifecycleArchiveIntegrityError,
+                    "task archive effect root may not be a symlink",
+                ):
+                    self.execute(records, inputs)
+            writer.assert_not_called()
+
+    def test_effect_rejects_symlink_receipt_root_before_archive_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(base, records)
+            inputs["effect_root"].mkdir()
+            target = base / "receipt-target"
+            target.mkdir()
+            (inputs["effect_root"] / "receipts").symlink_to(
+                target,
+                target_is_directory=True,
+            )
+            with mock.patch.object(lifecycle, "write_task_archive_segment") as writer:
+                with self.assertRaisesRegex(
+                    lifecycle.LifecycleArchiveIntegrityError,
+                    "task archive effect receipt root may not be a symlink",
+                ):
+                    self.execute(records, inputs)
+            writer.assert_not_called()
+
+    def test_effect_revalidation_drift_blocks_before_archive_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(Path(directory), records)
+            drifted = lifecycle_evidence.classify_observation_bundle(
+                lifecycle_evidence.LifecycleObservationBundle(
+                    identity="task-a",
+                    kind="task",
+                    observed_sources=frozenset(lifecycle_evidence.REQUIRED_SOURCES),
+                    source_sha256s={
+                        source: f"{index + 1:x}" * 64
+                        for index, source in enumerate(
+                            sorted(lifecycle_evidence.REQUIRED_SOURCES)
+                        )
+                    },
+                    state="running",
+                    active_task=True,
+                    receipt_integrity_valid=True,
+                )
+            )
+            inputs["current_classifications"] = {"task-a": drifted}
+            with mock.patch.object(lifecycle, "write_task_archive_segment") as writer:
+                with self.assertRaisesRegex(
+                    lifecycle.LifecycleArchiveError,
+                    "revalidation is not ready",
+                ):
+                    self.execute(records, inputs)
+            writer.assert_not_called()
+
+    def test_effect_reconciles_lost_success_receipt_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(Path(directory), records)
+            original_write = effect_plan.write_effect_execution_receipt
+
+            def write_then_lose_response(receipt, **kwargs):
+                result = original_write(receipt, **kwargs)
+                if receipt["status"] == "succeeded":
+                    raise RuntimeError("receipt response lost")
+                return result
+
+            with (
+                mock.patch.object(
+                    effect_plan,
+                    "write_effect_execution_receipt",
+                    side_effect=write_then_lose_response,
+                ),
+                mock.patch.object(lifecycle, "_now_unix", side_effect=[1001, 1002, 1003]),
+            ):
+                result = lifecycle.execute_task_archive_effect(
+                    records,
+                    archive_root=inputs["archive_root"],
+                    effect_root=inputs["effect_root"],
+                    source_store_sha256="c" * 64,
+                    source_schema_version="5",
+                    archive_plan=inputs["archive_plan"],
+                    plan=inputs["plan"],
+                    current_classifications=inputs["current_classifications"],
+                    lease_observations=inputs["lease_observations"],
+                    execution_id="task-archive:lost-success-receipt-response",
+                )
+            self.assertEqual(result["effect_receipt"]["receipt"]["status"], "succeeded")
+            self.assertTrue(result["effect_receipt"]["idempotent_replay"])
+            self.assertEqual(len(list((inputs["effect_root"] / "receipts").glob("receipt-*.json"))), 1)
+
+    def test_effect_success_receipt_failure_creates_recovery_and_blocks_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(Path(directory), records)
+            execution_id = "task-archive:success-receipt-failure"
+            original_write = effect_plan.write_effect_execution_receipt
+
+            def fail_success_receipt(receipt, **kwargs):
+                if receipt["status"] == "succeeded":
+                    raise RuntimeError("success receipt unavailable")
+                return original_write(receipt, **kwargs)
+
+            with (
+                mock.patch.object(
+                    effect_plan,
+                    "write_effect_execution_receipt",
+                    side_effect=fail_success_receipt,
+                ),
+                mock.patch.object(
+                    lifecycle,
+                    "_now_unix",
+                    side_effect=[1001, 1002, 1003, 1004],
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    lifecycle.LifecycleArchiveError,
+                    "success receipt outcome is ambiguous",
+                ):
+                    lifecycle.execute_task_archive_effect(
+                        records,
+                        archive_root=inputs["archive_root"],
+                        effect_root=inputs["effect_root"],
+                        source_store_sha256="c" * 64,
+                        source_schema_version="5",
+                        archive_plan=inputs["archive_plan"],
+                        plan=inputs["plan"],
+                        current_classifications=inputs["current_classifications"],
+                        lease_observations=inputs["lease_observations"],
+                        execution_id=execution_id,
+                    )
+            receipts = list((inputs["effect_root"] / "receipts").glob("receipt-*.json"))
+            self.assertEqual(len(receipts), 1)
+            revalidation = effect_plan.verify_effect_revalidation(
+                next((inputs["effect_root"] / "revalidations").glob("revalidation-*.json")),
+                plan=inputs["plan"],
+            )["revalidation"]
+            verified = effect_plan.verify_effect_execution_receipt(
+                receipts[0],
+                plan=inputs["plan"],
+                revalidation=revalidation,
+            )
+            self.assertEqual(verified["receipt"]["status"], "recovery_required")
+            with mock.patch.object(lifecycle, "write_task_archive_segment") as writer:
+                with self.assertRaisesRegex(
+                    lifecycle.LifecycleArchiveError,
+                    "blind retry is forbidden",
+                ):
+                    self.execute(records, inputs, execution_id=execution_id)
+            writer.assert_not_called()
+
+    def test_effect_recovery_receipt_blocks_same_execution_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(Path(directory), records)
+            execution_id = "task-archive:ambiguous-retry"
+            with mock.patch.object(
+                lifecycle,
+                "write_task_archive_segment",
+                side_effect=RuntimeError("transport outcome unknown"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "transport outcome unknown"):
+                    self.execute(records, inputs, execution_id=execution_id)
+            with mock.patch.object(lifecycle, "write_task_archive_segment") as writer:
+                with self.assertRaisesRegex(
+                    lifecycle.LifecycleArchiveError,
+                    "blind retry is forbidden",
+                ):
+                    self.execute(records, inputs, execution_id=execution_id)
+            writer.assert_not_called()
+
+    def test_effect_ambiguous_archive_failure_writes_recovery_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            records = [self.task("task-a")]
+            inputs = self.effect_inputs(Path(directory), records)
+            with mock.patch.object(
+                lifecycle,
+                "write_task_archive_segment",
+                side_effect=RuntimeError("transport outcome unknown"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "transport outcome unknown"):
+                    self.execute(records, inputs, execution_id="task-archive:ambiguous")
+            receipts = list((inputs["effect_root"] / "receipts").glob("receipt-*.json"))
+            self.assertEqual(len(receipts), 1)
+            verified = effect_plan.verify_effect_execution_receipt(
+                receipts[0],
+                plan=inputs["plan"],
+                revalidation=effect_plan.verify_effect_revalidation(
+                    next((inputs["effect_root"] / "revalidations").glob("revalidation-*.json")),
+                    plan=inputs["plan"],
+                )["revalidation"],
+            )
+            receipt = verified["receipt"]
+            self.assertEqual(receipt["status"], "recovery_required")
+            self.assertEqual(receipt["mutation_state"], "unknown")
+            self.assertFalse(receipt["blind_retry_allowed"])
+            self.assertEqual(receipt["recovery_refs"], [str(inputs["archive_root"].resolve())])
+
 
 
 if __name__ == "__main__":
