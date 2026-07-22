@@ -190,6 +190,83 @@ class DeployRuntimeTests(unittest.TestCase):
         ):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
 
+    def test_spawn_dependency_contract_loads_and_rejects_open_edges(self) -> None:
+        raw = {
+            "schema_version": 4,
+            "mode": "module",
+            "module": "grabowski_mcp",
+            "source": "src/grabowski_mcp.py",
+            "expected_tools": ["grabowski_status"],
+            "supporting_sources": [
+                {
+                    "module": "grabowski_worker_process",
+                    "source": "src/grabowski_worker_process.py",
+                }
+            ],
+            "runtime_assets": [],
+            "spawn_dependencies": [
+                {
+                    "kind": "python_module",
+                    "launcher_module": "grabowski_mcp",
+                    "spawned_module": "grabowski_worker_process",
+                }
+            ],
+        }
+        contract = deploy_runtime.load_contract_bytes(json.dumps(raw).encode())
+        self.assertEqual(
+            contract.spawn_dependencies[0].spawned_module,
+            "grabowski_worker_process",
+        )
+        self.assertEqual(contract.to_manifest()["spawn_dependencies"], raw["spawn_dependencies"])
+
+        invalid = json.loads(json.dumps(raw))
+        invalid["spawn_dependencies"][0]["spawned_module"] = "grabowski_missing"
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "Zielmodul"):
+            deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+
+        invalid = json.loads(json.dumps(raw))
+        invalid["spawn_dependencies"].append(dict(invalid["spawn_dependencies"][0]))
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "Doppelte Runtime-Spawn-Abhängigkeit"):
+            deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+
+        invalid = json.loads(json.dumps(raw))
+        invalid["schema_version"] = 3
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "schema_version 4"):
+            deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+
+        invalid = json.loads(json.dumps(raw))
+        invalid["schema_version"] = 3
+        invalid["spawn_dependencies"] = []
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "schema_version 4"):
+            deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+
+        invalid = json.loads(json.dumps(raw))
+        del invalid["spawn_dependencies"]
+        with self.assertRaisesRegex(deploy_runtime.DeployError, "benötigt spawn_dependencies"):
+            deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+
+    def test_manifest_validation_rejects_invalid_spawn_dependencies(self) -> None:
+        manifest = {
+            "entrypoint_contract": {
+                "schema_version": 4,
+                "mode": "module",
+                "module": "grabowski_mcp",
+                "source": "src/grabowski_mcp.py",
+                "expected_tools": ["grabowski_status"],
+                "supporting_sources": [],
+                "runtime_assets": [],
+                "spawn_dependencies": [
+                    {
+                        "kind": "python_module",
+                        "launcher_module": "grabowski_mcp",
+                        "spawned_module": "grabowski_missing",
+                    }
+                ],
+            }
+        }
+        errors = deploy_runtime.validate_manifest_schema(manifest)
+        self.assertIn("entrypoint_contract", errors)
+
     def test_manifest_validation_handles_invalid_supporting_sources_fail_closed(self) -> None:
         manifest = {
             "entrypoint_contract": {
