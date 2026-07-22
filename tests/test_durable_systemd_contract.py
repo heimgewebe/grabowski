@@ -105,6 +105,7 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("ProtectSystem=strict", service)
         self.assertIn("ProtectHome=read-only", service)
         self.assertIn("ReadWritePaths=%h/.local/state/grabowski", service)
+        self.assertNotIn("PrivateDevices=", service)
         self.assertIn("RestrictAddressFamilies=AF_UNIX", service)
         self.assertIn("OnUnitActiveSec=5min", timer)
         self.assertIn("RandomizedDelaySec=30s", timer)
