@@ -23,6 +23,7 @@ def task(
     updated: int = 20,
     action_required: bool = False,
     action_reason: str = "",
+    resource_keys: list[str] | None = None,
 ) -> dict:
     return {
         "task_id": task_id,
@@ -31,7 +32,7 @@ def task(
         "unit": f"grabowski-task-{task_id}.service",
         "cwd": cwd,
         "lease_owner_id": f"task:{task_id}",
-        "resource_keys": [],
+        "resource_keys": resource_keys or [],
         "created_at_unix": 10,
         "updated_at_unix": updated,
         "recommended_next_action": "inspect",
@@ -75,7 +76,8 @@ def checkout(
             "blocking": blocking,
             "tasks": [{"task_id": item} for item in task_ids or []],
             "resource_leases": [
-                {"owner_id": item} for item in owner_ids or []
+                {"owner_id": item, "resource_key": f"path:{path}"}
+                for item in owner_ids or []
             ],
             "processes": processes or [],
         },
@@ -84,6 +86,27 @@ def checkout(
         "cleanup_candidate": cleanup_candidate,
     }
 
+
+
+
+def attention(
+    task_id: str,
+    classification: str,
+    *,
+    state: str = "failed",
+    decision: str | None = None,
+) -> dict:
+    return {
+        "task_id": task_id,
+        "attempt": 1,
+        "state": state,
+        "classification": classification,
+        "decision": decision,
+        "authority": "bureau:test",
+        "evidence_ref": f"evidence:{task_id}",
+        "outcome_receipt_sha256": "a" * 64,
+        "evidence_error": None,
+    }
 
 def worker(
     worker_id: str,
@@ -109,6 +132,7 @@ def worker(
 def project(**overrides: object) -> dict:
     payload = {
         "tasks_payload": {"tasks": [], "pagination": {"has_more": False}},
+        "attention_payload": {"records": [], "pagination": {"has_more": False}},
         "resources_payload": {"leases": [], "count": 0, "truncated": False},
         "checkout_payloads": [{"repository": REPOSITORY, "worktrees": []}],
         "repository_filters": [REPOSITORY],
@@ -141,6 +165,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                             "checkout-a",
                             "/home/alex/repos/grabowski",
                             task_ids=[task_id],
+                            owner_ids=[f"task:{task_id}"],
                             blocking=True,
                         )
                     ],
@@ -170,7 +195,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             },
         )
         group = result["work"][0]
-        self.assertEqual(group["projection_state"], "attention")
+        self.assertEqual(group["projection_state"], "blocking")
         self.assertIn("terminal-task-with-live-surfaces", group["action_reasons"])
 
     def test_completed_task_without_current_surface_is_omitted(self) -> None:
@@ -195,20 +220,20 @@ class CurrentWorkProjectionTests(unittest.TestCase):
     def test_explicit_task_attention_evidence_keeps_terminal_failure_visible(self) -> None:
         result = project(
             tasks_payload={
-                "tasks": [
-                    task(
-                        "failed2",
-                        "failed",
-                        action_required=True,
-                        action_reason="lifecycle-receipt-missing",
-                    )
-                ],
+                "tasks": [task("failed2", "failed")],
                 "pagination": {"has_more": False},
-            }
+            },
+            attention_payload={
+                "records": [attention("failed2", "invalid_evidence")],
+                "pagination": {"has_more": False},
+            },
         )
         group = result["work"][0]
-        self.assertEqual(group["projection_state"], "attention")
-        self.assertIn("lifecycle-receipt-missing", group["action_reasons"])
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("attention-invalid_evidence", group["action_reasons"])
+        self.assertTrue(
+            any(ref["source"] == "task-attention-decision-evidence" for ref in group["authority_refs"])
+        )
 
     def test_outcome_unknown_remains_attention_without_other_surface(self) -> None:
         result = project(
@@ -218,7 +243,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             }
         )
         group = result["work"][0]
-        self.assertEqual(group["projection_state"], "attention")
+        self.assertEqual(group["projection_state"], "blocking")
         self.assertIn("task-outcome_unknown", group["action_reasons"])
 
     def test_worker_attention_is_preserved(self) -> None:
@@ -237,7 +262,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         group = result["work"][0]
         self.assertEqual(group["binding_status"], "authority-bound")
-        self.assertEqual(group["projection_state"], "attention")
+        self.assertEqual(group["projection_state"], "blocking")
         self.assertIn("systemd-observation-ambiguous", group["action_reasons"])
 
     def test_workspace_lease_binds_tmux_and_process(self) -> None:
@@ -286,7 +311,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         group = result["work"][0]
         self.assertEqual(group["binding_status"], "physical-only")
-        self.assertEqual(group["projection_state"], "attention")
+        self.assertEqual(group["projection_state"], "unknown")
         self.assertIn(
             "physical-workspace-without-authority", group["action_reasons"]
         )
@@ -326,7 +351,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         group = result["work"][0]
         self.assertEqual(group["binding_status"], "checkout-bound")
-        self.assertEqual(group["projection_state"], "attention")
+        self.assertEqual(group["projection_state"], "blocking")
         self.assertIn("dirty-checkout", group["action_reasons"])
 
     def test_clean_unbound_checkout_is_not_current_work(self) -> None:
@@ -363,7 +388,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             ]
         )
         group = result["work"][0]
-        self.assertEqual(group["projection_state"], "attention")
+        self.assertEqual(group["projection_state"], "blocking")
         self.assertIn("cleanup-candidate", group["action_reasons"])
 
     def test_dirty_main_checkout_is_attention(self) -> None:
@@ -421,7 +446,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                         checkout(
                             "ambiguous-one",
                             "/home/alex/repos/grabowski",
-                            task_ids=["taska", "taskb"],
+                            owner_ids=["task:taska", "task:taskb"],
+                            blocking=True,
                         )
                     ],
                 }
@@ -431,7 +457,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         attached = [item for item in groups.values() if item["checkout_refs"]]
         self.assertEqual(len(attached), 1)
         self.assertEqual(attached[0]["binding_status"], "ambiguous")
-        self.assertEqual(len(attached[0]["related_work_ids"]), 1)
+        self.assertEqual(set(attached[0]["related_work_ids"]), {"task:taska", "task:taskb"})
 
     def test_pagination_is_snapshot_bound_and_deterministic(self) -> None:
         tasks = [task("task1", updated=30), task("task2", updated=20)]
@@ -527,6 +553,161 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertIn("new task", boundaries)
         self.assertIn("permission to stop", boundaries)
         self.assertEqual(result["recommended_next_action"], "none")
+
+
+    def test_closed_attention_is_archived_from_current_but_visible_in_history(self) -> None:
+        task_payload = {
+            "tasks": [task("closed1", "failed")],
+            "pagination": {"has_more": False},
+        }
+        attention_payload = {
+            "records": [attention("closed1", "decision_closed", decision="closed")],
+            "pagination": {"has_more": False},
+        }
+        current = project(tasks_payload=task_payload, attention_payload=attention_payload)
+        history = project(
+            tasks_payload=task_payload,
+            attention_payload=attention_payload,
+            view="history",
+        )
+        self.assertEqual(current["total_projected"], 0)
+        self.assertEqual(history["total_projected"], 1)
+        self.assertEqual(history["work"][0]["projection_state"], "terminal_archived")
+        self.assertIn("attention:decision_closed", history["work"][0]["source_states"])
+
+    def test_deferred_attention_is_resumable(self) -> None:
+        result = project(
+            tasks_payload={
+                "tasks": [task("defer1", "failed")],
+                "pagination": {"has_more": False},
+            },
+            attention_payload={
+                "records": [attention("defer1", "decision_deferred", decision="deferred")],
+                "pagination": {"has_more": False},
+            },
+        )
+        self.assertEqual(result["state_counts"]["resumable"], 1)
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "resumable")
+        self.assertIn("attention-decision_deferred", group["action_reasons"])
+
+    def test_many_child_leases_keep_exact_aggregate_and_bounded_sample(self) -> None:
+        owner = "operator:many-children"
+        leases = [
+            lease(owner, f"path:/tmp/current-work/{index}", updated=100 + index)
+            for index in range(120)
+        ]
+        result = project(
+            resources_payload={
+                "leases": leases,
+                "count": len(leases),
+                "truncated": False,
+            }
+        )
+        self.assertEqual(result["total_projected"], 1)
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"operation:{owner}")
+        self.assertEqual(group["lease_summary"]["count"], 120)
+        self.assertEqual(group["lease_summary"]["resource_classes"], {"path": 120})
+        self.assertEqual(len(group["lease_refs"]), current_work.MAX_EVIDENCE)
+        self.assertTrue(group["lease_summary"]["sample_truncated"])
+        self.assertEqual(group["surface_counts"]["leases"], 120)
+
+    def test_shared_repository_leases_stay_separate_by_explicit_owner(self) -> None:
+        first_owner = "operator:first-operation"
+        second_owner = "operator:second-operation"
+        result = project(
+            resources_payload={
+                "leases": [
+                    lease(first_owner, f"repo:{REPOSITORY}:operation:first"),
+                    lease(second_owner, f"repo:{REPOSITORY}:operation:second"),
+                ],
+                "count": 2,
+                "truncated": False,
+            }
+        )
+        groups = {item["work_id"]: item for item in result["work"]}
+        self.assertEqual(
+            set(groups),
+            {f"operation:{first_owner}", f"operation:{second_owner}"},
+        )
+        self.assertEqual(groups[f"operation:{first_owner}"]["lease_summary"]["count"], 1)
+        self.assertEqual(groups[f"operation:{second_owner}"]["lease_summary"]["count"], 1)
+        self.assertEqual(
+            groups[f"operation:{first_owner}"]["explicit_bindings"][0]["kind"],
+            "operation",
+        )
+
+    def test_task_proximity_is_heuristic_and_never_checkout_authority(self) -> None:
+        result = project(
+            tasks_payload={
+                "tasks": [task("near1"), task("near2")],
+                "pagination": {"has_more": False},
+            },
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "heuristic-one",
+                            REPOSITORY,
+                            task_ids=["near1", "near2"],
+                            blocking=True,
+                        )
+                    ],
+                }
+            ],
+        )
+        checkout_group = next(item for item in result["work"] if item["checkout_refs"])
+        self.assertEqual(checkout_group["work_id"], "checkout:heuristic-one")
+        self.assertEqual(checkout_group["binding_status"], "checkout-bound")
+        self.assertEqual(
+            {ref["candidate_work_id"] for ref in checkout_group["heuristic_refs"]},
+            {"task:near1", "task:near2"},
+        )
+        self.assertFalse(
+            any(ref.get("source") == "task-ledger" for ref in checkout_group["authority_refs"])
+        )
+        self.assertIn("heuristic-relations-present", checkout_group["observation"]["uncertainty"]["reasons"])
+
+    def test_source_truncation_marks_each_group_partial_with_uncertainty(self) -> None:
+        result = project(
+            tasks_payload={
+                "tasks": [task("partial1")],
+                "pagination": {"has_more": True},
+            },
+            source_errors=[{"source": "checkout", "error": "unavailable"}],
+        )
+        group = result["work"][0]
+        self.assertEqual(group["observation"]["completeness"], "partial")
+        self.assertEqual(group["observation"]["uncertainty"]["level"], "medium")
+        reasons = group["observation"]["uncertainty"]["reasons"]
+        self.assertTrue(any(reason.startswith("truncated-sources:") for reason in reasons))
+        self.assertTrue(any(reason.startswith("source-errors:") for reason in reasons))
+
+    def test_checkout_exposes_exact_path_and_branch_bindings_for_drilldown(self) -> None:
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "bound-path-branch",
+                            "/home/alex/repos/.worktrees/bound-path-branch",
+                            dirty=True,
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        binding_kinds = {item["kind"] for item in group["explicit_bindings"]}
+        self.assertEqual(binding_kinds, {"path", "branch"})
+        self.assertEqual(
+            group["drill_down_refs"][0],
+            {"surface": "grabowski_checkout_inventory", "repository": REPOSITORY},
+        )
+
 
 
 if __name__ == "__main__":
