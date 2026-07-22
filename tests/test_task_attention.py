@@ -573,6 +573,8 @@ class TaskAttentionTests(unittest.TestCase):
         )
 
     def test_attention_list_holds_decision_snapshot_through_row_materialization(self) -> None:
+        deferred = self._failed_task()
+        attention.record_decision(self._parameters(deferred, decision="deferred"))
         record = self._failed_task()
         parameters = self._parameters(record, decision="closed")
         original_rows = tasks._task_list_current_rows
@@ -623,12 +625,13 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertTrue(writer_finished.is_set())
         self.assertEqual([], writer_errors)
         self.assertTrue(publish_reached.is_set())
-        self.assertEqual(1, listed["count"])
-        self.assertEqual(record["task_id"], listed["tasks"][0]["task_id"])
+        self.assertEqual(2, listed["count"])
+        self.assertIn(record["task_id"], {item["task_id"] for item in listed["tasks"]})
 
         after = tasks.grabowski_task_list(state="attention")
-        self.assertEqual(0, after["count"])
-        self.assertEqual(0, after["total_matching"])
+        self.assertEqual(1, after["count"])
+        self.assertEqual(1, after["total_matching"])
+        self.assertEqual(deferred["task_id"], after["tasks"][0]["task_id"])
 
     def test_task_list_attention_uses_decision_aware_current_projection(self) -> None:
         closed = self._failed_task()
@@ -665,6 +668,10 @@ class TaskAttentionTests(unittest.TestCase):
 
     def test_task_list_attention_degrades_to_raw_visibility_on_evidence_error(self) -> None:
         failed = self._failed_task()
+        self.decisions.mkdir(parents=True, mode=0o700)
+        lock_path = self.decisions / ".lock"
+        lock_path.write_bytes(b"")
+        os.chmod(lock_path, 0o600)
 
         with patch.object(
             attention,
@@ -690,8 +697,22 @@ class TaskAttentionTests(unittest.TestCase):
             listed["recommended_next_action"],
         )
 
+    def test_task_list_attention_does_not_create_absent_decision_store(self) -> None:
+        failed = self._failed_task()
+        self.assertFalse(self.decisions.exists())
+
+        listed = tasks.grabowski_task_list(state="attention")
+
+        self.assertFalse(self.decisions.exists())
+        self.assertEqual(1, listed["count"])
+        self.assertEqual(failed["task_id"], listed["tasks"][0]["task_id"])
+        self.assertEqual("verified", listed["attention_projection"]["status"])
+        self.assertEqual(0, listed["attention_projection"]["decision_candidate_count"])
+        self.assertEqual(0, listed["attention_projection"]["excluded_attention_count"])
+
     def test_task_list_attention_degrades_to_raw_visibility_on_decision_lock_error(self) -> None:
         failed = self._failed_task()
+        self.decisions.mkdir(parents=True, mode=0o700)
 
         class BrokenLock:
             def __enter__(self):

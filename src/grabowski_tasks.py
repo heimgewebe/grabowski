@@ -2274,7 +2274,7 @@ def _task_attention_projection(
     connection: sqlite3.Connection,
     projection: dict[str, Any],
     *,
-    evidence_error: str | None = None,
+    decision_snapshot: dict[str, str | None] | None = None,
 ) -> tuple[dict[str, Any], set[str]]:
     import grabowski_task_attention as task_attention
 
@@ -2318,8 +2318,54 @@ def _task_attention_projection(
             set(),
         )
 
-    if evidence_error is not None:
-        return degraded(evidence_error)
+    snapshot_status = (decision_snapshot or {}).get("status", "locked")
+    snapshot_error = (decision_snapshot or {}).get("evidence_error")
+    if snapshot_status == "degraded":
+        return degraded(str(snapshot_error or "TaskAttentionDecisionSnapshotError"))
+    if snapshot_status == "absent":
+        task_bindings = [
+            {
+                "task_id": str(record["task_id"]),
+                "attempt": int(record["attempt"]),
+                "unit": str(record["unit"]),
+                "authoritative_unit": str(record["authoritative_unit"]),
+                "argv_sha256": str(record["argv_sha256"]),
+                "execution_envelope_sha256": record["execution_envelope_sha256"],
+                "state": str(record["state"]),
+            }
+            for record in records
+        ]
+        return (
+            {
+                "status": "verified",
+                "evidence_error": None,
+                "projection_sha256": _sha256_json(
+                    {
+                        "schema_version": 1,
+                        "task_bindings": sorted(
+                            task_bindings,
+                            key=lambda item: str(item["task_id"]),
+                        ),
+                        "excluded_task_ids": [],
+                        "decision_classification_counts": {},
+                    }
+                ),
+                "raw_attention_count": len(records),
+                "current_attention_count": len(records),
+                "excluded_attention_count": 0,
+                "excluded_classification_counts": {
+                    classification: 0
+                    for classification in sorted(
+                        task_attention.CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS
+                    )
+                },
+                "decision_candidate_count": 0,
+                "decision_classification_counts": {},
+                "scope": "current_task_projection_after_valid_attention_decisions",
+                "raw_scope": "current_task_projection_before_attention_decisions",
+            },
+            set(),
+        )
     try:
         projected = task_attention.current_attention_projection(records)
     except (
@@ -3469,11 +3515,11 @@ def grabowski_task_list(
         # projection through cursor validation and row materialization so a
         # create-only closeout write cannot split one attention read across two
         # decision-store generations. Writers use the same lock exclusively.
-        with task_attention.decision_snapshot_guard() as decision_lock_error:
+        with task_attention.decision_snapshot_guard() as decision_snapshot:
             attention_projection, attention_excluded_task_ids = _task_attention_projection(
                 connection,
                 current_projection,
-                evidence_error=decision_lock_error,
+                decision_snapshot=decision_snapshot,
             )
             if (
                 attention_projection["raw_attention_count"]

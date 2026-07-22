@@ -187,11 +187,13 @@ def _read_private_json(path: Path, *, label: str) -> tuple[dict[str, Any], str]:
 
 
 @contextmanager
-def _state_lock(*, shared: bool = False) -> Iterator[None]:
+def _state_lock(*, shared: bool = False, create: bool = True) -> Iterator[None]:
     root = _state_root()
-    _ensure_private_directory(root, create=True)
+    _ensure_private_directory(root, create=create)
     lock_path = root / ".lock"
-    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    flags = os.O_RDWR | os.O_CLOEXEC
+    if create:
+        flags |= os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(lock_path, flags, 0o600)
@@ -225,21 +227,34 @@ def _state_lock(*, shared: bool = False) -> Iterator[None]:
 @contextmanager
 def decision_snapshot_lock() -> Iterator[None]:
     """Hold a shared snapshot boundary against create-only decision writes."""
-    with _state_lock(shared=True):
+    with _state_lock(shared=True, create=False):
         yield
 
 
 @contextmanager
-def decision_snapshot_guard() -> Iterator[str | None]:
-    """Yield a lock error name instead of hiding raw attention on lock failure."""
+def decision_snapshot_guard() -> Iterator[dict[str, str | None]]:
+    """Return one stable decision-store generation without read-side creation."""
+    root = _state_root()
+    try:
+        _ensure_private_directory(root, create=False)
+    except FileNotFoundError:
+        # Linearize an absent decision store at this observation. A writer may
+        # create the store afterwards, but this read remains a valid pre-write
+        # snapshot and the next attention cursor will bind the newer generation.
+        yield {"status": "absent", "evidence_error": None}
+        return
+    except (TaskAttentionError, OSError) as exc:
+        yield {"status": "degraded", "evidence_error": type(exc).__name__}
+        return
+
     lock = decision_snapshot_lock()
     try:
         lock.__enter__()
-    except (TaskAttentionError, OSError) as exc:
-        yield type(exc).__name__
+    except (FileNotFoundError, TaskAttentionError, OSError) as exc:
+        yield {"status": "degraded", "evidence_error": type(exc).__name__}
         return
     try:
-        yield None
+        yield {"status": "locked", "evidence_error": None}
     finally:
         lock.__exit__(None, None, None)
 
