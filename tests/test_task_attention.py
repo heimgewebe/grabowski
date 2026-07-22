@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest.mock import patch
@@ -548,6 +549,87 @@ class TaskAttentionTests(unittest.TestCase):
         )
         self.assertRegex(projection["projection_sha256"], r"^[0-9a-f]{64}$")
 
+    def test_task_current_records_for_states_batches_lifecycle_projection(self) -> None:
+        records = [self._failed_task() for _ in range(3)]
+        projection = tasks._task_current_projection()
+        original = tasks.lifecycle_projection.bounded_current_task_projection
+
+        with tasks._task_read_snapshot() as connection, patch.object(
+            tasks.lifecycle_projection,
+            "bounded_current_task_projection",
+            wraps=original,
+        ) as bounded:
+            current = tasks._task_current_records_for_states(
+                connection,
+                states=tasks.TASK_STATE_PROJECTIONS["attention"],
+                projection=projection,
+            )
+
+        self.assertEqual(1, bounded.call_count)
+        self.assertEqual(3, len(bounded.call_args.args[0]))
+        self.assertEqual(
+            {str(record["task_id"]) for record in records},
+            {str(record["task_id"]) for record in current},
+        )
+
+    def test_attention_list_holds_decision_snapshot_through_row_materialization(self) -> None:
+        record = self._failed_task()
+        parameters = self._parameters(record, decision="closed")
+        original_rows = tasks._task_list_current_rows
+        original_publish = attention.private_io.publish_private_create_only_json
+        writer_started = threading.Event()
+        publish_reached = threading.Event()
+        writer_finished = threading.Event()
+        writer_errors: list[BaseException] = []
+        writer_threads: list[threading.Thread] = []
+
+        def observed_publish(*args, **kwargs):
+            publish_reached.set()
+            return original_publish(*args, **kwargs)
+
+        def writer() -> None:
+            writer_started.set()
+            try:
+                attention.record_decision(parameters)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                writer_errors.append(exc)
+            finally:
+                writer_finished.set()
+
+        def rows_while_writer_waits(*args, **kwargs):
+            thread = threading.Thread(target=writer, daemon=True)
+            writer_threads.append(thread)
+            thread.start()
+            self.assertTrue(writer_started.wait(1.0))
+            self.assertFalse(
+                publish_reached.wait(0.1),
+                "decision writer reached publication while attention rows were materializing",
+            )
+            return original_rows(*args, **kwargs)
+
+        with patch.object(
+            attention.private_io,
+            "publish_private_create_only_json",
+            side_effect=observed_publish,
+        ), patch.object(
+            tasks,
+            "_task_list_current_rows",
+            side_effect=rows_while_writer_waits,
+        ):
+            listed = tasks.grabowski_task_list(state="attention")
+            self.assertEqual(1, len(writer_threads))
+            writer_threads[0].join(timeout=2.0)
+
+        self.assertTrue(writer_finished.is_set())
+        self.assertEqual([], writer_errors)
+        self.assertTrue(publish_reached.is_set())
+        self.assertEqual(1, listed["count"])
+        self.assertEqual(record["task_id"], listed["tasks"][0]["task_id"])
+
+        after = tasks.grabowski_task_list(state="attention")
+        self.assertEqual(0, after["count"])
+        self.assertEqual(0, after["total_matching"])
+
     def test_task_list_attention_uses_decision_aware_current_projection(self) -> None:
         closed = self._failed_task()
         attention.record_decision(self._parameters(closed, decision="closed"))
@@ -607,6 +689,33 @@ class TaskAttentionTests(unittest.TestCase):
             "repair attention projection evidence before relying on closeout filtering",
             listed["recommended_next_action"],
         )
+
+    def test_task_list_attention_degrades_to_raw_visibility_on_decision_lock_error(self) -> None:
+        failed = self._failed_task()
+
+        class BrokenLock:
+            def __enter__(self):
+                raise attention.TaskAttentionIntegrityError("unsafe decision lock")
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with patch.object(
+            attention,
+            "decision_snapshot_lock",
+            return_value=BrokenLock(),
+        ):
+            listed = tasks.grabowski_task_list(state="attention")
+
+        self.assertEqual(1, listed["count"])
+        self.assertEqual(failed["task_id"], listed["tasks"][0]["task_id"])
+        self.assertEqual("degraded", listed["attention_projection"]["status"])
+        self.assertEqual(
+            "TaskAttentionIntegrityError",
+            listed["attention_projection"]["evidence_error"],
+        )
+        self.assertEqual(0, listed["attention_projection"]["excluded_attention_count"])
+        self.assertIsNone(listed["attention_projection"]["decision_candidate_count"])
 
     def test_attention_cursor_is_invalidated_by_new_closeout_decision(self) -> None:
         first = self._failed_task()

@@ -187,7 +187,7 @@ def _read_private_json(path: Path, *, label: str) -> tuple[dict[str, Any], str]:
 
 
 @contextmanager
-def _state_lock() -> Iterator[None]:
+def _state_lock(*, shared: bool = False) -> Iterator[None]:
     root = _state_root()
     _ensure_private_directory(root, create=True)
     lock_path = root / ".lock"
@@ -205,9 +205,10 @@ def _state_lock() -> Iterator[None]:
         ):
             raise TaskAttentionIntegrityError("task attention lock is unsafe")
         deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        lock_mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(descriptor, lock_mode | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -219,6 +220,28 @@ def _state_lock() -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+
+@contextmanager
+def decision_snapshot_lock() -> Iterator[None]:
+    """Hold a shared snapshot boundary against create-only decision writes."""
+    with _state_lock(shared=True):
+        yield
+
+
+@contextmanager
+def decision_snapshot_guard() -> Iterator[str | None]:
+    """Yield a lock error name instead of hiding raw attention on lock failure."""
+    lock = decision_snapshot_lock()
+    try:
+        lock.__enter__()
+    except (TaskAttentionError, OSError) as exc:
+        yield type(exc).__name__
+        return
+    try:
+        yield None
+    finally:
+        lock.__exit__(None, None, None)
 
 
 def _task_binding(record: dict[str, Any]) -> dict[str, Any]:

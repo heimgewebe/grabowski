@@ -2256,22 +2256,25 @@ def _task_current_records_for_states(
         "ORDER BY created_at_unix DESC, task_id DESC",
         states,
     ).fetchall()
-    current_records: list[dict[str, Any]] = []
-    for row in rows:
-        raw = dict(row)
-        archive_record = _task_archive_record(raw)
-        current = lifecycle_projection.bounded_current_task_projection(
-            [archive_record],
-            projection=projection,
-        )
-        if current:
-            current_records.append(raw)
-    return current_records
+    raw_records = [dict(row) for row in rows]
+    archive_records = [_task_archive_record(record) for record in raw_records]
+    current_archive_records = lifecycle_projection.bounded_current_task_projection(
+        archive_records,
+        projection=projection,
+    )
+    current_task_ids = {str(record["task_id"]) for record in current_archive_records}
+    return [
+        record
+        for record in raw_records
+        if str(record["task_id"]) in current_task_ids
+    ]
 
 
 def _task_attention_projection(
     connection: sqlite3.Connection,
     projection: dict[str, Any],
+    *,
+    evidence_error: str | None = None,
 ) -> tuple[dict[str, Any], set[str]]:
     import grabowski_task_attention as task_attention
 
@@ -2280,13 +2283,8 @@ def _task_attention_projection(
         states=TASK_STATE_PROJECTIONS["attention"],
         projection=projection,
     )
-    try:
-        projected = task_attention.current_attention_projection(records)
-    except (
-        task_attention.TaskAttentionError,
-        task_attention.TaskAttentionInputError,
-        OSError,
-    ) as exc:
+
+    def degraded(error_name: str) -> tuple[dict[str, Any], set[str]]:
         raw_bindings = [
             {
                 "task_id": str(record["task_id"]),
@@ -2299,12 +2297,12 @@ def _task_attention_projection(
         return (
             {
                 "status": "degraded",
-                "evidence_error": type(exc).__name__,
+                "evidence_error": error_name,
                 "projection_sha256": _sha256_json(
                     {
                         "schema_version": 1,
                         "status": "degraded",
-                        "evidence_error": type(exc).__name__,
+                        "evidence_error": error_name,
                         "task_bindings": raw_bindings,
                     }
                 ),
@@ -2319,6 +2317,17 @@ def _task_attention_projection(
             },
             set(),
         )
+
+    if evidence_error is not None:
+        return degraded(evidence_error)
+    try:
+        projected = task_attention.current_attention_projection(records)
+    except (
+        task_attention.TaskAttentionError,
+        task_attention.TaskAttentionInputError,
+        OSError,
+    ) as exc:
+        return degraded(type(exc).__name__)
     excluded_task_ids = set(projected["excluded_task_ids"])
     public_projection = {
         key: value
@@ -3454,66 +3463,74 @@ def grabowski_task_list(
             projected_state_counts,
             projected_unknown_state_count,
         )
-        attention_projection, attention_excluded_task_ids = _task_attention_projection(
-            connection,
-            current_projection,
-        )
-        if (
-            attention_projection["raw_attention_count"]
-            != raw_projection_counts["attention"]
-        ):
-            raise lifecycle_projection.LifecycleProjectionIntegrityError(
-                "decision-aware attention projection does not match current raw attention count"
+        import grabowski_task_attention as task_attention
+
+        # Decision files live outside SQLite. Hold the shared decision lock from
+        # projection through cursor validation and row materialization so a
+        # create-only closeout write cannot split one attention read across two
+        # decision-store generations. Writers use the same lock exclusively.
+        with task_attention.decision_snapshot_guard() as decision_lock_error:
+            attention_projection, attention_excluded_task_ids = _task_attention_projection(
+                connection,
+                current_projection,
+                evidence_error=decision_lock_error,
             )
-        projection_counts = dict(raw_projection_counts)
-        projection_counts["attention"] = attention_projection["current_attention_count"]
-        list_snapshot_sha256 = projection_sha256
-        if state == "attention":
-            list_snapshot_sha256 = _sha256_json(
-                {
-                    "archive_projection_sha256": projection_sha256,
-                    "attention_projection_sha256": attention_projection[
-                        "projection_sha256"
-                    ],
-                }
-            )
-        scope = f"{snapshot_scope}:{list_snapshot_sha256}"
-        position = consumer_surface.decode_cursor(
-            cursor,
-            scope,
-            snapshot_scope=snapshot_scope,
-        )
-        cursor_created_at: int | None = None
-        cursor_task_id: str | None = None
-        if position is not None:
-            cursor_created_at = position.get("created_at_unix")
-            cursor_task_id = position.get("task_id")
             if (
-                isinstance(cursor_created_at, bool)
-                or not isinstance(cursor_created_at, int)
-                or cursor_created_at < 0
-                or not isinstance(cursor_task_id, str)
-                or not TASK_ID.fullmatch(cursor_task_id)
+                attention_projection["raw_attention_count"]
+                != raw_projection_counts["attention"]
             ):
-                raise ValueError("cursor position is invalid")
-        rows = _task_list_current_rows(
-            connection,
-            where=where,
-            parameters=parameters,
-            cursor_created_at=cursor_created_at,
-            cursor_task_id=cursor_task_id,
-            limit=limit,
-            projection=current_projection,
-            excluded_task_ids=(
-                attention_excluded_task_ids if state == "attention" else None
-            ),
-        )
-        if filter_states is None:
-            total_matching = sum(state_counts.values()) + unknown_state_count
-        elif state == "attention":
-            total_matching = projection_counts["attention"]
-        else:
-            total_matching = sum(state_counts[item] for item in filter_states)
+                raise lifecycle_projection.LifecycleProjectionIntegrityError(
+                    "decision-aware attention projection does not match current raw attention count"
+                )
+            projection_counts = dict(raw_projection_counts)
+            projection_counts["attention"] = attention_projection["current_attention_count"]
+            list_snapshot_sha256 = projection_sha256
+            if state == "attention":
+                list_snapshot_sha256 = _sha256_json(
+                    {
+                        "archive_projection_sha256": projection_sha256,
+                        "attention_projection_sha256": attention_projection[
+                            "projection_sha256"
+                        ],
+                    }
+                )
+            scope = f"{snapshot_scope}:{list_snapshot_sha256}"
+            position = consumer_surface.decode_cursor(
+                cursor,
+                scope,
+                snapshot_scope=snapshot_scope,
+            )
+            cursor_created_at: int | None = None
+            cursor_task_id: str | None = None
+            if position is not None:
+                cursor_created_at = position.get("created_at_unix")
+                cursor_task_id = position.get("task_id")
+                if (
+                    isinstance(cursor_created_at, bool)
+                    or not isinstance(cursor_created_at, int)
+                    or cursor_created_at < 0
+                    or not isinstance(cursor_task_id, str)
+                    or not TASK_ID.fullmatch(cursor_task_id)
+                ):
+                    raise ValueError("cursor position is invalid")
+            rows = _task_list_current_rows(
+                connection,
+                where=where,
+                parameters=parameters,
+                cursor_created_at=cursor_created_at,
+                cursor_task_id=cursor_task_id,
+                limit=limit,
+                projection=current_projection,
+                excluded_task_ids=(
+                    attention_excluded_task_ids if state == "attention" else None
+                ),
+            )
+            if filter_states is None:
+                total_matching = sum(state_counts.values()) + unknown_state_count
+            elif state == "attention":
+                total_matching = projection_counts["attention"]
+            else:
+                total_matching = sum(state_counts[item] for item in filter_states)
     projection_readback = _task_current_projection()
     if projection_readback.get("projection_sha256") != projection_sha256:
         raise lifecycle_projection.LifecycleProjectionIntegrityError(
