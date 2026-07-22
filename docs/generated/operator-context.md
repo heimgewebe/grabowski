@@ -175,6 +175,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_workspace_optimize` | agent-workspace | yes | low | Derive advisory cross-workspace optimization proposals from at least two immutable reports. |
 | `grabowski_agent_workspace_cleanup_plan` | agent-workspace | yes | low | Inventory closed workspace checkout cleanup eligibility while preserving manifests, receipts and event logs. |
 | `grabowski_agent_workspace_reconcile_stale` | agent-workspace | no | high | Mark one provably inactive stale workspace abandoned without stopping tasks, releasing resources or removing its checkout. |
+| `grabowski_agent_workspace_reconcile_idle_tmux` | agent-workspace | no | high | Remove only the exact non-authoritative idle tmux session from one provably inactive stale workspace, then invoke the existing non-destructive stale reconciliation. |
 | `grabowski_agent_workspace_cleanup` | agent-workspace | no | high | Create durable recovery refs and remove one eligible closed writer checkout without deleting workspace evidence. |
 | `grabowski_agent_execution_route` | agent-workspace | yes | low | Recommend a lean R0-R3 direct, isolated, full-workspace, contrast or explicitly fork-gated competition route while keeping parallel writers advisory-only. |
 | `grabowski_coding_agent_catalog` | agent-workspace | yes | low | Read the validated canonical coding-model, harness, route and quota inventory without probing or executing external agents. |

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "72fd9208be2aa3f5482864b46202d4754daad14fa8850dd525c66424802434a5",
+  "capability_source_sha256": "03101b30953fab1c719712cbceca180459f71adc2ef5c958f991f01f9a74a752",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "5272dd7e605a5e1cd66fe7379e9525681137c537f2bed406de2f4f3831f3fa90",
+  "contract_sha256": "ff98ed9e2ad26ee21cce59f41ed2ccab09a0034df17fd5a81003b6a2accf03aa",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1876,6 +1876,22 @@
       "reversibility": "historical-evidence-retained",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_reconcile_stale"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Remove one exact non-authoritative idle tmux session, then stale-reconcile the workspace.",
+      "effects": [
+        "audit-append",
+        "receipt-create",
+        "tmux-session-remove",
+        "workspace-event-append"
+      ],
+      "id": "grabowski_agent_workspace_reconcile_idle_tmux",
+      "purpose": "Remove only the exact non-authoritative idle tmux session from one provably inactive stale workspace, then invoke the existing non-destructive stale reconciliation.",
+      "read_only": false,
+      "reversibility": "historical-evidence-retained",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_reconcile_idle_tmux"
     },
     {
       "category": "agent-workspace",
