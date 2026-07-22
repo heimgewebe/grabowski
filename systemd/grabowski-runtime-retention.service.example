@@ -12,7 +12,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
-PrivateDevices=yes
+# PrivateDevices requires capability operations unavailable to this unprivileged systemd --user manager.
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 LockPersonality=yes
