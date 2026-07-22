@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import resource
 import stat
+import subprocess
 import sys
 import time
 from typing import Any
@@ -522,9 +523,45 @@ def finalize(directory: Path, environment: dict[str, str] | None = None) -> dict
         "reason": "queued" if created else "already_exists",
         "receipt": receipt,
     }
+    if created:
+        result["ntfy_dispatch_scheduled"] = _schedule_ntfy_dispatch(
+            payload["notification_id"], list(payload["requested_channels"])
+        )
     if finalization_result is not None:
         result["finalization"] = finalization_result
     return result
+
+
+def _schedule_ntfy_dispatch(notification_id: str, requested_channels: list[str]) -> bool:
+    if "ntfy" not in requested_channels:
+        return False
+    unit = f"grabowski-ntfy-dispatch-{notification_id}.service"
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/systemd-run",
+                "--user",
+                "--collect",
+                "--quiet",
+                "--no-block",
+                f"--unit={unit}",
+                "--property=Type=exec",
+                "--property=NoNewPrivileges=yes",
+                "--",
+                sys.executable,
+                "-I",
+                "-m",
+                "grabowski_ntfy_dispatch",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def _log_failure(stage: str, error: str) -> None:
