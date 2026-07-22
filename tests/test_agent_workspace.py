@@ -5641,7 +5641,7 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
             nonlocal session_live
-            self.assertEqual(argv, ["kill-session", "-t", f"={manifest['session_name']}"])
+            self.assertEqual(argv, ["kill-session", "-t", "$1"])
             self.assertEqual(timeout, 30)
             session_live = False
             return {"returncode": 0, "stdout": "", "stderr": ""}
@@ -5652,6 +5652,15 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
             mock.patch.object(workspace, "_tmux_has_exact_session", side_effect=has_session),
+            mock.patch.object(
+                workspace,
+                "_tmux_exact_session_identity",
+                side_effect=lambda session: (
+                    {"session_id": "$1", "session_created": 1784000000}
+                    if has_session(session)
+                    else None
+                ),
+            ),
             mock.patch.object(workspace, "_tmux_result", side_effect=tmux_result) as tmux,
             mock.patch.object(workspace.base, "_append_audit"),
             mock.patch.object(workspace, "_now", return_value=1784050000),
@@ -5705,7 +5714,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
             nonlocal session_live
             self.assertEqual(
-                argv, ["kill-session", "-t", f"={manifest['session_name']}"]
+                argv, ["kill-session", "-t", "$1"]
             )
             self.assertEqual(timeout, 30)
             session_live = False
@@ -5725,6 +5734,15 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
             mock.patch.object(
                 workspace, "_tmux_has_exact_session", side_effect=has_session
+            ),
+            mock.patch.object(
+                workspace,
+                "_tmux_exact_session_identity",
+                side_effect=lambda session: (
+                    {"session_id": "$1", "session_created": 1784000000}
+                    if has_session(session)
+                    else None
+                ),
             ),
             mock.patch.object(
                 workspace, "_tmux_result", side_effect=tmux_result
@@ -5804,7 +5822,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
             nonlocal session_live
             self.assertEqual(
-                argv, ["kill-session", "-t", f"={manifest['session_name']}"]
+                argv, ["kill-session", "-t", "$1"]
             )
             self.assertEqual(timeout, 30)
             session_live = False
@@ -5824,6 +5842,15 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
             mock.patch.object(
                 workspace, "_tmux_has_exact_session", side_effect=has_session
+            ),
+            mock.patch.object(
+                workspace,
+                "_tmux_exact_session_identity",
+                side_effect=lambda session: (
+                    {"session_id": "$1", "session_created": 1784000000}
+                    if has_session(session)
+                    else None
+                ),
             ),
             mock.patch.object(
                 workspace, "_tmux_result", side_effect=tmux_result
@@ -5881,6 +5908,125 @@ class AgentWorkspaceTests(unittest.TestCase):
             ]
         )
 
+    def test_idle_tmux_transition_retry_kills_only_same_session_lifetime(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        identity = {"session_id": "$41", "session_created": 1784050100}
+        session_live = True
+        kill_attempts = 0
+
+        def has_session(session: str) -> bool:
+            self.assertEqual(session, manifest["session_name"])
+            return session_live
+
+        def session_identity(session: str) -> dict | None:
+            self.assertEqual(session, manifest["session_name"])
+            return identity if session_live else None
+
+        def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
+            nonlocal session_live, kill_attempts
+            self.assertEqual(argv, ["kill-session", "-t", identity["session_id"]])
+            self.assertEqual(timeout, 30)
+            kill_attempts += 1
+            if kill_attempts == 1:
+                raise RuntimeError("simulated crash after intent before tmux effect")
+            session_live = False
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
+            mock.patch.object(workspace, "_tmux_has_exact_session", side_effect=has_session),
+            mock.patch.object(workspace, "_tmux_exact_session_identity", side_effect=session_identity),
+            mock.patch.object(workspace, "_tmux_result", side_effect=tmux_result) as tmux,
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan([manifest["workspace_id"]])["plans"][0]
+            with self.assertRaisesRegex(RuntimeError, "simulated crash after intent"):
+                workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                    manifest["workspace_id"], plan["plan_sha256"],
+                    "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+                )
+            intent = workspace._verified_idle_tmux_transition_intent(manifest["workspace_id"])
+            self.assertEqual(intent["session_identity"], identity)
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                manifest["workspace_id"], plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+            )
+
+        self.assertEqual(tmux.call_count, 2)
+        self.assertEqual(result["state"], "stale_workspace_reconciled")
+        self.assertTrue(result["tmux_mutation_performed_this_call"])
+        self.assertTrue(result["recovered_after_ambiguous_effect"])
+        self.assertEqual(result["idle_tmux_transition_receipt"]["session_identity"], identity)
+
+    def test_idle_tmux_transition_refuses_recreated_same_name_session_without_kill(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        original = {"session_id": "$51", "session_created": 1784050200}
+        recreated = {"session_id": "$52", "session_created": 1784050300}
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_exact_session_identity", return_value=recreated),
+            mock.patch.object(workspace, "_tmux_result") as tmux,
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan([manifest["workspace_id"]])["plans"][0]
+            workspace._prepare_idle_tmux_transition_intent(
+                manifest["workspace_id"], source_plan_sha256=plan["plan_sha256"],
+                session_name=manifest["session_name"], session_identity=original,
+            )
+            with self.assertRaisesRegex(workspace.AgentWorkspaceActionError, "recreated same-name session"):
+                workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                    manifest["workspace_id"], plan["plan_sha256"],
+                    "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+                )
+        tmux.assert_not_called()
+
+    def test_idle_tmux_transition_legacy_intent_refuses_live_session_without_kill(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_exact_session_identity", return_value={"session_id": "$61", "session_created": 1784050400}),
+            mock.patch.object(workspace, "_tmux_result") as tmux,
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan([manifest["workspace_id"]])["plans"][0]
+            body = {
+                "schema_version": 1, "kind": "grabowski_agent_workspace_idle_tmux_transition_intent",
+                "workspace_id": manifest["workspace_id"], "source_plan_sha256": plan["plan_sha256"],
+                "session_name": manifest["session_name"], "prepared_at": "2026-07-22T10:00:00+00:00",
+                "mutation_performed": False, "historical_evidence_preserved": True,
+            }
+            workspace._atomic_json(
+                workspace._idle_tmux_transition_intent_path(manifest["workspace_id"]),
+                {**body, "intent_sha256": workspace._sha256_json(body)},
+            )
+            with self.assertRaisesRegex(workspace.AgentWorkspaceActionError, "legacy idle tmux transition intent"):
+                workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                    manifest["workspace_id"], plan["plan_sha256"],
+                    "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+                )
+        tmux.assert_not_called()
+
     def test_idle_tmux_transition_refuses_other_stale_blockers_without_kill(self) -> None:
         manifest = self.manifest()
         manifest["created_at"] = "2026-01-01T00:00:00+00:00"
@@ -5934,7 +6080,7 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
             nonlocal session_live
-            self.assertEqual(argv, ["kill-session", "-t", f"={manifest['session_name']}"])
+            self.assertEqual(argv, ["kill-session", "-t", "$1"])
             self.assertEqual(timeout, 30)
             session_live = False
             return {"returncode": 0, "stdout": "", "stderr": ""}
@@ -5949,6 +6095,15 @@ class AgentWorkspaceTests(unittest.TestCase):
             ),
             mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
             mock.patch.object(workspace, "_tmux_has_exact_session", side_effect=has_session),
+            mock.patch.object(
+                workspace,
+                "_tmux_exact_session_identity",
+                side_effect=lambda session: (
+                    {"session_id": "$1", "session_created": 1784000000}
+                    if has_session(session)
+                    else None
+                ),
+            ),
             mock.patch.object(workspace, "_tmux_result", side_effect=tmux_result),
             mock.patch.object(workspace.base, "_append_audit"),
             mock.patch.object(workspace, "_now", return_value=1784050000),
