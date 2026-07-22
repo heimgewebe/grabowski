@@ -3077,6 +3077,66 @@ else:
         self.assertNotIn("sensitive historical output", json.dumps(result))
         self.assertIn("unredacted", result["failure"]["contract_error"])
 
+    def test_history_rejects_event_outside_requested_target_without_exposure(self) -> None:
+        event = json.loads(self.source.read_text(encoding="utf-8"))
+        event["subject"]["repo"] = "heimgewebe/other"
+        event["event_id"] = tasks.chronik.event_id(event)
+        history = {
+            "schema_version": "chronik-coding-history.v1",
+            "query": {
+                "repo": "heimgewebe/grabowski",
+                "host": None,
+                "component": None,
+                "operation": "implement",
+                "task_class": None,
+                "outcome": None,
+                "since": None,
+                "limit": 1,
+            },
+            "events": [event],
+            "event_ids": [event["event_id"]],
+            "historical_only": True,
+            "does_not_establish": [
+                "current_git_state",
+                "current_ci_state",
+                "current_runtime_state",
+                "safe_retry",
+            ],
+        }
+        execution = {
+            "returncode": 0,
+            "stdout": json.dumps(history),
+            "stderr": "",
+            "timed_out": False,
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_capability"),
+            patch.object(
+                tasks,
+                "_chronik_cli_run",
+                return_value=({"available": True}, execution),
+            ),
+        ):
+            result = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski", operation="implement", limit=1
+            )
+        self.assertFalse(result["available"])
+        self.assertEqual([], result["events"])
+        self.assertIn("unbound", result["failure"]["contract_error"])
+        self.assertNotIn("heimgewebe/other", json.dumps(result))
+
+    def test_history_rejects_invalid_since_before_cli_execution(self) -> None:
+        with (
+            patch.object(tasks.operator, "_require_operator_capability"),
+            patch.object(tasks, "_chronik_cli_run") as cli_run,
+        ):
+            with self.assertRaisesRegex(ValueError, "ISO-8601"):
+                tasks.grabowski_chronik_history(
+                    repo="heimgewebe/grabowski", since="not-a-timestamp"
+                )
+        cli_run.assert_not_called()
+
+
     def test_history_rejects_cli_result_bound_to_different_query(self) -> None:
         source = self.cli.read_text(encoding="utf-8")
         self.cli.write_text(
