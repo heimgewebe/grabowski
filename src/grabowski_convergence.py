@@ -33,18 +33,26 @@ STATUS_EXIT_CODES = {
     "source_stale": 5,
     "blocked": 6,
 }
-EXPECTED_ASSESSMENT_KEYS = frozenset(
+COMMON_ASSESSMENT_KEYS = frozenset(
     {
         "assessment_id",
         "blocked_by",
         "conflicts",
         "missing_evidence",
         "profile_sha256",
-        "risk_level",
         "schema_version",
         "status",
     }
 )
+EXPECTED_ASSESSMENT_KEYS_BY_VERSION = {
+    1: COMMON_ASSESSMENT_KEYS | {"risk_level"},
+    2: COMMON_ASSESSMENT_KEYS
+    | {"change_risk", "target_criticality", "profile_id", "profile_cell_id"},
+}
+ASSESSMENT_STRING_FIELDS_BY_VERSION = {
+    1: ("risk_level",),
+    2: ("change_risk", "target_criticality", "profile_id", "profile_cell_id"),
+}
 GitRunner = Callable[[Path, list[str]], dict[str, Any]]
 EvaluatorRunner = Callable[[Path, list[str]], dict[str, Any]]
 
@@ -193,23 +201,35 @@ def _validate_protocol_identity(
 
 
 def _validate_assessment(value: Any, returncode: int) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != EXPECTED_ASSESSMENT_KEYS:
+    if not isinstance(value, dict):
+        raise ConvergenceExecutionError("convergence evaluator returned an unexpected assessment shape")
+    schema_version = value.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in EXPECTED_ASSESSMENT_KEYS_BY_VERSION
+    ):
+        raise ConvergenceExecutionError("convergence evaluator schema version is unsupported")
+    if set(value) != EXPECTED_ASSESSMENT_KEYS_BY_VERSION[schema_version]:
         raise ConvergenceExecutionError("convergence evaluator returned an unexpected assessment shape")
     status_value = value.get("status")
     if not isinstance(status_value, str) or status_value not in ALLOWED_STATUSES:
         raise ConvergenceExecutionError("convergence evaluator returned an unsupported status")
     if STATUS_EXIT_CODES[status_value] != returncode:
         raise ConvergenceExecutionError("convergence evaluator status and exit code disagree")
-    if value.get("schema_version") != 1:
-        raise ConvergenceExecutionError("convergence evaluator schema version is unsupported")
     for field in ("blocked_by", "conflicts", "missing_evidence"):
         items = value.get(field)
         if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
             raise ConvergenceExecutionError(f"convergence evaluator field {field} is invalid")
-    for field in ("assessment_id", "profile_sha256", "risk_level"):
+    for field in (
+        "assessment_id",
+        "profile_sha256",
+        *ASSESSMENT_STRING_FIELDS_BY_VERSION[schema_version],
+    ):
         if not isinstance(value.get(field), str) or not value[field]:
             raise ConvergenceExecutionError(f"convergence evaluator field {field} is invalid")
-    _validate_sha256(value["profile_sha256"], label="assessment.profile_sha256")
+    if SHA256_RE.fullmatch(value["profile_sha256"]) is None:
+        raise ConvergenceExecutionError("convergence evaluator field profile_sha256 is invalid")
     return value
 
 

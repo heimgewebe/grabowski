@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import errno
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -196,6 +197,13 @@ OBSERVER_SAFETY_REPAIR_MARKER = "observer_safety_repair_retained_v1"
 OPERATOR_LISTENER_HOST = "127.0.0.1"
 OPERATOR_LISTENER_PORT = 18181
 OPERATOR_LISTENER_REQUIRED_SAMPLES = 2
+TUNNEL_METRICS_URL = core.HEALTH_URL.rsplit("/", 1)[0] + "/metrics"
+TUNNEL_DRAIN_METRIC_NAMES = (
+    "commands_queue_length",
+    "dispatcher_worker_pool_occupancy",
+)
+TUNNEL_DRAIN_REQUIRED_IDLE_SAMPLES = 3
+TUNNEL_DRAIN_SAMPLE_INTERVAL_SECONDS = 0.1
 OPERATOR_HTTP_ARGUMENTS = (
     "--transport",
     "streamable-http",
@@ -2238,6 +2246,96 @@ def wait_until_ready(timeout_seconds: int) -> DualReadiness:
     return readiness_probe(include_journal=True)
 
 
+def _parse_tunnel_drain_metrics(text: str) -> dict[str, float]:
+    observed: dict[str, float] = {}
+    duplicates: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for name in TUNNEL_DRAIN_METRIC_NAMES:
+            if not (line.startswith(name + " ") or line.startswith(name + "{")):
+                continue
+            metric, separator, value_text = line.rpartition(" ")
+            if not separator or not (metric == name or metric.startswith(name + "{")):
+                continue
+            if name in observed:
+                duplicates.append(name)
+                continue
+            try:
+                value = float(value_text)
+            except ValueError:
+                core.fail(
+                    "Tunnel-Drain-Metrik ist nicht numerisch",
+                    phase="tunnel-drain-metrics",
+                    details={"metric": name},
+                )
+            if not math.isfinite(value) or value < 0:
+                core.fail(
+                    "Tunnel-Drain-Metrik hat einen unzulässigen Wert",
+                    phase="tunnel-drain-metrics",
+                    details={"metric": name, "value": value_text},
+                )
+            observed[name] = value
+    missing = [name for name in TUNNEL_DRAIN_METRIC_NAMES if name not in observed]
+    if duplicates or missing:
+        core.fail(
+            "Tunnel-Drain-Metriken sind nicht eindeutig vollständig",
+            phase="tunnel-drain-metrics",
+            details={
+                "duplicate_metrics": sorted(set(duplicates)),
+                "missing_metrics": missing,
+                "observed": observed,
+            },
+        )
+    return observed
+
+
+def wait_for_tunnel_dispatcher_idle(*, timeout_seconds: int) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    consecutive_idle = 0
+    attempts = 0
+    last_observed: dict[str, float] = {}
+    last_error: dict[str, Any] | None = None
+    while True:
+        attempts += 1
+        metrics_text = core.http_text(TUNNEL_METRICS_URL)
+        if metrics_text is None:
+            consecutive_idle = 0
+            last_error = {"reason": "metrics-unavailable"}
+        else:
+            try:
+                observed = _parse_tunnel_drain_metrics(metrics_text)
+            except core.DeployError as exc:
+                consecutive_idle = 0
+                last_error = _error_summary(exc)
+            else:
+                last_observed = observed
+                idle = all(observed[name] == 0 for name in TUNNEL_DRAIN_METRIC_NAMES)
+                consecutive_idle = consecutive_idle + 1 if idle else 0
+                last_error = None
+                if consecutive_idle >= TUNNEL_DRAIN_REQUIRED_IDLE_SAMPLES:
+                    return {
+                        "attempts": attempts,
+                        "consecutive_idle_samples": consecutive_idle,
+                        "metrics": observed,
+                    }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(TUNNEL_DRAIN_SAMPLE_INTERVAL_SECONDS, remaining))
+    core.fail(
+        "Tunnel-Dispatcher wurde vor geplantem Stop nicht nachweislich leer",
+        phase="tunnel-drain-pre-stop",
+        details={
+            "attempts": attempts,
+            "required_consecutive_idle_samples": TUNNEL_DRAIN_REQUIRED_IDLE_SAMPLES,
+            "last_observed": last_observed,
+            "last_error": last_error,
+        },
+    )
+
+
 def stop_service(unit: str) -> core.ServiceObservation:
     result = core.run(
         ["systemctl", "--user", "stop", unit],
@@ -2456,6 +2554,8 @@ def deploy_url(
     phase = "post-host-assets-snapshot-revalidation"
     try:
         core.verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
+        phase = "tunnel-drain-pre-stop"
+        wait_for_tunnel_dispatcher_idle(timeout_seconds=timeout_seconds)
         phase = "stop-tunnel"
         stop_service(TUNNEL_SERVICE)
         phase = "stop-operator"
@@ -2566,6 +2666,10 @@ def deploy_url(
                 "Deployment und Watchdog-Host-Asset-Rücksicherung fehlgeschlagen: "
                 f"{original}; watchdog rollback: {watchdog_rollback_error}"
             )
+        if phase == "tunnel-drain-pre-stop":
+            if watchdog_rollback_error is not None:
+                raise rollback_original from original
+            raise original
         rollback_url(
             rollback_original,
             activation=activation,
