@@ -58,13 +58,36 @@ def _attempt_source(
         return default
 
 
-def _task_payload(view: str) -> dict[str, Any]:
+def _task_lease_ids(payload: dict[str, Any]) -> tuple[list[str], bool]:
+    leases = payload.get("leases", [])
+    if not isinstance(leases, list):
+        return [], True
+    task_ids = sorted(
+        {
+            owner_id.removeprefix("task:")
+            for item in leases
+            if isinstance(item, dict)
+            and isinstance((owner_id := item.get("owner_id")), str)
+            and owner_id.startswith("task:")
+            and owner_id != "task:"
+        }
+    )
+    return task_ids[:MAX_SOURCE_TASKS], len(task_ids) > MAX_SOURCE_TASKS
+
+
+def _task_payload(
+    view: str,
+    required_task_ids: list[str] | None = None,
+    *,
+    required_ids_truncated: bool = False,
+) -> dict[str, Any]:
     tasks = _module("grabowski_tasks")
     projection = tasks._task_current_projection()
+    required_task_ids = list(required_task_ids or [])
     with tasks._task_read_snapshot() as connection:
         if view == "current":
             placeholders = ",".join("?" for _ in CURRENT_TASK_STATES)
-            rows = tasks._task_list_current_rows(
+            current_rows = tasks._task_list_current_rows(
                 connection,
                 where=[f"state IN ({placeholders})"],
                 parameters=list(CURRENT_TASK_STATES),
@@ -73,19 +96,47 @@ def _task_payload(view: str) -> dict[str, Any]:
                 limit=MAX_SOURCE_TASKS,
                 projection=projection,
             )
+            valid_required_ids = [
+                task_id
+                for task_id in required_task_ids[:MAX_SOURCE_TASKS]
+                if isinstance(task_id, str) and tasks.TASK_ID.fullmatch(task_id) is not None
+            ]
+            exact_rows = []
+            if valid_required_ids:
+                exact_placeholders = ",".join("?" for _ in valid_required_ids)
+                exact_rows = connection.execute(
+                    f"SELECT * FROM tasks WHERE task_id IN ({exact_placeholders}) "
+                    "ORDER BY created_at_unix DESC, task_id DESC",
+                    valid_required_ids,
+                ).fetchall()
+            merged: list[Any] = []
+            seen_task_ids: set[str] = set()
+            for row in [*exact_rows, *current_rows]:
+                task_id = str(row["task_id"])
+                if task_id in seen_task_ids:
+                    continue
+                seen_task_ids.add(task_id)
+                merged.append(row)
+            has_more = (
+                required_ids_truncated
+                or len(required_task_ids) > MAX_SOURCE_TASKS
+                or len(current_rows) > MAX_SOURCE_TASKS
+                or len(merged) > MAX_SOURCE_TASKS
+            )
+            selected = merged[:MAX_SOURCE_TASKS]
+            source_projection = "current-task-projection-plus-exact-active-lease-lifecycles"
         else:
             rows = connection.execute(
                 "SELECT * FROM tasks ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
                 (MAX_SOURCE_TASKS + 1,),
             ).fetchall()
-    has_more = len(rows) > MAX_SOURCE_TASKS
-    selected = rows[:MAX_SOURCE_TASKS]
+            has_more = len(rows) > MAX_SOURCE_TASKS
+            selected = rows[:MAX_SOURCE_TASKS]
+            source_projection = "raw-task-ledger-window"
     return {
         "tasks": [tasks._public_for_view(dict(row), "standard") for row in selected],
         "pagination": {"has_more": has_more},
-        "source_projection": (
-            "current-task-projection" if view == "current" else "raw-task-ledger-window"
-        ),
+        "source_projection": source_projection,
     }
 
 
@@ -150,10 +201,22 @@ def grabowski_current_work(
         raise ValueError("view must be current or history")
 
     source_errors: list[dict[str, Any]] = []
+    resources_payload = _attempt_source(
+        "resources",
+        "resource_lease",
+        _resources_payload,
+        source_errors,
+        {"leases": [], "count": 0, "truncated": True},
+    )
+    lease_task_ids, lease_task_ids_truncated = _task_lease_ids(resources_payload)
     tasks_payload = _attempt_source(
         "tasks",
         "durable_job",
-        lambda: _task_payload(view),
+        lambda: _task_payload(
+            view,
+            lease_task_ids,
+            required_ids_truncated=lease_task_ids_truncated,
+        ),
         source_errors,
         {"tasks": [], "pagination": {"has_more": True}},
     )
@@ -163,13 +226,6 @@ def grabowski_current_work(
         lambda: _attention_payload(view),
         source_errors,
         {"records": [], "pagination": {"has_more": True}},
-    )
-    resources_payload = _attempt_source(
-        "resources",
-        "resource_lease",
-        _resources_payload,
-        source_errors,
-        {"leases": [], "count": 0, "truncated": True},
     )
     checkout_payloads = _attempt_source(
         "checkouts",

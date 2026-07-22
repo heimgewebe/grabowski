@@ -107,6 +107,57 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         self.assertIn("one or more source surfaces returned errors or malformed records", result["warnings"])
         self.assertEqual(result["work"][0]["observation"]["completeness"], "complete")
 
+
+    def test_task_lease_ids_are_bounded_and_deterministic(self) -> None:
+        payload = {
+            "leases": [
+                {"owner_id": "task:z-task"},
+                {"owner_id": "operator:other"},
+                {"owner_id": "task:a-task"},
+                {"owner_id": "task:z-task"},
+            ]
+        }
+        task_ids, truncated = surface._task_lease_ids(payload)
+        self.assertEqual(task_ids, ["a-task", "z-task"])
+        self.assertFalse(truncated)
+
+    def test_surface_requests_exact_lifecycle_for_task_owned_lease(self) -> None:
+        operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
+        seen: dict[str, object] = {}
+
+        def load_tasks(view: str, task_ids: list[str], *, required_ids_truncated: bool = False) -> dict:
+            seen["view"] = view
+            seen["task_ids"] = task_ids
+            seen["required_ids_truncated"] = required_ids_truncated
+            return task_payload()
+
+        with patch.object(surface, "_operator", return_value=operator), patch.object(
+            surface, "_resources_payload",
+            return_value={
+                "leases": [{"owner_id": "task:terminal123", "resource_key": "path:/tmp/x"}],
+                "count": 1,
+                "truncated": False,
+            },
+        ), patch.object(surface, "_task_payload", side_effect=load_tasks), patch.object(
+            surface, "_attention_payload",
+            return_value={"records": [], "pagination": {"has_more": False}},
+        ), patch.object(
+            surface, "_checkout_payloads",
+            return_value=[{"repository": REPOSITORY, "worktrees": []}],
+        ), patch.object(
+            surface, "_tmux_payload", return_value={"returncode": 0, "stdout": ""}
+        ), patch.object(
+            surface, "_process_payload", return_value={"returncode": 0, "lines": []}
+        ), patch.object(
+            surface, "_worker_payload",
+            side_effect=lambda kind, view: {"workers": [], "has_more": False},
+        ):
+            surface.grabowski_current_work([REPOSITORY])
+
+        self.assertEqual(seen["view"], "current")
+        self.assertEqual(seen["task_ids"], ["terminal123"])
+        self.assertFalse(seen["required_ids_truncated"])
+
     def test_repository_scope_is_bounded_and_unique(self) -> None:
         with self.assertRaisesRegex(ValueError, "between 1 and"):
             surface.grabowski_current_work([])

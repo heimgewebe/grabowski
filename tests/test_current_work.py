@@ -609,6 +609,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["work_id"], f"task:{task_id}")
         self.assertEqual(group["binding"]["kind"], "task")
         self.assertEqual(group["binding_status"], "lease-bound")
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("task-lifecycle-unresolved-for-live-lease", group["action_reasons"])
         self.assertEqual(group["observation"]["completeness"], "partial")
         self.assertEqual(result["total_projected_scope"], "bounded_source_snapshot")
         self.assertEqual(result["state_counts_scope"], "bounded_source_snapshot")

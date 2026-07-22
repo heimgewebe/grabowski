@@ -898,6 +898,12 @@ def _finalize_groups(
         )
         if task_item and task_item["state"] in TERMINAL_TASK_STATES and has_live_surface:
             _blocking(group, "terminal-task-with-live-surfaces")
+        if (
+            group["binding"]["kind"] == "task"
+            and group["lease_summary"]["count"]
+            and task_item is None
+        ):
+            _blocking(group, "task-lifecycle-unresolved-for-live-lease")
         archived_attention = bool(
             {"attention:decision_closed", "attention:decision_superseded"}
             & set(group["source_states"])
