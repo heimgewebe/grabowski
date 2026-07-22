@@ -111,6 +111,19 @@ class ManagedCargoEvidenceTests(unittest.TestCase):
         self.assertFalse(result["complete"])
         self.assertIn("not an absolute normalized path", result["observation_errors"][0])
 
+    def test_flock_wrapped_managed_task_is_still_projected(self) -> None:
+        record = self.record("task-a", "running", 42, target=self.target)
+        record["argv"] = [
+            "/usr/bin/flock",
+            "--shared",
+            f"/home/alex/.local/state/heim-pc/managed-builds/cache-locks/cargo/{self.key}.lock",
+            *record["argv"],
+        ]
+        result = cargo.build_evidence([record], cache_root=self.root)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["entries"][0]["cache_key"], self.key)
+        self.assertTrue(result["entries"][0]["protected"])
+
     def test_unmanaged_external_target_is_ignored(self) -> None:
         result = cargo.build_evidence(
             [self.record("task-a", "running", 42, target="/tmp/custom-target")],
@@ -188,6 +201,9 @@ class ManagedCargoEvidenceTests(unittest.TestCase):
         result = cargo.build_evidence(records, cache_root=self.root)
         entry = result["entries"][0]
         self.assertEqual(entry["task_ref_count"], 70)
+        self.assertEqual(entry["protecting_task_ref_count"], 0)
+        self.assertEqual(entry["oldest_task_ref_updated_at_unix"], 0)
+        self.assertEqual(entry["newest_task_ref_updated_at_unix"], 69)
         self.assertTrue(entry["task_refs_truncated"])
         self.assertEqual(len(entry["task_refs"]), cargo.MAX_TASK_REFS_PER_ENTRY)
         self.assertEqual(entry["last_used_at_unix"], 69)

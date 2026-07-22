@@ -49,8 +49,11 @@ MANAGED_BUILD_RESOLVER = (
 )
 MANAGED_BUILD_PYTHON = Path("/usr/bin/python3")
 MANAGED_CARGO_CACHE_ROOT = operator.HOME / ".cache/heim-pc/managed-builds/cargo"
+MANAGED_BUILD_STATE_ROOT = operator.HOME / ".local/state/heim-pc/managed-builds"
+MANAGED_CARGO_LOCK_ROOT = MANAGED_BUILD_STATE_ROOT / "cache-locks" / "cargo"
 MANAGED_CARGO_PROFILE = "operator-task"
 SYSTEMD_ENV_EXECUTABLE = "/usr/bin/env"
+FLOCK_EXECUTABLE = "/usr/bin/flock"
 SCRIPT_EXECUTABLES = frozenset({"bash", "sh", "zsh", "fish", "python", "python3"})
 CARGO_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])cargo(?:$|[^A-Za-z0-9_])")
 JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
@@ -1043,7 +1046,62 @@ def _bind_grabowski_runtime_python(
 
 
 def _explicit_cargo_target_dir(command: list[str]) -> bool:
+    # Conservative by design: shell snippets can override an inherited target.
     return any("CARGO_TARGET_DIR=" in item for item in command)
+
+
+def _direct_cargo_target_dir_values(command: list[str]) -> list[str]:
+    if not command or Path(command[0]).name != "env":
+        return []
+    values: list[str] = []
+    for item in command[1:]:
+        if item == "--" or (item.startswith("-") and "=" not in item):
+            continue
+        if "=" not in item:
+            break
+        if item.startswith("CARGO_TARGET_DIR="):
+            values.append(item.removeprefix("CARGO_TARGET_DIR="))
+    return values
+
+
+def _ambiguous_managed_cargo_target_override(command: list[str]) -> bool:
+    occurrences = sum("CARGO_TARGET_DIR=" in item for item in command)
+    if occurrences == 0:
+        return False
+    values = _direct_cargo_target_dir_values(command)
+    if occurrences != 1 or len(values) != 1:
+        return True
+    path = Path(values[0])
+    if not path.is_absolute() or ".." in path.parts:
+        return True
+    try:
+        relative = path.relative_to(MANAGED_CARGO_CACHE_ROOT)
+    except ValueError:
+        return False
+    return not (
+        len(relative.parts) == 2
+        and relative.parts[1] == "target"
+        and SHA256.fullmatch(relative.parts[0]) is not None
+    )
+
+def _explicit_managed_cargo_target_dir(command: list[str]) -> str | None:
+    values = sorted(set(_direct_cargo_target_dir_values(command)))
+    if len(values) != 1:
+        return None
+    path = Path(values[0])
+    if not path.is_absolute() or ".." in path.parts:
+        return None
+    try:
+        relative = path.relative_to(MANAGED_CARGO_CACHE_ROOT)
+    except ValueError:
+        return None
+    if (
+        len(relative.parts) != 2
+        or relative.parts[1] != "target"
+        or SHA256.fullmatch(relative.parts[0]) is None
+    ):
+        return None
+    return str(path)
 
 
 def _local_git_root(cwd: str) -> Path | None:
@@ -1244,6 +1302,7 @@ def _resolve_managed_cargo_target_dir(
         raise RuntimeError("Managed-build resolver returned an invalid Cargo environment")
     raw_target = environment.get("CARGO_TARGET_DIR")
     raw_cache = payload.get("cache_path")
+    raw_lifecycle_lock = payload.get("lifecycle_lock_path")
     prepared_paths = payload.get("prepared_paths")
     if (
         not isinstance(raw_target, str)
@@ -1252,6 +1311,9 @@ def _resolve_managed_cargo_target_dir(
         or not isinstance(raw_cache, str)
         or not raw_cache.startswith("/")
         or "\x00" in raw_cache
+        or not isinstance(raw_lifecycle_lock, str)
+        or not raw_lifecycle_lock.startswith("/")
+        or "\x00" in raw_lifecycle_lock
         or not isinstance(prepared_paths, list)
         or any(not isinstance(item, str) for item in prepared_paths)
     ):
@@ -1264,11 +1326,46 @@ def _resolve_managed_cargo_target_dir(
         raise RuntimeError("Managed-build resolver Cargo cache escapes the managed cache") from exc
     if len(relative_cache.parts) != 1 or target_dir != cache_path / "target":
         raise RuntimeError("Managed-build resolver returned an invalid Cargo cache binding")
-    if str(cache_path) not in prepared_paths or str(target_dir) not in prepared_paths:
+    expected_lock = MANAGED_CARGO_LOCK_ROOT / f"{relative_cache.parts[0]}.lock"
+    if raw_lifecycle_lock != str(expected_lock):
+        raise RuntimeError("Managed-build resolver returned an invalid Cargo lifecycle lock binding")
+    if (
+        str(cache_path) not in prepared_paths
+        or str(target_dir) not in prepared_paths
+        or str(expected_lock.parent) not in prepared_paths
+    ):
         raise RuntimeError("Managed-build resolver did not prepare the Cargo cache binding")
     if target_dir == root or root in target_dir.parents:
         raise RuntimeError("Managed-build resolver Cargo target points into the worktree")
     return str(target_dir)
+
+
+def _managed_cargo_lifecycle_lock(cargo_target_dir: str) -> Path:
+    target_dir = Path(cargo_target_dir)
+    cache_path = target_dir.parent
+    try:
+        relative = cache_path.relative_to(MANAGED_CARGO_CACHE_ROOT)
+    except ValueError as exc:
+        raise RuntimeError("managed Cargo target escapes the managed cache") from exc
+    if len(relative.parts) != 1 or target_dir != cache_path / "target":
+        raise RuntimeError("managed Cargo target has an invalid lifecycle lock binding")
+    cache_key = relative.parts[0]
+    if SHA256.fullmatch(cache_key) is None:
+        raise RuntimeError("managed Cargo cache key is invalid for lifecycle lock")
+    try:
+        MANAGED_CARGO_LOCK_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+        resolved_lock_root = MANAGED_CARGO_LOCK_ROOT.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("managed Cargo lifecycle lock root is unavailable") from exc
+    if (
+        resolved_lock_root != MANAGED_CARGO_LOCK_ROOT
+        or MANAGED_CARGO_LOCK_ROOT.is_symlink()
+        or not MANAGED_CARGO_LOCK_ROOT.is_dir()
+    ):
+        raise RuntimeError("managed Cargo lifecycle lock root is unsafe")
+    if not Path(FLOCK_EXECUTABLE).is_file() or not os.access(FLOCK_EXECUTABLE, os.X_OK):
+        raise RuntimeError("managed Cargo lifecycle lock executable is unavailable")
+    return MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
 
 
 def _bind_managed_cargo_environment(
@@ -1278,6 +1375,26 @@ def _bind_managed_cargo_environment(
     cwd: str,
     execution_backend: str,
 ) -> list[str]:
+    local_systemd = target["transport"] == "local" and execution_backend == "systemd-user"
+    explicit_managed_target = (
+        _explicit_managed_cargo_target_dir(command) if local_systemd else None
+    )
+    if (
+        local_systemd
+        and explicit_managed_target is None
+        and _ambiguous_managed_cargo_target_override(command)
+    ):
+        raise RuntimeError(
+            "ambiguous managed Cargo target override cannot be lifecycle-fenced"
+        )
+    if explicit_managed_target is not None:
+        lifecycle_lock = _managed_cargo_lifecycle_lock(explicit_managed_target)
+        return [
+            FLOCK_EXECUTABLE,
+            "--shared",
+            str(lifecycle_lock),
+            *command,
+        ]
     cargo_target_dir = _resolve_managed_cargo_target_dir(
         command,
         target=target,
@@ -1286,7 +1403,11 @@ def _bind_managed_cargo_environment(
     )
     if cargo_target_dir is None:
         return command
+    lifecycle_lock = _managed_cargo_lifecycle_lock(cargo_target_dir)
     return [
+        FLOCK_EXECUTABLE,
+        "--shared",
+        str(lifecycle_lock),
         SYSTEMD_ENV_EXECUTABLE,
         f"CARGO_TARGET_DIR={cargo_target_dir}",
         *command,
