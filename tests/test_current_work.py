@@ -676,14 +676,14 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 "tasks": [task("partial1")],
                 "pagination": {"has_more": True},
             },
-            source_errors=[{"source": "checkout", "error": "unavailable"}],
+            source_errors=[{"source": "tasks", "error": "unavailable"}],
         )
         group = result["work"][0]
         self.assertEqual(group["observation"]["completeness"], "partial")
         self.assertEqual(group["observation"]["uncertainty"]["level"], "medium")
         reasons = group["observation"]["uncertainty"]["reasons"]
         self.assertTrue(any(reason.startswith("truncated-sources:") for reason in reasons))
-        self.assertTrue(any(reason.startswith("source-errors:") for reason in reasons))
+        self.assertIn("source-errors:tasks", reasons)
 
     def test_checkout_exposes_exact_path_and_branch_bindings_for_drilldown(self) -> None:
         result = project(

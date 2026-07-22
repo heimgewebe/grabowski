@@ -612,22 +612,32 @@ def _add_workers(
             _set_projection_state(group, "terminal_archived")
 
 
-def _resource_matches_checkout(resource_key: str, item: dict[str, Any]) -> bool:
+def _resource_identifies_checkout(resource_key: str, item: dict[str, Any]) -> bool:
     binding = _resource_binding(resource_key)
     kind = binding["kind"]
     if kind == "path":
         path = binding["id"]
-        return _path_in_checkout(path, item["path"]) or _path_in_checkout(item["path"], path)
-    if kind == "repository":
-        return binding["id"].rstrip("/") == item["repository"].rstrip("/")
+        return _path_in_checkout(path, item["path"])
     if kind == "branch":
         return (
             binding.get("repository", "").rstrip("/") == item["repository"].rstrip("/")
             and bool(item["branch"])
             and binding["id"] == item["branch"]
         )
+    return False
+
+
+def _resource_relates_to_checkout(resource_key: str, item: dict[str, Any]) -> bool:
+    binding = _resource_binding(resource_key)
+    kind = binding["kind"]
+    if _resource_identifies_checkout(resource_key, item):
+        return True
+    if kind == "repository":
+        return binding["id"].rstrip("/") == item["repository"].rstrip("/")
     if kind == "component":
         return binding["id"].startswith(item["repository"].rstrip("/") + ":")
+    if kind == "operation":
+        return binding.get("repository", "").rstrip("/") == item["repository"].rstrip("/")
     return False
 
 
@@ -640,24 +650,57 @@ def _checkout_candidates(
     heuristic: list[dict[str, Any]] = []
     known_task_ids = set(tasks)
 
-    for owner_id, source_rank, source in (
-        (item["binding_owner_id"], 0, "checkout-lifecycle-binding"),
-        (item["retention_owner_id"], 1, "checkout-retention-owner"),
-    ):
-        if not owner_id:
-            continue
-        work_id, kind, binding_id = _owner_binding(_identifier(owner_id, "checkout.owner_id"), known_task_ids)
-        exact.setdefault(work_id, (source_rank, work_id, kind, binding_id))
+    # Lifecycle binding is the strongest explicit checkout ownership signal.
+    if item["binding_owner_id"]:
+        owner_id = _identifier(item["binding_owner_id"], "checkout.binding_owner_id")
+        work_id, kind, binding_id = _owner_binding(owner_id, known_task_ids)
+        exact[work_id] = (0, work_id, kind, binding_id)
+    elif item["retention_owner_id"]:
+        owner_id = _identifier(item["retention_owner_id"], "checkout.retention_owner_id")
+        work_id, kind, binding_id = _owner_binding(owner_id, known_task_ids)
+        exact[work_id] = (1, work_id, kind, binding_id)
+    else:
+        # Only path/branch resources identify one concrete checkout. Repo-wide
+        # resources relate to the repository but cannot establish checkout ownership.
+        for lease in item["resource_leases"]:
+            if not _resource_identifies_checkout(lease["resource_key"], item):
+                heuristic.append(
+                    {
+                        "kind": "checkout-resource-overlap",
+                        "owner_id": lease["owner_id"],
+                        "resource_key": lease["resource_key"],
+                        "authority": False,
+                    }
+                )
+                continue
+            owner_id = _identifier(lease["owner_id"], "checkout.lease_owner_id")
+            work_id, kind, binding_id = _owner_binding(owner_id, known_task_ids)
+            exact.setdefault(work_id, (2, work_id, kind, binding_id))
 
-    for lease in item["resource_leases"]:
-        owner_id = lease["owner_id"]
-        work_id, kind, binding_id = _owner_binding(_identifier(owner_id, "checkout.lease_owner_id"), known_task_ids)
-        exact.setdefault(work_id, (2, work_id, kind, binding_id))
+        for task_id, task_item in tasks.items():
+            identifying = [
+                key for key in task_item["resource_keys"]
+                if _resource_identifies_checkout(key, item)
+            ]
+            if identifying:
+                exact.setdefault(f"task:{task_id}", (2, f"task:{task_id}", "task", task_id))
+            else:
+                related = [
+                    key for key in task_item["resource_keys"]
+                    if _resource_relates_to_checkout(key, item)
+                ]
+                for resource_key in related[:MAX_EVIDENCE]:
+                    heuristic.append(
+                        {
+                            "kind": "task-resource-repository-overlap",
+                            "candidate_work_id": f"task:{task_id}",
+                            "task_id": task_id,
+                            "resource_key": resource_key,
+                            "authority": False,
+                        }
+                    )
 
-    for task_id, task_item in tasks.items():
-        if any(_resource_matches_checkout(key, item) for key in task_item["resource_keys"]):
-            exact.setdefault(f"task:{task_id}", (1, f"task:{task_id}", "task", task_id))
-        cwd = task_paths.get(task_id, "")
+    for task_id, cwd in task_paths.items():
         if cwd and _path_in_checkout(cwd, item["path"]):
             heuristic.append(
                 {
@@ -912,21 +955,44 @@ def _annotate_groups(
     source_truncation: dict[str, bool],
     source_errors: list[dict[str, Any]],
 ) -> None:
-    partial_sources = sorted(source for source, truncated in source_truncation.items() if truncated)
-    error_sources = sorted({str(item.get("source", "unknown")) for item in source_errors})
+    global_error_sources = {str(item.get("source", "unknown")) for item in source_errors}
     for group in groups:
-        authoritative_sources = {str(item.get("source")) for item in group["authority_refs"] if item.get("source")}
+        authoritative_sources = {
+            str(item.get("source"))
+            for item in group["authority_refs"]
+            if item.get("source")
+        }
+        relevant_sources: set[str] = set()
+        if group["binding"]["kind"] == "task" or any(
+            item.get("source") in {"task-ledger", "task-attention-decision-evidence"}
+            for item in group["authority_refs"]
+        ):
+            relevant_sources.update({"tasks", "attention"})
         if group["lease_summary"]["count"]:
             authoritative_sources.add("resource-lease-store")
+            relevant_sources.add("resources")
         if group["checkout_refs"]:
             authoritative_sources.add("checkout-inventory")
+            relevant_sources.add("checkouts")
         if group["worker_refs"]:
             authoritative_sources.add("worker-registry")
+            worker_kinds = {str(item.get("kind", "")) for item in group["worker_refs"]}
+            if "browser" in worker_kinds:
+                relevant_sources.add("browser_workers")
+            if "gui" in worker_kinds:
+                relevant_sources.add("gui_workers")
         observed_sources: set[str] = set()
         if group["physical_refs"]["tmux_sessions"]:
             observed_sources.add("tmux")
+            relevant_sources.add("tmux")
         if group["physical_refs"]["processes"]:
             observed_sources.add("process-list")
+            relevant_sources.add("processes")
+
+        partial_sources = sorted(
+            source for source in relevant_sources if source_truncation.get(source, False)
+        )
+        error_sources = sorted(relevant_sources & global_error_sources)
         uncertainty_reasons: list[str] = []
         if group["binding_status"] in {"ambiguous", "physical-only", "unbound"}:
             uncertainty_reasons.append(f"binding:{group['binding_status']}")
@@ -937,13 +1003,19 @@ def _annotate_groups(
         if error_sources:
             uncertainty_reasons.append("source-errors:" + ",".join(error_sources))
         high_uncertainty = group["binding_status"] in {"ambiguous", "physical-only", "unbound"}
+        medium_uncertainty = bool(
+            partial_sources
+            or error_sources
+            or (group["heuristic_refs"] and group["binding_status"] == "checkout-bound")
+        )
         group["observation"] = {
             "observed_at_unix": generated_at_unix,
             "authoritative_sources": sorted(authoritative_sources),
             "observed_non_authoritative_sources": sorted(observed_sources),
+            "relevant_sources": sorted(relevant_sources),
             "completeness": "partial" if partial_sources or error_sources else "complete",
             "uncertainty": {
-                "level": "high" if high_uncertainty else "medium" if uncertainty_reasons else "low",
+                "level": "high" if high_uncertainty else "medium" if medium_uncertainty else "low",
                 "reasons": uncertainty_reasons,
             },
         }
