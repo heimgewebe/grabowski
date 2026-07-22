@@ -250,6 +250,17 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
         self.assertEqual(invocations, [])
         self.assertTrue(self.lock_path.is_file())
 
+    def test_shell_embedded_managed_target_override_is_rejected(self) -> None:
+        command = [
+            "bash",
+            "-lc",
+            f"CARGO_TARGET_DIR={self.target_dir} cargo test",
+        ]
+        with self.assertRaisesRegex(
+            RuntimeError, "ambiguous managed Cargo target override"
+        ):
+            self._bind(command)
+
     def test_shell_embedded_target_override_is_not_misclassified_as_managed(self) -> None:
         command = ["bash", "-lc", "CARGO_TARGET_DIR=/tmp/caller-target cargo test"]
         result, invocations = self._bind(command)

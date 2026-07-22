@@ -1050,6 +1050,14 @@ def _explicit_cargo_target_dir(command: list[str]) -> bool:
     return any("CARGO_TARGET_DIR=" in item for item in command)
 
 
+def _ambiguous_managed_cargo_target_override(command: list[str]) -> bool:
+    managed_root = str(MANAGED_CARGO_CACHE_ROOT)
+    return any(
+        "CARGO_TARGET_DIR=" in item and managed_root in item
+        for item in command
+    )
+
+
 def _explicit_managed_cargo_target_dir(command: list[str]) -> str | None:
     values = sorted(
         {
@@ -1347,11 +1355,18 @@ def _bind_managed_cargo_environment(
     cwd: str,
     execution_backend: str,
 ) -> list[str]:
+    local_systemd = target["transport"] == "local" and execution_backend == "systemd-user"
     explicit_managed_target = (
-        _explicit_managed_cargo_target_dir(command)
-        if target["transport"] == "local" and execution_backend == "systemd-user"
-        else None
+        _explicit_managed_cargo_target_dir(command) if local_systemd else None
     )
+    if (
+        local_systemd
+        and explicit_managed_target is None
+        and _ambiguous_managed_cargo_target_override(command)
+    ):
+        raise RuntimeError(
+            "ambiguous managed Cargo target override cannot be lifecycle-fenced"
+        )
     if explicit_managed_target is not None:
         lifecycle_lock = _managed_cargo_lifecycle_lock(explicit_managed_target)
         return [

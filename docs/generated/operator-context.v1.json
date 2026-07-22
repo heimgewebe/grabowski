@@ -2697,7 +2697,7 @@
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
       "src/grabowski_task_attention.py": "931250142a95fb258010606174bec8fc44941bd76d90b9f694e6543daee4636a",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "93e2ba3111869360d542209f7e764e54fdb9cbb2cccd1968ce9e028696b1f747",
+      "src/grabowski_tasks.py": "d21dcac7f700cb42981530b48dc2e9bfa2a8e907ed576b64ec3f5126bec3f475",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9be067c783e69b810470d233d14dd09e3e214d23e4815235c09f533e901a0178",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"
