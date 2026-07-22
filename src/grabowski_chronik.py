@@ -17,6 +17,8 @@ from urllib.request import Request, urlopen
 ENABLED_ENV = "GRABOWSKI_CHRONIK_AGENT_RUN_OUTBOX"
 STATE_ROOT_ENV = "GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT"
 PLEXER_EVENTS_URL_ENV = "GRABOWSKI_PLEXER_EVENTS_URL"
+CODING_MEMORY_REPO_ENV = "GRABOWSKI_CHRONIK_CODING_MEMORY_REPO"
+CODING_MEMORY_DATA_DIR_ENV = "GRABOWSKI_CHRONIK_CODING_MEMORY_DATA_DIR"
 TASK_ENABLED_FIELD = "chronik_outbox_enabled"
 TASK_STATE_ROOT_FIELD = "chronik_outbox_state_root"
 TASK_CONTEXT_FIELD = "chronik_context_json"
@@ -32,8 +34,31 @@ WRITER_COMPACTION_LOCK_POLL_SECONDS = 0.01
 MAX_ARCHIVE_INDEX_BYTES = 16 * 1024 * 1024
 MAX_BUNDLE_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_BUNDLE_BYTES = 128 * 1024 * 1024
+MAX_CODING_MEMORY_SOURCE_BYTES = 16 * 1024 * 1024
+CODING_MEMORY_DOES_NOT_ESTABLISH = (
+    "current_git_state",
+    "current_ci_state",
+    "current_runtime_state",
+    "safe_retry",
+)
+CODING_MEMORY_FORBIDDEN_EVENT_KEYS = frozenset(
+    {
+        "argv",
+        "command",
+        "cwd",
+        "env",
+        "environment",
+        "password",
+        "prompt",
+        "secret",
+        "stderr",
+        "stdout",
+        "token",
+    }
+)
 _ARCHIVE_INDEX_CACHE: dict[Path, tuple[tuple[int, int, int, int, int], dict[str, Any]]] = {}
 _MANIFEST_CACHE: dict[Path, tuple[tuple[int, int, int, int, int], dict[str, Any]]] = {}
+
 
 
 def enabled() -> bool:
@@ -714,14 +739,15 @@ def _context(record: dict[str, Any]) -> dict[str, Any]:
 def _subject(context: dict[str, Any]) -> dict[str, Any]:
     scope = context.get("subject_scope")
     if scope == "repository":
-        subject = {"scope": "repository", "repo": context["repo"]}
-        for key in ("branch", "head"):
-            if context.get(key):
-                subject[key] = context[key]
-        return subject
-    if scope == "host":
-        return {"scope": "host", "host": context["host"]}
-    raise ValueError("stored Chronik context has invalid subject scope")
+        subject: dict[str, Any] = {"scope": "repository", "repo": context["repo"]}
+    elif scope == "host":
+        subject = {"scope": "host", "host": context["host"]}
+    else:
+        raise ValueError("stored Chronik context has invalid subject scope")
+    for key in ("branch", "head", "component", "bureau_task_id", "pr_number"):
+        if context.get(key) is not None and context.get(key) != "":
+            subject[key] = context[key]
+    return subject
 
 
 def build_event(record: dict[str, Any], state: str) -> dict[str, Any] | None:
@@ -865,4 +891,132 @@ def flush_outbox_file_to_plexer(
         result = send_event_to_plexer_safely(event, url=url, timeout_seconds=timeout_seconds)
         result["line"] = line_number
         results.append(result)
-    return {"events": len(results), "sent": sum(1 for result in results if result.get("sent") is True), "results": results}
+    return {
+        "events": len(results),
+        "sent": sum(1 for result in results if result.get("sent") is True),
+        "results": results,
+    }
+
+
+def _contains_forbidden_coding_memory_key(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if (
+                isinstance(key, str)
+                and key.lower() in CODING_MEMORY_FORBIDDEN_EVENT_KEYS
+            ):
+                return True
+            if _contains_forbidden_coding_memory_key(nested):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_contains_forbidden_coding_memory_key(item) for item in value)
+    return False
+
+
+def inspect_coding_memory_source(path: str) -> dict[str, Any]:
+    """Validate and hash one redacted Grabowski outbox JSONL without mutating it."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("Chronik outbox path must be non-empty text")
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("Chronik outbox path must be absolute")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"Chronik outbox source is unavailable: {exc}") from exc
+    if resolved != candidate:
+        raise ValueError("Chronik outbox path may not traverse symlinks or aliases")
+    expected_parent = (state_root() / "grabowski" / "chronik-outbox").resolve()
+    if resolved.parent != expected_parent:
+        raise ValueError(
+            "Chronik outbox source must be directly inside the configured state root"
+        )
+    if not resolved.name.startswith("grabowski_") or resolved.suffix != ".jsonl":
+        raise ValueError("Chronik outbox source must be a Grabowski JSONL file")
+    loaded = _read_regular_file(
+        resolved,
+        maximum=MAX_CODING_MEMORY_SOURCE_BYTES,
+        label="Chronik coding-memory source",
+    )
+    assert loaded is not None
+    raw, identity = loaded
+    if not raw.endswith(b"\n"):
+        raise ValueError("Chronik outbox source is incomplete")
+    event_ids: list[str] = []
+    canonical_events: list[bytes] = []
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        if not line:
+            raise ValueError(f"Chronik outbox source has a blank line at {line_number}")
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Chronik outbox source has invalid JSON at line {line_number}"
+            ) from exc
+        if not isinstance(event, dict):
+            raise ValueError(f"Chronik outbox event {line_number} must be an object")
+        if event.get("schema_version") != "agent-run-event.v0":
+            raise ValueError(f"Chronik outbox event {line_number} has invalid schema")
+        source = event.get("source")
+        if (
+            not isinstance(source, dict)
+            or source.get("repo") != "heimgewebe/grabowski"
+            or source.get("component") != "grabowski"
+        ):
+            raise ValueError(
+                f"Chronik outbox event {line_number} is not from Grabowski"
+            )
+        if event.get("kind") not in {
+            "agent.run.started",
+            "agent.run.completed",
+            "agent.run.blocked",
+        }:
+            raise ValueError(f"Chronik outbox event {line_number} has unsupported kind")
+        if _contains_forbidden_coding_memory_key(event):
+            raise ValueError(f"Chronik outbox event {line_number} is not redacted")
+        claimed_event_id = event.get("event_id")
+        if claimed_event_id != event_id(event):
+            raise ValueError(f"Chronik outbox event {line_number} has invalid event_id")
+        event_ids.append(claimed_event_id)
+        canonical_events.append(_canonical_bytes(event))
+    if not event_ids:
+        raise ValueError("Chronik outbox source is empty")
+    if len(event_ids) != len(set(event_ids)):
+        raise ValueError("Chronik outbox source contains duplicate event IDs")
+    return {
+        "path": str(resolved),
+        "sha256": _sha256_bytes(raw),
+        "bytes": len(raw),
+        "event_count": len(event_ids),
+        "event_ids": event_ids,
+        "event_ids_sha256": _sha256_bytes(_canonical_bytes(event_ids)),
+        "chronik_source_sha256": _sha256_bytes(b"\n".join(canonical_events)),
+        "identity": identity,
+    }
+
+
+def coding_memory_configuration() -> dict[str, Any]:
+    """Resolve the optional local Chronik coding-memory CLI without requiring it."""
+    repository = Path(
+        os.environ.get(CODING_MEMORY_REPO_ENV, str(Path.home() / "repos" / "chronik"))
+    ).expanduser()
+    data_dir = Path(
+        os.environ.get(
+            CODING_MEMORY_DATA_DIR_ENV,
+            str(Path.home() / ".local" / "state" / "chronik"),
+        )
+    ).expanduser()
+    cli = repository / "tools" / "coding_memory.py"
+    reason = None
+    if repository.is_symlink() or not repository.is_dir():
+        reason = "chronik_repository_unavailable"
+    elif cli.is_symlink() or not cli.is_file():
+        reason = "chronik_coding_memory_cli_unavailable"
+    return {
+        "available": reason is None,
+        "reason": reason,
+        "repository": str(repository),
+        "data_dir": str(data_dir),
+        "cli": str(cli),
+    }

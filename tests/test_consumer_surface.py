@@ -15,6 +15,7 @@ from tests.test_operator_contract import _load_operator_module
 from tests.test_operator_v2_runtime import grabowski_mcp
 from tests.test_read_surface import read_surface
 from tests.test_tasks import LOCAL_HOST, _launcher, tasks
+import os
 
 
 class ConsumerSurfaceTests(unittest.TestCase):
@@ -545,9 +546,16 @@ class ConsumerSurfaceTests(unittest.TestCase):
     def test_task_pagination_has_no_duplicates_and_cursor_is_view_filter_bound(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / "state").mkdir(parents=True, exist_ok=True)
+            os.chmod(root / "state", 0o700)
             database = root / "state" / "tasks.sqlite3"
+            audit_log = root / "state" / "write-audit.jsonl"
             resource_database = root / "state" / "resources.sqlite3"
             with mock.patch.object(tasks, "TASK_DB", database), mock.patch.object(
+                tasks.base,
+                "AUDIT_LOG",
+                audit_log,
+            ), mock.patch.object(
                 tasks.resources,
                 "RESOURCE_DB",
                 resource_database,
