@@ -19,11 +19,16 @@ import grabowski_tasks as tasks
 SCHEMA_VERSION = 1
 DECISION_KIND = "grabowski_task_attention_decision"
 DECISIONS = frozenset({"closed", "deferred", "superseded"})
+ATTENTION_VIEWS = frozenset({"current", "history"})
+CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS = frozenset(
+    {"decision_closed", "decision_superseded"}
+)
 TERMINAL_ATTENTION_STATES = frozenset({"failed", "timed_out", "signalled"})
 ATTENTION_STATES = tuple(tasks.TASK_STATE_PROJECTIONS["attention"])
 MAX_RECORD_BYTES = 64 * 1024
 MAX_TEXT_BYTES = 2_048
 MAX_PAGE_LIMIT = 100
+MAX_CURRENT_SCAN_ROWS = 5 * MAX_PAGE_LIMIT
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.02
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -811,17 +816,24 @@ def _classify_record(record: dict[str, Any]) -> dict[str, Any]:
 def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, Any]:
     parameters = _validate_exact_keys(
         dict(parameters or {}),
-        allowed={"limit", "cursor"},
+        allowed={"limit", "cursor", "view"},
         required=set(),
         label="task attention reconciliation parameters",
     )
     limit = parameters.get("limit", 20)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE_LIMIT:
         raise TaskAttentionInputError(f"limit must be between 1 and {MAX_PAGE_LIMIT}")
+    view = parameters.get("view", "current")
+    if not isinstance(view, str) or view not in ATTENTION_VIEWS:
+        raise TaskAttentionInputError("view must be current or history")
     cursor = parameters.get("cursor")
     if cursor is not None and not isinstance(cursor, str):
         raise TaskAttentionInputError("cursor must be a string when provided")
-    scope = "task-attention-reconciliation:v1"
+    scope = (
+        "task-attention-reconciliation:v1"
+        if view == "history"
+        else "task-attention-reconciliation:current:v1"
+    )
     position = consumer_surface.decode_cursor(cursor, scope)
     cursor_created_at: int | None = None
     cursor_task_id: str | None = None
@@ -838,29 +850,140 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
             raise TaskAttentionInputError("cursor position is invalid")
 
     placeholders = ",".join("?" for _ in ATTENTION_STATES)
-    where = [f"state IN ({placeholders})"]
-    values: list[Any] = list(ATTENTION_STATES)
-    if cursor_created_at is not None and cursor_task_id is not None:
-        where.append("(created_at_unix < ? OR (created_at_unix = ? AND task_id < ?))")
-        values.extend([cursor_created_at, cursor_created_at, cursor_task_id])
-    with tasks._task_read_snapshot() as connection:
-        rows = connection.execute(
+
+    def fetch_rows(
+        connection: Any,
+        *,
+        created_at: int | None,
+        task_id: str | None,
+        batch_limit: int,
+    ) -> list[Any]:
+        where = [f"state IN ({placeholders})"]
+        values: list[Any] = list(ATTENTION_STATES)
+        if created_at is not None and task_id is not None:
+            where.append("(created_at_unix < ? OR (created_at_unix = ? AND task_id < ?))")
+            values.extend([created_at, created_at, task_id])
+        return connection.execute(
             f"SELECT * FROM tasks WHERE {' AND '.join(where)} "
             "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
-            (*values, limit + 1),
+            (*values, batch_limit),
         ).fetchall()
-        total_attention = int(
+
+    scanned_raw = 0
+    filtered_counts = {
+        "decision_closed": 0,
+        "decision_superseded": 0,
+    }
+    page_records: list[dict[str, Any]] = []
+    has_more = False
+    next_cursor = None
+
+    with tasks._task_read_snapshot() as connection:
+        raw_total_attention = int(
             connection.execute(
                 f"SELECT COUNT(*) FROM tasks WHERE state IN ({placeholders})",
                 ATTENTION_STATES,
             ).fetchone()[0]
         )
-    has_more = len(rows) > limit
-    page_rows = rows[:limit]
-    records = [_classify_record(dict(row)) for row in page_rows]
+        if view == "history":
+            rows = fetch_rows(
+                connection,
+                created_at=cursor_created_at,
+                task_id=cursor_task_id,
+                batch_limit=limit + 1,
+            )
+            scanned_raw = min(len(rows), limit)
+            has_more = len(rows) > limit
+            page_rows = rows[:limit]
+            page_records = [_classify_record(dict(row)) for row in page_rows]
+            if has_more and page_rows:
+                last = dict(page_rows[-1])
+                next_cursor = consumer_surface.encode_cursor(
+                    scope,
+                    {
+                        "created_at_unix": int(last["created_at_unix"]),
+                        "task_id": str(last["task_id"]),
+                    },
+                )
+        else:
+            scan_created_at = cursor_created_at
+            scan_task_id = cursor_task_id
+            visible: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            source_exhausted = False
+            last_scanned_raw: dict[str, Any] | None = None
+            while (
+                len(visible) <= limit
+                and not source_exhausted
+                and scanned_raw < MAX_CURRENT_SCAN_ROWS
+            ):
+                batch_limit = min(
+                    MAX_PAGE_LIMIT,
+                    MAX_CURRENT_SCAN_ROWS - scanned_raw,
+                )
+                rows = fetch_rows(
+                    connection,
+                    created_at=scan_created_at,
+                    task_id=scan_task_id,
+                    batch_limit=batch_limit,
+                )
+                if not rows:
+                    source_exhausted = True
+                    break
+                for row in rows:
+                    raw = dict(row)
+                    scanned_raw += 1
+                    last_scanned_raw = raw
+                    classified = _classify_record(raw)
+                    classification = classified["classification"]
+                    if classification in CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS:
+                        filtered_counts[classification] += 1
+                    else:
+                        visible.append((raw, classified))
+                        if len(visible) > limit:
+                            break
+                    scan_created_at = int(raw["created_at_unix"])
+                    scan_task_id = str(raw["task_id"])
+                if len(visible) > limit:
+                    break
+                if len(rows) < batch_limit:
+                    source_exhausted = True
+                else:
+                    last_raw = dict(rows[-1])
+                    scan_created_at = int(last_raw["created_at_unix"])
+                    scan_task_id = str(last_raw["task_id"])
+
+            scan_budget_exhausted = False
+            if scanned_raw >= MAX_CURRENT_SCAN_ROWS and not source_exhausted:
+                scan_budget_exhausted = bool(
+                    fetch_rows(
+                        connection,
+                        created_at=scan_created_at,
+                        task_id=scan_task_id,
+                        batch_limit=1,
+                    )
+                )
+                if not scan_budget_exhausted:
+                    source_exhausted = True
+            has_more = len(visible) > limit or scan_budget_exhausted
+            page_visible = visible[:limit]
+            page_records = [classified for _raw, classified in page_visible]
+            cursor_row: dict[str, Any] | None = None
+            if len(visible) > limit and page_visible:
+                cursor_row = page_visible[-1][0]
+            elif scan_budget_exhausted:
+                cursor_row = last_scanned_raw
+            if has_more and cursor_row is not None:
+                next_cursor = consumer_surface.encode_cursor(
+                    scope,
+                    {
+                        "created_at_unix": int(cursor_row["created_at_unix"]),
+                        "task_id": str(cursor_row["task_id"]),
+                    },
+                )
+
     counts = {
         classification: sum(
-            1 for record in records if record["classification"] == classification
+            1 for record in page_records if record["classification"] == classification
         )
         for classification in (
             "actionable",
@@ -871,26 +994,24 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
             "invalid_evidence",
         )
     }
-    next_cursor = None
-    if has_more and page_rows:
-        last = dict(page_rows[-1])
-        next_cursor = consumer_surface.encode_cursor(
-            scope,
-            {
-                "created_at_unix": int(last["created_at_unix"]),
-                "task_id": str(last["task_id"]),
-            },
-        )
     return {
         "schema_version": SCHEMA_VERSION,
         "authority": "task_store_plus_create_only_decision_receipts",
-        "records": records,
+        "view": view,
+        "records": page_records,
         "classification_counts": counts,
         "classification_counts_scope": "returned_page",
-        "total_attention": total_attention,
+        "total_attention": raw_total_attention,
+        "total_attention_scope": "raw_task_state_projection_before_decisions",
+        "current_attention_excluded_classifications": sorted(
+            CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS
+        ),
+        "filtered_classification_counts": filtered_counts,
+        "filtered_classification_counts_scope": "scanned_raw_window",
         "pagination": {
             "limit": limit,
-            "returned": len(records),
+            "returned": len(page_records),
+            "scanned_raw": scanned_raw,
             "has_more": has_more,
             "next_cursor": next_cursor,
             "ordering": "created_at_unix_desc_task_id_desc",
@@ -898,8 +1019,8 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
         "recommended_next_action": (
             "inspect invalid evidence before relying on decisions"
             if counts["invalid_evidence"]
-            else "inspect actionable and outcome-unknown tasks"
-            if counts["actionable"] or counts["outcome_unknown"]
+            else "inspect actionable, deferred and outcome-unknown tasks"
+            if counts["actionable"] or counts["decision_deferred"] or counts["outcome_unknown"]
             else "continue pagination" if has_more else "none"
         ),
         "does_not_establish": [
@@ -909,5 +1030,6 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
             "completion_of_future_attempts",
             "systemd_or_fleet_post_state",
             "task_or_outcome_receipt_mutation",
+            "exact_global_current_attention_count",
         ],
     }

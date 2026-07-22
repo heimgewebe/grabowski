@@ -472,9 +472,31 @@ class TaskAttentionTests(unittest.TestCase):
                     with self.assertRaises(attention.TaskAttentionIntegrityError):
                         attention.record_decision(parameters)
 
-    def test_reconciliation_uses_no_observation_probe_and_classifies_decisions(self) -> None:
+    def test_history_reconciliation_uses_no_observation_probe_and_classifies_decisions(self) -> None:
         failed = self._failed_task()
         attention.record_decision(self._parameters(failed))
+        unknown = self._start()["task"]
+        tasks._set_state(str(unknown["task_id"]), "outcome_unknown", observation={"state": "outcome_unknown"})
+
+        with patch.object(tasks, "_observe", side_effect=AssertionError("probe called")), patch.object(
+            tasks, "_dispatch", side_effect=AssertionError("dispatch called")
+        ):
+            result = attention.reconcile_attention({"limit": 20, "view": "history"})
+
+        by_id = {item["task_id"]: item for item in result["records"]}
+        self.assertEqual("history", result["view"])
+        self.assertEqual("decision_closed", by_id[failed["task_id"]]["classification"])
+        self.assertEqual("outcome_unknown", by_id[unknown["task_id"]]["classification"])
+        self.assertEqual(1, result["classification_counts"]["decision_closed"])
+        self.assertEqual(1, result["classification_counts"]["outcome_unknown"])
+
+    def test_current_reconciliation_excludes_closed_and_superseded_but_keeps_deferred(self) -> None:
+        closed = self._failed_task()
+        attention.record_decision(self._parameters(closed, decision="closed"))
+        superseded = self._failed_task()
+        attention.record_decision(self._parameters(superseded, decision="superseded"))
+        deferred = self._failed_task()
+        attention.record_decision(self._parameters(deferred, decision="deferred"))
         unknown = self._start()["task"]
         tasks._set_state(str(unknown["task_id"]), "outcome_unknown", observation={"state": "outcome_unknown"})
 
@@ -484,10 +506,69 @@ class TaskAttentionTests(unittest.TestCase):
             result = attention.reconcile_attention({"limit": 20})
 
         by_id = {item["task_id"]: item for item in result["records"]}
-        self.assertEqual("decision_closed", by_id[failed["task_id"]]["classification"])
+        self.assertEqual("current", result["view"])
+        self.assertNotIn(closed["task_id"], by_id)
+        self.assertNotIn(superseded["task_id"], by_id)
+        self.assertEqual("decision_deferred", by_id[deferred["task_id"]]["classification"])
         self.assertEqual("outcome_unknown", by_id[unknown["task_id"]]["classification"])
-        self.assertEqual(1, result["classification_counts"]["decision_closed"])
+        self.assertEqual(1, result["classification_counts"]["decision_deferred"])
         self.assertEqual(1, result["classification_counts"]["outcome_unknown"])
+        self.assertEqual(1, result["filtered_classification_counts"]["decision_closed"])
+        self.assertEqual(1, result["filtered_classification_counts"]["decision_superseded"])
+        self.assertEqual(4, result["total_attention"])
+        self.assertEqual("raw_task_state_projection_before_decisions", result["total_attention_scope"])
+
+    def test_current_reconciliation_scans_past_filtered_rows_to_fill_page(self) -> None:
+        closed = self._failed_task()
+        attention.record_decision(self._parameters(closed, decision="closed"))
+        superseded = self._failed_task()
+        attention.record_decision(self._parameters(superseded, decision="superseded"))
+        actionable = self._failed_task()
+
+        page = attention.reconcile_attention({"limit": 1})
+
+        self.assertEqual([actionable["task_id"]], [item["task_id"] for item in page["records"]])
+        self.assertFalse(page["pagination"]["has_more"])
+        self.assertGreaterEqual(page["pagination"]["scanned_raw"], 3)
+        self.assertEqual(1, page["filtered_classification_counts"]["decision_closed"])
+        self.assertEqual(1, page["filtered_classification_counts"]["decision_superseded"])
+
+    def test_reconciliation_rejects_unknown_view(self) -> None:
+        with self.assertRaisesRegex(attention.TaskAttentionInputError, "view must be current or history"):
+            attention.reconcile_attention({"view": "other"})
+
+    def test_current_reconciliation_exact_scan_budget_does_not_invent_continuation(self) -> None:
+        for decision in ("closed", "superseded"):
+            record = self._failed_task()
+            attention.record_decision(self._parameters(record, decision=decision))
+
+        with patch.object(attention, "MAX_CURRENT_SCAN_ROWS", 2):
+            page = attention.reconcile_attention({"limit": 1})
+
+        self.assertEqual([], page["records"])
+        self.assertFalse(page["pagination"]["has_more"])
+        self.assertIsNone(page["pagination"]["next_cursor"])
+        self.assertEqual(2, page["pagination"]["scanned_raw"])
+        self.assertEqual("scanned_raw_window", page["filtered_classification_counts_scope"])
+
+    def test_current_reconciliation_scan_budget_returns_progress_cursor_when_all_rows_filter(self) -> None:
+        for decision in ("closed", "superseded", "closed"):
+            record = self._failed_task()
+            attention.record_decision(self._parameters(record, decision=decision))
+
+        with patch.object(attention, "MAX_CURRENT_SCAN_ROWS", 2):
+            first = attention.reconcile_attention({"limit": 1})
+            second = attention.reconcile_attention(
+                {"limit": 1, "cursor": first["pagination"]["next_cursor"]}
+            )
+
+        self.assertEqual([], first["records"])
+        self.assertTrue(first["pagination"]["has_more"])
+        self.assertIsNotNone(first["pagination"]["next_cursor"])
+        self.assertEqual(2, first["pagination"]["scanned_raw"])
+        self.assertEqual([], second["records"])
+        self.assertFalse(second["pagination"]["has_more"])
+        self.assertIsNone(second["pagination"]["next_cursor"])
 
     def test_missing_terminal_outcome_and_invalid_decision_are_visible(self) -> None:
         record = self._failed_task()
