@@ -70,6 +70,10 @@ Ein Execution-Receipt darf nur einen Effektversuch belegen, dessen Startzeitpunk
 
 `write_effect_execution_receipt()` persistiert create-only unter einer aus der Execution-ID abgeleiteten Identität und ist nur für exakt denselben Plan-/Revalidation-/Receipt-Inhalt idempotent wiederholbar. Ein gleichnamiger widersprüchlicher Beleg schlägt fail-closed fehl. Writer und Verifier verlangen dieselben Ursprungsbelege und prüfen deren exakte Digest-Bindungen erneut. Das Receipt selbst führt keinen Effekt aus und begründet weder Löschautorität noch abgeschlossene Recovery.
 
+`execute_task_archive_effect()` ist der konkrete Adapter für `task_archive`. Er verlangt einen unveränderlichen Task-Archiv-Dry-Run sowie einen generischen `task_archive`-Effect-Plan, dessen Ressourcenmenge exakt aus getrenntem Archive-Root und Effect-Root besteht. Beide direkten Schreib-Roots werden vor der Persistenz gegen Symlinks und Nicht-Verzeichnisse geprüft. Unmittelbar im Adapter wird der Plan gegen die aktuell übergebenen Lifecycle-Klassifikationen und exakten Lease-Beobachtungen revalidiert; Plan und Revalidation werden create-only persistiert, bevor der Segment-Write beginnt. Die interne Uhr bindet den tatsächlichen Effektstart strikt an die früheste Lease-Ablaufzeit.
+
+Nach erfolgreicher Segmentverifikation bindet das Execution Receipt Archivmanifest, Segment-SHA und Task-Archivplan. Ein bereits bestätigtes `succeeded`-Receipt derselben Execution-ID wird nur read-only zusammen mit dem erneut verifizierten Archiv zurückgegeben und führt keinen zweiten Segment-Write aus. Ein bestehendes `recovery_required`-Receipt blockiert dieselbe Execution-ID ausdrücklich gegen Blind-Retry. Ein unklarer Archivierungsfehler erzeugt, soweit der Receipt-Store verfügbar ist, einen create-only Recovery-Beleg mit `mutation_state=unknown`, konkretem Archive-Root als Recovery-Referenz und `blind_retry_allowed=false`.
+
 ## Recovery-sicherer Task-Archive Projection Switch
 
 `apply_task_archive_projection_switch()` verändert nicht den Taskstore, sondern persistiert create-only einen Projektionsumschaltbeleg für ein bereits vollständig verifiziertes Archivsegment.
