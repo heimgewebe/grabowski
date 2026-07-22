@@ -1626,7 +1626,6 @@ def _tmux_exact_session_identity(session: str) -> dict[str, Any] | None:
             "-p",
             "-t",
             _tmux_exact_target(session),
-            "-F",
             "#{session_id}\t#{session_created}",
         ]
     )
