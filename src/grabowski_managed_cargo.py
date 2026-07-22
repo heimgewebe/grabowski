@@ -204,6 +204,19 @@ def build_evidence(
             key=lambda ref: (-ref["updated_at_unix"], ref["task_id"]),
         )[:MAX_TASK_REFS_PER_ENTRY]
         entry["task_ref_count"] = len(all_refs)
+        entry["protecting_task_ref_count"] = sum(
+            1
+            for ref in all_refs
+            if ref["state"] in PROTECTING_STATES or ref["state"] not in KNOWN_STATES
+        )
+        entry["oldest_task_ref_updated_at_unix"] = min(
+            (ref["updated_at_unix"] for ref in all_refs),
+            default=None,
+        )
+        entry["newest_task_ref_updated_at_unix"] = max(
+            (ref["updated_at_unix"] for ref in all_refs),
+            default=None,
+        )
         entry["task_refs_truncated"] = len(all_refs) > MAX_TASK_REFS_PER_ENTRY
         entry["task_refs"] = sorted(selected_refs, key=lambda ref: ref["task_id"])
         entry["reasons"] = sorted(set(entry["reasons"]))
