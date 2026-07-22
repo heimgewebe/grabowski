@@ -515,6 +515,15 @@ def build_projection(
     classification_counts = output.get("counts")
     if not isinstance(classified_records, list) or not isinstance(classification_counts, dict):
         raise ConvergenceBackfillError("classifier output lacks records or counts")
+    expected_record_ids = [record["record_id"] for record in classifier_records]
+    classified_record_ids = [
+        record.get("record_id") if isinstance(record, dict) else None
+        for record in classified_records
+    ]
+    if classified_record_ids != expected_record_ids:
+        raise ConvergenceBackfillError(
+            "classifier output record identities do not match the selected bounded snapshot"
+        )
     source_records = []
     per_source_evidence_references = []
     for item in selected:

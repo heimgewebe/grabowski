@@ -216,6 +216,48 @@ class ConvergenceBackfillTests(unittest.TestCase):
                     bureau_attention_provider=_bureau_provider(),
                 )
 
+    def test_classifier_output_must_match_selected_record_identities_exactly(self) -> None:
+        inventory = {
+            "records": [
+                {"obligation_id": "goo-a", "state": "open"},
+                {"obligation_id": "goo-b", "state": "open"},
+            ],
+            "integrity_errors": [],
+            "scan_truncated": False,
+        }
+        statuses = {
+            "goo-a": _status("goo-a", "open"),
+            "goo-b": _status("goo-b", "open"),
+        }
+
+        def classifier(_name, parameters):
+            records = [dict(record) for record in parameters["records"]]
+            records.reverse()
+            return {
+                "status": "passed",
+                "output": {"records": records, "counts": {}},
+                "receipt": {
+                    "grip": "convergence-state-classify",
+                    "parameters_sha256": "a" * 64,
+                    "output_sha256": "b" * 64,
+                },
+                "receipt_sha256": "c" * 64,
+            }
+
+        with patch.object(backfill, "list_obligations", return_value=inventory), patch.object(
+            backfill, "status_obligation", side_effect=lambda value: statuses[value]
+        ):
+            with self.assertRaisesRegex(
+                backfill.ConvergenceBackfillError,
+                "record identities",
+            ):
+                backfill.build_projection(
+                    runtime_binding=RUNTIME,
+                    observation_unix=100,
+                    bureau_attention_provider=_bureau_provider(),
+                    classifier=classifier,
+                )
+
     def test_override_for_unselected_record_fails_closed(self) -> None:
         inventory = {"records": [{"obligation_id": "goo-test-open", "state": "open"}], "integrity_errors": [], "scan_truncated": False}
         with patch.object(backfill, "list_obligations", return_value=inventory), patch.object(
