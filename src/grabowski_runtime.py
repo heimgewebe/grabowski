@@ -3,6 +3,7 @@ from __future__ import annotations
 import grabowski_operator_core
 import grabowski_checkouts
 import grabowski_runtime_extensions
+import grabowski_audit_query
 import grabowski_read_surface
 import grabowski_self_deploy
 import grabowski_fleet

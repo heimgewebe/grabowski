@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "5272dd7e605a5e1cd66fe7379e9525681137c537f2bed406de2f4f3831f3fa90"
+    "sha256": "6d90e320a7a436b8540730dbd1a44bb47fd0cf6aad78a5710a2d62602ff14e28"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "0e08c4513c6fd93e483093227dae69e2e51546bc182e307a6087087b1cd18a50"
+    "sha256": "e8bf4ba0c37953b3c73117ac6d8f13916ccf88e55f8bbde39e6535509a881a86"
   },
   "counts": {
     "core": 22,
-    "full": 157,
-    "operator": 142
+    "full": 161,
+    "operator": 146
   },
   "profiles": {
     "core": [
@@ -57,6 +57,9 @@
       "grabowski_destroy_path",
       "grabowski_rollback_text",
       "grabowski_verify_audit",
+      "grabowski_audit_query",
+      "grabowski_audit_trace",
+      "grabowski_audit_analyze",
       "latest_complete_bundles",
       "repoground_bundle_discover",
       "repoground_bundle_status",
@@ -184,6 +187,7 @@
       "grabowski_agent_workspace_optimize",
       "grabowski_agent_workspace_cleanup_plan",
       "grabowski_agent_workspace_reconcile_stale",
+      "grabowski_agent_workspace_reconcile_idle_tmux",
       "grabowski_agent_workspace_cleanup",
       "grabowski_agent_execution_route",
       "grabowski_coding_agent_catalog",
@@ -215,6 +219,9 @@
       "grabowski_restore_removed_path",
       "grabowski_destroy_path",
       "grabowski_rollback_text",
+      "grabowski_audit_query",
+      "grabowski_audit_trace",
+      "grabowski_audit_analyze",
       "latest_complete_bundles",
       "repoground_bundle_discover",
       "repoground_bundle_status",
@@ -328,6 +335,7 @@
       "grabowski_agent_workspace_optimize",
       "grabowski_agent_workspace_cleanup_plan",
       "grabowski_agent_workspace_reconcile_stale",
+      "grabowski_agent_workspace_reconcile_idle_tmux",
       "grabowski_agent_workspace_cleanup",
       "grabowski_agent_execution_route",
       "grabowski_coding_agent_catalog",

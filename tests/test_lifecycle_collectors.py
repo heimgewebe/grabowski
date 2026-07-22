@@ -190,6 +190,7 @@ class LifecycleCollectorTests(unittest.TestCase):
             "checkout": {"coordination": {"processes": []}},
             **cleanup_plan,
         }
+        sources["task"] = observed({"tasks": status.get("tasks", {})})
         sources["workspace"] = observed({"status": status, "cleanup_plan": normalized_cleanup})
         sources["tmux"] = observed(tmux or {"live": False, "role_bound": False})
         sources["receipt"] = observed({"close_integrity": {"valid": receipt_valid}})
@@ -233,6 +234,48 @@ class LifecycleCollectorTests(unittest.TestCase):
         )
         self.assertEqual(result["classification"], "active")
         self.assertIn("open_task_role", result["reason_codes"])
+
+    def test_workspace_task_source_binds_live_role_readback(self):
+        status = self.closed_workspace_status()
+        status["closed"] = False
+        status["tasks"]["writer"] = {
+            "task_id": "w",
+            "state": "running",
+            "terminal": False,
+        }
+        result = collectors.collect_lifecycle_classification(
+            self.workspace_request(
+                status,
+                {"workspace_references": [], "workspace_reference_scan_errors": []},
+            )
+        )
+        task_projection = result["source_projections"]["task"]
+        self.assertTrue(task_projection["present"])
+        self.assertEqual(
+            task_projection["value"]["roles"]["writer"]["state"],
+            "running",
+        )
+        self.assertEqual(result["classification"], "active")
+
+    def test_workspace_task_observation_error_fails_closed(self):
+        status = self.closed_workspace_status()
+        status["tasks"]["writer"] = {
+            "task_id": "w",
+            "state": "observation_error",
+            "terminal": False,
+            "error": "task status unavailable",
+        }
+        result = collectors.collect_lifecycle_classification(
+            self.workspace_request(
+                status,
+                {"workspace_references": [], "workspace_reference_scan_errors": []},
+            )
+        )
+        self.assertEqual(result["classification"], "ambiguous")
+        self.assertIn(
+            "observation_error:source_error:task:workspace_task_observation_error:writer",
+            result["reason_codes"],
+        )
 
     def test_shared_workspace_reference_is_untouchable(self):
         result = collectors.collect_lifecycle_classification(

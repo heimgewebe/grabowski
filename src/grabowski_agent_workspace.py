@@ -22,6 +22,8 @@ import grabowski_resources as resources
 import grabowski_tasks as tasks
 import grabowski_command_identity as command_identity
 import grabowski_checkouts as checkouts
+import grabowski_lifecycle_collectors as lifecycle_collectors
+import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
 from grabowski_agent_sandbox import safe_git_environment
 try:
     import grabowski_operator_core as operator
@@ -100,6 +102,7 @@ WRITER_HANDOFF_TERMINAL_STATES = frozenset({"failed", "cancelled", "timed_out", 
 ROLE_PREFLIGHT_CACHE_TTL_SECONDS = 300
 MAX_WORKSPACE_EVENTS = 512
 WORKSPACE_CLEANUP_RETENTION_SECONDS = 30 * 24 * 60 * 60
+WORKSPACE_LIFECYCLE_EFFECT_LEASE_TTL_SECONDS = 5 * 60
 MAX_CLEANUP_WORKSPACES = 100
 MAX_WORKSPACE_REFERENCE_SCAN = 1000
 STALE_WORKSPACE_MINIMUM_AGE_SECONDS = 60 * 60
@@ -1604,6 +1607,15 @@ def _tmux_result(argv: list[str], *, timeout: int = 30) -> dict[str, Any]:
 
 def _tmux_has_session(session: str) -> bool:
     result = _tmux_result(["has-session", "-t", session])
+    return result["returncode"] == 0
+
+
+def _tmux_exact_target(session: str) -> str:
+    return f"={session}"
+
+
+def _tmux_has_exact_session(session: str) -> bool:
+    result = _tmux_result(["has-session", "-t", _tmux_exact_target(session)])
     return result["returncode"] == 0
 
 
@@ -6900,38 +6912,51 @@ def _workspace_created_unix(manifest: dict[str, Any]) -> int | None:
 
 
 def _closed_workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
-    close_receipt = manifest.get("close_receipt")
-    task_states = (
-        dict(close_receipt.get("task_states", {}))
-        if isinstance(close_receipt, dict)
-        and isinstance(close_receipt.get("task_states"), dict)
-        else {}
-    )
-    created_unix = _workspace_created_unix(manifest)
-    stale_after_unix = (
-        created_unix + STALE_WORKSPACE_MINIMUM_AGE_SECONDS
-        if created_unix is not None
-        else None
-    )
+    liveness = _workspace_liveness(manifest)
+    raw_resource_keys = manifest.get("resources", {}).get("lease_keys")
+    exact_resource_keys: list[str] = []
+    exact_live_resource_keys: list[str] = []
+    exact_resource_error: str | None = None
+    if not isinstance(raw_resource_keys, list) or any(
+        not isinstance(item, str) or not item for item in raw_resource_keys
+    ):
+        exact_resource_error = "workspace resource lease keys are invalid"
+    else:
+        try:
+            exact_resource_keys = resources.normalize_resource_keys(raw_resource_keys)
+            observed_at_unix = _now()
+            for key in exact_resource_keys:
+                lease = resources.inspect_resource(key)
+                if lease is None:
+                    continue
+                expires_at_unix = lease.get("expires_at_unix")
+                if not isinstance(expires_at_unix, int) or isinstance(
+                    expires_at_unix, bool
+                ):
+                    raise AgentWorkspaceActionError(
+                        f"workspace resource lease expiry is invalid: {key}"
+                    )
+                if expires_at_unix > observed_at_unix:
+                    exact_live_resource_keys.append(key)
+        except Exception as exc:
+            exact_resource_error = _error_summary(exc)
+    errors = [
+        value
+        for value in (
+            liveness.get("resource_observation_error"),
+            exact_resource_error,
+        )
+        if isinstance(value, str) and value
+    ]
     return {
-        "created_at": manifest.get("created_at"),
-        "created_at_unix": created_unix,
-        "stale_after_unix": stale_after_unix,
-        "stale_threshold_met": bool(
-            stale_after_unix is not None and _now() >= stale_after_unix
+        **liveness,
+        "live_resource_keys": sorted(
+            set(liveness.get("live_resource_keys", []))
+            | set(exact_live_resource_keys)
         ),
-        "task_states": task_states,
-        "nonterminal_roles": [],
-        "execution_live_roles": [],
-        "recovery_attention_roles": [],
-        "task_observation_error_roles": [],
-        "live_resource_keys": [],
-        "resource_observation_error": None,
-        "session_live": False,
-        "operationally_live": False,
-        "session_only_non_authoritative": False,
-        "unresolved_task_start_roles": [],
-        "source": "complete_close_receipt",
+        "resource_observation_error": "; ".join(errors) if errors else None,
+        "exact_resource_keys_checked": exact_resource_keys,
+        "source": "live_runtime_after_complete_close_receipt",
     }
 
 
@@ -7150,12 +7175,69 @@ def _workspace_cleanup_plan_data(
         blockers.append({"code": "workspace_not_closed"})
     elif close_receipt.get("resources_released") is not True:
         blockers.append({"code": "workspace_resources_not_released"})
+    if fully_closed:
+        if liveness.get("resource_observation_error"):
+            blockers.append(
+                {
+                    "code": "workspace_resource_outcome_unknown",
+                    "error": liveness["resource_observation_error"],
+                }
+            )
+        if liveness.get("live_resource_keys"):
+            blockers.append(
+                {
+                    "code": "workspace_resources_live",
+                    "resource_keys": liveness["live_resource_keys"],
+                }
+            )
+        if liveness.get("execution_live_roles"):
+            blockers.append(
+                {
+                    "code": "workspace_tasks_nonterminal",
+                    "roles": liveness["execution_live_roles"],
+                }
+            )
+        if liveness.get("recovery_attention_roles"):
+            blockers.append(
+                {
+                    "code": "workspace_tasks_require_reconciliation",
+                    "roles": liveness["recovery_attention_roles"],
+                }
+            )
+        if liveness.get("task_observation_error_roles"):
+            blockers.append(
+                {
+                    "code": "workspace_task_observation_error",
+                    "roles": liveness["task_observation_error_roles"],
+                }
+            )
+        if liveness.get("unresolved_task_start_roles"):
+            blockers.append(
+                {
+                    "code": "workspace_task_start_outcome_unknown",
+                    "roles": liveness["unresolved_task_start_roles"],
+                }
+            )
+        if liveness.get("session_live"):
+            blockers.append({"code": "workspace_tmux_session_live"})
     if isinstance(cleanup_intent, dict) and cleanup_intent.get("state") == "started":
         blockers.append(
             {
                 "code": "cleanup_outcome_unknown",
                 "intent_id": cleanup_intent.get("intent_id"),
                 "archive_id": cleanup_intent.get("archive_id"),
+            }
+        )
+    elif (
+        isinstance(cleanup_intent, dict)
+        and cleanup_intent.get("state") == "recovery_required"
+    ):
+        blockers.append(
+            {
+                "code": "cleanup_recovery_required",
+                "intent_id": cleanup_intent.get("intent_id"),
+                "archive_id": cleanup_intent.get("archive_id"),
+                "lifecycle_effects": cleanup_intent.get("lifecycle_effects", {}),
             }
         )
     references, reference_scan_errors = _workspace_cleanup_references(
@@ -7316,6 +7398,38 @@ def _workspace_cleanup_plan_data(
             else "abandoned_stale_workspace"
         ),
         "legacy_absence_receipt_required": legacy_absence_reconciliation,
+    }
+    session_name = manifest.get("session_name")
+    exact_idle_tmux_session_live = bool(
+        liveness.get("session_live") is True
+        and isinstance(session_name, str)
+        and session_name
+        and _tmux_has_exact_session(session_name)
+    )
+    idle_tmux_transition_eligible = bool(
+        exact_idle_tmux_session_live
+        and liveness.get("operationally_live") is False
+        and liveness.get("session_only_non_authoritative") is True
+        and isinstance(session_name, str)
+        and session_name
+        and stale_reconciliation["reconciliation_kind"] == "stale_abandonment"
+        and checkout_state["exists"]
+        and checkout_state["linked"]
+        and checkout_state["clean"]
+        and len(stale_blockers) == 1
+        and stale_blockers[0].get("code") == "workspace_idle_tmux_cleanup_required"
+    )
+    stale_reconciliation["idle_tmux_transition"] = {
+        "eligible": idle_tmux_transition_eligible,
+        "action": "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+        "confirmation_required": "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+        "session_name": session_name,
+        "exact_session_live": exact_idle_tmux_session_live,
+        "removes_tmux": True,
+        "mutates_tasks": False,
+        "mutates_resources": False,
+        "removes_worktree": False,
+        "deletes_workspace_evidence": False,
     }
     if cleanup_receipt_valid and checkout_state["exists"]:
         blockers.append({"code": "writer_worktree_reappeared_after_cleanup"})
@@ -7648,6 +7762,712 @@ def grabowski_agent_workspace_reconcile_stale(
     }
 
 
+@mcp.tool(name="grabowski_agent_workspace_reconcile_idle_tmux", annotations=MUTATING)
+def grabowski_agent_workspace_reconcile_idle_tmux(
+    workspace_id: str,
+    expected_plan_sha256: str,
+    confirmation: str = "",
+) -> dict[str, Any]:
+    """Remove one exact non-authoritative idle tmux session, then stale-reconcile the workspace."""
+    operator._require_operator_mutation("durable_job")
+    operator._require_operator_mutation("git_cli")
+    operator._require_operator_mutation("resource_lease")
+    operator._require_operator_mutation("tmux_interaction")
+    identifier = _required_string(workspace_id, "workspace_id", max_length=80)
+    if WORKSPACE_ID_RE.fullmatch(identifier) is None:
+        raise AgentWorkspaceError(f"invalid workspace_id: {identifier}")
+    expected_hash = _required_string(
+        expected_plan_sha256, "expected_plan_sha256", max_length=64
+    )
+    if SHA256_RE.fullmatch(expected_hash) is None:
+        raise AgentWorkspaceError("expected_plan_sha256 must be a lowercase SHA-256")
+    required_confirmation = "remove-idle-tmux-and-mark-stale-workspace-abandoned"
+    if confirmation != required_confirmation:
+        raise AgentWorkspaceError(
+            f"confirmation must be exactly '{required_confirmation}'"
+        )
+    with _lock(identifier):
+        manifest = _manifest(identifier)
+        existing = manifest.get("close_receipt")
+        if isinstance(existing, dict) and _close_integrity_status(manifest, existing)["valid"]:
+            return {
+                "workspace_id": identifier,
+                "state": "already_closed",
+                "idempotent": True,
+                "close_receipt": existing,
+                "tmux_removed": False,
+                "tmux_mutation_performed": False,
+            }
+        plan = _workspace_cleanup_plan_data(manifest)
+        if plan["plan_sha256"] != expected_hash:
+            raise AgentWorkspaceError("workspace lifecycle plan is stale; rerun cleanup_plan")
+        transition = plan["stale_reconciliation"].get("idle_tmux_transition")
+        if not isinstance(transition, dict) or transition.get("eligible") is not True:
+            return {
+                "workspace_id": identifier,
+                "state": "idle_tmux_transition_blocked",
+                "idempotent": False,
+                "plan": plan,
+            }
+        session_name = transition.get("session_name")
+        if not isinstance(session_name, str) or not session_name:
+            raise AgentWorkspaceError("idle tmux transition has no exact session binding")
+        pre_mutation_plan = _workspace_cleanup_plan_data(manifest)
+        if pre_mutation_plan["plan_sha256"] != expected_hash:
+            raise AgentWorkspaceError(
+                "workspace lifecycle plan changed before idle tmux removal; rerun cleanup_plan"
+            )
+        pre_mutation_transition = pre_mutation_plan["stale_reconciliation"].get(
+            "idle_tmux_transition"
+        )
+        if (
+            not isinstance(pre_mutation_transition, dict)
+            or pre_mutation_transition.get("eligible") is not True
+            or pre_mutation_transition.get("session_name") != session_name
+        ):
+            raise AgentWorkspaceError("idle tmux transition changed before removal")
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "agent-workspace-idle-tmux-transition-start",
+                "workspace_id": identifier,
+                "source_plan_sha256": expected_hash,
+                "session_name": session_name,
+                "confirmation": required_confirmation,
+                "mutation_performed": False,
+            }
+        )
+        killed = _tmux_result(["kill-session", "-t", _tmux_exact_target(session_name)])
+        tmux_mutation_performed = killed.get("returncode") == 0
+        if not tmux_mutation_performed and _tmux_has_exact_session(session_name):
+            raise AgentWorkspaceActionError(
+                str(killed.get("stderr") or "idle tmux session removal failed")
+            )
+        if _tmux_has_exact_session(session_name):
+            raise AgentWorkspaceActionError("idle tmux session remained live after removal")
+        transition_body = {
+            "schema_version": 1,
+            "workspace_id": identifier,
+            "source_plan_sha256": expected_hash,
+            "session_name": session_name,
+            "tmux_removed": True,
+            "tmux_mutation_performed": tmux_mutation_performed,
+            "task_mutation_performed": False,
+            "resource_mutation_performed": False,
+            "worktree_mutation_performed": False,
+            "historical_evidence_preserved": True,
+            "transitioned_at": _utc(),
+        }
+        transition_receipt = {
+            **transition_body,
+            "receipt_sha256": _sha256_json(transition_body),
+        }
+        _atomic_json(
+            _workspace_dir(identifier) / "idle-tmux-transition-receipt.json",
+            transition_receipt,
+        )
+        manifest["idle_tmux_transition_receipt"] = transition_receipt
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "agent-workspace-idle-tmux-remove",
+                "workspace_id": identifier,
+                "source_plan_sha256": expected_hash,
+                "session_name": session_name,
+                "receipt_sha256": transition_receipt["receipt_sha256"],
+                "tmux_removed": True,
+                "tmux_mutation_performed": tmux_mutation_performed,
+                "historical_evidence_preserved": True,
+            }
+        )
+        _append_workspace_event(
+            manifest,
+            "workspace_idle_tmux_removed",
+            outcome="verified",
+            evidence={
+                "source_plan_sha256": expected_hash,
+                "session_name": session_name,
+                "receipt_sha256": transition_receipt["receipt_sha256"],
+                "tmux_mutation_performed": tmux_mutation_performed,
+            },
+        )
+        _write_manifest(manifest)
+        post_tmux_plan = _workspace_cleanup_plan_data(manifest)
+        post_tmux_plan_sha256 = str(post_tmux_plan["plan_sha256"])
+        if not post_tmux_plan["stale_reconciliation"]["eligible"]:
+            return {
+                "workspace_id": identifier,
+                "state": "idle_tmux_removed_stale_reconciliation_blocked",
+                "idempotent": False,
+                "source_plan_sha256": expected_hash,
+                "post_tmux_plan_sha256": post_tmux_plan_sha256,
+                "tmux_removed": True,
+                "tmux_mutation_performed": tmux_mutation_performed,
+                "idle_tmux_transition_receipt": transition_receipt,
+                "plan": post_tmux_plan,
+            }
+    try:
+        close_result = grabowski_agent_workspace_reconcile_stale(
+            identifier,
+            post_tmux_plan_sha256,
+            "mark-stale-workspace-abandoned",
+        )
+    except AgentWorkspaceError as exc:
+        if "workspace lifecycle plan is stale" not in str(exc):
+            raise
+        with _lock(identifier):
+            current_plan = _workspace_cleanup_plan_data(_manifest(identifier))
+        return {
+            "workspace_id": identifier,
+            "state": "idle_tmux_removed_stale_reconciliation_blocked",
+            "idempotent": False,
+            "source_plan_sha256": expected_hash,
+            "post_tmux_plan_sha256": post_tmux_plan_sha256,
+            "tmux_removed": True,
+            "tmux_mutation_performed": tmux_mutation_performed,
+            "idle_tmux_transition_receipt": transition_receipt,
+            "reconciliation_error": str(exc),
+            "plan": current_plan,
+        }
+    return {
+        **close_result,
+        "source_plan_sha256": expected_hash,
+        "post_tmux_plan_sha256": post_tmux_plan_sha256,
+        "tmux_removed": True,
+        "tmux_mutation_performed": tmux_mutation_performed,
+        "idle_tmux_transition_receipt": transition_receipt,
+    }
+
+
+def _workspace_lifecycle_gate_resource(workspace_id: str) -> str:
+    return resources.normalize_resource_key(
+        f"gate:workspace-lifecycle:{workspace_id}"
+    )
+
+
+def _workspace_lifecycle_lease_owner(workspace_id: str) -> str:
+    return f"workspace-lifecycle:{workspace_id}"
+
+
+def _workspace_lifecycle_effect_roots(
+    manifest: dict[str, Any], effect_kind: str
+) -> dict[str, Path]:
+    if effect_kind not in {"workspace_archive", "retention_converge"}:
+        raise AgentWorkspaceError(f"unsupported workspace lifecycle effect: {effect_kind}")
+    root = (
+        _workspace_dir(str(manifest["workspace_id"]))
+        / "lifecycle-effects"
+        / effect_kind
+    )
+    return {
+        "root": root,
+        "plans": root / "plans",
+        "revalidations": root / "revalidations",
+        "receipts": root / "receipts",
+    }
+
+
+def _workspace_lifecycle_cleanup_plan(
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    projected_manifest = dict(manifest)
+    projected_manifest.pop("workspace_cleanup_intent", None)
+    return _workspace_cleanup_plan_data(projected_manifest)
+
+
+def _workspace_lifecycle_classification(
+    manifest: dict[str, Any],
+    cleanup_plan: dict[str, Any],
+    *,
+    observed_at_unix: int,
+) -> dict[str, Any]:
+    identifier = str(manifest["workspace_id"])
+    close_receipt = manifest.get("close_receipt")
+    close_integrity = _close_integrity_status(manifest, close_receipt)
+    cleanup_liveness = (
+        cleanup_plan.get("liveness")
+        if isinstance(cleanup_plan.get("liveness"), dict)
+        else {}
+    )
+    live_task_states = (
+        dict(cleanup_liveness.get("task_states", {}))
+        if isinstance(cleanup_liveness.get("task_states"), dict)
+        else {}
+    )
+    status_payload = {
+        "workspace_id": identifier,
+        "closed": bool(
+            isinstance(close_receipt, dict)
+            and close_receipt.get("state") == "complete"
+            and close_receipt.get("resources_released") is True
+            and close_integrity["valid"]
+        ),
+        "tasks": live_task_states,
+        "close_integrity": close_integrity,
+    }
+    checkout_inventory = checkouts.grabowski_checkout_inventory(
+        repo=str(manifest["repository"]),
+        include_processes=True,
+        include_tasks=True,
+        include_resources=True,
+    )
+    cleanup_checkout = (
+        cleanup_plan.get("checkout")
+        if isinstance(cleanup_plan.get("checkout"), dict)
+        else {}
+    )
+    cleanup_coordination = (
+        cleanup_checkout.get("coordination")
+        if isinstance(cleanup_checkout.get("coordination"), dict)
+        else {}
+    )
+    processes = cleanup_coordination.get("processes", [])
+    if not isinstance(processes, list):
+        processes = []
+    session_name = manifest.get("session_name")
+    tmux_live = bool(
+        isinstance(session_name, str)
+        and session_name
+        and _tmux_has_exact_session(session_name)
+    )
+    resource_values = manifest.get("resources")
+    raw_resource_keys = (
+        resource_values.get("lease_keys")
+        if isinstance(resource_values, dict)
+        else None
+    )
+    lease_read_error: str | None = None
+    exact_resource_keys: tuple[str, ...] = ()
+    lease_inspections: list[dict[str, Any]] = []
+    if not isinstance(raw_resource_keys, list) or any(
+        not isinstance(item, str) or not item for item in raw_resource_keys
+    ):
+        lease_read_error = "workspace resource lease keys are invalid"
+    else:
+        try:
+            exact_resource_keys = tuple(resources.normalize_resource_keys(raw_resource_keys))
+            lease_inspections = [
+                {"resource_key": key, "lease": resources.inspect_resource(key)}
+                for key in exact_resource_keys
+            ]
+        except Exception as exc:
+            lease_read_error = _error_summary(exc)
+    sources = {
+        "task": lifecycle_collectors.SourceReadback(
+            observed=True,
+            payload={"tasks": live_task_states},
+        ),
+        "workspace": lifecycle_collectors.SourceReadback(
+            observed=True,
+            payload={"status": status_payload, "cleanup_plan": cleanup_plan},
+        ),
+        "lease": lifecycle_collectors.SourceReadback(
+            observed=True,
+            payload={"inspections": lease_inspections},
+            error=lease_read_error,
+        ),
+        "checkout": lifecycle_collectors.SourceReadback(
+            observed=True,
+            payload=checkout_inventory,
+        ),
+        "process": lifecycle_collectors.SourceReadback(
+            observed=True,
+            payload={"processes": processes, "scope": manifest["writer_worktree"]},
+        ),
+        "tmux": lifecycle_collectors.SourceReadback(
+            observed=True,
+            payload={
+                "session_name": session_name,
+                "live": tmux_live,
+                "role_bound": False,
+                "error": None,
+            },
+        ),
+        "receipt": lifecycle_collectors.SourceReadback(
+            observed=True,
+            payload={"close_integrity": close_integrity},
+        ),
+    }
+    return lifecycle_collectors.collect_lifecycle_classification(
+        lifecycle_collectors.LifecycleCollectorRequest(
+            identity=identifier,
+            kind="workspace",
+            observed_at_unix=observed_at_unix,
+            sources=sources,
+            exact_resource_keys=exact_resource_keys,
+            expected_owner_id=_workspace_cleanup_owner(identifier),
+            checkout_path=str(manifest["writer_worktree"]),
+            process_scope=str(manifest["writer_worktree"]),
+        )
+    )
+
+
+def _workspace_lifecycle_effect_begin(
+    manifest: dict[str, Any],
+    _cleanup_plan: dict[str, Any],
+    *,
+    effect_kind: str,
+    intent_id: str,
+    execution_suffix: str = "",
+) -> dict[str, Any]:
+    identifier = str(manifest["workspace_id"])
+    observation_time = _now()
+    classification = _workspace_lifecycle_classification(
+        manifest,
+        _workspace_lifecycle_cleanup_plan(manifest),
+        observed_at_unix=observation_time,
+    )
+    gate_resource = _workspace_lifecycle_gate_resource(identifier)
+    lease_owner = _workspace_lifecycle_lease_owner(identifier)
+    plan = lifecycle_effect_plan.build_effect_plan(
+        [classification],
+        effect_kind=effect_kind,
+        lease_owner_id=lease_owner,
+        required_resource_keys=[gate_resource],
+        created_at_unix=observation_time,
+    )
+    roots = _workspace_lifecycle_effect_roots(manifest, effect_kind)
+    gate_lease = resources.acquire_resources(
+        lease_owner,
+        [gate_resource],
+        purpose=f"workspace lifecycle effect {effect_kind}: {identifier}",
+        ttl_seconds=WORKSPACE_LIFECYCLE_EFFECT_LEASE_TTL_SECONDS,
+        metadata={
+            "workspace_id": identifier,
+            "effect_kind": effect_kind,
+            "intent_id": intent_id,
+            "plan_sha256": plan["plan_sha256"],
+        },
+    )
+    try:
+        persisted_plan = lifecycle_effect_plan.write_effect_plan(
+            plan,
+            plan_root=roots["plans"],
+        )
+        current_manifest = _manifest(identifier)
+        current = _workspace_lifecycle_classification(
+            current_manifest,
+            _workspace_lifecycle_cleanup_plan(current_manifest),
+            observed_at_unix=observation_time,
+        )
+        lease_observations = [
+            lifecycle_effect_plan.LeaseObservation(
+                resource_key=str(item["resource_key"]),
+                owner_id=str(item["owner_id"]),
+                expires_at_unix=int(item["expires_at_unix"]),
+                metadata_sha256=str(item["metadata_sha256"]),
+            )
+            for item in gate_lease["leases"]
+        ]
+        revalidation = lifecycle_effect_plan.revalidate_effect_plan(
+            plan,
+            {identifier: current},
+            lease_observations,
+            now_unix=_now(),
+        )
+        if revalidation["ready_for_effect"] is not True:
+            raise AgentWorkspaceActionError(
+                "workspace lifecycle effect revalidation is not ready: "
+                + ", ".join(revalidation["errors"])
+            )
+        persisted_revalidation = lifecycle_effect_plan.write_effect_revalidation(
+            revalidation,
+            revalidation_root=roots["revalidations"],
+            plan=plan,
+        )
+        started_at_unix = _now()
+        if started_at_unix >= min(
+            int(item["expires_at_unix"]) for item in gate_lease["leases"]
+        ):
+            raise AgentWorkspaceActionError(
+                "workspace lifecycle effect lease expired before execution start"
+            )
+    except Exception:
+        resources.release_resources(
+            lease_owner,
+            [gate_resource],
+        )
+        raise
+    return {
+        "effect_kind": effect_kind,
+        "execution_id": (
+            f"{identifier}:{effect_kind}:{intent_id}"
+            + (f":{execution_suffix}" if execution_suffix else "")
+        ),
+        "plan": plan,
+        "plan_path": persisted_plan["plan_path"],
+        "revalidation": revalidation,
+        "revalidation_path": persisted_revalidation["revalidation_path"],
+        "receipt_root": roots["receipts"],
+        "gate_lease": gate_lease,
+        "gate_resource": gate_resource,
+        "lease_owner": lease_owner,
+        "started_at_unix": started_at_unix,
+    }
+
+
+def _workspace_lifecycle_effect_reference(
+    context: dict[str, Any],
+    receipt_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reference = {
+        "effect_kind": context["effect_kind"],
+        "execution_id": context["execution_id"],
+        "plan_path": context["plan_path"],
+        "plan_sha256": context["plan"]["plan_sha256"],
+        "revalidation_path": context["revalidation_path"],
+        "revalidation_sha256": context["revalidation"]["revalidation_sha256"],
+    }
+    if receipt_result is not None:
+        reference.update(
+            {
+                "receipt_path": receipt_result["receipt_path"],
+                "receipt_sha256": receipt_result["receipt"]["receipt_sha256"],
+                "status": receipt_result["receipt"]["status"],
+                "blind_retry_allowed": receipt_result["receipt"][
+                    "blind_retry_allowed"
+                ],
+            }
+        )
+    else:
+        reference["status"] = "ready"
+    return reference
+
+
+def _workspace_lifecycle_effect_finish(
+    context: dict[str, Any],
+    *,
+    transport_outcome: str,
+    mutation_state: str,
+    post_state_status: str,
+    post_state_sha256s: dict[str, str] | None = None,
+    recovery_refs: Iterable[str] = (),
+) -> dict[str, Any]:
+    receipt = lifecycle_effect_plan.build_effect_execution_receipt(
+        context["plan"],
+        context["revalidation"],
+        execution_id=context["execution_id"],
+        started_at_unix=int(context["started_at_unix"]),
+        completed_at_unix=_now(),
+        transport_outcome=transport_outcome,
+        mutation_state=mutation_state,
+        post_state_status=post_state_status,
+        post_state_sha256s=post_state_sha256s,
+        recovery_refs=recovery_refs,
+    )
+    return lifecycle_effect_plan.write_effect_execution_receipt(
+        receipt,
+        receipt_root=context["receipt_root"],
+        plan=context["plan"],
+        revalidation=context["revalidation"],
+    )
+
+
+def _workspace_lifecycle_effect_release(context: dict[str, Any]) -> None:
+    resources.release_resources(
+        str(context["lease_owner"]),
+        [str(context["gate_resource"])],
+    )
+
+
+def _record_workspace_lifecycle_effect(
+    manifest: dict[str, Any],
+    *,
+    intent_id: str,
+    effect_kind: str,
+    reference: dict[str, Any],
+) -> dict[str, Any]:
+    intent = manifest.get("workspace_cleanup_intent")
+    if not isinstance(intent, dict) or intent.get("intent_id") != intent_id:
+        raise AgentWorkspaceActionError(
+            "workspace cleanup intent changed during lifecycle effect"
+        )
+    effects = dict(intent.get("lifecycle_effects", {}))
+    current = effects.get(effect_kind)
+    stored_reference = dict(reference)
+    if isinstance(current, dict):
+        if current == stored_reference:
+            return dict(current)
+        if current.get("receipt_sha256") is not None:
+            if (
+                current.get("status") != "recovery_required"
+                or current.get("execution_id") == stored_reference.get("execution_id")
+            ):
+                raise AgentWorkspaceActionError(
+                    f"workspace lifecycle effect {effect_kind} already has different evidence"
+                )
+            stored_reference["supersedes"] = current
+        elif "supersedes" in current and "supersedes" not in stored_reference:
+            stored_reference["supersedes"] = current["supersedes"]
+    effects[effect_kind] = stored_reference
+    intent["lifecycle_effects"] = effects
+    manifest["workspace_cleanup_intent"] = intent
+    _write_manifest(manifest)
+    return stored_reference
+
+
+def _workspace_archive_post_state(
+    manifest: dict[str, Any],
+    archive_id: str,
+    *,
+    expected_checkout_key: str | None = None,
+    expected_head: str | None = None,
+    expected_branch: str | None = None,
+    expected_owner: str | None = None,
+) -> dict[str, str]:
+    archive = checkouts._load_archive(archive_id)
+    identifier = str(manifest["workspace_id"])
+    intent = manifest.get("workspace_cleanup_intent")
+    owner = expected_owner or _workspace_cleanup_owner(identifier)
+    head = expected_head
+    if head is None and isinstance(intent, dict):
+        head = intent.get("writer_head")
+    branch = expected_branch or str(manifest["writer_branch"])
+    checkout_path = _path_identity(str(manifest["writer_worktree"]))
+    repo = checkouts._resolve_repo(str(manifest["repository"]))
+    if (
+        _path_identity(str(archive.get("repo_path", ""))) != _path_identity(str(repo))
+        or _path_identity(str(archive.get("checkout_path", ""))) != checkout_path
+        or archive.get("head") != head
+        or archive.get("branch") != branch
+        or archive.get("owner_id") != owner
+        or (
+            expected_checkout_key is not None
+            and archive.get("checkout_key") != expected_checkout_key
+        )
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace archive post-state identity does not match the cleanup effect"
+        )
+    archive_root = checkouts.ARCHIVE_ROOT
+    if archive_root.is_symlink() or not archive_root.is_dir():
+        raise AgentWorkspaceActionError(
+            "workspace archive root is not a regular directory"
+        )
+    expected_manifest_path = (
+        archive_root.resolve(strict=True) / archive_id / "manifest.json"
+    )
+    manifest_path = Path(str(archive.get("manifest_path", "")))
+    if (
+        manifest_path.is_symlink()
+        or not manifest_path.is_file()
+        or manifest_path.resolve(strict=True) != expected_manifest_path
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace archive manifest path is invalid"
+        )
+    archive_manifest = _load_json(manifest_path)
+    recovery_refs = archive.get("recovery_refs")
+    if (
+        archive_manifest.get("schema_version") != 1
+        or archive_manifest.get("archive_id") != archive_id
+        or archive_manifest.get("checkout_key") != archive.get("checkout_key")
+        or _path_identity(str(archive_manifest.get("repo", "")))
+        != _path_identity(str(archive.get("repo_path", "")))
+        or _path_identity(str(archive_manifest.get("git_common_dir", "")))
+        != _path_identity(str(archive.get("repo_common_dir", "")))
+        or _path_identity(str(archive_manifest.get("checkout_path", "")))
+        != checkout_path
+        or archive_manifest.get("head") != head
+        or archive_manifest.get("branch") != branch
+        or archive_manifest.get("owner_id") != owner
+        or archive_manifest.get("recovery_refs") != recovery_refs
+        or not isinstance(recovery_refs, list)
+        or not recovery_refs
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace archive manifest does not match the archive record"
+        )
+    verified_refs = checkouts._verify_recovery_refs(repo, recovery_refs)
+    if not verified_refs or not all(item["present"] for item in verified_refs):
+        raise AgentWorkspaceActionError(
+            "workspace archive post-state recovery refs are not fully verified"
+        )
+    return {
+        "checkout_archive": _sha256_json(archive),
+        "checkout_archive_manifest": _sha256_json(archive_manifest),
+        "checkout_recovery_refs": _sha256_json(verified_refs),
+    }
+
+
+def _workspace_archive_recovery_readback(
+    manifest: dict[str, Any],
+    cleanup_plan: dict[str, Any],
+    *,
+    previous_archive_id: str | None,
+    owner: str,
+) -> dict[str, Any] | None:
+    checkout = cleanup_plan.get("checkout")
+    if not isinstance(checkout, dict):
+        return None
+    checkout_key = checkout.get("checkout_key")
+    expected_head = checkout.get("head")
+    expected_branch = checkout.get("branch")
+    if (
+        not isinstance(checkout_key, str)
+        or not isinstance(expected_head, str)
+        or not isinstance(expected_branch, str)
+    ):
+        return None
+    candidate = checkouts._latest_archive_for_key(checkout_key)
+    if (
+        not isinstance(candidate, dict)
+        or not isinstance(candidate.get("archive_id"), str)
+        or candidate.get("archive_id") == previous_archive_id
+        or candidate.get("cleaned_at_unix") is not None
+        or candidate.get("cleanup_plan_id") is not None
+    ):
+        return None
+    try:
+        _workspace_archive_post_state(
+            manifest,
+            str(candidate["archive_id"]),
+            expected_checkout_key=checkout_key,
+            expected_head=expected_head,
+            expected_branch=expected_branch,
+            expected_owner=owner,
+        )
+    except Exception:
+        return None
+    return candidate
+
+
+def _workspace_retention_post_state(
+    manifest: dict[str, Any], archive_id: str
+) -> dict[str, str]:
+    archive = checkouts._load_archive(archive_id)
+    archive_post_state = _workspace_archive_post_state(manifest, archive_id)
+    if archive.get("cleaned_at_unix") is None or archive.get("cleanup_plan_id") is None:
+        raise AgentWorkspaceActionError(
+            "retention convergence archive is not marked cleaned"
+        )
+    writer_worktree = Path(str(manifest["writer_worktree"])).expanduser()
+    if writer_worktree.exists():
+        raise AgentWorkspaceActionError(
+            "retention convergence writer worktree still exists"
+        )
+    repo = checkouts._resolve_repo(str(manifest["repository"]))
+    verified_refs = checkouts._verify_recovery_refs(
+        repo,
+        archive["recovery_refs"],
+    )
+    if not verified_refs or not all(item["present"] for item in verified_refs):
+        raise AgentWorkspaceActionError(
+            "retention convergence recovery refs are not fully verified"
+        )
+    return {
+        **archive_post_state,
+        "checkout_archive": _sha256_json(archive),
+        "checkout_recovery_refs": _sha256_json(verified_refs),
+        "writer_worktree_absence": _sha256_json(
+            {
+                "path": _path_identity(str(writer_worktree)),
+                "exists": False,
+            }
+        ),
+    }
+
+
 def _verified_workspace_cleanup_archive(
     manifest: dict[str, Any],
     intent: dict[str, Any],
@@ -7763,6 +8583,13 @@ def _publish_workspace_cleanup_receipt(
     applied_at_unix: int,
     reconciled_after_missing_worktree: bool,
 ) -> dict[str, Any]:
+    cleanup_intent = manifest.get("workspace_cleanup_intent")
+    lifecycle_effects = (
+        dict(cleanup_intent.get("lifecycle_effects", {}))
+        if isinstance(cleanup_intent, dict)
+        and isinstance(cleanup_intent.get("lifecycle_effects"), dict)
+        else {}
+    )
     receipt = {
         "schema_version": 1,
         "workspace_id": manifest["workspace_id"],
@@ -7776,6 +8603,7 @@ def _publish_workspace_cleanup_receipt(
         "historical_evidence_preserved": True,
         "workspace_state_deleted": False,
         "reconciled_after_missing_worktree": reconciled_after_missing_worktree,
+        "lifecycle_effects": lifecycle_effects,
     }
     receipt["receipt_sha256"] = _sha256_json(receipt)
     _atomic_json(
@@ -7821,6 +8649,9 @@ def grabowski_agent_workspace_cleanup(
             "confirmation must be exactly 'archive-and-remove-worktree'"
         )
     owner = _workspace_cleanup_owner(identifier)
+    reconciliation: dict[str, Any] | None = None
+    reconciliation_plan: dict[str, Any] | None = None
+    reconciliation_intent_id: str | None = None
     with _lock(identifier):
         manifest = _manifest(identifier)
         existing_receipt = manifest.get("workspace_cleanup_receipt")
@@ -7851,99 +8682,398 @@ def grabowski_agent_workspace_cleanup(
                 "idempotent": False,
                 "integrity": cleanup_integrity,
             }
-        reconciled = _workspace_cleanup_finalize_missing(manifest, expected_hash, owner)
-        if reconciled is not None:
-            receipt = _publish_workspace_cleanup_receipt(
-                manifest,
-                source_plan_sha256=expected_hash,
-                archive_id=reconciled["archive_id"],
-                checkout_cleanup_plan_id=reconciled["checkout_cleanup_plan_id"],
-                checkout_cleanup_plan_sha256=None,
-                applied_at_unix=int(reconciled["applied_at_unix"]),
-                reconciled_after_missing_worktree=True,
-            )
-            return {
-                "workspace_id": identifier,
-                "state": "cleanup_reconciled",
-                "idempotent": False,
-                "cleanup_receipt": receipt,
-            }
-        plan = _workspace_cleanup_plan_data(manifest)
-        if plan["plan_sha256"] != expected_hash:
-            raise AgentWorkspaceError("workspace cleanup plan is stale; rerun cleanup_plan")
-        if not plan["eligible"]:
-            return {
-                "workspace_id": identifier,
-                "state": "cleanup_blocked",
-                "plan": plan,
-                "idempotent": False,
-            }
-        prior_intent = manifest.get("workspace_cleanup_intent")
-        reusable_archive_id = None
-        if (
-            isinstance(prior_intent, dict)
-            and prior_intent.get("state") in {"failed", "waiting_grace"}
-            and prior_intent.get("writer_worktree") == plan["writer_worktree"]
-            and prior_intent.get("writer_branch") == plan["checkout"]["branch"]
-            and prior_intent.get("writer_head") == plan["checkout"]["head"]
-            and isinstance(prior_intent.get("archive_id"), str)
-        ):
-            reusable_archive_id = prior_intent["archive_id"]
-        intent = {
-            "schema_version": 1,
-            "intent_id": hashlib.sha256(
-                f"{identifier}:{expected_hash}:{time.time_ns()}".encode("utf-8")
-            ).hexdigest()[:24],
-            "state": "started",
-            "source_plan_sha256": expected_hash,
-            "owner_id": owner,
-            "writer_worktree": plan["writer_worktree"],
-            "writer_branch": plan["checkout"]["branch"],
-            "writer_head": plan["checkout"]["head"],
-            "archive_id": reusable_archive_id,
-            "started_at": _utc(),
-        }
-        manifest["workspace_cleanup_intent"] = intent
-        _append_workspace_event(
-            manifest,
-            "workspace_cleanup_requested",
-            outcome="started",
-            evidence={
-                "intent_id": intent["intent_id"],
-                "source_plan_sha256": expected_hash,
-                "historical_evidence_preserved": True,
-            },
+        reconciliation = _workspace_cleanup_finalize_missing(
+            manifest, expected_hash, owner
         )
-        _write_manifest(manifest)
-    archive_id = reusable_archive_id
-    try:
-        if archive_id is None:
-            archive_result = checkouts.grabowski_checkout_archive(
-                repo=plan["repository"],
-                checkout_path=plan["writer_worktree"],
-                owner_id=owner,
-                purpose=f"agent workspace cleanup {identifier}",
-                retention_until_unix=_now() + WORKSPACE_CLEANUP_RETENTION_SECONDS,
-                expected_head=str(plan["checkout"]["head"]),
-                expected_branch=str(plan["checkout"]["branch"]),
+        if reconciliation is not None:
+            reconciliation_plan = _workspace_cleanup_plan_data(manifest)
+            intent = manifest.get("workspace_cleanup_intent")
+            if not isinstance(intent, dict) or not isinstance(
+                intent.get("intent_id"), str
+            ):
+                raise AgentWorkspaceActionError(
+                    "workspace cleanup reconciliation lacks an intent identity"
+                )
+            reconciliation_intent_id = str(intent["intent_id"])
+        else:
+            plan = _workspace_cleanup_plan_data(manifest)
+            if plan["plan_sha256"] != expected_hash:
+                raise AgentWorkspaceError(
+                    "workspace cleanup plan is stale; rerun cleanup_plan"
+                )
+            if not plan["eligible"]:
+                return {
+                    "workspace_id": identifier,
+                    "state": "cleanup_blocked",
+                    "plan": plan,
+                    "idempotent": False,
+                }
+            prior_intent = manifest.get("workspace_cleanup_intent")
+            reusable_archive_id = None
+            if (
+                isinstance(prior_intent, dict)
+                and prior_intent.get("state") in {"failed", "waiting_grace"}
+                and prior_intent.get("writer_worktree") == plan["writer_worktree"]
+                and prior_intent.get("writer_branch") == plan["checkout"]["branch"]
+                and prior_intent.get("writer_head") == plan["checkout"]["head"]
+                and isinstance(prior_intent.get("archive_id"), str)
+            ):
+                reusable_archive_id = prior_intent["archive_id"]
+            intent = {
+                "schema_version": 1,
+                "intent_id": hashlib.sha256(
+                    f"{identifier}:{expected_hash}:{time.time_ns()}".encode("utf-8")
+                ).hexdigest()[:24],
+                "state": "started",
+                "source_plan_sha256": expected_hash,
+                "owner_id": owner,
+                "writer_worktree": plan["writer_worktree"],
+                "writer_branch": plan["checkout"]["branch"],
+                "writer_head": plan["checkout"]["head"],
+                "archive_id": reusable_archive_id,
+                "lifecycle_effects": (
+                    dict(prior_intent.get("lifecycle_effects", {}))
+                    if isinstance(prior_intent, dict)
+                    else {}
+                ),
+                "started_at": _utc(),
+            }
+            manifest["workspace_cleanup_intent"] = intent
+            _append_workspace_event(
+                manifest,
+                "workspace_cleanup_requested",
+                outcome="started",
+                evidence={
+                    "intent_id": intent["intent_id"],
+                    "source_plan_sha256": expected_hash,
+                    "historical_evidence_preserved": True,
+                },
             )
-            archive_id = str(archive_result["archive"]["archive_id"])
+            _write_manifest(manifest)
+
+    if reconciliation is not None:
+        assert reconciliation_plan is not None
+        assert reconciliation_intent_id is not None
+        effect = _workspace_lifecycle_effect_begin(
+            manifest,
+            reconciliation_plan,
+            effect_kind="retention_converge",
+            intent_id=reconciliation_intent_id,
+            execution_suffix="reconcile",
+        )
+        try:
             with _lock(identifier):
-                manifest = _manifest(identifier)
-                current_intent = manifest.get("workspace_cleanup_intent")
-                if not isinstance(current_intent, dict) or current_intent.get("intent_id") != intent["intent_id"]:
-                    raise AgentWorkspaceActionError("workspace cleanup intent changed after archive")
-                current_intent["archive_id"] = archive_id
-                manifest["workspace_cleanup_intent"] = current_intent
-                _write_manifest(manifest)
-        archive_record = checkouts._load_archive(archive_id)
+                current_manifest = _manifest(identifier)
+                _record_workspace_lifecycle_effect(
+                    current_manifest,
+                    intent_id=reconciliation_intent_id,
+                    effect_kind="retention_converge",
+                    reference=_workspace_lifecycle_effect_reference(effect),
+                )
+            post_state = _workspace_retention_post_state(
+                manifest, str(reconciliation["archive_id"])
+            )
+            effect_receipt = _workspace_lifecycle_effect_finish(
+                effect,
+                transport_outcome="confirmed_success",
+                mutation_state="not_performed",
+                post_state_status="verified",
+                post_state_sha256s=post_state,
+            )
+            effect_reference = _workspace_lifecycle_effect_reference(
+                effect, effect_receipt
+            )
+            with _lock(identifier):
+                current_manifest = _manifest(identifier)
+                _record_workspace_lifecycle_effect(
+                    current_manifest,
+                    intent_id=reconciliation_intent_id,
+                    effect_kind="retention_converge",
+                    reference=effect_reference,
+                )
+                receipt = _publish_workspace_cleanup_receipt(
+                    current_manifest,
+                    source_plan_sha256=expected_hash,
+                    archive_id=str(reconciliation["archive_id"]),
+                    checkout_cleanup_plan_id=str(
+                        reconciliation["checkout_cleanup_plan_id"]
+                    ),
+                    checkout_cleanup_plan_sha256=None,
+                    applied_at_unix=int(reconciliation["applied_at_unix"]),
+                    reconciled_after_missing_worktree=True,
+                )
+        finally:
+            _workspace_lifecycle_effect_release(effect)
+        return {
+            "workspace_id": identifier,
+            "state": "cleanup_reconciled",
+            "idempotent": False,
+            "cleanup_receipt": receipt,
+            "lifecycle_effect": effect_reference,
+        }
+
+    archive_id = reusable_archive_id
+    effect_mutation_ambiguous = False
+    try:
+        with _lock(identifier):
+            current_manifest = _manifest(identifier)
+            current_intent = current_manifest.get("workspace_cleanup_intent")
+            existing_effects = (
+                current_intent.get("lifecycle_effects", {})
+                if isinstance(current_intent, dict)
+                and isinstance(current_intent.get("lifecycle_effects"), dict)
+                else {}
+            )
+        archive_effect_reference = existing_effects.get("workspace_archive")
+        checkout_key = plan["checkout"].get("checkout_key")
+        if not isinstance(checkout_key, str):
+            raise AgentWorkspaceActionError(
+                "workspace cleanup plan lacks a checkout identity"
+            )
+        if archive_id is None:
+            previous_archive = checkouts._latest_archive_for_key(checkout_key)
+            previous_archive_id = (
+                str(previous_archive["archive_id"])
+                if isinstance(previous_archive, dict)
+                and isinstance(previous_archive.get("archive_id"), str)
+                else None
+            )
+            archive_effect = _workspace_lifecycle_effect_begin(
+                current_manifest,
+                plan,
+                effect_kind="workspace_archive",
+                intent_id=intent["intent_id"],
+            )
+            try:
+                with _lock(identifier):
+                    current_manifest = _manifest(identifier)
+                    _record_workspace_lifecycle_effect(
+                        current_manifest,
+                        intent_id=intent["intent_id"],
+                        effect_kind="workspace_archive",
+                        reference=_workspace_lifecycle_effect_reference(archive_effect),
+                    )
+                effect_mutation_ambiguous = True
+                try:
+                    archive_result = checkouts.grabowski_checkout_archive(
+                        repo=plan["repository"],
+                        checkout_path=plan["writer_worktree"],
+                        owner_id=owner,
+                        purpose=f"agent workspace cleanup {identifier}",
+                        retention_until_unix=(
+                            _now() + WORKSPACE_CLEANUP_RETENTION_SECONDS
+                        ),
+                        expected_head=str(plan["checkout"]["head"]),
+                        expected_branch=str(plan["checkout"]["branch"]),
+                    )
+                    archive_id = str(archive_result["archive"]["archive_id"])
+                    with _lock(identifier):
+                        current_manifest = _manifest(identifier)
+                        current_intent = current_manifest.get(
+                            "workspace_cleanup_intent"
+                        )
+                        if (
+                            not isinstance(current_intent, dict)
+                            or current_intent.get("intent_id")
+                            != intent["intent_id"]
+                        ):
+                            raise AgentWorkspaceActionError(
+                                "workspace cleanup intent changed after archive"
+                            )
+                        current_intent["archive_id"] = archive_id
+                        current_manifest["workspace_cleanup_intent"] = (
+                            current_intent
+                        )
+                        _write_manifest(current_manifest)
+                    post_state = _workspace_archive_post_state(
+                        current_manifest,
+                        archive_id,
+                        expected_checkout_key=checkout_key,
+                        expected_head=str(plan["checkout"]["head"]),
+                        expected_branch=str(plan["checkout"]["branch"]),
+                        expected_owner=owner,
+                    )
+                    archive_effect_receipt = _workspace_lifecycle_effect_finish(
+                        archive_effect,
+                        transport_outcome="confirmed_success",
+                        mutation_state="performed",
+                        post_state_status="verified",
+                        post_state_sha256s=post_state,
+                    )
+                    archive_effect_reference = (
+                        _workspace_lifecycle_effect_reference(
+                            archive_effect, archive_effect_receipt
+                        )
+                    )
+                    with _lock(identifier):
+                        current_manifest = _manifest(identifier)
+                        _record_workspace_lifecycle_effect(
+                            current_manifest,
+                            intent_id=intent["intent_id"],
+                            effect_kind="workspace_archive",
+                            reference=archive_effect_reference,
+                        )
+                    effect_mutation_ambiguous = False
+                except Exception:
+                    recovery_refs = [
+                        f"workspace-cleanup-intent:{identifier}:{intent['intent_id']}"
+                    ]
+                    if isinstance(archive_id, str):
+                        recovery_refs.append(f"checkout-archive:{archive_id}")
+                    recovery_receipt = _workspace_lifecycle_effect_finish(
+                        archive_effect,
+                        transport_outcome="unknown",
+                        mutation_state="unknown",
+                        post_state_status="unavailable",
+                        recovery_refs=recovery_refs,
+                    )
+                    archive_effect_reference = (
+                        _workspace_lifecycle_effect_reference(
+                            archive_effect, recovery_receipt
+                        )
+                    )
+                    with _lock(identifier):
+                        current_manifest = _manifest(identifier)
+                        _record_workspace_lifecycle_effect(
+                            current_manifest,
+                            intent_id=intent["intent_id"],
+                            effect_kind="workspace_archive",
+                            reference=archive_effect_reference,
+                        )
+                    recovered_archive = _workspace_archive_recovery_readback(
+                        current_manifest,
+                        plan,
+                        previous_archive_id=previous_archive_id,
+                        owner=owner,
+                    )
+                    if recovered_archive is None:
+                        raise
+                    archive_id = str(recovered_archive["archive_id"])
+                    with _lock(identifier):
+                        current_manifest = _manifest(identifier)
+                        current_intent = current_manifest.get(
+                            "workspace_cleanup_intent"
+                        )
+                        if (
+                            not isinstance(current_intent, dict)
+                            or current_intent.get("intent_id")
+                            != intent["intent_id"]
+                        ):
+                            raise AgentWorkspaceActionError(
+                                "workspace cleanup intent changed during archive recovery"
+                            )
+                        current_intent["archive_id"] = archive_id
+                        current_manifest["workspace_cleanup_intent"] = current_intent
+                        _write_manifest(current_manifest)
+                    effect_mutation_ambiguous = False
+            finally:
+                _workspace_lifecycle_effect_release(archive_effect)
+        if (
+            isinstance(archive_effect_reference, dict)
+            and archive_effect_reference.get("status") == "recovery_required"
+            and archive_id is not None
+        ):
+            archive_reconcile_effect = _workspace_lifecycle_effect_begin(
+                current_manifest,
+                plan,
+                effect_kind="workspace_archive",
+                intent_id=intent["intent_id"],
+                execution_suffix="reconcile",
+            )
+            try:
+                with _lock(identifier):
+                    current_manifest = _manifest(identifier)
+                    _record_workspace_lifecycle_effect(
+                        current_manifest,
+                        intent_id=intent["intent_id"],
+                        effect_kind="workspace_archive",
+                        reference=_workspace_lifecycle_effect_reference(
+                            archive_reconcile_effect
+                        ),
+                    )
+                post_state = _workspace_archive_post_state(
+                    current_manifest,
+                    str(archive_id),
+                    expected_checkout_key=checkout_key,
+                    expected_head=str(plan["checkout"]["head"]),
+                    expected_branch=str(plan["checkout"]["branch"]),
+                    expected_owner=owner,
+                )
+                archive_reconcile_receipt = _workspace_lifecycle_effect_finish(
+                    archive_reconcile_effect,
+                    transport_outcome="confirmed_success",
+                    mutation_state="not_performed",
+                    post_state_status="verified",
+                    post_state_sha256s=post_state,
+                )
+                archive_effect_reference = _workspace_lifecycle_effect_reference(
+                    archive_reconcile_effect, archive_reconcile_receipt
+                )
+                with _lock(identifier):
+                    current_manifest = _manifest(identifier)
+                    archive_effect_reference = _record_workspace_lifecycle_effect(
+                        current_manifest,
+                        intent_id=intent["intent_id"],
+                        effect_kind="workspace_archive",
+                        reference=archive_effect_reference,
+                    )
+            finally:
+                _workspace_lifecycle_effect_release(archive_reconcile_effect)
+        if not isinstance(archive_effect_reference, dict) or (
+            archive_effect_reference.get("status") != "succeeded"
+        ):
+            archive_effect = _workspace_lifecycle_effect_begin(
+                current_manifest,
+                plan,
+                effect_kind="workspace_archive",
+                intent_id=intent["intent_id"],
+            )
+            try:
+                with _lock(identifier):
+                    current_manifest = _manifest(identifier)
+                    _record_workspace_lifecycle_effect(
+                        current_manifest,
+                        intent_id=intent["intent_id"],
+                        effect_kind="workspace_archive",
+                        reference=_workspace_lifecycle_effect_reference(archive_effect),
+                    )
+                post_state = _workspace_archive_post_state(
+                    current_manifest,
+                    str(archive_id),
+                    expected_checkout_key=checkout_key,
+                    expected_head=str(plan["checkout"]["head"]),
+                    expected_branch=str(plan["checkout"]["branch"]),
+                    expected_owner=owner,
+                )
+                archive_effect_receipt = _workspace_lifecycle_effect_finish(
+                    archive_effect,
+                    transport_outcome="confirmed_success",
+                    mutation_state="not_performed",
+                    post_state_status="verified",
+                    post_state_sha256s=post_state,
+                )
+                archive_effect_reference = _workspace_lifecycle_effect_reference(
+                    archive_effect, archive_effect_receipt
+                )
+                with _lock(identifier):
+                    current_manifest = _manifest(identifier)
+                    _record_workspace_lifecycle_effect(
+                        current_manifest,
+                        intent_id=intent["intent_id"],
+                        effect_kind="workspace_archive",
+                        reference=archive_effect_reference,
+                    )
+            finally:
+                _workspace_lifecycle_effect_release(archive_effect)
+
+        archive_record = checkouts._load_archive(str(archive_id))
         archive_age_seconds = max(
             0, _now() - int(archive_record["created_at_unix"])
         )
         if archive_age_seconds < checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS:
             with _lock(identifier):
-                manifest = _manifest(identifier)
-                current_intent = manifest.get("workspace_cleanup_intent")
+                current_manifest = _manifest(identifier)
+                current_intent = current_manifest.get("workspace_cleanup_intent")
                 if (
                     not isinstance(current_intent, dict)
                     or current_intent.get("intent_id") != intent["intent_id"]
@@ -7963,9 +9093,9 @@ def grabowski_agent_workspace_cleanup(
                         "updated_at": _utc(),
                     }
                 )
-                manifest["workspace_cleanup_intent"] = current_intent
+                current_manifest["workspace_cleanup_intent"] = current_intent
                 _append_workspace_event(
-                    manifest,
+                    current_manifest,
                     "workspace_cleanup_archive_grace",
                     outcome="waiting",
                     evidence={
@@ -7975,9 +9105,14 @@ def grabowski_agent_workspace_cleanup(
                         "archive_grace_seconds": (
                             checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
                         ),
+                        "workspace_archive_effect_receipt_sha256": (
+                            archive_effect_reference.get("receipt_sha256")
+                            if isinstance(archive_effect_reference, dict)
+                            else None
+                        ),
                     },
                 )
-                _write_manifest(manifest)
+                _write_manifest(current_manifest)
             return {
                 "workspace_id": identifier,
                 "state": "archived_waiting_grace",
@@ -7986,63 +9121,167 @@ def grabowski_agent_workspace_cleanup(
                 "archive_age_seconds": archive_age_seconds,
                 "archive_grace_seconds": checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
                 "worktree_preserved": True,
+                "lifecycle_effect": archive_effect_reference,
             }
+
         dry_run = checkouts.grabowski_checkout_cleanup(
             repo=plan["repository"],
             checkout_path=plan["writer_worktree"],
             owner_id=owner,
             dry_run=True,
-            archive_id=archive_id,
+            archive_id=str(archive_id),
             expected_head=str(plan["checkout"]["head"]),
             expected_branch=str(plan["checkout"]["branch"]),
         )
         cleanup_plan = dry_run["plan"]
         if not cleanup_plan.get("safe_to_apply"):
-            raise AgentWorkspaceActionError("checkout cleanup dry run acquired new blockers")
+            raise AgentWorkspaceActionError(
+                "checkout cleanup dry run acquired new blockers"
+            )
         dry_run_record = dry_run["dry_run_record"]
-        applied = checkouts.grabowski_checkout_cleanup(
-            repo=plan["repository"],
-            checkout_path=plan["writer_worktree"],
-            owner_id=owner,
-            dry_run=False,
-            archive_id=archive_id,
-            plan_id=str(dry_run_record["plan_id"]),
-            expected_plan_sha256=str(cleanup_plan["plan_sha256"]),
-            confirmation="remove-linked-checkout",
+        with _lock(identifier):
+            current_manifest = _manifest(identifier)
+        retention_effect = _workspace_lifecycle_effect_begin(
+            current_manifest,
+            plan,
+            effect_kind="retention_converge",
+            intent_id=intent["intent_id"],
         )
+        try:
+            with _lock(identifier):
+                current_manifest = _manifest(identifier)
+                _record_workspace_lifecycle_effect(
+                    current_manifest,
+                    intent_id=intent["intent_id"],
+                    effect_kind="retention_converge",
+                    reference=_workspace_lifecycle_effect_reference(retention_effect),
+                )
+            effect_mutation_ambiguous = True
+            try:
+                applied = checkouts.grabowski_checkout_cleanup(
+                    repo=plan["repository"],
+                    checkout_path=plan["writer_worktree"],
+                    owner_id=owner,
+                    dry_run=False,
+                    archive_id=str(archive_id),
+                    plan_id=str(dry_run_record["plan_id"]),
+                    expected_plan_sha256=str(cleanup_plan["plan_sha256"]),
+                    confirmation="remove-linked-checkout",
+                )
+                post_state = _workspace_retention_post_state(
+                    current_manifest, str(archive_id)
+                )
+                retention_effect_receipt = _workspace_lifecycle_effect_finish(
+                    retention_effect,
+                    transport_outcome="confirmed_success",
+                    mutation_state="performed",
+                    post_state_status="verified",
+                    post_state_sha256s=post_state,
+                )
+                retention_effect_reference = (
+                    _workspace_lifecycle_effect_reference(
+                        retention_effect, retention_effect_receipt
+                    )
+                )
+                with _lock(identifier):
+                    current_manifest = _manifest(identifier)
+                    _record_workspace_lifecycle_effect(
+                        current_manifest,
+                        intent_id=intent["intent_id"],
+                        effect_kind="retention_converge",
+                        reference=retention_effect_reference,
+                    )
+                effect_mutation_ambiguous = False
+            except Exception:
+                recovery_receipt = _workspace_lifecycle_effect_finish(
+                    retention_effect,
+                    transport_outcome="unknown",
+                    mutation_state="unknown",
+                    post_state_status="unavailable",
+                    recovery_refs=[
+                        f"checkout-archive:{archive_id}",
+                        f"workspace-cleanup-intent:{identifier}:{intent['intent_id']}",
+                    ],
+                )
+                retention_effect_reference = (
+                    _workspace_lifecycle_effect_reference(
+                        retention_effect, recovery_receipt
+                    )
+                )
+                with _lock(identifier):
+                    current_manifest = _manifest(identifier)
+                    _record_workspace_lifecycle_effect(
+                        current_manifest,
+                        intent_id=intent["intent_id"],
+                        effect_kind="retention_converge",
+                        reference=retention_effect_reference,
+                    )
+                raise
+        finally:
+            _workspace_lifecycle_effect_release(retention_effect)
     except Exception as exc:
         with _lock(identifier):
-            manifest = _manifest(identifier)
-            current_intent = manifest.get("workspace_cleanup_intent")
-            if isinstance(current_intent, dict) and current_intent.get("intent_id") == intent["intent_id"]:
+            current_manifest = _manifest(identifier)
+            current_intent = current_manifest.get("workspace_cleanup_intent")
+            if (
+                isinstance(current_intent, dict)
+                and current_intent.get("intent_id") == intent["intent_id"]
+            ):
+                effects = current_intent.get("lifecycle_effects", {})
+                recovery_required = bool(
+                    effect_mutation_ambiguous
+                    or (
+                        isinstance(effects, dict)
+                        and any(
+                            isinstance(item, dict)
+                            and item.get("status") == "recovery_required"
+                            for item in effects.values()
+                        )
+                    )
+                )
                 current_intent.update(
                     {
-                        "state": "failed",
+                        "state": (
+                            "recovery_required" if recovery_required else "failed"
+                        ),
                         "archive_id": archive_id,
                         "failed_at": _utc(),
                         "error": _error_summary(exc),
                     }
                 )
-                manifest["workspace_cleanup_intent"] = current_intent
+                current_manifest["workspace_cleanup_intent"] = current_intent
                 _append_workspace_event(
-                    manifest,
+                    current_manifest,
                     "workspace_cleanup_failed",
-                    outcome="failed",
+                    outcome=(
+                        "recovery_required" if recovery_required else "failed"
+                    ),
                     evidence={
                         "intent_id": intent["intent_id"],
                         "archive_id": archive_id,
                         "error": _error_summary(exc),
+                        "blind_retry_allowed": False,
+                        "retry_requires_fresh_cleanup_plan": (
+                            not recovery_required
+                        ),
+                        "lifecycle_effects": effects,
                     },
                 )
-                _write_manifest(manifest)
+                _write_manifest(current_manifest)
         raise
+
     with _lock(identifier):
-        manifest = _manifest(identifier)
-        current_intent = manifest.get("workspace_cleanup_intent")
-        if not isinstance(current_intent, dict) or current_intent.get("intent_id") != intent["intent_id"]:
-            raise AgentWorkspaceActionError("workspace cleanup intent changed before finalization")
+        current_manifest = _manifest(identifier)
+        current_intent = current_manifest.get("workspace_cleanup_intent")
+        if (
+            not isinstance(current_intent, dict)
+            or current_intent.get("intent_id") != intent["intent_id"]
+        ):
+            raise AgentWorkspaceActionError(
+                "workspace cleanup intent changed before finalization"
+            )
         receipt = _publish_workspace_cleanup_receipt(
-            manifest,
+            current_manifest,
             source_plan_sha256=expected_hash,
             archive_id=str(archive_id),
             checkout_cleanup_plan_id=str(dry_run_record["plan_id"]),
@@ -8058,6 +9297,7 @@ def grabowski_agent_workspace_cleanup(
             "source_plan_sha256": expected_hash,
             "archive_id": archive_id,
             "checkout_cleanup_plan_id": dry_run_record["plan_id"],
+            "lifecycle_effects": receipt["lifecycle_effects"],
             "historical_evidence_preserved": True,
             "workspace_state_deleted": False,
         }
@@ -8069,6 +9309,7 @@ def grabowski_agent_workspace_cleanup(
         "cleanup_receipt": receipt,
         "archive": archive_record,
         "checkout_cleanup": applied,
+        "lifecycle_effects": receipt["lifecycle_effects"],
     }
 
 

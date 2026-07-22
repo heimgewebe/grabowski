@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -4826,6 +4827,7 @@ class AgentWorkspaceTests(unittest.TestCase):
 
     def _closed_cleanup_manifest(self) -> dict:
         manifest = self.manifest()
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
         receipt = signed_receipt(
             {
                 "schema_version": 1,
@@ -4884,6 +4886,134 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(plan["historical_evidence_preserved"])
         self.assertFalse(plan["workspace_state_deleted"])
         self.assertEqual(report["summary"]["eligible_count"], 1)
+
+    def test_cleanup_plan_rechecks_closed_workspace_live_state(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        manifest["tasks"]["writer"] = "writer-task"
+        workspace._write_manifest(manifest)
+        live_key = manifest["resources"]["lease_keys"][0]
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={
+                    "task_id": "writer-task",
+                    "state": "running",
+                    "terminal": False,
+                },
+            ),
+            mock.patch.object(
+                workspace.resources,
+                "list_resources",
+                return_value=[{"resource_key": live_key}],
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        self.assertEqual(
+            plan["liveness"]["source"],
+            "live_runtime_after_complete_close_receipt",
+        )
+        self.assertEqual(plan["liveness"]["execution_live_roles"], ["writer"])
+        self.assertEqual(plan["liveness"]["live_resource_keys"], [live_key])
+        blocker_codes = {item["code"] for item in plan["blockers"]}
+        self.assertIn("workspace_tasks_nonterminal", blocker_codes)
+        self.assertIn("workspace_resources_live", blocker_codes)
+        self.assertFalse(plan["eligible"])
+
+    def test_cleanup_plan_blocks_foreign_exact_lease_after_close(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        lease_key = manifest["resources"]["lease_keys"][0]
+        foreign_lease = {
+            "resource_key": lease_key,
+            "owner_id": "operator:foreign",
+            "expires_at_unix": int(time.time()) + 1000,
+            "metadata_sha256": "a" * 64,
+        }
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(
+                workspace.resources,
+                "inspect_resource",
+                return_value=foreign_lease,
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        self.assertFalse(plan["eligible"])
+        self.assertEqual(plan["liveness"]["exact_resource_keys_checked"], [lease_key])
+        self.assertEqual(plan["liveness"]["live_resource_keys"], [lease_key])
+        self.assertIn(
+            "workspace_resources_live",
+            {item["code"] for item in plan["blockers"]},
+        )
+
+    def test_workspace_lifecycle_classification_binds_exact_lease_readback(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        lease_key = manifest["resources"]["lease_keys"][0]
+        lease = {
+            "resource_key": lease_key,
+            "owner_id": "operator:foreign",
+            "expires_at_unix": int(time.time()) + 1000,
+            "metadata_sha256": "a" * 64,
+        }
+        with (
+            mock.patch.object(
+                workspace.resources,
+                "list_resources",
+                return_value=[],
+            ),
+            mock.patch.object(
+                workspace.resources,
+                "inspect_resource",
+                return_value=lease,
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=False),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "grabowski_checkout_inventory",
+                return_value={"worktrees": []},
+            ),
+        ):
+            cleanup_plan = workspace._workspace_lifecycle_cleanup_plan(manifest)
+            result = workspace._workspace_lifecycle_classification(
+                manifest,
+                cleanup_plan,
+                observed_at_unix=int(time.time()),
+            )
+        lease_projection = result["source_projections"]["lease"]
+        self.assertEqual(
+            lease_projection["value"]["required_resource_keys"],
+            [lease_key],
+        )
+        self.assertEqual(
+            lease_projection["value"]["exact_inspections"][0]["lease"]["owner_id"],
+            "operator:foreign",
+        )
+        self.assertEqual(result["classification"], "blocking")
+        self.assertIn("active_lease", result["reason_codes"])
 
     def test_cleanup_plan_blocks_open_workspace(self) -> None:
         manifest = self.manifest()
@@ -5010,6 +5140,24 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(workspace._valid_workspace_cleanup_receipt(receipt))
         self.assertTrue(receipt["historical_evidence_preserved"])
         self.assertFalse(receipt["workspace_state_deleted"])
+        lifecycle_effects = receipt["lifecycle_effects"]
+        self.assertEqual(
+            lifecycle_effects["workspace_archive"]["status"], "succeeded"
+        )
+        self.assertEqual(
+            lifecycle_effects["retention_converge"]["status"], "succeeded"
+        )
+        self.assertFalse(
+            lifecycle_effects["workspace_archive"]["blind_retry_allowed"]
+        )
+        self.assertFalse(
+            lifecycle_effects["retention_converge"]["blind_retry_allowed"]
+        )
+        for effect_kind in ("workspace_archive", "retention_converge"):
+            reference = lifecycle_effects[effect_kind]
+            self.assertTrue(Path(reference["plan_path"]).is_file())
+            self.assertTrue(Path(reference["revalidation_path"]).is_file())
+            self.assertTrue(Path(reference["receipt_path"]).is_file())
         archive = result["archive"]
         for item in archive["recovery_refs"]:
             self.assertEqual(
@@ -5017,6 +5165,244 @@ class AgentWorkspaceTests(unittest.TestCase):
                 item["target"],
             )
 
+
+    def test_cleanup_reconciles_lost_archive_response_without_second_archive(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        checkout_state = self.root / "checkout-state-archive-response-recovery"
+        patches = [
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_state / "checkouts.sqlite3"),
+            mock.patch.object(workspace.checkouts, "ARCHIVE_ROOT", checkout_state / "archives"),
+            mock.patch.object(workspace.checkouts, "CHECKOUT_LOCK", checkout_state / "checkouts.lock"),
+            mock.patch.object(workspace.checkouts.resources, "RESOURCE_DB", checkout_state / "resources.sqlite3"),
+            mock.patch.object(workspace.checkouts.tasks, "TASK_DB", checkout_state / "tasks.sqlite3"),
+            mock.patch.object(workspace.checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.checkouts.base, "_append_audit"),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+        ]
+        original_archive = workspace.checkouts.grabowski_checkout_archive
+        archive_calls = 0
+
+        def archive_then_raise(*args, **kwargs):
+            nonlocal archive_calls
+            archive_calls += 1
+            original_archive(*args, **kwargs)
+            raise RuntimeError("simulated lost archive response")
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11]:
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            with mock.patch.object(
+                workspace.checkouts,
+                "grabowski_checkout_archive",
+                side_effect=archive_then_raise,
+            ):
+                result = workspace.grabowski_agent_workspace_cleanup(
+                    manifest["workspace_id"],
+                    plan["plan_sha256"],
+                    "archive-and-remove-worktree",
+                )
+
+            self.assertEqual(archive_calls, 1)
+            self.assertEqual(result["state"], "archived_waiting_grace")
+            self.assertTrue(self.git.writer.exists())
+            effect = result["lifecycle_effect"]
+            self.assertEqual(effect["status"], "succeeded")
+            self.assertTrue(effect["execution_id"].endswith(":reconcile"))
+            self.assertEqual(effect["supersedes"]["status"], "recovery_required")
+            self.assertFalse(effect["supersedes"]["blind_retry_allowed"])
+            self.assertTrue(Path(effect["supersedes"]["receipt_path"]).is_file())
+            persisted = workspace._manifest(manifest["workspace_id"])
+            intent = persisted["workspace_cleanup_intent"]
+            self.assertEqual(intent["state"], "waiting_grace")
+            self.assertEqual(
+                intent["lifecycle_effects"]["workspace_archive"]["receipt_sha256"],
+                effect["receipt_sha256"],
+            )
+            self.assertEqual(intent["archive_id"], result["archive_id"])
+
+    def test_cleanup_retention_unknown_requires_recovery_and_blocks_blind_retry(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        checkout_state = self.root / "checkout-state-recovery"
+        patches = [
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_state / "checkouts.sqlite3"),
+            mock.patch.object(workspace.checkouts, "ARCHIVE_ROOT", checkout_state / "archives"),
+            mock.patch.object(workspace.checkouts, "CHECKOUT_LOCK", checkout_state / "checkouts.lock"),
+            mock.patch.object(workspace.checkouts.resources, "RESOURCE_DB", checkout_state / "resources.sqlite3"),
+            mock.patch.object(workspace.checkouts.tasks, "TASK_DB", checkout_state / "tasks.sqlite3"),
+            mock.patch.object(workspace.checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.checkouts.base, "_append_audit"),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+        ]
+        original_cleanup = workspace.checkouts.grabowski_checkout_cleanup
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11]:
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            waiting = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "archive-and-remove-worktree",
+            )
+            with workspace.checkouts._database() as connection:
+                connection.execute(
+                    "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
+                    (
+                        int(time.time())
+                        - workspace.checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
+                        waiting["archive_id"],
+                    ),
+                )
+                connection.commit()
+            refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+
+            def fail_apply(*args, **kwargs):
+                if kwargs.get("dry_run") is True:
+                    return original_cleanup(*args, **kwargs)
+                raise RuntimeError("simulated ambiguous checkout cleanup")
+
+            with mock.patch.object(
+                workspace.checkouts,
+                "grabowski_checkout_cleanup",
+                side_effect=fail_apply,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "simulated ambiguous checkout cleanup"
+                ):
+                    workspace.grabowski_agent_workspace_cleanup(
+                        manifest["workspace_id"],
+                        refreshed["plan_sha256"],
+                        "archive-and-remove-worktree",
+                    )
+
+            persisted = workspace._manifest(manifest["workspace_id"])
+            intent = persisted["workspace_cleanup_intent"]
+            self.assertEqual(intent["state"], "recovery_required")
+            retention_effect = intent["lifecycle_effects"]["retention_converge"]
+            self.assertEqual(retention_effect["status"], "recovery_required")
+            self.assertFalse(retention_effect["blind_retry_allowed"])
+            self.assertTrue(Path(retention_effect["receipt_path"]).is_file())
+            blocked_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertFalse(blocked_plan["eligible"])
+            self.assertIn(
+                "cleanup_recovery_required",
+                {item["code"] for item in blocked_plan["blockers"]},
+            )
+            with mock.patch.object(
+                workspace.checkouts, "grabowski_checkout_cleanup"
+            ) as cleanup:
+                blocked = workspace.grabowski_agent_workspace_cleanup(
+                    manifest["workspace_id"],
+                    blocked_plan["plan_sha256"],
+                    "archive-and-remove-worktree",
+                )
+            self.assertEqual(blocked["state"], "cleanup_blocked")
+            cleanup.assert_not_called()
+
+    def test_cleanup_reconciles_ambiguous_post_apply_without_second_mutation(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        checkout_state = self.root / "checkout-state-post-apply-recovery"
+        patches = [
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_state / "checkouts.sqlite3"),
+            mock.patch.object(workspace.checkouts, "ARCHIVE_ROOT", checkout_state / "archives"),
+            mock.patch.object(workspace.checkouts, "CHECKOUT_LOCK", checkout_state / "checkouts.lock"),
+            mock.patch.object(workspace.checkouts.resources, "RESOURCE_DB", checkout_state / "resources.sqlite3"),
+            mock.patch.object(workspace.checkouts.tasks, "TASK_DB", checkout_state / "tasks.sqlite3"),
+            mock.patch.object(workspace.checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.checkouts.base, "_append_audit"),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+        ]
+        original_cleanup = workspace.checkouts.grabowski_checkout_cleanup
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11]:
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            waiting = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "archive-and-remove-worktree",
+            )
+            with workspace.checkouts._database() as connection:
+                connection.execute(
+                    "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
+                    (
+                        int(time.time())
+                        - workspace.checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
+                        waiting["archive_id"],
+                    ),
+                )
+                connection.commit()
+            refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+
+            def apply_then_raise(*args, **kwargs):
+                result = original_cleanup(*args, **kwargs)
+                if kwargs.get("dry_run") is False:
+                    raise RuntimeError("simulated lost checkout cleanup response")
+                return result
+
+            with mock.patch.object(
+                workspace.checkouts,
+                "grabowski_checkout_cleanup",
+                side_effect=apply_then_raise,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "simulated lost checkout cleanup response"
+                ):
+                    workspace.grabowski_agent_workspace_cleanup(
+                        manifest["workspace_id"],
+                        refreshed["plan_sha256"],
+                        "archive-and-remove-worktree",
+                    )
+            self.assertFalse(self.git.writer.exists())
+            interrupted = workspace._manifest(manifest["workspace_id"])
+            prior_effect = interrupted["workspace_cleanup_intent"][
+                "lifecycle_effects"
+            ]["retention_converge"]
+            self.assertEqual(prior_effect["status"], "recovery_required")
+            self.assertFalse(prior_effect["blind_retry_allowed"])
+
+            with mock.patch.object(
+                workspace.checkouts, "grabowski_checkout_cleanup"
+            ) as cleanup:
+                reconciled = workspace.grabowski_agent_workspace_cleanup(
+                    manifest["workspace_id"],
+                    refreshed["plan_sha256"],
+                    "archive-and-remove-worktree",
+                )
+            cleanup.assert_not_called()
+            self.assertEqual(reconciled["state"], "cleanup_reconciled")
+            resolved = reconciled["cleanup_receipt"]["lifecycle_effects"][
+                "retention_converge"
+            ]
+            self.assertEqual(resolved["status"], "succeeded")
+            self.assertEqual(
+                resolved["supersedes"]["receipt_sha256"],
+                prior_effect["receipt_sha256"],
+            )
+            self.assertEqual(
+                resolved["supersedes"]["status"], "recovery_required"
+            )
+            self.assertNotEqual(
+                resolved["execution_id"], prior_effect["execution_id"]
+            )
 
     def test_cleanup_plan_blocks_invalid_close_receipt(self) -> None:
         manifest = self._closed_cleanup_manifest()
@@ -5171,6 +5557,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace, "_task_public", side_effect=task_public),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
             mock.patch.object(workspace, "_now", return_value=1784050000),
         ):
             report = workspace.grabowski_agent_workspace_cleanup_plan(
@@ -5191,6 +5578,275 @@ class AgentWorkspaceTests(unittest.TestCase):
         }
         self.assertIn("workspace_idle_tmux_cleanup_required", blocker_codes)
         self.assertNotIn("workspace_tmux_session_live", blocker_codes)
+        transition = plan["stale_reconciliation"]["idle_tmux_transition"]
+        self.assertFalse(transition["eligible"])
+        self.assertEqual(transition["session_name"], manifest["session_name"])
+
+    def test_stale_reconcile_remains_non_destructive_api(self) -> None:
+        parameters = inspect.signature(
+            workspace.grabowski_agent_workspace_reconcile_stale
+        ).parameters
+        self.assertNotIn("remove_idle_tmux_session", parameters)
+
+    def test_tmux_exact_session_probe_uses_exact_target(self) -> None:
+        with mock.patch.object(
+            workspace,
+            "_tmux_result",
+            return_value={"returncode": 0, "stdout": "", "stderr": ""},
+        ) as tmux:
+            self.assertTrue(workspace._tmux_has_exact_session("gaw-bound-session"))
+
+        tmux.assert_called_once_with(["has-session", "-t", "=gaw-bound-session"])
+
+    def test_idle_tmux_transition_refuses_prefix_only_session_without_kill(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=False),
+            mock.patch.object(workspace, "_tmux_result") as tmux,
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            transition = plan["stale_reconciliation"]["idle_tmux_transition"]
+            self.assertFalse(transition["eligible"])
+            self.assertFalse(transition["exact_session_live"])
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+            )
+
+        self.assertEqual(result["state"], "idle_tmux_transition_blocked")
+        tmux.assert_not_called()
+
+    def test_idle_tmux_transition_removes_exact_session_and_reconciles_stale(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        session_live = True
+
+        def has_session(session: str) -> bool:
+            self.assertEqual(session, manifest["session_name"])
+            return session_live
+
+        def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
+            nonlocal session_live
+            self.assertEqual(argv, ["kill-session", "-t", f"={manifest['session_name']}"])
+            self.assertEqual(timeout, 30)
+            session_live = False
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
+            mock.patch.object(workspace, "_tmux_has_exact_session", side_effect=has_session),
+            mock.patch.object(workspace, "_tmux_result", side_effect=tmux_result) as tmux,
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            transition = plan["stale_reconciliation"]["idle_tmux_transition"]
+            self.assertTrue(transition["eligible"])
+            self.assertFalse(plan["stale_reconciliation"]["eligible"])
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+            )
+
+        tmux.assert_called_once()
+        self.assertEqual(result["state"], "stale_workspace_reconciled")
+        self.assertTrue(result["tmux_removed"])
+        self.assertTrue(result["tmux_mutation_performed"])
+        transition_receipt = result["idle_tmux_transition_receipt"]
+        self.assertTrue(transition_receipt["tmux_removed"])
+        self.assertTrue(transition_receipt["tmux_mutation_performed"])
+        self.assertFalse(transition_receipt["task_mutation_performed"])
+        self.assertFalse(transition_receipt["resource_mutation_performed"])
+        self.assertFalse(transition_receipt["worktree_mutation_performed"])
+        receipt = result["close_receipt"]
+        self.assertEqual(receipt["closure_outcome"], "abandoned_stale_workspace")
+        self.assertFalse(receipt["tmux_removed"])
+        self.assertTrue(self.git.writer.exists())
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertTrue(
+            workspace._close_integrity_status(
+                persisted, persisted["close_receipt"]
+            )["valid"]
+        )
+
+    def test_idle_tmux_transition_refuses_other_stale_blockers_without_kill(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.resources,
+                "list_resources",
+                return_value=[{"resource_key": "path:/live"}],
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_result") as tmux,
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertFalse(
+                plan["stale_reconciliation"]["idle_tmux_transition"]["eligible"]
+            )
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+            )
+        self.assertEqual(result["state"], "idle_tmux_transition_blocked")
+        tmux.assert_not_called()
+
+    def test_idle_tmux_transition_rechecks_full_plan_after_session_removal(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        session_live = True
+        resource_observations = iter(
+            [
+                [],
+                [],
+                [],
+                [{"resource_key": "path:/new-live-resource"}],
+            ]
+        )
+
+        def has_session(session: str) -> bool:
+            self.assertEqual(session, manifest["session_name"])
+            return session_live
+
+        def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
+            nonlocal session_live
+            self.assertEqual(argv, ["kill-session", "-t", f"={manifest['session_name']}"])
+            self.assertEqual(timeout, 30)
+            session_live = False
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.resources,
+                "list_resources",
+                side_effect=lambda **kwargs: next(resource_observations),
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
+            mock.patch.object(workspace, "_tmux_has_exact_session", side_effect=has_session),
+            mock.patch.object(workspace, "_tmux_result", side_effect=tmux_result),
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertTrue(
+                plan["stale_reconciliation"]["idle_tmux_transition"]["eligible"]
+            )
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+            )
+
+        self.assertEqual(
+            result["state"], "idle_tmux_removed_stale_reconciliation_blocked"
+        )
+        self.assertTrue(result["tmux_removed"])
+        self.assertIn(
+            "workspace_resources_live",
+            {
+                blocker["code"]
+                for blocker in result["plan"]["stale_reconciliation"]["blockers"]
+            },
+        )
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertIsNone(persisted.get("close_receipt"))
+
+    def test_idle_tmux_transition_rechecks_plan_immediately_before_kill(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        resource_observations = iter(
+            [
+                [],
+                [],
+                [{"resource_key": "path:/new-live-resource"}],
+            ]
+        )
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.resources,
+                "list_resources",
+                side_effect=lambda **kwargs: next(resource_observations),
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_result") as tmux,
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertTrue(
+                plan["stale_reconciliation"]["idle_tmux_transition"]["eligible"]
+            )
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "plan changed before idle tmux removal",
+            ):
+                workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                    manifest["workspace_id"],
+                    plan["plan_sha256"],
+                    "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+                )
+
+        tmux.assert_not_called()
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertIsNone(persisted.get("close_receipt"))
+
+    def test_idle_tmux_transition_requires_distinct_typed_confirmation(self) -> None:
+        manifest = self.manifest()
+        workspace._write_manifest(manifest)
+        with mock.patch.object(workspace.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+            ):
+                workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                    manifest["workspace_id"],
+                    "a" * 64,
+                    "mark-stale-workspace-abandoned",
+                )
 
     def test_interrupted_task_requires_reconciliation_without_claiming_liveness(self) -> None:
         manifest = self.manifest(with_writer=False)
@@ -5207,6 +5863,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace, "_task_public", side_effect=task_public),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
             mock.patch.object(workspace, "_now", return_value=1784050000),
         ):
             plan = workspace.grabowski_agent_workspace_cleanup_plan(
@@ -5242,6 +5899,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace, "_task_public", side_effect=task_public),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
             mock.patch.object(workspace, "_now", return_value=1784050000),
         ):
             plan = workspace.grabowski_agent_workspace_cleanup_plan(
@@ -5688,6 +6346,12 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(
             result["cleanup_receipt"]["reconciled_after_missing_worktree"]
         )
+        retention_effect = result["cleanup_receipt"]["lifecycle_effects"][
+            "retention_converge"
+        ]
+        self.assertEqual(retention_effect["status"], "succeeded")
+        self.assertFalse(retention_effect["blind_retry_allowed"])
+        self.assertTrue(retention_effect["execution_id"].endswith(":reconcile"))
         self.assertFalse(self.git.writer.exists())
 
     def test_cleanup_finalize_rejects_archive_owner_mismatch(self) -> None:

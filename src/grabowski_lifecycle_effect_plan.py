@@ -726,6 +726,84 @@ def _validate_revalidation(
     return value
 
 
+def write_effect_revalidation(
+    revalidation: Mapping[str, Any],
+    *,
+    revalidation_root: Path,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    value = _validate_revalidation(revalidation, plan=plan)
+    if revalidation_root.is_symlink():
+        raise LifecycleEffectPlanIntegrityError(
+            "effect revalidation root may not be a symlink"
+        )
+    revalidation_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if revalidation_root.is_symlink() or not revalidation_root.is_dir():
+        raise LifecycleEffectPlanIntegrityError(
+            "effect revalidation root must be a regular directory"
+        )
+    os.chmod(revalidation_root, 0o700)
+    revalidation_path = revalidation_root / (
+        f"revalidation-{value['revalidation_sha256']}.json"
+    )
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    ).encode("utf-8") + b"\n"
+    if revalidation_path.exists():
+        verified = verify_effect_revalidation(
+            revalidation_path,
+            plan=plan,
+        )
+        if verified["revalidation"] != value:
+            raise LifecycleEffectPlanIntegrityError(
+                "existing effect revalidation conflicts with requested revalidation"
+            )
+        return {**verified, "idempotent_replay": True}
+    _write_create_only(revalidation_path, payload)
+    _fsync_directory(revalidation_root)
+    verified = verify_effect_revalidation(
+        revalidation_path,
+        plan=plan,
+    )
+    return {**verified, "idempotent_replay": False}
+
+
+def verify_effect_revalidation(
+    revalidation_path: Path,
+    *,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    if revalidation_path.is_symlink() or not revalidation_path.is_file():
+        raise LifecycleEffectPlanIntegrityError(
+            "effect revalidation path must be a regular non-symlink file"
+        )
+    try:
+        value = json.loads(revalidation_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LifecycleEffectPlanIntegrityError(
+            "effect revalidation JSON is invalid"
+        ) from exc
+    if not isinstance(value, Mapping):
+        raise LifecycleEffectPlanIntegrityError(
+            "effect revalidation must be a JSON object"
+        )
+    validated = _validate_revalidation(value, plan=plan)
+    expected_name = f"revalidation-{validated['revalidation_sha256']}.json"
+    if revalidation_path.name != expected_name:
+        raise LifecycleEffectPlanIntegrityError(
+            "effect revalidation filename does not match revalidation identity"
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "verified",
+        "revalidation_path": str(revalidation_path),
+        "revalidation": validated,
+    }
+
+
 def _normalize_post_state_sha256s(value: Any) -> dict[str, str]:
     if value is None:
         return {}

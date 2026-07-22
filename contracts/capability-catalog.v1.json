@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "72fd9208be2aa3f5482864b46202d4754daad14fa8850dd525c66424802434a5",
+  "capability_source_sha256": "1404ee91b23fb5d4877d2b9a6ea16f4e6a5d7b1488c70115376e9055f72121d0",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "5272dd7e605a5e1cd66fe7379e9525681137c537f2bed406de2f4f3831f3fa90",
+  "contract_sha256": "6d90e320a7a436b8540730dbd1a44bb47fd0cf6aad78a5710a2d62602ff14e28",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -251,6 +251,39 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_verify_audit"
+    },
+    {
+      "category": "audit",
+      "description": "Query the verified audit chain through a bounded evidence projection.",
+      "effects": [],
+      "id": "grabowski_audit_query",
+      "purpose": "Query bounded safe fields from the fully verified audit segment chain.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_query"
+    },
+    {
+      "category": "audit",
+      "description": "Trace one audit anchor through bounded one-hop correlations.",
+      "effects": [],
+      "id": "grabowski_audit_trace",
+      "purpose": "Trace one exact audit anchor through bounded one-hop evidence correlations without claiming causality.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_trace"
+    },
+    {
+      "category": "audit",
+      "description": "Compute bounded descriptive statistics from the verified audit chain.",
+      "effects": [],
+      "id": "grabowski_audit_analyze",
+      "purpose": "Compute bounded descriptive statistics from the fully verified audit segment chain.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_analyze"
     },
     {
       "category": "knowledge",
@@ -1876,6 +1909,22 @@
       "reversibility": "historical-evidence-retained",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_reconcile_stale"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Remove one exact non-authoritative idle tmux session, then stale-reconcile the workspace.",
+      "effects": [
+        "audit-append",
+        "receipt-create",
+        "tmux-session-remove",
+        "workspace-event-append"
+      ],
+      "id": "grabowski_agent_workspace_reconcile_idle_tmux",
+      "purpose": "Remove only the exact non-authoritative idle tmux session from one provably inactive stale workspace, then invoke the existing non-destructive stale reconciliation.",
+      "read_only": false,
+      "reversibility": "historical-evidence-retained",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_reconcile_idle_tmux"
     },
     {
       "category": "agent-workspace",

@@ -9,7 +9,7 @@ Er trennt drei Dinge, die zuvor leicht vermischt wurden:
 2. unveränderliche Archivierung terminaler Taskdatensätze;
 3. eine begrenzte Standardprojektion, die nur handlungsrelevante Zustände zeigt.
 
-Der Core löscht keine Task-, Workspace- oder Recovery-Belege und registriert noch keine neue MCP-Oberfläche. Diese Integration bleibt getrennt, solange zentrale Registrierungsdateien durch andere laufende Arbeiten exklusiv belegt sind.
+Der Core löscht keine Task-, Workspace- oder Recovery-Belege. Physisches Pruning bleibt außerhalb des T071-Vertrags.
 
 ## Einheitliche Klassifikation
 
@@ -51,12 +51,14 @@ Der Plan bindet Task-IDs und die SHA-256-Digests der vollständigen Record-Proje
 
 `write_task_archive_segment()` erzeugt create-only:
 
-- `records.jsonl` mit kanonisch sortierten vollständigen Taskrecords;
+- `records.jsonl` mit kanonisch sortierten Task-Archivrecords;
 - `manifest.json` mit Quellstore-Digest, Quellschema, Plan-Digest, Record-Anzahl, erstem und letztem Record-Hash, vollständiger Record-Hashfolge und Segment-SHA-256.
 
 Dateien und Verzeichnisse werden fsync-sicher persistiert. Ein identisches Segment ist idempotent lesbar. Existierende widersprüchliche Segmente oder manipulierte Records schlagen fail-closed fehl.
 
-Die Segmentarchivierung begründet ausdrücklich keine Erlaubnis, Records aus der Taskdatenbank zu löschen. Die spätere aktive Projektion darf erst nach erfolgreicher Segmentverifikation umgestellt werden.
+Für produktive Task-Store-Archive definiert `grabowski_tasks._task_archive_record()` die stabile Record-Projektion. Sie ist bewusst unabhängig von später veränderbarer Redaktionslogik: Identität, Status, Ressourcen- und Terminalisierungsbindungen werden explizit gespeichert; dynamische oder potentiell sensible JSON-Payloads werden durch SHA-256-Digests gebunden. Dadurch kann die aktuelle Task-Projektion einen unveränderten Datenbankrecord auch nach einer späteren Änderung der Ausgaberadaktion zuverlässig gegen das Archiv prüfen.
+
+Die Segmentarchivierung begründet ausdrücklich keine Erlaubnis, Records aus der Taskdatenbank zu löschen. Die aktive Projektion darf erst nach erfolgreicher Segmentverifikation umgestellt werden.
 
 ## Effect Plan, Revalidation und create-only Execution Receipts
 
@@ -70,7 +72,7 @@ Ein Execution-Receipt darf nur einen Effektversuch belegen, dessen Startzeitpunk
 
 ## Recovery-sicherer Task-Archive Projection Switch
 
-`apply_task_archive_projection_switch()` ist der erste konkrete T071-Effektadapter. Er verändert nicht den Taskstore, sondern persistiert create-only einen Projektionsumschaltbeleg für ein bereits vollständig verifiziertes Archivsegment.
+`apply_task_archive_projection_switch()` verändert nicht den Taskstore, sondern persistiert create-only einen Projektionsumschaltbeleg für ein bereits vollständig verifiziertes Archivsegment.
 
 Der Switch ist gebunden an:
 
@@ -88,12 +90,38 @@ Die Mutation wird innerhalb eines exklusiven Directory-Locks serialisiert. Ein v
 
 Der erfolgreiche Switch liefert verifizierte Post-State-Digests für Archivmanifest, Switch und Gesamtprojektion. Diese Digests können unmittelbar in ein create-only Execution-Receipt übernommen werden. Scheitert ein späterer Schritt, bleibt der deterministische Switch als Recovery-Readback erhalten.
 
+## Produktive Current-Task-Leseoberfläche
+
+`grabowski_task_list` lädt vor jeder paginierten Ausgabe den verifizierten Task-Projection-Switch-State. Der Standardpfad ist damit die aktuelle Handlungsprojektion und nicht mehr die unverdichtete historische Datenbankansicht.
+
+Für jeden projizierten Task wird innerhalb desselben SQLite-Read-Snapshots erneut der gespeicherte Taskrecord gelesen, in die stabile Archivprojektion überführt und gegen den im Archiv gebundenen Record-SHA-256 geprüft. Ein fehlender Taskrecord oder jede relevante Record-Drift blockiert die gesamte Leseoberfläche fail-closed. Die physische Taskzeile bleibt dabei erhalten.
+
+Pagination und Counts folgen derselben Projektion:
+
+- archivierte Records verbrauchen keinen Platz in einer Current-Page;
+- `total_matching`, `state_counts` und `projection_counts` beziehen sich auf `current_projection`;
+- der Cursor ist zusätzlich an `projection_sha256` gebunden;
+- ändert sich die Projection zwischen zwei Seiten, wird der alte Cursor mit `cursor_snapshot_changed` abgelehnt;
+- `current_projection` bleibt auch bei feldprojizierten Antworten als erforderliche Safety-Evidenz erhalten.
+
+Die Archive- und Projection-Roots folgen expliziten `GRABOWSKI_TASK_ARCHIVE_ROOT`- beziehungsweise `GRABOWSKI_TASK_PROJECTION_ROOT`-Overrides. Ohne Override liegen sie neben der tatsächlich geöffneten `TASK_DB`; dadurch lesen isolierte Test- oder Recovery-Stores nicht versehentlich den produktiven Projection-State.
+
+## Produktive Workspace-Archive- und Retention-Konvergenz
+
+`grabowski_agent_workspace_cleanup` bindet seine bestehende zweiphasige Checkout-Lifecycle-Kette jetzt automatisch an den T071-Effect-Vertrag. Die bisherige sichere Archiv- und Cleanup-Implementierung bleibt dabei die einzige Git-Mutationslogik; T071 legt eine zusätzliche, getrennte Evidenz- und Autoritätsschicht darum.
+
+Vor `workspace_archive` und `retention_converge` werden sieben Lifecycle-Quellen erneut gelesen und als `terminal_archivable` klassifiziert. Auch ein bereits vollständig geschlossener Workspace verlässt sich dabei nicht nur auf sein Close-Receipt: Rollen-Tasks, die Workspace-Ressourcen und die tmux-Sitzung werden frisch nachbeobachtet; sichtbare Live-Tasks, Ressourcen, Beobachtungsfehler oder eine weiter bestehende Sitzung blockieren bereits den Cleanup-Plan. Die separate Task-Quelle bindet die frischen Rollen-Readbacks, und die Lease-Quelle inspiziert jeden im Workspace-Manifest gebundenen Ressourcenkey exakt, sodass auch eine nach dem Close neu erschienene oder fremd übernommene Lease fail-closed blockiert. Der Effect Plan bindet diese Source-Digests und eine eigene `gate:workspace-lifecycle:<workspace_id>`-Lease. Diese Gate-Lease kollidiert absichtlich nicht mit den darunterliegenden exakten Checkout- und Git-Common-Dir-Leases, die `grabowski_checkouts` weiterhin unmittelbar um jede Git-Mutation hält. Plan und Revalidation werden create-only persistiert; erst danach beginnt der Effektversuch.
+
+Die Archivphase verifiziert nach dem bestehenden `grabowski_checkout_archive` den gespeicherten Archive-Record, das Archive-Manifest und alle Recovery-Refs und schreibt dafür ein create-only `workspace_archive` Execution Receipt. Ein bereits vorhandenes älteres Checkout-Archiv kann ohne erneute Mutation durch denselben verifizierten Post-State als `mutation_state=not_performed` in die T071-Kette aufgenommen werden. Während der bestehenden Cleanup-Grace bleibt der Writer-Worktree erhalten.
+
+Nach abgelaufener Grace bleibt der vorhandene Checkout-Cleanup-Dry-Run mit seinem eigenen `plan_sha256` die unmittelbare Löschautorität für den temporären Linked Worktree. Unmittelbar vor dem Apply wird zusätzlich `retention_converge` geplant und revalidiert. Erfolg ist erst belegt, wenn der Archive-Record `cleaned_at_unix` und `cleanup_plan_id` enthält, der Writer-Worktree fehlt und die Recovery-Refs weiterhin auflösbar sind. Beide Effect-Referenzen werden in das abschließende Workspace-Cleanup-Receipt übernommen; Workspace-Zustand und historische Belege werden nicht gelöscht.
+
+Ein unklarer Effektversuch schreibt konservativ `recovery_required` mit `blind_retry_allowed=false`. Der Workspace-Cleanup-Intent wechselt dann ebenfalls auf `recovery_required`; ein weiterer normaler Cleanup-Aufruf wird durch `cleanup_recovery_required` blockiert. Ist nach einem unterbrochenen Retention-Apply der Worktree bereits weg und der Checkout-Archive-Record eindeutig als bereinigt verifiziert, wird die bestehende Missing-Worktree-Reconciliation durch einen neuen, rein lesenden `retention_converge`-Post-State-Beleg abgeschlossen, statt die Mutation blind zu wiederholen.
+
 ## Noch getrennte Integrationsarbeit
 
-Für den vollständigen T071-Abschluss fehlen nach diesem Core noch:
+Für den vollständigen T071-Abschluss fehlen weiterhin:
 
-- produktive Anbindung der aktuellen Task-Leseoberflächen an den verifizierten Projection-Switch-State;
-- persistente Workspace-Close-/Archive-Konvergenz und Retention-Konvergenz;
 - gegebenenfalls weitere Effektadapter auf demselben Plan/Revalidation/Receipt-Vertrag, ohne Blind-Retry zu erlauben;
 - Deployment eines kohärenten T071-Heads und isolierter Livebeweis;
 - abschließende Audit-Integritätsprüfung und Bureau-Closeout.

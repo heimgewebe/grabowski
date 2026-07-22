@@ -13,6 +13,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertTrue((ROOT / "src" / "grabowski_client_snapshot.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_operator.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_runtime_extensions.py").is_file())
+        self.assertTrue((ROOT / "src" / "grabowski_audit_query.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_checkouts.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_runtime.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_read_surface.py").is_file())
@@ -43,6 +44,16 @@ class RepositoryContractTests(unittest.TestCase):
         for tool_name in expected:
             self.assertIn(tool_name, source)
         self.assertNotIn("heim_assi_status", source)
+
+    def test_audit_query_tool_names_are_present(self) -> None:
+        source = (ROOT / "src" / "grabowski_audit_query.py").read_text(encoding="utf-8")
+        for tool_name in (
+            "grabowski_audit_query",
+            "grabowski_audit_trace",
+            "grabowski_audit_analyze",
+        ):
+            self.assertIn(f'name="{tool_name}"', source)
+        self.assertIn("annotations=READ_ONLY", source)
 
     def test_extension_tool_names_are_present(self) -> None:
         source = (ROOT / "src" / "grabowski_runtime_extensions.py").read_text(
@@ -145,7 +156,7 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 157)
+        self.assertEqual(len(tools), 161)
         self.assertTrue(
             {
                 "grabowski_juno_status",
@@ -203,6 +214,13 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("grabowski_execution_governor_summary", tools)
         self.assertIn("grabowski_connector_transport_diagnostics", tools)
         self.assertIn("grabowski_operator_recall_export", tools)
+        self.assertTrue(
+            {
+                "grabowski_audit_query",
+                "grabowski_audit_trace",
+                "grabowski_audit_analyze",
+            }.issubset(tools)
+        )
         supporting = {
             item["module"]: item["source"] for item in contract["supporting_sources"]
         }
@@ -239,6 +257,7 @@ class RepositoryContractTests(unittest.TestCase):
             "grabowski_operator_obligation",
             "grabowski_capabilities",
             "grabowski_runtime_extensions",
+            "grabowski_audit_query",
             "grabowski_read_surface",
             "grabowski_self_deploy",
             "grabowski_checkouts",
@@ -323,6 +342,10 @@ class RepositoryContractTests(unittest.TestCase):
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn("import grabowski_bureau_intake", runtime)
         self.assertIn('"grabowski_bureau_intake"', pyproject)
+
+    def test_audit_query_is_packaged_as_a_python_module(self) -> None:
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('"grabowski_audit_query"', pyproject)
 
     def test_task_attention_is_packaged_as_a_python_module(self) -> None:
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")

@@ -188,7 +188,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(archive["audit"]["coordination_checked"]["processes"], 0)
 
 
-    def test_archive_uses_exact_checkout_and_common_dir_operation_leases(self) -> None:
+    def test_archive_uses_exact_checkout_common_dir_and_branch_operation_leases(self) -> None:
         result = self._archive()
         keys = {item["resource_key"] for item in result["lease"]["leases"]}
         self.assertEqual(
@@ -196,6 +196,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
             {
                 f"path:{self.checkout.resolve()}",
                 f"path:{self._common_dir()}",
+                f"repo:{self.repo.resolve()}:branch:topic",
             },
         )
         self.assertNotIn(f"repo:{self.repo.resolve()}", keys)
@@ -776,6 +777,89 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 str(self.repo), str(self.checkout), "owner-b", "foreign retention",
                 retained_until + 60, self.head, "topic",
             )
+
+    def test_branch_lease_is_checkout_coordination_blocker(self) -> None:
+        top_level, common_dir, record = checkouts._worktree_for_path(
+            self.repo, self.checkout
+        )
+        branch_key = f"repo:{top_level}:branch:{record['branch']}"
+        lease = {
+            "resource_key": branch_key,
+            "owner_id": "active-branch-owner",
+            "purpose": "active branch work",
+            "acquired_at_unix": int(time.time()) - 10,
+            "updated_at_unix": int(time.time()) - 10,
+            "expires_at_unix": int(time.time()) + 600,
+            "metadata_sha256": "a" * 64,
+            "reclaimed_from_owner": None,
+        }
+        with patch.object(checkouts, "_read_resource_leases", return_value=[lease]):
+            coordination = checkouts._linked_checkout_coordination(
+                self.checkout,
+                top_level,
+                common_dir,
+                branch=record["branch"],
+                include_processes=False,
+                include_tasks=False,
+                include_resources=True,
+            )
+
+        self.assertTrue(coordination["blocking"])
+        self.assertEqual(1, coordination["blocking_counts"]["resource_leases"])
+        self.assertEqual(branch_key, coordination["resource_leases"][0]["resource_key"])
+
+    def test_unrelated_branch_lease_does_not_block_checkout(self) -> None:
+        top_level, common_dir, record = checkouts._worktree_for_path(
+            self.repo, self.checkout
+        )
+        lease = {
+            "resource_key": f"repo:{top_level}:branch:other-topic",
+            "owner_id": "other-owner",
+            "purpose": "unrelated branch work",
+            "acquired_at_unix": int(time.time()) - 10,
+            "updated_at_unix": int(time.time()) - 10,
+            "expires_at_unix": int(time.time()) + 600,
+            "metadata_sha256": "b" * 64,
+            "reclaimed_from_owner": None,
+        }
+        with patch.object(checkouts, "_read_resource_leases", return_value=[lease]):
+            coordination = checkouts._linked_checkout_coordination(
+                self.checkout,
+                top_level,
+                common_dir,
+                branch=record["branch"],
+                include_processes=False,
+                include_tasks=False,
+                include_resources=True,
+            )
+
+        self.assertFalse(coordination["blocking"])
+        self.assertEqual(0, coordination["blocking_counts"]["resource_leases"])
+
+    def test_archive_atomically_conflicts_with_branch_lease_after_clear_readback(self) -> None:
+        top_level, _common_dir, record = checkouts._worktree_for_path(
+            self.repo, self.checkout
+        )
+        branch_key = f"repo:{top_level}:branch:{record['branch']}"
+        lease = checkouts.resources.acquire_resources(
+            "foreign-branch-owner",
+            [branch_key],
+            purpose="concurrent branch work",
+            ttl_seconds=600,
+        )
+        self.addCleanup(
+            checkouts.resources.release_resources,
+            lease["owner_id"],
+            [branch_key],
+        )
+        clear = checkouts._coordination_result([], [], [])
+        with (
+            patch.object(checkouts, "_linked_checkout_coordination", return_value=clear),
+            self.assertRaisesRegex(RuntimeError, "Resource is leased"),
+        ):
+            self._archive()
+
+        self.assertTrue(self.checkout.exists())
 
     def test_archive_rejects_symlinked_git_metadata(self) -> None:
         git_file = self.checkout / ".git"

@@ -128,6 +128,63 @@ def _project_task(payload: Mapping[str, Any] | None, identity: str) -> tuple[dic
     return body, {"state": state, "active_task": state in ACTIVE_TASK_STATES if state is not None else None}
 
 
+def _project_workspace_tasks(
+    payload: Mapping[str, Any] | None, identity: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    errors: list[str] = []
+    raw_tasks = (
+        payload.get("tasks")
+        if isinstance(payload, Mapping) and isinstance(payload.get("tasks"), Mapping)
+        else None
+    )
+    if raw_tasks is None:
+        body = _source_body(
+            "task",
+            present=False,
+            value={"workspace_id": identity, "roles": {}},
+            errors=["workspace_task_readback_missing"],
+        )
+        return body, {"state": None, "active_task": None}
+    roles: dict[str, dict[str, Any]] = {}
+    active_task = False
+    present = False
+    for role in sorted(raw_tasks):
+        raw = raw_tasks[role]
+        if not isinstance(raw, Mapping):
+            errors.append(f"workspace_task_role_invalid:{role}")
+            continue
+        task_id = raw.get("task_id")
+        if task_id is not None and (not isinstance(task_id, str) or not task_id):
+            errors.append(f"workspace_task_id_invalid:{role}")
+            task_id = None
+        state = raw.get("state")
+        terminal = raw.get("terminal")
+        error = raw.get("error")
+        if task_id is not None:
+            present = True
+            if not isinstance(state, str) or not state:
+                errors.append(f"workspace_task_state_invalid:{role}")
+            if not isinstance(terminal, bool):
+                errors.append(f"workspace_task_terminal_invalid:{role}")
+            if error:
+                errors.append(f"workspace_task_observation_error:{role}")
+            if state in ACTIVE_TASK_STATES:
+                active_task = True
+        roles[str(role)] = {
+            "task_id": task_id,
+            "state": state,
+            "terminal": terminal,
+            "error": error,
+        }
+    body = _source_body(
+        "task",
+        present=present,
+        value={"workspace_id": identity, "roles": roles},
+        errors=errors,
+    )
+    return body, {"state": None, "active_task": active_task}
+
+
 def _project_workspace(payload: Mapping[str, Any] | None, identity: str) -> tuple[dict[str, Any], dict[str, Any]]:
     errors: list[str] = []
     if payload is None:
@@ -610,7 +667,11 @@ def collect_lifecycle_classification(request: LifecycleCollectorRequest) -> dict
         return raw
 
     projectors = {
-        "task": lambda payload: _project_task(payload, request.identity),
+        "task": (
+            lambda payload: _project_workspace_tasks(payload, request.identity)
+            if request.kind == "workspace"
+            else _project_task(payload, request.identity)
+        ),
         "workspace": lambda payload: _project_workspace(payload, request.identity),
         "lease": lambda payload: _project_lease(payload, request.exact_resource_keys, request.observed_at_unix),
         "checkout": lambda payload: _project_checkout(

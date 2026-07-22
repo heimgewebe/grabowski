@@ -19,6 +19,9 @@
     "grabowski_destroy_path",
     "grabowski_rollback_text",
     "grabowski_verify_audit",
+    "grabowski_audit_query",
+    "grabowski_audit_trace",
+    "grabowski_audit_analyze",
     "latest_complete_bundles",
     "repoground_bundle_discover",
     "repoground_bundle_status",
@@ -146,6 +149,7 @@
     "grabowski_agent_workspace_optimize",
     "grabowski_agent_workspace_cleanup_plan",
     "grabowski_agent_workspace_reconcile_stale",
+    "grabowski_agent_workspace_reconcile_idle_tmux",
     "grabowski_agent_workspace_cleanup",
     "grabowski_agent_execution_route",
     "grabowski_coding_agent_catalog",
@@ -238,6 +242,10 @@
     {
       "module": "grabowski_runtime_extensions",
       "source": "src/grabowski_runtime_extensions.py"
+    },
+    {
+      "module": "grabowski_audit_query",
+      "source": "src/grabowski_audit_query.py"
     },
     {
       "module": "grabowski_checkouts",
@@ -382,6 +390,22 @@
     {
       "module": "grabowski_lifecycle_archive",
       "source": "src/grabowski_lifecycle_archive.py"
+    },
+    {
+      "module": "grabowski_lifecycle_collectors",
+      "source": "src/grabowski_lifecycle_collectors.py"
+    },
+    {
+      "module": "grabowski_lifecycle_evidence",
+      "source": "src/grabowski_lifecycle_evidence.py"
+    },
+    {
+      "module": "grabowski_lifecycle_effect_plan",
+      "source": "src/grabowski_lifecycle_effect_plan.py"
+    },
+    {
+      "module": "grabowski_lifecycle_projection",
+      "source": "src/grabowski_lifecycle_projection.py"
     },
     {
       "module": "grabowski_lifecycle_read_surface",
