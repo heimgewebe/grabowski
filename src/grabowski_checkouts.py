@@ -925,12 +925,23 @@ def _lease_ttl(retention_until_unix: int) -> int:
     return min(resources.MAX_TTL_SECONDS, remaining)
 
 
-def _checkout_resource_keys(repo_common_dir: Path, checkout_path: Path) -> list[str]:
-    """Return the exact checkout and shared Git-metadata serialization claims."""
-    return [
+def _checkout_resource_keys(
+    repo_common_dir: Path,
+    checkout_path: Path,
+    *,
+    repo_path: Path | None = None,
+    branch: str | None = None,
+) -> list[str]:
+    """Return exact checkout, Git-metadata and optional branch serialization claims."""
+    keys = [
         resources.normalize_resource_key(f"path:{checkout_path}"),
         resources.normalize_resource_key(f"path:{repo_common_dir}"),
     ]
+    if repo_path is not None and isinstance(branch, str) and branch:
+        keys.append(
+            resources.normalize_resource_key(f"repo:{repo_path}:branch:{branch}")
+        )
+    return keys
 
 
 def _acquire_checkout_resources(
@@ -941,12 +952,19 @@ def _acquire_checkout_resources(
     purpose: str,
     retention_until_unix: int,
     metadata: dict[str, Any],
+    repo_path: Path | None = None,
+    branch: str | None = None,
 ) -> dict[str, Any]:
     durable_owner = _owner(owner_id)
     lease_owner = f"checkout-op:{uuid.uuid4().hex[:20]}"
     return resources.acquire_resources(
         lease_owner,
-        _checkout_resource_keys(repo_common_dir, checkout_path),
+        _checkout_resource_keys(
+            repo_common_dir,
+            checkout_path,
+            repo_path=repo_path,
+            branch=branch,
+        ),
         purpose=purpose,
         ttl_seconds=OPERATION_LEASE_TTL_SECONDS,
         metadata={
@@ -1222,6 +1240,7 @@ def _linked_checkout_coordination(
     repo_path: Path,
     repo_common_dir: Path,
     *,
+    branch: str | None = None,
     owner_id: str | None = None,
     include_processes: bool = True,
     include_tasks: bool = True,
@@ -1231,9 +1250,14 @@ def _linked_checkout_coordination(
         _owner(owner_id)
     resource_blockers: list[dict[str, Any]] = []
     if include_resources:
+        branch_resource_key = (
+            f"repo:{repo_path}:branch:{branch}" if isinstance(branch, str) and branch else None
+        )
         for lease in _read_resource_leases():
-            if not _resource_related(
-                lease["resource_key"], [checkout_path, repo_common_dir]
+            resource_key = lease["resource_key"]
+            if not (
+                _resource_related(resource_key, [checkout_path, repo_common_dir])
+                or (branch_resource_key is not None and resource_key == branch_resource_key)
             ):
                 continue
             lease = {**lease, "blocking": True}
@@ -1423,6 +1447,7 @@ def checkout_inventory(
             checkout_path,
             top_level,
             common_dir,
+            branch=record.get("branch"),
             include_processes=include_processes,
             include_tasks=include_tasks,
             include_resources=include_resources,
@@ -1691,6 +1716,7 @@ def grabowski_checkout_archive(
         checkout,
         top_level,
         common_dir,
+        branch=record.get("branch"),
         owner_id=owner,
         include_processes=True,
         include_tasks=True,
@@ -1703,6 +1729,8 @@ def grabowski_checkout_archive(
         checkout_path=checkout,
         purpose=f"archive linked checkout: {archive_purpose}",
         retention_until_unix=until,
+        repo_path=top_level,
+        branch=record.get("branch"),
         metadata={
             "checkout_path": str(checkout),
             "repo": str(top_level),
@@ -1926,6 +1954,7 @@ def _cleanup_plan(
         checkout,
         top_level,
         common_dir,
+        branch=record.get("branch"),
         owner_id=owner,
         include_processes=True,
         include_tasks=True,
@@ -2085,6 +2114,8 @@ def grabowski_checkout_cleanup(
         checkout_path=checkout,
         purpose="apply linked checkout cleanup",
         retention_until_unix=retention_until_unix,
+        repo_path=Path(current_plan["repo"]),
+        branch=current_plan.get("branch"),
         metadata={
             "plan_id": plan_id,
             "archive_id": stored["archive_id"],
