@@ -393,6 +393,10 @@
       "source": "src/grabowski_job_finalizer.py"
     },
     {
+      "module": "grabowski_ntfy_dispatch",
+      "source": "src/grabowski_ntfy_dispatch.py"
+    },
+    {
       "module": "grabowski_juno",
       "source": "src/grabowski_juno.py"
     },
