@@ -7,6 +7,7 @@ Dieser Bootstrap ist die einzige absichtlich externe Root-Stufe. Vorher bleibt d
 | Repository | Root-eigenes Ziel | Modus |
 |---|---|---:|
 | `src/grabowski_privileged_broker.py` | `/usr/local/lib/grabowski/grabowski_privileged_broker.py` | `0644` |
+| `src/grabowski_command_identity.py` | `/usr/local/lib/grabowski/grabowski_command_identity.py` | `0644` |
 | `tools/grabowski_privileged_broker.py` | `/usr/local/libexec/grabowski-privileged-broker` | `0755` |
 | `tools/grabowski_privileged_request.py` | `/usr/local/bin/grabowski-privileged-request` | `0755` |
 | `tools/grabowski_rootbroker_cutover.py` | `/usr/local/libexec/grabowski-rootbroker-cutover` | `0755` |
@@ -18,7 +19,7 @@ Dieser Bootstrap ist die einzige absichtlich externe Root-Stufe. Vorher bleibt d
 
 Danach wird eine Systemgruppe `grabowski` angelegt, der Operator dieser Gruppe hinzugefügt und `systemd-tmpfiles --create /etc/tmpfiles.d/grabowski.conf` ausgeführt. Das versionierte tmpfiles-Fragment stellt sicher, dass `/run/grabowski` dauerhaft `root:grabowski` mit Modus `0750` gehört; `SocketGroup=grabowski` allein setzt nur die Gruppe des Sockets, nicht die des Elternverzeichnisses. Erst anschließend werden `systemctl daemon-reload` und ausschließlich `grabowski-privileged-broker.socket` aktiviert. Neue Gruppenmitgliedschaften gelten erst in einer frischen Login-Sitzung.
 
-Das Recovery-Source-Drop-in hält das Home-Verzeichnis mit `ProtectHome=tmpfs` verborgen. Vorherige Bind-Mount-Listen werden geleert. Sichtbar sind ausschließlich der feste Quellbeleg `last-server-recovery.json` und, falls vorhanden, der feste Kill-Switch. Eine Freigabe des gesamten Recovery-Verzeichnisses ist nicht Teil des Vertrags. `ProtectHome=yes` darf hier nicht verwendet werden: systemd kann darunter keine verschachtelten `BindReadOnlyPaths` erreichbar machen.
+Das Recovery-Source-Drop-in hält das Home-Verzeichnis mit `ProtectHome=tmpfs` verborgen. Vorherige Bind-Mount-Listen werden geleert und anschließend ausschließlich der feste Quellbeleg `last-server-recovery.json`, der optionale feste Kill-Switch sowie die eng katalogisierten Worktree-/Quarantäne-Wurzeln des Prozessreferenz-Observers read-only erneut gebunden. Eine Freigabe des gesamten Recovery-Verzeichnisses oder von `/home/alex/repos` ist nicht Teil des Vertrags. `ProtectHome=yes` darf hier nicht verwendet werden: systemd kann darunter keine verschachtelten `BindReadOnlyPaths` erreichbar machen.
 
 ## Bestehende Installation auf den kanonischen Publisher migrieren
 
