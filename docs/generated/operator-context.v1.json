@@ -2665,7 +2665,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_lifecycle_archive.py": "2dcddcd320047f4f14d260aa4127826b5f942a2645446f55919135846c07ae50",
+      "src/grabowski_lifecycle_archive.py": "79a29777e4650644895362d44795ecf590c30d05832fbc8b2164e280130db761",
       "src/grabowski_lifecycle_collectors.py": "33e9f34d7bfb7ed99cebe3dfc3f4e91e6c5f68ebf24a20f38a10aba6a317b885",
       "src/grabowski_lifecycle_effect_plan.py": "3cb6643fe10ee3fee3a914488605a79590a9354193e0ccc397c4a9d863fad567",
       "src/grabowski_lifecycle_evidence.py": "fc36996f2a70bfd601ffeb90bed9457c1c5225c9a67a1e00e3a41d10551e6a14",
