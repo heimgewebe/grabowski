@@ -305,6 +305,28 @@ class RepoGroundBundleToolTests(unittest.TestCase):
                     result["catalog"]["authority"], "canonical_publication_catalog"
                 )
 
+    def test_owner_slash_repo_identity_matches_canonical_aliases(self) -> None:
+        manifest = self._write_canonical_bundle("demo")
+
+        short = mcp.repoground_bundle_discover(repo="demo")
+        underscored = mcp.repoground_bundle_discover(repo="heimgewebe__demo")
+        slashed = mcp.repoground_bundle_discover(repo="heimgewebe/demo")
+
+        for result in (short, underscored, slashed):
+            self.assertEqual(result["candidate_count"], 1)
+            self.assertEqual(result["candidates"][0]["manifest_path"], str(manifest))
+            self.assertEqual(result["candidates"][0]["repo_id"], "heimgewebe__demo")
+
+        stem = slashed["candidates"][0]["stem"]
+        with patch.object(
+            mcp,
+            "_repoground_agent_preflight",
+            return_value={"available": True, "status": "pass"},
+        ):
+            preflight = mcp.repoground_preflight("heimgewebe/demo", stem=stem)
+        self.assertTrue(preflight["available"])
+        self.assertEqual(preflight["stem"], stem)
+
     def test_canonical_publication_precedes_legacy_for_all_consumers(self) -> None:
         _repo, head = self._git_repo("demo-repo")
         legacy = self._write_bundle(
@@ -596,8 +618,9 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(publication_missing["reason"], "no_bundle_found")
 
     def test_invalid_repo_name_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            mcp.repoground_bundle_discover(repo="../demo")
+        for repo in ("../demo", "/demo", "heimgewebe/", "heimgewebe/demo/extra"):
+            with self.subTest(repo=repo), self.assertRaises(ValueError):
+                mcp.repoground_bundle_discover(repo=repo)
 
     def test_context_pack_builds_context_ref(self) -> None:
         _repo, head = self._git_repo("demo-repo")
