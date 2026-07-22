@@ -774,9 +774,13 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
             )
             payload = json.loads(path.read_text(encoding="utf-8"))
             claimed = payload.get("receipt_sha256")
+            observed_payload_digest = _evidence_digest(
+                {key: value for key, value in payload.items() if key != "receipt_sha256"}
+            )
             if (
                 verified_digest != receipt_digest
                 or claimed != receipt_digest
+                or observed_payload_digest != claimed
                 or payload.get("task_id") != task_id
             ):
                 raise ValueError("receipt identity drift")
@@ -802,8 +806,11 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
 
     if bool(raw.get("chronik_outbox_enabled")):
         import grabowski_chronik as chronik
-        outbox_root = Path.home() / ".local/state/grabowski/chronik-outbox"
-        source = outbox_root / f"grabowski_task-{task_id}-a{int(raw['attempt'])}.jsonl"
+        expected_run_id = chronik.run_id(raw)
+        source = chronik.outbox_path(
+            {"source": {"run_id": expected_run_id}},
+            chronik.state_root(raw),
+        )
         try:
             loaded = chronik._read_regular_file(
                 source,
@@ -817,7 +824,18 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
             events = [json.loads(line) for line in data.decode("utf-8").splitlines() if line]
             if not events:
                 raise ValueError("empty Chronik source")
-            event_ids = [chronik.event_id(event) for event in events]
+            event_ids: list[str] = []
+            for event in events:
+                if (
+                    not isinstance(event, dict)
+                    or not isinstance(event.get("source"), dict)
+                    or event["source"].get("run_id") != expected_run_id
+                ):
+                    raise ValueError("Chronik source task identity drift")
+                recomputed_event_id = chronik.event_id(event)
+                if event.get("event_id") != recomputed_event_id:
+                    raise ValueError("Chronik event identity drift")
+                event_ids.append(recomputed_event_id)
         except Exception as exc:
             gaps.append(_external_gap("chronik", "chronik_source_unverifiable", task_id=task_id, error=type(exc).__name__))
         else:
@@ -851,7 +869,22 @@ def _lease_external_evidence(resource_key: str) -> tuple[list[dict[str, Any]], l
         return [], [_external_gap("lease", "lease_store_unverifiable", resource_key=resource_key, error=type(exc).__name__)]
     if row is None:
         return [], [_external_gap("lease", "lease_not_present", resource_key=resource_key)]
-    public = resources._public(row)
+    try:
+        public = resources._public(row)
+        metadata = resources._row_metadata(row)
+        _metadata_json, observed_metadata_sha256 = resources._metadata(metadata)
+        if public["metadata_sha256"] != observed_metadata_sha256:
+            raise ValueError("lease metadata digest drift")
+    except Exception as exc:
+        return [], [_external_gap("lease", "lease_store_unverifiable", resource_key=resource_key, error=type(exc).__name__)]
+    if int(public["expires_at_unix"]) <= resources._now():
+        return [], [_external_gap(
+            "lease",
+            "lease_not_active",
+            resource_key=resource_key,
+            owner_id=public["owner_id"],
+            expires_at_unix=int(public["expires_at_unix"]),
+        )]
     digest = _evidence_digest(public)
     return [{
         "source": "lease",
@@ -878,9 +911,16 @@ def _deployment_external_evidence(items: list[dict[str, Any]]) -> tuple[list[dic
         metadata = base._deployment_metadata()
     except Exception as exc:
         return [], [_external_gap("deployment", "deployment_metadata_unverifiable", error=type(exc).__name__)]
+    if metadata.get("provenance_valid") is not True or metadata.get("completion_status") != "complete":
+        return [], [_external_gap(
+            "deployment",
+            "deployment_metadata_unverifiable",
+            provenance_valid=metadata.get("provenance_valid"),
+            completion_status=metadata.get("completion_status"),
+        )]
     identity = {
         key: metadata.get(key)
-        for key in ("release_id", "repo_head", "entrypoint_contract_sha256", "source_sha256", "runtime_input_sha256", "runtime_lock_sha256", "completion_status")
+        for key in ("release_id", "repo_head", "entrypoint_contract_sha256", "source_sha256", "runtime_input_sha256", "runtime_lock_sha256", "completion_status", "provenance_valid")
     }
     matched = sorted(anchors & {str(identity.get("release_id")), str(identity.get("repo_head"))})
     if not matched:

@@ -180,10 +180,10 @@ Cross-store evidence remains the scope of the separately planned follow-up. Exte
 The projection is explicitly `derived_correlation_only`. It does not merge authority. Each verified item retains its source authority, relation type, stable identity and evidence digest:
 
 - Task evidence is read from a schema-verified read-only Task SQLite snapshot and bound to the stable task archive-record digest.
-- Lifecycle receipt evidence is accepted only when the Task row binds the receipt SHA-256 and the existing receipt verifier confirms the same digest.
-- Lease evidence is read from a schema-verified read-only Resource SQLite snapshot and correlated only by an exact held resource key.
-- Chronik evidence is read through the hardened bounded regular-file reader, then bound to the exact Task/attempt source name and source SHA-256; event IDs are recomputed and bounded in the response.
-- Deployment evidence is emitted only when an Audit seed carries a release/commit/head identity matching the currently verified deployment manifest.
+- Lifecycle receipt evidence is accepted only when the Task row binds the receipt SHA-256, the existing receipt verifier confirms the same digest and the reread payload independently recomputes to that digest.
+- Lease evidence is read from a schema-verified read-only Resource SQLite snapshot and correlated only by an exact currently active held resource key; expired or metadata-drifting rows degrade to a structured gap.
+- Chronik evidence is read through the hardened bounded regular-file reader, then bound to the task-specific state root and exact Task/attempt source name; the source run ID and stored event IDs must match recomputation, and the source SHA-256 plus bounded event IDs are returned.
+- Deployment evidence is emitted only when the current deployment metadata has complete, valid provenance and an Audit seed carries a release/commit/head identity matching its exact release ID or repo head.
 
 Missing, stale, drifting or unverifiable external evidence is returned as a structured `gap` and is never promoted to a verified link. Result payloads and source fan-out are bounded by `external_limit`.
 

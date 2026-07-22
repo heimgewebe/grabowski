@@ -587,6 +587,44 @@ class AuditQueryTests(unittest.TestCase):
             "not promoted to external evidence",
         )
 
+    def test_deployment_evidence_requires_valid_complete_provenance(self) -> None:
+        module = self._load_module([])
+        items = [{"record": {"release_id": "release-1"}}]
+        module.base._deployment_metadata = lambda: {
+            "release_id": "release-1",
+            "repo_head": "a" * 40,
+            "completion_status": "complete",
+            "provenance_valid": False,
+        }
+
+        evidence, gaps = module._deployment_external_evidence(items)
+
+        self.assertEqual(evidence, [])
+        self.assertEqual(gaps[0]["reason"], "deployment_metadata_unverifiable")
+        self.assertFalse(gaps[0]["context"]["provenance_valid"])
+
+    def test_deployment_evidence_binds_exact_identity_and_provenance(self) -> None:
+        module = self._load_module([])
+        items = [{"record": {"head": "b" * 40}}]
+        module.base._deployment_metadata = lambda: {
+            "release_id": "release-1",
+            "repo_head": "b" * 40,
+            "entrypoint_contract_sha256": "c" * 64,
+            "source_sha256": "d" * 64,
+            "runtime_input_sha256": "e" * 64,
+            "runtime_lock_sha256": "f" * 64,
+            "completion_status": "complete",
+            "provenance_valid": True,
+        }
+
+        evidence, gaps = module._deployment_external_evidence(items)
+
+        self.assertEqual(gaps, [])
+        self.assertEqual(evidence[0]["status"], "verified")
+        self.assertEqual(evidence[0]["relation"], "direct_identity")
+        self.assertEqual(evidence[0]["identity"]["matched_values"], ["b" * 40])
+        self.assertTrue(evidence[0]["record"]["provenance_valid"])
+
     def test_cross_store_external_limit_is_bounded(self) -> None:
         module = self._load_module(self._components())
         with self.assertRaisesRegex(ValueError, "external_limit must be between"):
@@ -692,6 +730,293 @@ class AuditQueryTests(unittest.TestCase):
             [gap["reason"] for gap in gaps if gap["source"] == "receipt"],
             ["receipt_unverifiable"],
         )
+
+
+    def test_receipt_reread_payload_must_recompute_to_bound_digest(self) -> None:
+        module = self._load_module([])
+        import tempfile
+        from contextlib import contextmanager
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outcomes = root / "outcomes"
+            outcomes.mkdir()
+            task_id = "task-reread-drift"
+            claimed = "a" * 64
+            (outcomes / f"{task_id}.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": task_id,
+                        "state": "forged-after-verifier",
+                        "attempt": 99,
+                        "receipt_sha256": claimed,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            row = {
+                "task_id": task_id,
+                "attempt": 1,
+                "state": "completed",
+                "unit": "unit",
+                "updated_at_unix": 1,
+                "lifecycle_receipt_sha256": claimed,
+                "terminalization_sha256": "b" * 64,
+                "chronik_outbox_enabled": 0,
+            }
+
+            class Connection:
+                def execute(self, _query, _parameters):
+                    return self
+
+                def fetchone(self):
+                    return row
+
+            fake_tasks = types.ModuleType("grabowski_tasks")
+            fake_tasks.TASK_DB = root / "tasks.sqlite3"
+            fake_tasks.TASK_OUTCOMES_DIR = outcomes
+            fake_tasks._preflight_task_store = lambda: "5"
+            fake_tasks._task_archive_record = lambda value: {
+                "task_id": value["task_id"],
+                "attempt": value["attempt"],
+                "state": value["state"],
+            }
+            fake_tasks._read_existing_outcome_receipt = (
+                lambda _path, transition_sha256, allow_legacy: claimed
+            )
+            fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+            @contextmanager
+            def readonly_sqlite(_path):
+                yield Connection()
+
+            fake_sqlite.readonly_sqlite = readonly_sqlite
+            previous_tasks = sys.modules.get("grabowski_tasks")
+            previous_sqlite = sys.modules.get("grabowski_sqlite_store")
+            sys.modules["grabowski_tasks"] = fake_tasks
+            sys.modules["grabowski_sqlite_store"] = fake_sqlite
+            try:
+                evidence, gaps = module._task_external_evidence(task_id)
+            finally:
+                if previous_tasks is None:
+                    sys.modules.pop("grabowski_tasks", None)
+                else:
+                    sys.modules["grabowski_tasks"] = previous_tasks
+                if previous_sqlite is None:
+                    sys.modules.pop("grabowski_sqlite_store", None)
+                else:
+                    sys.modules["grabowski_sqlite_store"] = previous_sqlite
+
+        self.assertNotIn("receipt", {item["source"] for item in evidence})
+        self.assertEqual(
+            [gap["reason"] for gap in gaps if gap["source"] == "receipt"],
+            ["receipt_unverifiable"],
+        )
+
+    def test_chronik_evidence_uses_task_bound_state_root(self) -> None:
+        module = self._load_module([])
+        from contextlib import contextmanager
+
+        task_id = "task-custom-root"
+        expected_run_id = f"task-{task_id}-a2"
+        custom_root = Path("/srv/custom-chronik-state")
+        expected_path = custom_root / "grabowski" / "chronik-outbox" / f"grabowski_{expected_run_id}.jsonl"
+        event_id = "sha256:" + "c" * 64
+        event = {"source": {"run_id": expected_run_id}, "event_id": event_id, "kind": "agent.run.completed"}
+        data = json.dumps(event).encode("utf-8") + b"\n"
+        seen: dict[str, object] = {}
+        row = {
+            "task_id": task_id,
+            "attempt": 2,
+            "state": "completed",
+            "unit": "unit",
+            "updated_at_unix": 1,
+            "lifecycle_receipt_sha256": None,
+            "terminalization_sha256": None,
+            "chronik_outbox_enabled": 1,
+            "chronik_outbox_state_root": str(custom_root),
+        }
+
+        class Connection:
+            def execute(self, _query, _parameters):
+                return self
+
+            def fetchone(self):
+                return row
+
+        fake_tasks = types.ModuleType("grabowski_tasks")
+        fake_tasks.TASK_DB = Path("/tmp/tasks.sqlite3")
+        fake_tasks.TASK_OUTCOMES_DIR = Path("/tmp/outcomes")
+        fake_tasks._preflight_task_store = lambda: "5"
+        fake_tasks._task_archive_record = lambda value: {
+            "task_id": value["task_id"],
+            "attempt": value["attempt"],
+            "state": value["state"],
+        }
+        fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+        @contextmanager
+        def readonly_sqlite(_path):
+            yield Connection()
+
+        fake_sqlite.readonly_sqlite = readonly_sqlite
+        fake_chronik = types.ModuleType("grabowski_chronik")
+        fake_chronik.MAX_BUNDLE_BYTES = 1024
+        fake_chronik.run_id = lambda record: f"task-{record['task_id']}-a{record['attempt']}"
+        fake_chronik.state_root = lambda record: Path(record["chronik_outbox_state_root"])
+
+        def outbox_path(value, root=None):
+            seen["root"] = root
+            return root / "grabowski" / "chronik-outbox" / f"grabowski_{value['source']['run_id']}.jsonl"
+
+        def read_regular_file(path, **_kwargs):
+            seen["path"] = path
+            return data, (1, 2, len(data), 3, 4)
+
+        fake_chronik.outbox_path = outbox_path
+        fake_chronik._read_regular_file = read_regular_file
+        fake_chronik.event_id = lambda _event: event_id
+        previous = {name: sys.modules.get(name) for name in ("grabowski_tasks", "grabowski_sqlite_store", "grabowski_chronik")}
+        sys.modules["grabowski_tasks"] = fake_tasks
+        sys.modules["grabowski_sqlite_store"] = fake_sqlite
+        sys.modules["grabowski_chronik"] = fake_chronik
+        try:
+            evidence, gaps = module._task_external_evidence(task_id)
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
+        self.assertEqual(seen["root"], custom_root)
+        self.assertEqual(seen["path"], expected_path)
+        self.assertIn("chronik", {item["source"] for item in evidence})
+        self.assertNotIn("chronik_source_unverifiable", {gap["reason"] for gap in gaps})
+
+    def test_chronik_event_source_identity_drift_is_a_gap(self) -> None:
+        module = self._load_module([])
+        from contextlib import contextmanager
+
+        task_id = "task-chronik-drift"
+        row = {
+            "task_id": task_id,
+            "attempt": 1,
+            "state": "completed",
+            "unit": "unit",
+            "updated_at_unix": 1,
+            "lifecycle_receipt_sha256": None,
+            "terminalization_sha256": None,
+            "chronik_outbox_enabled": 1,
+            "chronik_outbox_state_root": "/tmp/state",
+        }
+
+        class Connection:
+            def execute(self, _query, _parameters):
+                return self
+
+            def fetchone(self):
+                return row
+
+        fake_tasks = types.ModuleType("grabowski_tasks")
+        fake_tasks.TASK_DB = Path("/tmp/tasks.sqlite3")
+        fake_tasks.TASK_OUTCOMES_DIR = Path("/tmp/outcomes")
+        fake_tasks._preflight_task_store = lambda: "5"
+        fake_tasks._task_archive_record = lambda value: {"task_id": value["task_id"], "attempt": value["attempt"]}
+        fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+        @contextmanager
+        def readonly_sqlite(_path):
+            yield Connection()
+
+        fake_sqlite.readonly_sqlite = readonly_sqlite
+        fake_chronik = types.ModuleType("grabowski_chronik")
+        fake_chronik.MAX_BUNDLE_BYTES = 1024
+        fake_chronik.run_id = lambda record: f"task-{record['task_id']}-a{record['attempt']}"
+        fake_chronik.state_root = lambda record: Path(record["chronik_outbox_state_root"])
+        fake_chronik.outbox_path = lambda value, root=None: root / "grabowski" / "chronik-outbox" / f"grabowski_{value['source']['run_id']}.jsonl"
+        stored_event_id = "sha256:" + "d" * 64
+        drifted = {"source": {"run_id": "task-other-a1"}, "event_id": stored_event_id}
+        raw_data = json.dumps(drifted).encode("utf-8") + b"\n"
+        fake_chronik._read_regular_file = lambda *_args, **_kwargs: (raw_data, (1, 2, len(raw_data), 3, 4))
+        fake_chronik.event_id = lambda _event: stored_event_id
+        previous = {name: sys.modules.get(name) for name in ("grabowski_tasks", "grabowski_sqlite_store", "grabowski_chronik")}
+        sys.modules["grabowski_tasks"] = fake_tasks
+        sys.modules["grabowski_sqlite_store"] = fake_sqlite
+        sys.modules["grabowski_chronik"] = fake_chronik
+        try:
+            evidence, gaps = module._task_external_evidence(task_id)
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
+        self.assertNotIn("chronik", {item["source"] for item in evidence})
+        self.assertEqual(
+            [gap["reason"] for gap in gaps if gap["source"] == "chronik"],
+            ["chronik_source_unverifiable"],
+        )
+
+    def test_expired_lease_is_reported_as_inactive_gap(self) -> None:
+        module = self._load_module([])
+        from contextlib import contextmanager
+
+        metadata_sha256 = hashlib.sha256(b"{}").hexdigest()
+        row = {
+            "resource_key": "repo:/srv/example",
+            "owner_id": "owner",
+            "purpose": "test",
+            "acquired_at_unix": 1,
+            "updated_at_unix": 2,
+            "expires_at_unix": 10,
+            "metadata_sha256": metadata_sha256,
+            "metadata_json": "{}",
+            "reclaimed_from_owner": None,
+        }
+
+        class Connection:
+            def execute(self, _query, _parameters):
+                return self
+
+            def fetchone(self):
+                return row
+
+        fake_resources = types.ModuleType("grabowski_resources")
+        fake_resources.RESOURCE_DB = Path("/tmp/resources.sqlite3")
+        fake_resources._preflight_resource_store = lambda: "2"
+        fake_resources.normalize_resource_key = lambda value: value
+        fake_resources._public = lambda value: {key: item for key, item in dict(value).items() if key != "metadata_json"}
+        fake_resources._row_metadata = lambda _value: {}
+        fake_resources._metadata = lambda _value: ("{}", metadata_sha256)
+        fake_resources._now = lambda: 20
+        fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+        @contextmanager
+        def readonly_sqlite(_path):
+            yield Connection()
+
+        fake_sqlite.readonly_sqlite = readonly_sqlite
+        previous_resources = sys.modules.get("grabowski_resources")
+        previous_sqlite = sys.modules.get("grabowski_sqlite_store")
+        sys.modules["grabowski_resources"] = fake_resources
+        sys.modules["grabowski_sqlite_store"] = fake_sqlite
+        try:
+            evidence, gaps = module._lease_external_evidence("repo:/srv/example")
+        finally:
+            if previous_resources is None:
+                sys.modules.pop("grabowski_resources", None)
+            else:
+                sys.modules["grabowski_resources"] = previous_resources
+            if previous_sqlite is None:
+                sys.modules.pop("grabowski_sqlite_store", None)
+            else:
+                sys.modules["grabowski_sqlite_store"] = previous_sqlite
+
+        self.assertEqual(evidence, [])
+        self.assertEqual(gaps[0]["reason"], "lease_not_active")
+        self.assertEqual(gaps[0]["context"]["expires_at_unix"], 10)
 
 
 if __name__ == "__main__":
