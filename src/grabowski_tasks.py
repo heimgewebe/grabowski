@@ -3324,6 +3324,15 @@ def grabowski_task_list(
                 "schema_only cannot be combined with task-list filters or projections"
             )
         return _task_schema_inventory()
+    if view == "managed_cargo_evidence":
+        if state is not None or cursor is not None or fields is not None:
+            raise ValueError(
+                "managed_cargo_evidence view cannot be combined with state, cursor or fields"
+            )
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        _recover_pending_task_terminalizations()
+        return _managed_cargo_evidence_from_task_store(limit)
     selected_view = consumer_surface.normalize_view(view)
     _recover_pending_task_terminalizations()
     current_projection = _task_current_projection()
@@ -3497,4 +3506,35 @@ def grabowski_task_list(
             "recommended_next_action",
             "does_not_establish",
         ),
+    )
+
+
+# Managed Cargo cache evidence is a read-only projection of the canonical task database.
+import grabowski_managed_cargo as managed_cargo
+
+
+def _managed_cargo_evidence_from_task_store(max_entries: int) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    with _task_read_snapshot() as connection:
+        rows = connection.execute(
+            "SELECT task_id, state, argv_json, updated_at_unix "
+            "FROM tasks ORDER BY task_id"
+        ).fetchall()
+        for row in rows:
+            try:
+                argv = json.loads(str(row["argv_json"]))
+            except json.JSONDecodeError:
+                argv = None
+            records.append(
+                {
+                    "task_id": str(row["task_id"]),
+                    "state": str(row["state"]),
+                    "argv": argv,
+                    "updated_at_unix": int(row["updated_at_unix"]),
+                }
+            )
+    return managed_cargo.build_evidence(
+        records,
+        cache_root=MANAGED_CARGO_CACHE_ROOT,
+        max_entries=max_entries,
     )
