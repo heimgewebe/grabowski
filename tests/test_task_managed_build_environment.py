@@ -261,11 +261,23 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
         ):
             self._bind(command)
 
-    def test_shell_embedded_target_override_is_not_misclassified_as_managed(self) -> None:
+    def test_shell_embedded_target_override_is_rejected_as_ambiguous(self) -> None:
         command = ["bash", "-lc", "CARGO_TARGET_DIR=/tmp/caller-target cargo test"]
-        result, invocations = self._bind(command)
-        self.assertIs(result, command)
-        self.assertEqual(invocations, [])
+        with self.assertRaisesRegex(
+            RuntimeError, "ambiguous managed Cargo target override"
+        ):
+            self._bind(command)
+
+    def test_shell_expanded_home_managed_target_override_is_rejected(self) -> None:
+        command = [
+            "bash",
+            "-lc",
+            f'CARGO_TARGET_DIR="$HOME/.cache/heim-pc/managed-builds/cargo/{self.cache_path.name}/target" cargo test',
+        ]
+        with self.assertRaisesRegex(
+            RuntimeError, "ambiguous managed Cargo target override"
+        ):
+            self._bind(command)
 
     def test_remote_explicit_managed_target_is_not_locally_locked(self) -> None:
         command = [

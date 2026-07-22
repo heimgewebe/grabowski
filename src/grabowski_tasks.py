@@ -1050,22 +1050,42 @@ def _explicit_cargo_target_dir(command: list[str]) -> bool:
     return any("CARGO_TARGET_DIR=" in item for item in command)
 
 
-def _ambiguous_managed_cargo_target_override(command: list[str]) -> bool:
-    managed_root = str(MANAGED_CARGO_CACHE_ROOT)
-    return any(
-        "CARGO_TARGET_DIR=" in item and managed_root in item
-        for item in command
-    )
+def _direct_cargo_target_dir_values(command: list[str]) -> list[str]:
+    if not command or Path(command[0]).name != "env":
+        return []
+    values: list[str] = []
+    for item in command[1:]:
+        if item == "--" or (item.startswith("-") and "=" not in item):
+            continue
+        if "=" not in item:
+            break
+        if item.startswith("CARGO_TARGET_DIR="):
+            values.append(item.removeprefix("CARGO_TARGET_DIR="))
+    return values
 
+
+def _ambiguous_managed_cargo_target_override(command: list[str]) -> bool:
+    occurrences = sum("CARGO_TARGET_DIR=" in item for item in command)
+    if occurrences == 0:
+        return False
+    values = _direct_cargo_target_dir_values(command)
+    if occurrences != 1 or len(values) != 1:
+        return True
+    path = Path(values[0])
+    if not path.is_absolute() or ".." in path.parts:
+        return True
+    try:
+        relative = path.relative_to(MANAGED_CARGO_CACHE_ROOT)
+    except ValueError:
+        return False
+    return not (
+        len(relative.parts) == 2
+        and relative.parts[1] == "target"
+        and SHA256.fullmatch(relative.parts[0]) is not None
+    )
 
 def _explicit_managed_cargo_target_dir(command: list[str]) -> str | None:
-    values = sorted(
-        {
-            item.removeprefix("CARGO_TARGET_DIR=")
-            for item in command
-            if item.startswith("CARGO_TARGET_DIR=")
-        }
-    )
+    values = sorted(set(_direct_cargo_target_dir_values(command)))
     if len(values) != 1:
         return None
     path = Path(values[0])
