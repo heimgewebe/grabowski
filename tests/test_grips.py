@@ -711,6 +711,7 @@ class GripFoundationTests(unittest.TestCase):
                 "scout",
                 "situation",
                 "worktree-ensure",
+                "worktree-hygiene-reconcile",
                 "worktree-orient",
             },
             set(specs),
@@ -6955,3 +6956,346 @@ class GateEvidenceConvergenceGripTests(unittest.TestCase):
         )
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("duplicate record_id", result["output"]["error"])
+
+
+class WorktreeHygieneReconcileTests(unittest.TestCase):
+    OWNER = "operator:test-worktree-hygiene"
+    HEAD = "a" * 40
+    BRANCH = "feat/terminal-work"
+
+    def _owned_item(
+        self,
+        path: str,
+        *,
+        state: str = "retained",
+        dirty: bool | None = False,
+        blocking: bool = False,
+        archive: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "path": path,
+            "is_main": False,
+            "head": self.HEAD,
+            "branch": self.BRANCH,
+            "status": {"dirty": dirty},
+            "coordination": {"blocking": blocking},
+            "lifecycle_state": state,
+            "lifecycle": {
+                "retention": {
+                    "owner_id": self.OWNER,
+                    "retention_until_unix": int(time.time()) + 3600,
+                }
+                if archive is None
+                else None,
+                "binding": None,
+                "latest_archive": archive,
+            },
+        }
+
+    def _parameters(self, repo: str, *, apply_cleanup: bool = False) -> dict[str, object]:
+        return {
+            "repo": repo,
+            "owner_id": self.OWNER,
+            "apply_cleanup": apply_cleanup,
+            "confirmation": grips.WORKTREE_HYGIENE_CONFIRMATION,
+        }
+
+    def test_exact_merged_pr_archives_owned_clean_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = str(Path(tmp) / "worktree")
+            inventory = {
+                "inventory_sha256": "1" * 64,
+                "worktrees": [self._owned_item(checkout)],
+            }
+
+            def github_runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                self.assertIn("merged", argv)
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps(
+                        [
+                            {
+                                "number": 77,
+                                "url": "https://github.com/heimgewebe/grabowski/pull/77",
+                                "state": "MERGED",
+                                "baseRefName": "main",
+                                "headRefName": self.BRANCH,
+                                "headRefOid": self.HEAD,
+                                "mergedAt": "2026-07-22T01:00:00Z",
+                            }
+                        ]
+                    ),
+                    "stderr": "",
+                }
+
+            archive_result = {
+                "archive": {
+                    "archive_id": "20260722T010000Z-aaaaaaaaaaaa",
+                    "created_at_unix": 1000,
+                }
+            }
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch(
+                    "grabowski_checkouts.grabowski_checkout_archive",
+                    return_value=archive_result,
+                ) as archive,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    self._parameters(tmp),
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=github_runner,
+                )
+
+        self.assertEqual("passed", result["receipt"]["status"] )
+        self.assertEqual(1, result["output"]["actions"])
+        self.assertEqual(1, len(result["output"]["archived"]))
+        self.assertEqual(77, result["output"]["archived"][0]["merged_pr"]["number"])
+        archive.assert_called_once()
+        self.assertEqual(self.HEAD, archive.call_args.kwargs["expected_head"])
+        self.assertEqual(self.BRANCH, archive.call_args.kwargs["expected_branch"])
+
+    def test_head_mismatch_does_not_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = str(Path(tmp) / "worktree")
+            inventory = {
+                "inventory_sha256": "2" * 64,
+                "worktrees": [self._owned_item(checkout)],
+            }
+
+            def github_runner(_repo: Path, _argv: list[str]) -> dict[str, object]:
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps(
+                        [
+                            {
+                                "number": 78,
+                                "url": "https://github.com/heimgewebe/grabowski/pull/78",
+                                "state": "MERGED",
+                                "baseRefName": "main",
+                                "headRefName": self.BRANCH,
+                                "headRefOid": "b" * 40,
+                                "mergedAt": "2026-07-22T01:00:00Z",
+                            }
+                        ]
+                    ),
+                    "stderr": "",
+                }
+
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch("grabowski_checkouts.grabowski_checkout_archive") as archive,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    self._parameters(tmp),
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=github_runner,
+                )
+
+        archive.assert_not_called()
+        self.assertEqual(0, result["output"]["actions"])
+        self.assertEqual("terminality_not_proven", result["output"]["skipped"][0]["reason"])
+
+    def test_dirty_or_coordinated_checkout_fails_closed_before_github(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = {
+                "inventory_sha256": "3" * 64,
+                "worktrees": [
+                    self._owned_item(str(Path(tmp) / "dirty"), dirty=True),
+                    self._owned_item(str(Path(tmp) / "blocked"), blocking=True),
+                ],
+            }
+
+            def github_runner(_repo: Path, _argv: list[str]) -> dict[str, object]:
+                raise AssertionError("GitHub must not be queried for unsafe checkouts")
+
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch("grabowski_checkouts.grabowski_checkout_archive") as archive,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    self._parameters(tmp),
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=github_runner,
+                )
+
+        archive.assert_not_called()
+        self.assertEqual(0, result["output"]["github_queries"])
+        self.assertEqual(
+            ["active_coordination", "dirty_or_unobservable"],
+            sorted(item["reason"] for item in result["output"]["skipped"]),
+        )
+
+    def test_cleanup_candidate_uses_dry_run_hash_before_apply(self) -> None:
+        archive_record = {
+            "owner_id": self.OWNER,
+            "archive_id": "20260721T010000Z-bbbbbbbbbbbb",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = str(Path(tmp) / "worktree")
+            inventory = {
+                "inventory_sha256": "4" * 64,
+                "worktrees": [
+                    self._owned_item(
+                        checkout,
+                        state="cleanup_candidate",
+                        archive=archive_record,
+                    )
+                ],
+            }
+            dry = {
+                "plan": {
+                    "plan_sha256": "c" * 64,
+                    "safe_to_apply": True,
+                    "archive_id": archive_record["archive_id"],
+                },
+                "dry_run_record": {"plan_id": "cleanup-plan-1"},
+            }
+            applied = {"applied_at_unix": 2000}
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch(
+                    "grabowski_checkouts.grabowski_checkout_cleanup",
+                    side_effect=[dry, applied],
+                ) as cleanup,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    self._parameters(tmp, apply_cleanup=True),
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=lambda _repo, _argv: {
+                        "returncode": 1, "stdout": "", "stderr": "not expected"
+                    },
+                )
+
+        self.assertEqual(2, cleanup.call_count)
+        self.assertTrue(cleanup.call_args_list[0].kwargs["dry_run"])
+        self.assertFalse(cleanup.call_args_list[1].kwargs["dry_run"])
+        self.assertEqual("cleanup-plan-1", cleanup.call_args_list[1].kwargs["plan_id"])
+        self.assertEqual("c" * 64, cleanup.call_args_list[1].kwargs["expected_plan_sha256"])
+        self.assertEqual(1, len(result["output"]["cleaned"]))
+        self.assertEqual(2, result["output"]["actions"])
+
+    def test_cleanup_action_bound_can_stop_after_persisted_dry_run(self) -> None:
+        archive_record = {
+            "owner_id": self.OWNER,
+            "archive_id": "20260721T010000Z-dddddddddddd",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = str(Path(tmp) / "worktree")
+            inventory = {
+                "inventory_sha256": "6" * 64,
+                "worktrees": [
+                    self._owned_item(
+                        checkout,
+                        state="cleanup_candidate",
+                        archive=archive_record,
+                    )
+                ],
+            }
+            dry = {
+                "plan": {
+                    "plan_sha256": "d" * 64,
+                    "safe_to_apply": True,
+                    "archive_id": archive_record["archive_id"],
+                },
+                "dry_run_record": {"plan_id": "cleanup-plan-bound"},
+            }
+            parameters = self._parameters(tmp, apply_cleanup=True)
+            parameters["max_actions"] = 1
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch(
+                    "grabowski_checkouts.grabowski_checkout_cleanup",
+                    return_value=dry,
+                ) as cleanup,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    parameters,
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=lambda _repo, _argv: {
+                        "returncode": 1, "stdout": "", "stderr": "not expected"
+                    },
+                )
+
+        self.assertEqual(1, cleanup.call_count)
+        self.assertEqual(1, result["output"]["actions"])
+        self.assertEqual([], result["output"]["cleaned"])
+        self.assertEqual(
+            "cleanup_apply_deferred_by_action_bound",
+            result["output"]["skipped"][0]["reason"],
+        )
+
+    def test_ownerless_clean_checkout_is_adopted_only_after_exact_merge_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = str(Path(tmp) / "legacy-worktree")
+            item = self._owned_item(checkout, state="unclassified_clean")
+            item["lifecycle"]["retention"] = None
+            inventory = {
+                "inventory_sha256": "5" * 64,
+                "worktrees": [item],
+            }
+
+            def github_runner(_repo: Path, _argv: list[str]) -> dict[str, object]:
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps(
+                        [
+                            {
+                                "number": 79,
+                                "url": "https://github.com/heimgewebe/grabowski/pull/79",
+                                "state": "MERGED",
+                                "baseRefName": "main",
+                                "headRefName": self.BRANCH,
+                                "headRefOid": self.HEAD,
+                                "mergedAt": "2026-07-22T01:00:00Z",
+                            }
+                        ]
+                    ),
+                    "stderr": "",
+                }
+
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch(
+                    "grabowski_checkouts.grabowski_checkout_archive",
+                    return_value={
+                        "archive": {
+                            "archive_id": "20260722T010000Z-cccccccccccc",
+                            "created_at_unix": 1000,
+                        }
+                    },
+                ) as archive,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    self._parameters(tmp),
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=github_runner,
+                )
+
+        self.assertEqual(1, result["output"]["adopted_unowned_count"])
+        self.assertEqual(
+            "adopt_unowned_after_terminal_proof",
+            result["output"]["archived"][0]["ownership_mode"],
+        )
+        self.assertEqual(self.OWNER, archive.call_args.kwargs["owner_id"])
+
+    def test_surface_marks_worktree_hygiene_as_high_risk_and_not_mechanic_normal(self) -> None:
+        spec = next(
+            item for item in grips.list_grips()
+            if item["name"] == "worktree-hygiene-reconcile"
+        )
+        self.assertEqual("high", spec["risk"])
+        self.assertEqual("mutating", spec["effect"])
+        self.assertNotIn("worktree-hygiene-reconcile", grips.MECHANIC_NORMAL_GRIPS)
