@@ -415,6 +415,20 @@ class RuntimeSource:
 
 
 @dataclass(frozen=True)
+class RuntimeSpawnDependency:
+    kind: str
+    launcher_module: str
+    spawned_module: str
+
+    def to_manifest(self) -> dict[str, str]:
+        return {
+            "kind": self.kind,
+            "launcher_module": self.launcher_module,
+            "spawned_module": self.spawned_module,
+        }
+
+
+@dataclass(frozen=True)
 class RuntimeAsset:
     source: Path
     destination: Path
@@ -435,6 +449,7 @@ class RuntimeContract:
     module: str
     supporting_sources: tuple[RuntimeSource, ...] = ()
     runtime_assets: tuple[RuntimeAsset, ...] = ()
+    spawn_dependencies: tuple[RuntimeSpawnDependency, ...] = ()
 
     @property
     def sources(self) -> tuple[RuntimeSource, ...]:
@@ -458,6 +473,10 @@ class RuntimeContract:
         if self.schema_version >= 3:
             result["runtime_assets"] = [
                 item.to_manifest() for item in self.runtime_assets
+            ]
+        if self.schema_version >= 4:
+            result["spawn_dependencies"] = [
+                item.to_manifest() for item in self.spawn_dependencies
             ]
         return result
 
@@ -483,8 +502,8 @@ def load_contract_bytes(data: bytes) -> RuntimeContract:
     if not isinstance(raw, dict):
         fail("Runtime-Entry-Point-Contract ist kein Objekt")
     schema_version = raw.get("schema_version")
-    if schema_version not in {1, 2, 3}:
-        fail("Runtime-Entry-Point-Contract benötigt schema_version 1, 2 oder 3")
+    if schema_version not in {1, 2, 3, 4}:
+        fail("Runtime-Entry-Point-Contract benötigt schema_version 1, 2, 3 oder 4")
     mode = raw.get("mode")
     if mode != "module":
         fail(f"Nicht unterstützter Entry-Point-Modus: {mode!r}")
@@ -519,6 +538,51 @@ def load_contract_bytes(data: bytes) -> RuntimeContract:
         seen_modules.add(supporting_module)
         seen_paths.add(supporting_path)
         supporting.append(RuntimeSource(module=supporting_module, source=supporting_path))
+
+    if schema_version < 4 and "spawn_dependencies" in raw:
+        fail("spawn_dependencies benötigt schema_version 4")
+    if schema_version == 4 and "spawn_dependencies" not in raw:
+        fail("schema_version 4 benötigt spawn_dependencies")
+    raw_spawn_dependencies = raw.get("spawn_dependencies", [])
+    if not isinstance(raw_spawn_dependencies, list):
+        fail("spawn_dependencies muss eine Liste sein")
+    spawn_dependencies: list[RuntimeSpawnDependency] = []
+    seen_spawn_dependencies: set[tuple[str, str, str]] = set()
+    for index, item in enumerate(raw_spawn_dependencies):
+        if not isinstance(item, dict) or set(item) != {
+            "kind",
+            "launcher_module",
+            "spawned_module",
+        }:
+            fail(f"spawn_dependencies[{index}] ist ungültig")
+        kind = item.get("kind")
+        launcher_module = item.get("launcher_module")
+        spawned_module = item.get("spawned_module")
+        if kind != "python_module":
+            fail(f"Nicht unterstützte spawn_dependencies-Art: {kind!r}")
+        if (
+            not isinstance(launcher_module, str)
+            or MODULE_RE.fullmatch(launcher_module) is None
+            or launcher_module not in seen_modules
+        ):
+            fail(f"Ungültiges spawn_dependencies-Launcher-Modul: {launcher_module!r}")
+        if (
+            not isinstance(spawned_module, str)
+            or MODULE_RE.fullmatch(spawned_module) is None
+            or spawned_module not in seen_modules
+        ):
+            fail(f"Ungültiges spawn_dependencies-Zielmodul: {spawned_module!r}")
+        identity = (kind, launcher_module, spawned_module)
+        if identity in seen_spawn_dependencies:
+            fail("Doppelte Runtime-Spawn-Abhängigkeit")
+        seen_spawn_dependencies.add(identity)
+        spawn_dependencies.append(
+            RuntimeSpawnDependency(
+                kind=kind,
+                launcher_module=launcher_module,
+                spawned_module=spawned_module,
+            )
+        )
 
     raw_assets = raw.get("runtime_assets", [])
     if schema_version < 3 and raw_assets:
@@ -570,6 +634,7 @@ def load_contract_bytes(data: bytes) -> RuntimeContract:
         expected_tools=tuple(tools),
         supporting_sources=tuple(supporting),
         runtime_assets=tuple(runtime_assets),
+        spawn_dependencies=tuple(spawn_dependencies),
     )
 
 
@@ -1717,7 +1782,7 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
         errors.append("entrypoint_contract")
     else:
         schema_version = contract.get("schema_version")
-        if schema_version not in {1, 2, 3} or contract.get("mode") != "module":
+        if schema_version not in {1, 2, 3, 4} or contract.get("mode") != "module":
             errors.append("entrypoint_contract")
         main_module = contract.get("module")
         if not isinstance(main_module, str) or not MODULE_RE.fullmatch(main_module):
@@ -1760,6 +1825,39 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
                 modules.add(module)
                 supporting_modules.add(module)
                 seen_paths.add(source)
+
+        if schema_version in {1, 2, 3} and "spawn_dependencies" in contract:
+            errors.append("entrypoint_contract")
+        if schema_version == 4 and "spawn_dependencies" not in contract:
+            errors.append("entrypoint_contract")
+        spawn_dependencies = contract.get("spawn_dependencies", [])
+        if not isinstance(spawn_dependencies, list):
+            errors.append("entrypoint_contract")
+        else:
+            seen_spawn_dependencies: set[tuple[str, str, str]] = set()
+            for item in spawn_dependencies:
+                if not isinstance(item, dict) or set(item) != {
+                    "kind",
+                    "launcher_module",
+                    "spawned_module",
+                }:
+                    errors.append("entrypoint_contract")
+                    continue
+                kind = item.get("kind")
+                launcher_module = item.get("launcher_module")
+                spawned_module = item.get("spawned_module")
+                identity = (kind, launcher_module, spawned_module)
+                if (
+                    kind != "python_module"
+                    or not isinstance(launcher_module, str)
+                    or launcher_module not in modules
+                    or not isinstance(spawned_module, str)
+                    or spawned_module not in modules
+                    or identity in seen_spawn_dependencies
+                ):
+                    errors.append("entrypoint_contract")
+                    continue
+                seen_spawn_dependencies.add(identity)
 
         runtime_assets = contract.get("runtime_assets", [])
         if schema_version in {1, 2} and runtime_assets:

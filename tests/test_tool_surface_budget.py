@@ -64,6 +64,21 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
             ["grabowski_status"],
         )
 
+    def test_runtime_tool_projection_validates_schema_four_spawn_dependencies(self) -> None:
+        runtime = copy.deepcopy(self.runtime)
+        self.assertEqual(runtime["schema_version"], 4)
+        self.assertEqual(budget._runtime_tools(runtime), sorted(runtime["expected_tools"]))
+
+        invalid = copy.deepcopy(runtime)
+        invalid["spawn_dependencies"][0]["spawned_module"] = "grabowski_missing"
+        with self.assertRaisesRegex(budget.ToolSurfaceBudgetError, "deployment-closed"):
+            budget._runtime_tools(invalid)
+
+        invalid = copy.deepcopy(runtime)
+        del invalid["spawn_dependencies"]
+        with self.assertRaisesRegex(budget.ToolSurfaceBudgetError, "requires spawn_dependencies"):
+            budget._runtime_tools(invalid)
+
     def test_runtime_tool_projection_rejects_malformed_schema_three_assets(self) -> None:
         runtime = copy.deepcopy(self.runtime)
         runtime["runtime_assets"] = {"source": "catalog.json"}
