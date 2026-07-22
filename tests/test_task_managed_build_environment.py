@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import types
@@ -58,6 +59,8 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
         self.cache_root = Path(self.temporary.name) / "managed-builds" / "cargo"
         self.cache_path = self.cache_root / ("a" * 64)
         self.target_dir = self.cache_path / "target"
+        self.lock_root = Path(self.temporary.name) / "state" / "cache-locks" / "cargo"
+        self.lock_path = self.lock_root / f"{self.cache_path.name}.lock"
 
     def _payload(self, *, profile: str = "operator-task", target: Path | None = None) -> dict:
         target_dir = self.target_dir if target is None else target
@@ -69,8 +72,13 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
             "tool": "cargo",
             "profile": profile,
             "cache_path": str(cache_path),
+            "lifecycle_lock_path": str(self.lock_root / f"{cache_path.name}.lock"),
             "environment": {"CARGO_TARGET_DIR": str(target_dir)},
-            "prepared_paths": [str(cache_path), str(target_dir)],
+            "prepared_paths": [
+                str(cache_path),
+                str(target_dir),
+                str(self.lock_root),
+            ],
         }
 
     def _bind(
@@ -99,6 +107,7 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
         with (
             patch.object(tasks, "MANAGED_BUILD_RESOLVER", self.resolver),
             patch.object(tasks, "MANAGED_CARGO_CACHE_ROOT", self.cache_root),
+            patch.object(tasks, "MANAGED_CARGO_LOCK_ROOT", self.lock_root),
             patch.object(tasks, "_local_git_root", return_value=self.root),
             patch.object(tasks.operator, "_run", side_effect=fake_run),
             patch.dict(os.environ, {"CARGO_TARGET_DIR": ""}, clear=False),
@@ -116,6 +125,9 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
         self.assertEqual(
             result,
             [
+                "/usr/bin/flock",
+                "--shared",
+                str(self.lock_path),
                 "/usr/bin/env",
                 f"CARGO_TARGET_DIR={self.target_dir}",
                 "cargo",
@@ -146,9 +158,17 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 result, invocations = self._bind(command)
-                self.assertEqual(result[0], "/usr/bin/env")
-                self.assertEqual(result[1], f"CARGO_TARGET_DIR={self.target_dir}")
-                self.assertEqual(result[2:], command)
+                self.assertEqual(
+                    result[:5],
+                    [
+                        "/usr/bin/flock",
+                        "--shared",
+                        str(self.lock_path),
+                        "/usr/bin/env",
+                        f"CARGO_TARGET_DIR={self.target_dir}",
+                    ],
+                )
+                self.assertEqual(result[5:], command)
                 self.assertEqual(
                     invocations[0][invocations[0].index("--profile") + 1],
                     "operator-task",
@@ -167,7 +187,16 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
         script = self.root / "ci.sh"
         script.write_text("#!/bin/sh\ncargo test\n", encoding="utf-8")
         result, _invocations = self._bind(["bash", "ci.sh"])
-        self.assertEqual(result[:2], ["/usr/bin/env", f"CARGO_TARGET_DIR={self.target_dir}"])
+        self.assertEqual(
+            result[:5],
+            [
+                "/usr/bin/flock",
+                "--shared",
+                str(self.lock_path),
+                "/usr/bin/env",
+                f"CARGO_TARGET_DIR={self.target_dir}",
+            ],
+        )
 
     def test_non_cargo_task_is_unchanged(self) -> None:
         command = ["python3", "-c", "print('ok')"]
@@ -187,6 +216,57 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
         self.assertIs(result, command)
         self.assertEqual(invocations, [])
 
+    def test_explicit_managed_target_is_lock_only_wrapped(self) -> None:
+        command = [
+            "/usr/bin/env",
+            f"CARGO_TARGET_DIR={self.target_dir}",
+            "cargo",
+            "test",
+        ]
+        result, invocations = self._bind(command)
+        self.assertEqual(
+            result,
+            [
+                "/usr/bin/flock",
+                "--shared",
+                str(self.lock_path),
+                *command,
+            ],
+        )
+        self.assertEqual(invocations, [])
+
+    def test_explicit_managed_target_flock_wrapper_executes_child(self) -> None:
+        command = [
+            "/usr/bin/env",
+            f"CARGO_TARGET_DIR={self.target_dir}",
+            "/usr/bin/python3",
+            "-c",
+            "import os; assert os.environ['CARGO_TARGET_DIR'] == "
+            + repr(str(self.target_dir)),
+        ]
+        result, invocations = self._bind(command)
+        completed = subprocess.run(result, check=False, capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(invocations, [])
+        self.assertTrue(self.lock_path.is_file())
+
+    def test_shell_embedded_target_override_is_not_misclassified_as_managed(self) -> None:
+        command = ["bash", "-lc", "CARGO_TARGET_DIR=/tmp/caller-target cargo test"]
+        result, invocations = self._bind(command)
+        self.assertIs(result, command)
+        self.assertEqual(invocations, [])
+
+    def test_remote_explicit_managed_target_is_not_locally_locked(self) -> None:
+        command = [
+            "/usr/bin/env",
+            f"CARGO_TARGET_DIR={self.target_dir}",
+            "cargo",
+            "test",
+        ]
+        result, invocations = self._bind(command, transport="ssh")
+        self.assertIs(result, command)
+        self.assertEqual(invocations, [])
+
     def test_remote_and_root_backend_tasks_are_unchanged(self) -> None:
         command = ["cargo", "test"]
         remote, remote_calls = self._bind(command, transport="ssh")
@@ -201,6 +281,7 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
         with (
             patch.object(tasks, "MANAGED_BUILD_RESOLVER", missing),
             patch.object(tasks, "MANAGED_CARGO_CACHE_ROOT", self.cache_root),
+            patch.object(tasks, "MANAGED_CARGO_LOCK_ROOT", self.lock_root),
             patch.object(tasks, "_local_git_root", return_value=self.root),
             patch.dict(os.environ, {"CARGO_TARGET_DIR": ""}, clear=False),
             self.assertRaisesRegex(RuntimeError, "resolver runtime is unavailable"),
@@ -216,6 +297,12 @@ class ManagedCargoTaskEnvironmentTests(unittest.TestCase):
         outside = Path(self.temporary.name) / "outside" / "target"
         payload = self._payload(profile="test", target=outside)
         with self.assertRaisesRegex(RuntimeError, "cache escapes"):
+            self._bind(["cargo", "test"], payload=payload)
+
+    def test_resolver_lifecycle_lock_mismatch_is_rejected(self) -> None:
+        payload = self._payload(profile="test")
+        payload["lifecycle_lock_path"] = "/tmp/wrong-managed-cargo.lock"
+        with self.assertRaisesRegex(RuntimeError, "lifecycle lock binding"):
             self._bind(["cargo", "test"], payload=payload)
 
     def test_task_start_authorizes_before_preparing_managed_environment(self) -> None:
