@@ -524,6 +524,31 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(sources, {"tmux", "processes"})
         self.assertEqual(result["count"], 0)
 
+    def test_pagination_ignores_process_elapsed_time_but_preserves_it_in_output(self) -> None:
+        tasks = [task("task-a", updated=20), task("task-b", updated=10)]
+        first = project(
+            tasks_payload={"tasks": tasks, "pagination": {"has_more": False}},
+            process_payload={
+                "returncode": 0,
+                "lines": ["123 1 S 10 codex codex exec"],
+            },
+            limit=1,
+        )
+        self.assertTrue(first["pagination"]["has_more"])
+        self.assertEqual(first["unbound_physical"]["processes"][0]["elapsed_seconds"], 10)
+        second = project(
+            tasks_payload={"tasks": tasks, "pagination": {"has_more": False}},
+            process_payload={
+                "returncode": 0,
+                "lines": ["123 1 R 11 codex codex exec"],
+            },
+            generated_at_unix=101,
+            limit=1,
+            cursor=first["pagination"]["next_cursor"],
+        )
+        self.assertEqual(first["snapshot_sha256"], second["snapshot_sha256"])
+        self.assertEqual(second["unbound_physical"]["processes"][0]["elapsed_seconds"], 11)
+
     def test_invalid_source_shapes_fail_closed(self) -> None:
         with self.assertRaisesRegex(
             current_work.CurrentWorkProjectionError, "pagination must be an object"
@@ -609,6 +634,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["work_id"], f"task:{task_id}")
         self.assertEqual(group["binding"]["kind"], "task")
         self.assertEqual(group["binding_status"], "lease-bound")
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("task-lifecycle-unresolved-for-live-lease", group["action_reasons"])
         self.assertEqual(group["observation"]["completeness"], "partial")
         self.assertEqual(result["total_projected_scope"], "bounded_source_snapshot")
         self.assertEqual(result["state_counts_scope"], "bounded_source_snapshot")
