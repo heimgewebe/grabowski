@@ -142,6 +142,27 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_audit_query": {
+        "category": "audit",
+        "purpose": "Query bounded safe fields from the fully verified audit segment chain.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_audit_trace": {
+        "category": "audit",
+        "purpose": "Trace one exact audit anchor through bounded one-hop evidence correlations without claiming causality.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_audit_analyze": {
+        "category": "audit",
+        "purpose": "Compute bounded descriptive statistics from the fully verified audit segment chain.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "latest_complete_bundles": {
         "category": "knowledge",
         "purpose": "Read latest RepoGround publications with canonical catalog precedence.",
@@ -687,6 +708,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_task_archive_list": {
+        "category": "task-archive",
+        "purpose": "List immutable task archive segments through a bounded manifest-verified catalog.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_task_archive_read": {
+        "category": "task-archive",
+        "purpose": "Read one fully integrity-verified immutable task archive segment with bounded pagination.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_task_reconcile_check": {
         "category": "task",
         "purpose": "Preview reconcile effects for persistent task records without mutating state.",
@@ -1055,6 +1090,22 @@ TOOL_PROFILES.update(
             "purpose": "Mark one provably inactive stale workspace abandoned without stopping tasks, releasing resources or removing its checkout.",
             "risk_class": "high",
             "effects": ["receipt-create", "workspace-event-append", "audit-append"],
+            "reversibility": "historical-evidence-retained",
+        },
+        "grabowski_agent_workspace_reconcile_idle_tmux": {
+            "category": "agent-workspace",
+            "purpose": (
+                "Remove only the exact non-authoritative idle tmux session from one "
+                "provably inactive stale workspace, then invoke the existing "
+                "non-destructive stale reconciliation."
+            ),
+            "risk_class": "high",
+            "effects": [
+                "audit-append",
+                "receipt-create",
+                "tmux-session-remove",
+                "workspace-event-append",
+            ],
             "reversibility": "historical-evidence-retained",
         },
         "grabowski_agent_workspace_cleanup": {

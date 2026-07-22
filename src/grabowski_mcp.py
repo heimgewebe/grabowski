@@ -39,6 +39,7 @@ from mcp.types import ToolAnnotations
 
 import grabowski_consumer_surface as consumer_surface
 import grabowski_client_snapshot
+import grabowski_lifecycle_read_surface as lifecycle_read_surface
 import grabowski_blockades as blockade_policy
 import grabowski_blockade_store as blockade_store
 
@@ -240,6 +241,9 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_destroy_path": ("file_destroy",),
     "grabowski_rollback_text": ("rollback_text",),
     "grabowski_verify_audit": ("audit_verify",),
+    "grabowski_audit_query": ("audit_verify",),
+    "grabowski_audit_trace": ("audit_verify",),
+    "grabowski_audit_analyze": ("audit_verify",),
     "latest_complete_bundles": ("bundle_registry",),
     "repoground_bundle_discover": ("bundle_registry",),
     "repoground_bundle_status": ("bundle_registry",),
@@ -291,6 +295,12 @@ TOOL_CAPABILITY_REQUIREMENTS = {
         "tmux_interaction",
     ),
     "grabowski_agent_workspace_reconcile_stale": (
+        "durable_job",
+        "git_cli",
+        "resource_lease",
+        "tmux_interaction",
+    ),
+    "grabowski_agent_workspace_reconcile_idle_tmux": (
         "durable_job",
         "git_cli",
         "resource_lease",
@@ -350,6 +360,8 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_task_cancel": ("durable_job",),
     "grabowski_task_resume": ("durable_job",),
     "grabowski_task_list": ("durable_job",),
+    "grabowski_task_archive_list": ("file_read",),
+    "grabowski_task_archive_read": ("file_read",),
     "grabowski_task_reconcile_check": ("durable_job",),
     "grabowski_task_reconcile_refresh": ("durable_job",),
     "grabowski_task_reconcile_resume": ("durable_job",),
@@ -418,6 +430,7 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_agent_workspace_optimize",
     "grabowski_agent_workspace_cleanup_plan",
     "grabowski_agent_workspace_reconcile_stale",
+    "grabowski_agent_workspace_reconcile_idle_tmux",
     "grabowski_agent_workspace_cleanup",
     "grabowski_agent_competition_start",
     "grabowski_agent_competition_status",
@@ -8583,6 +8596,24 @@ def _repoground_budget_context(
     return context, counts, exact_used_bytes
 
 
+_REPOGROUND_PYTHON_CALL_GRAPH_SOURCE = "python_call_graph_json"
+
+
+def _repoground_relation_uses_coherent_source(value: Any, source: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    provenance = value.get("provenance")
+    candidates = [value.get("freshness")]
+    if isinstance(provenance, dict):
+        candidates.append(provenance.get("relation"))
+    return any(
+        isinstance(candidate, dict)
+        and candidate.get("source") == source
+        and candidate.get("status") == "coherent"
+        for candidate in candidates
+    )
+
+
 @mcp.tool(name="repoground_context_compose", annotations=READ_ANNOTATIONS)
 def repoground_context_compose(
     repo: str,
@@ -8702,9 +8733,7 @@ def repoground_context_compose(
     authority_rules = _repoground_authority_rules(preflight)
     gate_evidence = _repoground_gate_evidence(preflight, bundle_status)
     impact_status = str(impact.get("status", "unknown"))
-    source_statuses = _repoground_dict_items(impact.get("source_statuses")) if isinstance(impact, dict) else []
-    symbol_available = any(item.get("source") == "python_symbol_index_json" and item.get("status") == "available" for item in source_statuses)
-    call_graph_available = bool(impact.get("relations")) if isinstance(impact, dict) else False
+    causal_relations = _repoground_dict_items(impact.get("relations")) if isinstance(impact, dict) else []
 
     edit_context = impact.get("edit_context") if isinstance(impact, dict) and isinstance(impact.get("edit_context"), dict) else {}
     lane_values: dict[str, list[Any]] = {
@@ -8715,7 +8744,7 @@ def repoground_context_compose(
         "entry_manifest": [surfaces["agent_entry_manifest"]] if "agent_entry_manifest" in surfaces else [],
         "pr_delta_cards": [surfaces["pr_delta_cards_jsonl"]] if "pr_delta_cards_jsonl" in surfaces else [],
         "target_symbols": _repoground_dict_items(impact.get("target_symbols")) if isinstance(impact, dict) else [],
-        "causal_relations": _repoground_dict_items(impact.get("relations")) if isinstance(impact, dict) else [],
+        "causal_relations": causal_relations,
         "live_ranges": _repoground_dict_items(evidence.get("ranges")),
         "citations": [{"citation_id": item} for item in evidence.get("citation_ids", []) if isinstance(item, str)] if isinstance(evidence.get("citation_ids"), list) else [],
         "gaps": _repoground_dict_items(impact.get("gaps")) if isinstance(impact, dict) else [],
@@ -8737,17 +8766,23 @@ def repoground_context_compose(
         used.append("agent_impact")
     if effective_query and baseline.get("available"):
         used.append("query_context")
-    if symbol_available:
+    if context.get("target_symbols"):
         used.append("symbol_navigation")
-    if call_graph_available:
+    call_graph_used = any(
+        _repoground_relation_uses_coherent_source(
+            relation, _REPOGROUND_PYTHON_CALL_GRAPH_SOURCE
+        )
+        for relation in _repoground_dict_items(context.get("causal_relations"))
+    )
+    if call_graph_used:
         used.append("call_graph")
-    if "citation_map_jsonl" in surfaces or context.get("citations"):
+    if context.get("citations"):
         used.append("citation")
     if context.get("live_ranges"):
         used.append("live_evidence")
-    if "agent_entry_manifest" in surfaces:
+    if context.get("entry_manifest"):
         used.append("entry_manifest")
-    if "pr_delta_cards_jsonl" in surfaces:
+    if context.get("pr_delta_cards"):
         used.append("pr_delta_cards")
     all_lanes = ["direct_changes", "agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "symbol_navigation", "call_graph", "citation", "live_evidence"]
     skipped = [name for name in all_lanes if name not in used]
@@ -9157,6 +9192,42 @@ def grip_run(
         dispatch_parameters,
         profile=profile,
         allow_mutation=allow_mutation,
+    )
+
+
+@mcp.tool(name="grabowski_task_archive_list", annotations=READ_ANNOTATIONS)
+def grabowski_task_archive_list(
+    limit: int = 20,
+    cursor: str | None = None,
+    view: str = "minimal",
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """List immutable task archive segments through a bounded verified catalog."""
+    _require_capability("file_read")
+    return lifecycle_read_surface.task_archive_list(
+        limit=limit,
+        cursor=cursor,
+        view=view,
+        fields=fields,
+    )
+
+
+@mcp.tool(name="grabowski_task_archive_read", annotations=READ_ANNOTATIONS)
+def grabowski_task_archive_read(
+    segment_id: str,
+    limit: int = 20,
+    cursor: str | None = None,
+    view: str = "standard",
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Read one fully verified immutable task archive segment with pagination."""
+    _require_capability("file_read")
+    return lifecycle_read_surface.task_archive_read(
+        segment_id,
+        limit=limit,
+        cursor=cursor,
+        view=view,
+        fields=fields,
     )
 
 

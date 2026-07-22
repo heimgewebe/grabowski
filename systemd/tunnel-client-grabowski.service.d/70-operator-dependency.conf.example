@@ -1,3 +1,5 @@
 [Unit]
+# Follow operator stop/restart propagation without a hard failure coupling.
 Wants=grabowski-operator.service
 After=grabowski-operator.service
+PartOf=grabowski-operator.service

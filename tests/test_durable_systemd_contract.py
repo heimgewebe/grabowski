@@ -30,7 +30,7 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("--service tunnel-client-grabowski.service", tunnel)
         self.assertNotIn("grabowski-operator.service", tunnel)
 
-    def test_tunnel_dependency_is_non_binding(self) -> None:
+    def test_tunnel_restart_follows_operator_without_failure_binding(self) -> None:
         text = (
             ROOT
             / "systemd"
@@ -39,8 +39,8 @@ class DurableSystemdContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("Wants=grabowski-operator.service", text)
         self.assertIn("After=grabowski-operator.service", text)
+        self.assertIn("PartOf=grabowski-operator.service", text)
         self.assertNotIn("BindsTo=", text)
-        self.assertNotIn("PartOf=", text)
 
     def test_watchdog_cadence_matches_probe_cost(self) -> None:
         operator = (
@@ -89,6 +89,27 @@ class DurableSystemdContractTests(unittest.TestCase):
             self.assertNotIn("RestartSteps", "".join(
                 line for line in text.splitlines() if not line.startswith("#")
             ))
+
+    def test_runtime_retention_timer_uses_release_bound_hash_guarded_tool(self) -> None:
+        service = (
+            ROOT / "systemd" / "grabowski-runtime-retention.service.example"
+        ).read_text(encoding="utf-8")
+        timer = (
+            ROOT / "systemd" / "grabowski-runtime-retention.timer.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "%h/.local/share/grabowski-mcp/tools/maintain_runtime_state.py",
+            service,
+        )
+        self.assertIn("--periodic-apply", service)
+        self.assertIn("ProtectSystem=strict", service)
+        self.assertIn("ProtectHome=read-only", service)
+        self.assertIn("ReadWritePaths=%h/.local/state/grabowski", service)
+        self.assertNotIn("PrivateDevices=", service)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX", service)
+        self.assertIn("OnUnitActiveSec=5min", timer)
+        self.assertIn("RandomizedDelaySec=30s", timer)
+        self.assertIn("Persistent=true", timer)
 
 
 if __name__ == "__main__":

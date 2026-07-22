@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -31,10 +32,16 @@ DEFAULT_TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 DEFAULT_MCP_URL = "http://127.0.0.1:18181/_grabowski/mcp-liveness"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:18080/healthz"
 DEFAULT_READY_URL = "http://127.0.0.1:18080/readyz"
+DEFAULT_METRICS_URL = "http://127.0.0.1:18080/metrics"
+DEFAULT_CONTROL_PLANE_POLL_MAX_AGE = 90.0
+TUNNEL_METRICS_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+CONTROL_PLANE_POLL_METRIC = "commands_poll_last_successful_timestamp_seconds"
 PROTOCOL_VERSION = "2025-06-18"
 MCP_HEALTH_TOOL = "grabowski_runtime_health"
 MCP_MAX_RESPONSE_BYTES = 65536
 MCP_STDIO_SHUTDOWN_TIMEOUT = 2.0
+CONNECTOR_SNAPSHOT_REFRESH_MAX_OUTPUT_BYTES = 64 * 1024
+CONNECTOR_SNAPSHOT_REFRESH_TIMEOUT_SECONDS = 8.0
 STACK_DUMP_DIRECTORY_NAME = "operator-stackdumps-v1"
 STACK_DUMP_SLOT_COUNT = 8
 STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
@@ -228,6 +235,74 @@ def get_probe(url: str, expected_body: str, timeout: float) -> bool:
         return False
     finally:
         connection.close()
+
+
+def get_bounded_text(url: str, timeout: float, max_bytes: int) -> str | None:
+    if max_bytes < 1:
+        raise WatchdogError("invalid-http-response-limit")
+    host, port, path = loopback_http_url(url)
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        connection.request("GET", path, headers={"Connection": "close"})
+        response = connection.getresponse()
+        body = response.read(max_bytes + 1)
+        if response.status != 200 or len(body) > max_bytes:
+            return None
+        return body.decode("utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError, http.client.HTTPException):
+        return None
+    finally:
+        connection.close()
+
+
+def prometheus_metric_samples(text: str, metric_name: str) -> tuple[float, ...]:
+    if not metric_name or any(char.isspace() for char in metric_name):
+        raise WatchdogError("invalid-prometheus-metric-name")
+    values: list[float] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        token = parts[0]
+        if token != metric_name and not token.startswith(metric_name + "{"):
+            continue
+        try:
+            value = float(parts[1])
+        except ValueError:
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return tuple(values)
+
+
+def control_plane_poll_probe(
+    metrics_url: str,
+    timeout: float,
+    max_age_seconds: float,
+    *,
+    now: float | None = None,
+) -> str | None:
+    if max_age_seconds <= 0:
+        raise WatchdogError("invalid-control-plane-poll-max-age")
+    text = get_bounded_text(
+        metrics_url, timeout, TUNNEL_METRICS_MAX_RESPONSE_BYTES
+    )
+    if text is None:
+        return "control-plane-metrics-unavailable"
+    samples = prometheus_metric_samples(text, CONTROL_PLANE_POLL_METRIC)
+    if not samples:
+        return "control-plane-poll-missing"
+    observed = max(samples)
+    current = time.time() if now is None else now
+    age = current - observed
+    if age < -max_age_seconds:
+        return "control-plane-poll-timestamp-invalid"
+    if age > max_age_seconds:
+        return "control-plane-poll-stale"
+    return None
 
 
 class McpProbeFailure(Exception):
@@ -557,6 +632,8 @@ def probe_component(
     startup_grace: float,
     http_timeout: float,
     mcp_url: str = DEFAULT_MCP_URL,
+    metrics_url: str = DEFAULT_METRICS_URL,
+    control_plane_poll_max_age: float = DEFAULT_CONTROL_PLANE_POLL_MAX_AGE,
     proc_root: Path = Path("/proc"),
 ) -> ProbeResult:
     try:
@@ -618,6 +695,20 @@ def probe_component(
                 reasons.append("health-failed")
             if not get_probe(ready_url, "ready", http_timeout):
                 reasons.append("readiness-failed")
+            poll_failure = control_plane_poll_probe(
+                metrics_url, http_timeout, control_plane_poll_max_age
+            )
+            if poll_failure in {
+                "control-plane-metrics-unavailable",
+                "control-plane-poll-missing",
+                "control-plane-poll-stale",
+                "control-plane-poll-timestamp-invalid",
+            } and not reasons:
+                return ProbeResult(
+                    "indeterminate", (poll_failure,), pid, age, start_ticks
+                )
+            if poll_failure is not None:
+                reasons.append(poll_failure)
         except WatchdogError as exc:
             return ProbeResult("indeterminate", (str(exc),), pid, age, start_ticks)
     else:
@@ -1200,6 +1291,121 @@ def request_python_stack_dump(
         os.close(pidfd)
 
 
+def refresh_connector_snapshot_from_runtime(
+    *,
+    runtime_root: Path,
+    host: str,
+    port: int,
+    connector_pid: int,
+    connector_start_ticks: int,
+    timeout_seconds: float = CONNECTOR_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    """Refresh snapshot evidence without making snapshot failure a tunnel restart signal."""
+    try:
+        root = runtime_root.expanduser().resolve(strict=True)
+    except OSError:
+        return {"state": "error", "reason": "runtime-root-unavailable"}
+    executable = root / ".venv/bin/python"
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        return {"state": "error", "reason": "runtime-python-unavailable"}
+    if connector_pid <= 0 or connector_start_ticks < 0:
+        return {"state": "error", "reason": "connector-process-identity-unavailable"}
+    mcp_url = f"http://{host}:{port}/mcp"
+    child_environment = os.environ.copy()
+    child_environment.pop("PYTHONHOME", None)
+    child_environment.pop("PYTHONPATH", None)
+    child_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    child_environment["PYTHONNOUSERSITE"] = "1"
+    command = [
+        str(executable),
+        "-I",
+        "-m",
+        "grabowski_client_snapshot",
+        "refresh-if-needed",
+        "--runtime-root",
+        str(root),
+        "--mcp-url",
+        mcp_url,
+        "--connector-pid",
+        str(connector_pid),
+        "--connector-start-ticks",
+        str(connector_start_ticks),
+        "--timeout-seconds",
+        str(timeout_seconds),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(root),
+            env=child_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=max(1.0, timeout_seconds + 2.0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"state": "error", "reason": "snapshot-refresh-process-failed"}
+    encoded = completed.stdout.encode("utf-8", errors="replace")
+    if len(encoded) > CONNECTOR_SNAPSHOT_REFRESH_MAX_OUTPUT_BYTES:
+        return {"state": "error", "reason": "snapshot-refresh-output-too-large"}
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        return {"state": "error", "reason": "snapshot-refresh-output-missing"}
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return {"state": "error", "reason": "snapshot-refresh-output-invalid"}
+    if not isinstance(payload, dict):
+        return {"state": "error", "reason": "snapshot-refresh-output-invalid"}
+    state = payload.get("state")
+    if completed.returncode != 0 or state not in {"not_due", "renewed"}:
+        reason = payload.get("reason")
+        return {
+            "state": "error",
+            "reason": reason if isinstance(reason, str) and len(reason) <= 256 else "snapshot-refresh-failed",
+        }
+    allowed = {
+        key: payload[key]
+        for key in (
+            "state",
+            "reason",
+            "tool_count",
+            "names_sha256",
+            "release_id",
+            "receipt_sha256",
+            "session_id_sha256",
+        )
+        if key in payload
+    }
+    return allowed
+
+
+def _emit_connector_snapshot_refresh(
+    args: argparse.Namespace,
+    probe: ProbeResult,
+) -> None:
+    if (
+        args.component != "tunnel"
+        or args.check_only
+        or probe.pid is None
+        or probe.start_ticks is None
+    ):
+        return
+    result = refresh_connector_snapshot_from_runtime(
+        runtime_root=args.runtime_root,
+        host=args.host,
+        port=args.port,
+        connector_pid=probe.pid,
+        connector_start_ticks=probe.start_ticks,
+    )
+    emit(
+        "grabowski.connector_snapshot.refresh",
+        component=args.component,
+        service=args.service,
+        **result,
+    )
+
+
 def restart_service(service: str) -> None:
     try:
         subprocess.run(
@@ -1251,6 +1457,8 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 startup_grace=args.startup_grace,
                 http_timeout=args.http_timeout,
                 mcp_url=args.mcp_url,
+                metrics_url=args.metrics_url,
+                control_plane_poll_max_age=args.control_plane_poll_max_age,
             )
             state = load_state(state_path)
             common = {
@@ -1262,6 +1470,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
             }
 
             if probe.status == "healthy":
+                _emit_connector_snapshot_refresh(args, probe)
                 state = reset_after_healthy(
                     state,
                     now=int(time.time()),
@@ -1367,8 +1576,11 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     startup_grace=0,
                     http_timeout=args.http_timeout,
                     mcp_url=args.mcp_url,
+                    metrics_url=args.metrics_url,
+                    control_plane_poll_max_age=args.control_plane_poll_max_age,
                 )
                 if final_probe.status == "healthy":
+                    _emit_connector_snapshot_refresh(args, final_probe)
                     recovered_state = reset_after_healthy(
                         next_state,
                         now=int(time.time()),
@@ -1415,6 +1627,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--mcp-url", default=None, help=argparse.SUPPRESS)
     result.add_argument("--health-url", default=DEFAULT_HEALTH_URL)
     result.add_argument("--ready-url", default=DEFAULT_READY_URL)
+    result.add_argument("--metrics-url", default=DEFAULT_METRICS_URL)
+    result.add_argument(
+        "--control-plane-poll-max-age",
+        type=float,
+        default=DEFAULT_CONTROL_PLANE_POLL_MAX_AGE,
+    )
     result.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     result.add_argument("--failure-threshold", type=int, default=3)
     result.add_argument("--max-restarts", type=int, default=3)
@@ -1437,6 +1655,9 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         )
     if args.host != "127.0.0.1" or not 1024 <= args.port <= 65535:
         raise WatchdogError("invalid-operator-listener")
+    if args.control_plane_poll_max_age <= 0:
+        raise WatchdogError("invalid-control-plane-poll-max-age")
+    loopback_http_url(args.metrics_url)
     if args.mcp_url is None:
         args.mcp_url = (
             f"http://{args.host}:{args.port}/_grabowski/mcp-liveness"

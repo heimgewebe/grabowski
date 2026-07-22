@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "b7757445e200ed2d845a9cc4fe13987fc6f7787f1e0b1e7662a4d31e072b7311"
+    "sha256": "c822b22e56391d43d4a0afdaac5dd34b44a6438c0cf2e9f15755412432fbb6b7"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "5d7a1a235e62a021c9bda68a13df39b95c6075dc3be5e48b881c1e25212273eb"
+    "sha256": "44bd3a9eda0078a0c31d0d77a96f4ea4740c19c5ba98a28935eac017fdb9eb14"
   },
   "counts": {
     "core": 22,
-    "full": 155,
-    "operator": 140
+    "full": 161,
+    "operator": 146
   },
   "profiles": {
     "core": [
@@ -57,6 +57,9 @@
       "grabowski_destroy_path",
       "grabowski_rollback_text",
       "grabowski_verify_audit",
+      "grabowski_audit_query",
+      "grabowski_audit_trace",
+      "grabowski_audit_analyze",
       "latest_complete_bundles",
       "repoground_bundle_discover",
       "repoground_bundle_status",
@@ -184,6 +187,7 @@
       "grabowski_agent_workspace_optimize",
       "grabowski_agent_workspace_cleanup_plan",
       "grabowski_agent_workspace_reconcile_stale",
+      "grabowski_agent_workspace_reconcile_idle_tmux",
       "grabowski_agent_workspace_cleanup",
       "grabowski_agent_execution_route",
       "grabowski_coding_agent_catalog",
@@ -192,7 +196,9 @@
       "grabowski_agent_competition_status",
       "grabowski_agent_competition_compare",
       "grabowski_agent_bootstrap",
-      "grabowski_call_shape_check"
+      "grabowski_call_shape_check",
+      "grabowski_task_archive_list",
+      "grabowski_task_archive_read"
     ],
     "operator": [
       "grabowski_status",
@@ -213,6 +219,9 @@
       "grabowski_restore_removed_path",
       "grabowski_destroy_path",
       "grabowski_rollback_text",
+      "grabowski_audit_query",
+      "grabowski_audit_trace",
+      "grabowski_audit_analyze",
       "latest_complete_bundles",
       "repoground_bundle_discover",
       "repoground_bundle_status",
@@ -326,6 +335,7 @@
       "grabowski_agent_workspace_optimize",
       "grabowski_agent_workspace_cleanup_plan",
       "grabowski_agent_workspace_reconcile_stale",
+      "grabowski_agent_workspace_reconcile_idle_tmux",
       "grabowski_agent_workspace_cleanup",
       "grabowski_agent_execution_route",
       "grabowski_coding_agent_catalog",
@@ -334,7 +344,9 @@
       "grabowski_agent_competition_status",
       "grabowski_agent_competition_compare",
       "grabowski_agent_bootstrap",
-      "grabowski_call_shape_check"
+      "grabowski_call_shape_check",
+      "grabowski_task_archive_list",
+      "grabowski_task_archive_read"
     ]
   },
   "registration": {

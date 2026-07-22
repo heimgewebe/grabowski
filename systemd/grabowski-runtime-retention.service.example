@@ -1,0 +1,24 @@
+[Unit]
+Description=Apply bounded Grabowski runtime retention
+After=default.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python %h/.local/share/grabowski-mcp/tools/maintain_runtime_state.py --periodic-apply --minimum-job-age-seconds 86400 --max-archive-jobs 128
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# PrivateDevices requires capability operations unavailable to this unprivileged systemd --user manager.
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=%h/.local/state/grabowski
+UMask=0077
+MemoryMax=512M
+TasksMax=50
+TimeoutStartSec=180s

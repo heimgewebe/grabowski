@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "3a5d5b816ad4b781584f4f469ceedf752853ddf1145397ac27a329f459b347a1",
+  "capability_source_sha256": "e4a759a5baa3febed83be566f0eca0d123abaf6302a72d608485ac89b0403321",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "b7757445e200ed2d845a9cc4fe13987fc6f7787f1e0b1e7662a4d31e072b7311",
+  "contract_sha256": "c822b22e56391d43d4a0afdaac5dd34b44a6438c0cf2e9f15755412432fbb6b7",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -251,6 +251,39 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_verify_audit"
+    },
+    {
+      "category": "audit",
+      "description": "Query the verified audit chain through a bounded evidence projection.",
+      "effects": [],
+      "id": "grabowski_audit_query",
+      "purpose": "Query bounded safe fields from the fully verified audit segment chain.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_query"
+    },
+    {
+      "category": "audit",
+      "description": "Trace one audit anchor through bounded one-hop correlations.",
+      "effects": [],
+      "id": "grabowski_audit_trace",
+      "purpose": "Trace one exact audit anchor through bounded one-hop evidence correlations without claiming causality.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_trace"
+    },
+    {
+      "category": "audit",
+      "description": "Compute bounded descriptive statistics from the verified audit chain.",
+      "effects": [],
+      "id": "grabowski_audit_analyze",
+      "purpose": "Compute bounded descriptive statistics from the fully verified audit segment chain.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_analyze"
     },
     {
       "category": "knowledge",
@@ -1879,6 +1912,22 @@
     },
     {
       "category": "agent-workspace",
+      "description": "Remove one exact non-authoritative idle tmux session, then stale-reconcile the workspace.",
+      "effects": [
+        "audit-append",
+        "receipt-create",
+        "tmux-session-remove",
+        "workspace-event-append"
+      ],
+      "id": "grabowski_agent_workspace_reconcile_idle_tmux",
+      "purpose": "Remove only the exact non-authoritative idle tmux session from one provably inactive stale workspace, then invoke the existing non-destructive stale reconciliation.",
+      "read_only": false,
+      "reversibility": "historical-evidence-retained",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_reconcile_idle_tmux"
+    },
+    {
+      "category": "agent-workspace",
       "description": "Archive and remove one eligible closed writer checkout while preserving all workspace evidence.",
       "effects": [
         "checkout-archive",
@@ -1986,6 +2035,28 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_call_shape_check"
+    },
+    {
+      "category": "task-archive",
+      "description": "List immutable task archive segments through a bounded verified catalog.",
+      "effects": [],
+      "id": "grabowski_task_archive_list",
+      "purpose": "List immutable task archive segments through a bounded manifest-verified catalog.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_archive_list"
+    },
+    {
+      "category": "task-archive",
+      "description": "Read one fully verified immutable task archive segment with pagination.",
+      "effects": [],
+      "id": "grabowski_task_archive_read",
+      "purpose": "Read one fully integrity-verified immutable task archive segment with bounded pagination.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_archive_read"
     }
   ]
 }

@@ -11,12 +11,14 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 
 try:
     import pr_review_gate as gate
+    import review_evidence_schemas as evidence_schemas
 except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
     from tools import pr_review_gate as gate
+    from tools import review_evidence_schemas as evidence_schemas
 
 
 SCHEMA_VERSION = 1
@@ -28,33 +30,13 @@ COMMENT_PREFIX = "/grabowski-review-evidence v1"
 MAX_AUDIT_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 16 * 1024
 MAX_STATUS_B64_BYTES = 32 * 1024
+COMMAND_TIMEOUT_SECONDS = 30
 ALLOWED_WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write", "push"})
-REVIEW_TIER_RANK = {
-    "documentation": 1,
-    "very_small": 1,
-    "standard": 2,
-    "important_repo": 3,
-    "high_critical": 4,
-}
-STATUS_FIELDS = frozenset(
-    {
-        "schema_version",
-        "kind",
-        "repo",
-        "pr",
-        "head_sha",
-        "diff_sha256",
-        "audit_sha256",
-        "gate_verdict",
-        "self_review_gate_valid",
-        "all_findings_triaged",
-        "material_findings_remaining",
-        "minimum_review_iterations",
-        "actual_review_iterations",
-        "review_tier",
-        "tuning_signal",
-    }
-)
+REVIEW_TIER_RANK = evidence_schemas.REVIEW_TIER_RANK
+COMMENT_STATE_CURRENT = "current"
+COMMENT_STATE_SUPERSEDED = "superseded"
+COMMENT_STATE_STALE = "stale_or_edited"
+COMMENT_STATE_OUTSIDE_WINDOW = "outside_bounded_window"
 COMMENT_RE = re.compile(
     rf"\A{re.escape(COMMENT_PREFIX)}(?:\s+(?P<payload>[A-Za-z0-9+/=]+))?\s*\Z"
 )
@@ -92,39 +74,32 @@ def _normalize_sha256(value: Any) -> str | None:
     return normalized if SHA256_RE.fullmatch(normalized) else None
 
 
-def _required_audit_failures(audit: Any) -> list[str]:
-    if not isinstance(audit, dict):
-        return ["audit must be a JSON object"]
+def _prefixed_schema_failures(payload: Any, *, label: str, prefix: str) -> list[str]:
+    return [
+        f"{prefix} {failure}"
+        for failure in evidence_schemas.validate_evidence(payload, label=label)
+    ]
 
-    failures: list[str] = []
-    if audit.get("schema_version") != 1 or isinstance(audit.get("schema_version"), bool):
-        failures.append("audit schema_version must be integer 1")
-    if audit.get("kind") != AUDIT_KIND:
-        failures.append(f"audit kind must be {AUDIT_KIND}")
+
+def _required_audit_failures(audit: Any) -> list[str]:
+    failures = _prefixed_schema_failures(
+        audit, label="self-review audit", prefix="audit"
+    )
+    if not isinstance(audit, dict):
+        return failures
     if _normalize_repo(audit.get("repo")) is None:
         failures.append("audit repo is invalid")
-    if not _is_int(audit.get("pr")) or audit["pr"] <= 0:
-        failures.append("audit pr must be a positive integer")
     if _normalize_git_sha(audit.get("head_sha")) is None:
         failures.append("audit head_sha is invalid")
+    if _normalize_git_sha(audit.get("base_sha")) is None:
+        failures.append("audit base_sha is invalid")
     if _normalize_sha256(audit.get("diff_sha256")) is None:
         failures.append("audit diff_sha256 is invalid")
-    if audit.get("gate_verdict") not in {"PASS", "BLOCK"}:
-        failures.append("audit gate_verdict is invalid")
-    if not isinstance(audit.get("self_review_gate_valid"), bool):
-        failures.append("audit self_review_gate_valid must be boolean")
-    if not isinstance(audit.get("all_findings_triaged"), bool):
-        failures.append("audit all_findings_triaged must be boolean")
-    if not _is_int(audit.get("material_findings_remaining")) or audit["material_findings_remaining"] < 0:
+    if (
+        not _is_int(audit.get("material_findings_remaining"))
+        or audit.get("material_findings_remaining", -1) < 0
+    ):
         failures.append("audit material_findings_remaining must be an integer >= 0")
-    for field in ("minimum_review_iterations", "actual_review_iterations"):
-        value = audit.get(field)
-        if not _is_int(value) or value < 0:
-            failures.append(f"audit {field} must be an integer >= 0")
-    if audit.get("review_tier") not in REVIEW_TIER_RANK:
-        failures.append("audit review_tier is invalid")
-    if audit.get("tuning_signal") not in {"observe", "increase_depth", "repair_evidence"}:
-        failures.append("audit tuning_signal is invalid")
     return failures
 
 
@@ -146,8 +121,10 @@ def build_status_projection(audit_bytes: bytes) -> dict[str, Any]:
         "repo": _normalize_repo(audit["repo"]),
         "pr": audit["pr"],
         "head_sha": _normalize_git_sha(audit["head_sha"]),
+        "base_sha": _normalize_git_sha(audit["base_sha"]),
         "diff_sha256": _normalize_sha256(audit["diff_sha256"]),
         "audit_sha256": hashlib.sha256(audit_bytes).hexdigest(),
+        "review_policy_version": audit["review_policy_version"],
         "gate_verdict": audit["gate_verdict"],
         "self_review_gate_valid": audit["self_review_gate_valid"],
         "all_findings_triaged": audit["all_findings_triaged"],
@@ -160,7 +137,9 @@ def build_status_projection(audit_bytes: bytes) -> dict[str, Any]:
 
 
 def canonical_status_bytes(status: dict[str, Any]) -> bytes:
-    return (json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    return (json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
 
 
 def encode_status_projection(status: dict[str, Any]) -> str:
@@ -168,46 +147,20 @@ def encode_status_projection(status: dict[str, Any]) -> str:
 
 
 def _status_schema_failures(status: Any) -> list[str]:
+    failures = _prefixed_schema_failures(
+        status, label="review gate status", prefix="status evidence"
+    )
     if not isinstance(status, dict):
-        return ["status evidence must be a JSON object"]
-
-    failures: list[str] = []
-    keys = set(status)
-    missing = sorted(STATUS_FIELDS - keys)
-    unknown = sorted(keys - STATUS_FIELDS)
-    if missing:
-        failures.append("status evidence missing field(s): " + ", ".join(missing))
-    if unknown:
-        failures.append("status evidence has unknown field(s): " + ", ".join(unknown))
-    if status.get("schema_version") != 1 or isinstance(status.get("schema_version"), bool):
-        failures.append("status evidence schema_version must be integer 1")
-    if status.get("kind") != STATUS_KIND:
-        failures.append(f"status evidence kind must be {STATUS_KIND}")
+        return failures
     if _normalize_repo(status.get("repo")) is None:
         failures.append("status evidence repo is invalid")
-    if not _is_int(status.get("pr")) or status.get("pr", 0) <= 0:
-        failures.append("status evidence pr must be a positive integer")
     if _normalize_git_sha(status.get("head_sha")) is None:
         failures.append("status evidence head_sha is invalid")
+    if _normalize_git_sha(status.get("base_sha")) is None:
+        failures.append("status evidence base_sha is invalid")
     for field in ("diff_sha256", "audit_sha256"):
         if _normalize_sha256(status.get(field)) is None:
             failures.append(f"status evidence {field} is invalid")
-    if status.get("gate_verdict") not in {"PASS", "BLOCK"}:
-        failures.append("status evidence gate_verdict is invalid")
-    if not isinstance(status.get("self_review_gate_valid"), bool):
-        failures.append("status evidence self_review_gate_valid must be boolean")
-    if not isinstance(status.get("all_findings_triaged"), bool):
-        failures.append("status evidence all_findings_triaged must be boolean")
-    if not _is_int(status.get("material_findings_remaining")) or status.get("material_findings_remaining", -1) < 0:
-        failures.append("status evidence material_findings_remaining must be an integer >= 0")
-    for field in ("minimum_review_iterations", "actual_review_iterations"):
-        value = status.get(field)
-        if not _is_int(value) or value < 0:
-            failures.append(f"status evidence {field} must be an integer >= 0")
-    if status.get("review_tier") not in REVIEW_TIER_RANK:
-        failures.append("status evidence review_tier is invalid")
-    if status.get("tuning_signal") not in {"observe", "increase_depth", "repair_evidence"}:
-        failures.append("status evidence tuning_signal is invalid")
     return failures
 
 
@@ -215,14 +168,22 @@ def decode_status_projection(raw: str) -> dict[str, Any]:
     normalized = raw.strip()
     if not normalized:
         raise CiEvidenceError("status evidence is missing")
-    if len(normalized.encode("ascii", errors="ignore")) > MAX_STATUS_B64_BYTES:
-        raise CiEvidenceError(f"status evidence exceeds {MAX_STATUS_B64_BYTES} base64 bytes")
+    try:
+        normalized_size = len(normalized.encode("ascii"))
+    except UnicodeEncodeError as exc:
+        raise CiEvidenceError("status evidence is not valid base64") from exc
+    if normalized_size > MAX_STATUS_B64_BYTES:
+        raise CiEvidenceError(
+            f"status evidence exceeds {MAX_STATUS_B64_BYTES} base64 bytes"
+        )
     try:
         decoded = base64.b64decode(normalized, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise CiEvidenceError("status evidence is not valid base64") from exc
     if len(decoded) > MAX_STATUS_BYTES:
-        raise CiEvidenceError(f"decoded status evidence exceeds {MAX_STATUS_BYTES} bytes")
+        raise CiEvidenceError(
+            f"decoded status evidence exceeds {MAX_STATUS_BYTES} bytes"
+        )
     try:
         status = json.loads(decoded.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -244,7 +205,15 @@ def parse_comment_status(body: str) -> dict[str, Any]:
 
 
 def permission_allows_publish(permission: Any) -> bool:
-    return isinstance(permission, str) and permission.strip().lower() in ALLOWED_WRITE_PERMISSIONS
+    return (
+        isinstance(permission, str)
+        and permission.strip().lower() in ALLOWED_WRITE_PERMISSIONS
+    )
+
+
+def _is_review_command(body: str) -> bool:
+    stripped = body.strip()
+    return stripped == COMMENT_PREFIX or stripped.startswith(COMMENT_PREFIX + " ")
 
 
 def _comment_identity(comment: Any) -> tuple[int, str, str] | None:
@@ -267,7 +236,7 @@ def _comment_identity(comment: Any) -> tuple[int, str, str] | None:
 def select_latest_authorized_command_comment_id(
     comments: list[Any],
     *,
-    permission_lookup,
+    permission_lookup: Callable[[str], Any],
 ) -> int | None:
     candidates: list[tuple[int, str]] = []
     for comment in comments:
@@ -275,7 +244,7 @@ def select_latest_authorized_command_comment_id(
         if identity is None:
             continue
         comment_id, actor, body = identity
-        if not body.lstrip().startswith("/grabowski-review-evidence"):
+        if not _is_review_command(body):
             continue
         candidates.append((comment_id, actor))
 
@@ -285,13 +254,13 @@ def select_latest_authorized_command_comment_id(
     return None
 
 
-def command_comment_is_current_and_latest_authorized(
+def command_comment_authorization_state(
     comments: list[Any],
     *,
     current_comment_id: int,
     current_comment_body: str,
-    permission_lookup,
-) -> bool:
+    permission_lookup: Callable[[str], Any],
+) -> str:
     current_body: str | None = None
     for comment in comments:
         identity = _comment_identity(comment)
@@ -301,13 +270,33 @@ def command_comment_is_current_and_latest_authorized(
         if comment_id == current_comment_id:
             current_body = body
             break
-    if current_body is None or current_body != current_comment_body:
-        return False
+    if current_body is None:
+        return COMMENT_STATE_OUTSIDE_WINDOW
+    if current_body != current_comment_body:
+        return COMMENT_STATE_STALE
+    latest = select_latest_authorized_command_comment_id(
+        comments, permission_lookup=permission_lookup
+    )
+    if latest == current_comment_id:
+        return COMMENT_STATE_CURRENT
+    return COMMENT_STATE_SUPERSEDED
+
+
+def command_comment_is_current_and_latest_authorized(
+    comments: list[Any],
+    *,
+    current_comment_id: int,
+    current_comment_body: str,
+    permission_lookup: Callable[[str], Any],
+) -> bool:
     return (
-        select_latest_authorized_command_comment_id(
-            comments, permission_lookup=permission_lookup
+        command_comment_authorization_state(
+            comments,
+            current_comment_id=current_comment_id,
+            current_comment_body=current_comment_body,
+            permission_lookup=permission_lookup,
         )
-        == current_comment_id
+        == COMMENT_STATE_CURRENT
     )
 
 
@@ -325,6 +314,7 @@ def evaluate_status_projection(
 
     current_repo = _normalize_repo(repo_name)
     current_head = _normalize_git_sha(pr.get("headRefOid"))
+    current_base = _normalize_git_sha(pr.get("baseRefOid"))
     current_diff = _normalize_sha256(diff_sha256)
     if pr.get("state") != "OPEN":
         failures.append("PR is not open")
@@ -336,8 +326,12 @@ def evaluate_status_projection(
         failures.append("status evidence PR number mismatch")
     if _normalize_git_sha(status.get("head_sha")) != current_head:
         failures.append("status evidence head_sha mismatch")
+    if _normalize_git_sha(status.get("base_sha")) != current_base:
+        failures.append("status evidence base_sha mismatch")
     if _normalize_sha256(status.get("diff_sha256")) != current_diff:
         failures.append("status evidence diff_sha256 mismatch")
+    if status.get("review_policy_version") != evidence_schemas.REVIEW_POLICY_VERSION:
+        failures.append("status evidence review policy version is stale or invalid")
     if status.get("gate_verdict") != "PASS":
         failures.append("status evidence gate_verdict is not PASS")
     if status.get("self_review_gate_valid") is not True:
@@ -346,7 +340,9 @@ def evaluate_status_projection(
         failures.append("status evidence all_findings_triaged is not true")
     if status.get("material_findings_remaining") != 0:
         failures.append("status evidence has material findings remaining")
-    if status.get("actual_review_iterations", -1) < status.get("minimum_review_iterations", 0):
+    if status.get("actual_review_iterations", -1) < status.get(
+        "minimum_review_iterations", 0
+    ):
         failures.append("status evidence review depth is insufficient")
 
     current_minimum = complexity.get("minimum_self_review_iterations")
@@ -366,33 +362,55 @@ def evaluate_status_projection(
     return failures
 
 
+def _command_label(argv: list[str]) -> str:
+    return " ".join(argv[:3])
+
+
 def _run_json(argv: list[str], *, stdin: bytes | None = None) -> Any:
-    result = subprocess.run(
-        argv,
-        input=stdin,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            argv,
+            input=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CiEvidenceError(
+            f"command timed out after {COMMAND_TIMEOUT_SECONDS}s: {_command_label(argv)}"
+        ) from exc
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise CiEvidenceError(f"command failed: {' '.join(argv[:3])}: {detail[:500]}")
+        raise CiEvidenceError(
+            f"command failed: {_command_label(argv)}: {detail[:500]}"
+        )
     try:
         return json.loads(result.stdout.decode("utf-8"))
     except json.JSONDecodeError as exc:
-        raise CiEvidenceError(f"command returned invalid JSON: {' '.join(argv[:3])}") from exc
+        raise CiEvidenceError(
+            f"command returned invalid JSON: {_command_label(argv)}"
+        ) from exc
 
 
 def _run_bytes(argv: list[str]) -> bytes:
-    result = subprocess.run(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CiEvidenceError(
+            f"command timed out after {COMMAND_TIMEOUT_SECONDS}s: {_command_label(argv)}"
+        ) from exc
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise CiEvidenceError(f"command failed: {' '.join(argv[:3])}: {detail[:500]}")
+        raise CiEvidenceError(
+            f"command failed: {_command_label(argv)}: {detail[:500]}"
+        )
     return result.stdout
 
 
@@ -424,13 +442,14 @@ def collaborator_permission(repo_name: str, actor: str) -> str | None:
     return permission if isinstance(permission, str) else None
 
 
-def current_comment_is_latest_authorized(
+def current_comment_authorization_state(
     repo_name: str,
     pr_number: int,
     *,
     comment_id: int,
     comment_body: str,
-) -> bool:
+    permission_cache: dict[str, str | None] | None = None,
+) -> str:
     owner, name = repo_name.split("/", 1)
     query = """
 query($owner: String!, $name: String!, $number: Int!) {
@@ -464,11 +483,37 @@ query($owner: String!, $name: String!, $number: Int!) {
         raise CiEvidenceError("current PR comment window could not be read") from exc
     if not isinstance(comments, list):
         raise CiEvidenceError("current PR comment window is invalid")
-    return command_comment_is_current_and_latest_authorized(
+
+    cache = permission_cache if permission_cache is not None else {}
+
+    def cached_permission(actor: str) -> str | None:
+        if actor not in cache:
+            cache[actor] = collaborator_permission(repo_name, actor)
+        return cache[actor]
+
+    return command_comment_authorization_state(
         comments,
         current_comment_id=comment_id,
         current_comment_body=comment_body,
-        permission_lookup=lambda actor: collaborator_permission(repo_name, actor),
+        permission_lookup=cached_permission,
+    )
+
+
+def current_comment_is_latest_authorized(
+    repo_name: str,
+    pr_number: int,
+    *,
+    comment_id: int,
+    comment_body: str,
+) -> bool:
+    return (
+        current_comment_authorization_state(
+            repo_name,
+            pr_number,
+            comment_id=comment_id,
+            comment_body=comment_body,
+        )
+        == COMMENT_STATE_CURRENT
     )
 
 
@@ -488,7 +533,7 @@ def publish_commit_status(
         "state": "success" if passed else "failure",
         "context": STATUS_CONTEXT,
         "description": (
-            "Current head/diff-bound review evidence passed"
+            "Current head/base/diff-bound review evidence passed"
             if passed
             else f"Review evidence blocked ({failure_count} validation failure(s))"
         ),
@@ -526,12 +571,26 @@ def _safe_result(
         "kind": RESULT_KIND,
         "repo": repo_name,
         "pr": pr_number,
-        "head_sha": _normalize_git_sha(pr.get("headRefOid")) if isinstance(pr, dict) else None,
+        "head_sha": (
+            _normalize_git_sha(pr.get("headRefOid")) if isinstance(pr, dict) else None
+        ),
+        "base_sha": (
+            _normalize_git_sha(pr.get("baseRefOid")) if isinstance(pr, dict) else None
+        ),
         "diff_sha256": _normalize_sha256(diff_sha256),
-        "audit_sha256": _normalize_sha256(status.get("audit_sha256")) if isinstance(status, dict) else None,
-        "review_tier": complexity.get("review_tier") if isinstance(complexity, dict) else None,
+        "audit_sha256": (
+            _normalize_sha256(status.get("audit_sha256"))
+            if isinstance(status, dict)
+            else None
+        ),
+        "review_policy_version": evidence_schemas.REVIEW_POLICY_VERSION,
+        "review_tier": (
+            complexity.get("review_tier") if isinstance(complexity, dict) else None
+        ),
         "minimum_review_iterations": (
-            complexity.get("minimum_self_review_iterations") if isinstance(complexity, dict) else None
+            complexity.get("minimum_self_review_iterations")
+            if isinstance(complexity, dict)
+            else None
         ),
         "authorized": authorized,
         "actor_permission": permission,
@@ -539,6 +598,16 @@ def _safe_result(
         "failures": failures,
         "private_evidence_included": False,
     }
+
+
+def _comment_state_failure(state: str) -> str:
+    if state == COMMENT_STATE_STALE:
+        return "comment was edited after the triggering event"
+    if state == COMMENT_STATE_OUTSIDE_WINDOW:
+        return "comment is missing or outside the bounded authorization window"
+    if state == COMMENT_STATE_SUPERSEDED:
+        return "comment was superseded by a newer authorized review-evidence command"
+    return f"comment authorization state is invalid: {state}"
 
 
 def prepare_command(args: argparse.Namespace) -> int:
@@ -567,7 +636,21 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
     repo_name = _normalize_repo(args.repo_name or os.environ.get("GITHUB_REPOSITORY"))
     if repo_name is None:
         raise CiEvidenceError("repository identity is missing or invalid")
-    actor = args.actor or os.environ.get("GITHUB_ACTOR") or ""
+
+    event_actor = os.environ.get("GITHUB_ACTOR") or ""
+    if args.publish_status:
+        if args.comment_id is None:
+            raise CiEvidenceError("--comment-id is required when publishing status")
+        if not event_actor:
+            raise CiEvidenceError("GITHUB_ACTOR is required when publishing status")
+        if args.actor and args.actor != event_actor:
+            raise CiEvidenceError(
+                "--actor must match GITHUB_ACTOR when publishing status"
+            )
+        actor = event_actor
+    else:
+        actor = args.actor or event_actor
+
     permission = collaborator_permission(repo_name, actor)
     authorized = permission_allows_publish(permission)
     if not authorized:
@@ -585,28 +668,46 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
 
-    comment_body = os.environ.get(args.comment_body_env, "")
-    if args.comment_id is not None and not current_comment_is_latest_authorized(
-        repo_name,
-        args.pr,
-        comment_id=args.comment_id,
-        comment_body=comment_body,
-    ):
-        result = _safe_result(
-            repo_name=repo_name,
-            pr_number=args.pr,
-            pr=None,
-            diff_sha256=None,
-            failures=["comment is stale, edited, superseded, or outside the bounded authorization window"],
-            status=None,
-            complexity=None,
-            authorized=True,
-            permission=permission,
-        )
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return 0
-
     pr = load_live_pr(repo_name, args.pr)
+    head_sha = _normalize_git_sha(pr.get("headRefOid"))
+    comment_body = os.environ.get(args.comment_body_env, "")
+    permission_cache: dict[str, str | None] = {actor: permission}
+
+    if args.comment_id is not None:
+        comment_state = current_comment_authorization_state(
+            repo_name,
+            args.pr,
+            comment_id=args.comment_id,
+            comment_body=comment_body,
+            permission_cache=permission_cache,
+        )
+        if comment_state != COMMENT_STATE_CURRENT:
+            failures = [_comment_state_failure(comment_state)]
+            if (
+                comment_state != COMMENT_STATE_SUPERSEDED
+                and args.publish_status
+                and head_sha is not None
+            ):
+                publish_commit_status(
+                    repo_name=repo_name,
+                    head_sha=head_sha,
+                    passed=False,
+                    failure_count=len(failures),
+                )
+            result = _safe_result(
+                repo_name=repo_name,
+                pr_number=args.pr,
+                pr=pr,
+                diff_sha256=None,
+                failures=failures,
+                status=None,
+                complexity=None,
+                authorized=True,
+                permission=permission,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if comment_state == COMMENT_STATE_SUPERSEDED else 1
+
     diff_sha256 = current_diff_sha256(repo_name, args.pr)
     complexity = gate.classify_complexity(pr, None, repo_name=repo_name)
     failures: list[str] = []
@@ -626,13 +727,47 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
             )
         )
 
-    head_sha = _normalize_git_sha(pr.get("headRefOid"))
-    if head_sha is None:
+    final_pr = load_live_pr(repo_name, args.pr)
+    initial_head = _normalize_git_sha(pr.get("headRefOid"))
+    initial_base = _normalize_git_sha(pr.get("baseRefOid"))
+    final_head = _normalize_git_sha(final_pr.get("headRefOid"))
+    final_base = _normalize_git_sha(final_pr.get("baseRefOid"))
+    if final_head is None:
         failures.append("current PR head_sha is missing or invalid")
-    if args.publish_status and head_sha is not None:
+    if initial_head != final_head:
+        failures.append("PR head changed during review-evidence evaluation")
+    if initial_base != final_base:
+        failures.append("PR base changed during review-evidence evaluation")
+
+    if args.publish_status and args.comment_id is not None:
+        final_comment_state = current_comment_authorization_state(
+            repo_name,
+            args.pr,
+            comment_id=args.comment_id,
+            comment_body=comment_body,
+            permission_cache=permission_cache,
+        )
+        if final_comment_state == COMMENT_STATE_SUPERSEDED:
+            result = _safe_result(
+                repo_name=repo_name,
+                pr_number=args.pr,
+                pr=final_pr,
+                diff_sha256=diff_sha256,
+                failures=[_comment_state_failure(final_comment_state)],
+                status=status,
+                complexity=complexity,
+                authorized=True,
+                permission=permission,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        if final_comment_state != COMMENT_STATE_CURRENT:
+            failures.append(_comment_state_failure(final_comment_state))
+
+    if args.publish_status and final_head is not None:
         publish_commit_status(
             repo_name=repo_name,
-            head_sha=head_sha,
+            head_sha=final_head,
             passed=not failures,
             failure_count=len(failures),
         )
@@ -640,7 +775,7 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
     result = _safe_result(
         repo_name=repo_name,
         pr_number=args.pr,
-        pr=pr,
+        pr=final_pr,
         diff_sha256=diff_sha256,
         failures=failures,
         status=status,
@@ -659,8 +794,9 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser("prepare")
     prepare.add_argument("--audit", required=True)
     prepare.add_argument("--output")
-    prepare.add_argument("--base64", action="store_true")
-    prepare.add_argument("--comment", action="store_true")
+    output_mode = prepare.add_mutually_exclusive_group()
+    output_mode.add_argument("--base64", action="store_true")
+    output_mode.add_argument("--comment", action="store_true")
     prepare.set_defaults(handler=prepare_command)
 
     evaluate = subparsers.add_parser("evaluate-comment")

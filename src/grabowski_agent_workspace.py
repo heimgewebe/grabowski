@@ -1541,6 +1541,15 @@ def _tmux_has_session(session: str) -> bool:
     return result["returncode"] == 0
 
 
+def _tmux_exact_target(session: str) -> str:
+    return f"={session}"
+
+
+def _tmux_has_exact_session(session: str) -> bool:
+    result = _tmux_result(["has-session", "-t", _tmux_exact_target(session)])
+    return result["returncode"] == 0
+
+
 def _tmux_pane_ids(session: str) -> set[str]:
     result = _tmux_result(["list-panes", "-t", f"{session}:agents", "-F", "#{pane_id}"])
     if result["returncode"] != 0:
@@ -7271,6 +7280,38 @@ def _workspace_cleanup_plan_data(
         ),
         "legacy_absence_receipt_required": legacy_absence_reconciliation,
     }
+    session_name = manifest.get("session_name")
+    exact_idle_tmux_session_live = bool(
+        liveness.get("session_live") is True
+        and isinstance(session_name, str)
+        and session_name
+        and _tmux_has_exact_session(session_name)
+    )
+    idle_tmux_transition_eligible = bool(
+        exact_idle_tmux_session_live
+        and liveness.get("operationally_live") is False
+        and liveness.get("session_only_non_authoritative") is True
+        and isinstance(session_name, str)
+        and session_name
+        and stale_reconciliation["reconciliation_kind"] == "stale_abandonment"
+        and checkout_state["exists"]
+        and checkout_state["linked"]
+        and checkout_state["clean"]
+        and len(stale_blockers) == 1
+        and stale_blockers[0].get("code") == "workspace_idle_tmux_cleanup_required"
+    )
+    stale_reconciliation["idle_tmux_transition"] = {
+        "eligible": idle_tmux_transition_eligible,
+        "action": "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+        "confirmation_required": "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+        "session_name": session_name,
+        "exact_session_live": exact_idle_tmux_session_live,
+        "removes_tmux": True,
+        "mutates_tasks": False,
+        "mutates_resources": False,
+        "removes_worktree": False,
+        "deletes_workspace_evidence": False,
+    }
     if cleanup_receipt_valid and checkout_state["exists"]:
         blockers.append({"code": "writer_worktree_reappeared_after_cleanup"})
     already_cleaned = bool(cleanup_receipt_valid and not checkout_state["exists"])
@@ -7599,6 +7640,183 @@ def grabowski_agent_workspace_reconcile_stale(
         "legacy_absence_receipt": legacy_absence_receipt,
         "worktree_preserved": receipt["worktree_preserved"],
         "historical_evidence_preserved": True,
+    }
+
+
+@mcp.tool(name="grabowski_agent_workspace_reconcile_idle_tmux", annotations=MUTATING)
+def grabowski_agent_workspace_reconcile_idle_tmux(
+    workspace_id: str,
+    expected_plan_sha256: str,
+    confirmation: str = "",
+) -> dict[str, Any]:
+    """Remove one exact non-authoritative idle tmux session, then stale-reconcile the workspace."""
+    operator._require_operator_mutation("durable_job")
+    operator._require_operator_mutation("git_cli")
+    operator._require_operator_mutation("resource_lease")
+    operator._require_operator_mutation("tmux_interaction")
+    identifier = _required_string(workspace_id, "workspace_id", max_length=80)
+    if WORKSPACE_ID_RE.fullmatch(identifier) is None:
+        raise AgentWorkspaceError(f"invalid workspace_id: {identifier}")
+    expected_hash = _required_string(
+        expected_plan_sha256, "expected_plan_sha256", max_length=64
+    )
+    if SHA256_RE.fullmatch(expected_hash) is None:
+        raise AgentWorkspaceError("expected_plan_sha256 must be a lowercase SHA-256")
+    required_confirmation = "remove-idle-tmux-and-mark-stale-workspace-abandoned"
+    if confirmation != required_confirmation:
+        raise AgentWorkspaceError(
+            f"confirmation must be exactly '{required_confirmation}'"
+        )
+    with _lock(identifier):
+        manifest = _manifest(identifier)
+        existing = manifest.get("close_receipt")
+        if isinstance(existing, dict) and _close_integrity_status(manifest, existing)["valid"]:
+            return {
+                "workspace_id": identifier,
+                "state": "already_closed",
+                "idempotent": True,
+                "close_receipt": existing,
+                "tmux_removed": False,
+                "tmux_mutation_performed": False,
+            }
+        plan = _workspace_cleanup_plan_data(manifest)
+        if plan["plan_sha256"] != expected_hash:
+            raise AgentWorkspaceError("workspace lifecycle plan is stale; rerun cleanup_plan")
+        transition = plan["stale_reconciliation"].get("idle_tmux_transition")
+        if not isinstance(transition, dict) or transition.get("eligible") is not True:
+            return {
+                "workspace_id": identifier,
+                "state": "idle_tmux_transition_blocked",
+                "idempotent": False,
+                "plan": plan,
+            }
+        session_name = transition.get("session_name")
+        if not isinstance(session_name, str) or not session_name:
+            raise AgentWorkspaceError("idle tmux transition has no exact session binding")
+        pre_mutation_plan = _workspace_cleanup_plan_data(manifest)
+        if pre_mutation_plan["plan_sha256"] != expected_hash:
+            raise AgentWorkspaceError(
+                "workspace lifecycle plan changed before idle tmux removal; rerun cleanup_plan"
+            )
+        pre_mutation_transition = pre_mutation_plan["stale_reconciliation"].get(
+            "idle_tmux_transition"
+        )
+        if (
+            not isinstance(pre_mutation_transition, dict)
+            or pre_mutation_transition.get("eligible") is not True
+            or pre_mutation_transition.get("session_name") != session_name
+        ):
+            raise AgentWorkspaceError("idle tmux transition changed before removal")
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "agent-workspace-idle-tmux-transition-start",
+                "workspace_id": identifier,
+                "source_plan_sha256": expected_hash,
+                "session_name": session_name,
+                "confirmation": required_confirmation,
+                "mutation_performed": False,
+            }
+        )
+        killed = _tmux_result(["kill-session", "-t", _tmux_exact_target(session_name)])
+        tmux_mutation_performed = killed.get("returncode") == 0
+        if not tmux_mutation_performed and _tmux_has_exact_session(session_name):
+            raise AgentWorkspaceActionError(
+                str(killed.get("stderr") or "idle tmux session removal failed")
+            )
+        if _tmux_has_exact_session(session_name):
+            raise AgentWorkspaceActionError("idle tmux session remained live after removal")
+        transition_body = {
+            "schema_version": 1,
+            "workspace_id": identifier,
+            "source_plan_sha256": expected_hash,
+            "session_name": session_name,
+            "tmux_removed": True,
+            "tmux_mutation_performed": tmux_mutation_performed,
+            "task_mutation_performed": False,
+            "resource_mutation_performed": False,
+            "worktree_mutation_performed": False,
+            "historical_evidence_preserved": True,
+            "transitioned_at": _utc(),
+        }
+        transition_receipt = {
+            **transition_body,
+            "receipt_sha256": _sha256_json(transition_body),
+        }
+        _atomic_json(
+            _workspace_dir(identifier) / "idle-tmux-transition-receipt.json",
+            transition_receipt,
+        )
+        manifest["idle_tmux_transition_receipt"] = transition_receipt
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "agent-workspace-idle-tmux-remove",
+                "workspace_id": identifier,
+                "source_plan_sha256": expected_hash,
+                "session_name": session_name,
+                "receipt_sha256": transition_receipt["receipt_sha256"],
+                "tmux_removed": True,
+                "tmux_mutation_performed": tmux_mutation_performed,
+                "historical_evidence_preserved": True,
+            }
+        )
+        _append_workspace_event(
+            manifest,
+            "workspace_idle_tmux_removed",
+            outcome="verified",
+            evidence={
+                "source_plan_sha256": expected_hash,
+                "session_name": session_name,
+                "receipt_sha256": transition_receipt["receipt_sha256"],
+                "tmux_mutation_performed": tmux_mutation_performed,
+            },
+        )
+        _write_manifest(manifest)
+        post_tmux_plan = _workspace_cleanup_plan_data(manifest)
+        post_tmux_plan_sha256 = str(post_tmux_plan["plan_sha256"])
+        if not post_tmux_plan["stale_reconciliation"]["eligible"]:
+            return {
+                "workspace_id": identifier,
+                "state": "idle_tmux_removed_stale_reconciliation_blocked",
+                "idempotent": False,
+                "source_plan_sha256": expected_hash,
+                "post_tmux_plan_sha256": post_tmux_plan_sha256,
+                "tmux_removed": True,
+                "tmux_mutation_performed": tmux_mutation_performed,
+                "idle_tmux_transition_receipt": transition_receipt,
+                "plan": post_tmux_plan,
+            }
+    try:
+        close_result = grabowski_agent_workspace_reconcile_stale(
+            identifier,
+            post_tmux_plan_sha256,
+            "mark-stale-workspace-abandoned",
+        )
+    except AgentWorkspaceError as exc:
+        if "workspace lifecycle plan is stale" not in str(exc):
+            raise
+        with _lock(identifier):
+            current_plan = _workspace_cleanup_plan_data(_manifest(identifier))
+        return {
+            "workspace_id": identifier,
+            "state": "idle_tmux_removed_stale_reconciliation_blocked",
+            "idempotent": False,
+            "source_plan_sha256": expected_hash,
+            "post_tmux_plan_sha256": post_tmux_plan_sha256,
+            "tmux_removed": True,
+            "tmux_mutation_performed": tmux_mutation_performed,
+            "idle_tmux_transition_receipt": transition_receipt,
+            "reconciliation_error": str(exc),
+            "plan": current_plan,
+        }
+    return {
+        **close_result,
+        "source_plan_sha256": expected_hash,
+        "post_tmux_plan_sha256": post_tmux_plan_sha256,
+        "tmux_removed": True,
+        "tmux_mutation_performed": tmux_mutation_performed,
+        "idle_tmux_transition_receipt": transition_receipt,
     }
 
 
