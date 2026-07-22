@@ -1607,6 +1607,15 @@ def _tmux_has_session(session: str) -> bool:
     return result["returncode"] == 0
 
 
+def _tmux_exact_target(session: str) -> str:
+    return f"={session}"
+
+
+def _tmux_has_exact_session(session: str) -> bool:
+    result = _tmux_result(["has-session", "-t", _tmux_exact_target(session)])
+    return result["returncode"] == 0
+
+
 def _tmux_pane_ids(session: str) -> set[str]:
     result = _tmux_result(["list-panes", "-t", f"{session}:agents", "-F", "#{pane_id}"])
     if result["returncode"] != 0:
@@ -7318,8 +7327,14 @@ def _workspace_cleanup_plan_data(
         "legacy_absence_receipt_required": legacy_absence_reconciliation,
     }
     session_name = manifest.get("session_name")
-    idle_tmux_transition_eligible = bool(
+    exact_idle_tmux_session_live = bool(
         liveness.get("session_live") is True
+        and isinstance(session_name, str)
+        and session_name
+        and _tmux_has_exact_session(session_name)
+    )
+    idle_tmux_transition_eligible = bool(
+        exact_idle_tmux_session_live
         and liveness.get("operationally_live") is False
         and liveness.get("session_only_non_authoritative") is True
         and isinstance(session_name, str)
@@ -7336,6 +7351,7 @@ def _workspace_cleanup_plan_data(
         "action": "remove-idle-tmux-and-mark-stale-workspace-abandoned",
         "confirmation_required": "remove-idle-tmux-and-mark-stale-workspace-abandoned",
         "session_name": session_name,
+        "exact_session_live": exact_idle_tmux_session_live,
         "removes_tmux": True,
         "mutates_tasks": False,
         "mutates_resources": False,
@@ -7748,13 +7764,13 @@ def grabowski_agent_workspace_reconcile_idle_tmux(
                 "mutation_performed": False,
             }
         )
-        killed = _tmux_result(["kill-session", "-t", session_name])
+        killed = _tmux_result(["kill-session", "-t", _tmux_exact_target(session_name)])
         tmux_mutation_performed = killed.get("returncode") == 0
-        if not tmux_mutation_performed and _tmux_has_session(session_name):
+        if not tmux_mutation_performed and _tmux_has_exact_session(session_name):
             raise AgentWorkspaceActionError(
                 str(killed.get("stderr") or "idle tmux session removal failed")
             )
-        if _tmux_has_session(session_name):
+        if _tmux_has_exact_session(session_name):
             raise AgentWorkspaceActionError("idle tmux session remained live after removal")
         transition_body = {
             "schema_version": 1,

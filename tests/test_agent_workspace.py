@@ -5172,6 +5172,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace, "_task_public", side_effect=task_public),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
             mock.patch.object(workspace, "_now", return_value=1784050000),
         ):
             report = workspace.grabowski_agent_workspace_cleanup_plan(
@@ -5202,6 +5203,46 @@ class AgentWorkspaceTests(unittest.TestCase):
         ).parameters
         self.assertNotIn("remove_idle_tmux_session", parameters)
 
+    def test_tmux_exact_session_probe_uses_exact_target(self) -> None:
+        with mock.patch.object(
+            workspace,
+            "_tmux_result",
+            return_value={"returncode": 0, "stdout": "", "stderr": ""},
+        ) as tmux:
+            self.assertTrue(workspace._tmux_has_exact_session("gaw-bound-session"))
+
+        tmux.assert_called_once_with(["has-session", "-t", "=gaw-bound-session"])
+
+    def test_idle_tmux_transition_refuses_prefix_only_session_without_kill(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=False),
+            mock.patch.object(workspace, "_tmux_result") as tmux,
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            transition = plan["stale_reconciliation"]["idle_tmux_transition"]
+            self.assertFalse(transition["eligible"])
+            self.assertFalse(transition["exact_session_live"])
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+            )
+
+        self.assertEqual(result["state"], "idle_tmux_transition_blocked")
+        tmux.assert_not_called()
+
     def test_idle_tmux_transition_removes_exact_session_and_reconciles_stale(self) -> None:
         manifest = self.manifest()
         manifest["created_at"] = "2026-01-01T00:00:00+00:00"
@@ -5215,7 +5256,7 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
             nonlocal session_live
-            self.assertEqual(argv, ["kill-session", "-t", manifest["session_name"]])
+            self.assertEqual(argv, ["kill-session", "-t", f"={manifest['session_name']}"])
             self.assertEqual(timeout, 30)
             session_live = False
             return {"returncode": 0, "stdout": "", "stderr": ""}
@@ -5225,6 +5266,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
+            mock.patch.object(workspace, "_tmux_has_exact_session", side_effect=has_session),
             mock.patch.object(workspace, "_tmux_result", side_effect=tmux_result) as tmux,
             mock.patch.object(workspace.base, "_append_audit"),
             mock.patch.object(workspace, "_now", return_value=1784050000),
@@ -5276,6 +5318,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 return_value=[{"resource_key": "path:/live"}],
             ),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
             mock.patch.object(workspace, "_tmux_result") as tmux,
             mock.patch.object(workspace, "_now", return_value=1784050000),
         ):
@@ -5314,7 +5357,7 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
             nonlocal session_live
-            self.assertEqual(argv, ["kill-session", "-t", manifest["session_name"]])
+            self.assertEqual(argv, ["kill-session", "-t", f"={manifest['session_name']}"])
             self.assertEqual(timeout, 30)
             session_live = False
             return {"returncode": 0, "stdout": "", "stderr": ""}
@@ -5328,6 +5371,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 side_effect=lambda **kwargs: next(resource_observations),
             ),
             mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
+            mock.patch.object(workspace, "_tmux_has_exact_session", side_effect=has_session),
             mock.patch.object(workspace, "_tmux_result", side_effect=tmux_result),
             mock.patch.object(workspace.base, "_append_audit"),
             mock.patch.object(workspace, "_now", return_value=1784050000),
@@ -5380,6 +5424,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 side_effect=lambda **kwargs: next(resource_observations),
             ),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
             mock.patch.object(workspace, "_tmux_result") as tmux,
             mock.patch.object(workspace.base, "_append_audit"),
             mock.patch.object(workspace, "_now", return_value=1784050000),
@@ -5433,6 +5478,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace, "_task_public", side_effect=task_public),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
             mock.patch.object(workspace, "_now", return_value=1784050000),
         ):
             plan = workspace.grabowski_agent_workspace_cleanup_plan(
@@ -5468,6 +5514,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace, "_task_public", side_effect=task_public),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
+            mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
             mock.patch.object(workspace, "_now", return_value=1784050000),
         ):
             plan = workspace.grabowski_agent_workspace_cleanup_plan(
