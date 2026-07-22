@@ -36,6 +36,7 @@ known_capabilities = {
     "file_write",
     "friction_record",
     "audit_verify",
+    "audit_read",
     "rollback_text",
     "bundle_registry",
     "secret_inspect",

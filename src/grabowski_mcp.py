@@ -213,8 +213,10 @@ RESERVED_DISABLED_CAPABILITIES = (
     "chown",
     "secret_read",
 )
+AUDIT_READ_CAPABILITIES = ("audit_read",)
 ALL_CAPABILITIES = (
     BASE_CAPABILITIES
+    + AUDIT_READ_CAPABILITIES
     + SECRET_CAPABILITIES
     + OPERATOR_CAPABILITIES
     + RESERVED_DISABLED_CAPABILITIES
@@ -240,9 +242,9 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_destroy_path": ("file_destroy",),
     "grabowski_rollback_text": ("rollback_text",),
     "grabowski_verify_audit": ("audit_verify",),
-    "grabowski_audit_query": ("audit_verify",),
-    "grabowski_audit_trace": ("audit_verify",),
-    "grabowski_audit_analyze": ("audit_verify",),
+    "grabowski_audit_query": ("audit_read",),
+    "grabowski_audit_trace": ("audit_read",),
+    "grabowski_audit_analyze": ("audit_read",),
     "latest_complete_bundles": ("bundle_registry",),
     "repoground_bundle_discover": ("bundle_registry",),
     "repoground_bundle_status": ("bundle_registry",),
@@ -3311,6 +3313,7 @@ def _read_audit_chain_unlocked(
     path: Path,
     *,
     use_segment_cache: bool = True,
+    retain_verified_segment_data: bool = True,
 ) -> tuple[list[tuple[Path, bytes, dict[str, Any]]], bool]:
     components: list[tuple[Path, bytes, dict[str, Any]]] = []
     seen: set[Path] = set()
@@ -3377,7 +3380,12 @@ def _read_audit_chain_unlocked(
             compatibility_evidence = compatibility_evidence or bool(
                 expected.get("compatibility")
             )
-        components.append((current, data, status))
+        component_status = dict(status)
+        component_status["segment_sha256"] = observed_sha
+        component_data = data
+        if expected is not None and not retain_verified_segment_data:
+            component_data = b""
+        components.append((current, component_data, component_status))
         binding = _audit_predecessor_binding(path, first_record)
         if binding is None:
             return components, compatibility_evidence

@@ -1,26 +1,72 @@
-# Audit Query / Trace v1
+# Audit Query / Trace v1.1
 
-## Zweck
+## Purpose
 
-Die Grabowski-Audit-Kette bleibt die unveränderliche, manipulationsnachweisende Beweisschicht. Audit Query / Trace v1 legt darüber ausschließlich eine verwerfbare Read-only-Projektion. Die Projektion besitzt keine eigene Autorität und kann jederzeit aus der vollständig verifizierten Segmentkette neu aufgebaut werden.
+The Grabowski audit chain remains the immutable, tamper-evident evidence layer. Audit Query / Trace v1.1 exposes only a disposable read-only projection derived from a verified audit snapshot. The projection has no independent authority and can be rebuilt from the audit chain.
 
-## Wahrheitsmodell
+## Authority and capability model
 
-1. Vor jeder Projektion wird die bestehende segmentübergreifende Audit-Leseroutine unter dem gemeinsamen Audit-Koordinationslock verwendet.
-2. Aktives Segment und alle Vorgängersegmente werden durch die bestehende Audit-Verifikation geprüft.
-3. Ergebnisse werden in historischer Reihenfolge normalisiert und an Record- sowie Segment-SHA-256 gebunden.
-4. Ein `chain_fingerprint_sha256` bindet die konkrete Segmentfolge, aus der ein Ergebnis abgeleitet wurde.
-5. Es wird kein zweiter persistenter Index und keine zweite Wahrheit geschrieben.
+Audit integrity verification and audit content reading are separate authorities:
 
-Ein Query- oder Trace-Ergebnis beweist damit, aus welcher verifizierten Audit-Evidenz es abgeleitet wurde. Es beweist nicht automatisch, dass die protokollierte Handlung fachlich korrekt war oder dass zwei korrelierte Records kausal zusammenhängen.
+- `audit_verify` permits verification of the tamper-evident audit chain.
+- `audit_read` permits bounded projection, query, trace and descriptive analysis of safe audit fields.
 
-## Oberflächen
+The three public audit-read tools require `audit_read`. Possessing `audit_verify` alone does not authorize structured audit-content access.
+Legacy policy fallback does not implicitly grant `audit_read`; modern profiles must list it explicitly.
 
-### `grabowski_audit_query`
+## Verified snapshot model
 
-Begrenzte Suche über sichere, explizit freigegebene Record-Felder.
+1. The active audit chain and predecessor bindings are verified under the shared audit coordination lock.
+2. Immutable archived segments may reuse the existing identity-bound verification cache.
+3. The active segment bytes are captured while the lock is held because the active file may change after lock release.
+4. Archived segment contents are loaded lazily after lock release and must still match the verified snapshot SHA-256, record count and last-record hash.
+5. Record parsing, projection, filtering, tracing and analysis happen outside the shared coordination lock.
+6. No second persistent index or database is written.
 
-Unterstützte Filter:
+A cold verification cache can still require a complete historical verification pass while the shared lock is held. Warm verified segments avoid repeated historical verification work. Lazy archived reads never trust cache metadata alone: content is re-bound to the snapshot digest before use.
+
+## Evidence identity
+
+Each projected record retains:
+
+- `audit_ref`,
+- record evidence SHA-256,
+- segment path and segment SHA-256,
+- segment and record ordinal,
+- global record ordinal,
+- allowlist-based record projection,
+- projection-schema mismatch evidence when an allowlisted field has an unsupported shape.
+
+Two chain identities are exposed:
+
+- `chain_content_sha256`: binds ordered segment ordinals and segment content hashes.
+- `chain_materialization_sha256`: additionally binds segment paths.
+
+The legacy `chain_fingerprint_sha256` field remains as a compatibility alias for the materialization fingerprint and declares that semantic explicitly.
+
+For legacy records without a stored `record_sha256`, the verified raw line SHA-256 is used as the evidence reference. V2 stored record hashes are accepted only after the base audit verifier has checked hash shape, previous-hash linkage, sequence and recomputed record hash.
+
+## Bounded work
+
+Public query, trace and analyze operations scan at most `100000` records per invocation. Result limits are independent from scan limits.
+
+Responses expose:
+
+- scanned record count,
+- scan limit,
+- whether the scan is complete,
+- scanned global-ordinal range,
+- whether match/seed totals are globally known.
+
+When the chain exceeds the scan budget, the response explicitly states that matches outside the scanned window are unknown. v1.1 intentionally does not provide a continuation cursor; this is a bounded-work safety choice, not evidence of absence outside the scan window.
+
+Segment metadata is also bounded. At most eight segment descriptors are returned, together with exact segment count, first/last segment evidence, truncation state and omission count.
+
+## `grabowski_audit_query`
+
+Bounded safe-field search over the verified snapshot.
+
+Supported filters:
 
 - `operation`
 - `operation_prefix`
@@ -35,74 +81,94 @@ Unterstützte Filter:
 - `service`
 - `branch`
 - `resource_key`
+- `held_resource_key`
+- `requested_resource_key`
 - `record_sha256`
 - `since_unix`
 - `until_unix`
 - `has_failure_signal`
 
-Ergebnisse sind standardmäßig absteigend sortiert und auf maximal 200 Records begrenzt. Filter werden vollständig validiert, bevor die Audit-Kette gelesen wird; `record_sha256` akzeptiert ausschließlich exakt 64 kleingeschriebene Hexzeichen und ein Zeitfenster mit `since_unix > until_unix` wird abgewiesen.
+`resource_key` remains a compatibility alias matching either held or requested resources. New consumers should prefer the typed filters:
 
-### `grabowski_audit_trace`
+- `held_resource_key` matches `resource_keys` only.
+- `requested_resource_key` matches `requested_resource_keys` only.
 
-Erzeugt einen begrenzten Ein-Hop-Korrelationspfad ausgehend von einem exakten Anker.
+Inputs are validated once before scanning. Static filter values are not repeatedly revalidated for every record.
 
-Unterstützte Anker:
+## `grabowski_audit_trace`
+
+Produces a bounded one-hop correlation view from one exact anchor.
+
+Supported anchors:
 
 - `record_sha256`
 - `task_id`
 - `owner_id`
 - `transaction_id`
 - `resource_key`
+- `held_resource_key`
+- `requested_resource_key`
 - `unit`
 - `path`
 
-Direkte Treffer werden markiert. Weitere Records werden nur dann aufgenommen, wenn sie einen aus den direkten Treffern abgeleiteten stabilen Korrelationsschlüssel teilen. Verwendet werden Task-, Owner-, Transaktions-, Unit-, Pfad-, Repo-, Branch- und Ressourcenbezüge.
+Direct anchor matches are distinguished from correlated records. Held and requested resource relations remain separate during token derivation and correlation.
 
-Die Trace-Schicht behauptet ausdrücklich keine Kausalität. Sie ist eine Navigations- und Forensikhilfe. Korrelationswerte sind pro Feld auf 64 begrenzt; jede Kürzung wird mit `correlation_tokens_truncated` und der exakten Zahl ausgelassener Werte in `correlation_token_omissions` offengelegt.
+Broad anchors are bounded:
 
-### `grabowski_audit_analyze`
+- at most 256 seed records contribute correlation tokens,
+- at most 64 values are retained per correlation field,
+- omitted seed and token counts are disclosed,
+- `correlation_incomplete` is true whenever scan, seed or token truncation can make the graph incomplete.
 
-Berechnet ausschließlich deskriptive, neu erzeugbare Statistiken:
+Direct matches within the scanned window remain visible even when seed-token derivation is truncated.
 
-- häufigste Operationen,
-- häufigste Ressourcenschlüssel,
-- häufigste Task-IDs,
-- häufigste Owner-IDs,
-- Zeitbereich der ausgewählten Records,
-- Anzahl und begrenzte Evidenzbeispiele für Fehlerindikatoren,
+Trace results do not establish causality.
+
+## `grabowski_audit_analyze`
+
+Computes bounded-memory descriptive statistics over the bounded verified scan:
+
+- top operations,
+- top held resource keys,
+- top requested resource keys,
+- top task IDs,
+- top owner IDs,
+- selected-record time range,
+- failure-signal counts and bounded evidence samples,
 - `launcher_outcome_unknown`,
 - `recovery_required`.
 
-Die Analyse beweist weder Root Cause noch zukünftige Fehlerwahrscheinlichkeit.
+High-cardinality top-value tracking uses a bounded Space-Saving counter. Each returned top value includes an `error_upper_bound`. The response declares whether each counter is exact or approximate and reports capacity, tracked values and evictions.
 
-## Sichere Projektion
+The analysis does not establish root cause, causality or future failure probability.
 
-Die öffentliche Projektion gibt nicht beliebige Audit-Felder zurück. Nur ein expliziter Allowlist-Satz struktureller Felder wird ausgegeben. Dadurch werden versehentlich in historischen Records enthaltene fremde oder sensitive Zusatzfelder nicht automatisch zu einer neuen Leseoberfläche.
+## Safe projection and schema drift
 
-Jeder projizierte Record enthält:
+Public records expose only explicitly allowlisted scalar fields and the two explicitly typed string-list resource fields. Unknown fields are not projected.
 
-- `audit_ref`,
-- den Evidenzhash des Records,
-- Segmentpfad und Segment-SHA-256,
-- Segment- und Record-Ordinal,
-- globale Ordinalposition,
-- die allowlist-basierte Record-Projektion.
+If an allowlisted field changes to an unsupported shape, the field is not silently treated as absent. Record evidence reports:
 
-Für Legacy-Records ohne gespeicherten `record_sha256` wird der SHA-256 der verifizierten Rohzeile als Evidenzreferenz verwendet.
+- `projection_schema_mismatch: true`,
+- `projection_omitted_fields` with the affected allowlisted field names.
 
-## Fail-closed-Verhalten
+The unsupported value itself is not exposed.
 
-Kann die bestehende Audit-Segmentkette nicht verifiziert oder sicher gelesen werden, wird keine Query-, Trace- oder Analyseantwort aus unbestätigten Daten erzeugt. Der Fehler der Audit-Verifikation wird weitergegeben.
+## Fail-closed behavior
 
-## Nicht-Ziele
+No query, trace or analysis is produced from an unverified chain. Invalid JSON, invalid UTF-8, hash drift, predecessor mismatch, sequence mismatch, segment manifest mismatch or lazy archived-segment identity drift aborts the operation.
 
-Audit Query / Trace v1 ist nicht:
+Verified-record decode failures after snapshot creation are treated as internal invariant violations and are never skipped.
 
-- eine neue Audit-Datenbank,
-- ein persistenter Suchindex,
-- eine Policy-Engine,
-- eine automatische Root-Cause-Engine,
-- ein Berechtigungsnachweis für zukünftige Aktionen,
-- ein Ersatz für Task-, Receipt-, GitHub-, Chronik- oder Bureau-Wahrheit.
+## Non-goals
 
-Diese Systeme können später als getrennte Verbraucher oder als zusätzliche, explizit verifizierte Evidenzquellen angebunden werden. Die Audit-Kette bleibt dabei Provenienzanker, nicht semantische Gesamtwahrheit.
+Audit Query / Trace v1.1 is not:
+
+- a second audit database,
+- a persistent search index,
+- a policy engine,
+- a root-cause engine,
+- a permission proof for future actions,
+- a substitute for Task, Lease, Receipt, GitHub, Chronik or Bureau authority,
+- a complete cross-store evidence graph.
+
+Cross-store evidence remains the scope of the separately planned follow-up. External sources must retain their own authority, immutable evidence references and freshness identity rather than being copied into the audit projection.
