@@ -286,8 +286,10 @@ def build_task_archive_plan(
                         reason_codes.append(
                             f"attention_closeout:{closeout.get('closeout_state') or 'invalid'}"
                         )
-            except Exception:
-                reason_codes.append("attention_authority_unavailable")
+            except (OSError, ValueError, task_attention.TaskAttentionError) as exc:
+                reason_codes.append(
+                    f"attention_authority_unavailable:{type(exc).__name__}"
+                )
         if reason_codes:
             blocked.append({"task_id": identity, "reason_codes": reason_codes})
         else:

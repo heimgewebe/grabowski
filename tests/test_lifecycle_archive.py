@@ -244,6 +244,22 @@ class TaskArchivePlanTests(unittest.TestCase):
         )
         closeout_plan.assert_not_called()
 
+    def test_failed_task_archive_blocks_when_attention_authority_is_unavailable(self) -> None:
+        record = self.task("failed", updated_at=100)
+        record["state"] = "failed"
+        classifications = {"failed": {"classification": "terminal_archivable"}}
+
+        with mock.patch("grabowski_tasks._row_raw", side_effect=ValueError("missing")):
+            plan = lifecycle.build_task_archive_plan(
+                [record], classifications, now_unix=1000, minimum_age_seconds=100
+            )
+
+        self.assertEqual([], plan["eligible_task_ids"])
+        self.assertIn(
+            "attention_authority_unavailable:ValueError",
+            plan["blocked"][0]["reason_codes"],
+        )
+
     def test_completed_task_archive_does_not_require_attention_classification(self) -> None:
         record = self.task("completed", updated_at=100)
         classifications = {"completed": {"classification": "terminal_archivable"}}
