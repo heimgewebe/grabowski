@@ -591,6 +591,44 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["projection_state"], "resumable")
         self.assertIn("attention-decision_deferred", group["action_reasons"])
 
+    def test_task_typed_lease_remains_task_bound_when_task_sources_are_empty(self) -> None:
+        task_id = "outside-bounded-task-window"
+        result = project(
+            resources_payload={
+                "leases": [lease(f"task:{task_id}", f"path:/tmp/{task_id}")],
+                "count": 1,
+                "truncated": False,
+            },
+            tasks_payload={"tasks": [], "pagination": {"has_more": True}},
+            attention_payload={"records": [], "pagination": {"has_more": True}},
+        )
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"task:{task_id}")
+        self.assertEqual(group["binding"]["kind"], "task")
+        self.assertEqual(group["binding_status"], "lease-bound")
+        self.assertEqual(group["observation"]["completeness"], "partial")
+        self.assertEqual(result["total_projected_scope"], "bounded_source_snapshot")
+        self.assertEqual(result["state_counts_scope"], "bounded_source_snapshot")
+
+    def test_archived_attention_with_live_task_lease_is_blocking(self) -> None:
+        task_id = "closed-live-lease"
+        result = project(
+            attention_payload={
+                "records": [attention(task_id, "decision_closed", state="failed", decision="closed")],
+                "pagination": {"has_more": False},
+            },
+            resources_payload={
+                "leases": [lease(f"task:{task_id}", f"path:/tmp/{task_id}")],
+                "count": 1,
+                "truncated": False,
+            },
+        )
+        self.assertEqual(result["total_projected"], 1)
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"task:{task_id}")
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("archived-attention-with-live-surfaces", group["action_reasons"])
+
     def test_attention_only_terminal_task_absorbs_task_owned_live_lease(self) -> None:
         task_id = "attention-lease-task"
         result = project(

@@ -398,9 +398,8 @@ def _owner_binding(owner_id: str, known_task_ids: set[str]) -> tuple[str, str, s
     for prefix, kind in prefixes.items():
         if owner_id.startswith(prefix):
             binding_id = owner_id.removeprefix(prefix)
-            if kind != "task" or binding_id in known_task_ids:
-                work_kind = "workspace" if kind == "agent-workspace" else kind
-                return f"{work_kind}:{binding_id}", kind, binding_id
+            work_kind = "workspace" if kind == "agent-workspace" else kind
+            return f"{work_kind}:{binding_id}", kind, binding_id
     if owner_id.startswith("operator:"):
         return f"operation:{owner_id}", "operation-owner", owner_id
     return f"owner:{owner_id}", "lease-owner", owner_id
@@ -889,6 +888,12 @@ def _finalize_groups(
         )
         if task_item and task_item["state"] in TERMINAL_TASK_STATES and has_live_surface:
             _blocking(group, "terminal-task-with-live-surfaces")
+        archived_attention = bool(
+            {"attention:decision_closed", "attention:decision_superseded"}
+            & set(group["source_states"])
+        )
+        if archived_attention and has_live_surface:
+            _blocking(group, "archived-attention-with-live-surfaces")
         if view == "current" and group["projection_state"] == "terminal_archived" and not has_live_surface and not group["action_required"]:
             continue
 
@@ -1167,7 +1172,9 @@ def build_current_work_projection(
         "repository_filters": repositories,
         "count": len(page),
         "total_projected": len(projected),
+        "total_projected_scope": "bounded_source_snapshot",
         "state_counts": state_counts,
+        "state_counts_scope": "bounded_source_snapshot",
         "work": page,
         "pagination": {
             "limit": limit,
