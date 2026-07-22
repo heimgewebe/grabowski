@@ -595,11 +595,11 @@ class TaskAttentionTests(unittest.TestCase):
     def test_reconciliation_is_bounded_and_cursor_stable(self) -> None:
         first = self._failed_task()
         second = self._failed_task()
-        page = attention.reconcile_attention({"limit": 1})
+        page = attention.reconcile_attention({"limit": 1, "view": "history"})
         self.assertEqual(1, page["pagination"]["returned"])
         self.assertTrue(page["pagination"]["has_more"])
         next_page = attention.reconcile_attention(
-            {"limit": 1, "cursor": page["pagination"]["next_cursor"]}
+            {"limit": 1, "view": "history", "cursor": page["pagination"]["next_cursor"]}
         )
         ids = {page["records"][0]["task_id"], next_page["records"][0]["task_id"]}
         self.assertEqual({first["task_id"], second["task_id"]}, ids)
