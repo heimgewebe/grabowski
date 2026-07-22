@@ -1436,39 +1436,133 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         self.assertIsNone(asset.unit)
         self.assertEqual(dual.TUNNEL_OPERATOR_DEPENDENCY_PATH, asset.target)
 
+    def dependency_bytes(self) -> bytes:
+        return (ROOT / dual.TUNNEL_OPERATOR_DEPENDENCY_RELATIVE).read_bytes()
+
+    def dependency_observation(
+        self, target: Path | None = None
+    ) -> dict[str, tuple[str, ...]]:
+        target = target or dual.TUNNEL_OPERATOR_DEPENDENCY_PATH
+        return {
+            "LoadState": ("loaded",),
+            "Wants": (dual.OPERATOR_SERVICE, "network-online.target"),
+            "After": (dual.OPERATOR_SERVICE, "network-online.target"),
+            "PartOf": (dual.OPERATOR_SERVICE,),
+            "BindsTo": (),
+            "DropInPaths": (str(target.resolve()),),
+        }
+
+    def test_dependency_source_contract_is_exact(self) -> None:
+        expected = self.dependency_bytes()
+        self.assertEqual(
+            expected, dual._validate_tunnel_operator_dependency_bytes(expected)
+        )
+        invalid = {
+            "binds-to": expected + b"BindsTo=grabowski-operator.service\n",
+            "extra-partof": expected.replace(
+                b"PartOf=grabowski-operator.service",
+                b"PartOf=grabowski-operator.service other.service",
+            ),
+            "duplicate": expected + b"PartOf=grabowski-operator.service\n",
+            "extra-section": expected + b"[Service]\nType=oneshot\n",
+            "missing-newline": expected.rstrip(b"\n"),
+        }
+        for name, payload in invalid.items():
+            with self.subTest(name=name), self.assertRaises(core.DeployError):
+                dual._validate_tunnel_operator_dependency_bytes(payload)
+
     def test_effective_tunnel_operator_dependency_readback(self) -> None:
+        path = str(dual.TUNNEL_OPERATOR_DEPENDENCY_PATH.resolve())
         completed = subprocess.CompletedProcess(
             ["systemctl"],
             0,
+            "LoadState=loaded\n"
             "Wants=grabowski-operator.service network-online.target\n"
             "After=grabowski-operator.service network-online.target\n"
-            "PartOf=grabowski-operator.service\n",
+            "PartOf=grabowski-operator.service\n"
+            "BindsTo=\n"
+            f"DropInPaths={path}\n",
             "",
         )
         with mock.patch.object(core, "run", return_value=completed) as run:
             observed = dual.verify_tunnel_operator_dependency()
-        self.assertIn("grabowski-operator.service", observed["PartOf"])
-        self.assertIn("grabowski-operator.service", observed["After"])
-        self.assertIn("grabowski-operator.service", observed["Wants"])
-        self.assertIn("--property=PartOf", run.call_args.args[0])
+        self.assertEqual((dual.OPERATOR_SERVICE,), observed["PartOf"])
+        self.assertIn(dual.OPERATOR_SERVICE, observed["After"])
+        self.assertIn(dual.OPERATOR_SERVICE, observed["Wants"])
+        self.assertEqual((), observed["BindsTo"])
+        self.assertEqual(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                dual.TUNNEL_SERVICE,
+                "--property=LoadState",
+                "--property=Wants",
+                "--property=After",
+                "--property=PartOf",
+                "--property=BindsTo",
+                "--property=DropInPaths",
+            ],
+            run.call_args.args[0],
+        )
 
-    def test_effective_tunnel_operator_dependency_fails_closed_without_partof(self) -> None:
+    def test_effective_tunnel_operator_dependency_rejects_contract_drift(self) -> None:
+        base = self.dependency_observation()
+        cases = {
+            "load-state": {**base, "LoadState": ("not-found",)},
+            "wants": {**base, "Wants": ()},
+            "after": {**base, "After": ()},
+            "missing-partof": {**base, "PartOf": ()},
+            "extra-partof": {
+                **base,
+                "PartOf": tuple(sorted((dual.OPERATOR_SERVICE, "other.service"))),
+            },
+            "binds-to": {**base, "BindsTo": (dual.OPERATOR_SERVICE,)},
+            "wrong-dropin": {**base, "DropInPaths": ("/tmp/other.conf",)},
+        }
+        for name, observed in cases.items():
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    dual, "observe_tunnel_operator_dependency", return_value=observed
+                ),
+                self.assertRaises(core.DeployError),
+            ):
+                dual.verify_tunnel_operator_dependency()
+
+    def test_dependency_observation_rejects_duplicate_properties(self) -> None:
+        path = str(dual.TUNNEL_OPERATOR_DEPENDENCY_PATH.resolve())
         completed = subprocess.CompletedProcess(
             ["systemctl"],
             0,
+            "LoadState=loaded\n"
             "Wants=grabowski-operator.service\n"
             "After=grabowski-operator.service\n"
-            "PartOf=\n",
+            "PartOf=grabowski-operator.service\n"
+            "PartOf=grabowski-operator.service\n"
+            "BindsTo=\n"
+            f"DropInPaths={path}\n",
             "",
         )
         with mock.patch.object(core, "run", return_value=completed):
-            with self.assertRaises(core.DeployError):
-                dual.verify_tunnel_operator_dependency()
+            with self.assertRaises(core.DeployError) as raised:
+                dual.observe_tunnel_operator_dependency()
+        self.assertEqual(["PartOf"], raised.exception.details["duplicate_properties"])
 
-    def test_unchanged_dependency_dropin_still_reloads_before_readback(self) -> None:
+    def test_dependency_observation_preserves_systemctl_stderr(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["systemctl"], 1, "", "Failed to connect to bus"
+        )
+        with mock.patch.object(core, "run", return_value=completed):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.observe_tunnel_operator_dependency()
+        self.assertEqual("Failed to connect to bus", raised.exception.details["stderr"])
+
+    def test_unchanged_dependency_dropin_skips_reload_when_readback_is_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "70-operator-dependency.conf"
-            target.write_bytes(b"new")
+            expected = self.dependency_bytes()
+            target.write_bytes(expected)
             target.chmod(0o600)
             asset = dual.WatchdogHostAsset(
                 source=dual.TUNNEL_OPERATOR_DEPENDENCY_RELATIVE,
@@ -1476,9 +1570,141 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 mode=0o600,
                 reloads_systemd=True,
             )
+            preimage = self.dependency_observation(target)
             with (
-                mock.patch.object(core, "git_show", return_value=b"new"),
+                mock.patch.object(core, "git_show", return_value=expected),
+                mock.patch.object(
+                    dual, "observe_tunnel_operator_dependency", return_value=preimage
+                ),
                 mock.patch.object(dual, "_systemd_daemon_reload") as reload,
+                mock.patch.object(
+                    dual, "verify_watchdog_systemd_fragments", return_value={}
+                ),
+                mock.patch.object(
+                    dual, "verify_tunnel_operator_dependency", return_value=preimage
+                ) as verify,
+            ):
+                projection = dual.install_watchdog_host_assets(
+                    ROOT, self.snapshot(), assets=(asset,)
+                )
+        self.assertEqual((), projection.changed_targets)
+        reload.assert_not_called()
+        verify.assert_called_once_with((asset,))
+
+    def test_unchanged_dependency_dropin_reloads_once_to_repair_stale_readback(self) -> None:
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "70-operator-dependency.conf"
+            expected = self.dependency_bytes()
+            target.write_bytes(expected)
+            target.chmod(0o600)
+            asset = dual.WatchdogHostAsset(
+                source=dual.TUNNEL_OPERATOR_DEPENDENCY_RELATIVE,
+                target=target,
+                mode=0o600,
+                reloads_systemd=True,
+            )
+            preimage = self.dependency_observation(target)
+            verify_calls = 0
+
+            def verify(_assets):
+                nonlocal verify_calls
+                verify_calls += 1
+                events.append("verify")
+                if verify_calls == 1:
+                    raise core.DeployError("stale manager state")
+                return preimage
+
+            with (
+                mock.patch.object(core, "git_show", return_value=expected),
+                mock.patch.object(
+                    dual, "observe_tunnel_operator_dependency", return_value=preimage
+                ),
+                mock.patch.object(
+                    dual, "_systemd_daemon_reload",
+                    side_effect=lambda: events.append("reload"),
+                ),
+                mock.patch.object(
+                    dual, "verify_watchdog_systemd_fragments", return_value={}
+                ),
+                mock.patch.object(
+                    dual, "verify_tunnel_operator_dependency", side_effect=verify
+                ),
+            ):
+                projection = dual.install_watchdog_host_assets(
+                    ROOT, self.snapshot(), assets=(asset,)
+                )
+        self.assertEqual((), projection.changed_targets)
+        self.assertEqual(["verify", "reload", "verify"], events)
+
+    def test_changed_dependency_dropin_reloads_before_effective_readback(self) -> None:
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "nested" / "70-operator-dependency.conf"
+            old = b"[Unit]\nWants=grabowski-operator.service\nAfter=grabowski-operator.service\n"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(old)
+            target.chmod(0o600)
+            expected = self.dependency_bytes()
+            asset = dual.WatchdogHostAsset(
+                source=dual.TUNNEL_OPERATOR_DEPENDENCY_RELATIVE,
+                target=target,
+                mode=0o600,
+                reloads_systemd=True,
+            )
+            preimage = {**self.dependency_observation(target), "PartOf": ()}
+            with (
+                mock.patch.object(core, "git_show", return_value=expected),
+                mock.patch.object(
+                    dual, "observe_tunnel_operator_dependency", return_value=preimage
+                ),
+                mock.patch.object(
+                    dual, "_systemd_daemon_reload",
+                    side_effect=lambda: events.append("reload"),
+                ),
+                mock.patch.object(
+                    dual, "verify_watchdog_systemd_fragments", return_value={}
+                ),
+                mock.patch.object(
+                    dual,
+                    "verify_tunnel_operator_dependency",
+                    side_effect=lambda _assets: events.append("verify") or {},
+                ),
+            ):
+                projection = dual.install_watchdog_host_assets(
+                    ROOT, self.snapshot(), assets=(asset,)
+                )
+            installed = target.read_bytes()
+        self.assertEqual((str(target),), projection.changed_targets)
+        self.assertEqual(expected, installed)
+        self.assertEqual(["reload", "verify"], events)
+
+    def test_dependency_install_creates_missing_dropin_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = (
+                Path(directory)
+                / "missing"
+                / "tunnel-client-grabowski.service.d"
+                / "70-operator-dependency.conf"
+            )
+            expected = self.dependency_bytes()
+            asset = dual.WatchdogHostAsset(
+                source=dual.TUNNEL_OPERATOR_DEPENDENCY_RELATIVE,
+                target=target,
+                mode=0o600,
+                reloads_systemd=True,
+            )
+            preimage = {
+                **self.dependency_observation(target),
+                "DropInPaths": (),
+                "PartOf": (),
+            }
+            with (
+                mock.patch.object(core, "git_show", return_value=expected),
+                mock.patch.object(
+                    dual, "observe_tunnel_operator_dependency", return_value=preimage
+                ),
+                mock.patch.object(dual, "_systemd_daemon_reload"),
                 mock.patch.object(
                     dual, "verify_watchdog_systemd_fragments", return_value={}
                 ),
@@ -1486,11 +1712,60 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                     dual, "verify_tunnel_operator_dependency", return_value={}
                 ),
             ):
-                projection = dual.install_watchdog_host_assets(
+                dual.install_watchdog_host_assets(
                     ROOT, self.snapshot(), assets=(asset,)
                 )
-        self.assertEqual((), projection.changed_targets)
+            installed = target.read_bytes()
+        self.assertEqual(expected, installed)
+
+    def test_rollback_restores_dependency_preimage_after_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "70-operator-dependency.conf"
+            expected = self.dependency_bytes()
+            old = b"[Unit]\nWants=grabowski-operator.service\nAfter=grabowski-operator.service\n"
+            target.write_bytes(expected)
+            target.chmod(0o600)
+            asset = dual.WatchdogHostAsset(
+                source=dual.TUNNEL_OPERATOR_DEPENDENCY_RELATIVE,
+                target=target,
+                mode=0o600,
+                reloads_systemd=True,
+            )
+            dependency_preimage = {
+                **self.dependency_observation(target),
+                "PartOf": (),
+                "DropInPaths": (),
+            }
+            projection = dual.WatchdogHostAssetProjection(
+                repo_head="a" * 40,
+                preimages=(
+                    dual.WatchdogHostAssetPreimage(
+                        asset=asset,
+                        existed=True,
+                        content=old,
+                        mode=0o600,
+                        identity=None,
+                    ),
+                ),
+                expected={str(target): expected},
+                changed_targets=(str(target),),
+                asset_set_sha256="b" * 64,
+                tunnel_operator_dependency_preimage=dependency_preimage,
+            )
+            with (
+                mock.patch.object(dual, "_systemd_daemon_reload") as reload,
+                mock.patch.object(
+                    dual, "verify_watchdog_systemd_fragments", return_value={}
+                ),
+                mock.patch.object(
+                    dual, "verify_tunnel_operator_dependency_preimage", return_value={}
+                ) as verify_preimage,
+            ):
+                dual.restore_watchdog_host_assets(projection)
+            restored = target.read_bytes()
+        self.assertEqual(old, restored)
         reload.assert_called_once_with()
+        verify_preimage.assert_called_once_with(dependency_preimage, (asset,))
 
     def test_projection_is_git_head_bound_atomic_and_reversible(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1854,6 +2129,56 @@ class DeploymentSequenceTests(unittest.TestCase):
                 expected_agent_instructions=TEST_AGENT_INSTRUCTIONS_IDENTITY,
             )
 
+    def test_tunnel_drain_metrics_require_unique_complete_nonnegative_values(self) -> None:
+        valid = (
+            "commands_queue_length{scope=\"controlplane\"} 0\n"
+            "dispatcher_worker_pool_occupancy{scope=\"dispatcher\"} 2\n"
+        )
+        self.assertEqual(
+            {
+                "commands_queue_length": 0.0,
+                "dispatcher_worker_pool_occupancy": 2.0,
+            },
+            dual._parse_tunnel_drain_metrics(valid),
+        )
+        invalid = {
+            "missing": "commands_queue_length 0\n",
+            "duplicate": valid + "dispatcher_worker_pool_occupancy 0\n",
+            "negative": valid.replace("occupancy{scope=\"dispatcher\"} 2", "occupancy{scope=\"dispatcher\"} -1"),
+            "nan": valid.replace("occupancy{scope=\"dispatcher\"} 2", "occupancy{scope=\"dispatcher\"} NaN"),
+        }
+        for name, payload in invalid.items():
+            with self.subTest(name=name), self.assertRaises(core.DeployError):
+                dual._parse_tunnel_drain_metrics(payload)
+
+    def test_tunnel_drain_wait_requires_consecutive_idle_samples(self) -> None:
+        busy = (
+            "commands_queue_length 0\n"
+            "dispatcher_worker_pool_occupancy 1\n"
+        )
+        idle = (
+            "commands_queue_length 0\n"
+            "dispatcher_worker_pool_occupancy 0\n"
+        )
+        with (
+            mock.patch.object(core, "http_text", side_effect=[busy, idle, idle, idle]),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            result = dual.wait_for_tunnel_dispatcher_idle(timeout_seconds=5)
+        self.assertEqual(4, result["attempts"])
+        self.assertEqual(3, result["consecutive_idle_samples"])
+        self.assertEqual(0.0, result["metrics"]["dispatcher_worker_pool_occupancy"])
+
+    def test_tunnel_drain_wait_fails_closed_without_metrics(self) -> None:
+        with (
+            mock.patch.object(core, "http_text", return_value=None),
+            mock.patch.object(dual.time, "monotonic", side_effect=[0.0, 2.0]),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.wait_for_tunnel_dispatcher_idle(timeout_seconds=1)
+        self.assertEqual("tunnel-drain-pre-stop", raised.exception.phase)
+        self.assertEqual({"reason": "metrics-unavailable"}, raised.exception.details["last_error"])
+
     def test_cutover_order_is_tunnel_then_operator_and_reverse_on_start(self) -> None:
         events: list[str] = []
         snapshot = self.snapshot()
@@ -1889,6 +2214,11 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "install_safety_observer_unit",
                 side_effect=lambda *args: events.append("install:observer"),
             ) as install,
+            mock.patch.object(
+                dual,
+                "wait_for_tunnel_dispatcher_idle",
+                side_effect=lambda **kwargs: events.append("drain:tunnel") or {},
+            ),
             mock.patch.object(
                 dual,
                 "stop_service",
@@ -1941,6 +2271,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "install:watchdogs",
                 "install:observer",
                 "verify:snapshot",
+                "drain:tunnel",
                 f"stop:{dual.TUNNEL_SERVICE}",
                 f"stop:{dual.OPERATOR_SERVICE}",
                 "verify:snapshot",
@@ -2019,6 +2350,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(
                 dual, "install_safety_observer_unit", return_value=repair
             ),
+            mock.patch.object(dual, "wait_for_tunnel_dispatcher_idle", return_value={}),
             mock.patch.object(dual, "stop_service", side_effect=stop),
             mock.patch.object(core, "activate_pointer") as activate,
             mock.patch.object(dual, "rollback_url", side_effect=rollback),
@@ -2050,6 +2382,60 @@ class DeploymentSequenceTests(unittest.TestCase):
                 **repair,
             },
         )
+
+    def test_drain_failure_aborts_before_service_stop_without_service_rollback(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                dual,
+                "preflight_url",
+                return_value=(
+                    self.snapshot(),
+                    RUNTIME,
+                    dual.ProfileTopology("url", server_url_count=1),
+                ),
+            ),
+            mock.patch.object(core, "build_release", return_value=self.build()),
+            mock.patch.object(core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(core, "verify_manifest"),
+            mock.patch.object(core, "capture_pointer", return_value=SimpleNamespace()),
+            mock.patch.object(
+                dual, "install_watchdog_host_assets", return_value=self.watchdog_projection()
+            ),
+            mock.patch.object(dual, "restore_watchdog_host_assets") as restore_watchdogs,
+            mock.patch.object(
+                dual,
+                "install_safety_observer_unit",
+                return_value={
+                    "changed": False,
+                    "repo_head": "a" * 40,
+                    "sha256": "d" * 64,
+                },
+            ),
+            mock.patch.object(
+                dual,
+                "wait_for_tunnel_dispatcher_idle",
+                side_effect=core.DeployError(
+                    "busy", phase="tunnel-drain-pre-stop"
+                ),
+            ),
+            mock.patch.object(dual, "stop_service") as stop,
+            mock.patch.object(dual, "rollback_url") as rollback,
+            mock.patch("sys.stderr", stderr),
+        ):
+            with self.assertRaisesRegex(core.DeployError, "busy"):
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+        stop.assert_not_called()
+        rollback.assert_not_called()
+        restore_watchdogs.assert_called_once()
+        payload = json.loads(
+            next(
+                line.removeprefix("PRIMARY-DEPLOY-ERROR: ")
+                for line in stderr.getvalue().splitlines()
+                if line.startswith("PRIMARY-DEPLOY-ERROR: ")
+            )
+        )
+        self.assertEqual("tunnel-drain-pre-stop", payload["deploy_phase"])
 
     def test_post_observer_snapshot_failure_retains_repair_and_rolls_back(self) -> None:
         stderr = io.StringIO()
@@ -2159,6 +2545,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                     "sha256": "d" * 64,
                 },
             ),
+            mock.patch.object(dual, "wait_for_tunnel_dispatcher_idle", return_value={}),
             mock.patch.object(dual, "stop_service", side_effect=stop),
             mock.patch.object(dual, "rollback_url", side_effect=rollback),
             mock.patch("sys.stderr", stderr),

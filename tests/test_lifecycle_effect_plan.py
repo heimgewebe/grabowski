@@ -382,6 +382,34 @@ class LifecycleEffectPlanTests(unittest.TestCase):
         )
         self.assertEqual(receipt["status"], "failed")
 
+    def test_effect_receipt_must_start_before_earliest_lease_expiry(self) -> None:
+        with self.assertRaises(ValueError):
+            self.build_receipt(started_at_unix=2000, completed_at_unix=2001)
+
+    def test_self_consistent_receipt_start_after_lease_expiry_fails_binding(self) -> None:
+        plan = self.build_plan()
+        revalidation = self.ready_revalidation(plan=plan)
+        receipt = self.build_receipt(plan=plan, revalidation=revalidation)
+        forged = {**receipt, "started_at_unix": 2000, "completed_at_unix": 2001}
+        body = {key: value for key, value in forged.items() if key != "receipt_sha256"}
+        forged["receipt_sha256"] = effect_plan.sha256_json(body)
+        with self.assertRaises(effect_plan.LifecycleEffectPlanIntegrityError):
+            effect_plan._validate_effect_execution_receipt_binding(
+                forged, plan=plan, revalidation=revalidation
+            )
+
+    def test_recovery_receipt_may_complete_after_lease_expiry_if_started_in_time(self) -> None:
+        receipt = self.build_receipt(
+            started_at_unix=1999,
+            completed_at_unix=2001,
+            transport_outcome="unknown",
+            mutation_state="unknown",
+            post_state_status="unavailable",
+            post_state_sha256s=None,
+            recovery_refs=["recovery:effect:exec-task-a-001"],
+        )
+        self.assertEqual(receipt["status"], "recovery_required")
+
     def test_confirmed_outcome_requires_verified_post_state(self) -> None:
         with self.assertRaises(ValueError):
             self.build_receipt(

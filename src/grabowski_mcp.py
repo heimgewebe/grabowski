@@ -8667,19 +8667,22 @@ def _repoground_budget_context(
     return context, counts, exact_used_bytes
 
 
-def _repoground_evidence_uses_coherent_source(value: Any, source: str) -> bool:
-    if isinstance(value, dict):
-        if value.get("source") == source and value.get("status") == "coherent":
-            return True
-        return any(
-            _repoground_evidence_uses_coherent_source(item, source)
-            for item in value.values()
-        )
-    if isinstance(value, list):
-        return any(
-            _repoground_evidence_uses_coherent_source(item, source) for item in value
-        )
-    return False
+_REPOGROUND_PYTHON_CALL_GRAPH_SOURCE = "python_call_graph_json"
+
+
+def _repoground_relation_uses_coherent_source(value: Any, source: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    provenance = value.get("provenance")
+    candidates = [value.get("freshness")]
+    if isinstance(provenance, dict):
+        candidates.append(provenance.get("relation"))
+    return any(
+        isinstance(candidate, dict)
+        and candidate.get("source") == source
+        and candidate.get("status") == "coherent"
+        for candidate in candidates
+    )
 
 
 @mcp.tool(name="repoground_context_compose", annotations=READ_ANNOTATIONS)
@@ -8801,8 +8804,6 @@ def repoground_context_compose(
     authority_rules = _repoground_authority_rules(preflight)
     gate_evidence = _repoground_gate_evidence(preflight, bundle_status)
     impact_status = str(impact.get("status", "unknown"))
-    source_statuses = _repoground_dict_items(impact.get("source_statuses")) if isinstance(impact, dict) else []
-    symbol_available = any(item.get("source") == "python_symbol_index_json" and item.get("status") == "available" for item in source_statuses)
     causal_relations = _repoground_dict_items(impact.get("relations")) if isinstance(impact, dict) else []
 
     edit_context = impact.get("edit_context") if isinstance(impact, dict) and isinstance(impact.get("edit_context"), dict) else {}
@@ -8836,20 +8837,23 @@ def repoground_context_compose(
         used.append("agent_impact")
     if effective_query and baseline.get("available"):
         used.append("query_context")
-    if symbol_available:
+    if context.get("target_symbols"):
         used.append("symbol_navigation")
-    call_graph_used = _repoground_evidence_uses_coherent_source(
-        context.get("causal_relations", []), "python_call_graph_json"
+    call_graph_used = any(
+        _repoground_relation_uses_coherent_source(
+            relation, _REPOGROUND_PYTHON_CALL_GRAPH_SOURCE
+        )
+        for relation in _repoground_dict_items(context.get("causal_relations"))
     )
     if call_graph_used:
         used.append("call_graph")
-    if "citation_map_jsonl" in surfaces or context.get("citations"):
+    if context.get("citations"):
         used.append("citation")
     if context.get("live_ranges"):
         used.append("live_evidence")
-    if "agent_entry_manifest" in surfaces:
+    if context.get("entry_manifest"):
         used.append("entry_manifest")
-    if "pr_delta_cards_jsonl" in surfaces:
+    if context.get("pr_delta_cards"):
         used.append("pr_delta_cards")
     all_lanes = ["direct_changes", "agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "symbol_navigation", "call_graph", "citation", "live_evidence"]
     skipped = [name for name in all_lanes if name not in used]
