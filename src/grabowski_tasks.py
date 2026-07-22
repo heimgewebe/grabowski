@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -3949,6 +3950,72 @@ def _chronik_bounded_text(value: str, *, label: str, maximum: int = 256) -> str:
     return normalized
 
 
+def _chronik_parse_timestamp(value: str, *, label: str) -> datetime:
+    candidate = value.strip()
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _chronik_history_event_matches_query(
+    event: dict[str, Any],
+    normalized: dict[str, str],
+    *,
+    since_timestamp: datetime | None,
+) -> bool:
+    if event.get("schema_version") != "agent-run-event.v0":
+        return False
+    source = event.get("source")
+    if (
+        not isinstance(source, dict)
+        or source.get("repo") != "heimgewebe/grabowski"
+        or source.get("component") != "grabowski"
+    ):
+        return False
+    if event.get("kind") not in {
+        "agent.run.started",
+        "agent.run.completed",
+        "agent.run.blocked",
+    }:
+        return False
+    if event.get("event_id") != chronik.event_id(event):
+        return False
+    subject = event.get("subject")
+    data = event.get("data")
+    if not isinstance(subject, dict) or not isinstance(data, dict):
+        return False
+    if normalized["repo"]:
+        if subject.get("scope") != "repository" or subject.get("repo") != normalized["repo"]:
+            return False
+    elif subject.get("scope") != "host" or subject.get("host") != normalized["host"]:
+        return False
+    if normalized["component"] and subject.get("component") != normalized["component"]:
+        return False
+    if normalized["operation"] and data.get("operation") != normalized["operation"]:
+        return False
+    if normalized["task_class"] and data.get("task_class") != normalized["task_class"]:
+        return False
+    if normalized["outcome"] and data.get("result") != normalized["outcome"]:
+        return False
+    if since_timestamp is not None:
+        timestamp = event.get("ts")
+        if not isinstance(timestamp, str):
+            return False
+        try:
+            event_timestamp = _chronik_parse_timestamp(timestamp, label="history event ts")
+        except ValueError:
+            return False
+        if event_timestamp < since_timestamp:
+            return False
+    return True
+
+
 def _chronik_cli_run(
     arguments: list[str],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -4177,6 +4244,11 @@ def grabowski_chronik_history(
     }
     if bool(normalized["repo"]) == bool(normalized["host"]):
         raise ValueError("exactly one of repo or host is required")
+    since_timestamp = (
+        _chronik_parse_timestamp(normalized["since"], label="since")
+        if normalized["since"]
+        else None
+    )
     arguments = ["query"]
     target_key = "repo" if normalized["repo"] else "host"
     arguments.append(f"--{target_key}={normalized[target_key]}")
@@ -4249,6 +4321,15 @@ def grabowski_chronik_history(
                 for event in raw_events
             ):
                 raise ValueError("Chronik coding-memory history contains unredacted event")
+            if any(
+                not _chronik_history_event_matches_query(
+                    event, normalized, since_timestamp=since_timestamp
+                )
+                for event in raw_events
+            ):
+                raise ValueError(
+                    "Chronik coding-memory history contains event unbound to requested query"
+                )
             if not isinstance(raw_claims, list) or not all(
                 isinstance(claim, str) for claim in raw_claims
             ):

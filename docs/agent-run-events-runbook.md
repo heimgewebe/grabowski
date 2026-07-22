@@ -147,7 +147,7 @@ The task-local `chronik_context_json` remains the persisted context truth. It is
 Two typed tools expose the optional local coding-memory seam:
 
 - `grabowski_chronik_outbox_import(path)` imports exactly one existing `grabowski_*.jsonl` directly below `chronik-outbox`. The source must contain only hash-valid, redacted `agent-run-event.v0` records from Grabowski. The adapter calls Chronik's existing positional `import INPUT` command, verifies that the source identity is unchanged afterwards, and returns a SHA-256-bound receipt. Re-import is delegated to Chronik's idempotent event-ID contract; the source is never deleted or compacted by this tool.
-- `grabowski_chronik_history(...)` calls Chronik's bounded `query` command for exactly one repository or host target. The adapter verifies that Chronik's returned query envelope is exactly bound to the requested repository/host and filters before exposing events. Every response is historical-only and explicitly does not establish current Git state, current CI state, current runtime state, or safe retry.
+- `grabowski_chronik_history(...)` calls Chronik's bounded `query` command for exactly one repository or host target. The adapter verifies that Chronik's returned query envelope is exactly bound to the requested repository/host and rejects the response unless every returned event is a valid Grabowski event that matches the requested target and filters before anything is exposed. Every response is historical-only and explicitly does not establish current Git state, current CI state, current runtime state, or safe retry.
 
 The optional checkout and data directory are configured with:
 
