@@ -504,5 +504,195 @@ class AuditQueryTests(unittest.TestCase):
             module.query_audit({})
 
 
+    def test_trace_external_evidence_is_opt_in_and_preserves_non_causality(self) -> None:
+        module = self._load_module(self._components())
+        plain = module.trace_audit("task_id", "task-1")
+        self.assertNotIn("external_evidence", plain)
+
+        module._cross_store_evidence = lambda items, limit: {
+            "schema_version": 1,
+            "kind": "grabowski_cross_store_evidence_projection",
+            "authority": "derived_correlation_only",
+            "evidence": [],
+            "gaps": [],
+            "truncated": False,
+            "does_not_establish": ["causality", "root_cause"],
+        }
+        enriched = module.trace_audit(
+            "task_id",
+            "task-1",
+            include_external_evidence=True,
+            external_limit=3,
+        )
+        self.assertEqual(
+            enriched["external_evidence"]["authority"],
+            "derived_correlation_only",
+        )
+        self.assertIn("causality", enriched["external_evidence"]["does_not_establish"])
+        self.assertIn(
+            "causality_between_correlated_records",
+            enriched["does_not_establish"],
+        )
+
+    def test_cross_store_projection_keeps_source_authorities_and_structured_gaps(self) -> None:
+        module = self._load_module(self._components())
+        module._task_external_evidence = lambda task_id: ([{
+            "source": "task",
+            "status": "verified",
+            "authority": "authoritative_task_store",
+            "relation": "direct_identity",
+            "identity": {"task_id": task_id},
+            "evidence_sha256": "a" * 64,
+            "record": {"task_id": task_id},
+        }], [{"source": "receipt", "status": "gap", "reason": "receipt_not_bound", "context": {"task_id": task_id}}])
+        module._lease_external_evidence = lambda resource_key: ([{
+            "source": "lease",
+            "status": "verified",
+            "authority": "authoritative_resource_lease_store",
+            "relation": "direct_resource_identity",
+            "identity": {"resource_key": resource_key},
+            "evidence_sha256": "b" * 64,
+            "record": {"resource_key": resource_key},
+        }], [])
+        module._deployment_external_evidence = lambda items: ([], [{
+            "source": "deployment",
+            "status": "gap",
+            "reason": "no_deployment_identity_in_audit_seed",
+            "context": {},
+        }])
+
+        result = module._cross_store_evidence(
+            [
+                {
+                    "record": {
+                        "task_id": "task-1",
+                        "resource_keys": ["repo:/srv/example"],
+                    }
+                }
+            ],
+            limit=10,
+        )
+        self.assertEqual(result["authority"], "derived_correlation_only")
+        self.assertEqual(
+            {item["authority"] for item in result["evidence"]},
+            {"authoritative_task_store", "authoritative_resource_lease_store"},
+        )
+        self.assertEqual(
+            {gap["reason"] for gap in result["gaps"]},
+            {"receipt_not_bound", "no_deployment_identity_in_audit_seed"},
+        )
+        self.assertIn("single_cross_store_truth", result["does_not_establish"])
+        self.assertEqual(
+            result["relation_semantics"]["temporal_proximity"],
+            "not promoted to external evidence",
+        )
+
+    def test_cross_store_external_limit_is_bounded(self) -> None:
+        module = self._load_module(self._components())
+        with self.assertRaisesRegex(ValueError, "external_limit must be between"):
+            module._cross_store_evidence([], limit=0)
+        with self.assertRaisesRegex(ValueError, "external_limit must be between"):
+            module._cross_store_evidence([], limit=51)
+
+    def test_external_trace_inputs_fail_before_audit_read(self) -> None:
+        module = self._load_module(self._components())
+        module.capture_verified_audit_snapshot = lambda _path=None: (_ for _ in ()).throw(
+            AssertionError("audit read must not happen")
+        )
+        with self.assertRaisesRegex(ValueError, "include_external_evidence must be a boolean"):
+            module.trace_audit("task_id", "task-1", include_external_evidence=1)
+        with self.assertRaisesRegex(ValueError, "external_limit must be between"):
+            module.trace_audit(
+                "task_id",
+                "task-1",
+                include_external_evidence=True,
+                external_limit=0,
+            )
+
+    def test_receipt_digest_drift_is_reported_as_gap(self) -> None:
+        module = self._load_module([])
+        import tempfile
+        from contextlib import contextmanager
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outcomes = root / "outcomes"
+            outcomes.mkdir()
+            task_id = "task-drift"
+            claimed = "a" * 64
+            (outcomes / f"{task_id}.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": task_id,
+                        "state": "completed",
+                        "attempt": 1,
+                        "receipt_sha256": claimed,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            row = {
+                "task_id": task_id,
+                "attempt": 1,
+                "state": "completed",
+                "unit": "unit",
+                "updated_at_unix": 1,
+                "lifecycle_receipt_sha256": claimed,
+                "terminalization_sha256": "b" * 64,
+                "chronik_outbox_enabled": 0,
+            }
+
+            class Connection:
+                def execute(self, _query, _parameters):
+                    return self
+
+                def fetchone(self):
+                    return row
+
+            fake_tasks = types.ModuleType("grabowski_tasks")
+            fake_tasks.TASK_DB = root / "tasks.sqlite3"
+            fake_tasks.TASK_OUTCOMES_DIR = outcomes
+            fake_tasks._preflight_task_store = lambda: "5"
+            fake_tasks._task_archive_record = lambda value: {
+                "task_id": value["task_id"],
+                "attempt": value["attempt"],
+                "state": value["state"],
+            }
+            fake_tasks._read_existing_outcome_receipt = (
+                lambda _path, transition_sha256, allow_legacy: (_ for _ in ()).throw(
+                    RuntimeError("receipt digest mismatch")
+                )
+            )
+            fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+            @contextmanager
+            def readonly_sqlite(_path):
+                yield Connection()
+
+            fake_sqlite.readonly_sqlite = readonly_sqlite
+            previous_tasks = sys.modules.get("grabowski_tasks")
+            previous_sqlite = sys.modules.get("grabowski_sqlite_store")
+            sys.modules["grabowski_tasks"] = fake_tasks
+            sys.modules["grabowski_sqlite_store"] = fake_sqlite
+            try:
+                evidence, gaps = module._task_external_evidence(task_id)
+            finally:
+                if previous_tasks is None:
+                    sys.modules.pop("grabowski_tasks", None)
+                else:
+                    sys.modules["grabowski_tasks"] = previous_tasks
+                if previous_sqlite is None:
+                    sys.modules.pop("grabowski_sqlite_store", None)
+                else:
+                    sys.modules["grabowski_sqlite_store"] = previous_sqlite
+
+        self.assertEqual(evidence[0]["source"], "task")
+        self.assertNotIn("receipt", {item["source"] for item in evidence})
+        self.assertEqual(
+            [gap["reason"] for gap in gaps if gap["source"] == "receipt"],
+            ["receipt_unverifiable"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

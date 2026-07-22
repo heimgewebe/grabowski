@@ -172,3 +172,19 @@ Audit Query / Trace v1.1 is not:
 - a complete cross-store evidence graph.
 
 Cross-store evidence remains the scope of the separately planned follow-up. External sources must retain their own authority, immutable evidence references and freshness identity rather than being copied into the audit projection.
+
+## Optional cross-store evidence projection
+
+`grabowski_audit_trace` can opt into bounded external evidence with `include_external_evidence=true` and `external_limit` between 1 and 50. The default remains unchanged and does not read external stores.
+
+The projection is explicitly `derived_correlation_only`. It does not merge authority. Each verified item retains its source authority, relation type, stable identity and evidence digest:
+
+- Task evidence is read from a schema-verified read-only Task SQLite snapshot and bound to the stable task archive-record digest.
+- Lifecycle receipt evidence is accepted only when the Task row binds the receipt SHA-256 and the existing receipt verifier confirms the same digest.
+- Lease evidence is read from a schema-verified read-only Resource SQLite snapshot and correlated only by an exact held resource key.
+- Chronik evidence is read through the hardened bounded regular-file reader, then bound to the exact Task/attempt source name and source SHA-256; event IDs are recomputed and bounded in the response.
+- Deployment evidence is emitted only when an Audit seed carries a release/commit/head identity matching the currently verified deployment manifest.
+
+Missing, stale, drifting or unverifiable external evidence is returned as a structured `gap` and is never promoted to a verified link. Result payloads and source fan-out are bounded by `external_limit`.
+
+Relation labels distinguish direct identity and digest bindings. The combined projection explicitly does not establish a single cross-store truth, causality, root cause, task success from Audit correlation, semantic correctness or future action authority.

@@ -2640,7 +2640,7 @@
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "4ea793a295ca5d4dc73489795984fe8ffd27d623377d058c6fe5d71ee477fec8",
-      "src/grabowski_audit_query.py": "e11cc0c90fbddc637becabedb9f2301fbf632e28806d4f4d285041d388f4a392",
+      "src/grabowski_audit_query.py": "0fa8874cbed5c22b8159ad40605844236ed8a585aca02a1269b8730fe1e4f407",
       "src/grabowski_blockade_authority.py": "f4f5d5260b8f88a01eb176b25427de4726c57a926982cb446b54ccb6e1dbadcd",
       "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",

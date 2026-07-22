@@ -711,6 +711,251 @@ def _shared_correlations(item: dict[str, Any], tokens: dict[str, list[str]]) -> 
     return matches
 
 
+
+def _evidence_digest(value: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _external_gap(source: str, reason: str, **context: Any) -> dict[str, Any]:
+    return {
+        "source": source,
+        "status": "gap",
+        "reason": reason,
+        "context": context,
+    }
+
+
+def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    import grabowski_tasks as tasks
+    import grabowski_sqlite_store as sqlite_store
+
+    evidence: list[dict[str, Any]] = []
+    gaps: list[dict[str, Any]] = []
+    try:
+        version = tasks._preflight_task_store()
+        if version is None:
+            return evidence, [_external_gap("task", "task_store_uninitialized", task_id=task_id)]
+        with sqlite_store.readonly_sqlite(tasks.TASK_DB) as connection:
+            row = connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    except Exception as exc:
+        return evidence, [_external_gap("task", "task_store_unverifiable", task_id=task_id, error=type(exc).__name__)]
+    if row is None:
+        return evidence, [_external_gap("task", "task_not_found", task_id=task_id)]
+
+    raw = dict(row)
+    stable = tasks._task_archive_record(raw)
+    task_digest = _evidence_digest(stable)
+    evidence.append({
+        "source": "task",
+        "status": "verified",
+        "authority": "authoritative_task_store",
+        "relation": "direct_identity",
+        "identity": {"task_id": task_id, "attempt": int(raw["attempt"])},
+        "evidence_sha256": task_digest,
+        "record": {
+            "task_id": task_id,
+            "attempt": int(raw["attempt"]),
+            "state": raw["state"],
+            "unit": raw["unit"],
+            "updated_at_unix": int(raw["updated_at_unix"]),
+            "lifecycle_receipt_sha256": raw.get("lifecycle_receipt_sha256"),
+            "terminalization_sha256": raw.get("terminalization_sha256"),
+        },
+    })
+
+    receipt_digest = raw.get("lifecycle_receipt_sha256")
+    if isinstance(receipt_digest, str) and receipt_digest:
+        path = tasks.TASK_OUTCOMES_DIR / f"{task_id}.json"
+        try:
+            verified_digest = tasks._read_existing_outcome_receipt(
+                path,
+                transition_sha256=None,
+                allow_legacy=True,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            claimed = payload.get("receipt_sha256")
+            if (
+                verified_digest != receipt_digest
+                or claimed != receipt_digest
+                or payload.get("task_id") != task_id
+            ):
+                raise ValueError("receipt identity drift")
+        except Exception as exc:
+            gaps.append(_external_gap("receipt", "receipt_unverifiable", task_id=task_id, error=type(exc).__name__))
+        else:
+            evidence.append({
+                "source": "receipt",
+                "status": "verified",
+                "authority": "authoritative_task_lifecycle_receipt",
+                "relation": "direct_digest_binding",
+                "identity": {"task_id": task_id, "receipt_sha256": claimed},
+                "evidence_sha256": claimed,
+                "record": {
+                    "task_id": task_id,
+                    "state": payload.get("state"),
+                    "attempt": payload.get("attempt"),
+                    "observed_at_unix": payload.get("observed_at_unix"),
+                },
+            })
+    else:
+        gaps.append(_external_gap("receipt", "receipt_not_bound", task_id=task_id))
+
+    if bool(raw.get("chronik_outbox_enabled")):
+        import grabowski_chronik as chronik
+        outbox_root = Path.home() / ".local/state/grabowski/chronik-outbox"
+        source = outbox_root / f"grabowski_task-{task_id}-a{int(raw['attempt'])}.jsonl"
+        try:
+            loaded = chronik._read_regular_file(
+                source,
+                maximum=chronik.MAX_BUNDLE_BYTES,
+                label="Chronik outbox source",
+                allow_missing=True,
+            )
+            if loaded is None:
+                raise FileNotFoundError(source)
+            data, _identity = loaded
+            events = [json.loads(line) for line in data.decode("utf-8").splitlines() if line]
+            if not events:
+                raise ValueError("empty Chronik source")
+            event_ids = [chronik.event_id(event) for event in events]
+        except Exception as exc:
+            gaps.append(_external_gap("chronik", "chronik_source_unverifiable", task_id=task_id, error=type(exc).__name__))
+        else:
+            source_digest = hashlib.sha256(data).hexdigest()
+            evidence.append({
+                "source": "chronik",
+                "status": "verified",
+                "authority": "authoritative_chronik_outbox_source",
+                "relation": "direct_task_identity",
+                "identity": {"task_id": task_id, "attempt": int(raw["attempt"]), "source_sha256": source_digest},
+                "evidence_sha256": source_digest,
+                "record": {"event_count": len(event_ids), "event_ids": event_ids[:8], "event_ids_truncated": len(event_ids) > 8},
+            })
+    else:
+        gaps.append(_external_gap("chronik", "chronik_not_enabled_for_task", task_id=task_id))
+    return evidence, gaps
+
+
+def _lease_external_evidence(resource_key: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    import grabowski_resources as resources
+    import grabowski_sqlite_store as sqlite_store
+
+    try:
+        version = resources._preflight_resource_store()
+        if version is None:
+            return [], [_external_gap("lease", "lease_store_uninitialized", resource_key=resource_key)]
+        key = resources.normalize_resource_key(resource_key)
+        with sqlite_store.readonly_sqlite(resources.RESOURCE_DB) as connection:
+            row = connection.execute("SELECT * FROM leases WHERE resource_key=?", (key,)).fetchone()
+    except Exception as exc:
+        return [], [_external_gap("lease", "lease_store_unverifiable", resource_key=resource_key, error=type(exc).__name__)]
+    if row is None:
+        return [], [_external_gap("lease", "lease_not_present", resource_key=resource_key)]
+    public = resources._public(row)
+    digest = _evidence_digest(public)
+    return [{
+        "source": "lease",
+        "status": "verified",
+        "authority": "authoritative_resource_lease_store",
+        "relation": "direct_resource_identity",
+        "identity": {"resource_key": key, "owner_id": public["owner_id"]},
+        "evidence_sha256": digest,
+        "record": public,
+    }], []
+
+
+def _deployment_external_evidence(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    anchors: set[str] = set()
+    for item in items:
+        record = item["record"]
+        for field in ("release_id", "commit", "head"):
+            value = record.get(field)
+            if isinstance(value, str) and value:
+                anchors.add(value)
+    if not anchors:
+        return [], [_external_gap("deployment", "no_deployment_identity_in_audit_seed")]
+    try:
+        metadata = base._deployment_metadata()
+    except Exception as exc:
+        return [], [_external_gap("deployment", "deployment_metadata_unverifiable", error=type(exc).__name__)]
+    identity = {
+        key: metadata.get(key)
+        for key in ("release_id", "repo_head", "entrypoint_contract_sha256", "source_sha256", "runtime_input_sha256", "runtime_lock_sha256", "completion_status")
+    }
+    matched = sorted(anchors & {str(identity.get("release_id")), str(identity.get("repo_head"))})
+    if not matched:
+        return [], [_external_gap("deployment", "deployment_identity_does_not_match_current_runtime", audit_identities=sorted(anchors))]
+    return [{
+        "source": "deployment",
+        "status": "verified",
+        "authority": "authoritative_deployment_manifest",
+        "relation": "direct_identity",
+        "identity": {"matched_values": matched},
+        "evidence_sha256": _evidence_digest(identity),
+        "record": identity,
+    }], []
+
+
+def _cross_store_evidence(items: list[dict[str, Any]], *, limit: int) -> dict[str, Any]:
+    selected_limit = _bounded_positive_int(limit, label="external_limit", maximum=50)
+    evidence: list[dict[str, Any]] = []
+    gaps: list[dict[str, Any]] = []
+    task_ids = sorted({
+        value
+        for item in items
+        if isinstance((value := item["record"].get("task_id")), str) and value
+    })
+    resource_keys = sorted({
+        resource
+        for item in items
+        for resource in _held_resource_values(item["record"])
+    })
+    for task_id in task_ids[:selected_limit]:
+        found, missing = _task_external_evidence(task_id)
+        evidence.extend(found)
+        gaps.extend(missing)
+    for resource_key in resource_keys[:selected_limit]:
+        found, missing = _lease_external_evidence(resource_key)
+        evidence.extend(found)
+        gaps.extend(missing)
+    found, missing = _deployment_external_evidence(items)
+    evidence.extend(found)
+    gaps.extend(missing)
+    evidence_truncated = len(evidence) > selected_limit
+    gaps_truncated = len(gaps) > selected_limit
+    evidence = evidence[:selected_limit]
+    gaps = gaps[:selected_limit]
+    truncated = (
+        len(task_ids) > selected_limit
+        or len(resource_keys) > selected_limit
+        or evidence_truncated
+        or gaps_truncated
+    )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_cross_store_evidence_projection",
+        "authority": "derived_correlation_only",
+        "relation_semantics": {
+            "direct_identity": "exact stable identity match",
+            "direct_digest_binding": "source digest explicitly bound by authoritative record",
+            "direct_resource_identity": "exact held resource key match",
+            "direct_task_identity": "exact task and attempt source binding",
+            "shared_key": "reported only by the parent audit trace correlation labels",
+            "temporal_proximity": "not promoted to external evidence",
+        },
+        "evidence": evidence,
+        "gaps": gaps,
+        "truncated": truncated,
+        "does_not_establish": [
+            "single_cross_store_truth",
+            "causality",
+            "root_cause",
+            "task_success_from_audit_correlation",
+            "semantic_correctness",
+            "future_action_authority",
+        ],
+    }
+
 def trace_audit(
     anchor_kind: str,
     anchor_value: str,
@@ -718,10 +963,19 @@ def trace_audit(
     limit: int = 100,
     order: str = "asc",
     path: Path | None = None,
+    include_external_evidence: bool = False,
+    external_limit: int = 20,
 ) -> dict[str, Any]:
     """Return a bounded one-hop correlation trace without claiming causality."""
     if anchor_kind not in _TRACE_ANCHOR_KINDS:
         raise ValueError(f"anchor_kind must be one of {sorted(_TRACE_ANCHOR_KINDS)}")
+    if type(include_external_evidence) is not bool:
+        raise ValueError("include_external_evidence must be a boolean")
+    selected_external_limit = (
+        _bounded_positive_int(external_limit, label="external_limit", maximum=50)
+        if include_external_evidence
+        else external_limit
+    )
     value = (
         _sha256_text(anchor_value, label="anchor_value")
         if anchor_kind == "record_sha256"
@@ -790,7 +1044,7 @@ def trace_audit(
     correlation_incomplete = bool(
         scan["scan_truncated"] or seed_truncated or truncated_tokens
     )
-    return {
+    result = {
         "schema_version": 2,
         "kind": "grabowski_audit_trace_result",
         "authority": "derived_from_verified_audit_chain",
@@ -826,6 +1080,12 @@ def trace_audit(
             ),
         ],
     }
+    if include_external_evidence:
+        result["external_evidence"] = _cross_store_evidence(
+            seeds,
+            limit=selected_external_limit,
+        )
+    return result
 
 
 def _has_failure_signal(record: dict[str, Any]) -> bool:
@@ -1002,10 +1262,19 @@ def grabowski_audit_trace(
     anchor_value: str,
     limit: int = 100,
     order: str = "asc",
+    include_external_evidence: bool = False,
+    external_limit: int = 20,
 ) -> dict[str, Any]:
     """Trace one audit anchor through bounded one-hop correlations."""
     base._require_capability("audit_read")
-    return trace_audit(anchor_kind, anchor_value, limit=limit, order=order)
+    return trace_audit(
+        anchor_kind,
+        anchor_value,
+        limit=limit,
+        order=order,
+        include_external_evidence=include_external_evidence,
+        external_limit=external_limit,
+    )
 
 
 @mcp.tool(name="grabowski_audit_analyze", annotations=READ_ONLY)
