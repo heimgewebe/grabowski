@@ -75,6 +75,7 @@ class TrustedOwnerTests(unittest.TestCase):
         capabilities = TRUSTED_POLICY["profiles"]["trusted-owner"]["capabilities"]
         self.assertIn("file_destroy", capabilities)
         self.assertIn("file_delete", capabilities)
+        self.assertIn("audit_read", capabilities)
         self.assertLess(capabilities.index("file_delete"), capabilities.index("file_destroy"))
 
 

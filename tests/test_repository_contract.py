@@ -413,7 +413,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(policy["profiles"]["break-glass"]["max_risk_level"], "high")
         self.assertIn("repo-orient", policy["profiles"]["observe"]["allowed_grips"])
         self.assertNotIn("captain-run", policy["profiles"]["mutate"]["allowed_grips"])
-        for capability in ("file_read", "audit_verify", "bundle_registry"):
+        for capability in ("file_read", "audit_verify", "audit_read", "bundle_registry"):
             self.assertIn(capability, observe_caps)
             self.assertIn(capability, maintain_caps)
         for capability in (

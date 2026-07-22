@@ -54,6 +54,7 @@
     "file_delete": "Remove regular files or empty directories into quarantine for audit-backed restoration.",
     "file_destroy": "Irreversibly remove regular files or empty directories only through a separate explicit capability.",
     "audit_verify": "Verify the tamper-evident write audit chain.",
+    "audit_read": "Read bounded safe fields from the verified audit chain without granting audit mutation authority.",
     "rollback_text": "Restore a quarantined preimage from an audited replace transaction.",
     "bundle_registry": "Read the curated Lens/repoLens latest-complete bundle registry.",
     "secret_inspect": "Inspect metadata and bounded directory listings under explicit secret roots without returning file content.",
@@ -110,6 +111,7 @@
       "capabilities": [
         "file_read",
         "audit_verify",
+        "audit_read",
         "bundle_registry",
         "process_inspect",
         "port_inspect"
@@ -157,6 +159,7 @@
       "capabilities": [
         "file_read",
         "audit_verify",
+        "audit_read",
         "bundle_registry",
         "process_inspect",
         "port_inspect"
@@ -207,6 +210,7 @@
         "file_read",
         "file_write",
         "audit_verify",
+        "audit_read",
         "rollback_text",
         "bundle_registry",
         "durable_job",
@@ -272,6 +276,7 @@
         "file_read",
         "file_write",
         "audit_verify",
+        "audit_read",
         "rollback_text",
         "bundle_registry",
         "durable_job",
