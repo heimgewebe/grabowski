@@ -5689,6 +5689,198 @@ class AgentWorkspaceTests(unittest.TestCase):
             )["valid"]
         )
 
+    def test_idle_tmux_transition_recovers_after_receipt_before_manifest(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        session_live = True
+        persist_attempts = 0
+        original_persist = workspace._persist_idle_tmux_transition_manifest
+
+        def has_session(session: str) -> bool:
+            self.assertEqual(session, manifest["session_name"])
+            return session_live
+
+        def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
+            nonlocal session_live
+            self.assertEqual(
+                argv, ["kill-session", "-t", f"={manifest['session_name']}"]
+            )
+            self.assertEqual(timeout, 30)
+            session_live = False
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+        def persist(*args: object, **kwargs: object) -> None:
+            nonlocal persist_attempts
+            persist_attempts += 1
+            if persist_attempts == 1:
+                raise RuntimeError("simulated crash after transition receipt")
+            original_persist(*args, **kwargs)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
+            mock.patch.object(
+                workspace, "_tmux_has_exact_session", side_effect=has_session
+            ),
+            mock.patch.object(
+                workspace, "_tmux_result", side_effect=tmux_result
+            ) as tmux,
+            mock.patch.object(
+                workspace,
+                "_persist_idle_tmux_transition_manifest",
+                side_effect=persist,
+            ),
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            with self.assertRaisesRegex(
+                RuntimeError, "simulated crash after transition receipt"
+            ):
+                workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                    manifest["workspace_id"],
+                    plan["plan_sha256"],
+                    "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+                )
+            receipt = workspace._verified_idle_tmux_transition_receipt(
+                manifest["workspace_id"]
+            )
+            self.assertIsNotNone(receipt)
+            persisted_after_crash = workspace._manifest(manifest["workspace_id"])
+            self.assertNotIn(
+                "idle_tmux_transition_receipt", persisted_after_crash
+            )
+            recovery_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertNotEqual(recovery_plan["plan_sha256"], plan["plan_sha256"])
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                manifest["workspace_id"],
+                recovery_plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+            )
+
+        tmux.assert_called_once()
+        self.assertEqual(result["state"], "stale_workspace_reconciled")
+        self.assertEqual(result["source_plan_sha256"], plan["plan_sha256"])
+        self.assertTrue(result["tmux_removed"])
+        self.assertTrue(result["tmux_mutation_performed"])
+        self.assertFalse(result["tmux_mutation_performed_this_call"])
+        self.assertFalse(result["recovered_after_ambiguous_effect"])
+        self.assertEqual(
+            result["idle_tmux_transition_receipt"]["receipt_sha256"],
+            receipt["receipt_sha256"],
+        )
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual(
+            persisted["idle_tmux_transition_receipt"]["receipt_sha256"],
+            receipt["receipt_sha256"],
+        )
+        self.assertTrue(
+            workspace._close_integrity_status(
+                persisted, persisted["close_receipt"]
+            )["valid"]
+        )
+
+    def test_idle_tmux_transition_recovers_after_kill_before_receipt(self) -> None:
+        manifest = self.manifest()
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        workspace._write_manifest(manifest)
+        session_live = True
+        publish_attempts = 0
+        original_publish = workspace._publish_idle_tmux_transition_receipt
+
+        def has_session(session: str) -> bool:
+            self.assertEqual(session, manifest["session_name"])
+            return session_live
+
+        def tmux_result(argv: list[str], *, timeout: int = 30) -> dict:
+            nonlocal session_live
+            self.assertEqual(
+                argv, ["kill-session", "-t", f"={manifest['session_name']}"]
+            )
+            self.assertEqual(timeout, 30)
+            session_live = False
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+        def publish(*args: object, **kwargs: object) -> dict:
+            nonlocal publish_attempts
+            publish_attempts += 1
+            if publish_attempts == 1:
+                raise RuntimeError("simulated crash after tmux removal")
+            return original_publish(*args, **kwargs)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
+            mock.patch.object(
+                workspace, "_tmux_has_exact_session", side_effect=has_session
+            ),
+            mock.patch.object(
+                workspace, "_tmux_result", side_effect=tmux_result
+            ) as tmux,
+            mock.patch.object(
+                workspace, "_publish_idle_tmux_transition_receipt", side_effect=publish
+            ),
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            with self.assertRaisesRegex(
+                RuntimeError, "simulated crash after tmux removal"
+            ):
+                workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                    manifest["workspace_id"],
+                    plan["plan_sha256"],
+                    "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+                )
+            self.assertFalse(session_live)
+            intent = workspace._verified_idle_tmux_transition_intent(
+                manifest["workspace_id"]
+            )
+            self.assertIsNotNone(intent)
+            self.assertEqual(intent["source_plan_sha256"], plan["plan_sha256"])
+            recovery_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertNotEqual(recovery_plan["plan_sha256"], plan["plan_sha256"])
+            result = workspace.grabowski_agent_workspace_reconcile_idle_tmux(
+                manifest["workspace_id"],
+                recovery_plan["plan_sha256"],
+                "remove-idle-tmux-and-mark-stale-workspace-abandoned",
+            )
+
+        tmux.assert_called_once()
+        self.assertEqual(result["state"], "stale_workspace_reconciled")
+        self.assertEqual(result["source_plan_sha256"], plan["plan_sha256"])
+        self.assertTrue(result["tmux_removed"])
+        self.assertFalse(result["tmux_mutation_performed"])
+        self.assertFalse(result["tmux_mutation_performed_this_call"])
+        self.assertTrue(result["recovered_after_ambiguous_effect"])
+        transition_receipt = result["idle_tmux_transition_receipt"]
+        self.assertTrue(transition_receipt["recovered_after_ambiguous_effect"])
+        self.assertFalse(transition_receipt["tmux_mutation_performed"])
+        self.assertEqual(
+            transition_receipt["source_intent_sha256"], intent["intent_sha256"]
+        )
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertTrue(
+            workspace._close_integrity_status(persisted, persisted["close_receipt"])[
+                "valid"
+            ]
+        )
+
     def test_idle_tmux_transition_refuses_other_stale_blockers_without_kill(self) -> None:
         manifest = self.manifest()
         manifest["created_at"] = "2026-01-01T00:00:00+00:00"
