@@ -393,6 +393,10 @@
     {
       "source": "config/coding-agent-catalog.json",
       "destination": "config/coding-agent-catalog.json"
+    },
+    {
+      "source": "tools/maintain_runtime_state.py",
+      "destination": "tools/maintain_runtime_state.py"
     }
   ]
 }
