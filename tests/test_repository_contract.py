@@ -275,6 +275,7 @@ class RepositoryContractTests(unittest.TestCase):
             "grabowski_private_io",
             "grabowski_job_origin",
             "grabowski_job_finalizer",
+            "grabowski_ntfy_dispatch",
         ):
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
@@ -315,8 +316,12 @@ class RepositoryContractTests(unittest.TestCase):
             contract["module"],
             *(item["module"] for item in contract["supporting_sources"]),
         }
+        runtime_sources = [
+            {"module": contract["module"], "source": contract["source"]},
+            *contract["supporting_sources"],
+        ]
         missing: dict[str, list[str]] = {}
-        for item in contract["supporting_sources"]:
+        for item in runtime_sources:
             module = item["module"]
             tree = ast.parse((ROOT / item["source"]).read_text(encoding="utf-8"))
             imports: set[str] = set()
@@ -333,6 +338,45 @@ class RepositoryContractTests(unittest.TestCase):
                     if candidate.startswith("grabowski_")
                 )
             absent = sorted(imports - deployed_modules)
+            if absent:
+                missing[module] = absent
+        self.assertEqual({}, missing)
+
+    def test_runtime_spawned_python_modules_are_in_deployment_source_set(self) -> None:
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        deployed_modules = {
+            contract["module"],
+            *(item["module"] for item in contract["supporting_sources"]),
+        }
+        runtime_sources = [
+            {"module": contract["module"], "source": contract["source"]},
+            *contract["supporting_sources"],
+        ]
+        missing: dict[str, list[str]] = {}
+        for item in runtime_sources:
+            module = item["module"]
+            tree = ast.parse((ROOT / item["source"]).read_text(encoding="utf-8"))
+            spawned: set[str] = set()
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.List, ast.Tuple)):
+                    continue
+                literal_values = [
+                    element.value
+                    if isinstance(element, ast.Constant) and isinstance(element.value, str)
+                    else None
+                    for element in node.elts
+                ]
+                for index, value in enumerate(literal_values[:-1]):
+                    candidate = literal_values[index + 1]
+                    if (
+                        value == "-m"
+                        and isinstance(candidate, str)
+                        and candidate.startswith("grabowski_")
+                    ):
+                        spawned.add(candidate)
+            absent = sorted(spawned - deployed_modules)
             if absent:
                 missing[module] = absent
         self.assertEqual({}, missing)
