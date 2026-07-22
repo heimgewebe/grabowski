@@ -273,6 +273,25 @@ class TaskAttentionGripTests(unittest.TestCase):
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertEqual(["attention_decision_conflict"], result["output"]["blocked_reasons"])
 
+    def test_reconciliation_grip_maps_cursor_input_error_to_blocked_preflight(self) -> None:
+        with patch.object(
+            attention,
+            "reconcile_attention",
+            side_effect=attention.TaskAttentionInputError(
+                "cursor does not match this view or filter"
+            ),
+        ):
+            result = grips.grip_run(
+                "task-attention-reconciliation",
+                {"limit": 20, "cursor": "stale"},
+            )
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertEqual(
+            "cursor does not match this view or filter",
+            result["output"]["error"],
+        )
+
     def test_reconciliation_grip_is_read_only_and_exposes_conservative_counts(self) -> None:
         output = {
             "schema_version": 1,

@@ -537,6 +537,23 @@ class TaskAttentionTests(unittest.TestCase):
         with self.assertRaisesRegex(attention.TaskAttentionInputError, "view must be current or history"):
             attention.reconcile_attention({"view": "other"})
 
+    def test_reconciliation_rejects_cursor_from_other_view_as_input_error(self) -> None:
+        self._failed_task()
+        self._failed_task()
+        history = attention.reconcile_attention({"limit": 1, "view": "history"})
+        cursor = history["pagination"]["next_cursor"]
+        self.assertIsNotNone(cursor)
+
+        with self.assertRaisesRegex(
+            attention.TaskAttentionInputError,
+            "cursor does not match this view or filter",
+        ):
+            attention.reconcile_attention({"limit": 1, "cursor": cursor})
+
+    def test_reconciliation_rejects_malformed_cursor_as_input_error(self) -> None:
+        with self.assertRaises(attention.TaskAttentionInputError):
+            attention.reconcile_attention({"cursor": "not-a-valid-cursor"})
+
     def test_current_reconciliation_exact_scan_budget_does_not_invent_continuation(self) -> None:
         for decision in ("closed", "superseded"):
             record = self._failed_task()
