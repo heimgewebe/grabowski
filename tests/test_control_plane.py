@@ -362,6 +362,70 @@ class PrivilegedBrokerTests(unittest.TestCase):
         )
         self.assertEqual(timeout, 120)
 
+    def test_template_target_allows_json_payload_braces(self) -> None:
+        reference = self._reference()
+        target = json.dumps(
+            {
+                "schema_version": 1,
+                "target_uid": 1000,
+                "roots": ["/home/alex/repos/.weltgewebe-worktrees"],
+                "max_processes": 8192,
+                "max_file_descriptors": 131072,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        reference["action"] = "observe_process_references"
+        reference["target"] = target
+        reference["justification"] = "Observe bounded process references"
+        reference.pop("reference_sha256")
+        reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 1,
+            "actions": {
+                "observe_process_references": {
+                    "enabled": True,
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "argv": [
+                        "/usr/local/libexec/grabowski-process-reference-observer",
+                        "{target}",
+                    ],
+                    "timeout_seconds": 30,
+                }
+            },
+        }
+
+        argv, timeout = privileged_broker.resolve_action(config, parsed)
+
+        self.assertEqual(
+            argv,
+            ["/usr/local/libexec/grabowski-process-reference-observer", target],
+        )
+        self.assertEqual(timeout, 30)
+
+    def test_template_rejects_unknown_placeholder_before_substitution(self) -> None:
+        reference = self._reference()
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 1,
+            "actions": {
+                "edit_system_service": {
+                    "enabled": True,
+                    "target_pattern": "[A-Za-z0-9_.@:-]{1,200}",
+                    "argv": ["/usr/bin/systemctl", "restart", "{unknown}"],
+                    "timeout_seconds": 120,
+                }
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "unknown placeholder"):
+            privileged_broker.resolve_action(config, parsed)
+
     def test_reset_failed_systemd_unit_uses_fixed_template(self) -> None:
         reference = self._reference()
         reference["action"] = "reset_failed_systemd_unit"

@@ -155,9 +155,12 @@ def _resolve_template_action(
         raise ValueError("privileged argv template is invalid")
     if not isinstance(timeout, int) or not 1 <= timeout <= 3600:
         raise ValueError("privileged timeout is invalid")
-    argv = [reference["target"] if token == "{target}" else token for token in template]
-    if any("{" in token or "}" in token for token in argv):
+    if any(
+        ("{" in token or "}" in token) and token != "{target}"
+        for token in template
+    ):
         raise ValueError("privileged argv contains an unknown placeholder")
+    argv = [reference["target"] if token == "{target}" else token for token in template]
     if not Path(argv[0]).is_absolute():
         raise ValueError("privileged executable must be an absolute path")
     return {
