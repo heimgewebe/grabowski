@@ -289,6 +289,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
             "module": contract["module"],
             "source": contract["source"],
             "supporting_sources": contract.get("supporting_sources", []),
+            "spawn_dependencies": contract.get("spawn_dependencies", []),
             "expected_tools": expected_tools,
         },
         "policy_contract": {

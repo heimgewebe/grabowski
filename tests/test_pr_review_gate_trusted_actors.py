@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HEAD = "a" * 40
 BASE = "b" * 40
 DIFF_SHA = "c" * 64
+FRESHNESS = "registry-registration-preflight/freshness"
 
 
 def _load_gate():
@@ -108,6 +109,63 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn(
             "expected check(s) missing or non-green: validate (3.10)",
+            result["failures"],
+        )
+
+    def test_base_bound_expected_check_accepts_exact_current_base_link(self) -> None:
+        state = _state()
+        state["checks"].append(
+            {
+                "bucket": "pass",
+                "name": FRESHNESS,
+                "link": f"https://github.com/heimgewebe/bureau/actions/runs/1?base_sha={BASE}",
+            }
+        )
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
+
+    def test_base_bound_expected_check_blocks_stale_base_link(self) -> None:
+        state = _state()
+        state["checks"].append(
+            {
+                "bucket": "pass",
+                "name": FRESHNESS,
+                "link": f"https://github.com/heimgewebe/bureau/actions/runs/1?base_sha={HEAD}",
+            }
+        )
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn(
+            f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+            result["failures"],
+        )
+
+    def test_base_bound_expected_check_blocks_missing_link(self) -> None:
+        state = _state()
+        state["checks"].append({"bucket": "pass", "name": FRESHNESS})
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn(
+            f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
             result["failures"],
         )
 

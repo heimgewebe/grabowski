@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 try:
     from review_evidence_schemas import REVIEW_POLICY_VERSION, validate_evidence
@@ -35,6 +36,7 @@ DERIVED_REVIEW_STATUS_NAMES = {
     "Review evidence gate (advisory)",
     "Review evidence gate (attested)",
 }
+BASE_BOUND_REQUIRED_CHECK_NAMES = {"registry-registration-preflight/freshness"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
@@ -1887,6 +1889,19 @@ def expected_check_names_for_repo(
     raise GateInputError("cannot derive expected checks from base required-check catalog, bootstrap policy, or validate workflow")
 
 
+def _check_link_matches_base_sha(check: dict[str, Any], base_sha: object) -> bool:
+    if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
+        return False
+    link = check.get("link")
+    if not isinstance(link, str) or not link:
+        return False
+    try:
+        values = parse_qs(urlparse(link).query, keep_blank_values=True).get("base_sha", [])
+    except ValueError:
+        return False
+    return values == [base_sha]
+
+
 def evaluate_review_gate(
     state: dict[str, Any],
     *,
@@ -2077,6 +2092,8 @@ def evaluate_review_gate(
     expected_check_buckets_by_name: dict[str, list[str | None]] = {
         name: [] for name in expected_check_names
     }
+    stale_or_unbound_base_checks: set[str] = set()
+    current_base_sha = pr.get("baseRefOid")
     blocking_checks = []
     for check in checks:
         if not isinstance(check, dict):
@@ -2089,6 +2106,10 @@ def evaluate_review_gate(
             expected_check_buckets_by_name[name].append(bucket)
             if bucket not in PASS_CHECK_BUCKETS:
                 blocking_checks.append(check)
+            elif name in BASE_BOUND_REQUIRED_CHECK_NAMES and not _check_link_matches_base_sha(
+                check, current_base_sha
+            ):
+                stale_or_unbound_base_checks.add(name)
             continue
         if bucket not in PASS_CHECK_BUCKETS and bucket != "skipping":
             blocking_checks.append(check)
@@ -2101,6 +2122,11 @@ def evaluate_review_gate(
     if missing_expected_checks:
         failures.append(
             f"expected check(s) missing or non-green: {', '.join(missing_expected_checks)}"
+        )
+    if stale_or_unbound_base_checks:
+        failures.append(
+            "base-bound expected check(s) stale or unbound for current base: "
+            + ", ".join(sorted(stale_or_unbound_base_checks))
         )
     if blocking_checks:
         failures.append(f"{len(blocking_checks)} non-green check(s)")
@@ -2143,7 +2169,12 @@ def evaluate_review_gate(
             "evidence": policy_waiver,
             "failures": waiver_failures,
         },
-        "check_policy": {"expected_check_names": list(expected_check_names)},
+        "check_policy": {
+            "expected_check_names": list(expected_check_names),
+            "base_bound_check_names": sorted(
+                set(expected_check_names) & BASE_BOUND_REQUIRED_CHECK_NAMES
+            ),
+        },
     }
 
 

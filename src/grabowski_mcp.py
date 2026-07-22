@@ -3980,11 +3980,13 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         return False
     schema_version = contract.get("schema_version")
     expected_keys = {"schema_version", "mode", "module", "source", "expected_tools"}
-    if schema_version in {2, 3}:
+    if schema_version in {2, 3, 4}:
         expected_keys.add("supporting_sources")
-    if schema_version == 3:
+    if schema_version in {3, 4}:
         expected_keys.add("runtime_assets")
-    if schema_version not in {1, 2, 3} or set(contract) != expected_keys:
+    if schema_version == 4:
+        expected_keys.add("spawn_dependencies")
+    if schema_version not in {1, 2, 3, 4} or set(contract) != expected_keys:
         return False
     module = contract.get("module")
     source = contract.get("source")
@@ -4025,6 +4027,32 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         modules.add(item_module)
         supporting_modules.add(item_module)
         sources.add(item_source)
+
+    spawn_dependencies = contract.get("spawn_dependencies", [])
+    if not isinstance(spawn_dependencies, list):
+        return False
+    seen_spawn_dependencies: set[tuple[str, str, str]] = set()
+    for item in spawn_dependencies:
+        if not isinstance(item, dict) or set(item) != {
+            "kind",
+            "launcher_module",
+            "spawned_module",
+        }:
+            return False
+        kind = item.get("kind")
+        launcher_module = item.get("launcher_module")
+        spawned_module = item.get("spawned_module")
+        identity = (kind, launcher_module, spawned_module)
+        if (
+            kind != "python_module"
+            or not isinstance(launcher_module, str)
+            or launcher_module not in modules
+            or not isinstance(spawned_module, str)
+            or spawned_module not in modules
+            or identity in seen_spawn_dependencies
+        ):
+            return False
+        seen_spawn_dependencies.add(identity)
 
     runtime_asset_destinations: set[str] = set()
     runtime_asset_sources: set[str] = set()

@@ -165,7 +165,7 @@
   ],
   "mode": "module",
   "module": "grabowski_operator",
-  "schema_version": 3,
+  "schema_version": 4,
   "source": "src/grabowski_runtime.py",
   "supporting_sources": [
     {
@@ -393,6 +393,10 @@
       "source": "src/grabowski_job_finalizer.py"
     },
     {
+      "module": "grabowski_ntfy_dispatch",
+      "source": "src/grabowski_ntfy_dispatch.py"
+    },
+    {
       "module": "grabowski_juno",
       "source": "src/grabowski_juno.py"
     },
@@ -433,6 +437,33 @@
     {
       "source": "tools/maintain_runtime_state.py",
       "destination": "tools/maintain_runtime_state.py"
+    }
+  ],
+  "spawn_dependencies": [
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_workspace"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_writer"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_role"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_workers",
+      "spawned_module": "grabowski_worker_process"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_job_finalizer",
+      "spawned_module": "grabowski_ntfy_dispatch"
     }
   ]
 }
