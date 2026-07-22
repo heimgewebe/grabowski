@@ -50,9 +50,9 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         self.assertTrue(report["valid"], report)
         self.assertTrue(report["schema_valid"])
         self.assertEqual(report["baseline_tool_count"], 125)
-        self.assertEqual(report["current_tool_count"], 161)
-        self.assertEqual(report["growth"], 44)
-        self.assertEqual(report["accepted_addition_count"], 44)
+        self.assertEqual(report["current_tool_count"], 162)
+        self.assertEqual(report["growth"], 45)
+        self.assertEqual(report["accepted_addition_count"], 45)
         self.assertEqual(report["operation_count"], 3)
         self.assertEqual(report["retired_tool_count"], 8)
 
@@ -63,6 +63,21 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
             ),
             ["grabowski_status"],
         )
+
+    def test_runtime_tool_projection_validates_schema_four_spawn_dependencies(self) -> None:
+        runtime = copy.deepcopy(self.runtime)
+        self.assertEqual(runtime["schema_version"], 4)
+        self.assertEqual(budget._runtime_tools(runtime), sorted(runtime["expected_tools"]))
+
+        invalid = copy.deepcopy(runtime)
+        invalid["spawn_dependencies"][0]["spawned_module"] = "grabowski_missing"
+        with self.assertRaisesRegex(budget.ToolSurfaceBudgetError, "deployment-closed"):
+            budget._runtime_tools(invalid)
+
+        invalid = copy.deepcopy(runtime)
+        del invalid["spawn_dependencies"]
+        with self.assertRaisesRegex(budget.ToolSurfaceBudgetError, "requires spawn_dependencies"):
+            budget._runtime_tools(invalid)
 
     def test_runtime_tool_projection_rejects_malformed_schema_three_assets(self) -> None:
         runtime = copy.deepcopy(self.runtime)
@@ -133,7 +148,7 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
             report["accepted_addition_count"],
             len(self.contract["accepted_additions"]) + 1,
         )
-        self.assertEqual(report["growth"], 45)
+        self.assertEqual(report["growth"], 46)
 
     def test_semantic_drift_of_existing_tool_is_rejected(self) -> None:
         capabilities = copy.deepcopy(self.capabilities)

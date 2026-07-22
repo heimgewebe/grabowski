@@ -146,8 +146,16 @@ class RepositoryContractTests(unittest.TestCase):
         contract = json.loads(
             (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(contract["schema_version"], 3)
+        self.assertEqual(contract["schema_version"], 4)
         self.assertEqual(contract["mode"], "module")
+        self.assertIn(
+            {
+                "kind": "python_module",
+                "launcher_module": "grabowski_job_finalizer",
+                "spawned_module": "grabowski_ntfy_dispatch",
+            },
+            contract["spawn_dependencies"],
+        )
         self.assertEqual(contract["module"], "grabowski_operator")
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
@@ -165,7 +173,7 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 161)
+        self.assertEqual(len(tools), 162)
         self.assertTrue(
             {
                 "grabowski_juno_status",
@@ -284,6 +292,7 @@ class RepositoryContractTests(unittest.TestCase):
             "grabowski_private_io",
             "grabowski_job_origin",
             "grabowski_job_finalizer",
+            "grabowski_ntfy_dispatch",
         ):
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
@@ -324,8 +333,12 @@ class RepositoryContractTests(unittest.TestCase):
             contract["module"],
             *(item["module"] for item in contract["supporting_sources"]),
         }
+        runtime_sources = [
+            {"module": contract["module"], "source": contract["source"]},
+            *contract["supporting_sources"],
+        ]
         missing: dict[str, list[str]] = {}
-        for item in contract["supporting_sources"]:
+        for item in runtime_sources:
             module = item["module"]
             tree = ast.parse((ROOT / item["source"]).read_text(encoding="utf-8"))
             imports: set[str] = set()
@@ -345,6 +358,51 @@ class RepositoryContractTests(unittest.TestCase):
             if absent:
                 missing[module] = absent
         self.assertEqual({}, missing)
+
+    def test_runtime_python_module_spawns_are_explicitly_declared(self) -> None:
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        deployed_modules = {
+            contract["module"],
+            *(item["module"] for item in contract["supporting_sources"]),
+        }
+        declared = {
+            (item["launcher_module"], item["spawned_module"])
+            for item in contract["spawn_dependencies"]
+            if item.get("kind") == "python_module"
+        }
+        self.assertEqual(len(declared), len(contract["spawn_dependencies"]))
+        self.assertEqual(
+            {module for edge in declared for module in edge} - deployed_modules,
+            set(),
+        )
+        runtime_sources = [
+            {"module": contract["module"], "source": contract["source"]},
+            *contract["supporting_sources"],
+        ]
+        literal_spawns: set[tuple[str, str]] = set()
+        for item in runtime_sources:
+            launcher_module = item["module"]
+            tree = ast.parse((ROOT / item["source"]).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.List, ast.Tuple)):
+                    continue
+                literal_values = [
+                    element.value
+                    if isinstance(element, ast.Constant) and isinstance(element.value, str)
+                    else None
+                    for element in node.elts
+                ]
+                for index, value in enumerate(literal_values[:-1]):
+                    candidate = literal_values[index + 1]
+                    if (
+                        value == "-m"
+                        and isinstance(candidate, str)
+                        and candidate.startswith("grabowski_")
+                    ):
+                        literal_spawns.add((launcher_module, candidate))
+        self.assertEqual(literal_spawns - declared, set())
 
     def test_bureau_intake_adapter_is_loaded_and_packaged(self) -> None:
         runtime = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
@@ -422,7 +480,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(policy["profiles"]["break-glass"]["max_risk_level"], "high")
         self.assertIn("repo-orient", policy["profiles"]["observe"]["allowed_grips"])
         self.assertNotIn("captain-run", policy["profiles"]["mutate"]["allowed_grips"])
-        for capability in ("file_read", "audit_verify", "bundle_registry"):
+        for capability in ("file_read", "audit_verify", "audit_read", "bundle_registry"):
             self.assertIn(capability, observe_caps)
             self.assertIn(capability, maintain_caps)
         for capability in (

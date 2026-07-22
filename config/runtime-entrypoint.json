@@ -39,6 +39,7 @@
     "grabowski_deployment_identity",
     "grabowski_contract_drift",
     "grabowski_checkout_summary",
+    "grabowski_current_work",
     "grabowski_git_status",
     "grabowski_git_diff",
     "grabowski_git_log",
@@ -164,7 +165,7 @@
   ],
   "mode": "module",
   "module": "grabowski_operator",
-  "schema_version": 3,
+  "schema_version": 4,
   "source": "src/grabowski_runtime.py",
   "supporting_sources": [
     {
@@ -250,6 +251,18 @@
     {
       "module": "grabowski_checkouts",
       "source": "src/grabowski_checkouts.py"
+    },
+    {
+      "module": "grabowski_current_work",
+      "source": "src/grabowski_current_work.py"
+    },
+    {
+      "module": "grabowski_managed_cargo",
+      "source": "src/grabowski_managed_cargo.py"
+    },
+    {
+      "module": "grabowski_current_work_surface",
+      "source": "src/grabowski_current_work_surface.py"
     },
     {
       "module": "grabowski_fleet",
@@ -380,6 +393,10 @@
       "source": "src/grabowski_job_finalizer.py"
     },
     {
+      "module": "grabowski_ntfy_dispatch",
+      "source": "src/grabowski_ntfy_dispatch.py"
+    },
+    {
       "module": "grabowski_juno",
       "source": "src/grabowski_juno.py"
     },
@@ -390,6 +407,10 @@
     {
       "module": "grabowski_lifecycle_archive",
       "source": "src/grabowski_lifecycle_archive.py"
+    },
+    {
+      "module": "grabowski_lifecycle_collectors",
+      "source": "src/grabowski_lifecycle_collectors.py"
     },
     {
       "module": "grabowski_lifecycle_evidence",
@@ -428,6 +449,33 @@
     {
       "source": "tools/maintain_runtime_state.py",
       "destination": "tools/maintain_runtime_state.py"
+    }
+  ],
+  "spawn_dependencies": [
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_workspace"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_writer"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_role"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_workers",
+      "spawned_module": "grabowski_worker_process"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_job_finalizer",
+      "spawned_module": "grabowski_ntfy_dispatch"
     }
   ]
 }

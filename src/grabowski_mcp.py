@@ -214,8 +214,10 @@ RESERVED_DISABLED_CAPABILITIES = (
     "chown",
     "secret_read",
 )
+AUDIT_READ_CAPABILITIES = ("audit_read",)
 ALL_CAPABILITIES = (
     BASE_CAPABILITIES
+    + AUDIT_READ_CAPABILITIES
     + SECRET_CAPABILITIES
     + OPERATOR_CAPABILITIES
     + RESERVED_DISABLED_CAPABILITIES
@@ -241,9 +243,9 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_destroy_path": ("file_destroy",),
     "grabowski_rollback_text": ("rollback_text",),
     "grabowski_verify_audit": ("audit_verify",),
-    "grabowski_audit_query": ("audit_verify",),
-    "grabowski_audit_trace": ("audit_verify",),
-    "grabowski_audit_analyze": ("audit_verify",),
+    "grabowski_audit_query": ("audit_read",),
+    "grabowski_audit_trace": ("audit_read",),
+    "grabowski_audit_analyze": ("audit_read",),
     "latest_complete_bundles": ("bundle_registry",),
     "repoground_bundle_discover": ("bundle_registry",),
     "repoground_bundle_status": ("bundle_registry",),
@@ -261,6 +263,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_deployment_identity": (),
     "grabowski_contract_drift": (),
     "grabowski_checkout_summary": (),
+    "grabowski_current_work": (),
     "grabowski_git_status": (),
     "grabowski_git_diff": (),
     "grabowski_git_log": (),
@@ -3018,15 +3021,20 @@ def _verify_audit_descriptor(path: Path, descriptor: int) -> dict[str, Any]:
     return _verify_audit_bytes(path, data, exists=True)
 
 
-def _read_audit_file(path: Path) -> tuple[bytes, dict[str, Any]]:
+def _read_audit_file_bytes(path: Path) -> tuple[bytes, bool]:
+    """Read one audit file through the hardened descriptor contract without parsing it."""
     descriptor = _open_audit_read_target(path)
     if descriptor is None:
-        return b"", _verify_audit_bytes(path, b"", exists=False)
+        return b"", False
     try:
-        data = _read_audit_descriptor(descriptor, path)
-        return data, _verify_audit_bytes(path, data, exists=True)
+        return _read_audit_descriptor(descriptor, path), True
     finally:
         _close_audit_descriptor(descriptor)
+
+
+def _read_audit_file(path: Path) -> tuple[bytes, dict[str, Any]]:
+    data, exists = _read_audit_file_bytes(path)
+    return data, _verify_audit_bytes(path, data, exists=exists)
 
 
 def _first_audit_record(data: bytes) -> dict[str, Any] | None:
@@ -3312,6 +3320,7 @@ def _read_audit_chain_unlocked(
     path: Path,
     *,
     use_segment_cache: bool = True,
+    retain_verified_segment_data: bool = True,
 ) -> tuple[list[tuple[Path, bytes, dict[str, Any]]], bool]:
     components: list[tuple[Path, bytes, dict[str, Any]]] = []
     seen: set[Path] = set()
@@ -3378,7 +3387,12 @@ def _read_audit_chain_unlocked(
             compatibility_evidence = compatibility_evidence or bool(
                 expected.get("compatibility")
             )
-        components.append((current, data, status))
+        component_status = dict(status)
+        component_status["segment_sha256"] = observed_sha
+        component_data = data
+        if expected is not None and not retain_verified_segment_data:
+            component_data = b""
+        components.append((current, component_data, component_status))
         binding = _audit_predecessor_binding(path, first_record)
         if binding is None:
             return components, compatibility_evidence
@@ -3967,11 +3981,13 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         return False
     schema_version = contract.get("schema_version")
     expected_keys = {"schema_version", "mode", "module", "source", "expected_tools"}
-    if schema_version in {2, 3}:
+    if schema_version in {2, 3, 4}:
         expected_keys.add("supporting_sources")
-    if schema_version == 3:
+    if schema_version in {3, 4}:
         expected_keys.add("runtime_assets")
-    if schema_version not in {1, 2, 3} or set(contract) != expected_keys:
+    if schema_version == 4:
+        expected_keys.add("spawn_dependencies")
+    if schema_version not in {1, 2, 3, 4} or set(contract) != expected_keys:
         return False
     module = contract.get("module")
     source = contract.get("source")
@@ -4012,6 +4028,32 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         modules.add(item_module)
         supporting_modules.add(item_module)
         sources.add(item_source)
+
+    spawn_dependencies = contract.get("spawn_dependencies", [])
+    if not isinstance(spawn_dependencies, list):
+        return False
+    seen_spawn_dependencies: set[tuple[str, str, str]] = set()
+    for item in spawn_dependencies:
+        if not isinstance(item, dict) or set(item) != {
+            "kind",
+            "launcher_module",
+            "spawned_module",
+        }:
+            return False
+        kind = item.get("kind")
+        launcher_module = item.get("launcher_module")
+        spawned_module = item.get("spawned_module")
+        identity = (kind, launcher_module, spawned_module)
+        if (
+            kind != "python_module"
+            or not isinstance(launcher_module, str)
+            or launcher_module not in modules
+            or not isinstance(spawned_module, str)
+            or spawned_module not in modules
+            or identity in seen_spawn_dependencies
+        ):
+            return False
+        seen_spawn_dependencies.add(identity)
 
     runtime_asset_destinations: set[str] = set()
     runtime_asset_sources: set[str] = set()

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "e4a759a5baa3febed83be566f0eca0d123abaf6302a72d608485ac89b0403321",
+  "capability_source_sha256": "8f2695e8aff8c696c7f1f5fade7e38fcbae264be8fd463b79b52bcdbd808f812",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "c822b22e56391d43d4a0afdaac5dd34b44a6438c0cf2e9f15755412432fbb6b7",
+  "contract_sha256": "2a75639179f2c3b00995a57c0305613292fc042b6556f15e3b1c5530d529d936",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -257,7 +257,7 @@
       "description": "Query the verified audit chain through a bounded evidence projection.",
       "effects": [],
       "id": "grabowski_audit_query",
-      "purpose": "Query bounded safe fields from the fully verified audit segment chain.",
+      "purpose": "Query bounded safe fields from a verified audit snapshot with explicit scan completeness.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -268,7 +268,7 @@
       "description": "Trace one audit anchor through bounded one-hop correlations.",
       "effects": [],
       "id": "grabowski_audit_trace",
-      "purpose": "Trace one exact audit anchor through bounded one-hop evidence correlations without claiming causality.",
+      "purpose": "Trace one exact audit anchor through bounded one-hop typed evidence correlations without claiming causality.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -279,7 +279,7 @@
       "description": "Compute bounded descriptive statistics from the verified audit chain.",
       "effects": [],
       "id": "grabowski_audit_analyze",
-      "purpose": "Compute bounded descriptive statistics from the fully verified audit segment chain.",
+      "purpose": "Compute bounded-memory descriptive statistics from a verified audit snapshot with explicit approximation semantics.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -471,6 +471,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_summary"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Project bounded current operator work without creating a second lifecycle truth.",
+      "effects": [],
+      "id": "grabowski_current_work",
+      "purpose": "Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_current_work"
     },
     {
       "category": "version-control",

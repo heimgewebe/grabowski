@@ -33,6 +33,7 @@ LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.02
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
+DECISION_FILE_RE = re.compile(r"(?P<task_id>[0-9a-f]{24})\.a(?P<attempt>[1-9][0-9]*)\.json\Z")
 
 
 class TaskAttentionError(RuntimeError):
@@ -186,11 +187,13 @@ def _read_private_json(path: Path, *, label: str) -> tuple[dict[str, Any], str]:
 
 
 @contextmanager
-def _state_lock() -> Iterator[None]:
+def _state_lock(*, shared: bool = False, create: bool = True) -> Iterator[None]:
     root = _state_root()
-    _ensure_private_directory(root, create=True)
+    _ensure_private_directory(root, create=create)
     lock_path = root / ".lock"
-    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    flags = os.O_RDWR | os.O_CLOEXEC
+    if create:
+        flags |= os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(lock_path, flags, 0o600)
@@ -204,9 +207,10 @@ def _state_lock() -> Iterator[None]:
         ):
             raise TaskAttentionIntegrityError("task attention lock is unsafe")
         deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        lock_mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(descriptor, lock_mode | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -218,6 +222,41 @@ def _state_lock() -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+
+@contextmanager
+def decision_snapshot_lock() -> Iterator[None]:
+    """Hold a shared snapshot boundary against create-only decision writes."""
+    with _state_lock(shared=True, create=False):
+        yield
+
+
+@contextmanager
+def decision_snapshot_guard() -> Iterator[dict[str, str | None]]:
+    """Return one stable decision-store generation without read-side creation."""
+    root = _state_root()
+    try:
+        _ensure_private_directory(root, create=False)
+    except FileNotFoundError:
+        # Linearize an absent decision store at this observation. A writer may
+        # create the store afterwards, but this read remains a valid pre-write
+        # snapshot and the next attention cursor will bind the newer generation.
+        yield {"status": "absent", "evidence_error": None}
+        return
+    except (TaskAttentionError, OSError) as exc:
+        yield {"status": "degraded", "evidence_error": type(exc).__name__}
+        return
+
+    lock = decision_snapshot_lock()
+    try:
+        lock.__enter__()
+    except (FileNotFoundError, TaskAttentionError, OSError) as exc:
+        yield {"status": "degraded", "evidence_error": type(exc).__name__}
+        return
+    try:
+        yield {"status": "locked", "evidence_error": None}
+    finally:
+        lock.__exit__(None, None, None)
 
 
 def _task_binding(record: dict[str, Any]) -> dict[str, Any]:
@@ -811,6 +850,87 @@ def _classify_record(record: dict[str, Any]) -> dict[str, Any]:
     base["authority"] = decision["authority"]
     base["evidence_ref"] = decision["evidence_ref"]
     return base
+
+
+def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Project operational attention without rewriting retained task history.
+
+    Raw attention remains the state-derived set. Only valid create-only decisions
+    bound to the current task attempt may remove ``closed`` or ``superseded``
+    records from the operational attention projection. Missing, stale or invalid
+    evidence therefore fails open into current attention rather than hiding work.
+    """
+    current_by_task: dict[str, dict[str, Any]] = {}
+    for value in records:
+        if not isinstance(value, dict):
+            raise TaskAttentionInputError("current attention records must be objects")
+        record = dict(value)
+        if record.get("state") not in ATTENTION_STATES:
+            raise TaskAttentionInputError("current attention record has a non-attention state")
+        binding = _task_binding(record)
+        task_id = binding["task_id"]
+        if task_id in current_by_task:
+            raise TaskAttentionIntegrityError("current attention projection contains duplicate task ids")
+        current_by_task[task_id] = record
+
+    excluded_task_ids: set[str] = set()
+    decision_classification_counts: dict[str, int] = {}
+    decision_candidate_count = 0
+    root = _state_root()
+    try:
+        _ensure_private_directory(root, create=False)
+    except FileNotFoundError:
+        pass
+    else:
+        try:
+            entries = sorted(root.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise TaskAttentionIntegrityError("task attention decisions cannot be listed safely") from exc
+        for path in entries:
+            match = DECISION_FILE_RE.fullmatch(path.name)
+            if match is None:
+                continue
+            record = current_by_task.get(match.group("task_id"))
+            if record is None or int(record["attempt"]) != int(match.group("attempt")):
+                continue
+            decision_candidate_count += 1
+            classified = _classify_record(record)
+            classification = str(classified["classification"])
+            decision_classification_counts[classification] = (
+                decision_classification_counts.get(classification, 0) + 1
+            )
+            if classification in CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS:
+                excluded_task_ids.add(str(record["task_id"]))
+
+    excluded_counts = {
+        classification: decision_classification_counts.get(classification, 0)
+        for classification in sorted(CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS)
+    }
+    raw_attention_count = len(current_by_task)
+    current_attention_count = raw_attention_count - len(excluded_task_ids)
+    projection_material = {
+        "schema_version": 1,
+        "task_bindings": [
+            {**_task_binding(record), "state": record["state"]}
+            for _task_id, record in sorted(current_by_task.items())
+        ],
+        "excluded_task_ids": sorted(excluded_task_ids),
+        "decision_classification_counts": dict(sorted(decision_classification_counts.items())),
+    }
+    return {
+        "status": "verified",
+        "evidence_error": None,
+        "projection_sha256": _sha256_json(projection_material),
+        "raw_attention_count": raw_attention_count,
+        "current_attention_count": current_attention_count,
+        "excluded_attention_count": len(excluded_task_ids),
+        "excluded_classification_counts": excluded_counts,
+        "decision_candidate_count": decision_candidate_count,
+        "decision_classification_counts": dict(sorted(decision_classification_counts.items())),
+        "excluded_task_ids": excluded_task_ids,
+        "scope": "current_task_projection_after_valid_attention_decisions",
+        "raw_scope": "current_task_projection_before_attention_decisions",
+    }
 
 
 def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, Any]:

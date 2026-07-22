@@ -208,6 +208,29 @@ class DeploymentMetadataTests(unittest.TestCase):
         ):
             return grabowski_mcp._deployment_metadata()
 
+    def test_manifest_schema_accepts_closed_v4_spawn_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self._release(Path(directory))
+            manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+            contract = manifest["entrypoint_contract"]
+            contract["schema_version"] = 4
+            contract["spawn_dependencies"] = [
+                {
+                    "kind": "python_module",
+                    "launcher_module": "grabowski_operator",
+                    "spawned_module": "grabowski_mcp",
+                }
+            ]
+            self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
+
+            contract["spawn_dependencies"][0]["spawned_module"] = "grabowski_missing"
+            self.assertFalse(grabowski_mcp._manifest_schema_valid(manifest))
+
+            contract["spawn_dependencies"] = []
+            self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
+            del contract["spawn_dependencies"]
+            self.assertFalse(grabowski_mcp._manifest_schema_valid(manifest))
+
     def test_valid_release_through_stable_symlink_has_valid_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = self._release(Path(directory))
