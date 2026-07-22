@@ -211,6 +211,44 @@ class LifecycleEffectPlanTests(unittest.TestCase):
         self.assertFalse(result["mutation_performed"])
         self.assertEqual(len(result["revalidation_sha256"]), 64)
 
+    def test_write_verify_revalidation_and_idempotent_replay(self) -> None:
+        plan = self.build_plan()
+        revalidation = self.ready_revalidation(plan=plan)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "effect-revalidations"
+            first = effect_plan.write_effect_revalidation(
+                revalidation, revalidation_root=root, plan=plan
+            )
+            self.assertEqual(first["status"], "verified")
+            self.assertFalse(first["idempotent_replay"])
+            second = effect_plan.write_effect_revalidation(
+                revalidation, revalidation_root=root, plan=plan
+            )
+            self.assertTrue(second["idempotent_replay"])
+            self.assertEqual(first["revalidation"], second["revalidation"])
+            verified = effect_plan.verify_effect_revalidation(
+                Path(first["revalidation_path"]), plan=plan
+            )
+            self.assertEqual(
+                verified["revalidation"]["revalidation_sha256"],
+                revalidation["revalidation_sha256"],
+            )
+
+    def test_tampered_persisted_revalidation_fails_verification(self) -> None:
+        plan = self.build_plan()
+        revalidation = self.ready_revalidation(plan=plan)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "effect-revalidations"
+            result = effect_plan.write_effect_revalidation(
+                revalidation, revalidation_root=root, plan=plan
+            )
+            path = Path(result["revalidation_path"])
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["ready_for_effect"] = False
+            path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            with self.assertRaises(effect_plan.LifecycleEffectPlanIntegrityError):
+                effect_plan.verify_effect_revalidation(path, plan=plan)
+
     def test_revalidation_fails_when_current_classification_missing(self) -> None:
         plan = self.build_plan()
         result = effect_plan.revalidate_effect_plan(
