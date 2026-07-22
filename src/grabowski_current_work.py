@@ -116,6 +116,13 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _snapshot_process(process: dict[str, Any]) -> dict[str, Any]:
+    snapshot_process = dict(process)
+    snapshot_process.pop("elapsed_seconds", None)
+    snapshot_process.pop("state", None)
+    return snapshot_process
+
+
 def _snapshot_group(group: dict[str, Any]) -> dict[str, Any]:
     snapshot_group = dict(group)
     observation = snapshot_group.get("observation")
@@ -123,6 +130,17 @@ def _snapshot_group(group: dict[str, Any]) -> dict[str, Any]:
         snapshot_observation = dict(observation)
         snapshot_observation.pop("observed_at_unix", None)
         snapshot_group["observation"] = snapshot_observation
+    physical_refs = snapshot_group.get("physical_refs")
+    if isinstance(physical_refs, dict):
+        snapshot_physical_refs = dict(physical_refs)
+        processes = snapshot_physical_refs.get("processes")
+        if isinstance(processes, list):
+            snapshot_physical_refs["processes"] = [
+                _snapshot_process(process)
+                for process in processes
+                if isinstance(process, dict)
+            ]
+        snapshot_group["physical_refs"] = snapshot_physical_refs
     return snapshot_group
 
 
@@ -1156,7 +1174,16 @@ def build_current_work_projection(
         "view": view,
         "groups": [_snapshot_group(group) for group in projected],
         "unbound_tmux": unbound_tmux,
-        "unbound_processes": unbound_processes,
+        "unbound_processes": sorted(
+            (_snapshot_process(process) for process in unbound_processes),
+            key=lambda process: (
+                int(process.get("pid", 0)),
+                int(process.get("ppid", 0)),
+                str(process.get("executable", "")),
+                str(process.get("command_class", "")),
+                str(process.get("workspace_id") or ""),
+            ),
+        ),
         "source_errors": errors,
         "source_truncation": source_truncation,
         "repository_filters": repositories,
