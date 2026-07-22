@@ -262,6 +262,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_deployment_identity": (),
     "grabowski_contract_drift": (),
     "grabowski_checkout_summary": (),
+    "grabowski_current_work": (),
     "grabowski_git_status": (),
     "grabowski_git_diff": (),
     "grabowski_git_log": (),
