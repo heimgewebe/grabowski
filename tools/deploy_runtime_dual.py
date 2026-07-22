@@ -198,10 +198,17 @@ OPERATOR_LISTENER_HOST = "127.0.0.1"
 OPERATOR_LISTENER_PORT = 18181
 OPERATOR_LISTENER_REQUIRED_SAMPLES = 2
 TUNNEL_METRICS_URL = core.HEALTH_URL.rsplit("/", 1)[0] + "/metrics"
-TUNNEL_DRAIN_METRIC_NAMES = (
+TUNNEL_DRAIN_GAUGE_NAMES = (
     "commands_queue_length",
     "dispatcher_worker_pool_occupancy",
 )
+TUNNEL_DRAIN_COUNTER_NAMES = (
+    "commands_polled_total",
+    "commands_enqueued_total",
+)
+TUNNEL_DRAIN_IDENTITY_NAMES = ("process_start_time_seconds",)
+TUNNEL_DRAIN_STABILITY_NAMES = TUNNEL_DRAIN_COUNTER_NAMES + TUNNEL_DRAIN_IDENTITY_NAMES
+TUNNEL_DRAIN_METRIC_NAMES = TUNNEL_DRAIN_GAUGE_NAMES + TUNNEL_DRAIN_STABILITY_NAMES
 TUNNEL_DRAIN_REQUIRED_IDLE_SAMPLES = 3
 TUNNEL_DRAIN_SAMPLE_INTERVAL_SECONDS = 0.1
 OPERATOR_HTTP_ARGUMENTS = (
@@ -2291,49 +2298,151 @@ def _parse_tunnel_drain_metrics(text: str) -> dict[str, float]:
     return observed
 
 
+def _tunnel_drain_counter_snapshot(observed: dict[str, float]) -> dict[str, float]:
+    return {name: observed[name] for name in TUNNEL_DRAIN_COUNTER_NAMES}
+
+
+def _tunnel_drain_stability_snapshot(observed: dict[str, float]) -> dict[str, float]:
+    return {name: observed[name] for name in TUNNEL_DRAIN_STABILITY_NAMES}
+
+
+def _require_tunnel_drain_counters_not_regressed(
+    previous: dict[str, float],
+    current: dict[str, float],
+) -> None:
+    regressed = {
+        name: {"previous": previous[name], "current": current[name]}
+        for name in TUNNEL_DRAIN_COUNTER_NAMES
+        if current[name] < previous[name]
+    }
+    if regressed:
+        core.fail(
+            "Tunnel-Drain-Zähler gingen während des Stabilitätsbeweises zurück",
+            phase="tunnel-drain-pre-stop",
+            details={"regressed_counters": regressed},
+        )
+
+
 def wait_for_tunnel_dispatcher_idle(*, timeout_seconds: int) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     consecutive_idle = 0
     attempts = 0
     last_observed: dict[str, float] = {}
+    last_idle_stability: dict[str, float] | None = None
+    last_valid_counters: dict[str, float] | None = None
+    expected_process_start_time: float | None = None
     last_error: dict[str, Any] | None = None
     while True:
         attempts += 1
         metrics_text = core.http_text(TUNNEL_METRICS_URL)
         if metrics_text is None:
             consecutive_idle = 0
+            last_idle_stability = None
             last_error = {"reason": "metrics-unavailable"}
         else:
             try:
                 observed = _parse_tunnel_drain_metrics(metrics_text)
             except core.DeployError as exc:
                 consecutive_idle = 0
+                last_idle_stability = None
                 last_error = _error_summary(exc)
             else:
                 last_observed = observed
-                idle = all(observed[name] == 0 for name in TUNNEL_DRAIN_METRIC_NAMES)
-                consecutive_idle = consecutive_idle + 1 if idle else 0
+                stability = _tunnel_drain_stability_snapshot(observed)
+                counters = _tunnel_drain_counter_snapshot(observed)
+                if last_valid_counters is not None:
+                    _require_tunnel_drain_counters_not_regressed(
+                        last_valid_counters,
+                        counters,
+                    )
+                last_valid_counters = counters
+                process_start_time = stability["process_start_time_seconds"]
+                if expected_process_start_time is None:
+                    expected_process_start_time = process_start_time
+                elif process_start_time != expected_process_start_time:
+                    core.fail(
+                        "Tunnel-Prozess wechselte während des Drain-Stabilitätsbeweises",
+                        phase="tunnel-drain-pre-stop",
+                        details={
+                            "expected_process_start_time_seconds": expected_process_start_time,
+                            "observed_process_start_time_seconds": process_start_time,
+                        },
+                    )
+                idle = all(observed[name] == 0 for name in TUNNEL_DRAIN_GAUGE_NAMES)
+                if not idle:
+                    consecutive_idle = 0
+                    last_idle_stability = None
+                elif last_idle_stability is None or stability != last_idle_stability:
+                    consecutive_idle = 1
+                    last_idle_stability = stability
+                else:
+                    consecutive_idle += 1
                 last_error = None
                 if consecutive_idle >= TUNNEL_DRAIN_REQUIRED_IDLE_SAMPLES:
                     return {
                         "attempts": attempts,
                         "consecutive_idle_samples": consecutive_idle,
                         "metrics": observed,
+                        "stability": stability,
                     }
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         time.sleep(min(TUNNEL_DRAIN_SAMPLE_INTERVAL_SECONDS, remaining))
     core.fail(
-        "Tunnel-Dispatcher wurde vor geplantem Stop nicht nachweislich leer",
+        "Tunnel-Dispatcher wurde vor geplantem Stop nicht stabil leer",
         phase="tunnel-drain-pre-stop",
         details={
             "attempts": attempts,
             "required_consecutive_idle_samples": TUNNEL_DRAIN_REQUIRED_IDLE_SAMPLES,
             "last_observed": last_observed,
+            "last_idle_stability": last_idle_stability or {},
+            "last_valid_counters": last_valid_counters or {},
+            "expected_process_start_time_seconds": expected_process_start_time,
             "last_error": last_error,
         },
     )
+
+
+def verify_tunnel_drain_final_guard(
+    expected_stability: dict[str, float],
+) -> dict[str, float]:
+    metrics_text = core.http_text(TUNNEL_METRICS_URL)
+    if metrics_text is None:
+        core.fail(
+            "Tunnel-Drain-Finalprüfung konnte Metriken nicht lesen",
+            phase="tunnel-drain-final-guard",
+            details={"reason": "metrics-unavailable"},
+        )
+    try:
+        observed = _parse_tunnel_drain_metrics(metrics_text)
+    except core.DeployError as exc:
+        core.fail(
+            "Tunnel-Drain-Finalprüfung konnte Metriken nicht sicher auswerten",
+            phase="tunnel-drain-final-guard",
+            details={"metrics_error": _error_summary(exc)},
+        )
+    busy = {
+        name: observed[name]
+        for name in TUNNEL_DRAIN_GAUGE_NAMES
+        if observed[name] != 0
+    }
+    stability = _tunnel_drain_stability_snapshot(observed)
+    changed_stability = {
+        name: {"expected": expected_stability.get(name), "observed": stability[name]}
+        for name in TUNNEL_DRAIN_STABILITY_NAMES
+        if expected_stability.get(name) != stability[name]
+    }
+    if busy or changed_stability:
+        core.fail(
+            "Tunnel wurde zwischen Drain-Beweis und geplantem Stop wieder aktiv",
+            phase="tunnel-drain-final-guard",
+            details={
+                "busy_metrics": busy,
+                "changed_stability": changed_stability,
+            },
+        )
+    return observed
 
 
 def stop_service(unit: str) -> core.ServiceObservation:
@@ -2555,7 +2664,9 @@ def deploy_url(
     try:
         core.verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
         phase = "tunnel-drain-pre-stop"
-        wait_for_tunnel_dispatcher_idle(timeout_seconds=timeout_seconds)
+        drain_proof = wait_for_tunnel_dispatcher_idle(timeout_seconds=timeout_seconds)
+        phase = "tunnel-drain-final-guard"
+        final_drain_metrics = verify_tunnel_drain_final_guard(drain_proof["stability"])
         phase = "stop-tunnel"
         stop_service(TUNNEL_SERVICE)
         phase = "stop-operator"
@@ -2618,6 +2729,13 @@ def deploy_url(
         print(f"Runtime:         {runtime}")
         print(f"Release:         {build.release_path}")
         print(f"Watchdog-Assets: {watchdog_projection.asset_set_sha256}")
+        print(
+            "Tunnel-Drain:    "
+            f"attempts={drain_proof['attempts']} "
+            f"stable={drain_proof['consecutive_idle_samples']} "
+            f"final_queue={final_drain_metrics['commands_queue_length']:g} "
+            f"final_workers={final_drain_metrics['dispatcher_worker_pool_occupancy']:g}"
+        )
         print(f"Legacy-Backup:   {activation.legacy_backup}")
     except Exception as original:
         watchdog_rollback_error: Exception | None = None
@@ -2666,7 +2784,7 @@ def deploy_url(
                 "Deployment und Watchdog-Host-Asset-Rücksicherung fehlgeschlagen: "
                 f"{original}; watchdog rollback: {watchdog_rollback_error}"
             )
-        if phase == "tunnel-drain-pre-stop":
+        if phase in {"tunnel-drain-pre-stop", "tunnel-drain-final-guard"}:
             if watchdog_rollback_error is not None:
                 raise rollback_original from original
             raise original

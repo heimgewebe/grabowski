@@ -2129,11 +2129,17 @@ class DeploymentSequenceTests(unittest.TestCase):
         valid = (
             "commands_queue_length{scope=\"controlplane\"} 0\n"
             "dispatcher_worker_pool_occupancy{scope=\"dispatcher\"} 2\n"
+            "commands_polled_total{scope=\"controlplane\"} 10\n"
+            "commands_enqueued_total{scope=\"controlplane\"} 10\n"
+            "process_start_time_seconds 1000\n"
         )
         self.assertEqual(
             {
                 "commands_queue_length": 0.0,
                 "dispatcher_worker_pool_occupancy": 2.0,
+                "commands_polled_total": 10.0,
+                "commands_enqueued_total": 10.0,
+                "process_start_time_seconds": 1000.0,
             },
             dual._parse_tunnel_drain_metrics(valid),
         )
@@ -2147,23 +2153,111 @@ class DeploymentSequenceTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(core.DeployError):
                 dual._parse_tunnel_drain_metrics(payload)
 
-    def test_tunnel_drain_wait_requires_consecutive_idle_samples(self) -> None:
-        busy = (
-            "commands_queue_length 0\n"
-            "dispatcher_worker_pool_occupancy 1\n"
-        )
-        idle = (
-            "commands_queue_length 0\n"
-            "dispatcher_worker_pool_occupancy 0\n"
-        )
+    def test_tunnel_drain_wait_requires_stable_counters_across_idle_samples(self) -> None:
+        def metrics(*, workers: int, counter: int) -> str:
+            return (
+                "commands_queue_length 0\n"
+                f"dispatcher_worker_pool_occupancy {workers}\n"
+                f"commands_polled_total {counter}\n"
+                f"commands_enqueued_total {counter}\n"
+                "process_start_time_seconds 1000\n"
+            )
+
         with (
-            mock.patch.object(core, "http_text", side_effect=[busy, idle, idle, idle]),
+            mock.patch.object(
+                core,
+                "http_text",
+                side_effect=[
+                    metrics(workers=1, counter=10),
+                    metrics(workers=0, counter=10),
+                    metrics(workers=0, counter=11),
+                    metrics(workers=0, counter=11),
+                    metrics(workers=0, counter=11),
+                ],
+            ),
             mock.patch.object(dual.time, "sleep"),
         ):
             result = dual.wait_for_tunnel_dispatcher_idle(timeout_seconds=5)
-        self.assertEqual(4, result["attempts"])
+        self.assertEqual(5, result["attempts"])
         self.assertEqual(3, result["consecutive_idle_samples"])
-        self.assertEqual(0.0, result["metrics"]["dispatcher_worker_pool_occupancy"])
+        self.assertEqual(
+            {
+                "commands_polled_total": 11.0,
+                "commands_enqueued_total": 11.0,
+                "process_start_time_seconds": 1000.0,
+            },
+            result["stability"],
+        )
+
+    def test_tunnel_drain_wait_fails_closed_on_counter_regression(self) -> None:
+        first = (
+            "commands_queue_length 0\n"
+            "dispatcher_worker_pool_occupancy 1\n"
+            "commands_polled_total 10\n"
+            "commands_enqueued_total 10\n"
+            "process_start_time_seconds 1000\n"
+        )
+        regressed = first.replace(
+            "dispatcher_worker_pool_occupancy 1",
+            "dispatcher_worker_pool_occupancy 0",
+        ).replace("total 10", "total 9")
+        with (
+            mock.patch.object(core, "http_text", side_effect=[first, regressed]),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.wait_for_tunnel_dispatcher_idle(timeout_seconds=5)
+        self.assertEqual("tunnel-drain-pre-stop", raised.exception.phase)
+        self.assertIn("commands_polled_total", raised.exception.details["regressed_counters"])
+
+    def test_tunnel_drain_wait_fails_closed_on_process_switch(self) -> None:
+        first = (
+            "commands_queue_length 1\n"
+            "dispatcher_worker_pool_occupancy 1\n"
+            "commands_polled_total 10\n"
+            "commands_enqueued_total 10\n"
+            "process_start_time_seconds 1000\n"
+        )
+        restarted = first.replace("process_start_time_seconds 1000", "process_start_time_seconds 1001")
+        with (
+            mock.patch.object(core, "http_text", side_effect=[first, restarted]),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.wait_for_tunnel_dispatcher_idle(timeout_seconds=5)
+        self.assertEqual("tunnel-drain-pre-stop", raised.exception.phase)
+        self.assertEqual(
+            1000.0,
+            raised.exception.details["expected_process_start_time_seconds"],
+        )
+        self.assertEqual(
+            1001.0,
+            raised.exception.details["observed_process_start_time_seconds"],
+        )
+
+    def test_tunnel_drain_final_guard_requires_same_counters_and_idle_gauges(self) -> None:
+        idle = (
+            "commands_queue_length 0\n"
+            "dispatcher_worker_pool_occupancy 0\n"
+            "commands_polled_total 10\n"
+            "commands_enqueued_total 10\n"
+            "process_start_time_seconds 1000\n"
+        )
+        expected = {
+            "commands_polled_total": 10.0,
+            "commands_enqueued_total": 10.0,
+            "process_start_time_seconds": 1000.0,
+        }
+        with mock.patch.object(core, "http_text", return_value=idle):
+            observed = dual.verify_tunnel_drain_final_guard(expected)
+        self.assertEqual(0.0, observed["dispatcher_worker_pool_occupancy"])
+
+        churned = idle.replace("commands_enqueued_total 10", "commands_enqueued_total 11")
+        with mock.patch.object(core, "http_text", return_value=churned):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.verify_tunnel_drain_final_guard(expected)
+        self.assertEqual("tunnel-drain-final-guard", raised.exception.phase)
+        self.assertIn("commands_enqueued_total", raised.exception.details["changed_stability"])
 
     def test_tunnel_drain_wait_fails_closed_without_metrics(self) -> None:
         with (
@@ -2213,7 +2307,25 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(
                 dual,
                 "wait_for_tunnel_dispatcher_idle",
-                side_effect=lambda **kwargs: events.append("drain:tunnel") or {},
+                side_effect=lambda **kwargs: events.append("drain:tunnel")
+                or {
+                    "attempts": 4,
+                    "consecutive_idle_samples": 3,
+                    "stability": {
+                        "commands_polled_total": 10.0,
+                        "commands_enqueued_total": 10.0,
+                        "process_start_time_seconds": 1000.0,
+                    },
+                },
+            ),
+            mock.patch.object(
+                dual,
+                "verify_tunnel_drain_final_guard",
+                side_effect=lambda stability: events.append("drain:final-guard")
+                or {
+                    "commands_queue_length": 0.0,
+                    "dispatcher_worker_pool_occupancy": 0.0,
+                },
             ),
             mock.patch.object(
                 dual,
@@ -2268,6 +2380,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "install:observer",
                 "verify:snapshot",
                 "drain:tunnel",
+                "drain:final-guard",
                 f"stop:{dual.TUNNEL_SERVICE}",
                 f"stop:{dual.OPERATOR_SERVICE}",
                 "verify:snapshot",
@@ -2346,7 +2459,18 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(
                 dual, "install_safety_observer_unit", return_value=repair
             ),
-            mock.patch.object(dual, "wait_for_tunnel_dispatcher_idle", return_value={}),
+            mock.patch.object(
+                dual,
+                "wait_for_tunnel_dispatcher_idle",
+                return_value={
+                    "stability": {
+                        "commands_polled_total": 10.0,
+                        "commands_enqueued_total": 10.0,
+                        "process_start_time_seconds": 1000.0,
+                    }
+                },
+            ),
+            mock.patch.object(dual, "verify_tunnel_drain_final_guard", return_value={}),
             mock.patch.object(dual, "stop_service", side_effect=stop),
             mock.patch.object(core, "activate_pointer") as activate,
             mock.patch.object(dual, "rollback_url", side_effect=rollback),
@@ -2432,6 +2556,70 @@ class DeploymentSequenceTests(unittest.TestCase):
             )
         )
         self.assertEqual("tunnel-drain-pre-stop", payload["deploy_phase"])
+
+    def test_final_guard_failure_aborts_before_service_stop_without_service_rollback(self) -> None:
+        stderr = io.StringIO()
+        stability = {
+            "commands_polled_total": 10.0,
+            "commands_enqueued_total": 10.0,
+            "process_start_time_seconds": 1000.0,
+        }
+        with (
+            mock.patch.object(
+                dual,
+                "preflight_url",
+                return_value=(
+                    self.snapshot(),
+                    RUNTIME,
+                    dual.ProfileTopology("url", server_url_count=1),
+                ),
+            ),
+            mock.patch.object(core, "build_release", return_value=self.build()),
+            mock.patch.object(core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(core, "verify_manifest"),
+            mock.patch.object(core, "capture_pointer", return_value=SimpleNamespace()),
+            mock.patch.object(
+                dual, "install_watchdog_host_assets", return_value=self.watchdog_projection()
+            ),
+            mock.patch.object(dual, "restore_watchdog_host_assets") as restore_watchdogs,
+            mock.patch.object(
+                dual,
+                "install_safety_observer_unit",
+                return_value={
+                    "changed": False,
+                    "repo_head": "a" * 40,
+                    "sha256": "d" * 64,
+                },
+            ),
+            mock.patch.object(
+                dual,
+                "wait_for_tunnel_dispatcher_idle",
+                return_value={"stability": stability},
+            ),
+            mock.patch.object(
+                dual,
+                "verify_tunnel_drain_final_guard",
+                side_effect=core.DeployError(
+                    "new command", phase="tunnel-drain-final-guard"
+                ),
+            ),
+            mock.patch.object(dual, "stop_service") as stop,
+            mock.patch.object(dual, "rollback_url") as rollback,
+            mock.patch("sys.stderr", stderr),
+        ):
+            with self.assertRaisesRegex(core.DeployError, "new command"):
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+        stop.assert_not_called()
+        rollback.assert_not_called()
+        restore_watchdogs.assert_called_once()
+        payload = json.loads(
+            next(
+                line.removeprefix("PRIMARY-DEPLOY-ERROR: ")
+                for line in stderr.getvalue().splitlines()
+                if line.startswith("PRIMARY-DEPLOY-ERROR: ")
+            )
+        )
+        self.assertEqual("tunnel-drain-final-guard", payload["deploy_phase"])
 
     def test_post_observer_snapshot_failure_retains_repair_and_rolls_back(self) -> None:
         stderr = io.StringIO()
@@ -2541,7 +2729,18 @@ class DeploymentSequenceTests(unittest.TestCase):
                     "sha256": "d" * 64,
                 },
             ),
-            mock.patch.object(dual, "wait_for_tunnel_dispatcher_idle", return_value={}),
+            mock.patch.object(
+                dual,
+                "wait_for_tunnel_dispatcher_idle",
+                return_value={
+                    "stability": {
+                        "commands_polled_total": 10.0,
+                        "commands_enqueued_total": 10.0,
+                        "process_start_time_seconds": 1000.0,
+                    }
+                },
+            ),
+            mock.patch.object(dual, "verify_tunnel_drain_final_guard", return_value={}),
             mock.patch.object(dual, "stop_service", side_effect=stop),
             mock.patch.object(dual, "rollback_url", side_effect=rollback),
             mock.patch("sys.stderr", stderr),
