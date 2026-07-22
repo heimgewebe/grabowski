@@ -2358,6 +2358,33 @@
     ],
     "module": "grabowski_operator",
     "source": "src/grabowski_runtime.py",
+    "spawn_dependencies": [
+      {
+        "kind": "python_module",
+        "launcher_module": "grabowski_agent_workspace",
+        "spawned_module": "grabowski_agent_workspace"
+      },
+      {
+        "kind": "python_module",
+        "launcher_module": "grabowski_agent_workspace",
+        "spawned_module": "grabowski_agent_writer"
+      },
+      {
+        "kind": "python_module",
+        "launcher_module": "grabowski_agent_workspace",
+        "spawned_module": "grabowski_agent_role"
+      },
+      {
+        "kind": "python_module",
+        "launcher_module": "grabowski_workers",
+        "spawned_module": "grabowski_worker_process"
+      },
+      {
+        "kind": "python_module",
+        "launcher_module": "grabowski_job_finalizer",
+        "spawned_module": "grabowski_ntfy_dispatch"
+      }
+    ],
     "supporting_sources": [
       {
         "module": "grabowski_operator_core",
@@ -2637,7 +2664,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "16a8f093150dc77a47a5ccaa14f11175f588f2d703d6748ded58badc5656fa2a"
+      "sha256": "fc272cc9a406566f39d2ee9ea9fd9ccd0a52dca05232d2016ece26872bd1cd24"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2680,7 +2707,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "4320466d3514599481034e43a66b458cc74e77487472e4455fb27f1c3b4dbe17",
+      "src/grabowski_mcp.py": "f92dd21adf25aa99ef7d8f2400ac4ebcafbbec3c0a34d387f0f20e65288ed914",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_ntfy_dispatch.py": "75be1e72248720a1c21d70366a8a08f3833693e25060c87fce4b1ba802c1fcca",
