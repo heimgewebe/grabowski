@@ -1622,24 +1622,31 @@ def _tmux_has_exact_session(session: str) -> bool:
 def _tmux_exact_session_identity(session: str) -> dict[str, Any] | None:
     result = _tmux_result(
         [
-            "display-message",
-            "-p",
-            "-t",
-            _tmux_exact_target(session),
-            "#{session_id}\t#{session_created}",
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_id}\t#{session_created}",
         ]
     )
     if result.get("returncode") != 0:
         return None
-    parts = str(result.get("stdout") or "").strip().split("\t")
+    matches: list[tuple[str, str]] = []
+    for line in str(result.get("stdout") or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3 or parts[0] != session:
+            continue
+        matches.append((parts[1], parts[2]))
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise AgentWorkspaceActionError("tmux exact session identity is ambiguous")
+    session_id, session_created = matches[0]
     if (
-        len(parts) != 2
-        or not parts[0].startswith("$")
-        or not parts[0][1:].isdigit()
-        or not parts[1].isdigit()
+        not session_id.startswith("$")
+        or not session_id[1:].isdigit()
+        or not session_created.isdigit()
     ):
         raise AgentWorkspaceActionError("tmux exact session identity is invalid")
-    return {"session_id": parts[0], "session_created": int(parts[1])}
+    return {"session_id": session_id, "session_created": int(session_created)}
 
 
 def _valid_tmux_session_identity(value: object) -> bool:
