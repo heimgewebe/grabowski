@@ -12,6 +12,7 @@
   "capability_definitions": {
     "artifact_transfer": "Transfer regular files with hash-bound source and destination preconditions.",
     "audit_verify": "Verify the tamper-evident write audit chain.",
+    "audit_read": "Read bounded safe fields from the verified audit chain without granting audit mutation authority.",
     "browser_profile_read": "Read bounded browser profile metadata and text under explicit browser profile roots; binary databases are metadata-only.",
     "browser_worker": "Start and control isolated agent-owned browser workers with loopback-only debugging.",
     "bundle_registry": "Read the curated Lens/repoLens latest-complete bundle registry.",
@@ -69,6 +70,7 @@
         "file_read",
         "file_write",
         "audit_verify",
+        "audit_read",
         "rollback_text",
         "bundle_registry",
         "durable_job",
@@ -119,6 +121,7 @@
       "capabilities": [
         "file_read",
         "audit_verify",
+        "audit_read",
         "bundle_registry",
         "process_inspect",
         "port_inspect",
@@ -158,6 +161,7 @@
         "file_read",
         "file_write",
         "audit_verify",
+        "audit_read",
         "rollback_text",
         "bundle_registry",
         "secret_inspect",
