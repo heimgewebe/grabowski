@@ -1082,6 +1082,12 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
     def test_systemd_socket_contract_is_rooted_and_group_bounded(self) -> None:
         socket_unit = (ROOT / "systemd" / "grabowski-privileged-broker.socket").read_text(encoding="utf-8")
         service_unit = (ROOT / "systemd" / "grabowski-privileged-broker@.service").read_text(encoding="utf-8")
+        recovery_dropin = (
+            ROOT
+            / "systemd"
+            / "grabowski-privileged-broker@.service.d"
+            / "recovery-source.conf"
+        ).read_text(encoding="utf-8")
         tmpfiles = (ROOT / "tmpfiles" / "grabowski.conf").read_text(encoding="utf-8")
         self.assertIn("Accept=yes", socket_unit)
         self.assertIn("SocketGroup=grabowski", socket_unit)
@@ -1102,6 +1108,9 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertNotIn("BindReadOnlyPaths=-/home/alex/repos\n", service_unit)
         for path in privileged.PROCESS_REFERENCE_ALLOWED_ROOTS:
             self.assertIn(f"BindReadOnlyPaths=-{path}", service_unit)
+            self.assertIn(f"BindReadOnlyPaths=-{path}", recovery_dropin)
+        self.assertIn("BindReadOnlyPaths=\n", recovery_dropin)
+        self.assertNotIn("BindReadOnlyPaths=-/home/alex/repos\n", recovery_dropin)
         self.assertNotIn("BindPaths=/home/alex", service_unit)
         self.assertNotIn("ProtectHome=yes", service_unit)
         self.assertIn("ExecStart=/usr/local/libexec/grabowski-privileged-broker", service_unit)

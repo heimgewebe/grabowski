@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import fcntl
 import hashlib
 import importlib.util
@@ -183,6 +184,78 @@ class RootbrokerCutoverTests(unittest.TestCase):
         self.assertEqual(artifact.source_relative, "src/grabowski_command_identity.py")
         self.assertEqual(artifact.mode, 0o644)
         self.assertTrue(artifact.python_source)
+
+    def test_source_artifact_validation_rejects_missing_local_dependency(self) -> None:
+        broker_target = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
+        broker_data = b"import grabowski_command_identity\n"
+        artifacts = {
+            broker_target: (
+                broker_data,
+                0o644,
+                hashlib.sha256(broker_data).hexdigest(),
+            )
+        }
+
+        with self.assertRaisesRegex(
+            cutover.CutoverError,
+            "source artifact local dependency is missing",
+        ):
+            cutover._validate_source_artifacts(
+                artifacts,
+                python_targets={broker_target},
+            )
+
+    def test_source_artifact_validation_accepts_closed_local_dependencies(self) -> None:
+        broker_target = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
+        identity_target = Path("/usr/local/lib/grabowski/grabowski_command_identity.py")
+        broker_data = b"import grabowski_command_identity\n"
+        identity_data = b"VALUE = 1\n"
+        artifacts = {
+            broker_target: (
+                broker_data,
+                0o644,
+                hashlib.sha256(broker_data).hexdigest(),
+            ),
+            identity_target: (
+                identity_data,
+                0o644,
+                hashlib.sha256(identity_data).hexdigest(),
+            ),
+        }
+
+        cutover._validate_source_artifacts(
+            artifacts,
+            python_targets=set(artifacts),
+        )
+
+    def test_python_artifacts_include_local_import_dependencies(self) -> None:
+        source_artifacts = {
+            Path(artifact.source_relative).stem: artifact
+            for artifact in cutover.ARTIFACTS
+            if artifact.python_source and artifact.source_relative.startswith("src/")
+        }
+        missing: list[tuple[str, str]] = []
+
+        for module_name, artifact in source_artifacts.items():
+            tree = ast.parse((ROOT / artifact.source_relative).read_text(encoding="utf-8"))
+            dependencies: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    dependencies.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                    dependencies.add(node.module)
+            for dependency in dependencies:
+                if not dependency.startswith("grabowski_"):
+                    continue
+                if not (ROOT / "src" / f"{dependency}.py").is_file():
+                    continue
+                if dependency not in source_artifacts:
+                    missing.append((module_name, dependency))
+
+        self.assertEqual(missing, [])
+        command_identity = source_artifacts["grabowski_command_identity"]
+        self.assertEqual(command_identity.target, cutover.COMMAND_IDENTITY_MODULE_TARGET)
+        self.assertEqual(command_identity.mode, 0o644)
 
     def test_merge_adds_only_publisher_and_target_binding(self) -> None:
         current = _installed_config()
@@ -389,15 +462,18 @@ class RootbrokerCutoverTests(unittest.TestCase):
 
     def test_recovery_source_dropin_is_exact_and_narrow(self) -> None:
         publisher = _publisher()
-        expected = (
-            "[Service]\n"
-            "ProtectHome=tmpfs\n"
-            "BindReadOnlyPaths=\n"
-            "BindReadOnlyPaths=/home/alex/.local/state/grabowski/recovery/"
-            "last-server-recovery.json\n"
-            "BindReadOnlyPaths=-/home/alex/.local/state/grabowski/"
-            "operator-kill-switch\n"
-        ).encode("utf-8")
+        expected_lines = [
+            "[Service]",
+            "ProtectHome=tmpfs",
+            "BindReadOnlyPaths=",
+            "BindReadOnlyPaths=/home/alex/.local/state/grabowski/recovery/last-server-recovery.json",
+            "BindReadOnlyPaths=-/home/alex/.local/state/grabowski/operator-kill-switch",
+        ]
+        expected_lines.extend(
+            f"BindReadOnlyPaths=-{path}"
+            for path in cutover.PROCESS_OBSERVER_BIND_PATHS
+        )
+        expected = ("\n".join(expected_lines) + "\n").encode("utf-8")
         artifacts = {
             cutover.RECOVERY_SOURCE_DROPIN_TARGET: (
                 expected,
@@ -414,6 +490,12 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover._expected_recovery_source_dropin(publisher),
             expected,
         )
+        for path in cutover.PROCESS_OBSERVER_BIND_PATHS:
+            self.assertIn(
+                f"BindReadOnlyPaths=-{path}\n".encode("utf-8"),
+                expected,
+            )
+        self.assertNotIn(b"BindReadOnlyPaths=-/home/alex/repos\n", expected)
 
         broad = expected.replace(
             b"recovery/last-server-recovery.json",
