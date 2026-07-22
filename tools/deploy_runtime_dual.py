@@ -117,6 +117,18 @@ WATCHDOG_HOST_ASSETS = (
         mode=0o600,
         unit="grabowski-tunnel-watchdog.timer",
     ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-runtime-retention.service.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-runtime-retention.service",
+        mode=0o600,
+        unit="grabowski-runtime-retention.service",
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-runtime-retention.timer.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-runtime-retention.timer",
+        mode=0o600,
+        unit="grabowski-runtime-retention.timer",
+    ),
 )
 OBSERVER_FORBIDDEN_RELATIONS = {
     "Wants",
