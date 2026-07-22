@@ -104,8 +104,9 @@ The evaluator distinguishes:
 - `superseded`: a newer authorized v1 command exists; the older run performs no status mutation;
 - `stale_or_edited`: the triggering comment still exists in the window but its body no longer matches the event;
 - `outside_bounded_window`: the triggering comment cannot be proven current within the bounded window.
+- `authorization_unknown`: authorization of a newer command could not be determined safely.
 
-Only `superseded` is a safe no-op. The other non-current states are blocking once the triggering actor has been authorized. Permission lookups are cached per evaluation, and subprocess calls have bounded timeouts.
+Failures to read the current comment window after the triggering actor and PR head are known likewise attempt to replace any older green status with a blocking status rather than silently preserving it. Only `superseded` is a safe no-op. The other non-current states are blocking once the triggering actor has been authorized. Permission lookups are cached per evaluation, and subprocess calls have bounded timeouts.
 
 There remains an unavoidable small distributed-systems race between the final freshness read and the commit-status API write. The second freshness read and final head/base read materially narrow that window; a newer authorized command will subsequently re-evaluate the same head. A future attested status service could make generation ordering atomic, but this workflow does not claim that stronger property.
 

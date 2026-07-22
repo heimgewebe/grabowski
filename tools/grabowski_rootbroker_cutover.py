@@ -20,6 +20,7 @@ CONFIG_TARGET = Path("/etc/grabowski/privileged-actions.json")
 BLOCKADES_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockades.py")
 BLOCKADE_STORE_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_store.py")
 BLOCKADE_AUTHORITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_authority.py")
+COMMAND_IDENTITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_command_identity.py")
 BROKER_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
 BROKER_WRAPPER_TARGET = Path("/usr/local/libexec/grabowski-privileged-broker")
 PROCESS_OBSERVER_TARGET = Path("/usr/local/libexec/grabowski-process-reference-observer")
@@ -69,6 +70,12 @@ ARTIFACTS = (
     Artifact(
         "src/grabowski_blockade_authority.py",
         BLOCKADE_AUTHORITY_MODULE_TARGET,
+        0o644,
+        True,
+    ),
+    Artifact(
+        "src/grabowski_command_identity.py",
+        COMMAND_IDENTITY_MODULE_TARGET,
         0o644,
         True,
     ),

@@ -176,6 +176,14 @@ class FakeRunner:
 
 
 class RootbrokerCutoverTests(unittest.TestCase):
+    def test_cutover_artifacts_include_command_identity_dependency(self) -> None:
+        artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
+
+        artifact = artifacts[cutover.COMMAND_IDENTITY_MODULE_TARGET]
+        self.assertEqual(artifact.source_relative, "src/grabowski_command_identity.py")
+        self.assertEqual(artifact.mode, 0o644)
+        self.assertTrue(artifact.python_source)
+
     def test_merge_adds_only_publisher_and_target_binding(self) -> None:
         current = _installed_config()
         original = json.loads(json.dumps(current))
