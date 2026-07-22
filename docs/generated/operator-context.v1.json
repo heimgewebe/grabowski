@@ -245,7 +245,7 @@
       "description": "Query the verified audit chain through a bounded evidence projection.",
       "effects": [],
       "id": "grabowski_audit_query",
-      "purpose": "Query bounded safe fields from the fully verified audit segment chain.",
+      "purpose": "Query bounded safe fields from a verified audit snapshot with explicit scan completeness.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -256,7 +256,7 @@
       "description": "Trace one audit anchor through bounded one-hop correlations.",
       "effects": [],
       "id": "grabowski_audit_trace",
-      "purpose": "Trace one exact audit anchor through bounded one-hop evidence correlations without claiming causality.",
+      "purpose": "Trace one exact audit anchor through bounded one-hop typed evidence correlations without claiming causality.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -267,7 +267,7 @@
       "description": "Compute bounded descriptive statistics from the verified audit chain.",
       "effects": [],
       "id": "grabowski_audit_analyze",
-      "purpose": "Compute bounded descriptive statistics from the fully verified audit segment chain.",
+      "purpose": "Compute bounded-memory descriptive statistics from a verified audit snapshot with explicit approximation semantics.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -459,6 +459,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_summary"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Project bounded current operator work without creating a second lifecycle truth.",
+      "effects": [],
+      "id": "grabowski_current_work",
+      "purpose": "Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_current_work"
     },
     {
       "category": "version-control",
@@ -2158,6 +2169,7 @@
     "capabilities": [
       "file_read",
       "audit_verify",
+      "audit_read",
       "bundle_registry",
       "process_inspect",
       "port_inspect",
@@ -2220,6 +2232,7 @@
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
       "grabowski_checkout_summary",
+      "grabowski_current_work",
       "grabowski_git_status",
       "grabowski_git_diff",
       "grabowski_git_log",
@@ -2431,6 +2444,18 @@
         "source": "src/grabowski_checkouts.py"
       },
       {
+        "module": "grabowski_current_work",
+        "source": "src/grabowski_current_work.py"
+      },
+      {
+        "module": "grabowski_managed_cargo",
+        "source": "src/grabowski_managed_cargo.py"
+      },
+      {
+        "module": "grabowski_current_work_surface",
+        "source": "src/grabowski_current_work_surface.py"
+      },
+      {
         "module": "grabowski_fleet",
         "source": "src/grabowski_fleet.py"
       },
@@ -2600,33 +2625,33 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "1404ee91b23fb5d4877d2b9a6ea16f4e6a5d7b1488c70115376e9055f72121d0"
+      "sha256": "84d8147c050eddfb1aa6f9072f0642c5d25004c220bf3cf77e96d199ecfcae38"
     },
     "policy_example": {
       "path": "config/access.example.json",
-      "sha256": "476fbafcf084c6fb658c00c9509cde06e7a2874df7a2cc31964c8ba7d6284ac5"
+      "sha256": "d548f3a0d0e29fdadaca69404a8c51c83e618adf81076499e11946112b4e44be"
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "6d90e320a7a436b8540730dbd1a44bb47fd0cf6aad78a5710a2d62602ff14e28"
+      "sha256": "1a9a3a0ff0adb2e05d1b112d31ab010cf11fe10b3a8f73fcddd7e6d717dc3431"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
       "src/grabowski_agent_competition.py": "a73185abdcd26b6bad07b1fc5511182b820fd0e7b6eee3fbb9b558f5df83f442",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "b3b0635cb3eead8f67e2841c944ea12f91136f8e189f5850fdc4278bc3dfb6d4",
+      "src/grabowski_agent_workspace.py": "e4f263b6aa825b3eaa60ea60a05c551c1a003a298e38d4ca093a492e6aa891e2",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "4ea793a295ca5d4dc73489795984fe8ffd27d623377d058c6fe5d71ee477fec8",
-      "src/grabowski_audit_query.py": "9ba44554c1ed988ad1c31a24a8e209efd0e97e03ade98ef98f70340940bcc988",
+      "src/grabowski_audit_query.py": "345252725dd57dc68aad7f7db33943d0c4bb596313e09e0afcd13c5864a7c587",
       "src/grabowski_blockade_authority.py": "f4f5d5260b8f88a01eb176b25427de4726c57a926982cb446b54ccb6e1dbadcd",
       "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_intake.py": "4eab97232ddee6fcebc83232209f37b2babb90d22d9fc809e71111e6d67a4c8b",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "1404ee91b23fb5d4877d2b9a6ea16f4e6a5d7b1488c70115376e9055f72121d0",
+      "src/grabowski_capabilities.py": "84d8147c050eddfb1aa6f9072f0642c5d25004c220bf3cf77e96d199ecfcae38",
       "src/grabowski_checkouts.py": "2c1a313621eeaf416e84e5bf55357bce5f561be7e909b7f48adaab3f4b229e53",
       "src/grabowski_chronik.py": "e44d25d955ab35efbfe3ec381f84395f070d37fcd8726a0488269a47137ade8f",
       "src/grabowski_client_snapshot.py": "769781a03136edce241925884d9dc396ed9b2e676dc32a4fa74dcd02a2da3152",
@@ -2634,21 +2659,24 @@
       "src/grabowski_command_identity.py": "8a45a7161aa992c41be86f0b9301077917e47b67034674ea16845e2622e7ffee",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_convergence.py": "55184278ede657b5d5eecdbe7defc272376bd9b6b4d8e4075fcb3db649ba559e",
+      "src/grabowski_current_work.py": "33b2e455bc3198b7094573f60706c3874f9a46d09df946c07c7cb0b96894ddb6",
+      "src/grabowski_current_work_surface.py": "e496b2fde7fcd179006bdf82629a50929ec2be84ec1db8d302e67e0d8ec7ae95",
       "src/grabowski_fleet.py": "0daf060517bde7b17caf7dd1f684e29521fb7b7457d1bfd79b32cf28a15c3beb",
       "src/grabowski_friction.py": "673df67bac2b3e9aa3374992b4b243d367393dc87af673e863a3827ca044a0d8",
       "src/grabowski_grip_orchestration.py": "f9a7ad69853f5e6466689a554d8d6ce7b0accebc90ff9168174b6ae4fad87d4c",
       "src/grabowski_grips.py": "51924d3515f5dac7cb5fe1995f0e9bdfcfd20e457942005ed982c4e9001651b0",
-      "src/grabowski_job_finalizer.py": "809b24c2336ab958730b17643e7df73cc352f9b58e24ab64fecff04c0d1da302",
+      "src/grabowski_job_finalizer.py": "ecda3a3761c92a89a17367f75b2b2e359ae224c441d3502ca63c2aa69af1aa0f",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_lifecycle_archive.py": "2dcddcd320047f4f14d260aa4127826b5f942a2645446f55919135846c07ae50",
+      "src/grabowski_lifecycle_archive.py": "79a29777e4650644895362d44795ecf590c30d05832fbc8b2164e280130db761",
       "src/grabowski_lifecycle_collectors.py": "33e9f34d7bfb7ed99cebe3dfc3f4e91e6c5f68ebf24a20f38a10aba6a317b885",
       "src/grabowski_lifecycle_effect_plan.py": "3cb6643fe10ee3fee3a914488605a79590a9354193e0ccc397c4a9d863fad567",
       "src/grabowski_lifecycle_evidence.py": "fc36996f2a70bfd601ffeb90bed9457c1c5225c9a67a1e00e3a41d10551e6a14",
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
-      "src/grabowski_mcp.py": "9fa90e553b5eb7f313878e998a0269e3c42d69fb1f0e581623815f4967f1a034",
+      "src/grabowski_managed_cargo.py": "009f53a7a45b26efcb563c5e735a3dadb6d2b69fe6d451879f2d8e82a79b0e89",
+      "src/grabowski_mcp.py": "4320466d3514599481034e43a66b458cc74e77487472e4455fb27f1c3b4dbe17",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
@@ -2656,20 +2684,20 @@
       "src/grabowski_operator_obligation.py": "a18dd9e4c9b2915aecdf51897b38da08dc1b557541e823e9fb3bd7a0e470c085",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "ea0cd51630be7362a985ed0a56288d521c9d3b7341218d656306643e6c27a498",
-      "src/grabowski_privileged_broker.py": "d33faefb5039d8209040598e054a2a9ec8a1e0fbc141f39fa8ff605c9cb2b72f",
+      "src/grabowski_privileged_broker.py": "a64fb92d5ecddf73cc08c59ce0a2212481afe8e71a07bfbd1be8c3df0243071a",
       "src/grabowski_read_surface.py": "a0636b7d20cf288c27096173d85c47e1b14dee4f0c5ef67b435fa425dd49d11a",
       "src/grabowski_recall.py": "dee423d64dfa4c98d49f0a42a64aa9219b19af25ac4a1d3311600e4c585ab65c",
       "src/grabowski_recovery.py": "1c5b0843345f5aa7d1da7f3f0c5831e647f652c83eba7733b4a2c998d291c16d",
       "src/grabowski_repobrief.py": "cdec704a822293cf194db6f0dff6481b3f3c4679d4a5b58756a0ea235c052e0a",
       "src/grabowski_repoground_catalog.py": "4981ef23c7cdada7d96d51803c63c8702effb095193271dbf51294bd199fd851",
       "src/grabowski_resources.py": "cd6b68aabe44ad53dcded80104637c188e404e24b9393469b7f048beb8554fc0",
-      "src/grabowski_runtime.py": "11d5bf1a2c427bc8708ed16916e19cba5d8f776d0212ef175da301938d269665",
+      "src/grabowski_runtime.py": "a2015e8e945f7779b79fff3d9f8e8486afb6e172a96312d9a756d1132b054f68",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "b8d92b82b762b763941735ef6c1b87ecad78ab60166eeaf5dbd8ac66f4325258",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
-      "src/grabowski_task_attention.py": "d66250baaf80ff82e996b2a5eaa1c5842d8f8fe5f4308d48e9cb35f45baf735f",
+      "src/grabowski_task_attention.py": "931250142a95fb258010606174bec8fc44941bd76d90b9f694e6543daee4636a",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "60ce42453d19cb5d5efaf4b98406852849c789edb74ec7e582ab575dd6d89576",
+      "src/grabowski_tasks.py": "359339a568c323ed1a07ed2b97d9950ec9e691ce1afc83b6abe19963d32029a2",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9be067c783e69b810470d233d14dd09e3e214d23e4815235c09f533e901a0178",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"

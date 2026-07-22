@@ -37,6 +37,7 @@ COMMENT_STATE_CURRENT = "current"
 COMMENT_STATE_SUPERSEDED = "superseded"
 COMMENT_STATE_STALE = "stale_or_edited"
 COMMENT_STATE_OUTSIDE_WINDOW = "outside_bounded_window"
+COMMENT_STATE_AUTHORIZATION_UNKNOWN = "authorization_unknown"
 COMMENT_RE = re.compile(
     rf"\A{re.escape(COMMENT_PREFIX)}(?:\s+(?P<payload>[A-Za-z0-9+/=]+))?\s*\Z"
 )
@@ -274,9 +275,12 @@ def command_comment_authorization_state(
         return COMMENT_STATE_OUTSIDE_WINDOW
     if current_body != current_comment_body:
         return COMMENT_STATE_STALE
-    latest = select_latest_authorized_command_comment_id(
-        comments, permission_lookup=permission_lookup
-    )
+    try:
+        latest = select_latest_authorized_command_comment_id(
+            comments, permission_lookup=permission_lookup
+        )
+    except CiEvidenceError:
+        return COMMENT_STATE_AUTHORIZATION_UNKNOWN
     if latest == current_comment_id:
         return COMMENT_STATE_CURRENT
     return COMMENT_STATE_SUPERSEDED
@@ -533,7 +537,7 @@ def publish_commit_status(
         "state": "success" if passed else "failure",
         "context": STATUS_CONTEXT,
         "description": (
-            "Current head/base/diff-bound review evidence passed"
+            "Authorized review assertion passed current bindings"
             if passed
             else f"Review evidence blocked ({failure_count} validation failure(s))"
         ),
@@ -607,6 +611,8 @@ def _comment_state_failure(state: str) -> str:
         return "comment is missing or outside the bounded authorization window"
     if state == COMMENT_STATE_SUPERSEDED:
         return "comment was superseded by a newer authorized review-evidence command"
+    if state == COMMENT_STATE_AUTHORIZATION_UNKNOWN:
+        return "authorization of a newer review-evidence command could not be determined"
     return f"comment authorization state is invalid: {state}"
 
 
@@ -674,13 +680,36 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
     permission_cache: dict[str, str | None] = {actor: permission}
 
     if args.comment_id is not None:
-        comment_state = current_comment_authorization_state(
-            repo_name,
-            args.pr,
-            comment_id=args.comment_id,
-            comment_body=comment_body,
-            permission_cache=permission_cache,
-        )
+        try:
+            comment_state = current_comment_authorization_state(
+                repo_name,
+                args.pr,
+                comment_id=args.comment_id,
+                comment_body=comment_body,
+                permission_cache=permission_cache,
+            )
+        except CiEvidenceError as exc:
+            failures = [f"comment freshness could not be proven: {exc}"]
+            if args.publish_status and head_sha is not None:
+                publish_commit_status(
+                    repo_name=repo_name,
+                    head_sha=head_sha,
+                    passed=False,
+                    failure_count=len(failures),
+                )
+            result = _safe_result(
+                repo_name=repo_name,
+                pr_number=args.pr,
+                pr=pr,
+                diff_sha256=None,
+                failures=failures,
+                status=None,
+                complexity=None,
+                authorized=True,
+                permission=permission,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 1
         if comment_state != COMMENT_STATE_CURRENT:
             failures = [_comment_state_failure(comment_state)]
             if (
@@ -727,9 +756,41 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
             )
         )
 
-    final_pr = load_live_pr(repo_name, args.pr)
     initial_head = _normalize_git_sha(pr.get("headRefOid"))
     initial_base = _normalize_git_sha(pr.get("baseRefOid"))
+
+    if args.publish_status and args.comment_id is not None:
+        try:
+            final_comment_state = current_comment_authorization_state(
+                repo_name,
+                args.pr,
+                comment_id=args.comment_id,
+                comment_body=comment_body,
+                permission_cache=permission_cache,
+            )
+        except CiEvidenceError as exc:
+            failures.append(
+                f"comment freshness could not be proven before status publication: {exc}"
+            )
+        else:
+            if final_comment_state == COMMENT_STATE_SUPERSEDED:
+                result = _safe_result(
+                    repo_name=repo_name,
+                    pr_number=args.pr,
+                    pr=pr,
+                    diff_sha256=diff_sha256,
+                    failures=[_comment_state_failure(final_comment_state)],
+                    status=status,
+                    complexity=complexity,
+                    authorized=True,
+                    permission=permission,
+                )
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return 0
+            if final_comment_state != COMMENT_STATE_CURRENT:
+                failures.append(_comment_state_failure(final_comment_state))
+
+    final_pr = load_live_pr(repo_name, args.pr)
     final_head = _normalize_git_sha(final_pr.get("headRefOid"))
     final_base = _normalize_git_sha(final_pr.get("baseRefOid"))
     if final_head is None:
@@ -738,31 +799,6 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
         failures.append("PR head changed during review-evidence evaluation")
     if initial_base != final_base:
         failures.append("PR base changed during review-evidence evaluation")
-
-    if args.publish_status and args.comment_id is not None:
-        final_comment_state = current_comment_authorization_state(
-            repo_name,
-            args.pr,
-            comment_id=args.comment_id,
-            comment_body=comment_body,
-            permission_cache=permission_cache,
-        )
-        if final_comment_state == COMMENT_STATE_SUPERSEDED:
-            result = _safe_result(
-                repo_name=repo_name,
-                pr_number=args.pr,
-                pr=final_pr,
-                diff_sha256=diff_sha256,
-                failures=[_comment_state_failure(final_comment_state)],
-                status=status,
-                complexity=complexity,
-                authorized=True,
-                permission=permission,
-            )
-            print(json.dumps(result, indent=2, sort_keys=True))
-            return 0
-        if final_comment_state != COMMENT_STATE_CURRENT:
-            failures.append(_comment_state_failure(final_comment_state))
 
     if args.publish_status and final_head is not None:
         publish_commit_status(

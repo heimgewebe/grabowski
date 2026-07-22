@@ -170,6 +170,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             "file_read",
             "file_write",
             "audit_verify",
+            "audit_read",
             "rollback_text",
             "bundle_registry",
             "secret_inspect",
@@ -930,6 +931,16 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             operator_tools,
         )
 
+    def test_legacy_policy_does_not_implicitly_gain_audit_read(self) -> None:
+        policy = {
+            "mode": "bounded-read-write",
+            "read_roots": [],
+            "write_roots": [],
+        }
+        profile = grabowski_mcp._legacy_profile(policy)
+        self.assertIn("audit_verify", profile["capabilities"])
+        self.assertNotIn("audit_read", profile["capabilities"])
+
     def test_legacy_operator_capability_semantics_are_mirrored(self) -> None:
         policy = {
             "version": 1,
@@ -975,10 +986,14 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 161)
+        self.assertEqual(summary["registered_tool_requirements"], 162)
         self.assertEqual(missing["grabowski_remove_path"], ["file_delete"])
         self.assertEqual(missing["grabowski_restore_removed_path"], ["file_delete"])
         self.assertEqual(missing["repoground_bundle_discover"], ["bundle_registry"])
+        self.assertEqual(missing["grabowski_audit_query"], ["audit_read"])
+        self.assertEqual(missing["grabowski_audit_trace"], ["audit_read"])
+        self.assertEqual(missing["grabowski_audit_analyze"], ["audit_read"])
+        self.assertNotIn("grabowski_verify_audit", missing)
         self.assertEqual(missing["grip_run"], ["terminal_execute"])
         self.assertEqual(
             missing["grabowski_connector_transport_diagnostics"],

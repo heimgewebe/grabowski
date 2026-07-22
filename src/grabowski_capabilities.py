@@ -144,21 +144,21 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_audit_query": {
         "category": "audit",
-        "purpose": "Query bounded safe fields from the fully verified audit segment chain.",
+        "purpose": "Query bounded safe fields from a verified audit snapshot with explicit scan completeness.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
     "grabowski_audit_trace": {
         "category": "audit",
-        "purpose": "Trace one exact audit anchor through bounded one-hop evidence correlations without claiming causality.",
+        "purpose": "Trace one exact audit anchor through bounded one-hop typed evidence correlations without claiming causality.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
     "grabowski_audit_analyze": {
         "category": "audit",
-        "purpose": "Compute bounded descriptive statistics from the fully verified audit segment chain.",
+        "purpose": "Compute bounded-memory descriptive statistics from a verified audit snapshot with explicit approximation semantics.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
@@ -920,6 +920,13 @@ TOOL_PROFILES.update(
         "grabowski_checkout_summary": {
             "category": "version-control",
             "purpose": "Read a bounded summary of Grabowski repository worktrees.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_current_work": {
+            "category": "operations-observability",
+            "purpose": "Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",

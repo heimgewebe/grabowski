@@ -362,6 +362,70 @@ class PrivilegedBrokerTests(unittest.TestCase):
         )
         self.assertEqual(timeout, 120)
 
+    def test_template_target_allows_json_payload_braces(self) -> None:
+        reference = self._reference()
+        target = json.dumps(
+            {
+                "schema_version": 1,
+                "target_uid": 1000,
+                "roots": ["/home/alex/repos/.weltgewebe-worktrees"],
+                "max_processes": 8192,
+                "max_file_descriptors": 131072,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        reference["action"] = "observe_process_references"
+        reference["target"] = target
+        reference["justification"] = "Observe bounded process references"
+        reference.pop("reference_sha256")
+        reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 1,
+            "actions": {
+                "observe_process_references": {
+                    "enabled": True,
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "argv": [
+                        "/usr/local/libexec/grabowski-process-reference-observer",
+                        "{target}",
+                    ],
+                    "timeout_seconds": 30,
+                }
+            },
+        }
+
+        argv, timeout = privileged_broker.resolve_action(config, parsed)
+
+        self.assertEqual(
+            argv,
+            ["/usr/local/libexec/grabowski-process-reference-observer", target],
+        )
+        self.assertEqual(timeout, 30)
+
+    def test_template_rejects_unknown_placeholder_before_substitution(self) -> None:
+        reference = self._reference()
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 1,
+            "actions": {
+                "edit_system_service": {
+                    "enabled": True,
+                    "target_pattern": "[A-Za-z0-9_.@:-]{1,200}",
+                    "argv": ["/usr/bin/systemctl", "restart", "{unknown}"],
+                    "timeout_seconds": 120,
+                }
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "unknown placeholder"):
+            privileged_broker.resolve_action(config, parsed)
+
     def test_reset_failed_systemd_unit_uses_fixed_template(self) -> None:
         reference = self._reference()
         reference["action"] = "reset_failed_systemd_unit"
@@ -1018,6 +1082,12 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
     def test_systemd_socket_contract_is_rooted_and_group_bounded(self) -> None:
         socket_unit = (ROOT / "systemd" / "grabowski-privileged-broker.socket").read_text(encoding="utf-8")
         service_unit = (ROOT / "systemd" / "grabowski-privileged-broker@.service").read_text(encoding="utf-8")
+        recovery_dropin = (
+            ROOT
+            / "systemd"
+            / "grabowski-privileged-broker@.service.d"
+            / "recovery-source.conf"
+        ).read_text(encoding="utf-8")
         tmpfiles = (ROOT / "tmpfiles" / "grabowski.conf").read_text(encoding="utf-8")
         self.assertIn("Accept=yes", socket_unit)
         self.assertIn("SocketGroup=grabowski", socket_unit)
@@ -1038,6 +1108,9 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertNotIn("BindReadOnlyPaths=-/home/alex/repos\n", service_unit)
         for path in privileged.PROCESS_REFERENCE_ALLOWED_ROOTS:
             self.assertIn(f"BindReadOnlyPaths=-{path}", service_unit)
+            self.assertIn(f"BindReadOnlyPaths=-{path}", recovery_dropin)
+        self.assertIn("BindReadOnlyPaths=\n", recovery_dropin)
+        self.assertNotIn("BindReadOnlyPaths=-/home/alex/repos\n", recovery_dropin)
         self.assertNotIn("BindPaths=/home/alex", service_unit)
         self.assertNotIn("ProtectHome=yes", service_unit)
         self.assertIn("ExecStart=/usr/local/libexec/grabowski-privileged-broker", service_unit)
